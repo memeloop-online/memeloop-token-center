@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memeloop.dev/token-center/schemas/model-route.schema.json",
+  "title": "Model route",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["public_model", "upstream_account_id", "upstream_model", "protocol"],
+  "properties": {
+    "tenant_external_id": { "type": "string", "default": "default" },
+    "public_model": { "type": "string", "minLength": 1 },
+    "upstream_account_id": { "type": "string", "format": "uuid" },
+    "upstream_model": { "type": "string", "minLength": 1 },
+    "protocol": { "enum": ["openai", "anthropic"] },
+    "priority": { "type": "integer", "default": 0 }
+  }
+}

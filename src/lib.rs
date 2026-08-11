@@ -6,12 +6,14 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod model;
+pub mod provider;
 
 use std::sync::Arc;
 
 use archive::ArchiveStore;
 use config::Config;
 use db::Database;
+use provider::ProviderCatalog;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,6 +21,7 @@ pub struct AppState {
     pub db: Database,
     pub archive: ArchiveStore,
     pub http: reqwest::Client,
+    pub providers: ProviderCatalog,
 }
 
 impl AppState {
@@ -31,6 +34,7 @@ impl AppState {
             config: Arc::new(config),
             db,
             archive,
+            providers: ProviderCatalog::builtins(),
             http: reqwest::Client::builder()
                 .pool_max_idle_per_host(64)
                 .build()?,

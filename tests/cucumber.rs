@@ -9,7 +9,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
+    matchers::{body_partial_json, header, method, path},
 };
 
 #[derive(World)]
@@ -22,6 +22,8 @@ struct TokenCenterWorld {
     current_key: String,
     old_key: String,
     stable_key_id: Option<Uuid>,
+    oauth_upstream_id: Option<Uuid>,
+    oauth_generation: i64,
     status: Option<StatusCode>,
     response: Value,
 }
@@ -37,6 +39,8 @@ impl Default for TokenCenterWorld {
             current_key: String::new(),
             old_key: String::new(),
             stable_key_id: None,
+            oauth_upstream_id: None,
+            oauth_generation: 0,
             status: None,
             response: Value::Null,
         }
@@ -117,6 +121,232 @@ async fn mock_successful_anthropic(world: &mut TokenCenterWorld) {
         })))
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
+}
+
+#[given("the mock routed upstream accepts API key and OAuth credentials")]
+async fn mock_routed_upstream(world: &mut TokenCenterWorld) {
+    for (authorization, model) in [
+        ("ApiKey direct-secret", "api-upstream"),
+        ("Bearer oauth-access-1", "oauth-upstream"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", authorization))
+            .and(body_partial_json(json!({"model": model})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": format!("chatcmpl-{model}"),
+                "choices": [{"message": {"role": "assistant", "content": "routed"}}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2}
+            })))
+            .mount(world.mock.as_ref().expect("mock server"))
+            .await;
+    }
+}
+
+#[when("the service creates API and OAuth routes")]
+async fn create_upstream_routes(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let api_account = create_upstream_account(
+        world,
+        "direct-api",
+        json!({
+            "type": "api_key",
+            "value": "direct-secret",
+            "header": "authorization",
+            "prefix": "ApiKey "
+        }),
+        &mock_url,
+    )
+    .await;
+    assert!(api_account.get("credential").is_none());
+    let oauth_account = create_upstream_account(
+        world,
+        "oauth-account",
+        json!({
+            "type": "oauth",
+            "access_token": "oauth-access-1",
+            "refresh_token": "oauth-refresh-1",
+            "expires_at": 4102444800000_i64
+        }),
+        &mock_url,
+    )
+    .await;
+    assert!(oauth_account.get("credential").is_none());
+    let api_id = api_account["id"].as_str().expect("API account id");
+    let oauth_id = oauth_account["id"].as_str().expect("OAuth account id");
+    world.oauth_upstream_id = Some(Uuid::from_str(oauth_id).expect("OAuth UUID"));
+    world.oauth_generation = oauth_account["credential_generation"]
+        .as_i64()
+        .expect("credential generation");
+    create_route(world, "api-public", api_id, "api-upstream").await;
+    create_route(world, "oauth-public", oauth_id, "oauth-upstream").await;
+}
+
+async fn create_upstream_account(
+    world: &TokenCenterWorld,
+    name: &str,
+    credential: Value,
+    base_url: &str,
+) -> Value {
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/upstreams", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "name": name,
+            "driver": "http-json",
+            "config": {"base_url": base_url},
+            "credential": credential
+        }))
+        .send()
+        .await
+        .expect("create upstream account");
+    let status = response.status();
+    let body = response.text().await.expect("upstream account response");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    serde_json::from_str(&body).expect("upstream account JSON")
+}
+
+async fn create_route(
+    world: &TokenCenterWorld,
+    public_model: &str,
+    upstream_account_id: &str,
+    upstream_model: &str,
+) {
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/model-routes", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "public_model": public_model,
+            "upstream_account_id": upstream_account_id,
+            "upstream_model": upstream_model,
+            "protocol": "openai"
+        }))
+        .send()
+        .await
+        .expect("create model route");
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[when("the service creates a key allowing both routed models")]
+async fn create_key_for_routed_models(world: &mut TokenCenterWorld) {
+    for model in ["api-public", "oauth-public"] {
+        let response = world
+            .client
+            .post(format!(
+                "{}/internal/v1/prices/USD/{model}",
+                world.service_url
+            ))
+            .bearer_auth("test-service-token")
+            .json(&json!({"input_per_million": "1", "output_per_million": "1"}))
+            .send()
+            .await
+            .expect("create routed model price");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "principal_external_id": "routed-user",
+            "alias": "routed",
+            "currency": "USD",
+            "initial_balance": "10",
+            "policy": {"allowed_models": ["api-public", "oauth-public"]}
+        }))
+        .send()
+        .await
+        .expect("create routed key");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let value: Value = response.json().await.expect("routed key JSON");
+    world.current_key = value["key"].as_str().expect("issued key").to_owned();
+}
+
+#[when("the client calls both routed models")]
+async fn call_both_routed_models(world: &mut TokenCenterWorld) {
+    call_model(world, "api-public".to_owned()).await;
+    assert_eq!(world.status, Some(StatusCode::OK));
+    call_model(world, "oauth-public".to_owned()).await;
+}
+
+#[then("both upstream authentication types used the same routing pipeline")]
+async fn both_auth_types_were_routed(world: &mut TokenCenterWorld) {
+    let requests = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("received requests");
+    let authorizations = requests
+        .iter()
+        .filter_map(|request| request.headers.get("authorization"))
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    assert!(authorizations.contains(&"ApiKey direct-secret"));
+    assert!(authorizations.contains(&"Bearer oauth-access-1"));
+}
+
+#[when("the service rotates the OAuth upstream credential")]
+async fn rotate_oauth_upstream(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer oauth-access-2"))
+        .and(body_partial_json(json!({"model": "oauth-upstream"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-oauth-rotated",
+            "choices": [{"message": {"role": "assistant", "content": "rotated"}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2}
+        })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    let account_id = world.oauth_upstream_id.expect("OAuth upstream id");
+    let response = world
+        .client
+        .put(format!(
+            "{}/internal/v1/upstreams/{account_id}/credential",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "credential": {
+                "type": "oauth",
+                "access_token": "oauth-access-2",
+                "refresh_token": "oauth-refresh-2",
+                "expires_at": 4102444800000_i64
+            }
+        }))
+        .send()
+        .await
+        .expect("rotate OAuth upstream credential");
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = response.json().await.expect("rotated upstream JSON");
+    assert_eq!(value["id"], account_id.to_string());
+    world.oauth_generation = value["credential_generation"]
+        .as_i64()
+        .expect("rotated generation");
+}
+
+#[then("the OAuth upstream account retains its stable id and uses generation 2")]
+async fn oauth_upstream_retains_id(world: &mut TokenCenterWorld) {
+    assert!(world.oauth_upstream_id.is_some());
+    assert_eq!(world.oauth_generation, 2);
+    let requests = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("received requests");
+    assert!(requests.iter().any(|request| {
+        request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer oauth-access-2")
+    }));
 }
 
 #[when(expr = "the service creates a key for principal {string} allowing model {string}")]

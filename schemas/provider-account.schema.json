@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memeloop.dev/token-center/schemas/provider-account.schema.json",
+  "title": "Upstream provider account",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "driver", "config", "credential"],
+  "properties": {
+    "tenant_external_id": { "type": "string", "default": "default" },
+    "name": { "type": "string", "minLength": 1 },
+    "driver": { "type": "string", "default": "http-json" },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_url"],
+      "properties": {
+        "base_url": { "type": "string", "format": "uri" },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600,
+          "default": 120
+        }
+      }
+    },
+    "credential": {
+      "oneOf": [
+        {
+          "title": "API key",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "value"],
+          "properties": {
+            "type": { "const": "api_key" },
+            "value": { "type": "string", "minLength": 1, "writeOnly": true },
+            "header": { "type": "string", "default": "authorization" },
+            "prefix": { "type": "string", "default": "Bearer " }
+          }
+        },
+        {
+          "title": "OAuth",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "access_token"],
+          "properties": {
+            "type": { "const": "oauth" },
+            "access_token": { "type": "string", "minLength": 1, "writeOnly": true },
+            "refresh_token": { "type": "string", "writeOnly": true },
+            "expires_at": {
+              "type": "integer",
+              "description": "Unix milliseconds"
+            },
+            "header": { "type": "string", "default": "authorization" },
+            "prefix": { "type": "string", "default": "Bearer " }
+          }
+        }
+      ]
+    }
+  }
+}

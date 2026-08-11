@@ -21,6 +21,7 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 - OpenAI：`/v1/chat/completions`、`/v1/responses`、`/v1/embeddings`。
 - Anthropic：`/v1/messages`、`/v1/messages/count_tokens`。
 - Service：创建/轮换 key、设置同币种模型价格、幂等发放余额。
+- Provider：创建稳定上游账号、轮换 API/OAuth credential、建立公开模型到上游模型的路由。
 - Self-service：key 信息、请求列表/详情、聚合统计、逻辑会话簇/关系边。
 
 模型请求先按正文 token 上界与最大输出做余额预留，同时原子执行 RPM 限流；响应返回 usage 后结算实际费用并释放差额。daily、rolling-weekly 与 lifetime budget 均在调用上游前检查。
@@ -52,5 +53,6 @@ Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，�
 
 ## 配置与插件
 
-核心和 key policy 的 JSON Schema 位于 `schemas/`。插件 ABI 位于 `wit/token-center.wit`；OCI 插件包格式和 capability 限制见 `plugins/README.md`。Helm Chart 位于 `charts/memeloop-token-center`，生产 values 只引用外部 PostgreSQL/S3 Secret，不把凭证写入 ConfigMap。
+核心、key policy、provider 账号和模型路由的 JSON Schema 位于 `schemas/`。`GET /internal/v1/provider-types` 还会返回每种 provider 贡献的配置与 credential Schema，前端可直接交给 JSON Schema 表单渲染器。API key 与 OAuth 都是同一种稳定上游账号的 credential；轮换只推进 generation，请求历史继续引用同一个账号主键。credential 使用带认证加密后再写入数据库，并且管理 API 只返回脱敏元信息。
 
+插件 ABI 位于 `wit/token-center.wit`；OCI 插件包格式和 capability 限制见 `plugins/README.md`。Helm Chart 位于 `charts/memeloop-token-center`，生产 values 只引用外部 PostgreSQL/S3 Secret，不把凭证写入 ConfigMap。

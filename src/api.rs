@@ -6,7 +6,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
@@ -21,9 +21,13 @@ use uuid::Uuid;
 
 use crate::{
     AppState, crypto,
-    db::{CreateKeyInput, FinishRequest, NewRequest},
+    db::{
+        CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput, FinishRequest,
+        NewRequest, unix_millis,
+    },
     error::AppError,
     model::{AuthenticatedKey, KeyPolicy},
+    provider::UpstreamCredential,
 };
 
 const REQUEST_ID_HEADER: &str = "x-mtc-request-id";
@@ -35,6 +39,13 @@ pub fn router(state: AppState) -> Router {
         .route("/portal", get(portal))
         .route("/internal/v1/keys", post(create_key))
         .route("/internal/v1/keys/{key_id}/rotate", post(rotate_key))
+        .route("/internal/v1/provider-types", get(provider_types))
+        .route("/internal/v1/upstreams", post(create_upstream))
+        .route(
+            "/internal/v1/upstreams/{account_id}/credential",
+            put(rotate_upstream_credential),
+        )
+        .route("/internal/v1/model-routes", post(create_model_route))
         .route("/internal/v1/prices/{currency}/{model}", post(upsert_price))
         .route(
             "/internal/v1/accounts/{account_id}/grants",
@@ -140,6 +151,115 @@ async fn rotate_key(
         .rotate_key(key_id, state.config.key_pepper.as_bytes())
         .await?;
     Ok(Json(issued))
+}
+
+async fn provider_types(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state)?;
+    Ok(Json(state.providers.list().to_vec()))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateUpstreamRequest {
+    #[serde(default = "default_tenant")]
+    tenant_external_id: String,
+    name: String,
+    #[serde(default = "default_provider_driver")]
+    driver: String,
+    config: Value,
+    credential: UpstreamCredential,
+}
+
+fn default_provider_driver() -> String {
+    "http-json".to_owned()
+}
+
+async fn create_upstream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateUpstreamRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state)?;
+    if !state.providers.contains(&body.driver) {
+        return Err(AppError::BadRequest(format!(
+            "unknown provider driver: {}",
+            body.driver
+        )));
+    }
+    body.credential.validate(unix_millis())?;
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: body.tenant_external_id,
+                name: body.name,
+                driver: body.driver,
+                config: body.config,
+                credential: body.credential,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(account)))
+}
+
+#[derive(Debug, Deserialize)]
+struct RotateUpstreamCredentialRequest {
+    credential: UpstreamCredential,
+}
+
+async fn rotate_upstream_credential(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Json(body): Json<RotateUpstreamCredentialRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state)?;
+    body.credential.validate(unix_millis())?;
+    Ok(Json(
+        state
+            .db
+            .rotate_upstream_credential(
+                account_id,
+                body.credential,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateModelRouteRequest {
+    #[serde(default = "default_tenant")]
+    tenant_external_id: String,
+    public_model: String,
+    upstream_account_id: Uuid,
+    upstream_model: String,
+    protocol: String,
+    #[serde(default)]
+    priority: i64,
+}
+
+async fn create_model_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateModelRouteRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state)?;
+    let route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: body.tenant_external_id,
+            public_model: body.public_model,
+            upstream_account_id: body.upstream_account_id,
+            upstream_model: body.upstream_model,
+            protocol: body.protocol,
+            priority: body.priority,
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(route)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +504,64 @@ async fn proxy(
     if !key.policy.allows_model(&model) {
         return Err(AppError::Forbidden);
     }
+    let resolved_route = state
+        .db
+        .resolve_upstream(
+            key.tenant_id,
+            &model,
+            protocol.name(),
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?;
+    let (
+        base_url,
+        upstream_credential,
+        legacy_upstream_key,
+        upstream_model,
+        upstream_account_id,
+        model_route_id,
+    ) = if let Some(route) = resolved_route {
+        if route.driver != "http-json" {
+            return Err(AppError::Upstream(format!(
+                "provider driver {} is not loaded",
+                route.driver
+            )));
+        }
+        route.credential.validate(unix_millis())?;
+        (
+            route.base_url,
+            Some(route.credential),
+            None,
+            route.upstream_model,
+            Some(route.account_id),
+            Some(route.route_id),
+        )
+    } else {
+        let (base_url, upstream_key) = if protocol.is_openai() {
+            (
+                state.config.upstream_openai_url.clone(),
+                state.config.upstream_openai_key.clone(),
+            )
+        } else {
+            (
+                state.config.upstream_anthropic_url.clone(),
+                state.config.upstream_anthropic_key.clone(),
+            )
+        };
+        (
+            base_url.ok_or_else(|| AppError::Upstream(protocol.name().into()))?,
+            None,
+            upstream_key,
+            model.clone(),
+            None,
+            None,
+        )
+    };
+    let mut forwarded_json = request_json.clone();
+    if let Some(value) = forwarded_json.get_mut("model") {
+        *value = Value::String(upstream_model);
+    }
+    let forwarded_body = serde_json::to_vec(&forwarded_json).map_err(|_| AppError::Internal)?;
     let price = state.db.model_price(&model, &key.currency).await?;
     let input_token_ceiling = i64::try_from(body.len()).unwrap_or(i64::MAX);
     let default_output_token_ceiling = if matches!(
@@ -405,18 +583,6 @@ async fn proxy(
         .reserve_usage(&key, &price, input_token_ceiling, output_token_ceiling)
         .await?;
 
-    let (base_url, upstream_key) = if protocol.is_openai() {
-        (
-            state.config.upstream_openai_url.as_ref(),
-            state.config.upstream_openai_key.as_ref(),
-        )
-    } else {
-        (
-            state.config.upstream_anthropic_url.as_ref(),
-            state.config.upstream_anthropic_key.as_ref(),
-        )
-    };
-    let base_url = base_url.ok_or_else(|| AppError::Upstream(protocol.name().into()))?;
     let path = protocol.path();
     let request_id = Uuid::now_v7();
     let prefix = format!("tenants/{}/requests/{request_id}", key.tenant_id);
@@ -436,9 +602,11 @@ async fn proxy(
             key_id: key.key_id,
             tenant_id: key.tenant_id,
             protocol: protocol.name().to_owned(),
-            model,
+            model: model.clone(),
             request_object: stored_request,
             reservation_id: reservation.id,
+            upstream_account_id,
+            model_route_id,
         })
         .await?;
     let conversation_hint = conversation_hint(&headers, &request_json);
@@ -471,8 +639,10 @@ async fn proxy(
                 .cloned()
                 .unwrap_or(HeaderValue::from_static("application/json")),
         )
-        .body(body);
-    if let Some(upstream_key) = upstream_key {
+        .body(forwarded_body);
+    if let Some(credential) = upstream_credential.as_ref() {
+        request = credential.apply(request, unix_millis())?;
+    } else if let Some(upstream_key) = legacy_upstream_key.as_ref() {
         request = if protocol.is_openai() {
             request.bearer_auth(upstream_key)
         } else {

@@ -48,3 +48,16 @@ Feature: Stable key identity and read-only self-service statistics
     When the service creates a key with RPM 1 allowing model "gpt-test"
     And the client calls model "gpt-test" twice
     Then the response status is 429
+
+  Scenario: API key and OAuth credentials share stable upstream routing
+    Given a token center backed by SQLite and memory object storage
+    And the mock routed upstream accepts API key and OAuth credentials
+    When the service creates API and OAuth routes
+    And the service creates a key allowing both routed models
+    And the client calls both routed models
+    Then the response status is 200
+    And both upstream authentication types used the same routing pipeline
+    When the service rotates the OAuth upstream credential
+    And the client calls model "oauth-public"
+    Then the response status is 200
+    And the OAuth upstream account retains its stable id and uses generation 2

@@ -13,6 +13,10 @@ use crate::{
         IssuedKey, KeyPolicy, KeyView, ModelPrice, RequestArchiveRefs, RequestView, SelfStats,
         StatsBucket, StatsSummary, UsageReservation, micros_to_decimal_string, priced_tokens,
     },
+    provider::{
+        ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
+        seal_credential, validate_config,
+    },
 };
 
 #[derive(Clone)]
@@ -44,6 +48,8 @@ pub struct NewRequest {
     pub model: String,
     pub request_object: String,
     pub reservation_id: Uuid,
+    pub upstream_account_id: Option<Uuid>,
+    pub model_route_id: Option<Uuid>,
 }
 
 pub struct FinishRequest {
@@ -55,6 +61,23 @@ pub struct FinishRequest {
     pub cost_micros: i64,
     pub error_code: Option<String>,
     pub response_object: String,
+}
+
+pub struct CreateUpstreamAccountInput {
+    pub tenant_external_id: String,
+    pub name: String,
+    pub driver: String,
+    pub config: serde_json::Value,
+    pub credential: UpstreamCredential,
+}
+
+pub struct CreateModelRouteInput {
+    pub tenant_external_id: String,
+    pub public_model: String,
+    pub upstream_account_id: Uuid,
+    pub upstream_model: String,
+    pub protocol: String,
+    pub priority: i64,
 }
 
 impl Database {
@@ -91,6 +114,31 @@ impl Database {
                     .await?;
             } else {
                 sqlx::query(statement).execute(&mut *connection).await?;
+            }
+        }
+        for column in ["upstream_account_id", "model_route_id"] {
+            let exists = match self.backend {
+                DatabaseBackend::PostgreSql => sqlx::query(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'request_records' AND column_name = ?",
+                )
+                .bind(column)
+                .fetch_optional(&mut *connection)
+                .await?
+                .is_some(),
+                DatabaseBackend::Sqlite => sqlx::query(
+                    "SELECT name FROM pragma_table_info('request_records') WHERE name = ?",
+                )
+                .bind(column)
+                .fetch_optional(&mut *connection)
+                .await?
+                .is_some(),
+            };
+            if !exists {
+                sqlx::query(&format!(
+                    "ALTER TABLE request_records ADD COLUMN {column} TEXT"
+                ))
+                .execute(&mut *connection)
+                .await?;
             }
         }
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
@@ -251,6 +299,244 @@ impl Database {
             key: issued.secret,
             fingerprint: issued.fingerprint,
         })
+    }
+
+    pub async fn create_upstream_account(
+        &self,
+        input: CreateUpstreamAccountInput,
+        key_material: &[u8],
+    ) -> Result<UpstreamAccountView, AppError> {
+        if input.name.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "upstream account name is required".into(),
+            ));
+        }
+        let _ = validate_config(&input.config)?;
+        let now = unix_millis();
+        let account_id = Uuid::now_v7();
+        let tenant_candidate = Uuid::now_v7();
+        let config_json = serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
+        let credential_ciphertext = seal_credential(&input.credential, key_material)?;
+        let auth_kind = input.credential.auth_kind();
+        let credential_expires_at = input.credential.expires_at();
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tenants (id, external_id, created_at) VALUES (?, ?, ?) ON CONFLICT(external_id) DO NOTHING",
+        )
+        .bind(tenant_candidate.to_string())
+        .bind(&input.tenant_external_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let tenant_id: String = sqlx::query("SELECT id FROM tenants WHERE external_id = ?")
+            .bind(&input.tenant_external_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("id")?;
+        sqlx::query(
+            "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)",
+        )
+        .bind(account_id.to_string())
+        .bind(&tenant_id)
+        .bind(input.name.trim())
+        .bind(&input.driver)
+        .bind(auth_kind)
+        .bind(config_json)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at) VALUES (?, ?, 1, ?, ?, ?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(account_id.to_string())
+        .bind(credential_ciphertext)
+        .bind(credential_expires_at)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(UpstreamAccountView {
+            id: account_id,
+            tenant_id: parse_uuid(tenant_id)?,
+            name: input.name.trim().to_owned(),
+            driver: input.driver,
+            auth_kind: auth_kind.to_owned(),
+            credential_generation: 1,
+            status: "active".to_owned(),
+            config: input.config,
+            credential_expires_at,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub async fn rotate_upstream_credential(
+        &self,
+        account_id: Uuid,
+        credential: UpstreamCredential,
+        key_material: &[u8],
+    ) -> Result<UpstreamAccountView, AppError> {
+        let now = unix_millis();
+        let ciphertext = seal_credential(&credential, key_material)?;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT tenant_id, name, driver, auth_kind, config_json, status, credential_generation, created_at FROM upstream_accounts WHERE id = ?",
+        )
+        .bind(account_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        let status: String = row.try_get("status")?;
+        if status != "active" {
+            return Err(AppError::Forbidden);
+        }
+        let auth_kind: String = row.try_get("auth_kind")?;
+        if auth_kind != credential.auth_kind() {
+            return Err(AppError::BadRequest(
+                "credential rotation cannot change auth type; create a new upstream account".into(),
+            ));
+        }
+        let generation: i64 = row.try_get::<i64, _>("credential_generation")? + 1;
+        sqlx::query(
+            "UPDATE upstream_credentials SET revoked_at = ? WHERE upstream_account_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(account_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(account_id.to_string())
+        .bind(generation)
+        .bind(ciphertext)
+        .bind(credential.expires_at())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE upstream_accounts SET credential_generation = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(generation)
+        .bind(now)
+        .bind(account_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let config_json: String = row.try_get("config_json")?;
+        Ok(UpstreamAccountView {
+            id: account_id,
+            tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+            name: row.try_get("name")?,
+            driver: row.try_get("driver")?,
+            auth_kind,
+            credential_generation: generation,
+            status,
+            config: serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?,
+            credential_expires_at: credential.expires_at(),
+            created_at: row.try_get("created_at")?,
+            updated_at: now,
+        })
+    }
+
+    pub async fn create_model_route(
+        &self,
+        input: CreateModelRouteInput,
+    ) -> Result<ModelRouteView, AppError> {
+        if input.public_model.trim().is_empty() || input.upstream_model.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "public_model and upstream_model are required".into(),
+            ));
+        }
+        if !matches!(input.protocol.as_str(), "openai" | "anthropic") {
+            return Err(AppError::BadRequest(
+                "route protocol must be openai or anthropic".into(),
+            ));
+        }
+        let now = unix_millis();
+        let route_id = Uuid::now_v7();
+        let mut tx = self.pool.begin().await?;
+        let tenant_id: String = sqlx::query("SELECT id FROM tenants WHERE external_id = ?")
+            .bind(&input.tenant_external_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?
+            .try_get("id")?;
+        let account_tenant: String = sqlx::query(
+            "SELECT tenant_id FROM upstream_accounts WHERE id = ? AND status = 'active'",
+        )
+        .bind(input.upstream_account_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?
+        .try_get("tenant_id")?;
+        if account_tenant != tenant_id {
+            return Err(AppError::Forbidden);
+        }
+        sqlx::query(
+            "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        )
+        .bind(route_id.to_string())
+        .bind(&tenant_id)
+        .bind(input.public_model.trim())
+        .bind(input.upstream_account_id.to_string())
+        .bind(input.upstream_model.trim())
+        .bind(&input.protocol)
+        .bind(input.priority)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ModelRouteView {
+            id: route_id,
+            tenant_id: parse_uuid(tenant_id)?,
+            public_model: input.public_model.trim().to_owned(),
+            upstream_account_id: input.upstream_account_id,
+            upstream_model: input.upstream_model.trim().to_owned(),
+            protocol: input.protocol,
+            priority: input.priority,
+            enabled: true,
+        })
+    }
+
+    pub async fn resolve_upstream(
+        &self,
+        tenant_id: Uuid,
+        public_model: &str,
+        protocol: &str,
+        key_material: &[u8],
+    ) -> Result<Option<ResolvedUpstream>, AppError> {
+        let row = sqlx::query(
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE r.tenant_id = ? AND r.public_model = ? AND r.protocol = ? AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1",
+        )
+        .bind(tenant_id.to_string())
+        .bind(public_model)
+        .bind(protocol)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let config_json: String = row.try_get("config_json")?;
+        let config: serde_json::Value =
+            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+        let base_url = validate_config(&config)?;
+        let ciphertext: String = row.try_get("credential_ciphertext")?;
+        Ok(Some(ResolvedUpstream {
+            route_id: parse_uuid(row.try_get("route_id")?)?,
+            account_id: parse_uuid(row.try_get("account_id")?)?,
+            driver: row.try_get("driver")?,
+            base_url,
+            upstream_model: row.try_get("upstream_model")?,
+            credential: open_credential(&ciphertext, key_material)?,
+        }))
     }
 
     pub async fn authenticate_key(
@@ -642,7 +928,7 @@ impl Database {
 
     pub async fn record_request_started(&self, request: NewRequest) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, input_tokens, output_tokens, cost_micros) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)",
+            "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, input_tokens, output_tokens, cost_micros) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)",
         )
         .bind(request.request_id.to_string())
         .bind(request.tenant_id.to_string())
@@ -652,6 +938,8 @@ impl Database {
         .bind(request.model)
         .bind(request.request_object)
         .bind(request.reservation_id.to_string())
+        .bind(request.upstream_account_id.map(|id| id.to_string()))
+        .bind(request.model_route_id.map(|id| id.to_string()))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1184,10 +1472,13 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS key_credentials (id TEXT PRIMARY KEY, key_id TEXT NOT NULL, generation BIGINT NOT NULL, secret_hash BYTEA NOT NULL, fingerprint TEXT NOT NULL, created_at BIGINT NOT NULL, revoked_at BIGINT, UNIQUE(key_id, generation))",
     "CREATE TABLE IF NOT EXISTS ledger_entries (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, key_id TEXT, kind TEXT NOT NULL, amount_micros BIGINT NOT NULL, currency TEXT NOT NULL, source TEXT NOT NULL, idempotency_key TEXT UNIQUE, created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS model_prices (id TEXT PRIMARY KEY, model TEXT NOT NULL, currency TEXT NOT NULL, input_micros_per_million BIGINT NOT NULL, output_micros_per_million BIGINT NOT NULL, source TEXT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(model, currency))",
+    "CREATE TABLE IF NOT EXISTS upstream_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, driver TEXT NOT NULL, auth_kind TEXT NOT NULL, config_json TEXT NOT NULL, status TEXT NOT NULL, credential_generation BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, name))",
+    "CREATE TABLE IF NOT EXISTS upstream_credentials (id TEXT PRIMARY KEY, upstream_account_id TEXT NOT NULL, generation BIGINT NOT NULL, credential_ciphertext TEXT NOT NULL, expires_at BIGINT, created_at BIGINT NOT NULL, revoked_at BIGINT, UNIQUE(upstream_account_id, generation))",
+    "CREATE TABLE IF NOT EXISTS model_routes (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, public_model TEXT NOT NULL, upstream_account_id TEXT NOT NULL, upstream_model TEXT NOT NULL, protocol TEXT NOT NULL, priority BIGINT NOT NULL, enabled BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, public_model, protocol, priority))",
     "CREATE TABLE IF NOT EXISTS usage_reservations (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, key_id TEXT NOT NULL, price_id TEXT NOT NULL, reserved_micros BIGINT NOT NULL, reserved_tokens BIGINT NOT NULL, rate_window_start BIGINT NOT NULL, actual_micros BIGINT, status TEXT NOT NULL, created_at BIGINT NOT NULL, settled_at BIGINT)",
     "CREATE TABLE IF NOT EXISTS rate_limit_windows (key_id TEXT NOT NULL, window_start BIGINT NOT NULL, requests BIGINT NOT NULL, tokens BIGINT NOT NULL, PRIMARY KEY(key_id, window_start))",
     "CREATE TABLE IF NOT EXISTS key_runtime_state (key_id TEXT PRIMARY KEY, active_requests BIGINT NOT NULL, updated_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, key_id TEXT NOT NULL, created_at BIGINT NOT NULL, completed_at BIGINT, protocol TEXT NOT NULL, model TEXT NOT NULL, status_code BIGINT, duration_ms BIGINT, input_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL, error_code TEXT, request_object TEXT NOT NULL, response_object TEXT, reservation_id TEXT NOT NULL, conversation_cluster_id TEXT)",
+    "CREATE TABLE IF NOT EXISTS request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, key_id TEXT NOT NULL, created_at BIGINT NOT NULL, completed_at BIGINT, protocol TEXT NOT NULL, model TEXT NOT NULL, status_code BIGINT, duration_ms BIGINT, input_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL, error_code TEXT, request_object TEXT NOT NULL, response_object TEXT, reservation_id TEXT NOT NULL, conversation_cluster_id TEXT, upstream_account_id TEXT, model_route_id TEXT)",
     "CREATE TABLE IF NOT EXISTS usage_daily_aggregates (key_id TEXT NOT NULL, day_bucket BIGINT NOT NULL, model TEXT NOT NULL, status_class TEXT NOT NULL, error_code TEXT NOT NULL, requests BIGINT NOT NULL, input_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL, PRIMARY KEY(key_id, day_bucket, model, status_class, error_code))",
     "CREATE TABLE IF NOT EXISTS semantic_atoms (tenant_id TEXT NOT NULL, content_hash TEXT NOT NULL, instance_hash TEXT NOT NULL, role TEXT NOT NULL, kind TEXT NOT NULL, content_json TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY(tenant_id, content_hash))",
     "CREATE TABLE IF NOT EXISTS context_nodes (tenant_id TEXT NOT NULL, node_hash TEXT NOT NULL, parent_hash TEXT, atom_hash TEXT NOT NULL, depth BIGINT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY(tenant_id, node_hash))",
@@ -1200,12 +1491,15 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS request_records_error_idx ON request_records (tenant_id, error_code, created_at DESC) WHERE error_code IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS ledger_entries_key_time_idx ON ledger_entries (key_id, created_at DESC) WHERE key_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS usage_reservations_key_status_idx ON usage_reservations (key_id, status, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS upstream_accounts_tenant_driver_idx ON upstream_accounts (tenant_id, driver, status)",
+    "CREATE INDEX IF NOT EXISTS upstream_credentials_active_idx ON upstream_credentials (upstream_account_id, revoked_at, generation DESC)",
+    "CREATE INDEX IF NOT EXISTS model_routes_lookup_idx ON model_routes (tenant_id, public_model, protocol, enabled, priority)",
     "CREATE INDEX IF NOT EXISTS conversation_observations_key_time_idx ON conversation_observations (key_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS conversation_observations_cluster_time_idx ON conversation_observations (cluster_id, created_at ASC)",
     "CREATE INDEX IF NOT EXISTS conversation_edges_cluster_target_idx ON conversation_edges (cluster_id, to_observation_id)",
 ];
 
-const POSTGRES_REQUEST_RECORDS: &str = "CREATE TABLE IF NOT EXISTS request_records (id TEXT NOT NULL, tenant_id TEXT NOT NULL, key_id TEXT NOT NULL, created_at BIGINT NOT NULL, completed_at BIGINT, protocol TEXT NOT NULL, model TEXT NOT NULL, status_code BIGINT, duration_ms BIGINT, input_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL, error_code TEXT, request_object TEXT NOT NULL, response_object TEXT, reservation_id TEXT NOT NULL, conversation_cluster_id TEXT) PARTITION BY RANGE (created_at)";
+const POSTGRES_REQUEST_RECORDS: &str = "CREATE TABLE IF NOT EXISTS request_records (id TEXT NOT NULL, tenant_id TEXT NOT NULL, key_id TEXT NOT NULL, created_at BIGINT NOT NULL, completed_at BIGINT, protocol TEXT NOT NULL, model TEXT NOT NULL, status_code BIGINT, duration_ms BIGINT, input_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL, error_code TEXT, request_object TEXT NOT NULL, response_object TEXT, reservation_id TEXT NOT NULL, conversation_cluster_id TEXT, upstream_account_id TEXT, model_route_id TEXT) PARTITION BY RANGE (created_at)";
 
 const POSTGRES_REQUEST_PARTITIONS: &str = r#"
 DO $$
@@ -1229,3 +1523,37 @@ BEGIN
 END $$;
 CREATE TABLE IF NOT EXISTS request_records_default PARTITION OF request_records DEFAULT;
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sqlite_upgrade_adds_request_routing_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("upgrade.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, key_id TEXT NOT NULL, created_at BIGINT NOT NULL, completed_at BIGINT, protocol TEXT NOT NULL, model TEXT NOT NULL, status_code BIGINT, duration_ms BIGINT, input_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL, error_code TEXT, request_object TEXT NOT NULL, response_object TEXT, reservation_id TEXT NOT NULL, conversation_cluster_id TEXT)",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        database.migrate().await.unwrap();
+
+        for column in ["upstream_account_id", "model_route_id"] {
+            let present =
+                sqlx::query("SELECT name FROM pragma_table_info('request_records') WHERE name = ?")
+                    .bind(column)
+                    .fetch_optional(&database.pool)
+                    .await
+                    .unwrap()
+                    .is_some();
+            assert!(present, "missing upgraded column {column}");
+        }
+    }
+}
