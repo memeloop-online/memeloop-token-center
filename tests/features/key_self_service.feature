@@ -1,0 +1,50 @@
+Feature: Stable key identity and read-only self-service statistics
+  A user can read the same key history after credential rotation, but cannot administer the service.
+
+  Scenario: Key rotation preserves history and policy without migration
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI upstream returns a successful completion
+    When the service creates a key for principal "alice" allowing model "gpt-test"
+    And the client calls model "gpt-test"
+    Then the response status is 200
+    When the service rotates the key
+    Then the rotated credential retains the stable key id
+    And the old credential is rejected
+    When the client views its statistics with the rotated credential
+    Then the statistics contain 1 request and 10 tokens
+    And the request detail contains the archived prompt and response
+    And the downstream key cannot create another key
+
+  Scenario: Model permission is enforced before proxying
+    Given a token center backed by SQLite and memory object storage
+    When the service creates a key for principal "bob" allowing model "allowed-model"
+    And the client calls model "denied-model"
+    Then the response status is 403
+
+  Scenario: Balance is reserved before calling the upstream
+    Given a token center backed by SQLite and memory object storage
+    When the service creates an exhausted key allowing model "paid-model"
+    And the client calls model "paid-model"
+    Then the response status is 429
+
+  Scenario: Full-context agent requests share a logical conversation
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI upstream returns a successful completion
+    When the service creates a key for principal "carol" allowing model "gpt-test"
+    And the client sends two full-context requests for model "gpt-test" in one session
+    Then the response status is 200
+    And the requests form one logical conversation with a continuation edge
+
+  Scenario: Claude Code can use the Anthropic Messages protocol
+    Given a token center backed by SQLite and memory object storage
+    And the mock Anthropic upstream returns a successful message
+    When the service creates a key for principal "dave" allowing model "claude-test"
+    And the Claude client calls model "claude-test"
+    Then the response status is 200
+
+  Scenario: RPM is enforced across requests
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI upstream returns a successful completion
+    When the service creates a key with RPM 1 allowing model "gpt-test"
+    And the client calls model "gpt-test" twice
+    Then the response status is 429

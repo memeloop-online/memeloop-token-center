@@ -1,0 +1,56 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/memeloop/memeloop-token-center
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+config:
+  databaseUrlSecret:
+    name: memeloop-token-center-secrets
+    key: database-url
+  keyPepperSecret:
+    name: memeloop-token-center-secrets
+    key: key-pepper
+  serviceTokenSecret:
+    name: memeloop-token-center-secrets
+    key: service-token
+  archiveBackend: s3
+  s3:
+    bucket: memeloop-token-center
+    endpoint: ""
+    region: us-east-1
+    allowHttp: false
+    credentialsSecret:
+      name: memeloop-token-center-secrets
+      accessKey: s3-access-key
+      secretKey: s3-secret-key
+  upstream:
+    openaiUrl: ""
+    anthropicUrl: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+
+serviceMonitor:
+  enabled: false
+

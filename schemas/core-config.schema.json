@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memeloop.dev/token-center/schemas/core-config.schema.json",
+  "title": "Memeloop Token Center",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["database", "archive"],
+  "properties": {
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url_secret"],
+      "properties": { "url_secret": { "type": "string", "minLength": 1 } }
+    },
+    "archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend"],
+      "properties": {
+        "backend": { "enum": ["s3", "filesystem", "memory"], "default": "s3" },
+        "bucket": { "type": "string" },
+        "endpoint": { "type": "string", "format": "uri" },
+        "region": { "type": "string", "default": "us-east-1" }
+      }
+    }
+  }
+}
+

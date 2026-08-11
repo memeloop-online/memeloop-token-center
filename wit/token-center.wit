@@ -1,0 +1,53 @@
+package memeloop:token-center@0.1.0;
+
+interface types {
+  record request-context {
+    tenant-id: string,
+    principal-id: string,
+    key-id: string,
+    protocol: string,
+    model: string,
+    config-json: string,
+  }
+
+  record decision {
+    allow: bool,
+    reason: option<string>,
+    model: option<string>,
+    upstream-account-id: option<string>,
+    request-json: option<string>,
+  }
+
+  record metering {
+    currency: string,
+    amount: string,
+    input-tokens: u64,
+    output-tokens: u64,
+    estimated: bool,
+  }
+}
+
+interface host {
+  log: func(level: string, message: string);
+  kv-get: func(key: string) -> result<option<list<u8>>, string>;
+  kv-put: func(key: string, value: list<u8>) -> result<_, string>;
+  http-request: func(method: string, url: string, headers-json: string, body: list<u8>) -> result<list<u8>, string>;
+}
+
+interface traffic-policy {
+  use types.{request-context, decision};
+  post-auth: func(context: request-context, request-json: string) -> result<decision, string>;
+}
+
+interface upstream-provider {
+  use types.{request-context, metering};
+  list-models: func(config-json: string) -> result<string, string>;
+  quote: func(context: request-context, request-json: string) -> result<metering, string>;
+}
+
+world plugin {
+  import host;
+  export traffic-policy;
+  export upstream-provider;
+}
+

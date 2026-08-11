@@ -1,0 +1,39 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "memeloop-token-center.fullname" . }}-migrate
+  labels:
+    {{- include "memeloop-token-center.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        {{- include "memeloop-token-center.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["migrate"]
+          env:
+            - name: MTC_DATABASE_URL
+              valueFrom: { secretKeyRef: { name: {{ .Values.config.databaseUrlSecret.name }}, key: {{ .Values.config.databaseUrlSecret.key }} } }
+            - name: MTC_KEY_PEPPER
+              valueFrom: { secretKeyRef: { name: {{ .Values.config.keyPepperSecret.name }}, key: {{ .Values.config.keyPepperSecret.key }} } }
+            - name: MTC_SERVICE_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ .Values.config.serviceTokenSecret.name }}, key: {{ .Values.config.serviceTokenSecret.key }} } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

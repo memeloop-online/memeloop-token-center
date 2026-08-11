@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memeloop.dev/token-center/schemas/key-policy.schema.json",
+  "title": "Key policy",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "allowed_models": {
+      "title": "Allowed models",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "default": []
+    },
+    "requests_per_minute": { "title": "Requests per minute", "type": "integer", "minimum": 1, "default": 60 },
+    "tokens_per_minute": { "title": "Tokens per minute", "type": "integer", "minimum": 1, "default": 100000 },
+    "max_concurrency": { "title": "Maximum concurrency", "type": "integer", "minimum": 1, "default": 4 },
+    "daily_budget": { "$ref": "#/$defs/decimal" },
+    "weekly_budget": { "$ref": "#/$defs/decimal" },
+    "lifetime_budget": { "$ref": "#/$defs/decimal" }
+  },
+  "$defs": {
+    "decimal": {
+      "type": ["string", "null"],
+      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,12})?$"
+    }
+  }
+}
+

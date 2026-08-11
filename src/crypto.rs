@@ -1,0 +1,93 @@
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
+use uuid::Uuid;
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub struct IssuedCredential {
+    pub credential_id: Uuid,
+    pub key_id: Uuid,
+    pub secret: String,
+    pub fingerprint: String,
+    pub secret_hash: Vec<u8>,
+}
+
+pub struct ParsedCredential<'a> {
+    pub key_id: Uuid,
+    pub secret_material: &'a str,
+}
+
+pub fn issue_credential(key_id: Uuid, pepper: &[u8]) -> IssuedCredential {
+    let credential_id = Uuid::now_v7();
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).expect("operating system random source");
+    let material = URL_SAFE_NO_PAD.encode(random);
+    let secret = format!("mtc_{}_{}", key_id.simple(), material);
+    let secret_hash = keyed_hash(pepper, secret.as_bytes());
+    let fingerprint = hex_prefix(&secret_hash, 8);
+
+    IssuedCredential {
+        credential_id,
+        key_id,
+        secret,
+        fingerprint,
+        secret_hash,
+    }
+}
+
+pub fn parse_credential(value: &str) -> Option<ParsedCredential<'_>> {
+    let raw = value.strip_prefix("mtc_")?;
+    let (key_id, secret_material) = raw.split_once('_')?;
+    if secret_material.len() < 32 {
+        return None;
+    }
+
+    Some(ParsedCredential {
+        key_id: Uuid::parse_str(key_id).ok()?,
+        secret_material,
+    })
+}
+
+pub fn verify_credential(value: &str, pepper: &[u8], expected: &[u8]) -> bool {
+    let actual = keyed_hash(pepper, value.as_bytes());
+    actual.as_slice().ct_eq(expected).into()
+}
+
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.ct_eq(right).into()
+}
+
+fn keyed_hash(pepper: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(pepper).expect("HMAC accepts any key length");
+    mac.update(value);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn hex_prefix(bytes: &[u8], count: usize) -> String {
+    bytes
+        .iter()
+        .take(count)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issued_key_carries_stable_public_id_and_verifies() {
+        let key_id = Uuid::now_v7();
+        let issued = issue_credential(key_id, b"a pepper that is long enough for this test");
+        let parsed = parse_credential(&issued.secret).expect("valid key");
+
+        assert_eq!(parsed.key_id, key_id);
+        assert!(verify_credential(
+            &issued.secret,
+            b"a pepper that is long enough for this test",
+            &issued.secret_hash
+        ));
+    }
+}

@@ -1,0 +1,10 @@
+/target/
+/.cargo/
+/.env
+/web/node_modules/
+/web/dist/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+
