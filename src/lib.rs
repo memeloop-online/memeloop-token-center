@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod model;
+pub mod oauth;
 pub mod provider;
 
 use std::sync::Arc;

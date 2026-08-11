@@ -27,6 +27,10 @@ use crate::{
     },
     error::AppError,
     model::{AuthenticatedKey, KeyPolicy},
+    oauth::{
+        CursorOAuthEndpoints, CursorPollResult, StartCursorLogin, poll_cursor_login,
+        refresh_cursor_credential, start_cursor_login,
+    },
     provider::UpstreamCredential,
 };
 
@@ -40,10 +44,16 @@ pub fn router(state: AppState) -> Router {
         .route("/internal/v1/keys", post(create_key))
         .route("/internal/v1/keys/{key_id}/rotate", post(rotate_key))
         .route("/internal/v1/provider-types", get(provider_types))
+        .route("/internal/v1/oauth/cursor/start", post(start_cursor_oauth))
+        .route("/internal/v1/oauth/cursor/poll", post(poll_cursor_oauth))
         .route("/internal/v1/upstreams", post(create_upstream))
         .route(
             "/internal/v1/upstreams/{account_id}/credential",
             put(rotate_upstream_credential),
+        )
+        .route(
+            "/internal/v1/upstreams/{account_id}/oauth/refresh",
+            post(refresh_upstream_oauth),
         )
         .route("/internal/v1/model-routes", post(create_model_route))
         .route("/internal/v1/prices/{currency}/{model}", post(upsert_price))
@@ -162,6 +172,136 @@ async fn provider_types(
 }
 
 #[derive(Debug, Deserialize)]
+struct StartCursorOAuthRequest {
+    #[serde(default = "default_tenant")]
+    tenant_external_id: String,
+    account_name: String,
+    #[serde(default = "default_provider_driver")]
+    provider_driver: String,
+    provider_config: Value,
+    #[serde(default)]
+    endpoints: CursorOAuthEndpoints,
+}
+
+async fn start_cursor_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StartCursorOAuthRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state)?;
+    if !state.providers.contains(&body.provider_driver) {
+        return Err(AppError::BadRequest(format!(
+            "unknown provider driver: {}",
+            body.provider_driver
+        )));
+    }
+    Ok(Json(start_cursor_login(
+        StartCursorLogin {
+            tenant_external_id: body.tenant_external_id,
+            account_name: body.account_name,
+            provider_driver: body.provider_driver,
+            provider_config: body.provider_config,
+            endpoints: body.endpoints,
+        },
+        state.config.key_pepper.as_bytes(),
+        unix_millis(),
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct PollCursorOAuthRequest {
+    session_token: String,
+}
+
+async fn poll_cursor_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PollCursorOAuthRequest>,
+) -> Result<Response, AppError> {
+    require_service(&headers, &state)?;
+    match poll_cursor_login(
+        &state.http,
+        &body.session_token,
+        state.config.key_pepper.as_bytes(),
+        unix_millis(),
+    )
+    .await?
+    {
+        CursorPollResult::Pending {
+            retry_after_seconds,
+        } => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "pending",
+                "retry_after_seconds": retry_after_seconds
+            })),
+        )
+            .into_response()),
+        CursorPollResult::Ready(ready) => {
+            let ready = *ready;
+            let account = state
+                .db
+                .create_upstream_account(
+                    CreateUpstreamAccountInput {
+                        tenant_external_id: ready.tenant_external_id,
+                        name: ready.account_name,
+                        driver: ready.provider_driver,
+                        config: ready.provider_config,
+                        credential: ready.credential,
+                        oauth_session_id: Some(ready.session_id),
+                    },
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await?;
+            Ok((StatusCode::CREATED, Json(account)).into_response())
+        }
+    }
+}
+
+async fn refresh_upstream_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state)?;
+    let (account, credential) = state
+        .db
+        .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
+        .await?;
+    if account.auth_kind != "oauth" {
+        return Err(AppError::BadRequest(
+            "upstream account does not use OAuth".into(),
+        ));
+    }
+    let driver = account
+        .config
+        .pointer("/oauth/driver")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("upstream OAuth driver is missing".into()))?;
+    let refresh_url = account
+        .config
+        .pointer("/oauth/refresh_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("upstream OAuth refresh URL is missing".into()))?;
+    let refreshed = match driver {
+        "cursor" => {
+            refresh_cursor_credential(&state.http, refresh_url, &credential, unix_millis()).await?
+        }
+        _ => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported OAuth driver: {driver}"
+            )));
+        }
+    };
+    Ok(Json(
+        state
+            .db
+            .rotate_upstream_credential(account_id, refreshed, state.config.key_pepper.as_bytes())
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateUpstreamRequest {
     #[serde(default = "default_tenant")]
     tenant_external_id: String,
@@ -198,6 +338,7 @@ async fn create_upstream(
                 driver: body.driver,
                 config: body.config,
                 credential: body.credential,
+                oauth_session_id: None,
             },
             state.config.key_pepper.as_bytes(),
         )

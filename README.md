@@ -22,6 +22,7 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 - Anthropic：`/v1/messages`、`/v1/messages/count_tokens`。
 - Service：创建/轮换 key、设置同币种模型价格、幂等发放余额。
 - Provider：创建稳定上游账号、轮换 API/OAuth credential、建立公开模型到上游模型的路由。
+- OAuth：Cursor PKCE 登录、轮询完成和 refresh；登录状态是有时限的加密 token，可跨 K8s 副本重试。
 - Self-service：key 信息、请求列表/详情、聚合统计、逻辑会话簇/关系边。
 
 模型请求先按正文 token 上界与最大输出做余额预留，同时原子执行 RPM 限流；响应返回 usage 后结算实际费用并释放差额。daily、rolling-weekly 与 lifetime budget 均在调用上游前检查。
@@ -54,5 +55,7 @@ Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，�
 ## 配置与插件
 
 核心、key policy、provider 账号和模型路由的 JSON Schema 位于 `schemas/`。`GET /internal/v1/provider-types` 还会返回每种 provider 贡献的配置与 credential Schema，前端可直接交给 JSON Schema 表单渲染器。API key 与 OAuth 都是同一种稳定上游账号的 credential；轮换只推进 generation，请求历史继续引用同一个账号主键。credential 使用带认证加密后再写入数据库，并且管理 API 只返回脱敏元信息。
+
+Cursor 登录入口为 `/internal/v1/oauth/cursor/start` 与 `/internal/v1/oauth/cursor/poll`，刷新入口为 `/internal/v1/upstreams/{account_id}/oauth/refresh`。这里负责 PKCE、token 生命周期与稳定账号；Cursor 原生 Connect/Agent Runtime 到公开协议的转换仍应由专用 provider 插件完成，不能假装成无损 OpenAI 兼容。当前内置 `http-json` driver 可用于兼容上游或独立适配 sidecar。
 
 插件 ABI 位于 `wit/token-center.wit`；OCI 插件包格式和 capability 限制见 `plugins/README.md`。Helm Chart 位于 `charts/memeloop-token-center`，生产 values 只引用外部 PostgreSQL/S3 Secret，不把凭证写入 ConfigMap。

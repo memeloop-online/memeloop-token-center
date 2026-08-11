@@ -69,6 +69,7 @@ pub struct CreateUpstreamAccountInput {
     pub driver: String,
     pub config: serde_json::Value,
     pub credential: UpstreamCredential,
+    pub oauth_session_id: Option<Uuid>,
 }
 
 pub struct CreateModelRouteInput {
@@ -141,6 +142,30 @@ impl Database {
                 .await?;
             }
         }
+        let oauth_session_column_exists = match self.backend {
+            DatabaseBackend::PostgreSql => sqlx::query(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'upstream_accounts' AND column_name = 'oauth_session_id'",
+            )
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_some(),
+            DatabaseBackend::Sqlite => sqlx::query(
+                "SELECT name FROM pragma_table_info('upstream_accounts') WHERE name = 'oauth_session_id'",
+            )
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_some(),
+        };
+        if !oauth_session_column_exists {
+            sqlx::query("ALTER TABLE upstream_accounts ADD COLUMN oauth_session_id TEXT")
+                .execute(&mut *connection)
+                .await?;
+        }
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS upstream_accounts_oauth_session_idx ON upstream_accounts (oauth_session_id) WHERE oauth_session_id IS NOT NULL",
+        )
+        .execute(&mut *connection)
+        .await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SELECT pg_advisory_unlock(734627102948311)")
                 .execute(&mut *connection)
@@ -334,8 +359,20 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?
             .try_get("id")?;
+        if let Some(session_id) = input.oauth_session_id {
+            let existing = sqlx::query(
+                "SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.oauth_session_id = ?",
+            )
+            .bind(session_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(existing) = existing {
+                tx.commit().await?;
+                return upstream_account_view(existing);
+            }
+        }
         sqlx::query(
-            "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)",
+            "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, oauth_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?)",
         )
         .bind(account_id.to_string())
         .bind(&tenant_id)
@@ -343,6 +380,7 @@ impl Database {
         .bind(&input.driver)
         .bind(auth_kind)
         .bind(config_json)
+        .bind(input.oauth_session_id.map(|id| id.to_string()))
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -443,6 +481,23 @@ impl Database {
             created_at: row.try_get("created_at")?,
             updated_at: now,
         })
+    }
+
+    pub async fn upstream_account_with_credential(
+        &self,
+        account_id: Uuid,
+        key_material: &[u8],
+    ) -> Result<(UpstreamAccountView, UpstreamCredential), AppError> {
+        let row = sqlx::query(
+            "SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = ?",
+        )
+        .bind(account_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        let ciphertext: String = row.try_get("credential_ciphertext")?;
+        let credential = open_credential(&ciphertext, key_material)?;
+        Ok((upstream_account_view(row)?, credential))
     }
 
     pub async fn create_model_route(
@@ -1372,6 +1427,23 @@ fn aggregate_buckets(rows: Vec<sqlx::any::AnyRow>) -> Result<Vec<StatsBucket>, A
         .collect()
 }
 
+fn upstream_account_view(row: sqlx::any::AnyRow) -> Result<UpstreamAccountView, AppError> {
+    let config_json: String = row.try_get("config_json")?;
+    Ok(UpstreamAccountView {
+        id: parse_uuid(row.try_get("id")?)?,
+        tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+        name: row.try_get("name")?,
+        driver: row.try_get("driver")?,
+        auth_kind: row.try_get("auth_kind")?,
+        credential_generation: row.try_get("credential_generation")?,
+        status: row.try_get("status")?,
+        config: serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?,
+        credential_expires_at: row.try_get("expires_at")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn aggregate_bucket(row: sqlx::any::AnyRow, name: String) -> Result<StatsBucket, AppError> {
     Ok(StatsBucket {
         name,
@@ -1472,7 +1544,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS key_credentials (id TEXT PRIMARY KEY, key_id TEXT NOT NULL, generation BIGINT NOT NULL, secret_hash BYTEA NOT NULL, fingerprint TEXT NOT NULL, created_at BIGINT NOT NULL, revoked_at BIGINT, UNIQUE(key_id, generation))",
     "CREATE TABLE IF NOT EXISTS ledger_entries (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, key_id TEXT, kind TEXT NOT NULL, amount_micros BIGINT NOT NULL, currency TEXT NOT NULL, source TEXT NOT NULL, idempotency_key TEXT UNIQUE, created_at BIGINT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS model_prices (id TEXT PRIMARY KEY, model TEXT NOT NULL, currency TEXT NOT NULL, input_micros_per_million BIGINT NOT NULL, output_micros_per_million BIGINT NOT NULL, source TEXT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(model, currency))",
-    "CREATE TABLE IF NOT EXISTS upstream_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, driver TEXT NOT NULL, auth_kind TEXT NOT NULL, config_json TEXT NOT NULL, status TEXT NOT NULL, credential_generation BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, name))",
+    "CREATE TABLE IF NOT EXISTS upstream_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, driver TEXT NOT NULL, auth_kind TEXT NOT NULL, config_json TEXT NOT NULL, status TEXT NOT NULL, credential_generation BIGINT NOT NULL, oauth_session_id TEXT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, name))",
     "CREATE TABLE IF NOT EXISTS upstream_credentials (id TEXT PRIMARY KEY, upstream_account_id TEXT NOT NULL, generation BIGINT NOT NULL, credential_ciphertext TEXT NOT NULL, expires_at BIGINT, created_at BIGINT NOT NULL, revoked_at BIGINT, UNIQUE(upstream_account_id, generation))",
     "CREATE TABLE IF NOT EXISTS model_routes (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, public_model TEXT NOT NULL, upstream_account_id TEXT NOT NULL, upstream_model TEXT NOT NULL, protocol TEXT NOT NULL, priority BIGINT NOT NULL, enabled BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, public_model, protocol, priority))",
     "CREATE TABLE IF NOT EXISTS usage_reservations (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, key_id TEXT NOT NULL, price_id TEXT NOT NULL, reserved_micros BIGINT NOT NULL, reserved_tokens BIGINT NOT NULL, rate_window_start BIGINT NOT NULL, actual_micros BIGINT, status TEXT NOT NULL, created_at BIGINT NOT NULL, settled_at BIGINT)",
@@ -1542,6 +1614,12 @@ mod tests {
         .execute(&database.pool)
         .await
         .unwrap();
+        sqlx::query(
+            "CREATE TABLE upstream_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, driver TEXT NOT NULL, auth_kind TEXT NOT NULL, config_json TEXT NOT NULL, status TEXT NOT NULL, credential_generation BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, name))",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
 
         database.migrate().await.unwrap();
 
@@ -1555,5 +1633,13 @@ mod tests {
                     .is_some();
             assert!(present, "missing upgraded column {column}");
         }
+        let oauth_session_present = sqlx::query(
+            "SELECT name FROM pragma_table_info('upstream_accounts') WHERE name = 'oauth_session_id'",
+        )
+        .fetch_optional(&database.pool)
+        .await
+        .unwrap()
+        .is_some();
+        assert!(oauth_session_present);
     }
 }

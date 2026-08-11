@@ -20,6 +20,16 @@
           "minimum": 1,
           "maximum": 600,
           "default": 120
+        },
+        "oauth": {
+          "type": "object",
+          "readOnly": true,
+          "additionalProperties": false,
+          "required": ["driver", "refresh_url"],
+          "properties": {
+            "driver": { "type": "string" },
+            "refresh_url": { "type": "string", "format": "uri" }
+          }
         }
       }
     },

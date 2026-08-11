@@ -61,3 +61,18 @@ Feature: Stable key identity and read-only self-service statistics
     And the client calls model "oauth-public"
     Then the response status is 200
     And the OAuth upstream account retains its stable id and uses generation 2
+
+  Scenario: Cursor PKCE login and refresh create a routable OAuth account
+    Given a token center backed by SQLite and memory object storage
+    And the mock Cursor OAuth server and compatible upstream are ready
+    When the service starts a Cursor OAuth login
+    Then the Cursor login URL contains a PKCE challenge without exposing the verifier
+    When the service polls the completed Cursor OAuth login
+    And the service routes model "cursor-public" through the Cursor OAuth account
+    And the service creates a key for principal "cursor-user" allowing model "cursor-public"
+    And the client calls model "cursor-public"
+    Then the response status is 200
+    When the service refreshes the Cursor OAuth account
+    And the client calls model "cursor-public"
+    Then the response status is 200
+    And the refreshed Cursor account keeps its id and uses generation 2

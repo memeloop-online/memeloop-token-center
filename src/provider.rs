@@ -145,7 +145,17 @@ impl ProviderCatalog {
             "required": ["base_url"],
             "properties": {
                 "base_url": {"type": "string", "format": "uri"},
-                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "default": 120}
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "default": 120},
+                "oauth": {
+                    "type": "object",
+                    "readOnly": true,
+                    "additionalProperties": false,
+                    "required": ["driver", "refresh_url"],
+                    "properties": {
+                        "driver": {"type": "string"},
+                        "refresh_url": {"type": "string", "format": "uri"}
+                    }
+                }
             }
         });
         let credential_schema = json!({
@@ -267,7 +277,15 @@ pub fn seal_credential(
     credential: &UpstreamCredential,
     key_material: &[u8],
 ) -> Result<String, AppError> {
-    let plaintext = serde_json::to_vec(credential).map_err(|_| AppError::Internal)?;
+    seal_private_json(credential, key_material, ENVELOPE_AAD)
+}
+
+pub(crate) fn seal_private_json<T: Serialize>(
+    value: &T,
+    key_material: &[u8],
+    aad: &[u8],
+) -> Result<String, AppError> {
+    let plaintext = serde_json::to_vec(value).map_err(|_| AppError::Internal)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&encryption_key(key_material))
         .map_err(|_| AppError::Internal)?;
     let mut nonce = [0_u8; 12];
@@ -277,7 +295,7 @@ pub fn seal_credential(
             (&nonce).into(),
             Payload {
                 msg: &plaintext,
-                aad: ENVELOPE_AAD,
+                aad,
             },
         )
         .map_err(|_| AppError::Internal)?;
@@ -292,6 +310,14 @@ pub fn open_credential(
     envelope: &str,
     key_material: &[u8],
 ) -> Result<UpstreamCredential, AppError> {
+    open_private_json(envelope, key_material, ENVELOPE_AAD)
+}
+
+pub(crate) fn open_private_json<T: for<'de> Deserialize<'de>>(
+    envelope: &str,
+    key_material: &[u8],
+    aad: &[u8],
+) -> Result<T, AppError> {
     let mut parts = envelope.split('.');
     let version = parts.next();
     let nonce = parts.next();
@@ -313,7 +339,7 @@ pub fn open_credential(
             (&nonce).into(),
             Payload {
                 msg: &ciphertext,
-                aad: ENVELOPE_AAD,
+                aad,
             },
         )
         .map_err(|_| AppError::Internal)?;

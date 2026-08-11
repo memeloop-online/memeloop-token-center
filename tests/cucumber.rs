@@ -24,6 +24,10 @@ struct TokenCenterWorld {
     stable_key_id: Option<Uuid>,
     oauth_upstream_id: Option<Uuid>,
     oauth_generation: i64,
+    cursor_session_token: String,
+    cursor_login_url: String,
+    cursor_account_id: Option<Uuid>,
+    cursor_generation: i64,
     status: Option<StatusCode>,
     response: Value,
 }
@@ -41,6 +45,10 @@ impl Default for TokenCenterWorld {
             stable_key_id: None,
             oauth_upstream_id: None,
             oauth_generation: 0,
+            cursor_session_token: String::new(),
+            cursor_login_url: String::new(),
+            cursor_account_id: None,
+            cursor_generation: 0,
             status: None,
             response: Value::Null,
         }
@@ -346,6 +354,181 @@ async fn oauth_upstream_retains_id(world: &mut TokenCenterWorld) {
             .get("authorization")
             .and_then(|value| value.to_str().ok())
             == Some("Bearer oauth-access-2")
+    }));
+}
+
+#[given("the mock Cursor OAuth server and compatible upstream are ready")]
+async fn mock_cursor_oauth(world: &mut TokenCenterWorld) {
+    Mock::given(method("GET"))
+        .and(path("/cursor/auth/poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "accessToken": "cursor-access-1",
+            "refreshToken": "cursor-refresh-1"
+        })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/cursor/auth/exchange_user_api_key"))
+        .and(header("authorization", "Bearer cursor-refresh-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "accessToken": "cursor-access-2"
+        })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    for access_token in ["cursor-access-1", "cursor-access-2"] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header(
+                "authorization",
+                format!("Bearer {access_token}").as_str(),
+            ))
+            .and(body_partial_json(json!({"model": "cursor-upstream"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": format!("chatcmpl-{access_token}"),
+                "choices": [{"message": {"role": "assistant", "content": "cursor"}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2}
+            })))
+            .mount(world.mock.as_ref().expect("mock server"))
+            .await;
+    }
+}
+
+#[when("the service starts a Cursor OAuth login")]
+async fn start_cursor_oauth(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/oauth/cursor/start",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "account_name": "cursor-oauth",
+            "provider_driver": "http-json",
+            "provider_config": {"base_url": mock_url},
+            "endpoints": {
+                "login_url": format!("{mock_url}/cursor/loginDeepControl"),
+                "poll_url": format!("{mock_url}/cursor/auth/poll"),
+                "refresh_url": format!("{mock_url}/cursor/auth/exchange_user_api_key")
+            }
+        }))
+        .send()
+        .await
+        .expect("start Cursor OAuth");
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = response.json().await.expect("Cursor OAuth start JSON");
+    world.cursor_login_url = value["login_url"]
+        .as_str()
+        .expect("Cursor login URL")
+        .to_owned();
+    world.cursor_session_token = value["session_token"]
+        .as_str()
+        .expect("Cursor session token")
+        .to_owned();
+}
+
+#[then("the Cursor login URL contains a PKCE challenge without exposing the verifier")]
+async fn cursor_login_contains_pkce(world: &mut TokenCenterWorld) {
+    let login_url = url::Url::parse(&world.cursor_login_url).expect("valid Cursor login URL");
+    let query = login_url
+        .query_pairs()
+        .collect::<std::collections::HashMap<_, _>>();
+    assert!(query.contains_key("challenge"));
+    assert!(query.contains_key("uuid"));
+    assert!(!query.contains_key("verifier"));
+    assert!(!world.cursor_session_token.contains("cursor-oauth"));
+}
+
+#[when("the service polls the completed Cursor OAuth login")]
+async fn poll_cursor_oauth(world: &mut TokenCenterWorld) {
+    let poll = || {
+        world
+            .client
+            .post(format!(
+                "{}/internal/v1/oauth/cursor/poll",
+                world.service_url
+            ))
+            .bearer_auth("test-service-token")
+            .json(&json!({"session_token": world.cursor_session_token}))
+            .send()
+    };
+    let response = poll().await.expect("poll Cursor OAuth");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let value: Value = response.json().await.expect("Cursor account JSON");
+    assert_eq!(value["auth_kind"], "oauth");
+    assert!(value.get("credential").is_none());
+    world.cursor_account_id = Some(
+        Uuid::from_str(value["id"].as_str().expect("Cursor account id"))
+            .expect("Cursor account UUID"),
+    );
+    world.cursor_generation = value["credential_generation"]
+        .as_i64()
+        .expect("Cursor generation");
+    let retry = poll().await.expect("retry completed Cursor OAuth poll");
+    assert_eq!(retry.status(), StatusCode::CREATED);
+    let retry_value: Value = retry.json().await.expect("retried Cursor account JSON");
+    assert_eq!(
+        retry_value["id"],
+        world
+            .cursor_account_id
+            .expect("Cursor account id")
+            .to_string()
+    );
+}
+
+#[when(expr = "the service routes model {string} through the Cursor OAuth account")]
+async fn route_cursor_model(world: &mut TokenCenterWorld, model: String) {
+    create_route(
+        world,
+        &model,
+        &world
+            .cursor_account_id
+            .expect("Cursor account id")
+            .to_string(),
+        "cursor-upstream",
+    )
+    .await;
+}
+
+#[when("the service refreshes the Cursor OAuth account")]
+async fn refresh_cursor_oauth(world: &mut TokenCenterWorld) {
+    let account_id = world.cursor_account_id.expect("Cursor account id");
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/upstreams/{account_id}/oauth/refresh",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("refresh Cursor OAuth");
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = response.json().await.expect("refreshed Cursor account");
+    assert_eq!(value["id"], account_id.to_string());
+    world.cursor_generation = value["credential_generation"]
+        .as_i64()
+        .expect("refreshed generation");
+}
+
+#[then("the refreshed Cursor account keeps its id and uses generation 2")]
+async fn refreshed_cursor_account_is_stable(world: &mut TokenCenterWorld) {
+    assert!(world.cursor_account_id.is_some());
+    assert_eq!(world.cursor_generation, 2);
+    let requests = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("received requests");
+    assert!(requests.iter().any(|request| {
+        request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer cursor-access-2")
     }));
 }
 
