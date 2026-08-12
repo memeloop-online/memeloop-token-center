@@ -1,12 +1,12 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::Read,
     path::{Component as PathComponent, Path, PathBuf},
     sync::Arc,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use wasmtime::component::{Component, HasSelf, Linker};
@@ -73,7 +73,8 @@ pub struct TrafficDecision {
 #[derive(Clone, Default)]
 pub struct PluginRuntime {
     engine: Option<Engine>,
-    http: Option<reqwest::blocking::Client>,
+    http: Option<reqwest::Client>,
+    runtime: Option<tokio::runtime::Handle>,
     kv: Option<PluginKv>,
     plugins: Arc<Vec<LoadedPlugin>>,
     providers: Arc<Vec<ProviderType>>,
@@ -82,13 +83,13 @@ pub struct PluginRuntime {
 #[derive(Clone)]
 struct PluginKv {
     database: Database,
-    runtime: tokio::runtime::Handle,
 }
 
 struct HostState {
     plugin_id: String,
     capabilities: Vec<PluginCapability>,
-    http: reqwest::blocking::Client,
+    http: reqwest::Client,
+    runtime: tokio::runtime::Handle,
     kv: Option<PluginKv>,
     limits: StoreLimits,
 }
@@ -111,29 +112,35 @@ impl PluginRuntime {
         engine_config.consume_fuel(true);
         let engine = Engine::new(&engine_config)
             .map_err(|error| AppError::Storage(format!("initialize plugin runtime: {error}")))?;
-        let http = reqwest::blocking::Client::builder()
+        let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| AppError::Storage(format!("initialize plugin HTTP: {error}")))?;
-        let mut directories = fs::read_dir(root)
+        let entries = fs::read_dir(root)
             .map_err(|error| AppError::Storage(error.to_string()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| AppError::Storage(error.to_string()))?;
-        directories.sort_by_key(fs::DirEntry::file_name);
-
-        let mut plugins = Vec::new();
-        let mut providers = Vec::new();
-        for directory in directories {
-            if !directory
+        let mut directories = Vec::new();
+        for entry in entries {
+            if entry
                 .file_type()
                 .map_err(|error| AppError::Storage(error.to_string()))?
                 .is_dir()
             {
-                continue;
+                directories.push(entry.path());
             }
-            let manifest_path = directory.path().join("plugin.json");
+        }
+        directories.sort();
+        if root.join("plugin.json").is_file() {
+            directories.insert(0, root.to_path_buf());
+        }
+
+        let mut plugins = Vec::new();
+        let mut providers = Vec::new();
+        for directory in directories {
+            let manifest_path = directory.join("plugin.json");
             if !manifest_path.is_file() {
                 continue;
             }
@@ -162,7 +169,7 @@ impl PluginRuntime {
                 .wasm
                 .as_deref()
                 .map(|wasm| {
-                    let wasm_path = safe_child(&directory.path(), wasm)?;
+                    let wasm_path = safe_child(&directory, wasm)?;
                     Component::from_file(&engine, &wasm_path).map_err(|error| {
                         AppError::BadRequest(format!("compile {}: {error}", wasm_path.display()))
                     })
@@ -177,10 +184,8 @@ impl PluginRuntime {
         Ok(Self {
             engine: Some(engine),
             http: Some(http),
-            kv: Some(PluginKv {
-                database,
-                runtime: tokio::runtime::Handle::current(),
-            }),
+            runtime: Some(tokio::runtime::Handle::current()),
+            kv: Some(PluginKv { database }),
             plugins: Arc::new(plugins),
             providers: Arc::new(providers),
         })
@@ -209,6 +214,7 @@ impl PluginRuntime {
             });
         };
         let http = self.http.as_ref().ok_or(AppError::Internal)?;
+        let runtime = self.runtime.as_ref().ok_or(AppError::Internal)?;
         let mut current = request_json.clone();
         let mut decision = TrafficDecision {
             allow: true,
@@ -236,6 +242,7 @@ impl PluginRuntime {
                     plugin_id: plugin.manifest.id.clone(),
                     capabilities: plugin.manifest.capabilities.clone(),
                     http: http.clone(),
+                    runtime: runtime.clone(),
                     kv: self.kv.clone(),
                     limits,
                 },
@@ -306,7 +313,7 @@ impl memeloop::token_center::host::Host for HostState {
             .kv
             .as_ref()
             .ok_or_else(|| "plugin KV runtime is unavailable".to_owned())?;
-        kv.runtime
+        self.runtime
             .block_on(kv.database.plugin_kv_get(&self.plugin_id, &key))
             .map_err(|error| error.to_string())
     }
@@ -323,7 +330,7 @@ impl memeloop::token_center::host::Host for HostState {
             .kv
             .as_ref()
             .ok_or_else(|| "plugin KV runtime is unavailable".to_owned())?;
-        kv.runtime
+        self.runtime
             .block_on(kv.database.plugin_kv_put(&self.plugin_id, &key, &value))
             .map_err(|error| error.to_string())
     }
@@ -368,27 +375,30 @@ impl memeloop::token_center::host::Host for HostState {
                 .map_err(|_| "plugin HTTP header value is invalid".to_owned())?;
             request = request.header(name, value);
         }
-        let mut response = request.send().map_err(|error| error.to_string())?;
-        let status = response.status().as_u16();
-        let response_headers = response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (name.to_string(), value.to_owned()))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut response_body = Vec::new();
-        response
-            .by_ref()
-            .take((PLUGIN_HTTP_BODY_BYTES + 1) as u64)
-            .read_to_end(&mut response_body)
-            .map_err(|error| error.to_string())?;
-        if response_body.len() > PLUGIN_HTTP_BODY_BYTES {
-            return Err("plugin HTTP response exceeds 16 MiB".to_owned());
-        }
+        let (status, response_headers, response_body) = self.runtime.block_on(async move {
+            let response = request.send().await.map_err(|error| error.to_string())?;
+            let status = response.status().as_u16();
+            let response_headers = response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.to_string(), value.to_owned()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut response_body = Vec::new();
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|error| error.to_string())?;
+                if response_body.len().saturating_add(chunk.len()) > PLUGIN_HTTP_BODY_BYTES {
+                    return Err("plugin HTTP response exceeds 16 MiB".to_owned());
+                }
+                response_body.extend_from_slice(&chunk);
+            }
+            Ok::<_, String>((status, response_headers, response_body))
+        })?;
         serde_json::to_vec(&serde_json::json!({
             "status": status,
             "headers": response_headers,
@@ -565,5 +575,47 @@ mod tests {
         let mut invalid = manifest;
         invalid.contributions.traffic_policy = true;
         assert!(validate_manifest(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn config_map_style_root_manifest_is_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("plugin.db").display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        fs::write(
+            directory.path().join("plugin.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "config-map-provider",
+                "version": "1.0.0",
+                "wit_version": "0.1.0",
+                "wasm": null,
+                "contributions": {
+                    "providers": [{
+                        "id": "config-map-http",
+                        "display_name": "ConfigMap HTTP",
+                        "protocols": ["openai"],
+                        "modalities": ["text"],
+                        "config_schema": {"type": "object"},
+                        "credential_schema": {"type": "object"}
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let runtime = PluginRuntime::load(directory.path().to_str(), database).unwrap();
+        assert_eq!(runtime.manifests().len(), 1);
+        assert_eq!(runtime.provider_types()[0].id, "config-map-http");
+        assert_eq!(
+            runtime.provider_types()[0].source,
+            "plugin:config-map-provider@1.0.0"
+        );
+        drop(runtime);
     }
 }
