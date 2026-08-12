@@ -31,7 +31,7 @@ pub struct PluginManifest {
     pub version: String,
     pub wit_version: String,
     #[serde(default = "default_wasm_file")]
-    pub wasm: String,
+    pub wasm: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<PluginCapability>,
     #[serde(default)]
@@ -58,7 +58,7 @@ pub enum PluginCapability {
 #[derive(Clone)]
 struct LoadedPlugin {
     manifest: PluginManifest,
-    component: Component,
+    component: Option<Component>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -158,10 +158,16 @@ impl PluginRuntime {
                 provider.source = format!("plugin:{}@{}", manifest.id, manifest.version);
                 providers.push(provider);
             }
-            let wasm_path = safe_child(&directory.path(), &manifest.wasm)?;
-            let component = Component::from_file(&engine, &wasm_path).map_err(|error| {
-                AppError::BadRequest(format!("compile {}: {error}", wasm_path.display()))
-            })?;
+            let component = manifest
+                .wasm
+                .as_deref()
+                .map(|wasm| {
+                    let wasm_path = safe_child(&directory.path(), wasm)?;
+                    Component::from_file(&engine, &wasm_path).map_err(|error| {
+                        AppError::BadRequest(format!("compile {}: {error}", wasm_path.display()))
+                    })
+                })
+                .transpose()?;
             plugins.push(LoadedPlugin {
                 manifest,
                 component,
@@ -213,6 +219,12 @@ impl PluginRuntime {
             .iter()
             .filter(|plugin| plugin.manifest.contributions.traffic_policy)
         {
+            let component = plugin.component.as_ref().ok_or_else(|| {
+                AppError::Storage(format!(
+                    "plugin {} contributes a traffic policy without a component",
+                    plugin.manifest.id
+                ))
+            })?;
             let limits = StoreLimitsBuilder::new()
                 .memory_size(PLUGIN_MEMORY_BYTES)
                 .instances(1)
@@ -235,7 +247,7 @@ impl PluginRuntime {
             let mut linker = Linker::new(engine);
             Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
                 .map_err(|error| AppError::Storage(error.to_string()))?;
-            let bindings = Plugin::instantiate(&mut store, &plugin.component, &linker)
+            let bindings = Plugin::instantiate(&mut store, component, &linker)
                 .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
             let request = serde_json::to_string(&current).map_err(|_| AppError::Internal)?;
             let result = bindings
@@ -405,6 +417,12 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
             manifest.id
         )));
     }
+    if manifest.contributions.traffic_policy && manifest.wasm.is_none() {
+        return Err(AppError::BadRequest(format!(
+            "plugin {} needs a component for its traffic policy",
+            manifest.id
+        )));
+    }
     for capability in &manifest.capabilities {
         if let PluginCapability::Http { allowed_origins } = capability {
             if allowed_origins.is_empty() {
@@ -480,8 +498,8 @@ fn safe_child(root: &Path, child: &str) -> Result<PathBuf, AppError> {
     Ok(root.join(child))
 }
 
-fn default_wasm_file() -> String {
-    "plugin.wasm".to_owned()
+fn default_wasm_file() -> Option<String> {
+    Some("plugin.wasm".to_owned())
 }
 
 fn plugin_failure(plugin_id: &str, error: wasmtime::Error) -> AppError {
@@ -508,7 +526,7 @@ mod tests {
             id: "test-plugin".to_owned(),
             version: "1.0.0".to_owned(),
             wit_version: "0.1.0".to_owned(),
-            wasm: "plugin.wasm".to_owned(),
+            wasm: Some("plugin.wasm".to_owned()),
             capabilities: vec![PluginCapability::Http {
                 allowed_origins: vec!["https://example.com/oauth/token".to_owned()],
             }],
@@ -516,5 +534,36 @@ mod tests {
         };
 
         assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_only_oauth_provider_does_not_require_wasm() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "example-oauth",
+            "version": "1.0.0",
+            "wit_version": "0.1.0",
+            "wasm": null,
+            "contributions": {
+                "providers": [{
+                    "id": "example-provider",
+                    "display_name": "Example provider",
+                    "protocols": ["openai"],
+                    "modalities": ["text"],
+                    "config_schema": {"type": "object"},
+                    "credential_schema": {"type": "object"},
+                    "oauth_adapter": {
+                        "login_url": "http://example-oauth.default.svc/login",
+                        "poll_url": "http://example-oauth.default.svc/poll",
+                        "refresh_url": "http://example-oauth.default.svc/refresh"
+                    }
+                }]
+            }
+        }))
+        .unwrap();
+        assert!(validate_manifest(&manifest).is_ok());
+
+        let mut invalid = manifest;
+        invalid.contributions.traffic_policy = true;
+        assert!(validate_manifest(&invalid).is_err());
     }
 }

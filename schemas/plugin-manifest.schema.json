@@ -9,7 +9,11 @@
     "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
     "version": { "type": "string", "minLength": 1 },
     "wit_version": { "const": "0.1.0" },
-    "wasm": { "type": "string", "default": "plugin.wasm" },
+    "wasm": {
+      "type": ["string", "null"],
+      "default": "plugin.wasm",
+      "description": "Set null for a manifest-only provider contribution."
+    },
     "capabilities": {
       "type": "array",
       "uniqueItems": true,

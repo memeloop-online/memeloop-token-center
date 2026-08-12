@@ -2,9 +2,9 @@
 
 Token Center 插件是固定 digest 的 OCI artifact。解包后的每个插件各占一个目录，至少包含：
 
-- `plugin.wasm`：实现 `wit/token-center.wit` 的 Component Model 组件。
 - `plugin.json`：插件 id、版本、WIT API 版本、扩展点、capability allowlist 和 JSON Schema provider contribution。
 - `README.md`：使用说明。
+- 可选 `plugin.wasm`：实现 `wit/token-center.wit` 的 Component Model 组件；纯 Provider/OAuth Schema contribution 可设 `"wasm": null`，traffic policy 则必须提供组件。
 - 可选 `icon.png` 与配置 JSON Schema。
 
 设置 `MTC_PLUGIN_DIR` 后，服务会在启动时编译目录下的组件；同名 provider 或不兼容的 `wit_version` 会让启动失败。Helm 用 `plugins.existingConfigMap` 或 `plugins.existingClaim` 只读挂载该目录。
