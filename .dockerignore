@@ -1,0 +1,10 @@
+.git
+.github
+.forgejo
+target
+web/node_modules
+web/dist
+*.log
+.env*
+compose.yaml
+

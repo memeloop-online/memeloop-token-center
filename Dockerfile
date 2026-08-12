@@ -1,23 +1,36 @@
 # syntax=docker/dockerfile:1.7
-FROM node:24-bookworm-slim AS web-builder
+ARG NODE_IMAGE=node:24.18.0-bookworm-slim
+ARG RUST_IMAGE=rust:1.95.0-bookworm
+ARG RUNTIME_IMAGE=debian:bookworm-slim
+
+FROM ${NODE_IMAGE} AS web-builder
+ARG NPM_REGISTRY=https://registry.npmmirror.com
 WORKDIR /build/web
 COPY web/package.json web/package-lock.json ./
-RUN npm ci
+RUN npm config set registry "${NPM_REGISTRY}" && npm ci
 COPY web ./
 RUN npm run build
 
-FROM rust:1.95-bookworm AS builder
-RUN apt-get update \
+FROM ${RUST_IMAGE} AS builder
+ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian
+ARG CARGO_REGISTRY=sparse+https://rsproxy.cn/index/
+RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends cmake clang perl pkg-config \
     && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /usr/local/cargo \
+    && printf '[source.crates-io]\nreplace-with = "build-mirror"\n[source.build-mirror]\nregistry = "%s"\n' "${CARGO_REGISTRY}" \
+      > /usr/local/cargo/config.toml
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
 RUN cargo build --locked --release --bin memeloop-token-center
 
-FROM debian:bookworm-slim
-RUN apt-get update \
+FROM ${RUNTIME_IMAGE}
+ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian
+RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home token-center
