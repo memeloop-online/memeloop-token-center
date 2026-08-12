@@ -559,7 +559,7 @@ async fn import_cpa_accounts_twice(world: &mut TokenCenterWorld) {
         "bridge_secret": "bridge-import-secret",
         "auth_files": [
             {
-                "filename": "github-copilot-test.json",
+                "filename": "github-copilot-opaqueimporthandle123.json",
                 "document": {
                     "type": "subscription-bridge",
                     "upstream": "copilot",
@@ -568,7 +568,7 @@ async fn import_cpa_accounts_twice(world: &mut TokenCenterWorld) {
                 }
             },
             {
-                "filename": "codex-test.json",
+                "filename": "codex-codex-import-secret.json",
                 "document": {
                     "type": "codex",
                     "access_token": "codex-import-secret",

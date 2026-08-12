@@ -749,12 +749,12 @@ async fn import_cpa_subscription_accounts(
     let mut skipped = Vec::new();
     for auth_file in body.auth_files {
         validate_cpa_auth_filename(&auth_file.filename)?;
+        let source_fingerprint = cpa_source_fingerprint(&auth_file.filename);
         let serialized = serde_json::to_vec(&auth_file.document).map_err(|_| AppError::Internal)?;
         if serialized.len() > 1024 * 1024 {
-            return Err(AppError::BadRequest(format!(
-                "CPA auth document {} exceeds 1 MiB",
-                auth_file.filename
-            )));
+            return Err(AppError::BadRequest(
+                "CPA auth document exceeds 1 MiB".into(),
+            ));
         }
         match cpa_subscription_account(&auth_file.document)? {
             Some((provider, handle, label)) => {
@@ -786,14 +786,14 @@ async fn import_cpa_subscription_accounts(
                     )
                     .await?;
                 imported.push(json!({
-                    "filename": auth_file.filename,
+                    "source_fingerprint": source_fingerprint,
                     "provider": provider,
                     "label": label,
                     "account": account
                 }));
             }
             None => skipped.push(json!({
-                "filename": auth_file.filename,
+                "source_fingerprint": source_fingerprint,
                 "reason": "requires_provider_adapter"
             })),
         }
@@ -802,6 +802,14 @@ async fn import_cpa_subscription_accounts(
         StatusCode::CREATED,
         Json(json!({"imported": imported, "skipped": skipped})),
     ))
+}
+
+fn cpa_source_fingerprint(filename: &str) -> String {
+    let digest = Sha256::digest(filename.as_bytes());
+    format!(
+        "sha256:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7]
+    )
 }
 
 fn validate_cpa_auth_filename(filename: &str) -> Result<(), AppError> {
