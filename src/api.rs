@@ -49,6 +49,7 @@ use crate::{
 
 const REQUEST_ID_HEADER: &str = "x-mtc-request-id";
 const MAX_SUBSCRIPTION_BRIDGE_RESPONSE: usize = 16 * 1024 * 1024;
+const MAX_CPA_IMPORT_BODY: usize = 34 * 1024 * 1024;
 
 pub fn router(state: AppState) -> Router {
     router_for_role(state, RuntimeRole::All)
@@ -102,7 +103,8 @@ fn control_router() -> Router<AppState> {
         )
         .route(
             "/internal/v1/imports/cpa/subscription-accounts",
-            post(import_cpa_subscription_accounts),
+            post(import_cpa_subscription_accounts)
+                .layer(DefaultBodyLimit::max(MAX_CPA_IMPORT_BODY)),
         )
         .route("/internal/v1/requests", get(internal_requests))
         .route("/internal/v1/request-events", get(internal_request_events))
@@ -683,7 +685,11 @@ async fn import_cpa_subscription_accounts(
     let base_url = crate::provider::validate_config(&json!({
         "base_url": body.bridge_base_url
     }))?;
-    if body.bridge_secret.as_deref().is_some_and(str::is_empty) {
+    if body
+        .bridge_secret
+        .as_deref()
+        .is_some_and(|secret| secret.trim().is_empty())
+    {
         return Err(AppError::BadRequest("bridge_secret cannot be empty".into()));
     }
 

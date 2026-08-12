@@ -23,10 +23,14 @@ RUN mkdir -p /usr/local/cargo \
       > /usr/local/cargo/config.toml
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+    && printf 'pub fn dependency_cache_marker() {}\n' > src/lib.rs \
+    && printf 'fn main() {}\n' > src/main.rs \
+    && cargo build --locked --release --bin memeloop-token-center \
+    && rm -rf src
 COPY src ./src
 COPY migrations ./migrations
 COPY schemas ./schemas
-COPY tests ./tests
 COPY wit ./wit
 RUN cargo build --locked --release --bin memeloop-token-center \
     && cp target/release/memeloop-token-center /tmp/memeloop-token-center \
