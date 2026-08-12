@@ -23,7 +23,7 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 - OpenAI：`/v1/chat/completions`、`/v1/responses`、`/v1/embeddings`。
 - Anthropic：`/v1/messages`、`/v1/messages/count_tokens`。
 - 多模态生成：`/v1/generations`、`/v1/videos/generations`、`/v1/images/generations`；内置火山引擎 Seedance 视频任务与 ComfyUI 本地/Cloud 图片、视频工作流，统一执行模型权限、额度预留、限流、计费、轮询和 S3/CAS 归档。
-- Service：创建/轮换 key、设置同币种模型价格、幂等发放余额；可创建 tenant 绑定、scope 最小化的服务凭据供 memeloop web 使用。服务凭据也有稳定 UUID 与 generation，轮换后旧 token 立即失效。
+- Service：创建/轮换 key、更新模型/限流/预算 policy、设置同币种模型价格、幂等发放余额；可创建 tenant 绑定、scope 最小化的服务凭据供 memeloop web 使用。服务凭据也有稳定 UUID 与 generation，轮换后旧 token 立即失效。
 - Provider：创建稳定上游账号、轮换 API/OAuth credential、配置无需认证的私有 ComfyUI、建立公开模型到上游模型的路由。
 - OAuth：原生接入 CPA Subscription Bridge 的 GitHub Copilot/Cursor 订阅登录、opaque handle 推理，以及 Cursor 直接 PKCE/refresh；登录状态是有时限的加密 token，可跨 K8s 副本重试。
 - Self-service：key 信息、请求列表/详情、聚合统计、逻辑会话簇/关系边。
@@ -46,6 +46,8 @@ cargo run -- serve
 ```
 
 服务端管理 API 使用 `MTC_SERVICE_TOKEN`；下游模型 API 和 `/self/v1/*` 使用生成的 `mtc_...` key。用户 key 只能调用被授权模型以及读取该稳定 key 身份对应的请求和统计，不能创建 key、发放余额或修改策略。
+
+`POST /internal/v1/keys` 接受可选 `Idempotency-Key`。同一键和同一规范化请求会在 24 小时内重放同一个稳定 key 响应；换请求体复用会被拒绝。响应缓存使用独立 AAD 的认证加密，worker 到期清除。`PUT /internal/v1/keys/{key_id}/policy` 可由 tenant-scoped `keys:write` 服务凭据幂等更新权限与限流，而不改变 key 身份或历史。
 
 ## 测试
 

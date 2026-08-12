@@ -1,6 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rust_decimal::{Decimal, prelude::ToPrimitive};
+use sha2::{Digest, Sha256};
 use sqlx::{
     AnyPool, Row,
     any::{AnyPoolOptions, AnyQueryResult, AnyRow},
@@ -20,9 +21,11 @@ use crate::{
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
-        seal_credential, validate_config,
+        open_private_json, seal_credential, seal_private_json, validate_config,
     },
 };
+
+const KEY_PROVISIONING_AAD: &[u8] = b"memeloop-token-center/key-provisioning-response/v1";
 
 #[derive(Clone)]
 pub struct Database {
@@ -43,6 +46,7 @@ pub struct CreateKeyInput {
     pub currency: String,
     pub policy: KeyPolicy,
     pub initial_balance: Decimal,
+    pub idempotency_key: Option<String>,
 }
 
 pub struct CreateServiceTokenInput {
@@ -225,6 +229,35 @@ impl Database {
     ) -> Result<IssuedKey, AppError> {
         validate_currency(&input.currency)?;
         validate_policy_budgets(&input.policy)?;
+        let idempotency_key = input
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if input.idempotency_key.is_some() && idempotency_key.is_none() {
+            return Err(AppError::BadRequest(
+                "Idempotency-Key cannot be empty".into(),
+            ));
+        }
+        if idempotency_key.is_some_and(|value| {
+            value.len() > 200 || !value.bytes().all(|byte| byte.is_ascii_graphic())
+        }) {
+            return Err(AppError::BadRequest(
+                "Idempotency-Key must be at most 200 visible ASCII characters".into(),
+            ));
+        }
+        let provisioning_request_hash = idempotency_key.map(|_| {
+            let canonical = serde_json::to_vec(&serde_json::json!({
+                "tenant_external_id": input.tenant_external_id.trim(),
+                "principal_external_id": input.principal_external_id.trim(),
+                "alias": input.alias.trim(),
+                "currency": input.currency.to_uppercase(),
+                "policy": input.policy,
+                "initial_balance": input.initial_balance.normalize().to_string()
+            }))
+            .expect("key provisioning request is JSON serializable");
+            format!("{:x}", Sha256::digest(canonical))
+        });
         let now = unix_millis();
         let tenant_id = Uuid::now_v7();
         let principal_id = Uuid::now_v7();
@@ -234,6 +267,43 @@ impl Database {
         let policy_json = serde_json::to_string(&input.policy).map_err(|_| AppError::Internal)?;
         let initial_balance_micros = decimal_to_micros(input.initial_balance)?;
         let mut tx = self.pool.begin().await?;
+
+        if let Some(idempotency_key) = idempotency_key {
+            if matches!(self.backend, DatabaseBackend::PostgreSql) {
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(?, 734627102948312))")
+                    .bind(idempotency_key)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            let existing = sqlx::query(
+                "SELECT provisioning_request_hash, issued_key_ciphertext FROM key_records WHERE provisioning_idempotency_key = ?",
+            )
+            .bind(idempotency_key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(existing) = existing {
+                let existing_hash: Option<String> =
+                    existing.try_get("provisioning_request_hash")?;
+                if existing_hash.as_deref() != provisioning_request_hash.as_deref() {
+                    return Err(AppError::BadRequest(
+                        "Idempotency-Key was already used with a different key request".into(),
+                    ));
+                }
+                let ciphertext: Option<String> = existing.try_get("issued_key_ciphertext")?;
+                let issued = open_private_json(
+                    ciphertext.as_deref().ok_or_else(|| {
+                        AppError::BadRequest(
+                            "idempotent key provisioning response is no longer available; rotate the key"
+                                .into(),
+                        )
+                    })?,
+                    pepper,
+                    KEY_PROVISIONING_AAD,
+                )?;
+                tx.commit().await?;
+                return Ok(issued);
+            }
+        }
 
         sqlx::query(
             "INSERT INTO tenants (id, external_id, created_at) VALUES (?, ?, ?) ON CONFLICT(external_id) DO NOTHING",
@@ -279,8 +349,20 @@ impl Database {
         .execute(&mut *tx)
         .await?;
 
+        let issued_key = IssuedKey {
+            key_id,
+            account_id,
+            alias: input.alias.clone(),
+            currency: input.currency.to_uppercase(),
+            credential_generation: 1,
+            key: issued.secret.clone(),
+            fingerprint: issued.fingerprint.clone(),
+        };
+        let issued_key_ciphertext = idempotency_key
+            .map(|_| seal_private_json(&issued_key, pepper, KEY_PROVISIONING_AAD))
+            .transpose()?;
         sqlx::query(
-            "INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)",
+            "INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, provisioning_idempotency_key, provisioning_request_hash, issued_key_ciphertext, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, ?)",
         )
         .bind(key_id.to_string())
         .bind(&tenant_id)
@@ -289,6 +371,9 @@ impl Database {
         .bind(&input.alias)
         .bind(input.currency.to_uppercase())
         .bind(policy_json)
+        .bind(idempotency_key)
+        .bind(provisioning_request_hash)
+        .bind(issued_key_ciphertext)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -310,15 +395,7 @@ impl Database {
         }
 
         tx.commit().await?;
-        Ok(IssuedKey {
-            key_id,
-            account_id,
-            alias: input.alias,
-            currency: input.currency.to_uppercase(),
-            credential_generation: 1,
-            key: issued.secret,
-            fingerprint: issued.fingerprint,
-        })
+        Ok(issued_key)
     }
 
     pub async fn create_service_token(
@@ -363,6 +440,27 @@ impl Database {
             scopes: input.scopes,
             tenant_external_id: input.tenant_external_id,
         })
+    }
+
+    pub async fn update_key_policy(
+        &self,
+        key_id: Uuid,
+        policy: KeyPolicy,
+    ) -> Result<KeyPolicy, AppError> {
+        validate_policy_budgets(&policy)?;
+        let policy_json = serde_json::to_string(&policy).map_err(|_| AppError::Internal)?;
+        let result = sqlx::query(
+            "UPDATE key_records SET policy_json = ?, updated_at = ? WHERE id = ? AND status = 'active'",
+        )
+        .bind(policy_json)
+        .bind(unix_millis())
+        .bind(key_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+        Ok(policy)
     }
 
     pub async fn rotate_service_token(
@@ -1522,6 +1620,18 @@ impl Database {
         Ok(released)
     }
 
+    pub async fn expire_key_provisioning_responses(&self, limit: i64) -> Result<u64, AppError> {
+        let cutoff = unix_millis().saturating_sub(24 * 60 * 60 * 1_000);
+        let result = sqlx::query(
+            "UPDATE key_records SET issued_key_ciphertext = NULL WHERE id IN (SELECT id FROM key_records WHERE issued_key_ciphertext IS NOT NULL AND created_at < ? ORDER BY created_at, id LIMIT ?)",
+        )
+        .bind(cutoff)
+        .bind(limit.clamp(1, 10_000))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn grant(
         &self,
         account_id: Uuid,
@@ -2359,6 +2469,11 @@ const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "asynchronous generation jobs",
         sql: include_str!("../migrations/sqlite/0005_generation_jobs.sql"),
     },
+    Migration {
+        version: 6,
+        name: "idempotent key provisioning",
+        sql: include_str!("../migrations/sqlite/0006_key_provisioning.sql"),
+    },
 ];
 
 const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -2386,6 +2501,11 @@ const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "asynchronous generation jobs",
         sql: include_str!("../migrations/postgres/0005_generation_jobs.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "idempotent key provisioning",
+        sql: include_str!("../migrations/postgres/0006_key_provisioning.sql"),
     },
 ];
 
@@ -2518,6 +2638,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_provisioning_replays_one_encrypted_response_for_an_idempotency_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("key-idempotency.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"a downstream key pepper longer than thirty-two bytes";
+        let request = |alias: &str| CreateKeyInput {
+            tenant_external_id: "tenant".to_owned(),
+            principal_external_id: "member".to_owned(),
+            alias: alias.to_owned(),
+            currency: "USD".to_owned(),
+            policy: KeyPolicy::default(),
+            initial_balance: Decimal::ONE,
+            idempotency_key: Some("registration-event-1".to_owned()),
+        };
+
+        let first = database
+            .create_key(request("primary"), pepper)
+            .await
+            .unwrap();
+        let replay = database
+            .create_key(request("primary"), pepper)
+            .await
+            .unwrap();
+        assert_eq!(replay.key_id, first.key_id);
+        assert_eq!(replay.account_id, first.account_id);
+        assert_eq!(replay.key, first.key);
+        assert!(matches!(
+            database.create_key(request("different"), pepper).await,
+            Err(AppError::BadRequest(_))
+        ));
+
+        let count: i64 = sqlx::query("SELECT COUNT(*) AS count FROM key_records")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap()
+            .try_get("count")
+            .unwrap();
+        assert_eq!(count, 1);
+        let ciphertext: String =
+            sqlx::query("SELECT issued_key_ciphertext FROM key_records WHERE id = ?")
+                .bind(first.key_id.to_string())
+                .fetch_one(&database.pool)
+                .await
+                .unwrap()
+                .try_get("issued_key_ciphertext")
+                .unwrap();
+        assert!(!ciphertext.contains(&first.key));
+    }
+
+    #[tokio::test]
     async fn maintenance_releases_old_unlinked_reservations() {
         let directory = tempfile::tempdir().unwrap();
         let database_url = format!(
@@ -2536,6 +2710,7 @@ mod tests {
                     currency: "USD".to_owned(),
                     policy: KeyPolicy::default(),
                     initial_balance: Decimal::ONE,
+                    idempotency_key: None,
                 },
                 pepper,
             )

@@ -28,6 +28,15 @@ pub async fn run(state: AppState) {
                         tracing::error!(%error, "worker failed to release orphaned usage reservations");
                     }
                 }
+                match state.db.expire_key_provisioning_responses(1_000).await {
+                    Ok(expired) if expired > 0 => {
+                        tracing::info!(expired, "worker expired encrypted key provisioning responses");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "worker failed to expire key provisioning responses");
+                    }
+                }
             }
             _ = generations.tick() => {
                 if let Err(error) = generation::process_one(&state, &worker_id).await {

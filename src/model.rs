@@ -66,7 +66,7 @@ pub struct AuthenticatedKey {
     pub policy: KeyPolicy,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IssuedKey {
     pub key_id: Uuid,
     pub account_id: Uuid,

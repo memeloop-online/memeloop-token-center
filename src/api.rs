@@ -76,6 +76,7 @@ fn control_router() -> Router<AppState> {
         .route("/operator", get(operator_index))
         .route("/internal/v1/keys", post(create_key))
         .route("/internal/v1/keys/{key_id}/rotate", post(rotate_key))
+        .route("/internal/v1/keys/{key_id}/policy", put(update_key_policy))
         .route("/internal/v1/service-tokens", post(create_service_token))
         .route(
             "/internal/v1/service-tokens/{service_id}/rotate",
@@ -246,6 +247,10 @@ async fn create_key(
             "initial_balance cannot be negative".into(),
         ));
     }
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let issued = state
         .db
         .create_key(
@@ -256,6 +261,7 @@ async fn create_key(
                 currency: body.currency,
                 policy: body.policy,
                 initial_balance,
+                idempotency_key,
             },
             state.config.key_pepper.as_bytes(),
         )
@@ -277,6 +283,19 @@ async fn rotate_key(
         .rotate_key(key_id, state.config.key_pepper.as_bytes())
         .await?;
     Ok(Json(issued))
+}
+
+async fn update_key_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key_id): Path<Uuid>,
+    Json(policy): Json<KeyPolicy>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "keys:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_key_tenant(key_id, tenant).await?;
+    }
+    Ok(Json(state.db.update_key_policy(key_id, policy).await?))
 }
 
 #[derive(Debug, Deserialize)]

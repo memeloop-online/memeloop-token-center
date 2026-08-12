@@ -34,6 +34,7 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::TEN,
+                idempotency_key: None,
             },
             pepper,
         )
