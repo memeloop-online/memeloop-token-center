@@ -35,7 +35,7 @@ impl AppState {
         let db = Database::connect(&config.database_url).await?;
         db.migrate().await?;
         let archive = ArchiveStore::from_config(&config).await?;
-        let plugins = PluginRuntime::load(config.plugin_dir.as_deref())?;
+        let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())?;
         let mut providers = ProviderCatalog::builtins();
         providers.extend(plugins.provider_types())?;
 

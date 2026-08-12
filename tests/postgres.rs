@@ -156,4 +156,15 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
             "1"
         );
     }
+    database
+        .plugin_kv_put("postgres-plugin", &format!("state/{unique}"), b"durable")
+        .await
+        .unwrap();
+    assert_eq!(
+        database
+            .plugin_kv_get("postgres-plugin", &format!("state/{unique}"))
+            .await
+            .unwrap(),
+        Some(b"durable".to_vec())
+    );
 }

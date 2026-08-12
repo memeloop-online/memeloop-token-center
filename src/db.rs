@@ -1633,6 +1633,75 @@ impl Database {
         Ok(result.rows_affected())
     }
 
+    pub async fn plugin_kv_get(
+        &self,
+        plugin_id: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        validate_plugin_kv_key(plugin_id, key)?;
+        let row = sqlx::query("SELECT value FROM plugin_kv WHERE plugin_id = $1 AND key = $2")
+            .bind(plugin_id)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| row.try_get("value").map_err(AppError::from))
+            .transpose()
+    }
+
+    pub async fn plugin_kv_put(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        value: &[u8],
+    ) -> Result<(), AppError> {
+        const MAX_VALUE_BYTES: usize = 1024 * 1024;
+        const MAX_PLUGIN_BYTES: i64 = 16 * 1024 * 1024;
+        validate_plugin_kv_key(plugin_id, key)?;
+        if value.len() > MAX_VALUE_BYTES {
+            return Err(AppError::BadRequest("plugin KV value exceeds 1 MiB".into()));
+        }
+        let mut transaction = self.pool.begin().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948313))")
+                .bind(plugin_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        let length_expression = match self.backend {
+            DatabaseBackend::PostgreSql => "OCTET_LENGTH(value)",
+            DatabaseBackend::Sqlite => "LENGTH(value)",
+        };
+        let usage_query = format!(
+            "SELECT COALESCE(SUM({length_expression}), 0) AS total_bytes, COALESCE(MAX(CASE WHEN key = $2 THEN {length_expression} ELSE 0 END), 0) AS current_bytes FROM plugin_kv WHERE plugin_id = $1"
+        );
+        let usage = sqlx::query(&usage_query)
+            .bind(plugin_id)
+            .bind(key)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let total_bytes: i64 = usage.try_get("total_bytes")?;
+        let current_bytes: i64 = usage.try_get("current_bytes")?;
+        let next_bytes = total_bytes
+            .saturating_sub(current_bytes)
+            .saturating_add(value.len() as i64);
+        if next_bytes > MAX_PLUGIN_BYTES {
+            return Err(AppError::BadRequest(
+                "plugin KV namespace exceeds 16 MiB".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO plugin_kv (plugin_id, key, value, updated_at) VALUES ($1, $2, $3, $4) ON CONFLICT(plugin_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        )
+        .bind(plugin_id)
+        .bind(key)
+        .bind(value)
+        .bind(unix_millis())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn grant(
         &self,
         account_id: Uuid,
@@ -2486,6 +2555,28 @@ fn validate_idempotency_key(value: &str, field: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn validate_plugin_kv_key(plugin_id: &str, key: &str) -> Result<(), AppError> {
+    if plugin_id.is_empty()
+        || plugin_id.len() > 120
+        || !plugin_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(AppError::BadRequest("invalid plugin id for KV".into()));
+    }
+    if key.is_empty()
+        || key.len() > 256
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+    {
+        return Err(AppError::BadRequest(
+            "plugin KV key must contain 1 to 256 safe ASCII characters".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_service_token_input(input: &CreateServiceTokenInput) -> Result<(), AppError> {
     if input.name.trim().is_empty() || input.name.len() > 120 {
         return Err(AppError::BadRequest(
@@ -2635,6 +2726,11 @@ const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "idempotent grant reversals",
         sql: include_str!("../migrations/sqlite/0007_grant_reversals.sql"),
     },
+    Migration {
+        version: 8,
+        name: "bounded plugin KV",
+        sql: include_str!("../migrations/sqlite/0008_plugin_kv.sql"),
+    },
 ];
 
 const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -2672,6 +2768,11 @@ const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 7,
         name: "idempotent grant reversals",
         sql: include_str!("../migrations/postgres/0007_grant_reversals.sql"),
+    },
+    Migration {
+        version: 8,
+        name: "bounded plugin KV",
+        sql: include_str!("../migrations/postgres/0008_plugin_kv.sql"),
     },
 ];
 
@@ -2969,6 +3070,59 @@ mod tests {
         .try_get("count")
         .unwrap();
         assert_eq!(reversals, 1);
+    }
+
+    #[tokio::test]
+    async fn plugin_kv_is_namespaced_and_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("plugin-kv.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+
+        database
+            .plugin_kv_put("routing-plugin", "oauth/state", b"encrypted-state")
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .plugin_kv_get("routing-plugin", "oauth/state")
+                .await
+                .unwrap(),
+            Some(b"encrypted-state".to_vec())
+        );
+        assert_eq!(
+            database
+                .plugin_kv_get("other-plugin", "oauth/state")
+                .await
+                .unwrap(),
+            None
+        );
+        database
+            .plugin_kv_put("routing-plugin", "oauth/state", b"next-state")
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .plugin_kv_get("routing-plugin", "oauth/state")
+                .await
+                .unwrap(),
+            Some(b"next-state".to_vec())
+        );
+        assert!(
+            database
+                .plugin_kv_put("routing-plugin", "unsafe key", b"value")
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .plugin_kv_put("routing-plugin", "too-large", &vec![0_u8; 1024 * 1024 + 1])
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

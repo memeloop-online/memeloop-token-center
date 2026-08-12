@@ -13,7 +13,7 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config as WasmtimeConfig, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use self::memeloop::token_center::types;
-use crate::{error::AppError, provider::ProviderType};
+use crate::{db::Database, error::AppError, provider::ProviderType};
 
 const PLUGIN_FUEL: u64 = 5_000_000;
 const PLUGIN_MEMORY_BYTES: usize = 32 * 1024 * 1024;
@@ -74,19 +74,27 @@ pub struct TrafficDecision {
 pub struct PluginRuntime {
     engine: Option<Engine>,
     http: Option<reqwest::blocking::Client>,
+    kv: Option<PluginKv>,
     plugins: Arc<Vec<LoadedPlugin>>,
     providers: Arc<Vec<ProviderType>>,
+}
+
+#[derive(Clone)]
+struct PluginKv {
+    database: Database,
+    runtime: tokio::runtime::Handle,
 }
 
 struct HostState {
     plugin_id: String,
     capabilities: Vec<PluginCapability>,
     http: reqwest::blocking::Client,
+    kv: Option<PluginKv>,
     limits: StoreLimits,
 }
 
 impl PluginRuntime {
-    pub fn load(root: Option<&str>) -> Result<Self, AppError> {
+    pub fn load(root: Option<&str>, database: Database) -> Result<Self, AppError> {
         let Some(root) = root else {
             return Ok(Self::default());
         };
@@ -163,6 +171,10 @@ impl PluginRuntime {
         Ok(Self {
             engine: Some(engine),
             http: Some(http),
+            kv: Some(PluginKv {
+                database,
+                runtime: tokio::runtime::Handle::current(),
+            }),
             plugins: Arc::new(plugins),
             providers: Arc::new(providers),
         })
@@ -212,6 +224,7 @@ impl PluginRuntime {
                     plugin_id: plugin.manifest.id.clone(),
                     capabilities: plugin.manifest.capabilities.clone(),
                     http: http.clone(),
+                    kv: self.kv.clone(),
                     limits,
                 },
             );
@@ -269,12 +282,38 @@ impl memeloop::token_center::host::Host for HostState {
         }
     }
 
-    fn kv_get(&mut self, _key: String) -> Result<Option<Vec<u8>>, String> {
-        Err("plugin KV capability is not enabled in this runtime".to_owned())
+    fn kv_get(&mut self, key: String) -> Result<Option<Vec<u8>>, String> {
+        if !self
+            .capabilities
+            .iter()
+            .any(|capability| matches!(capability, PluginCapability::Kv))
+        {
+            return Err("plugin did not declare the KV capability".to_owned());
+        }
+        let kv = self
+            .kv
+            .as_ref()
+            .ok_or_else(|| "plugin KV runtime is unavailable".to_owned())?;
+        kv.runtime
+            .block_on(kv.database.plugin_kv_get(&self.plugin_id, &key))
+            .map_err(|error| error.to_string())
     }
 
-    fn kv_put(&mut self, _key: String, _value: Vec<u8>) -> Result<(), String> {
-        Err("plugin KV capability is not enabled in this runtime".to_owned())
+    fn kv_put(&mut self, key: String, value: Vec<u8>) -> Result<(), String> {
+        if !self
+            .capabilities
+            .iter()
+            .any(|capability| matches!(capability, PluginCapability::Kv))
+        {
+            return Err("plugin did not declare the KV capability".to_owned());
+        }
+        let kv = self
+            .kv
+            .as_ref()
+            .ok_or_else(|| "plugin KV runtime is unavailable".to_owned())?;
+        kv.runtime
+            .block_on(kv.database.plugin_kv_put(&self.plugin_id, &key, &value))
+            .map_err(|error| error.to_string())
     }
 
     fn http_request(
