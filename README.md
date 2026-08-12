@@ -29,7 +29,7 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 - Provider：创建稳定上游账号、轮换 API/OAuth credential、配置无需认证的私有 ComfyUI、建立公开模型到上游模型的路由。
 - OAuth：原生接入 CPA Subscription Bridge 的 GitHub Copilot/Cursor 订阅登录、opaque handle 推理，以及 Cursor 直接 PKCE/refresh；插件 provider 还能声明同协议的 OAuth Adapter。登录状态是有时限的加密 token，可跨 K8s 副本重试。
 - Self-service：key 信息、请求列表/详情、聚合统计、逻辑会话簇/关系边。
-- Operator：`/internal/v1/request-events` 以追加式 started/finished 事件提供 SSE 尾流，跨副本从 PostgreSQL 游标续读，不加载归档正文。
+- Operator：`/internal/v1/request-events` 以追加式 started/finished 事件提供 SSE 尾流，跨副本从 PostgreSQL 游标续读；`/internal/v1/stats` 从日聚合表汇总租户级请求、模型、日期、错误和多模态费用，`/internal/v1/requests/{request_id}` 按需加载文本或生成任务归档正文。全部接口同时执行 service scope 与 tenant 边界检查。
 
 模型请求先按正文 token 上界与最大输出做余额预留，同时原子执行 RPM 限流；响应返回 usage 后结算实际费用并释放差额。生成任务按秒或任务等单位预留，worker 使用 PostgreSQL `FOR UPDATE SKIP LOCKED` 租约领取任务并幂等结算。daily、rolling-weekly 与 lifetime budget 均在调用上游前检查；崩溃窗口遗留且没有请求/任务引用的额度预留会由 worker 有界回收。
 
@@ -58,7 +58,7 @@ cargo test
 cargo test --test cucumber
 ```
 
-Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，不需要 PostgreSQL 或真实 S3。当前覆盖 14 个场景、93 个步骤，包括稳定 key 轮换、权限/额度/限流、订阅 grant 幂等撤销、OpenAI/Anthropic、API/OAuth 同管线、Cursor PKCE、Copilot/Cursor subscription bridge、CPA 账号安全导入、逻辑会话以及 Seedance/ComfyUI 异步生成与归档。
+Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，不需要 PostgreSQL 或真实 S3。当前覆盖 15 个场景、99 个步骤，包括稳定 key 轮换、权限/额度/限流、订阅 grant 幂等撤销、OpenAI/Anthropic、API/OAuth 同管线、Cursor PKCE、Copilot/Cursor subscription bridge、CPA 账号安全导入、逻辑会话以及 Seedance/ComfyUI 异步生成、计费与统一排障详情。`MTC_TEST_POSTGRES_URL` 可启用真实 PostgreSQL v1–v10 迁移、队列、聚合、事件与详情查询测试。
 
 memeloop web 对余额发放使用 `POST /internal/v1/accounts/{account_id}/grants`；取消或替换订阅时使用 `POST /internal/v1/accounts/{account_id}/grant-reversals`，body 指向原 grant 的幂等键，且 reversal 自己必须使用新的 `Idempotency-Key`。为避免对已经消费的服务做隐式退款，当前只允许撤销仍完整未消费的 grant；部分消费后的退款需要由业务侧人工或后续按 grant lot 结算。
 
@@ -74,4 +74,4 @@ Copilot/Cursor 订阅登录入口为 `/internal/v1/oauth/subscription-bridge/sta
 
 插件 ABI 位于 `wit/token-center.wit`；运行时使用 Wasmtime Component Model，每次调用限制 32 MiB 与固定 fuel，HTTP 只能访问 manifest 中由运维审核的精确 origin。声明 `kv` capability 的插件可以使用 PostgreSQL/SQLite 中按插件 ID 隔离的持久 KV，每个值上限 1 MiB、每个插件上限 16 MiB；未声明 capability 的调用会在 host 边界被拒绝。Provider contribution 可以携带 JSON Schema 和 `oauth_adapter`，由 `/internal/v1/oauth/provider-adapter/*` 执行固定的 PKCE adapter 协议，无需给插件任意进程内权限。OCI 插件包格式、`plugin.json` 和 capability 限制见 `plugins/README.md`。Helm Chart 可从只读 ConfigMap/PVC 加载插件；生产 values 只引用外部 PostgreSQL/S3 Secret，不把凭证写入 ConfigMap。
 
-React/Vite 管理端位于 `web/`：`/operator` 是 service token 控制面，提供实时请求、上游账号 Schema 表单、路由、key 和 OAuth；`/portal` 是下游 key 只读统计，可查看生成任务的状态、费用、错误和归档对象。前端静态资产在镜像构建时生成，不依赖 Node.js 运行时。
+React/Vite 管理端位于 `web/`：`/operator` 是 service token 控制面，提供租户聚合指标、模型/日期/错误分布、实时请求尾流、按需归档排障、上游账号 Schema 表单、路由、key 和 OAuth；`/portal` 是下游 key 只读统计，可查看生成任务的状态、费用、错误和归档对象。前端静态资产在镜像构建时生成，不依赖 Node.js 运行时。
