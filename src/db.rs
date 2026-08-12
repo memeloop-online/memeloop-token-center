@@ -734,14 +734,33 @@ impl Database {
         protocol: &str,
         key_material: &[u8],
     ) -> Result<Option<ResolvedUpstream>, AppError> {
-        let row = sqlx::query(
-            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE r.tenant_id = ? AND r.public_model = ? AND r.protocol = ? AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1",
-        )
-        .bind(tenant_id.to_string())
-        .bind(public_model)
-        .bind(protocol)
-        .fetch_optional(&self.pool)
-        .await?;
+        self.resolve_upstream_with_hint(tenant_id, public_model, protocol, None, key_material)
+            .await
+    }
+
+    pub async fn resolve_upstream_with_hint(
+        &self,
+        tenant_id: Uuid,
+        public_model: &str,
+        protocol: &str,
+        upstream_account_id: Option<Uuid>,
+        key_material: &[u8],
+    ) -> Result<Option<ResolvedUpstream>, AppError> {
+        let sql = if upstream_account_id.is_some() {
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE r.tenant_id = ? AND r.public_model = ? AND r.protocol = ? AND a.id = ? AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+        } else {
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE r.tenant_id = ? AND r.public_model = ? AND r.protocol = ? AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+        };
+        let query = sqlx::query(sql)
+            .bind(tenant_id.to_string())
+            .bind(public_model)
+            .bind(protocol);
+        let query = if let Some(account_id) = upstream_account_id {
+            query.bind(account_id.to_string())
+        } else {
+            query
+        };
+        let row = query.fetch_optional(&self.pool).await?;
         let Some(row) = row else {
             return Ok(None);
         };

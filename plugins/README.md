@@ -1,11 +1,30 @@
 # Plugin packages
 
-Token Center 插件是固定 digest 的 OCI artifact，至少包含：
+Token Center 插件是固定 digest 的 OCI artifact。解包后的每个插件各占一个目录，至少包含：
 
 - `plugin.wasm`：实现 `wit/token-center.wit` 的 Component Model 组件。
-- `spec.yaml`：插件 id、版本、WIT API 版本、扩展点、requested capabilities 和 JSON Schema 路径。
+- `plugin.json`：插件 id、版本、WIT API 版本、扩展点、capability allowlist 和 JSON Schema provider contribution。
 - `README.md`：使用说明。
 - 可选 `icon.png` 与配置 JSON Schema。
 
-核心 key 鉴权、账本和 tenant 边界不可被插件替换。插件只能请求显式 host capability；HTTP 必须通过 allowlist，KV 自动按 tenant 和插件命名空间隔离。v1 前端扩展保持声明式，只允许 JSON Schema、说明和动作表单，不注入任意 JavaScript。
+设置 `MTC_PLUGIN_DIR` 后，服务会在启动时编译目录下的组件；同名 provider 或不兼容的 `wit_version` 会让启动失败。Helm 用 `plugins.existingConfigMap` 或 `plugins.existingClaim` 只读挂载该目录。
 
+核心 key 鉴权、账本和 tenant 边界不可被插件替换。每次 traffic policy 调用使用独立 Store，限制 32 MiB 线性内存和 500 万 fuel。HTTP host call 仅允许 `plugin.json` 明确列出的精确 origin，禁止重定向，请求和响应各限制 16 MiB；返回值是 `{status, headers, body_base64}` JSON。KV ABI 已保留但当前 fail-closed，后续接 PostgreSQL tenant/plugin 命名空间后才会开放。前端扩展保持声明式，只允许 JSON Schema、说明和动作表单，不注入任意 JavaScript。
+
+最小 manifest：
+
+```json
+{
+  "id": "example-policy",
+  "version": "1.0.0",
+  "wit_version": "0.1.0",
+  "capabilities": [
+    { "kind": "log" },
+    { "kind": "http", "allowed_origins": ["https://oauth.example.com"] }
+  ],
+  "contributions": {
+    "traffic_policy": true,
+    "providers": []
+  }
+}
+```

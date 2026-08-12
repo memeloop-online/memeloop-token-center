@@ -60,6 +60,20 @@ export interface ProviderType {
   source: string;
 }
 
+export interface PluginManifest {
+  id: string;
+  version: string;
+  wit_version: string;
+  capabilities: Array<
+    | { kind: 'log' | 'kv' }
+    | { kind: 'http'; allowed_origins: string[] }
+  >;
+  contributions: {
+    traffic_policy?: boolean;
+    providers?: ProviderType[];
+  };
+}
+
 export interface UpstreamAccount {
   id: string;
   name: string;
@@ -76,6 +90,7 @@ export interface ConfigurationSchemas {
   key_create: Record<string, unknown>;
   key_policy: Record<string, unknown>;
   model_route: Record<string, unknown>;
+  plugin_manifest: Record<string, unknown>;
   provider_account: Record<string, unknown>;
   service_token: Record<string, unknown>;
 }

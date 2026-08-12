@@ -32,7 +32,7 @@ hmac = "0.12"
 http = "1"
 mime_guess = "2"
 object_store = { version = "0.14.1", features = ["aws"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls", "stream"] }
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -47,6 +47,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
+wasmtime = { version = "47.0.3", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 
 [dev-dependencies]
 cucumber = { version = "0.23.0", features = ["macros"] }

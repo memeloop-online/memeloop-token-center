@@ -88,6 +88,12 @@ config:
     openaiUrl: ""
     anthropicUrl: ""
 
+plugins:
+  enabled: false
+  mountPath: /var/lib/memeloop-token-center/plugins
+  existingConfigMap: ""
+  existingClaim: ""
+
 ingress:
   enabled: false
   className: ""

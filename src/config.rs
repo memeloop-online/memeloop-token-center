@@ -44,6 +44,7 @@ pub struct Config {
     pub upstream_openai_key: Option<String>,
     pub upstream_anthropic_url: Option<String>,
     pub upstream_anthropic_key: Option<String>,
+    pub plugin_dir: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,6 +89,7 @@ impl Config {
             upstream_openai_key: env::var("MTC_UPSTREAM_OPENAI_KEY").ok(),
             upstream_anthropic_url: env::var("MTC_UPSTREAM_ANTHROPIC_URL").ok(),
             upstream_anthropic_key: env::var("MTC_UPSTREAM_ANTHROPIC_KEY").ok(),
+            plugin_dir: env::var("MTC_PLUGIN_DIR").ok(),
         })
     }
 
@@ -109,6 +111,7 @@ impl Config {
             upstream_openai_key: None,
             upstream_anthropic_url: None,
             upstream_anthropic_key: None,
+            plugin_dir: None,
         }
     }
 }

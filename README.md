@@ -63,6 +63,6 @@ Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，�
 
 Cursor 登录入口为 `/internal/v1/oauth/cursor/start` 与 `/internal/v1/oauth/cursor/poll`，刷新入口为 `/internal/v1/upstreams/{account_id}/oauth/refresh`。这里负责 PKCE、token 生命周期与稳定账号；Cursor 原生 Connect/Agent Runtime 到公开协议的转换仍应由专用 provider 插件完成，不能假装成无损 OpenAI 兼容。当前内置 `http-json` driver 可用于兼容上游或独立适配 sidecar。
 
-插件 ABI 位于 `wit/token-center.wit`；OCI 插件包格式和 capability 限制见 `plugins/README.md`。Helm Chart 位于 `charts/memeloop-token-center`，生产 values 只引用外部 PostgreSQL/S3 Secret，不把凭证写入 ConfigMap。
+插件 ABI 位于 `wit/token-center.wit`；运行时使用 Wasmtime Component Model，每次调用限制 32 MiB 与固定 fuel，HTTP 只能访问 manifest 中由运维审核的精确 origin。OCI 插件包格式、`plugin.json` 和 capability 限制见 `plugins/README.md`。Helm Chart 可从只读 ConfigMap/PVC 加载插件；生产 values 只引用外部 PostgreSQL/S3 Secret，不把凭证写入 ConfigMap。
 
 React/Vite 管理端位于 `web/`：`/operator` 是 service token 控制面，提供实时请求、上游账号 Schema 表单、路由、key 和 OAuth；`/portal` 是下游 key 只读统计。前端静态资产在镜像构建时生成，不依赖 Node.js 运行时。

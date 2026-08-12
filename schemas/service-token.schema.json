@@ -23,6 +23,7 @@
           "requests:read",
           "providers:read",
           "providers:write",
+          "plugins:read",
           "oauth:write",
           "routes:write",
           "prices:write",

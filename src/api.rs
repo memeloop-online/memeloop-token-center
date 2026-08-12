@@ -41,6 +41,7 @@ use crate::{
         CursorOAuthEndpoints, CursorPollResult, StartCursorLogin, poll_cursor_login,
         refresh_cursor_credential, start_cursor_login,
     },
+    plugin::memeloop::token_center::types::RequestContext,
     provider::UpstreamCredential,
 };
 
@@ -79,6 +80,7 @@ fn control_router() -> Router<AppState> {
             post(rotate_service_token),
         )
         .route("/internal/v1/provider-types", get(provider_types))
+        .route("/internal/v1/plugins", get(plugin_manifests))
         .route("/internal/v1/schemas", get(configuration_schemas))
         .route("/internal/v1/oauth/cursor/start", post(start_cursor_oauth))
         .route("/internal/v1/oauth/cursor/poll", post(poll_cursor_oauth))
@@ -309,6 +311,14 @@ async fn provider_types(
     Ok(Json(state.providers.list().to_vec()))
 }
 
+async fn plugin_manifests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state, "plugins:read").await?;
+    Ok(Json(state.plugins.manifests()))
+}
+
 async fn configuration_schemas(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -322,6 +332,7 @@ async fn configuration_schemas(
         "key_create": schema(include_str!("../schemas/key-create.schema.json"))?,
         "key_policy": schema(include_str!("../schemas/key-policy.schema.json"))?,
         "model_route": schema(include_str!("../schemas/model-route.schema.json"))?,
+        "plugin_manifest": schema(include_str!("../schemas/plugin-manifest.schema.json"))?,
         "provider_account": schema(include_str!("../schemas/provider-account.schema.json"))?,
         "service_token": schema(include_str!("../schemas/service-token.schema.json"))?
     })))
@@ -883,22 +894,56 @@ async fn proxy(
     protocol: Protocol,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    let request_json: Value = serde_json::from_slice(&body)
+    let original_request_json: Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
-    let model = request_json
+    let requested_model = original_request_json
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("model is required".into()))?
         .to_owned();
+    if !key.policy.allows_model(&requested_model) {
+        return Err(AppError::Forbidden);
+    }
+    let plugins = state.plugins.clone();
+    let plugin_request = original_request_json.clone();
+    let plugin_context = RequestContext {
+        tenant_id: key.tenant_id.to_string(),
+        principal_id: key.principal_id.to_string(),
+        key_id: key.key_id.to_string(),
+        protocol: protocol.name().to_owned(),
+        model: requested_model.clone(),
+        config_json: "{}".to_owned(),
+    };
+    let plugin_decision =
+        tokio::task::spawn_blocking(move || plugins.apply_traffic(plugin_context, &plugin_request))
+            .await
+            .map_err(|error| AppError::Upstream(format!("plugin task failed: {error}")))??;
+    if !plugin_decision.allow {
+        tracing::warn!(reason = ?plugin_decision.reason, "traffic policy plugin denied request");
+        return Err(AppError::Forbidden);
+    }
+    let request_json = plugin_decision
+        .request_json
+        .unwrap_or_else(|| original_request_json.clone());
+    let model = plugin_decision.model.unwrap_or(requested_model);
     if !key.policy.allows_model(&model) {
         return Err(AppError::Forbidden);
     }
+    let upstream_account_hint = plugin_decision
+        .upstream_account_id
+        .map(|value| {
+            Uuid::parse_str(&value).map_err(|_| {
+                AppError::Upstream("plugin returned an invalid upstream account id".into())
+            })
+        })
+        .transpose()?;
     let resolved_route = state
         .db
-        .resolve_upstream(
+        .resolve_upstream_with_hint(
             key.tenant_id,
             &model,
             protocol.name(),
+            upstream_account_hint,
             state.config.key_pepper.as_bytes(),
         )
         .await?;
@@ -910,7 +955,7 @@ async fn proxy(
         upstream_account_id,
         model_route_id,
     ) = if let Some(route) = resolved_route {
-        if route.driver != "http-json" {
+        if !state.providers.contains(&route.driver) {
             return Err(AppError::Upstream(format!(
                 "provider driver {} is not loaded",
                 route.driver
@@ -952,7 +997,8 @@ async fn proxy(
     }
     let forwarded_body = serde_json::to_vec(&forwarded_json).map_err(|_| AppError::Internal)?;
     let price = state.db.model_price(&model, &key.currency).await?;
-    let input_token_ceiling = i64::try_from(body.len()).unwrap_or(i64::MAX);
+    let input_token_ceiling =
+        i64::try_from(body.len().max(forwarded_body.len())).unwrap_or(i64::MAX);
     let default_output_token_ceiling = if matches!(
         protocol,
         Protocol::OpenAiEmbeddings | Protocol::AnthropicCountTokens
@@ -996,7 +1042,7 @@ async fn proxy(
             model_route_id,
         })
         .await?;
-    let conversation_hint = conversation_hint(&headers, &request_json);
+    let conversation_hint = conversation_hint(&headers, &original_request_json);
     let client_name = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
@@ -1005,7 +1051,7 @@ async fn proxy(
         .record_conversation_observation(
             &key,
             request_id,
-            &request_json,
+            &original_request_json,
             conversation_hint.as_deref(),
             client_name,
         )

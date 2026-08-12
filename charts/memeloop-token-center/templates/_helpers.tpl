@@ -65,4 +65,8 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ .Values.config.upstream.openaiUrl | quote }}
 - name: MTC_UPSTREAM_ANTHROPIC_URL
   value: {{ .Values.config.upstream.anthropicUrl | quote }}
+{{- if .Values.plugins.enabled }}
+- name: MTC_PLUGIN_DIR
+  value: {{ .Values.plugins.mountPath | quote }}
+{{- end }}
 {{- end -}}

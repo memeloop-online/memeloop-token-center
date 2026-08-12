@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memeloop.dev/schemas/plugin-manifest.schema.json",
+  "title": "Token Center plugin manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "version", "wit_version"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+    "version": { "type": "string", "minLength": 1 },
+    "wit_version": { "const": "0.1.0" },
+    "wasm": { "type": "string", "default": "plugin.wasm" },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind"],
+            "properties": { "kind": { "const": "log" } }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind"],
+            "properties": { "kind": { "const": "kv" } }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "allowed_origins"],
+            "properties": {
+              "kind": { "const": "http" },
+              "allowed_origins": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "format": "uri" }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "contributions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "traffic_policy": { "type": "boolean", "default": false },
+        "providers": {
+          "type": "array",
+          "items": { "type": "object" }
+        }
+      }
+    }
+  }
+}

@@ -120,7 +120,7 @@ fn bearer_prefix() -> String {
     "Bearer ".to_owned()
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderType {
     pub id: String,
     pub display_name: String,
@@ -209,6 +209,27 @@ impl ProviderCatalog {
 
     pub fn list(&self) -> &[ProviderType] {
         &self.types
+    }
+
+    pub fn extend(
+        &mut self,
+        contributions: impl IntoIterator<Item = ProviderType>,
+    ) -> Result<(), AppError> {
+        for contribution in contributions {
+            if contribution.id.trim().is_empty()
+                || self
+                    .types
+                    .iter()
+                    .any(|provider| provider.id == contribution.id)
+            {
+                return Err(AppError::BadRequest(format!(
+                    "duplicate or empty provider type: {}",
+                    contribution.id
+                )));
+            }
+            self.types.push(contribution);
+        }
+        Ok(())
     }
 
     pub fn contains(&self, driver: &str) -> bool {

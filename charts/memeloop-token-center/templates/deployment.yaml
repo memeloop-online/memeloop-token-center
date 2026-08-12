@@ -67,6 +67,25 @@ spec:
             capabilities: { drop: ["ALL"] }
           resources:
             {{- toYaml $roleConfig.resources | nindent 12 }}
+          {{- if $.Values.plugins.enabled }}
+          volumeMounts:
+            - name: plugins
+              mountPath: {{ $.Values.plugins.mountPath }}
+              readOnly: true
+          {{- end }}
+      {{- if $.Values.plugins.enabled }}
+      volumes:
+        - name: plugins
+          {{- if $.Values.plugins.existingConfigMap }}
+          configMap:
+            name: {{ $.Values.plugins.existingConfigMap }}
+          {{- else if $.Values.plugins.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ $.Values.plugins.existingClaim }}
+          {{- else }}
+          {{- fail "plugins.enabled requires plugins.existingConfigMap or plugins.existingClaim" }}
+          {{- end }}
+      {{- end }}
       {{- with $.Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

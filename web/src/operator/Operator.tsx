@@ -4,34 +4,36 @@ import { useEffect, useMemo, useState } from 'react';
 import type { RJSFSchema } from '@rjsf/utils';
 import { api, streamSse } from '../api';
 import { RequestTable, Shell } from '../components';
-import type { ConfigurationSchemas, ProviderType, RequestEvent, RequestView, UpstreamAccount } from '../types';
+import type { ConfigurationSchemas, PluginManifest, ProviderType, RequestEvent, RequestView, UpstreamAccount } from '../types';
 
-type Tab = 'traffic' | 'upstreams' | 'routes' | 'keys' | 'oauth' | 'services';
+type Tab = 'traffic' | 'upstreams' | 'routes' | 'keys' | 'oauth' | 'services' | 'plugins';
 
-const tabs: Array<[Tab, string]> = [['traffic', '实时请求'], ['upstreams', '上游账号'], ['routes', '模型路由'], ['keys', '创建 Key'], ['oauth', 'OAuth'], ['services', '服务凭据']];
+const tabs: Array<[Tab, string]> = [['traffic', '实时请求'], ['upstreams', '上游账号'], ['routes', '模型路由'], ['keys', '创建 Key'], ['oauth', 'OAuth'], ['services', '服务凭据'], ['plugins', '插件']];
 
 export function Operator() {
   const [token, setToken] = useState(() => sessionStorage.getItem('mtc-service-token') ?? '');
   const [tab, setTab] = useState<Tab>('traffic');
   const [providers, setProviders] = useState<ProviderType[]>([]);
+  const [plugins, setPlugins] = useState<PluginManifest[]>([]);
   const [upstreams, setUpstreams] = useState<UpstreamAccount[]>([]);
   const [requests, setRequests] = useState<RequestView[]>([]);
   const [schemas, setSchemas] = useState<ConfigurationSchemas>();
   const [error, setError] = useState('');
-  const provider = providers[0];
 
   async function refresh() {
     if (!token.trim()) return;
     sessionStorage.setItem('mtc-service-token', token.trim());
     setError('');
     try {
-      const [nextProviders, nextUpstreams, nextRequests, nextSchemas] = await Promise.all([
+      const [nextProviders, nextPlugins, nextUpstreams, nextRequests, nextSchemas] = await Promise.all([
         api<ProviderType[]>('/internal/v1/provider-types', token),
+        api<PluginManifest[]>('/internal/v1/plugins', token),
         api<UpstreamAccount[]>('/internal/v1/upstreams', token),
         api<RequestView[]>('/internal/v1/requests?limit=100', token),
         api<ConfigurationSchemas>('/internal/v1/schemas', token),
       ]);
       setProviders(nextProviders);
+      setPlugins(nextPlugins);
       setUpstreams(nextUpstreams);
       setRequests(nextRequests);
       setSchemas(nextSchemas);
@@ -88,18 +90,25 @@ export function Operator() {
       <nav className="tabs">{tabs.map(([id, label]) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}>{label}</button>)}</nav>
       {error && <div className="notice error">{error}</div>}
       {tab === 'traffic' && <article className="panel"><div className="panel-title"><h2>实时请求尾流</h2><span>SSE 亚秒级尾查 · 不载入正文</span></div><RequestTable requests={requests} /></article>}
-      {tab === 'upstreams' && <Upstreams token={token} provider={provider} values={upstreams} onCreated={() => void refresh()} />}
+      {tab === 'upstreams' && <Upstreams token={token} providers={providers} values={upstreams} onCreated={() => void refresh()} />}
       {tab === 'routes' && <RouteForm token={token} upstreams={upstreams} />}
       {tab === 'keys' && <KeyForm token={token} schema={schemas?.key_create} />}
       {tab === 'oauth' && <OAuth token={token} onCreated={() => void refresh()} />}
       {tab === 'services' && <ServiceTokenForm token={token} schema={schemas?.service_token} />}
+      {tab === 'plugins' && <Plugins values={plugins} />}
     </Shell>
   );
 }
 
-function Upstreams({ token, provider, values, onCreated }: { token: string; provider?: ProviderType; values: UpstreamAccount[]; onCreated: () => void }) {
+function Upstreams({ token, providers, values, onCreated }: { token: string; providers: ProviderType[]; values: UpstreamAccount[]; onCreated: () => void }) {
+  const [driver, setDriver] = useState('');
+  const provider = providers.find((value) => value.id === driver) ?? providers[0];
   const schema = useMemo<RJSFSchema | undefined>(() => provider ? ({ type: 'object', required: ['name', 'config', 'credential'], properties: { name: { type: 'string', title: '账号名称' }, driver: { type: 'string', default: provider.id, readOnly: true }, config: provider.config_schema, credential: provider.credential_schema } } as RJSFSchema) : undefined, [provider]);
-  return <section className="two-column operator-grid"><article className="panel"><h2>账号</h2><div className="account-list">{values.map((value) => <div className="account" key={value.id}><div><b>{value.name}</b><span>{value.driver} · {value.auth_kind}</span></div><span className="pill">gen {value.credential_generation}</span></div>)}</div></article><article className="panel form-panel"><h2>新增上游</h2>{schema ? <Form schema={schema} validator={validator} onSubmit={async ({ formData }) => { await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify(formData) }); onCreated(); }}><button type="submit">创建上游账号</button></Form> : <div className="empty">连接管理 API 后加载 Schema</div>}</article></section>;
+  return <section className="two-column operator-grid"><article className="panel"><h2>账号</h2><div className="account-list">{values.map((value) => <div className="account" key={value.id}><div><b>{value.name}</b><span>{value.driver} · {value.auth_kind}</span></div><span className="pill">gen {value.credential_generation}</span></div>)}</div></article><article className="panel form-panel"><h2>新增上游</h2><label>Provider<select value={provider?.id ?? ''} onChange={(event) => setDriver(event.target.value)}>{providers.map((value) => <option key={value.id} value={value.id}>{value.display_name} · {value.source}</option>)}</select></label>{schema ? <Form key={provider.id} schema={schema} validator={validator} onSubmit={async ({ formData }) => { await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify(formData) }); onCreated(); }}><button type="submit">创建上游账号</button></Form> : <div className="empty">连接管理 API 后加载 Schema</div>}</article></section>;
+}
+
+function Plugins({ values }: { values: PluginManifest[] }) {
+  return <article className="panel"><div className="panel-title"><h2>已加载插件</h2><span>Wasmtime Component · fail-closed capabilities</span></div><div className="account-list">{values.length === 0 && <div className="empty">当前未挂载插件</div>}{values.map((value) => <div className="account" key={value.id}><div><b>{value.id}</b><span>v{value.version} · WIT {value.wit_version} · {(value.contributions.providers ?? []).length} provider</span></div><span className="pill">{value.contributions.traffic_policy ? 'traffic policy' : 'provider'}</span></div>)}</div></article>;
 }
 
 function RouteForm({ token, upstreams }: { token: string; upstreams: UpstreamAccount[] }) {
