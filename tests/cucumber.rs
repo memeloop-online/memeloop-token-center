@@ -551,6 +551,77 @@ async fn mock_copilot_subscription_bridge(world: &mut TokenCenterWorld) {
         .await;
 }
 
+#[when("the service imports CPA Copilot and unsupported Codex auth documents twice")]
+async fn import_cpa_accounts_twice(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let payload = json!({
+        "bridge_base_url": mock_url,
+        "bridge_secret": "bridge-import-secret",
+        "auth_files": [
+            {
+                "filename": "github-copilot-test.json",
+                "document": {
+                    "type": "subscription-bridge",
+                    "upstream": "copilot",
+                    "handle": "opaqueimporthandle123",
+                    "label": "Imported Copilot"
+                }
+            },
+            {
+                "filename": "codex-test.json",
+                "document": {
+                    "type": "codex",
+                    "access_token": "codex-import-secret",
+                    "refresh_token": "codex-refresh-secret"
+                }
+            }
+        ]
+    });
+    for attempt in 0..2 {
+        let response = world
+            .client
+            .post(format!(
+                "{}/internal/v1/imports/cpa/subscription-accounts",
+                world.service_url
+            ))
+            .bearer_auth("test-service-token")
+            .json(&payload)
+            .send()
+            .await
+            .expect("import CPA auth documents");
+        world.status = Some(response.status());
+        world.response = response.json().await.expect("CPA import JSON");
+        let account_id = world.response["imported"][0]["account"]["id"]
+            .as_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("imported account id");
+        if attempt == 0 {
+            world.oauth_upstream_id = Some(account_id);
+        } else {
+            assert_eq!(world.oauth_upstream_id, Some(account_id));
+        }
+    }
+}
+
+#[then(
+    "one opaque CPA account is imported and unsupported OAuth is skipped without echoing secrets"
+)]
+async fn cpa_import_is_safe(world: &mut TokenCenterWorld) {
+    assert_eq!(world.status, Some(StatusCode::CREATED));
+    assert_eq!(world.response["imported"].as_array().map(Vec::len), Some(1));
+    assert_eq!(world.response["imported"][0]["provider"], "copilot");
+    assert_eq!(world.response["skipped"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        world.response["skipped"][0]["reason"],
+        "requires_provider_adapter"
+    );
+    let serialized = world.response.to_string();
+    assert!(!serialized.contains("opaqueimporthandle123"));
+    assert!(!serialized.contains("bridge-import-secret"));
+    assert!(!serialized.contains("codex-import-secret"));
+    assert!(!serialized.contains("codex-refresh-secret"));
+}
+
 #[when("the service creates a Copilot bridge account route and key")]
 async fn create_copilot_bridge_route_and_key(world: &mut TokenCenterWorld) {
     let mock_url = world.mock.as_ref().expect("mock server").uri();

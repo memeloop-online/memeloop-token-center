@@ -116,3 +116,8 @@ Feature: Stable key identity and read-only self-service statistics
     And the client calls model "copilot-public"
     Then the response status is 200
     And the Copilot response is unwrapped without exposing the bridge handle
+
+  Scenario: CPA subscription account import is idempotent and fail-closed
+    Given a token center backed by SQLite and memory object storage
+    When the service imports CPA Copilot and unsupported Codex auth documents twice
+    Then one opaque CPA account is imported and unsupported OAuth is skipped without echoing secrets

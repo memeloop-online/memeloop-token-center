@@ -56,7 +56,7 @@ cargo test
 cargo test --test cucumber
 ```
 
-Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，不需要 PostgreSQL 或真实 S3。当前覆盖 13 个场景、90 个步骤，包括稳定 key 轮换、权限/额度/限流、订阅 grant 幂等撤销、OpenAI/Anthropic、API/OAuth 同管线、Cursor PKCE、Copilot/Cursor subscription bridge、逻辑会话以及 Seedance/ComfyUI 异步生成与归档。
+Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，不需要 PostgreSQL 或真实 S3。当前覆盖 14 个场景、93 个步骤，包括稳定 key 轮换、权限/额度/限流、订阅 grant 幂等撤销、OpenAI/Anthropic、API/OAuth 同管线、Cursor PKCE、Copilot/Cursor subscription bridge、CPA 账号安全导入、逻辑会话以及 Seedance/ComfyUI 异步生成与归档。
 
 memeloop web 对余额发放使用 `POST /internal/v1/accounts/{account_id}/grants`；取消或替换订阅时使用 `POST /internal/v1/accounts/{account_id}/grant-reversals`，body 指向原 grant 的幂等键，且 reversal 自己必须使用新的 `Idempotency-Key`。为避免对已经消费的服务做隐式退款，当前只允许撤销仍完整未消费的 grant；部分消费后的退款需要由业务侧人工或后续按 grant lot 结算。
 
@@ -67,6 +67,8 @@ memeloop web 对余额发放使用 `POST /internal/v1/accounts/{account_id}/gran
 核心、key、service token、provider 账号、模型路由和生成价格的 JSON Schema 位于 `schemas/`，并由 `GET /internal/v1/schemas` 提供。`GET /internal/v1/provider-types` 还会返回每种 provider 贡献的配置与 credential Schema，前端直接交给 JSON Schema 表单渲染器。API key、OAuth 和无需认证的私有上游都是同一种稳定上游账号的 credential；轮换只推进 generation，请求历史继续引用同一个账号主键。credential 使用带认证加密后再写入数据库，并且管理 API 只返回脱敏元信息。
 
 Copilot/Cursor 订阅登录入口为 `/internal/v1/oauth/subscription-bridge/start` 与 `/internal/v1/oauth/subscription-bridge/poll`。Token Center 只加密保存 bridge 返回的 opaque handle 和可选 bridge secret，真实 OAuth 状态继续隔离在 bridge 的持久卷中；下游 OpenAI Chat 请求会原生映射到 bridge `/v1/execute`，并继续执行同一套模型权限、额度、限流、计费和归档。Cursor 直接 PKCE 入口为 `/internal/v1/oauth/cursor/start` 与 `/internal/v1/oauth/cursor/poll`，刷新入口为 `/internal/v1/upstreams/{account_id}/oauth/refresh`。Cursor 原生 Connect/Agent Runtime 到公开协议的转换仍需对应 provider adapter，不能假装成无损 OpenAI 兼容。
+
+`POST /internal/v1/imports/cpa/subscription-accounts` 可以上传 CPA 导出的 Copilot/Cursor auth JSON，并把 opaque handle 幂等迁移为稳定上游账号；API 不返回 handle、bridge secret 或原文件正文。Codex、Kimi 等 auth 文件会以 `requires_provider_adapter` 明确跳过，因为它们的私有 OAuth 执行与刷新语义不是公开 OpenAI API 契约；可以继续把 CPA 当兼容上游，或安装经过审核的 provider adapter，不能把 token 文件机械伪装成通用 OAuth。
 
 插件 ABI 位于 `wit/token-center.wit`；运行时使用 Wasmtime Component Model，每次调用限制 32 MiB 与固定 fuel，HTTP 只能访问 manifest 中由运维审核的精确 origin。声明 `kv` capability 的插件可以使用 PostgreSQL/SQLite 中按插件 ID 隔离的持久 KV，每个值上限 1 MiB、每个插件上限 16 MiB；未声明 capability 的调用会在 host 边界被拒绝。OCI 插件包格式、`plugin.json` 和 capability 限制见 `plugins/README.md`。Helm Chart 可从只读 ConfigMap/PVC 加载插件；生产 values 只引用外部 PostgreSQL/S3 Secret，不把凭证写入 ConfigMap。
 
