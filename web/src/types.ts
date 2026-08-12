@@ -50,6 +50,46 @@ export interface SelfStats {
   errors: StatsBucket[];
 }
 
+export interface KeyView {
+  key_id: string;
+  alias: string;
+  currency: string;
+  credential_generation: number;
+  created_at: number;
+  policy: {
+    allowed_models: string[];
+    requests_per_minute: number;
+    tokens_per_minute: number;
+    max_concurrency: number;
+    daily_budget: string | null;
+    weekly_budget: string | null;
+    lifetime_budget: string | null;
+  };
+  available_balance: string;
+}
+
+export interface ConversationCluster {
+  cluster_id: string;
+  explicit_session_id: string | null;
+  updated_at: number;
+  request_count: number;
+  candidate_edge_count: number;
+}
+
+export interface ConversationEdge {
+  from_request_id: string | null;
+  to_request_id: string;
+  relation: 'continues' | 'retry' | 'edit' | 'branch' | 'compacts' | 'subagent' | 'candidate';
+  confidence: number;
+  evidence: unknown;
+}
+
+export interface ConversationDetail {
+  cluster: ConversationCluster;
+  requests: RequestView[];
+  edges: ConversationEdge[];
+}
+
 export interface GenerationJob {
   job_id: string;
   created_at: number;
