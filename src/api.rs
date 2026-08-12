@@ -38,14 +38,16 @@ use crate::{
     error::AppError,
     model::{AuthenticatedKey, AuthenticatedService, KeyPolicy},
     oauth::{
-        CursorOAuthEndpoints, CursorPollResult, StartCursorLogin, poll_cursor_login,
-        refresh_cursor_credential, start_cursor_login,
+        CursorOAuthEndpoints, CursorPollResult, StartCursorLogin, StartSubscriptionBridgeLogin,
+        SubscriptionBridgePollResult, poll_cursor_login, poll_subscription_bridge_login,
+        refresh_cursor_credential, start_cursor_login, start_subscription_bridge_login,
     },
     plugin::memeloop::token_center::types::RequestContext,
     provider::UpstreamCredential,
 };
 
 const REQUEST_ID_HEADER: &str = "x-mtc-request-id";
+const MAX_SUBSCRIPTION_BRIDGE_RESPONSE: usize = 16 * 1024 * 1024;
 
 pub fn router(state: AppState) -> Router {
     router_for_role(state, RuntimeRole::All)
@@ -84,6 +86,14 @@ fn control_router() -> Router<AppState> {
         .route("/internal/v1/schemas", get(configuration_schemas))
         .route("/internal/v1/oauth/cursor/start", post(start_cursor_oauth))
         .route("/internal/v1/oauth/cursor/poll", post(poll_cursor_oauth))
+        .route(
+            "/internal/v1/oauth/subscription-bridge/start",
+            post(start_subscription_bridge_oauth),
+        )
+        .route(
+            "/internal/v1/oauth/subscription-bridge/poll",
+            post(poll_subscription_bridge_oauth),
+        )
         .route(
             "/internal/v1/upstreams",
             get(list_upstreams).post(create_upstream),
@@ -427,6 +437,90 @@ async fn poll_cursor_oauth(
                         tenant_external_id: ready.tenant_external_id,
                         name: ready.account_name,
                         driver: ready.provider_driver,
+                        config: ready.provider_config,
+                        credential: ready.credential,
+                        oauth_session_id: Some(ready.session_id),
+                    },
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await?;
+            Ok((StatusCode::CREATED, Json(account)).into_response())
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StartSubscriptionBridgeOAuthRequest {
+    #[serde(default = "default_tenant")]
+    tenant_external_id: String,
+    account_name: String,
+    provider: String,
+    base_url: String,
+    bridge_secret: Option<String>,
+}
+
+async fn start_subscription_bridge_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StartSubscriptionBridgeOAuthRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "oauth:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    Ok(Json(
+        start_subscription_bridge_login(
+            &state.http,
+            StartSubscriptionBridgeLogin {
+                tenant_external_id: body.tenant_external_id,
+                account_name: body.account_name,
+                provider_config: json!({
+                    "base_url": body.base_url,
+                    "provider": body.provider
+                }),
+                bridge_secret: body.bridge_secret,
+            },
+            state.config.key_pepper.as_bytes(),
+            unix_millis(),
+        )
+        .await?,
+    ))
+}
+
+async fn poll_subscription_bridge_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PollCursorOAuthRequest>,
+) -> Result<Response, AppError> {
+    let service = require_service(&headers, &state, "oauth:write").await?;
+    match poll_subscription_bridge_login(
+        &state.http,
+        &body.session_token,
+        state.config.key_pepper.as_bytes(),
+        unix_millis(),
+    )
+    .await?
+    {
+        SubscriptionBridgePollResult::Pending {
+            retry_after_seconds,
+            message,
+        } => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "pending",
+                "retry_after_seconds": retry_after_seconds,
+                "message": message
+            })),
+        )
+            .into_response()),
+        SubscriptionBridgePollResult::Ready(ready) => {
+            let ready = *ready;
+            require_service_tenant(&service, &ready.tenant_external_id)?;
+            let account = state
+                .db
+                .create_upstream_account(
+                    CreateUpstreamAccountInput {
+                        tenant_external_id: ready.tenant_external_id,
+                        name: ready.account_name,
+                        driver: "cpa-subscription-bridge".to_owned(),
                         config: ready.provider_config,
                         credential: ready.credential,
                         oauth_session_id: Some(ready.session_id),
@@ -1144,6 +1238,8 @@ async fn proxy(
         upstream_model,
         upstream_account_id,
         model_route_id,
+        route_driver,
+        route_config,
     ) = if let Some(route) = resolved_route {
         if !state.providers.contains(&route.driver) {
             return Err(AppError::Upstream(format!(
@@ -1159,6 +1255,8 @@ async fn proxy(
             route.upstream_model,
             Some(route.account_id),
             Some(route.route_id),
+            Some(route.driver),
+            Some(route.config),
         )
     } else {
         let (base_url, upstream_key) = if protocol.is_openai() {
@@ -1179,8 +1277,31 @@ async fn proxy(
             model.clone(),
             None,
             None,
+            None,
+            None,
         )
     };
+    if route_driver.as_deref() == Some("cpa-subscription-bridge") {
+        if !matches!(protocol, Protocol::OpenAiChat) {
+            return Err(AppError::BadRequest(
+                "CPA subscription bridge supports OpenAI chat completions only".into(),
+            ));
+        }
+        let valid_provider = route_config
+            .as_ref()
+            .and_then(|config| config.get("provider"))
+            .and_then(Value::as_str)
+            .is_some_and(|provider| matches!(provider, "copilot" | "cursor"));
+        let has_handle = upstream_credential
+            .as_ref()
+            .and_then(UpstreamCredential::subscription_bridge_handle)
+            .is_some();
+        if !valid_provider || !has_handle {
+            return Err(AppError::Upstream(
+                "subscription bridge account configuration is invalid".into(),
+            ));
+        }
+    }
     let mut forwarded_json = request_json.clone();
     if let Some(value) = forwarded_json.get_mut("model") {
         *value = Value::String(upstream_model);
@@ -1208,7 +1329,6 @@ async fn proxy(
         .reserve_usage(&key, &price, input_token_ceiling, output_token_ceiling)
         .await?;
 
-    let path = protocol.path();
     let request_id = Uuid::now_v7();
     let response_staging = format!("staging/{request_id}/response.bin");
     let stored_request = match state.archive.put_content(body.clone()).await {
@@ -1251,9 +1371,45 @@ async fn proxy(
     }
 
     let started = Instant::now();
+    let bridge_stream = forwarded_json
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (request_path, request_body) = if route_driver.as_deref() == Some("cpa-subscription-bridge")
+    {
+        let provider = route_config
+            .as_ref()
+            .and_then(|config| config.get("provider"))
+            .and_then(Value::as_str)
+            .filter(|provider| matches!(*provider, "copilot" | "cursor"))
+            .ok_or_else(|| AppError::Upstream("subscription bridge provider is invalid".into()))?;
+        let handle = upstream_credential
+            .as_ref()
+            .and_then(UpstreamCredential::subscription_bridge_handle)
+            .ok_or_else(|| {
+                AppError::Upstream("subscription bridge account has no handle".into())
+            })?;
+        (
+            "/v1/execute",
+            serde_json::to_vec(&json!({
+                "provider": provider,
+                "handle": handle,
+                "model": forwarded_json.get("model").and_then(Value::as_str),
+                "stream": bridge_stream,
+                "payload": forwarded_json
+            }))
+            .map_err(|_| AppError::Internal)?,
+        )
+    } else {
+        (protocol.path(), forwarded_body)
+    };
     let mut request = state
         .http
-        .post(format!("{}{}", base_url.trim_end_matches('/'), path))
+        .post(format!(
+            "{}{}",
+            base_url.trim_end_matches('/'),
+            request_path
+        ))
         .header(header::CONTENT_TYPE, "application/json")
         .header(
             header::ACCEPT,
@@ -1262,7 +1418,7 @@ async fn proxy(
                 .cloned()
                 .unwrap_or(HeaderValue::from_static("application/json")),
         )
-        .body(forwarded_body);
+        .body(request_body);
     if let Some(credential) = upstream_credential.as_ref() {
         request = credential.apply(request, unix_millis())?;
     } else if let Some(upstream_key) = legacy_upstream_key.as_ref() {
@@ -1296,6 +1452,21 @@ async fn proxy(
             return Err(AppError::Upstream(error.to_string()));
         }
     };
+    if route_driver.as_deref() == Some("cpa-subscription-bridge") {
+        return finish_subscription_bridge_response(
+            BufferedRequest {
+                state: &state,
+                reservation,
+                request_id,
+                started,
+            },
+            upstream,
+            input_token_ceiling,
+            output_token_ceiling,
+            bridge_stream,
+        )
+        .await;
+    }
     let status = upstream.status();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let archive_writer = match state.archive.start_writer(&response_staging).await {
@@ -1348,8 +1519,11 @@ async fn proxy(
         } else {
             format!("gap://{request_id}/response")
         };
-        let (input_tokens, output_tokens) =
-            extract_usage(&usage_capture).unwrap_or((input_token_ceiling, output_token_ceiling));
+        let (input_tokens, output_tokens) = if status.is_success() {
+            extract_usage(&usage_capture).unwrap_or((input_token_ceiling, output_token_ceiling))
+        } else {
+            (0, 0)
+        };
         let actual_cost_micros = background_state
             .db
             .settle_usage(&reservation, input_tokens, output_tokens)
@@ -1385,6 +1559,211 @@ async fn proxy(
     response
         .body(Body::from_stream(ReceiverStream::new(body_receiver)))
         .map_err(|_| AppError::Internal)
+}
+
+struct BufferedRequest<'a> {
+    state: &'a AppState,
+    reservation: crate::model::UsageReservation,
+    request_id: Uuid,
+    started: Instant,
+}
+
+async fn finish_subscription_bridge_response(
+    request: BufferedRequest<'_>,
+    upstream: reqwest::Response,
+    input_token_ceiling: i64,
+    output_token_ceiling: i64,
+    stream: bool,
+) -> Result<Response, AppError> {
+    let request_id = request.request_id;
+    let upstream_status = upstream.status();
+    let raw = match read_bounded_upstream(upstream, MAX_SUBSCRIPTION_BRIDGE_RESPONSE).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            tracing::warn!(%request_id, %error, "subscription bridge response failed");
+            return finish_buffered_request(
+                &request,
+                StatusCode::BAD_GATEWAY,
+                Bytes::from_static(
+                    b"{\"error\":{\"message\":\"subscription bridge response failed\"}}",
+                ),
+                "application/json",
+                0,
+                0,
+                Some("upstream_stream".to_owned()),
+            )
+            .await;
+        }
+    };
+    if !upstream_status.is_success() {
+        return finish_buffered_request(
+            &request,
+            StatusCode::BAD_GATEWAY,
+            Bytes::from_static(
+                b"{\"error\":{\"message\":\"subscription bridge rejected the request\"}}",
+            ),
+            "application/json",
+            0,
+            0,
+            Some(format!("http_{}", upstream_status.as_u16())),
+        )
+        .await;
+    }
+    let wrapper: Value = match serde_json::from_slice(&raw) {
+        Ok(wrapper) => wrapper,
+        Err(_) => {
+            return finish_buffered_request(
+                &request,
+                StatusCode::BAD_GATEWAY,
+                Bytes::from_static(
+                    b"{\"error\":{\"message\":\"subscription bridge returned invalid JSON\"}}",
+                ),
+                "application/json",
+                0,
+                0,
+                Some("upstream_invalid_json".to_owned()),
+            )
+            .await;
+        }
+    };
+    let (body, content_type) = match unwrap_subscription_bridge_body(&wrapper, stream) {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%request_id, %error, "subscription bridge response shape is invalid");
+            return finish_buffered_request(
+                &request,
+                StatusCode::BAD_GATEWAY,
+                Bytes::from_static(b"{\"error\":{\"message\":\"subscription bridge returned an invalid response\"}}"),
+                "application/json",
+                0,
+                0,
+                Some("upstream_invalid_response".to_owned()),
+            )
+            .await;
+        }
+    };
+    let (input_tokens, output_tokens) = extract_usage(&body)
+        .filter(|(input, output)| input.saturating_add(*output) > 0)
+        .unwrap_or_else(|| {
+            (
+                estimated_tokens(input_token_ceiling),
+                estimated_tokens(i64::try_from(body.len()).unwrap_or(i64::MAX))
+                    .min(output_token_ceiling),
+            )
+        });
+    finish_buffered_request(
+        &request,
+        StatusCode::OK,
+        body,
+        content_type,
+        input_tokens,
+        output_tokens,
+        None,
+    )
+    .await
+}
+
+fn unwrap_subscription_bridge_body(
+    wrapper: &Value,
+    stream: bool,
+) -> Result<(Bytes, &'static str), AppError> {
+    if stream {
+        let chunks = wrapper
+            .get("chunks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AppError::Upstream("subscription bridge returned no chunks".into()))?;
+        let mut body = Vec::new();
+        for chunk in chunks {
+            let chunk = chunk.as_str().ok_or_else(|| {
+                AppError::Upstream("subscription bridge returned an invalid chunk".into())
+            })?;
+            if body.len().saturating_add(chunk.len()) > MAX_SUBSCRIPTION_BRIDGE_RESPONSE {
+                return Err(AppError::Upstream(
+                    "subscription bridge stream is too large".into(),
+                ));
+            }
+            body.extend_from_slice(chunk.as_bytes());
+        }
+        Ok((Bytes::from(body), "text/event-stream"))
+    } else {
+        let payload = wrapper
+            .get("payload")
+            .ok_or_else(|| AppError::Upstream("subscription bridge returned no payload".into()))?;
+        Ok((
+            Bytes::from(serde_json::to_vec(payload).map_err(|_| AppError::Internal)?),
+            "application/json",
+        ))
+    }
+}
+
+async fn finish_buffered_request(
+    request: &BufferedRequest<'_>,
+    status: StatusCode,
+    body: Bytes,
+    content_type: &'static str,
+    input_tokens: i64,
+    output_tokens: i64,
+    error_code: Option<String>,
+) -> Result<Response, AppError> {
+    let request_id = request.request_id;
+    let stored_response = match request.state.archive.put_content(body.clone()).await {
+        Ok(location) => location,
+        Err(error) => {
+            tracing::warn!(%request_id, %error, "buffered response archive gap");
+            format!("gap://{request_id}/response")
+        }
+    };
+    let actual_cost_micros = request
+        .state
+        .db
+        .settle_usage(&request.reservation, input_tokens, output_tokens)
+        .await?;
+    request
+        .state
+        .db
+        .record_request_finished(FinishRequest {
+            request_id,
+            status_code: i64::from(status.as_u16()),
+            duration_ms: request.started.elapsed().as_millis() as i64,
+            input_tokens,
+            output_tokens,
+            cost_micros: actual_cost_micros,
+            error_code,
+            response_object: stored_response,
+        })
+        .await?;
+    Response::builder()
+        .status(status)
+        .header(REQUEST_ID_HEADER, request_id.to_string())
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .map_err(|_| AppError::Internal)
+}
+
+async fn read_bounded_upstream(
+    response: reqwest::Response,
+    maximum: usize,
+) -> Result<Vec<u8>, AppError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(AppError::Upstream("upstream response is too large".into()));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| AppError::Upstream(error.to_string()))?;
+        if body.len().saturating_add(chunk.len()) > maximum {
+            return Err(AppError::Upstream("upstream response is too large".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn estimated_tokens(bytes: i64) -> i64 {
+    bytes.max(0).saturating_add(3) / 4
 }
 
 fn extract_usage(body: &[u8]) -> Option<(i64, i64)> {

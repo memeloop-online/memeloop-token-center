@@ -102,3 +102,11 @@ Feature: Stable key identity and read-only self-service statistics
     And the client creates a ComfyUI image generation
     Then the response status is 202
     And the ComfyUI generation eventually succeeds with an archived image costing 0.2
+
+  Scenario: Copilot subscription OAuth uses an opaque bridge handle
+    Given a token center backed by SQLite and memory object storage
+    And the mock CPA subscription bridge completes Copilot OAuth and inference
+    When the service creates a Copilot bridge account route and key
+    And the client calls model "copilot-public"
+    Then the response status is 200
+    And the Copilot response is unwrapped without exposing the bridge handle

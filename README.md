@@ -25,7 +25,7 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 - 多模态生成：`/v1/generations`、`/v1/videos/generations`、`/v1/images/generations`；内置火山引擎 Seedance 视频任务与 ComfyUI 本地/Cloud 图片、视频工作流，统一执行模型权限、额度预留、限流、计费、轮询和 S3/CAS 归档。
 - Service：创建/轮换 key、设置同币种模型价格、幂等发放余额；可创建 tenant 绑定、scope 最小化的服务凭据供 memeloop web 使用。服务凭据也有稳定 UUID 与 generation，轮换后旧 token 立即失效。
 - Provider：创建稳定上游账号、轮换 API/OAuth credential、配置无需认证的私有 ComfyUI、建立公开模型到上游模型的路由。
-- OAuth：Cursor PKCE 登录、轮询完成和 refresh；登录状态是有时限的加密 token，可跨 K8s 副本重试。
+- OAuth：原生接入 CPA Subscription Bridge 的 GitHub Copilot/Cursor 订阅登录、opaque handle 推理，以及 Cursor 直接 PKCE/refresh；登录状态是有时限的加密 token，可跨 K8s 副本重试。
 - Self-service：key 信息、请求列表/详情、聚合统计、逻辑会话簇/关系边。
 - Operator：`/internal/v1/request-events` 以追加式 started/finished 事件提供 SSE 尾流，跨副本从 PostgreSQL 游标续读，不加载归档正文。
 
@@ -54,7 +54,7 @@ cargo test
 cargo test --test cucumber
 ```
 
-Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，不需要 PostgreSQL 或真实 S3。当前覆盖 11 个场景、80 个步骤，包括稳定 key 轮换、权限/额度/限流、OpenAI/Anthropic、API/OAuth 同管线、Cursor PKCE、逻辑会话以及 Seedance/ComfyUI 异步生成与归档。
+Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，不需要 PostgreSQL 或真实 S3。当前覆盖 12 个场景、86 个步骤，包括稳定 key 轮换、权限/额度/限流、OpenAI/Anthropic、API/OAuth 同管线、Cursor PKCE、Copilot/Cursor subscription bridge、逻辑会话以及 Seedance/ComfyUI 异步生成与归档。
 
 数据库 DDL 位于 `migrations/`，每个版本都在同一事务和 PostgreSQL advisory transaction lock 下应用。PostgreSQL 的请求与事件表按天分区，并为 key/tenant/模型/状态/错误/上游/逻辑会话尾查建立专用 B-tree 与 BRIN 索引；生成任务有领取、稳定 key 时间线、上游任务和预留关联索引。SQLite 保留等价的小型测试 schema。连接池默认每进程最多 8 个连接且不预热，HTTP 上游连接池也有严格空闲上限；控制响应与生成文件分别有 4 MiB 和 512 MiB 流式上限。
 
@@ -62,7 +62,7 @@ Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，�
 
 核心、key、service token、provider 账号、模型路由和生成价格的 JSON Schema 位于 `schemas/`，并由 `GET /internal/v1/schemas` 提供。`GET /internal/v1/provider-types` 还会返回每种 provider 贡献的配置与 credential Schema，前端直接交给 JSON Schema 表单渲染器。API key、OAuth 和无需认证的私有上游都是同一种稳定上游账号的 credential；轮换只推进 generation，请求历史继续引用同一个账号主键。credential 使用带认证加密后再写入数据库，并且管理 API 只返回脱敏元信息。
 
-Cursor 登录入口为 `/internal/v1/oauth/cursor/start` 与 `/internal/v1/oauth/cursor/poll`，刷新入口为 `/internal/v1/upstreams/{account_id}/oauth/refresh`。这里负责 PKCE、token 生命周期与稳定账号；Cursor 原生 Connect/Agent Runtime 到公开协议的转换仍应由专用 provider 插件完成，不能假装成无损 OpenAI 兼容。当前内置 `http-json` driver 可用于兼容上游或独立适配 sidecar。
+Copilot/Cursor 订阅登录入口为 `/internal/v1/oauth/subscription-bridge/start` 与 `/internal/v1/oauth/subscription-bridge/poll`。Token Center 只加密保存 bridge 返回的 opaque handle 和可选 bridge secret，真实 OAuth 状态继续隔离在 bridge 的持久卷中；下游 OpenAI Chat 请求会原生映射到 bridge `/v1/execute`，并继续执行同一套模型权限、额度、限流、计费和归档。Cursor 直接 PKCE 入口为 `/internal/v1/oauth/cursor/start` 与 `/internal/v1/oauth/cursor/poll`，刷新入口为 `/internal/v1/upstreams/{account_id}/oauth/refresh`。Cursor 原生 Connect/Agent Runtime 到公开协议的转换仍需对应 provider adapter，不能假装成无损 OpenAI 兼容。
 
 插件 ABI 位于 `wit/token-center.wit`；运行时使用 Wasmtime Component Model，每次调用限制 32 MiB 与固定 fuel，HTTP 只能访问 manifest 中由运维审核的精确 origin。OCI 插件包格式、`plugin.json` 和 capability 限制见 `plugins/README.md`。Helm Chart 可从只读 ConfigMap/PVC 加载插件；生产 values 只引用外部 PostgreSQL/S3 Secret，不把凭证写入 ConfigMap。
 

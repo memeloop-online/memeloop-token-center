@@ -18,6 +18,10 @@ const ENVELOPE_AAD: &[u8] = b"memeloop-token-center/upstream-credential/v1";
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UpstreamCredential {
     None,
+    SubscriptionBridge {
+        handle: String,
+        secret: Option<String>,
+    },
     ApiKey {
         value: String,
         #[serde(default = "authorization_header")]
@@ -41,14 +45,14 @@ impl UpstreamCredential {
     pub fn auth_kind(&self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::SubscriptionBridge { .. } | Self::OAuth { .. } => "oauth",
             Self::ApiKey { .. } => "api_key",
-            Self::OAuth { .. } => "oauth",
         }
     }
 
     pub fn expires_at(&self) -> Option<i64> {
         match self {
-            Self::None | Self::ApiKey { .. } => None,
+            Self::None | Self::SubscriptionBridge { .. } | Self::ApiKey { .. } => None,
             Self::OAuth { expires_at, .. } => *expires_at,
         }
     }
@@ -61,6 +65,12 @@ impl UpstreamCredential {
         self.validate(now)?;
         let (secret, header, prefix) = match self {
             Self::None => return Ok(request),
+            Self::SubscriptionBridge { secret, .. } => {
+                return Ok(match secret {
+                    Some(secret) => request.bearer_auth(secret),
+                    None => request,
+                });
+            }
             Self::ApiKey {
                 value,
                 header,
@@ -83,6 +93,21 @@ impl UpstreamCredential {
     pub fn validate(&self, now: i64) -> Result<(), AppError> {
         let (secret, header, prefix) = match self {
             Self::None => return Ok(()),
+            Self::SubscriptionBridge { handle, secret } => {
+                validate_bridge_handle(handle)?;
+                let Some(secret) = secret.as_ref() else {
+                    return Ok(());
+                };
+                if secret.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "subscription bridge secret cannot be empty".into(),
+                    ));
+                }
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).map_err(
+                    |_| AppError::BadRequest("invalid subscription bridge secret".into()),
+                )?;
+                return Ok(());
+            }
             Self::ApiKey {
                 value,
                 header,
@@ -114,6 +139,27 @@ impl UpstreamCredential {
             .map_err(|_| AppError::BadRequest("invalid upstream credential value".into()))?;
         Ok(())
     }
+
+    pub fn subscription_bridge_handle(&self) -> Option<&str> {
+        match self {
+            Self::SubscriptionBridge { handle, .. } => Some(handle),
+            _ => None,
+        }
+    }
+}
+
+fn validate_bridge_handle(handle: &str) -> Result<(), AppError> {
+    if handle.is_empty()
+        || handle.len() > 80
+        || !handle
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return Err(AppError::BadRequest(
+            "subscription bridge handle must be 1-80 ASCII alphanumeric characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn authorization_header() -> String {
@@ -237,6 +283,34 @@ impl ProviderCatalog {
                 }
             }),
             credential_schema: credential_schema.clone(),
+            source: "builtin".to_owned(),
+        });
+        types.push(ProviderType {
+            id: "cpa-subscription-bridge".to_owned(),
+            display_name: "CPA Copilot/Cursor subscription bridge".to_owned(),
+            protocols: vec!["openai".to_owned()],
+            modalities: vec!["text".to_owned()],
+            config_schema: json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["base_url", "provider"],
+                "properties": {
+                    "base_url": {"type": "string", "format": "uri"},
+                    "provider": {"type": "string", "enum": ["copilot", "cursor"]}
+                }
+            }),
+            credential_schema: json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "handle"],
+                "properties": {
+                    "type": {"const": "subscription_bridge"},
+                    "handle": {"type": "string", "pattern": "^[A-Za-z0-9]{1,80}$", "writeOnly": true},
+                    "secret": {"type": "string", "minLength": 1, "writeOnly": true}
+                }
+            }),
             source: "builtin".to_owned(),
         });
         types.push(ProviderType {
@@ -455,5 +529,32 @@ mod tests {
             serde_json::from_value(json!({"type": "none"})).unwrap();
         assert_eq!(credential.auth_kind(), "none");
         credential.validate(42).unwrap();
+    }
+
+    #[test]
+    fn subscription_bridge_credential_round_trips_without_exposing_handle_or_secret() {
+        let credential = UpstreamCredential::SubscriptionBridge {
+            handle: "OpaqueHandle123".to_owned(),
+            secret: Some("bridge-secret".to_owned()),
+        };
+        credential.validate(42).unwrap();
+        let envelope =
+            seal_credential(&credential, b"a key material with at least 32 bytes").unwrap();
+        assert!(!envelope.contains("OpaqueHandle123"));
+        assert!(!envelope.contains("bridge-secret"));
+        let opened = open_credential(&envelope, b"a key material with at least 32 bytes").unwrap();
+        assert_eq!(opened.auth_kind(), "oauth");
+        assert_eq!(opened.subscription_bridge_handle(), Some("OpaqueHandle123"));
+    }
+
+    #[test]
+    fn subscription_bridge_rejects_unsafe_handles() {
+        for handle in ["", "../account", "contains space", "handle_with_symbol"] {
+            let credential = UpstreamCredential::SubscriptionBridge {
+                handle: handle.to_owned(),
+                secret: None,
+            };
+            assert!(credential.validate(42).is_err(), "accepted {handle:?}");
+        }
     }
 }

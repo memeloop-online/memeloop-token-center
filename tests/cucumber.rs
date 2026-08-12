@@ -34,6 +34,7 @@ struct TokenCenterWorld {
     old_service_token: String,
     stable_service_id: Option<Uuid>,
     generation_job_id: Option<Uuid>,
+    subscription_session_token: String,
     status: Option<StatusCode>,
     response: Value,
 }
@@ -60,6 +61,7 @@ impl Default for TokenCenterWorld {
             old_service_token: String::new(),
             stable_service_id: None,
             generation_job_id: None,
+            subscription_session_token: String::new(),
             status: None,
             response: Value::Null,
         }
@@ -492,6 +494,158 @@ async fn assert_generation_stats(world: &TokenCenterWorld, model: &str, cost: &s
     .await
     .expect("generation lifecycle events before timeout");
     assert!(lifecycle.contains("\"protocol\":\"generation\""));
+}
+
+#[given("the mock CPA subscription bridge completes Copilot OAuth and inference")]
+async fn mock_copilot_subscription_bridge(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/start"))
+        .and(header("authorization", "Bearer bridge-secret"))
+        .and(body_partial_json(json!({"provider": "copilot"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "url": "https://github.com/login/device?user_code=TEST-CODE",
+            "state": "bridge-login-state",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "metadata": {"user_code": "TEST-CODE"}
+        })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/poll"))
+        .and(header("authorization", "Bearer bridge-secret"))
+        .and(body_partial_json(json!({
+            "provider": "copilot",
+            "state": "bridge-login-state"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "success",
+            "message": "login completed",
+            "auth": {
+                "type": "subscription-bridge",
+                "upstream": "copilot",
+                "handle": "opaquehandle123",
+                "label": "Copilot subscription"
+            }
+        })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/execute"))
+        .and(header("authorization", "Bearer bridge-secret"))
+        .and(body_partial_json(json!({
+            "provider": "copilot",
+            "handle": "opaquehandle123",
+            "model": "copilot-upstream"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "payload": {
+                "id": "chatcmpl-copilot",
+                "object": "chat.completion",
+                "choices": [{"message": {"role": "assistant", "content": "hello from Copilot"}}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            }
+        })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[when("the service creates a Copilot bridge account route and key")]
+async fn create_copilot_bridge_route_and_key(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let start = world
+        .client
+        .post(format!(
+            "{}/internal/v1/oauth/subscription-bridge/start",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "account_name": "copilot-subscription",
+            "provider": "copilot",
+            "base_url": mock_url,
+            "bridge_secret": "bridge-secret"
+        }))
+        .send()
+        .await
+        .expect("start Copilot bridge OAuth");
+    assert_eq!(start.status(), StatusCode::OK);
+    let started: Value = start.json().await.expect("Copilot start JSON");
+    assert!(
+        started["login_url"]
+            .as_str()
+            .is_some_and(|url| url.contains("user_code=TEST-CODE"))
+    );
+    world.subscription_session_token = started["session_token"]
+        .as_str()
+        .expect("subscription session token")
+        .to_owned();
+    let poll = world
+        .client
+        .post(format!(
+            "{}/internal/v1/oauth/subscription-bridge/poll",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"session_token": world.subscription_session_token}))
+        .send()
+        .await
+        .expect("poll Copilot bridge OAuth");
+    assert_eq!(poll.status(), StatusCode::CREATED);
+    let account: Value = poll.json().await.expect("Copilot account JSON");
+    assert_eq!(account["auth_kind"], "oauth");
+    let route = world
+        .client
+        .post(format!("{}/internal/v1/model-routes", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "public_model": "copilot-public",
+            "upstream_account_id": account["id"],
+            "upstream_model": "copilot-upstream",
+            "protocol": "openai"
+        }))
+        .send()
+        .await
+        .expect("create Copilot route");
+    assert_eq!(route.status(), StatusCode::CREATED);
+    let price = world
+        .client
+        .post(format!(
+            "{}/internal/v1/prices/USD/copilot-public",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"input_per_million": "1", "output_per_million": "1"}))
+        .send()
+        .await
+        .expect("create Copilot price");
+    assert_eq!(price.status(), StatusCode::OK);
+    let key = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "principal_external_id": "copilot-user",
+            "alias": "copilot",
+            "currency": "USD",
+            "initial_balance": "10",
+            "policy": {"allowed_models": ["copilot-public"]}
+        }))
+        .send()
+        .await
+        .expect("create Copilot key");
+    assert_eq!(key.status(), StatusCode::CREATED);
+    let key: Value = key.json().await.expect("Copilot key JSON");
+    world.current_key = key["key"].as_str().expect("Copilot key").to_owned();
+}
+
+#[then("the Copilot response is unwrapped without exposing the bridge handle")]
+async fn copilot_response_is_unwrapped(world: &mut TokenCenterWorld) {
+    assert_eq!(
+        world.response["choices"][0]["message"]["content"],
+        "hello from Copilot"
+    );
+    assert!(world.response.get("payload").is_none());
+    assert!(!world.response.to_string().contains("opaquehandle123"));
 }
 
 #[given("the mock OpenAI upstream returns a successful completion")]
