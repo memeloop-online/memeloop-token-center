@@ -128,4 +128,32 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].event_kind, "started");
     assert_eq!(events[1].event_kind, "finished");
+
+    assert_eq!(
+        database
+            .grant(
+                issued.account_id,
+                Decimal::ONE,
+                "postgres-subscription",
+                &format!("postgres:{unique}:grant"),
+            )
+            .await
+            .unwrap(),
+        "1"
+    );
+    let reversal_idempotency = format!("postgres:{unique}:reversal");
+    for _ in 0..2 {
+        assert_eq!(
+            database
+                .reverse_grant(
+                    issued.account_id,
+                    &format!("postgres:{unique}:grant"),
+                    "postgres-subscription-cancelled",
+                    &reversal_idempotency,
+                )
+                .await
+                .unwrap(),
+            "1"
+        );
+    }
 }

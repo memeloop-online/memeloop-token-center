@@ -1,9 +1,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{Days, Utc};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use sha2::{Digest, Sha256};
 use sqlx::{
-    AnyPool, Row,
+    AnyConnection, AnyPool, Row,
     any::{AnyPoolOptions, AnyQueryResult, AnyRow},
 };
 use uuid::Uuid;
@@ -120,6 +121,9 @@ pub struct FinishGenerationJobInput<'a> {
 
 impl Database {
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
+        // `$n` placeholders are accepted by both PostgreSQL and SQLite. `sqlx::Any` deliberately
+        // does not translate `?` into PostgreSQL placeholders, so all queries in this module use
+        // the shared `$n` form.
         sqlx::any::install_default_drivers();
         let backend = if database_url.starts_with("sqlite:") {
             DatabaseBackend::Sqlite
@@ -157,14 +161,14 @@ impl Database {
         for column in ["upstream_account_id", "model_route_id"] {
             let exists = match self.backend {
                 DatabaseBackend::PostgreSql => sqlx::query(
-                    "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'request_records' AND column_name = ?",
+                    "SELECT column_name::TEXT AS column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'request_records' AND column_name = $1",
                 )
                 .bind(column)
                 .fetch_optional(&mut *transaction)
                 .await?
                 .is_some(),
                 DatabaseBackend::Sqlite => sqlx::query(
-                    "SELECT name FROM pragma_table_info('request_records') WHERE name = ?",
+                    "SELECT name FROM pragma_table_info('request_records') WHERE name = $1",
                 )
                 .bind(column)
                 .fetch_optional(&mut *transaction)
@@ -181,7 +185,7 @@ impl Database {
         }
         let oauth_session_column_exists = match self.backend {
             DatabaseBackend::PostgreSql => sqlx::query(
-                "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'upstream_accounts' AND column_name = 'oauth_session_id'",
+                "SELECT column_name::TEXT AS column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'upstream_accounts' AND column_name = 'oauth_session_id'",
             )
             .fetch_optional(&mut *transaction)
             .await?
@@ -205,9 +209,7 @@ impl Database {
         .await?;
         apply_migration_range(&mut transaction, migrations, 2, i64::MAX).await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            sqlx::raw_sql(POSTGRES_REQUEST_PARTITIONS)
-                .execute(&mut *transaction)
-                .await?;
+            maintain_postgres_partitions(&mut transaction).await?;
         }
         transaction.commit().await?;
         Ok(())
@@ -215,9 +217,8 @@ impl Database {
 
     pub async fn maintain_partitions(&self) -> Result<(), sqlx::Error> {
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            sqlx::raw_sql(POSTGRES_REQUEST_PARTITIONS)
-                .execute(&self.pool)
-                .await?;
+            let mut connection = self.pool.acquire().await?;
+            maintain_postgres_partitions(&mut connection).await?;
         }
         Ok(())
     }
@@ -270,13 +271,13 @@ impl Database {
 
         if let Some(idempotency_key) = idempotency_key {
             if matches!(self.backend, DatabaseBackend::PostgreSql) {
-                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(?, 734627102948312))")
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948312))")
                     .bind(idempotency_key)
                     .execute(&mut *tx)
                     .await?;
             }
             let existing = sqlx::query(
-                "SELECT provisioning_request_hash, issued_key_ciphertext FROM key_records WHERE provisioning_idempotency_key = ?",
+                "SELECT provisioning_request_hash, issued_key_ciphertext FROM key_records WHERE provisioning_idempotency_key = $1",
             )
             .bind(idempotency_key)
             .fetch_optional(&mut *tx)
@@ -306,21 +307,21 @@ impl Database {
         }
 
         sqlx::query(
-            "INSERT INTO tenants (id, external_id, created_at) VALUES (?, ?, ?) ON CONFLICT(external_id) DO NOTHING",
+            "INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, $3) ON CONFLICT(external_id) DO NOTHING",
         )
         .bind(tenant_id.to_string())
         .bind(&input.tenant_external_id)
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        let tenant_id: String = sqlx::query("SELECT id FROM tenants WHERE external_id = ?")
+        let tenant_id: String = sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
             .bind(&input.tenant_external_id)
             .fetch_one(&mut *tx)
             .await?
             .try_get("id")?;
 
         sqlx::query(
-            "INSERT INTO principals (id, tenant_id, external_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(tenant_id, external_id) DO NOTHING",
+            "INSERT INTO principals (id, tenant_id, external_id, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT(tenant_id, external_id) DO NOTHING",
         )
         .bind(principal_id.to_string())
         .bind(&tenant_id)
@@ -329,7 +330,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let principal_id: String =
-            sqlx::query("SELECT id FROM principals WHERE tenant_id = ? AND external_id = ?")
+            sqlx::query("SELECT id FROM principals WHERE tenant_id = $1 AND external_id = $2")
                 .bind(&tenant_id)
                 .bind(&input.principal_external_id)
                 .fetch_one(&mut *tx)
@@ -337,7 +338,7 @@ impl Database {
                 .try_get("id")?;
 
         sqlx::query(
-            "INSERT INTO credit_accounts (id, tenant_id, principal_id, currency, available_micros, reserved_micros, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            "INSERT INTO credit_accounts (id, tenant_id, principal_id, currency, available_micros, reserved_micros, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)",
         )
         .bind(account_id.to_string())
         .bind(&tenant_id)
@@ -362,7 +363,7 @@ impl Database {
             .map(|_| seal_private_json(&issued_key, pepper, KEY_PROVISIONING_AAD))
             .transpose()?;
         sqlx::query(
-            "INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, provisioning_idempotency_key, provisioning_request_hash, issued_key_ciphertext, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, ?)",
+            "INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, provisioning_idempotency_key, provisioning_request_hash, issued_key_ciphertext, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', 1, $8, $9, $10, $11, $12)",
         )
         .bind(key_id.to_string())
         .bind(&tenant_id)
@@ -382,7 +383,7 @@ impl Database {
         insert_credential(&mut tx, &issued, 1, now).await?;
         if initial_balance_micros != 0 {
             sqlx::query(
-                "INSERT INTO ledger_entries (id, account_id, key_id, kind, amount_micros, currency, source, created_at) VALUES (?, ?, ?, 'grant', ?, ?, 'initial', ?)",
+                "INSERT INTO ledger_entries (id, account_id, key_id, kind, amount_micros, currency, source, created_at) VALUES ($1, $2, $3, 'grant', $4, $5, 'initial', $6)",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(account_id.to_string())
@@ -410,7 +411,7 @@ impl Database {
         let scopes_json = serde_json::to_string(&input.scopes).map_err(|_| AppError::Internal)?;
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO service_principals (id, name, status, credential_generation, created_at, updated_at) VALUES (?, ?, 'active', 1, ?, ?)",
+            "INSERT INTO service_principals (id, name, status, credential_generation, created_at, updated_at) VALUES ($1, $2, 'active', 1, $3, $4)",
         )
         .bind(service_id.to_string())
         .bind(input.name.trim())
@@ -419,7 +420,7 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
-            "INSERT INTO service_credentials (id, service_principal_id, generation, secret_hash, fingerprint, scopes_json, tenant_external_id, created_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+            "INSERT INTO service_credentials (id, service_principal_id, generation, secret_hash, fingerprint, scopes_json, tenant_external_id, created_at) VALUES ($1, $2, 1, $3, $4, $5, $6, $7)",
         )
         .bind(issued.credential_id.to_string())
         .bind(service_id.to_string())
@@ -450,7 +451,7 @@ impl Database {
         validate_policy_budgets(&policy)?;
         let policy_json = serde_json::to_string(&policy).map_err(|_| AppError::Internal)?;
         let result = sqlx::query(
-            "UPDATE key_records SET policy_json = ?, updated_at = ? WHERE id = ? AND status = 'active'",
+            "UPDATE key_records SET policy_json = $1, updated_at = $2 WHERE id = $3 AND status = 'active'",
         )
         .bind(policy_json)
         .bind(unix_millis())
@@ -472,7 +473,7 @@ impl Database {
         let issued = crypto::issue_service_credential(service_id, pepper);
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT p.name, p.status, p.credential_generation, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL WHERE p.id = ?",
+            "SELECT p.name, p.status, p.credential_generation, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL WHERE p.id = $1",
         )
         .bind(service_id.to_string())
         .fetch_optional(&mut *transaction)
@@ -488,14 +489,14 @@ impl Database {
         let tenant_external_id: Option<String> = row.try_get("tenant_external_id")?;
         let name: String = row.try_get("name")?;
         sqlx::query(
-            "UPDATE service_credentials SET revoked_at = ? WHERE service_principal_id = ? AND revoked_at IS NULL",
+            "UPDATE service_credentials SET revoked_at = $1 WHERE service_principal_id = $2 AND revoked_at IS NULL",
         )
         .bind(now)
         .bind(service_id.to_string())
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
-            "INSERT INTO service_credentials (id, service_principal_id, generation, secret_hash, fingerprint, scopes_json, tenant_external_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO service_credentials (id, service_principal_id, generation, secret_hash, fingerprint, scopes_json, tenant_external_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(issued.credential_id.to_string())
         .bind(service_id.to_string())
@@ -508,7 +509,7 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
-            "UPDATE service_principals SET credential_generation = ?, updated_at = ? WHERE id = ?",
+            "UPDATE service_principals SET credential_generation = $1, updated_at = $2 WHERE id = $3",
         )
         .bind(generation)
         .bind(now)
@@ -534,7 +535,7 @@ impl Database {
     ) -> Result<AuthenticatedService, AppError> {
         let parsed = crypto::parse_service_credential(value).ok_or(AppError::Unauthorized)?;
         let row = sqlx::query(
-            "SELECT p.status, c.secret_hash, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL WHERE p.id = ?",
+            "SELECT p.status, c.secret_hash, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL WHERE p.id = $1",
         )
         .bind(parsed.key_id.to_string())
         .fetch_optional(&self.pool)
@@ -558,7 +559,7 @@ impl Database {
         let now = unix_millis();
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT account_id, alias, currency, credential_generation, status FROM key_records WHERE id = ?",
+            "SELECT account_id, alias, currency, credential_generation, status FROM key_records WHERE id = $1",
         )
         .bind(key_id.to_string())
         .fetch_optional(&mut *tx)
@@ -575,7 +576,7 @@ impl Database {
         let issued = crypto::issue_credential(key_id, pepper);
 
         sqlx::query(
-            "UPDATE key_credentials SET revoked_at = ? WHERE key_id = ? AND revoked_at IS NULL",
+            "UPDATE key_credentials SET revoked_at = $1 WHERE key_id = $2 AND revoked_at IS NULL",
         )
         .bind(now)
         .bind(key_id.to_string())
@@ -583,7 +584,7 @@ impl Database {
         .await?;
         insert_credential(&mut tx, &issued, generation, now).await?;
         sqlx::query(
-            "UPDATE key_records SET credential_generation = ?, updated_at = ? WHERE id = ?",
+            "UPDATE key_records SET credential_generation = $1, updated_at = $2 WHERE id = $3",
         )
         .bind(generation)
         .bind(now)
@@ -624,21 +625,21 @@ impl Database {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "INSERT INTO tenants (id, external_id, created_at) VALUES (?, ?, ?) ON CONFLICT(external_id) DO NOTHING",
+            "INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, $3) ON CONFLICT(external_id) DO NOTHING",
         )
         .bind(tenant_candidate.to_string())
         .bind(&input.tenant_external_id)
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        let tenant_id: String = sqlx::query("SELECT id FROM tenants WHERE external_id = ?")
+        let tenant_id: String = sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
             .bind(&input.tenant_external_id)
             .fetch_one(&mut *tx)
             .await?
             .try_get("id")?;
         if let Some(session_id) = input.oauth_session_id {
             let existing = sqlx::query(
-                "SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.oauth_session_id = ?",
+                "SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.oauth_session_id = $1",
             )
             .bind(session_id.to_string())
             .fetch_optional(&mut *tx)
@@ -649,7 +650,7 @@ impl Database {
             }
         }
         sqlx::query(
-            "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, oauth_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?)",
+            "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, oauth_session_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, 'active', 1, $7, $8, $9)",
         )
         .bind(account_id.to_string())
         .bind(&tenant_id)
@@ -663,7 +664,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at) VALUES (?, ?, 1, ?, ?, ?)",
+            "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at) VALUES ($1, $2, 1, $3, $4, $5)",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(account_id.to_string())
@@ -699,7 +700,7 @@ impl Database {
         let ciphertext = seal_credential(&credential, key_material)?;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT tenant_id, name, driver, auth_kind, config_json, status, credential_generation, created_at FROM upstream_accounts WHERE id = ?",
+            "SELECT tenant_id, name, driver, auth_kind, config_json, status, credential_generation, created_at FROM upstream_accounts WHERE id = $1",
         )
         .bind(account_id.to_string())
         .fetch_optional(&mut *tx)
@@ -717,14 +718,14 @@ impl Database {
         }
         let generation: i64 = row.try_get::<i64, _>("credential_generation")? + 1;
         sqlx::query(
-            "UPDATE upstream_credentials SET revoked_at = ? WHERE upstream_account_id = ? AND revoked_at IS NULL",
+            "UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND revoked_at IS NULL",
         )
         .bind(now)
         .bind(account_id.to_string())
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(account_id.to_string())
@@ -735,7 +736,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE upstream_accounts SET credential_generation = ?, updated_at = ? WHERE id = ?",
+            "UPDATE upstream_accounts SET credential_generation = $1, updated_at = $2 WHERE id = $3",
         )
         .bind(generation)
         .bind(now)
@@ -766,7 +767,7 @@ impl Database {
         key_material: &[u8],
     ) -> Result<(UpstreamAccountView, UpstreamCredential), AppError> {
         let row = sqlx::query(
-            "SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = ?",
+            "SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1",
         )
         .bind(account_id.to_string())
         .fetch_optional(&self.pool)
@@ -797,14 +798,14 @@ impl Database {
         let now = unix_millis();
         let route_id = Uuid::now_v7();
         let mut tx = self.pool.begin().await?;
-        let tenant_id: String = sqlx::query("SELECT id FROM tenants WHERE external_id = ?")
+        let tenant_id: String = sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
             .bind(&input.tenant_external_id)
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound)?
             .try_get("id")?;
         let account_tenant: String = sqlx::query(
-            "SELECT tenant_id FROM upstream_accounts WHERE id = ? AND status = 'active'",
+            "SELECT tenant_id FROM upstream_accounts WHERE id = $1 AND status = 'active'",
         )
         .bind(input.upstream_account_id.to_string())
         .fetch_optional(&mut *tx)
@@ -815,7 +816,7 @@ impl Database {
             return Err(AppError::Forbidden);
         }
         sqlx::query(
-            "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9)",
         )
         .bind(route_id.to_string())
         .bind(&tenant_id)
@@ -846,7 +847,7 @@ impl Database {
         tenant_external_id: &str,
     ) -> Result<Vec<UpstreamAccountView>, AppError> {
         let rows = sqlx::query(
-            "SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE t.external_id = ? ORDER BY a.created_at DESC, a.id DESC",
+            "SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE t.external_id = $1 ORDER BY a.created_at DESC, a.id DESC",
         )
         .bind(tenant_external_id)
         .fetch_all(&self.pool)
@@ -874,9 +875,9 @@ impl Database {
         key_material: &[u8],
     ) -> Result<Option<ResolvedUpstream>, AppError> {
         let sql = if upstream_account_id.is_some() {
-            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE r.tenant_id = ? AND r.public_model = ? AND r.protocol = ? AND a.id = ? AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND a.id = $4 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
         } else {
-            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE r.tenant_id = ? AND r.public_model = ? AND r.protocol = ? AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
         };
         let query = sqlx::query(sql)
             .bind(tenant_id.to_string())
@@ -914,7 +915,7 @@ impl Database {
     ) -> Result<AuthenticatedKey, AppError> {
         let parsed = crypto::parse_credential(value).ok_or(AppError::Unauthorized)?;
         let row = sqlx::query(
-            "SELECT k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_records k JOIN key_credentials c ON c.key_id = k.id WHERE k.id = ? AND c.revoked_at IS NULL ORDER BY c.generation DESC",
+            "SELECT k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_records k JOIN key_credentials c ON c.key_id = k.id WHERE k.id = $1 AND c.revoked_at IS NULL ORDER BY c.generation DESC",
         )
         .bind(parsed.key_id.to_string())
         .fetch_optional(&self.pool)
@@ -941,7 +942,7 @@ impl Database {
 
     pub async fn key_view(&self, key: &AuthenticatedKey) -> Result<KeyView, AppError> {
         let row = sqlx::query(
-            "SELECT k.created_at, a.available_micros FROM key_records k JOIN credit_accounts a ON a.id = k.account_id WHERE k.id = ?",
+            "SELECT k.created_at, a.available_micros FROM key_records k JOIN credit_accounts a ON a.id = k.account_id WHERE k.id = $1",
         )
         .bind(key.key_id.to_string())
         .fetch_one(&self.pool)
@@ -963,7 +964,7 @@ impl Database {
         tenant_external_id: &str,
     ) -> Result<(), AppError> {
         let exists = sqlx::query(
-            "SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id WHERE k.id = ? AND t.external_id = ?",
+            "SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id WHERE k.id = $1 AND t.external_id = $2",
         )
         .bind(key_id.to_string())
         .bind(tenant_external_id)
@@ -979,7 +980,7 @@ impl Database {
         tenant_external_id: &str,
     ) -> Result<(), AppError> {
         let exists = sqlx::query(
-            "SELECT a.id FROM credit_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = ? AND t.external_id = ?",
+            "SELECT a.id FROM credit_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2",
         )
         .bind(account_id.to_string())
         .bind(tenant_external_id)
@@ -995,7 +996,7 @@ impl Database {
         tenant_external_id: &str,
     ) -> Result<(), AppError> {
         let exists = sqlx::query(
-            "SELECT a.id FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = ? AND t.external_id = ?",
+            "SELECT a.id FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2",
         )
         .bind(account_id.to_string())
         .bind(tenant_external_id)
@@ -1022,7 +1023,7 @@ impl Database {
         }
         let id = Uuid::now_v7();
         sqlx::query(
-            "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES (?, ?, ?, ?, ?, 'manual', ?) ON CONFLICT(model, currency) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, updated_at = excluded.updated_at",
+            "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES ($1, $2, $3, $4, $5, 'manual', $6) ON CONFLICT(model, currency) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, updated_at = excluded.updated_at",
         )
         .bind(id.to_string())
         .bind(model)
@@ -1037,7 +1038,7 @@ impl Database {
 
     pub async fn model_price(&self, model: &str, currency: &str) -> Result<ModelPrice, AppError> {
         let row = sqlx::query(
-            "SELECT id, input_micros_per_million, output_micros_per_million FROM model_prices WHERE model = ? AND currency = ?",
+            "SELECT id, input_micros_per_million, output_micros_per_million FROM model_prices WHERE model = $1 AND currency = $2",
         )
         .bind(model)
         .bind(currency.to_uppercase())
@@ -1072,7 +1073,7 @@ impl Database {
         }
         let id = Uuid::now_v7();
         sqlx::query(
-            "INSERT INTO generation_prices (id, model, currency, billing_unit, micros_per_unit, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(model, currency) DO UPDATE SET billing_unit = excluded.billing_unit, micros_per_unit = excluded.micros_per_unit, updated_at = excluded.updated_at",
+            "INSERT INTO generation_prices (id, model, currency, billing_unit, micros_per_unit, updated_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT(model, currency) DO UPDATE SET billing_unit = excluded.billing_unit, micros_per_unit = excluded.micros_per_unit, updated_at = excluded.updated_at",
         )
         .bind(id.to_string())
         .bind(model)
@@ -1091,7 +1092,7 @@ impl Database {
         currency: &str,
     ) -> Result<GenerationPrice, AppError> {
         let row = sqlx::query(
-            "SELECT id, model, currency, billing_unit, micros_per_unit FROM generation_prices WHERE model = ? AND currency = ?",
+            "SELECT id, model, currency, billing_unit, micros_per_unit FROM generation_prices WHERE model = $1 AND currency = $2",
         )
         .bind(model)
         .bind(currency.to_uppercase())
@@ -1116,7 +1117,7 @@ impl Database {
         let now = unix_millis();
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO generation_jobs (id, tenant_id, key_id, upstream_account_id, reservation_id, public_model, upstream_model, driver, status, request_object, estimated_units, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+            "INSERT INTO generation_jobs (id, tenant_id, key_id, upstream_account_id, reservation_id, public_model, upstream_model, driver, status, request_object, estimated_units, next_attempt_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', $9, $10, $11, $12, $13)",
         )
         .bind(input.job_id.to_string())
         .bind(input.key.tenant_id.to_string())
@@ -1134,7 +1135,7 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES (?, ?, ?, ?, ?, 'started', 'generation', ?, 0, 0, 0)",
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', 'generation', $6, 0, 0, 0)",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(input.key.tenant_id.to_string())
@@ -1168,7 +1169,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<GenerationJobView>, AppError> {
         let rows = sqlx::query(
-            "SELECT id, created_at, updated_at, completed_at, public_model, driver, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json FROM generation_jobs WHERE key_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            "SELECT id, created_at, updated_at, completed_at, public_model, driver, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json FROM generation_jobs WHERE key_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
         )
         .bind(key_id.to_string())
         .bind(limit.clamp(1, 200))
@@ -1183,7 +1184,7 @@ impl Database {
         job_id: Uuid,
     ) -> Result<GenerationJobView, AppError> {
         let row = sqlx::query(
-            "SELECT id, created_at, updated_at, completed_at, public_model, driver, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json FROM generation_jobs WHERE id = ? AND key_id = ?",
+            "SELECT id, created_at, updated_at, completed_at, public_model, driver, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json FROM generation_jobs WHERE id = $1 AND key_id = $2",
         )
         .bind(job_id.to_string())
         .bind(key_id.to_string())
@@ -1201,10 +1202,10 @@ impl Database {
         let mut transaction = self.pool.begin().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running') AND next_attempt_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at < ?) ORDER BY next_attempt_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1"
+                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running') AND next_attempt_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at < $2) ORDER BY next_attempt_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running') AND next_attempt_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at < ?) ORDER BY next_attempt_at, created_at, id LIMIT 1"
+                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running') AND next_attempt_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at < $2) ORDER BY next_attempt_at, created_at, id LIMIT 1"
             }
         };
         let candidate = sqlx::query(select)
@@ -1218,7 +1219,7 @@ impl Database {
         };
         let job_id: String = candidate.try_get("id")?;
         let claimed = sqlx::query(
-            "UPDATE generation_jobs SET lease_owner = ?, lease_expires_at = ?, attempt_count = attempt_count + 1, updated_at = ? WHERE id = ? AND status IN ('queued', 'running') AND (lease_expires_at IS NULL OR lease_expires_at < ?)",
+            "UPDATE generation_jobs SET lease_owner = $1, lease_expires_at = $2, attempt_count = attempt_count + 1, updated_at = $3 WHERE id = $4 AND status IN ('queued', 'running') AND (lease_expires_at IS NULL OR lease_expires_at < $5)",
         )
         .bind(worker_id)
         .bind(now.saturating_add(60_000))
@@ -1232,7 +1233,7 @@ impl Database {
             return Ok(None);
         }
         let row = sqlx::query(
-            "SELECT j.id, j.created_at, j.tenant_id, j.key_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, p.micros_per_unit FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id JOIN generation_prices p ON p.id = r.price_id WHERE j.id = ?",
+            "SELECT j.id, j.created_at, j.tenant_id, j.key_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, p.micros_per_unit FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id JOIN generation_prices p ON p.id = r.price_id WHERE j.id = $1",
         )
         .bind(&job_id)
         .fetch_one(&mut *transaction)
@@ -1277,7 +1278,7 @@ impl Database {
         upstream_job_id: &str,
     ) -> Result<(), AppError> {
         generation_update_claimed(
-            sqlx::query("UPDATE generation_jobs SET status = 'running', upstream_job_id = ?, failure_count = 0, error_code = NULL, next_attempt_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND lease_owner = ?")
+            sqlx::query("UPDATE generation_jobs SET status = 'running', upstream_job_id = $1, failure_count = 0, error_code = NULL, next_attempt_at = $2, lease_owner = NULL, lease_expires_at = NULL, updated_at = $3 WHERE id = $4 AND lease_owner = $5")
                 .bind(upstream_job_id)
                 .bind(unix_millis().saturating_add(2_000))
                 .bind(unix_millis())
@@ -1297,7 +1298,7 @@ impl Database {
     ) -> Result<(), AppError> {
         let now = unix_millis();
         generation_update_claimed(
-            sqlx::query("UPDATE generation_jobs SET next_attempt_at = ?, error_code = ?, failure_count = CASE WHEN ? IS NULL THEN 0 ELSE failure_count + 1 END, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND lease_owner = ?")
+            sqlx::query("UPDATE generation_jobs SET next_attempt_at = $1, error_code = $2, failure_count = CASE WHEN $3 IS NULL THEN 0 ELSE failure_count + 1 END, lease_owner = NULL, lease_expires_at = NULL, updated_at = $4 WHERE id = $5 AND lease_owner = $6")
                 .bind(now.saturating_add(delay_ms.max(500)))
                 .bind(error_code)
                 .bind(error_code)
@@ -1323,7 +1324,7 @@ impl Database {
             .transpose()
             .map_err(|_| AppError::Internal)?;
         let mut transaction = self.pool.begin().await?;
-        let updated = sqlx::query("UPDATE generation_jobs SET status = ?, billed_units = ?, cost_micros = ?, result_json = ?, error_code = ?, completed_at = ?, updated_at = ?, lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND lease_owner = ?")
+        let updated = sqlx::query("UPDATE generation_jobs SET status = $1, billed_units = $2, cost_micros = $3, result_json = $4, error_code = $5, completed_at = $6, updated_at = $7, lease_owner = NULL, lease_expires_at = NULL WHERE id = $8 AND lease_owner = $9")
                 .bind(input.status)
                 .bind(input.billed_units)
                 .bind(input.cost_micros)
@@ -1340,7 +1341,7 @@ impl Database {
             return Err(AppError::NotFound);
         }
         sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT ?, tenant_id, key_id, id, ?, 'finished', 'generation', public_model, CASE WHEN status = 'succeeded' THEN 200 ELSE 502 END, ? - created_at, 0, 0, cost_micros, error_code FROM generation_jobs WHERE id = ?",
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', 'generation', public_model, CASE WHEN status = 'succeeded' THEN 200 ELSE 502 END, $3 - created_at, 0, 0, cost_micros, error_code FROM generation_jobs WHERE id = $4",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(now)
@@ -1353,7 +1354,7 @@ impl Database {
     }
 
     pub async fn allowed_models(&self, key: &AuthenticatedKey) -> Result<Vec<String>, AppError> {
-        let rows = sqlx::query("SELECT model FROM model_prices WHERE currency = ? UNION SELECT model FROM generation_prices WHERE currency = ? ORDER BY model")
+        let rows = sqlx::query("SELECT model FROM model_prices WHERE currency = $1 UNION SELECT model FROM generation_prices WHERE currency = $2 ORDER BY model")
             .bind(&key.currency)
             .bind(&key.currency)
             .fetch_all(&self.pool)
@@ -1393,7 +1394,7 @@ impl Database {
         let mut tx = self.pool.begin().await?;
 
         let rate_result = sqlx::query(
-            "INSERT INTO rate_limit_windows (key_id, window_start, requests, tokens) VALUES (?, ?, 1, ?) ON CONFLICT(key_id, window_start) DO UPDATE SET requests = rate_limit_windows.requests + 1, tokens = rate_limit_windows.tokens + ? WHERE rate_limit_windows.requests < ? AND rate_limit_windows.tokens + ? <= ?",
+            "INSERT INTO rate_limit_windows (key_id, window_start, requests, tokens) VALUES ($1, $2, 1, $3) ON CONFLICT(key_id, window_start) DO UPDATE SET requests = rate_limit_windows.requests + 1, tokens = rate_limit_windows.tokens + $4 WHERE rate_limit_windows.requests < $5 AND rate_limit_windows.tokens + $6 <= $7",
         )
         .bind(key.key_id.to_string())
         .bind(window_start)
@@ -1409,7 +1410,7 @@ impl Database {
         }
 
         let concurrency_result = sqlx::query(
-            "INSERT INTO key_runtime_state (key_id, active_requests, updated_at) VALUES (?, 1, ?) ON CONFLICT(key_id) DO UPDATE SET active_requests = CASE WHEN key_runtime_state.updated_at < ? THEN 1 ELSE key_runtime_state.active_requests + 1 END, updated_at = excluded.updated_at WHERE key_runtime_state.updated_at < ? OR key_runtime_state.active_requests < ?",
+            "INSERT INTO key_runtime_state (key_id, active_requests, updated_at) VALUES ($1, 1, $2) ON CONFLICT(key_id) DO UPDATE SET active_requests = CASE WHEN key_runtime_state.updated_at < $3 THEN 1 ELSE key_runtime_state.active_requests + 1 END, updated_at = excluded.updated_at WHERE key_runtime_state.updated_at < $4 OR key_runtime_state.active_requests < $5",
         )
         .bind(key.key_id.to_string())
         .bind(now)
@@ -1423,7 +1424,7 @@ impl Database {
         }
 
         let active_reserved: i64 = sqlx::query(
-            "SELECT CAST(COALESCE(SUM(reserved_micros), 0) AS BIGINT) AS amount FROM usage_reservations WHERE key_id = ? AND status = 'reserved'",
+            "SELECT CAST(COALESCE(SUM(reserved_micros), 0) AS BIGINT) AS amount FROM usage_reservations WHERE key_id = $1 AND status = 'reserved'",
         )
         .bind(key.key_id.to_string())
         .fetch_one(&mut *tx)
@@ -1448,7 +1449,7 @@ impl Database {
                 Decimal::from_str_exact(configured_budget).map_err(|_| AppError::Internal)?,
             )?;
             let spent: i64 = sqlx::query(
-                "SELECT CAST(COALESCE(SUM(-amount_micros), 0) AS BIGINT) AS amount FROM ledger_entries WHERE key_id = ? AND kind = 'usage' AND created_at >= ?",
+                "SELECT CAST(COALESCE(SUM(-amount_micros), 0) AS BIGINT) AS amount FROM ledger_entries WHERE key_id = $1 AND kind = 'usage' AND created_at >= $2",
             )
             .bind(key.key_id.to_string())
             .bind(since)
@@ -1465,7 +1466,7 @@ impl Database {
         }
 
         let balance_result = sqlx::query(
-            "UPDATE credit_accounts SET available_micros = available_micros - ?, reserved_micros = reserved_micros + ?, updated_at = ? WHERE id = ? AND currency = ? AND available_micros >= ?",
+            "UPDATE credit_accounts SET available_micros = available_micros - $1, reserved_micros = reserved_micros + $2, updated_at = $3 WHERE id = $4 AND currency = $5 AND available_micros >= $6",
         )
         .bind(reserved_micros)
         .bind(reserved_micros)
@@ -1481,7 +1482,7 @@ impl Database {
 
         let id = Uuid::now_v7();
         sqlx::query(
-            "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, rate_window_start, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?)",
+            "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, rate_window_start, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'reserved', $8)",
         )
         .bind(id.to_string())
         .bind(key.account_id.to_string())
@@ -1529,7 +1530,7 @@ impl Database {
         let now = unix_millis();
         let mut tx = self.pool.begin().await?;
         let claimed = sqlx::query(
-            "UPDATE usage_reservations SET actual_micros = ?, status = 'settled', settled_at = ? WHERE id = ? AND status = 'reserved'",
+            "UPDATE usage_reservations SET actual_micros = $1, status = 'settled', settled_at = $2 WHERE id = $3 AND status = 'reserved'",
         )
         .bind(actual_micros)
         .bind(now)
@@ -1538,7 +1539,7 @@ impl Database {
         .await?;
         if claimed.rows_affected() == 0 {
             let existing: i64 = sqlx::query(
-                "SELECT actual_micros FROM usage_reservations WHERE id = ? AND status = 'settled'",
+                "SELECT actual_micros FROM usage_reservations WHERE id = $1 AND status = 'settled'",
             )
             .bind(reservation.id.to_string())
             .fetch_optional(&mut *tx)
@@ -1549,7 +1550,7 @@ impl Database {
             return Ok(existing);
         }
         sqlx::query(
-            "UPDATE credit_accounts SET available_micros = available_micros + ? - ?, reserved_micros = reserved_micros - ?, updated_at = ? WHERE id = ?",
+            "UPDATE credit_accounts SET available_micros = available_micros + $1 - $2, reserved_micros = reserved_micros - $3, updated_at = $4 WHERE id = $5",
         )
         .bind(released)
         .bind(overage)
@@ -1560,7 +1561,7 @@ impl Database {
         .await?;
         let actual_tokens = input_tokens.saturating_add(output_tokens).max(0);
         sqlx::query(
-            "UPDATE rate_limit_windows SET tokens = CASE WHEN tokens - ? + ? < 0 THEN 0 ELSE tokens - ? + ? END WHERE key_id = ? AND window_start = ?",
+            "UPDATE rate_limit_windows SET tokens = CASE WHEN tokens - $1 + $2 < 0 THEN 0 ELSE tokens - $3 + $4 END WHERE key_id = $5 AND window_start = $6",
         )
         .bind(reservation.reserved_tokens)
         .bind(actual_tokens)
@@ -1571,14 +1572,14 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE key_runtime_state SET active_requests = CASE WHEN active_requests > 0 THEN active_requests - 1 ELSE 0 END, updated_at = ? WHERE key_id = ?",
+            "UPDATE key_runtime_state SET active_requests = CASE WHEN active_requests > 0 THEN active_requests - 1 ELSE 0 END, updated_at = $1 WHERE key_id = $2",
         )
         .bind(now)
         .bind(reservation.key_id.to_string())
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO ledger_entries (id, account_id, key_id, kind, amount_micros, currency, source, created_at) SELECT ?, ?, ?, 'usage', ?, currency, ?, ? FROM credit_accounts WHERE id = ?",
+            "INSERT INTO ledger_entries (id, account_id, key_id, kind, amount_micros, currency, source, created_at) SELECT $1, $2, $3, 'usage', $4, currency, $5, $6 FROM credit_accounts WHERE id = $7",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(reservation.account_id.to_string())
@@ -1596,7 +1597,7 @@ impl Database {
     pub async fn release_orphaned_reservations(&self, limit: i64) -> Result<u64, AppError> {
         let cutoff = unix_millis().saturating_sub(30 * 60 * 1_000);
         let rows = sqlx::query(
-            "SELECT r.id, r.account_id, r.key_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start FROM usage_reservations r WHERE r.status = 'reserved' AND r.created_at < ? AND NOT EXISTS (SELECT 1 FROM request_records q WHERE q.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) ORDER BY r.created_at, r.id LIMIT ?",
+            "SELECT r.id, r.account_id, r.key_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start FROM usage_reservations r WHERE r.status = 'reserved' AND r.created_at < $1 AND NOT EXISTS (SELECT 1 FROM request_records q WHERE q.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) ORDER BY r.created_at, r.id LIMIT $2",
         )
         .bind(cutoff)
         .bind(limit.clamp(1, 1_000))
@@ -1623,7 +1624,7 @@ impl Database {
     pub async fn expire_key_provisioning_responses(&self, limit: i64) -> Result<u64, AppError> {
         let cutoff = unix_millis().saturating_sub(24 * 60 * 60 * 1_000);
         let result = sqlx::query(
-            "UPDATE key_records SET issued_key_ciphertext = NULL WHERE id IN (SELECT id FROM key_records WHERE issued_key_ciphertext IS NOT NULL AND created_at < ? ORDER BY created_at, id LIMIT ?)",
+            "UPDATE key_records SET issued_key_ciphertext = NULL WHERE id IN (SELECT id FROM key_records WHERE issued_key_ciphertext IS NOT NULL AND created_at < $1 ORDER BY created_at, id LIMIT $2)",
         )
         .bind(cutoff)
         .bind(limit.clamp(1, 10_000))
@@ -1652,14 +1653,14 @@ impl Database {
         }
         let now = unix_millis();
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT currency FROM credit_accounts WHERE id = ?")
+        let row = sqlx::query("SELECT currency FROM credit_accounts WHERE id = $1")
             .bind(account_id.to_string())
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound)?;
         let currency: String = row.try_get("currency")?;
         let inserted = sqlx::query(
-            "INSERT INTO ledger_entries (id, account_id, kind, amount_micros, currency, source, idempotency_key, created_at) VALUES (?, ?, 'grant', ?, ?, ?, ?, ?) ON CONFLICT(idempotency_key) DO NOTHING",
+            "INSERT INTO ledger_entries (id, account_id, kind, amount_micros, currency, source, idempotency_key, created_at) VALUES ($1, $2, 'grant', $3, $4, $5, $6, $7) ON CONFLICT(idempotency_key) DO NOTHING",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(account_id.to_string())
@@ -1672,7 +1673,7 @@ impl Database {
         .await?;
         if inserted.rows_affected() == 0 {
             let existing: i64 = sqlx::query(
-                "SELECT amount_micros FROM ledger_entries WHERE idempotency_key = ? AND account_id = ? AND kind = 'grant'",
+                "SELECT amount_micros FROM ledger_entries WHERE idempotency_key = $1 AND account_id = $2 AND kind = 'grant'",
             )
             .bind(idempotency_key)
             .bind(account_id.to_string())
@@ -1684,7 +1685,7 @@ impl Database {
             return Ok(micros_to_decimal_string(existing));
         }
         sqlx::query(
-            "UPDATE credit_accounts SET available_micros = available_micros + ?, updated_at = ? WHERE id = ?",
+            "UPDATE credit_accounts SET available_micros = available_micros + $1, updated_at = $2 WHERE id = $3",
         )
         .bind(amount_micros)
         .bind(now)
@@ -1714,7 +1715,7 @@ impl Database {
         let now = unix_millis();
         let mut tx = self.pool.begin().await?;
         let account_lock =
-            sqlx::query("UPDATE credit_accounts SET updated_at = updated_at WHERE id = ?")
+            sqlx::query("UPDATE credit_accounts SET updated_at = updated_at WHERE id = $1")
                 .bind(account_id.to_string())
                 .execute(&mut *tx)
                 .await?;
@@ -1722,7 +1723,7 @@ impl Database {
             return Err(AppError::NotFound);
         }
         let original = sqlx::query(
-            "SELECT id, amount_micros, currency, created_at FROM ledger_entries WHERE account_id = ? AND kind = 'grant' AND idempotency_key = ?",
+            "SELECT id, amount_micros, currency, created_at FROM ledger_entries WHERE account_id = $1 AND kind = 'grant' AND idempotency_key = $2",
         )
         .bind(account_id.to_string())
         .bind(grant_idempotency_key)
@@ -1734,7 +1735,7 @@ impl Database {
         let currency: String = original.try_get("currency")?;
         let granted_at: i64 = original.try_get("created_at")?;
         let may_have_been_consumed = sqlx::query(
-            "SELECT id FROM ledger_entries WHERE account_id = ? AND kind = 'usage' AND created_at >= ? LIMIT 1",
+            "SELECT id FROM ledger_entries WHERE account_id = $1 AND kind = 'usage' AND created_at >= $2 LIMIT 1",
         )
         .bind(account_id.to_string())
         .bind(granted_at)
@@ -1748,7 +1749,7 @@ impl Database {
         }
 
         let inserted = sqlx::query(
-            "INSERT INTO ledger_entries (id, account_id, kind, amount_micros, currency, source, idempotency_key, reference_entry_id, created_at) VALUES (?, ?, 'grant_reversal', ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            "INSERT INTO ledger_entries (id, account_id, kind, amount_micros, currency, source, idempotency_key, reference_entry_id, created_at) VALUES ($1, $2, 'grant_reversal', $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(account_id.to_string())
@@ -1762,7 +1763,7 @@ impl Database {
         .await?;
         if inserted.rows_affected() == 0 {
             let replay = sqlx::query(
-                "SELECT amount_micros, reference_entry_id FROM ledger_entries WHERE account_id = ? AND kind = 'grant_reversal' AND idempotency_key = ?",
+                "SELECT amount_micros, reference_entry_id FROM ledger_entries WHERE account_id = $1 AND kind = 'grant_reversal' AND idempotency_key = $2",
             )
             .bind(account_id.to_string())
             .bind(idempotency_key)
@@ -1780,7 +1781,7 @@ impl Database {
                 return Ok(micros_to_decimal_string(replay_amount.saturating_abs()));
             }
             let existing_idempotency =
-                sqlx::query("SELECT kind FROM ledger_entries WHERE idempotency_key = ?")
+                sqlx::query("SELECT kind FROM ledger_entries WHERE idempotency_key = $1")
                     .bind(idempotency_key)
                     .fetch_optional(&mut *tx)
                     .await?;
@@ -1793,7 +1794,7 @@ impl Database {
         }
 
         let updated = sqlx::query(
-            "UPDATE credit_accounts SET available_micros = available_micros - ?, updated_at = ? WHERE id = ? AND currency = ? AND available_micros >= ?",
+            "UPDATE credit_accounts SET available_micros = available_micros - $1, updated_at = $2 WHERE id = $3 AND currency = $4 AND available_micros >= $5",
         )
         .bind(amount_micros)
         .bind(now)
@@ -1803,7 +1804,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         if updated.rows_affected() != 1 {
-            let exists = sqlx::query("SELECT id FROM credit_accounts WHERE id = ?")
+            let exists = sqlx::query("SELECT id FROM credit_accounts WHERE id = $1")
                 .bind(account_id.to_string())
                 .fetch_optional(&mut *tx)
                 .await?
@@ -1822,7 +1823,7 @@ impl Database {
         let now = unix_millis();
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, input_tokens, output_tokens, cost_micros) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)",
+            "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0, 0)",
         )
         .bind(request.request_id.to_string())
         .bind(request.tenant_id.to_string())
@@ -1837,7 +1838,7 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES (?, ?, ?, ?, ?, 'started', ?, ?, 0, 0, 0)",
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, $5, 'started', $6, $7, 0, 0, 0)",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(request.tenant_id.to_string())
@@ -1872,7 +1873,7 @@ impl Database {
 
         for atom in &atoms {
             sqlx::query(
-                "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tenant_id, content_hash) DO NOTHING",
+                "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(tenant_id, content_hash) DO NOTHING",
             )
             .bind(key.tenant_id.to_string())
             .bind(&atom.content_hash)
@@ -1886,7 +1887,7 @@ impl Database {
         }
         for node in &nodes {
             sqlx::query(
-                "INSERT INTO context_nodes (tenant_id, node_hash, parent_hash, atom_hash, depth, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(tenant_id, node_hash) DO NOTHING",
+                "INSERT INTO context_nodes (tenant_id, node_hash, parent_hash, atom_hash, depth, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT(tenant_id, node_hash) DO NOTHING",
             )
             .bind(key.tenant_id.to_string())
             .bind(&node.node_hash)
@@ -1899,7 +1900,7 @@ impl Database {
         }
 
         let candidates = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.explicit_session_id, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = ? AND c.principal_id = ? ORDER BY o.created_at DESC LIMIT 50",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.explicit_session_id, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 ORDER BY o.created_at DESC LIMIT 50",
         )
         .bind(key.tenant_id.to_string())
         .bind(key.principal_id.to_string())
@@ -1947,7 +1948,7 @@ impl Database {
         } else {
             let id = Uuid::now_v7();
             sqlx::query(
-                "INSERT INTO conversation_clusters (id, tenant_id, principal_id, explicit_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO conversation_clusters (id, tenant_id, principal_id, explicit_session_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)",
             )
             .bind(id.to_string())
             .bind(key.tenant_id.to_string())
@@ -1961,7 +1962,7 @@ impl Database {
         };
 
         sqlx::query(
-            "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, leaf_node_hash, atom_hashes_json, explicit_session_id, client_name, created_at, inference_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, leaf_node_hash, atom_hashes_json, explicit_session_id, client_name, created_at, inference_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)",
         )
         .bind(observation_id.to_string())
         .bind(cluster_id.to_string())
@@ -1977,7 +1978,7 @@ impl Database {
 
         if let Some((previous_id, _, relation, confidence, _)) = selected {
             sqlx::query(
-                "INSERT INTO conversation_edges (id, cluster_id, from_observation_id, to_observation_id, relation_kind, confidence_millis, evidence_json, pinned, inference_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?)",
+                "INSERT INTO conversation_edges (id, cluster_id, from_observation_id, to_observation_id, relation_kind, confidence_millis, evidence_json, pinned, inference_version, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 1, $8)",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(cluster_id.to_string())
@@ -1994,12 +1995,12 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
-        sqlx::query("UPDATE conversation_clusters SET updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE conversation_clusters SET updated_at = $1 WHERE id = $2")
             .bind(now)
             .bind(cluster_id.to_string())
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE request_records SET conversation_cluster_id = ? WHERE id = ?")
+        sqlx::query("UPDATE request_records SET conversation_cluster_id = $1 WHERE id = $2")
             .bind(cluster_id.to_string())
             .bind(request_id.to_string())
             .execute(&mut *tx)
@@ -2012,7 +2013,7 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         let completed_at = unix_millis();
         let updated = sqlx::query(
-            "UPDATE request_records SET status_code = ?, duration_ms = ?, input_tokens = ?, output_tokens = ?, cost_micros = ?, error_code = ?, response_object = ?, completed_at = ? WHERE id = ? AND completed_at IS NULL",
+            "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, output_tokens = $4, cost_micros = $5, error_code = $6, response_object = $7, completed_at = $8 WHERE id = $9 AND completed_at IS NULL",
         )
         .bind(request.status_code)
         .bind(request.duration_ms)
@@ -2030,13 +2031,13 @@ impl Database {
             return Ok(());
         }
         sqlx::query(
-            "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, CASE WHEN status_code >= 200 AND status_code < 400 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), 1, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = ? ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + 1, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",
+            "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, CASE WHEN status_code >= 200 AND status_code < 400 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), 1, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1 ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + 1, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",
         )
         .bind(request.request_id.to_string())
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT ?, tenant_id, key_id, id, ?, 'finished', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = ?",
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = $3",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(completed_at)
@@ -2058,7 +2059,7 @@ impl Database {
             .map(|event_id| event_id.to_string())
             .unwrap_or_default();
         let rows = sqlx::query(
-            "SELECT e.event_id, e.request_id, e.event_at, e.event_kind, e.key_id, e.protocol, e.model, e.status_code, e.duration_ms, e.input_tokens, e.output_tokens, e.cost_micros, e.error_code FROM request_events e JOIN tenants t ON t.id = e.tenant_id WHERE t.external_id = ? AND (e.event_at > ? OR (e.event_at = ? AND e.event_id > ?)) ORDER BY e.event_at ASC, e.event_id ASC LIMIT ?",
+            "SELECT e.event_id, e.request_id, e.event_at, e.event_kind, e.key_id, e.protocol, e.model, e.status_code, e.duration_ms, e.input_tokens, e.output_tokens, e.cost_micros, e.error_code FROM request_events e JOIN tenants t ON t.id = e.tenant_id WHERE t.external_id = $1 AND (e.event_at > $2 OR (e.event_at = $3 AND e.event_id > $4)) ORDER BY e.event_at ASC, e.event_id ASC LIMIT $5",
         )
         .bind(tenant_external_id)
         .bind(after_event_at)
@@ -2094,7 +2095,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<RequestView>, AppError> {
         let rows = sqlx::query(
-            "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE key_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE key_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
         )
         .bind(key_id.to_string())
         .bind(limit.clamp(1, 100))
@@ -2125,7 +2126,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<RequestView>, AppError> {
         let rows = sqlx::query(
-            "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM (SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.output_tokens, r.cost_micros, r.error_code FROM request_records r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = ? UNION ALL SELECT g.id, g.created_at, 'generation' AS protocol, g.public_model AS model, CASE WHEN g.status = 'succeeded' THEN 200 WHEN g.status IN ('failed', 'cancelled') THEN 502 ELSE NULL END AS status_code, CASE WHEN g.completed_at IS NULL THEN NULL ELSE g.completed_at - g.created_at END AS duration_ms, 0 AS input_tokens, 0 AS output_tokens, g.cost_micros, g.error_code FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = ?) AS all_requests ORDER BY created_at DESC, id DESC LIMIT ?",
+            "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM (SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.output_tokens, r.cost_micros, r.error_code FROM request_records r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = $1 UNION ALL SELECT g.id, g.created_at, 'generation' AS protocol, g.public_model AS model, CASE WHEN g.status = 'succeeded' THEN 200 WHEN g.status IN ('failed', 'cancelled') THEN 502 ELSE NULL END AS status_code, CASE WHEN g.completed_at IS NULL THEN NULL ELSE g.completed_at - g.created_at END AS duration_ms, 0 AS input_tokens, 0 AS output_tokens, g.cost_micros, g.error_code FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $2) AS all_requests ORDER BY created_at DESC, id DESC LIMIT $3",
         )
         .bind(tenant_external_id)
         .bind(tenant_external_id)
@@ -2156,7 +2157,7 @@ impl Database {
         request_id: Uuid,
     ) -> Result<RequestArchiveRefs, AppError> {
         let row = sqlx::query(
-            "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code, request_object, response_object FROM request_records WHERE id = ? AND key_id = ?",
+            "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code, request_object, response_object FROM request_records WHERE id = $1 AND key_id = $2",
         )
         .bind(request_id.to_string())
         .bind(key_id.to_string())
@@ -2186,7 +2187,7 @@ impl Database {
         key_id: Uuid,
     ) -> Result<Vec<ConversationClusterView>, AppError> {
         let rows = sqlx::query(
-            "SELECT c.id, c.explicit_session_id, c.updated_at, (SELECT COUNT(*) FROM conversation_observations count_o WHERE count_o.cluster_id = c.id AND count_o.key_id = ?) AS request_count, (SELECT COUNT(*) FROM conversation_edges e JOIN conversation_observations target_o ON target_o.id = e.to_observation_id WHERE e.cluster_id = c.id AND target_o.key_id = ? AND e.relation_kind = 'candidate') AS candidate_edge_count FROM conversation_clusters c WHERE EXISTS (SELECT 1 FROM conversation_observations own_o WHERE own_o.cluster_id = c.id AND own_o.key_id = ?) ORDER BY c.updated_at DESC",
+            "SELECT c.id, c.explicit_session_id, c.updated_at, (SELECT COUNT(*) FROM conversation_observations count_o WHERE count_o.cluster_id = c.id AND count_o.key_id = $1) AS request_count, (SELECT COUNT(*) FROM conversation_edges e JOIN conversation_observations target_o ON target_o.id = e.to_observation_id WHERE e.cluster_id = c.id AND target_o.key_id = $2 AND e.relation_kind = 'candidate') AS candidate_edge_count FROM conversation_clusters c WHERE EXISTS (SELECT 1 FROM conversation_observations own_o WHERE own_o.cluster_id = c.id AND own_o.key_id = $3) ORDER BY c.updated_at DESC",
         )
         .bind(key_id.to_string())
         .bind(key_id.to_string())
@@ -2218,7 +2219,7 @@ impl Database {
             .find(|cluster| cluster.cluster_id == cluster_id)
             .ok_or(AppError::NotFound)?;
         let request_rows = sqlx::query(
-            "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE key_id = ? AND conversation_cluster_id = ? ORDER BY created_at ASC, id ASC",
+            "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 ORDER BY created_at ASC, id ASC",
         )
         .bind(key_id.to_string())
         .bind(cluster_id.to_string())
@@ -2242,7 +2243,7 @@ impl Database {
             })
             .collect::<Result<Vec<_>, AppError>>()?;
         let edge_rows = sqlx::query(
-            "SELECT source_o.request_id AS from_request_id, target_o.request_id AS to_request_id, e.relation_kind, e.confidence_millis, e.evidence_json FROM conversation_edges e JOIN conversation_observations target_o ON target_o.id = e.to_observation_id LEFT JOIN conversation_observations source_o ON source_o.id = e.from_observation_id WHERE e.cluster_id = ? AND target_o.key_id = ? AND (source_o.key_id = ? OR source_o.id IS NULL) ORDER BY target_o.created_at ASC",
+            "SELECT source_o.request_id AS from_request_id, target_o.request_id AS to_request_id, e.relation_kind, e.confidence_millis, e.evidence_json FROM conversation_edges e JOIN conversation_observations target_o ON target_o.id = e.to_observation_id LEFT JOIN conversation_observations source_o ON source_o.id = e.from_observation_id WHERE e.cluster_id = $1 AND target_o.key_id = $2 AND (source_o.key_id = $3 OR source_o.id IS NULL) ORDER BY target_o.created_at ASC",
         )
         .bind(cluster_id.to_string())
         .bind(key_id.to_string())
@@ -2274,7 +2275,7 @@ impl Database {
     pub async fn stats(&self, key_id: Uuid) -> Result<SelfStats, AppError> {
         let key_id = key_id.to_string();
         let summary_row = sqlx::query(
-            "SELECT CAST(COALESCE(SUM(total_requests), 0) AS BIGINT) AS total_requests, CAST(COALESCE(SUM(successful_requests), 0) AS BIGINT) AS successful_requests, CAST(COALESCE(SUM(failed_requests), 0) AS BIGINT) AS failed_requests, CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens, CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros FROM (SELECT COALESCE(SUM(requests), 0) AS total_requests, COALESCE(SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END), 0) AS failed_requests, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM usage_daily_aggregates WHERE key_id = ? UNION ALL SELECT COUNT(*) AS total_requests, COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN status IN ('failed', 'cancelled') THEN 1 ELSE 0 END), 0) AS failed_requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = ? AND status IN ('succeeded', 'failed', 'cancelled')) AS totals",
+            "SELECT CAST(COALESCE(SUM(total_requests), 0) AS BIGINT) AS total_requests, CAST(COALESCE(SUM(successful_requests), 0) AS BIGINT) AS successful_requests, CAST(COALESCE(SUM(failed_requests), 0) AS BIGINT) AS failed_requests, CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens, CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros FROM (SELECT COALESCE(SUM(requests), 0) AS total_requests, COALESCE(SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END), 0) AS failed_requests, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM usage_daily_aggregates WHERE key_id = $1 UNION ALL SELECT COUNT(*) AS total_requests, COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN status IN ('failed', 'cancelled') THEN 1 ELSE 0 END), 0) AS failed_requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = $2 AND status IN ('succeeded', 'failed', 'cancelled')) AS totals",
         )
         .bind(&key_id)
         .bind(&key_id)
@@ -2290,7 +2291,7 @@ impl Database {
         };
 
         let model_rows = sqlx::query(
-            "SELECT name, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT model AS name, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates WHERE key_id = ? UNION ALL SELECT public_model AS name, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = ? AND status IN ('succeeded', 'failed', 'cancelled') GROUP BY public_model) AS model_totals GROUP BY name ORDER BY requests DESC, name ASC",
+            "SELECT name, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT model AS name, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates WHERE key_id = $1 UNION ALL SELECT public_model AS name, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = $2 AND status IN ('succeeded', 'failed', 'cancelled') GROUP BY public_model) AS model_totals GROUP BY name ORDER BY requests DESC, name ASC",
         )
         .bind(&key_id)
         .bind(&key_id)
@@ -2299,7 +2300,7 @@ impl Database {
         let by_model = aggregate_buckets(model_rows)?;
 
         let day_rows = sqlx::query(
-            "SELECT day_bucket, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT day_bucket, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates WHERE key_id = ? UNION ALL SELECT created_at / 86400000 AS day_bucket, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = ? AND status IN ('succeeded', 'failed', 'cancelled') GROUP BY created_at / 86400000) AS day_totals GROUP BY day_bucket ORDER BY day_bucket ASC",
+            "SELECT day_bucket, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT day_bucket, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates WHERE key_id = $1 UNION ALL SELECT created_at / 86400000 AS day_bucket, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = $2 AND status IN ('succeeded', 'failed', 'cancelled') GROUP BY created_at / 86400000) AS day_totals GROUP BY day_bucket ORDER BY day_bucket ASC",
         )
         .bind(&key_id)
         .bind(&key_id)
@@ -2317,7 +2318,7 @@ impl Database {
             .collect::<Result<Vec<_>, AppError>>()?;
 
         let error_rows = sqlx::query(
-            "SELECT name, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT error_code AS name, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates WHERE key_id = ? AND error_code <> '' UNION ALL SELECT error_code AS name, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = ? AND status IN ('failed', 'cancelled') AND error_code IS NOT NULL AND error_code <> '' GROUP BY error_code) AS error_totals GROUP BY name ORDER BY requests DESC, name ASC",
+            "SELECT name, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT error_code AS name, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates WHERE key_id = $1 AND error_code <> '' UNION ALL SELECT error_code AS name, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = $2 AND status IN ('failed', 'cancelled') AND error_code IS NOT NULL AND error_code <> '' GROUP BY error_code) AS error_totals GROUP BY name ORDER BY requests DESC, name ASC",
         )
         .bind(&key_id)
         .bind(&key_id)
@@ -2345,7 +2346,7 @@ async fn apply_migration_range(
         .iter()
         .filter(|migration| (first..=last).contains(&migration.version))
     {
-        let applied = sqlx::query("SELECT version FROM schema_migrations WHERE version = ?")
+        let applied = sqlx::query("SELECT version FROM schema_migrations WHERE version = $1")
             .bind(migration.version)
             .fetch_optional(&mut **transaction)
             .await?
@@ -2353,15 +2354,30 @@ async fn apply_migration_range(
         if applied {
             continue;
         }
-        sqlx::raw_sql(migration.sql)
-            .execute(&mut **transaction)
-            .await?;
-        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
-            .bind(migration.version)
-            .bind(migration.name)
-            .bind(unix_millis())
-            .execute(&mut **transaction)
-            .await?;
+        for statement in migration
+            .sql
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+        {
+            sqlx::query(statement)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|error| {
+                    sqlx::Error::Protocol(format!(
+                        "migration {} ({}) failed at statement `{statement}`: {error}",
+                        migration.version, migration.name
+                    ))
+                })?;
+        }
+        sqlx::query(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+        )
+        .bind(migration.version)
+        .bind(migration.name)
+        .bind(unix_millis())
+        .execute(&mut **transaction)
+        .await?;
     }
     Ok(())
 }
@@ -2373,7 +2389,7 @@ async fn insert_credential(
     now: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO key_credentials (id, key_id, generation, secret_hash, fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO key_credentials (id, key_id, generation, secret_hash, fingerprint, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(issued.credential_id.to_string())
     .bind(issued.key_id.to_string())
@@ -2659,37 +2675,41 @@ const POSTGRES_MIGRATIONS: &[Migration] = &[
     },
 ];
 
-const POSTGRES_REQUEST_PARTITIONS: &str = r#"
-DO $$
-DECLARE
-    day_offset integer;
-    day_start bigint;
-    day_end bigint;
-    partition_name text;
-    event_partition_name text;
-BEGIN
-    FOR day_offset IN 0..8 LOOP
-        day_start := (extract(epoch FROM date_trunc('day', now() + make_interval(days => day_offset))) * 1000)::bigint;
-        day_end := (extract(epoch FROM date_trunc('day', now() + make_interval(days => day_offset + 1))) * 1000)::bigint;
-        partition_name := 'request_records_' || to_char(now() + make_interval(days => day_offset), 'YYYYMMDD');
-        event_partition_name := 'request_events_' || to_char(now() + make_interval(days => day_offset), 'YYYYMMDD');
-        EXECUTE format(
-            'CREATE TABLE IF NOT EXISTS %I PARTITION OF request_records FOR VALUES FROM (%s) TO (%s)',
-            partition_name,
-            day_start,
-            day_end
-        );
-        EXECUTE format(
-            'CREATE TABLE IF NOT EXISTS %I PARTITION OF request_events FOR VALUES FROM (%s) TO (%s)',
-            event_partition_name,
-            day_start,
-            day_end
-        );
-    END LOOP;
-END $$;
-CREATE TABLE IF NOT EXISTS request_records_default PARTITION OF request_records DEFAULT;
-CREATE TABLE IF NOT EXISTS request_events_default PARTITION OF request_events DEFAULT;
-"#;
+async fn maintain_postgres_partitions(connection: &mut AnyConnection) -> Result<(), sqlx::Error> {
+    let today = Utc::now().date_naive();
+    for offset in 0..=8_u64 {
+        let day = today
+            .checked_add_days(Days::new(offset))
+            .expect("partition date is representable");
+        let next_day = day
+            .checked_add_days(Days::new(1))
+            .expect("partition end date is representable");
+        let start = day
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is representable")
+            .and_utc()
+            .timestamp_millis();
+        let end = next_day
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is representable")
+            .and_utc()
+            .timestamp_millis();
+        let suffix = day.format("%Y%m%d");
+        for table in ["request_records", "request_events"] {
+            let partition = format!("{table}_{suffix}");
+            let statement = format!(
+                "CREATE TABLE IF NOT EXISTS {partition} PARTITION OF {table} FOR VALUES FROM ({start}) TO ({end})"
+            );
+            sqlx::query(&statement).execute(&mut *connection).await?;
+        }
+    }
+    for table in ["request_records", "request_events"] {
+        let statement =
+            format!("CREATE TABLE IF NOT EXISTS {table}_default PARTITION OF {table} DEFAULT");
+        sqlx::query(&statement).execute(&mut *connection).await?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -2719,13 +2739,14 @@ mod tests {
         database.migrate().await.unwrap();
 
         for column in ["upstream_account_id", "model_route_id"] {
-            let present =
-                sqlx::query("SELECT name FROM pragma_table_info('request_records') WHERE name = ?")
-                    .bind(column)
-                    .fetch_optional(&database.pool)
-                    .await
-                    .unwrap()
-                    .is_some();
+            let present = sqlx::query(
+                "SELECT name FROM pragma_table_info('request_records') WHERE name = $1",
+            )
+            .bind(column)
+            .fetch_optional(&database.pool)
+            .await
+            .unwrap()
+            .is_some();
             assert!(present, "missing upgraded column {column}");
         }
         let oauth_session_present = sqlx::query(
@@ -2831,7 +2852,7 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         let ciphertext: String =
-            sqlx::query("SELECT issued_key_ciphertext FROM key_records WHERE id = ?")
+            sqlx::query("SELECT issued_key_ciphertext FROM key_records WHERE id = $1")
                 .bind(first.key_id.to_string())
                 .fetch_one(&database.pool)
                 .await
@@ -2923,7 +2944,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::query("UPDATE credit_accounts SET available_micros = 4000000 WHERE id = ?")
+        sqlx::query("UPDATE credit_accounts SET available_micros = 4000000 WHERE id = $1")
             .bind(issued.account_id.to_string())
             .execute(&database.pool)
             .await
@@ -2989,7 +3010,7 @@ mod tests {
             .unwrap();
         assert_eq!(reservation.reserved_micros, 1_000);
         let reserved_account = sqlx::query(
-            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = ?",
+            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
         )
         .bind(issued.account_id.to_string())
         .fetch_one(&database.pool)
@@ -2997,7 +3018,7 @@ mod tests {
         .unwrap();
         assert_eq!(reserved_account.get::<i64, _>("available_micros"), 999_000);
         assert_eq!(reserved_account.get::<i64, _>("reserved_micros"), 1_000);
-        sqlx::query("UPDATE usage_reservations SET created_at = ? WHERE id = ?")
+        sqlx::query("UPDATE usage_reservations SET created_at = $1 WHERE id = $2")
             .bind(unix_millis().saturating_sub(31 * 60 * 1_000))
             .bind(reservation.id.to_string())
             .execute(&database.pool)
@@ -3009,7 +3030,7 @@ mod tests {
             1
         );
         let reservation_row =
-            sqlx::query("SELECT status, actual_micros FROM usage_reservations WHERE id = ?")
+            sqlx::query("SELECT status, actual_micros FROM usage_reservations WHERE id = $1")
                 .bind(reservation.id.to_string())
                 .fetch_one(&database.pool)
                 .await
@@ -3017,7 +3038,7 @@ mod tests {
         assert_eq!(reservation_row.get::<String, _>("status"), "settled");
         assert_eq!(reservation_row.get::<i64, _>("actual_micros"), 0);
         let account_row = sqlx::query(
-            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = ?",
+            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
         )
         .bind(issued.account_id.to_string())
         .fetch_one(&database.pool)
@@ -3038,7 +3059,7 @@ mod tests {
             2_000
         );
         let overage_account = sqlx::query(
-            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = ?",
+            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
         )
         .bind(issued.account_id.to_string())
         .fetch_one(&database.pool)
