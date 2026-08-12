@@ -7,6 +7,7 @@ Feature: Stable key identity and read-only self-service statistics
     When the service creates a key for principal "alice" allowing model "gpt-test"
     And the client calls model "gpt-test"
     Then the response status is 200
+    And the operator realtime stream contains started and finished events
     When the service rotates the key
     Then the rotated credential retains the stable key id
     And the old credential is rejected
@@ -76,3 +77,12 @@ Feature: Stable key identity and read-only self-service statistics
     And the client calls model "cursor-public"
     Then the response status is 200
     And the refreshed Cursor account keeps its id and uses generation 2
+
+  Scenario: Scoped service credentials rotate without crossing tenant boundaries
+    Given a token center backed by SQLite and memory object storage
+    When the bootstrap service creates a tenant scoped service token
+    Then the scoped service token can create a key in its tenant
+    And the scoped service token cannot update global prices
+    When the bootstrap service rotates the scoped service token
+    Then the old service token is rejected
+    And the rotated service token retains its stable service id

@@ -20,11 +20,19 @@ pub struct ParsedCredential<'a> {
 }
 
 pub fn issue_credential(key_id: Uuid, pepper: &[u8]) -> IssuedCredential {
+    issue_credential_with_prefix(key_id, pepper, "mtc")
+}
+
+pub fn issue_service_credential(service_id: Uuid, pepper: &[u8]) -> IssuedCredential {
+    issue_credential_with_prefix(service_id, pepper, "mts")
+}
+
+fn issue_credential_with_prefix(key_id: Uuid, pepper: &[u8], prefix: &str) -> IssuedCredential {
     let credential_id = Uuid::now_v7();
     let mut random = [0_u8; 32];
     getrandom::fill(&mut random).expect("operating system random source");
     let material = URL_SAFE_NO_PAD.encode(random);
-    let secret = format!("mtc_{}_{}", key_id.simple(), material);
+    let secret = format!("{prefix}_{}_{}", key_id.simple(), material);
     let secret_hash = keyed_hash(pepper, secret.as_bytes());
     let fingerprint = hex_prefix(&secret_hash, 8);
 
@@ -38,7 +46,15 @@ pub fn issue_credential(key_id: Uuid, pepper: &[u8]) -> IssuedCredential {
 }
 
 pub fn parse_credential(value: &str) -> Option<ParsedCredential<'_>> {
-    let raw = value.strip_prefix("mtc_")?;
+    parse_credential_with_prefix(value, "mtc")
+}
+
+pub fn parse_service_credential(value: &str) -> Option<ParsedCredential<'_>> {
+    parse_credential_with_prefix(value, "mts")
+}
+
+fn parse_credential_with_prefix<'a>(value: &'a str, prefix: &str) -> Option<ParsedCredential<'a>> {
+    let raw = value.strip_prefix(prefix)?.strip_prefix('_')?;
     let (key_id, secret_material) = raw.split_once('_')?;
     if secret_material.len() < 32 {
         return None;

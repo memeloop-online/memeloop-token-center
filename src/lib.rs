@@ -38,7 +38,8 @@ impl AppState {
             archive,
             providers: ProviderCatalog::builtins(),
             http: reqwest::Client::builder()
-                .pool_max_idle_per_host(64)
+                .pool_max_idle_per_host(8)
+                .pool_idle_timeout(std::time::Duration::from_secs(30))
                 .build()?,
         })
     }

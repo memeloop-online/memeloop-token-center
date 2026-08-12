@@ -1,6 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use cucumber::{World, given, then, when};
+use futures_util::StreamExt;
 use memeloop_token_center::{AppState, api, config::Config};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
@@ -28,6 +29,9 @@ struct TokenCenterWorld {
     cursor_login_url: String,
     cursor_account_id: Option<Uuid>,
     cursor_generation: i64,
+    current_service_token: String,
+    old_service_token: String,
+    stable_service_id: Option<Uuid>,
     status: Option<StatusCode>,
     response: Value,
 }
@@ -49,6 +53,9 @@ impl Default for TokenCenterWorld {
             cursor_login_url: String::new(),
             cursor_account_id: None,
             cursor_generation: 0,
+            current_service_token: String::new(),
+            old_service_token: String::new(),
+            stable_service_id: None,
             status: None,
             response: Value::Null,
         }
@@ -733,6 +740,159 @@ async fn response_status(world: &mut TokenCenterWorld, expected: u16) {
         world.status,
         Some(StatusCode::from_u16(expected).expect("valid HTTP status"))
     );
+}
+
+#[then("the operator realtime stream contains started and finished events")]
+async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .get(format!(
+            "{}/internal/v1/request-events?after_event_at=0",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("request event stream");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.bytes_stream();
+    let lifecycle = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut body = String::new();
+        while let Some(chunk) = stream.next().await {
+            body.push_str(&String::from_utf8_lossy(&chunk.expect("SSE chunk")));
+            if body.contains("\"event_kind\":\"started\"")
+                && body.contains("\"event_kind\":\"finished\"")
+            {
+                return body;
+            }
+        }
+        body
+    })
+    .await
+    .expect("request lifecycle events before timeout");
+    assert!(lifecycle.contains("\"event_kind\":\"started\""));
+    assert!(lifecycle.contains("\"event_kind\":\"finished\""));
+}
+
+#[when("the bootstrap service creates a tenant scoped service token")]
+async fn create_scoped_service_token(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/service-tokens", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "name": "memeloop-web-test",
+            "scopes": ["keys:write"],
+            "tenant_external_id": "scoped-tenant"
+        }))
+        .send()
+        .await
+        .expect("create scoped service token");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let value: Value = response.json().await.expect("service token JSON");
+    world.current_service_token = value["token"]
+        .as_str()
+        .expect("issued service token")
+        .to_owned();
+    world.stable_service_id = Some(
+        Uuid::from_str(value["service_id"].as_str().expect("service id")).expect("service UUID"),
+    );
+}
+
+#[then("the scoped service token can create a key in its tenant")]
+async fn scoped_service_creates_tenant_key(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth(&world.current_service_token)
+        .json(&json!({
+            "tenant_external_id": "scoped-tenant",
+            "principal_external_id": "member-1",
+            "alias": "member-key",
+            "currency": "USD",
+            "initial_balance": "1"
+        }))
+        .send()
+        .await
+        .expect("create tenant key with scoped token");
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[then("the scoped service token cannot update global prices")]
+async fn scoped_service_cannot_update_prices(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/prices/USD/global-model",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_service_token)
+        .json(&json!({"input_per_million": "1", "output_per_million": "1"}))
+        .send()
+        .await
+        .expect("reject global price update");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[when("the bootstrap service rotates the scoped service token")]
+async fn rotate_scoped_service_token(world: &mut TokenCenterWorld) {
+    world.old_service_token = world.current_service_token.clone();
+    let service_id = world.stable_service_id.expect("stable service id");
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/service-tokens/{service_id}/rotate",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("rotate scoped service token");
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = response.json().await.expect("rotated service token JSON");
+    assert_eq!(value["service_id"], service_id.to_string());
+    assert_eq!(value["credential_generation"], 2);
+    world.current_service_token = value["token"]
+        .as_str()
+        .expect("rotated service token")
+        .to_owned();
+}
+
+#[then("the old service token is rejected")]
+async fn old_service_token_is_rejected(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth(&world.old_service_token)
+        .json(&json!({
+            "tenant_external_id": "scoped-tenant",
+            "principal_external_id": "member-old",
+            "alias": "old-token",
+            "currency": "USD"
+        }))
+        .send()
+        .await
+        .expect("old service token check");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[then("the rotated service token retains its stable service id")]
+async fn rotated_service_token_retains_identity(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth(&world.current_service_token)
+        .json(&json!({
+            "tenant_external_id": "scoped-tenant",
+            "principal_external_id": "member-new",
+            "alias": "new-token",
+            "currency": "USD"
+        }))
+        .send()
+        .await
+        .expect("rotated service token check");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(world.stable_service_id.is_some());
 }
 
 #[when("the service rotates the key")]

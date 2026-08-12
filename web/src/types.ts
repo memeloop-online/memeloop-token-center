@@ -11,6 +11,22 @@ export interface RequestView {
   error_code: string | null;
 }
 
+export interface RequestEvent {
+  event_id: string;
+  request_id: string;
+  event_at: number;
+  event_kind: 'started' | 'finished';
+  key_id: string;
+  protocol: string;
+  model: string;
+  status_code: number | null;
+  duration_ms: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  cost: string;
+  error_code: string | null;
+}
+
 export interface StatsBucket {
   name: string;
   requests: number;
@@ -53,4 +69,13 @@ export interface UpstreamAccount {
   status: string;
   credential_expires_at: number | null;
   config: Record<string, unknown>;
+}
+
+export interface ConfigurationSchemas {
+  core_config: Record<string, unknown>;
+  key_create: Record<string, unknown>;
+  key_policy: Record<string, unknown>;
+  model_route: Record<string, unknown>;
+  provider_account: Record<string, unknown>;
+  service_token: Record<string, unknown>;
 }

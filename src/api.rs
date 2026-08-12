@@ -1,11 +1,19 @@
-use std::{path::PathBuf, str::FromStr, time::Instant};
+use std::{
+    convert::Infallible,
+    path::PathBuf,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{
+        Html, IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post, put},
 };
 use futures_util::StreamExt;
@@ -24,11 +32,11 @@ use crate::{
     config::RuntimeRole,
     crypto,
     db::{
-        CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput, FinishRequest,
-        NewRequest, unix_millis,
+        CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput, CreateUpstreamAccountInput,
+        FinishRequest, NewRequest, unix_millis,
     },
     error::AppError,
-    model::{AuthenticatedKey, KeyPolicy},
+    model::{AuthenticatedKey, AuthenticatedService, KeyPolicy},
     oauth::{
         CursorOAuthEndpoints, CursorPollResult, StartCursorLogin, poll_cursor_login,
         refresh_cursor_credential, start_cursor_login,
@@ -53,7 +61,7 @@ pub fn router_for_role(state: AppState, role: RuntimeRole) -> Router {
         application = application.merge(gateway_router());
     }
     application
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
@@ -65,7 +73,13 @@ fn control_router() -> Router<AppState> {
         .route("/operator", get(operator_index))
         .route("/internal/v1/keys", post(create_key))
         .route("/internal/v1/keys/{key_id}/rotate", post(rotate_key))
+        .route("/internal/v1/service-tokens", post(create_service_token))
+        .route(
+            "/internal/v1/service-tokens/{service_id}/rotate",
+            post(rotate_service_token),
+        )
         .route("/internal/v1/provider-types", get(provider_types))
+        .route("/internal/v1/schemas", get(configuration_schemas))
         .route("/internal/v1/oauth/cursor/start", post(start_cursor_oauth))
         .route("/internal/v1/oauth/cursor/poll", post(poll_cursor_oauth))
         .route(
@@ -73,6 +87,7 @@ fn control_router() -> Router<AppState> {
             get(list_upstreams).post(create_upstream),
         )
         .route("/internal/v1/requests", get(internal_requests))
+        .route("/internal/v1/request-events", get(internal_request_events))
         .route(
             "/internal/v1/upstreams/{account_id}/credential",
             put(rotate_upstream_credential),
@@ -201,7 +216,8 @@ async fn create_key(
     headers: HeaderMap,
     Json(body): Json<CreateKeyRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
+    let service = require_service(&headers, &state, "keys:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
     let initial_balance = Decimal::from_str(&body.initial_balance)
         .map_err(|_| AppError::BadRequest("initial_balance must be a decimal string".into()))?;
     if initial_balance.is_sign_negative() {
@@ -231,7 +247,10 @@ async fn rotate_key(
     headers: HeaderMap,
     Path(key_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
+    let service = require_service(&headers, &state, "keys:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_key_tenant(key_id, tenant).await?;
+    }
     let issued = state
         .db
         .rotate_key(key_id, state.config.key_pepper.as_bytes())
@@ -239,12 +258,73 @@ async fn rotate_key(
     Ok(Json(issued))
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateServiceTokenRequest {
+    name: String,
+    scopes: Vec<String>,
+    tenant_external_id: Option<String>,
+}
+
+async fn create_service_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateServiceTokenRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "service_tokens:write").await?;
+    require_global_service(&service)?;
+    let issued = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: body.name,
+                scopes: body.scopes,
+                tenant_external_id: body.tenant_external_id,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(issued)))
+}
+
+async fn rotate_service_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(service_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "service_tokens:write").await?;
+    require_global_service(&service)?;
+    Ok(Json(
+        state
+            .db
+            .rotate_service_token(service_id, state.config.key_pepper.as_bytes())
+            .await?,
+    ))
+}
+
 async fn provider_types(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
+    require_service(&headers, &state, "providers:read").await?;
     Ok(Json(state.providers.list().to_vec()))
+}
+
+async fn configuration_schemas(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state, "schemas:read").await?;
+    fn schema(source: &str) -> Result<Value, AppError> {
+        serde_json::from_str(source).map_err(|_| AppError::Internal)
+    }
+    Ok(Json(json!({
+        "core_config": schema(include_str!("../schemas/core-config.schema.json"))?,
+        "key_create": schema(include_str!("../schemas/key-create.schema.json"))?,
+        "key_policy": schema(include_str!("../schemas/key-policy.schema.json"))?,
+        "model_route": schema(include_str!("../schemas/model-route.schema.json"))?,
+        "provider_account": schema(include_str!("../schemas/provider-account.schema.json"))?,
+        "service_token": schema(include_str!("../schemas/service-token.schema.json"))?
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,7 +344,8 @@ async fn start_cursor_oauth(
     headers: HeaderMap,
     Json(body): Json<StartCursorOAuthRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
+    let service = require_service(&headers, &state, "oauth:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
     if !state.providers.contains(&body.provider_driver) {
         return Err(AppError::BadRequest(format!(
             "unknown provider driver: {}",
@@ -294,7 +375,7 @@ async fn poll_cursor_oauth(
     headers: HeaderMap,
     Json(body): Json<PollCursorOAuthRequest>,
 ) -> Result<Response, AppError> {
-    require_service(&headers, &state)?;
+    let service = require_service(&headers, &state, "oauth:write").await?;
     match poll_cursor_login(
         &state.http,
         &body.session_token,
@@ -315,6 +396,7 @@ async fn poll_cursor_oauth(
             .into_response()),
         CursorPollResult::Ready(ready) => {
             let ready = *ready;
+            require_service_tenant(&service, &ready.tenant_external_id)?;
             let account = state
                 .db
                 .create_upstream_account(
@@ -339,7 +421,10 @@ async fn refresh_upstream_oauth(
     headers: HeaderMap,
     Path(account_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
+    let service = require_service(&headers, &state, "oauth:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_upstream_tenant(account_id, tenant).await?;
+    }
     let (account, credential) = state
         .db
         .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
@@ -397,7 +482,8 @@ async fn create_upstream(
     headers: HeaderMap,
     Json(body): Json<CreateUpstreamRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
+    let service = require_service(&headers, &state, "providers:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
     if !state.providers.contains(&body.driver) {
         return Err(AppError::BadRequest(format!(
             "unknown provider driver: {}",
@@ -426,8 +512,9 @@ async fn list_upstreams(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
-    Ok(Json(state.db.list_upstream_accounts("default").await?))
+    let service = require_service(&headers, &state, "providers:read").await?;
+    let tenant = service.tenant_external_id.as_deref().unwrap_or("default");
+    Ok(Json(state.db.list_upstream_accounts(tenant).await?))
 }
 
 async fn internal_requests(
@@ -435,10 +522,68 @@ async fn internal_requests(
     headers: HeaderMap,
     Query(query): Query<RequestsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
-    Ok(Json(
-        state.db.list_all_requests("default", query.limit).await?,
-    ))
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = service.tenant_external_id.as_deref().unwrap_or("default");
+    Ok(Json(state.db.list_all_requests(tenant, query.limit).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestEventsQuery {
+    after_event_at: Option<i64>,
+    after_event_id: Option<Uuid>,
+}
+
+async fn internal_request_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RequestEventsQuery>,
+) -> Result<Response, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = service
+        .tenant_external_id
+        .unwrap_or_else(|| "default".to_owned());
+    let database = state.db.clone();
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+    tokio::spawn(async move {
+        let mut event_at = query
+            .after_event_at
+            .unwrap_or_else(|| unix_millis().saturating_sub(5_000));
+        let mut event_id = query.after_event_id;
+        loop {
+            match database
+                .request_events_after(&tenant, event_at, event_id, 500)
+                .await
+            {
+                Ok(events) => {
+                    for request_event in events {
+                        event_at = request_event.event_at;
+                        event_id = Some(request_event.event_id);
+                        let event = Event::default()
+                            .id(request_event.event_id.to_string())
+                            .event(format!("request.{}", request_event.event_kind))
+                            .json_data(request_event);
+                        let Ok(event) = event else {
+                            continue;
+                        };
+                        if sender.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %tenant, "request event tail query failed");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+    Ok(Sse::new(ReceiverStream::new(receiver))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,7 +597,10 @@ async fn rotate_upstream_credential(
     Path(account_id): Path<Uuid>,
     Json(body): Json<RotateUpstreamCredentialRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
+    let service = require_service(&headers, &state, "providers:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_upstream_tenant(account_id, tenant).await?;
+    }
     body.credential.validate(unix_millis())?;
     Ok(Json(
         state
@@ -483,7 +631,8 @@ async fn create_model_route(
     headers: HeaderMap,
     Json(body): Json<CreateModelRouteRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
+    let service = require_service(&headers, &state, "routes:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
     let route = state
         .db
         .create_model_route(CreateModelRouteInput {
@@ -510,7 +659,8 @@ async fn upsert_price(
     Path((currency, model)): Path<(String, String)>,
     Json(body): Json<PriceRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
+    let service = require_service(&headers, &state, "prices:write").await?;
+    require_global_service(&service)?;
     let input = parse_decimal(&body.input_per_million, "input_per_million")?;
     let output = parse_decimal(&body.output_per_million, "output_per_million")?;
     let price = state
@@ -538,7 +688,10 @@ async fn grant_balance(
     Path(account_id): Path<Uuid>,
     Json(body): Json<GrantRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    require_service(&headers, &state)?;
+    let service = require_service(&headers, &state, "credits:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_account_tenant(account_id, tenant).await?;
+    }
     let amount = parse_decimal(&body.amount, "amount")?;
     let idempotency_key = headers
         .get("idempotency-key")
@@ -1117,10 +1270,44 @@ fn parse_decimal(value: &str, field: &str) -> Result<Decimal, AppError> {
         .map_err(|_| AppError::BadRequest(format!("{field} must be a decimal string")))
 }
 
-fn require_service(headers: &HeaderMap, state: &AppState) -> Result<(), AppError> {
+async fn require_service(
+    headers: &HeaderMap,
+    state: &AppState,
+    scope: &str,
+) -> Result<AuthenticatedService, AppError> {
     let provided = bearer(headers).ok_or(AppError::Unauthorized)?;
-    if !crypto::constant_time_eq(provided.as_bytes(), state.config.service_token.as_bytes()) {
-        return Err(AppError::Unauthorized);
+    let service =
+        if crypto::constant_time_eq(provided.as_bytes(), state.config.service_token.as_bytes()) {
+            AuthenticatedService::bootstrap()
+        } else {
+            state
+                .db
+                .authenticate_service_token(provided, state.config.key_pepper.as_bytes())
+                .await?
+        };
+    if !service.allows(scope) {
+        return Err(AppError::Forbidden);
+    }
+    Ok(service)
+}
+
+fn require_service_tenant(
+    service: &AuthenticatedService,
+    tenant_external_id: &str,
+) -> Result<(), AppError> {
+    if service
+        .tenant_external_id
+        .as_deref()
+        .is_some_and(|tenant| tenant != tenant_external_id)
+    {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
+fn require_global_service(service: &AuthenticatedService) -> Result<(), AppError> {
+    if service.tenant_external_id.is_some() {
+        return Err(AppError::Forbidden);
     }
     Ok(())
 }

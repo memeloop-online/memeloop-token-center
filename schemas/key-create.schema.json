@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memeloop.dev/token-center/schemas/key-create.schema.json",
+  "title": "Downstream key",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["principal_external_id", "alias", "currency"],
+  "properties": {
+    "tenant_external_id": { "type": "string", "default": "default", "title": "Tenant" },
+    "principal_external_id": { "type": "string", "minLength": 1, "title": "Principal" },
+    "alias": { "type": "string", "minLength": 1, "title": "Key alias" },
+    "currency": { "enum": ["USD", "CNY"], "default": "USD" },
+    "initial_balance": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$",
+      "default": "0",
+      "title": "Initial credit"
+    },
+    "policy": {
+      "title": "Policy",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowed_models": {
+          "title": "Allowed models",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": []
+        },
+        "requests_per_minute": { "type": "integer", "minimum": 1, "default": 60 },
+        "tokens_per_minute": { "type": "integer", "minimum": 1, "default": 100000 },
+        "max_concurrency": { "type": "integer", "minimum": 1, "default": 4 },
+        "daily_budget": { "$ref": "#/$defs/decimal" },
+        "weekly_budget": { "$ref": "#/$defs/decimal" },
+        "lifetime_budget": { "$ref": "#/$defs/decimal" }
+      }
+    }
+  },
+  "$defs": {
+    "decimal": {
+      "type": ["string", "null"],
+      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$"
+    }
+  }
+}
+

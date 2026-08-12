@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use sqlx::{AnyPool, Row, any::AnyPoolOptions};
@@ -9,9 +9,10 @@ use crate::{
     crypto,
     error::AppError,
     model::{
-        AuthenticatedKey, ConversationClusterDetail, ConversationClusterView, ConversationEdgeView,
-        IssuedKey, KeyPolicy, KeyView, ModelPrice, RequestArchiveRefs, RequestView, SelfStats,
-        StatsBucket, StatsSummary, UsageReservation, micros_to_decimal_string, priced_tokens,
+        AuthenticatedKey, AuthenticatedService, ConversationClusterDetail, ConversationClusterView,
+        ConversationEdgeView, IssuedKey, IssuedServiceToken, KeyPolicy, KeyView, ModelPrice,
+        RequestArchiveRefs, RequestEventView, RequestView, SelfStats, StatsBucket, StatsSummary,
+        UsageReservation, micros_to_decimal_string, priced_tokens,
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
@@ -38,6 +39,12 @@ pub struct CreateKeyInput {
     pub currency: String,
     pub policy: KeyPolicy,
     pub initial_balance: Decimal,
+}
+
+pub struct CreateServiceTokenInput {
+    pub name: String,
+    pub scopes: Vec<String>,
+    pub tenant_external_id: Option<String>,
 }
 
 pub struct NewRequest {
@@ -90,47 +97,47 @@ impl Database {
             DatabaseBackend::PostgreSql
         };
         let pool = AnyPoolOptions::new()
-            .max_connections(20)
+            .min_connections(0)
+            .max_connections(8)
+            .acquire_timeout(Duration::from_secs(10))
+            .idle_timeout(Some(Duration::from_secs(5 * 60)))
+            .max_lifetime(Some(Duration::from_secs(30 * 60)))
             .connect(database_url)
             .await?;
         Ok(Self { pool, backend })
     }
 
     pub async fn migrate(&self) -> Result<(), sqlx::Error> {
-        let mut connection = self.pool.acquire().await?;
+        let mut transaction = self.pool.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            sqlx::query("SELECT pg_advisory_lock(734627102948311)")
-                .execute(&mut *connection)
+            sqlx::query("SELECT pg_advisory_xact_lock(734627102948311)")
+                .execute(&mut *transaction)
                 .await?;
         }
-        for statement in SCHEMA {
-            if matches!(self.backend, DatabaseBackend::PostgreSql)
-                && statement.starts_with("CREATE TABLE IF NOT EXISTS request_records ")
-            {
-                sqlx::query(POSTGRES_REQUEST_RECORDS)
-                    .execute(&mut *connection)
-                    .await?;
-                sqlx::raw_sql(POSTGRES_REQUEST_PARTITIONS)
-                    .execute(&mut *connection)
-                    .await?;
-            } else {
-                sqlx::query(statement).execute(&mut *connection).await?;
-            }
-        }
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        let migrations = match self.backend {
+            DatabaseBackend::PostgreSql => POSTGRES_MIGRATIONS,
+            DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
+        };
+        apply_migration_range(&mut transaction, migrations, i64::MIN, 1).await?;
         for column in ["upstream_account_id", "model_route_id"] {
             let exists = match self.backend {
                 DatabaseBackend::PostgreSql => sqlx::query(
                     "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'request_records' AND column_name = ?",
                 )
                 .bind(column)
-                .fetch_optional(&mut *connection)
+                .fetch_optional(&mut *transaction)
                 .await?
                 .is_some(),
                 DatabaseBackend::Sqlite => sqlx::query(
                     "SELECT name FROM pragma_table_info('request_records') WHERE name = ?",
                 )
                 .bind(column)
-                .fetch_optional(&mut *connection)
+                .fetch_optional(&mut *transaction)
                 .await?
                 .is_some(),
             };
@@ -138,7 +145,7 @@ impl Database {
                 sqlx::query(&format!(
                     "ALTER TABLE request_records ADD COLUMN {column} TEXT"
                 ))
-                .execute(&mut *connection)
+                .execute(&mut *transaction)
                 .await?;
             }
         }
@@ -146,31 +153,33 @@ impl Database {
             DatabaseBackend::PostgreSql => sqlx::query(
                 "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'upstream_accounts' AND column_name = 'oauth_session_id'",
             )
-            .fetch_optional(&mut *connection)
+            .fetch_optional(&mut *transaction)
             .await?
             .is_some(),
             DatabaseBackend::Sqlite => sqlx::query(
                 "SELECT name FROM pragma_table_info('upstream_accounts') WHERE name = 'oauth_session_id'",
             )
-            .fetch_optional(&mut *connection)
+            .fetch_optional(&mut *transaction)
             .await?
             .is_some(),
         };
         if !oauth_session_column_exists {
             sqlx::query("ALTER TABLE upstream_accounts ADD COLUMN oauth_session_id TEXT")
-                .execute(&mut *connection)
+                .execute(&mut *transaction)
                 .await?;
         }
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS upstream_accounts_oauth_session_idx ON upstream_accounts (oauth_session_id) WHERE oauth_session_id IS NOT NULL",
         )
-        .execute(&mut *connection)
+        .execute(&mut *transaction)
         .await?;
+        apply_migration_range(&mut transaction, migrations, 2, i64::MAX).await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            sqlx::query("SELECT pg_advisory_unlock(734627102948311)")
-                .execute(&mut *connection)
+            sqlx::raw_sql(POSTGRES_REQUEST_PARTITIONS)
+                .execute(&mut *transaction)
                 .await?;
         }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -283,6 +292,141 @@ impl Database {
             credential_generation: 1,
             key: issued.secret,
             fingerprint: issued.fingerprint,
+        })
+    }
+
+    pub async fn create_service_token(
+        &self,
+        input: CreateServiceTokenInput,
+        pepper: &[u8],
+    ) -> Result<IssuedServiceToken, AppError> {
+        validate_service_token_input(&input)?;
+        let now = unix_millis();
+        let service_id = Uuid::now_v7();
+        let issued = crypto::issue_service_credential(service_id, pepper);
+        let scopes_json = serde_json::to_string(&input.scopes).map_err(|_| AppError::Internal)?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO service_principals (id, name, status, credential_generation, created_at, updated_at) VALUES (?, ?, 'active', 1, ?, ?)",
+        )
+        .bind(service_id.to_string())
+        .bind(input.name.trim())
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO service_credentials (id, service_principal_id, generation, secret_hash, fingerprint, scopes_json, tenant_external_id, created_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+        )
+        .bind(issued.credential_id.to_string())
+        .bind(service_id.to_string())
+        .bind(&issued.secret_hash)
+        .bind(&issued.fingerprint)
+        .bind(scopes_json)
+        .bind(&input.tenant_external_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(IssuedServiceToken {
+            service_id,
+            name: input.name.trim().to_owned(),
+            credential_generation: 1,
+            token: issued.secret,
+            fingerprint: issued.fingerprint,
+            scopes: input.scopes,
+            tenant_external_id: input.tenant_external_id,
+        })
+    }
+
+    pub async fn rotate_service_token(
+        &self,
+        service_id: Uuid,
+        pepper: &[u8],
+    ) -> Result<IssuedServiceToken, AppError> {
+        let now = unix_millis();
+        let issued = crypto::issue_service_credential(service_id, pepper);
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT p.name, p.status, p.credential_generation, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL WHERE p.id = ?",
+        )
+        .bind(service_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        if row.try_get::<String, _>("status")? != "active" {
+            return Err(AppError::Forbidden);
+        }
+        let generation = row.try_get::<i64, _>("credential_generation")? + 1;
+        let scopes_json: String = row.try_get("scopes_json")?;
+        let scopes: Vec<String> =
+            serde_json::from_str(&scopes_json).map_err(|_| AppError::Internal)?;
+        let tenant_external_id: Option<String> = row.try_get("tenant_external_id")?;
+        let name: String = row.try_get("name")?;
+        sqlx::query(
+            "UPDATE service_credentials SET revoked_at = ? WHERE service_principal_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(service_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO service_credentials (id, service_principal_id, generation, secret_hash, fingerprint, scopes_json, tenant_external_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(issued.credential_id.to_string())
+        .bind(service_id.to_string())
+        .bind(generation)
+        .bind(&issued.secret_hash)
+        .bind(&issued.fingerprint)
+        .bind(scopes_json)
+        .bind(&tenant_external_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE service_principals SET credential_generation = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(generation)
+        .bind(now)
+        .bind(service_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(IssuedServiceToken {
+            service_id,
+            name,
+            credential_generation: generation,
+            token: issued.secret,
+            fingerprint: issued.fingerprint,
+            scopes,
+            tenant_external_id,
+        })
+    }
+
+    pub async fn authenticate_service_token(
+        &self,
+        value: &str,
+        pepper: &[u8],
+    ) -> Result<AuthenticatedService, AppError> {
+        let parsed = crypto::parse_service_credential(value).ok_or(AppError::Unauthorized)?;
+        let row = sqlx::query(
+            "SELECT p.status, c.secret_hash, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL WHERE p.id = ?",
+        )
+        .bind(parsed.key_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+        let expected: Vec<u8> = row.try_get("secret_hash")?;
+        if row.try_get::<String, _>("status")? != "active"
+            || !crypto::verify_credential(value, pepper, &expected)
+        {
+            return Err(AppError::Unauthorized);
+        }
+        let scopes_json: String = row.try_get("scopes_json")?;
+        Ok(AuthenticatedService {
+            service_id: Some(parsed.key_id),
+            scopes: serde_json::from_str(&scopes_json).map_err(|_| AppError::Internal)?,
+            tenant_external_id: row.try_get("tenant_external_id")?,
         })
     }
 
@@ -666,6 +810,54 @@ impl Database {
         })
     }
 
+    pub async fn require_key_tenant(
+        &self,
+        key_id: Uuid,
+        tenant_external_id: &str,
+    ) -> Result<(), AppError> {
+        let exists = sqlx::query(
+            "SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id WHERE k.id = ? AND t.external_id = ?",
+        )
+        .bind(key_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some();
+        exists.then_some(()).ok_or(AppError::Forbidden)
+    }
+
+    pub async fn require_account_tenant(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+    ) -> Result<(), AppError> {
+        let exists = sqlx::query(
+            "SELECT a.id FROM credit_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = ? AND t.external_id = ?",
+        )
+        .bind(account_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some();
+        exists.then_some(()).ok_or(AppError::Forbidden)
+    }
+
+    pub async fn require_upstream_tenant(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+    ) -> Result<(), AppError> {
+        let exists = sqlx::query(
+            "SELECT a.id FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = ? AND t.external_id = ?",
+        )
+        .bind(account_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some();
+        exists.then_some(()).ok_or(AppError::Forbidden)
+    }
+
     pub async fn upsert_model_price(
         &self,
         model: &str,
@@ -1004,21 +1196,36 @@ impl Database {
     }
 
     pub async fn record_request_started(&self, request: NewRequest) -> Result<(), AppError> {
+        let now = unix_millis();
+        let mut transaction = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, request_object, reservation_id, upstream_account_id, model_route_id, input_tokens, output_tokens, cost_micros) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)",
         )
         .bind(request.request_id.to_string())
         .bind(request.tenant_id.to_string())
         .bind(request.key_id.to_string())
-        .bind(unix_millis())
-        .bind(request.protocol)
-        .bind(request.model)
-        .bind(request.request_object)
+        .bind(now)
+        .bind(&request.protocol)
+        .bind(&request.model)
+        .bind(&request.request_object)
         .bind(request.reservation_id.to_string())
         .bind(request.upstream_account_id.map(|id| id.to_string()))
         .bind(request.model_route_id.map(|id| id.to_string()))
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        sqlx::query(
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES (?, ?, ?, ?, ?, 'started', ?, ?, 0, 0, 0)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(request.tenant_id.to_string())
+        .bind(request.key_id.to_string())
+        .bind(request.request_id.to_string())
+        .bind(now)
+        .bind(request.protocol)
+        .bind(request.model)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -1180,6 +1387,7 @@ impl Database {
 
     pub async fn record_request_finished(&self, request: FinishRequest) -> Result<(), AppError> {
         let mut tx = self.pool.begin().await?;
+        let completed_at = unix_millis();
         let updated = sqlx::query(
             "UPDATE request_records SET status_code = ?, duration_ms = ?, input_tokens = ?, output_tokens = ?, cost_micros = ?, error_code = ?, response_object = ?, completed_at = ? WHERE id = ? AND completed_at IS NULL",
         )
@@ -1188,9 +1396,9 @@ impl Database {
         .bind(request.input_tokens)
         .bind(request.output_tokens)
         .bind(request.cost_micros)
-        .bind(request.error_code)
-        .bind(request.response_object)
-        .bind(unix_millis())
+        .bind(&request.error_code)
+        .bind(&request.response_object)
+        .bind(completed_at)
         .bind(request.request_id.to_string())
         .execute(&mut *tx)
         .await?;
@@ -1204,8 +1412,57 @@ impl Database {
         .bind(request.request_id.to_string())
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT ?, tenant_id, key_id, id, ?, 'finished', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records WHERE id = ?",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(completed_at)
+        .bind(request.request_id.to_string())
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn request_events_after(
+        &self,
+        tenant_external_id: &str,
+        after_event_at: i64,
+        after_event_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<RequestEventView>, AppError> {
+        let after_event_id = after_event_id
+            .map(|event_id| event_id.to_string())
+            .unwrap_or_default();
+        let rows = sqlx::query(
+            "SELECT e.event_id, e.request_id, e.event_at, e.event_kind, e.key_id, e.protocol, e.model, e.status_code, e.duration_ms, e.input_tokens, e.output_tokens, e.cost_micros, e.error_code FROM request_events e JOIN tenants t ON t.id = e.tenant_id WHERE t.external_id = ? AND (e.event_at > ? OR (e.event_at = ? AND e.event_id > ?)) ORDER BY e.event_at ASC, e.event_id ASC LIMIT ?",
+        )
+        .bind(tenant_external_id)
+        .bind(after_event_at)
+        .bind(after_event_at)
+        .bind(after_event_id)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RequestEventView {
+                    event_id: parse_uuid(row.try_get("event_id")?)?,
+                    request_id: parse_uuid(row.try_get("request_id")?)?,
+                    event_at: row.try_get("event_at")?,
+                    event_kind: row.try_get("event_kind")?,
+                    key_id: parse_uuid(row.try_get("key_id")?)?,
+                    protocol: row.try_get("protocol")?,
+                    model: row.try_get("model")?,
+                    status_code: row.try_get("status_code")?,
+                    duration_ms: row.try_get("duration_ms")?,
+                    input_tokens: row.try_get("input_tokens")?,
+                    output_tokens: row.try_get("output_tokens")?,
+                    cost: micros_to_decimal_string(row.try_get("cost_micros")?),
+                    error_code: row.try_get("error_code")?,
+                })
+            })
+            .collect()
     }
 
     pub async fn list_requests(
@@ -1450,6 +1707,37 @@ impl Database {
     }
 }
 
+async fn apply_migration_range(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+    migrations: &[Migration],
+    first: i64,
+    last: i64,
+) -> Result<(), sqlx::Error> {
+    for migration in migrations
+        .iter()
+        .filter(|migration| (first..=last).contains(&migration.version))
+    {
+        let applied = sqlx::query("SELECT version FROM schema_migrations WHERE version = ?")
+            .bind(migration.version)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .is_some();
+        if applied {
+            continue;
+        }
+        sqlx::raw_sql(migration.sql)
+            .execute(&mut **transaction)
+            .await?;
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(migration.version)
+            .bind(migration.name)
+            .bind(unix_millis())
+            .execute(&mut **transaction)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn insert_credential(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     issued: &crypto::IssuedCredential,
@@ -1544,6 +1832,40 @@ fn validate_currency(currency: &str) -> Result<(), AppError> {
     }
 }
 
+fn validate_service_token_input(input: &CreateServiceTokenInput) -> Result<(), AppError> {
+    if input.name.trim().is_empty() || input.name.len() > 120 {
+        return Err(AppError::BadRequest(
+            "service token name must contain 1 to 120 characters".into(),
+        ));
+    }
+    if input.scopes.is_empty() || input.scopes.len() > 32 {
+        return Err(AppError::BadRequest(
+            "service token must contain 1 to 32 scopes".into(),
+        ));
+    }
+    if input.scopes.iter().any(|scope| {
+        scope.is_empty()
+            || scope.len() > 80
+            || !scope.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-' | b'*')
+            })
+    }) {
+        return Err(AppError::BadRequest(
+            "service token scopes contain unsupported characters".into(),
+        ));
+    }
+    if input
+        .tenant_external_id
+        .as_deref()
+        .is_some_and(|tenant| tenant.trim().is_empty() || tenant.len() > 200)
+    {
+        return Err(AppError::BadRequest(
+            "tenant_external_id must contain 1 to 200 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_policy_budgets(policy: &KeyPolicy) -> Result<(), AppError> {
     for value in [
         policy.daily_budget.as_deref(),
@@ -1588,42 +1910,57 @@ pub fn unix_millis() -> i64 {
         .as_millis() as i64
 }
 
-const SCHEMA: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY, external_id TEXT NOT NULL UNIQUE, created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS principals (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, external_id TEXT NOT NULL, created_at BIGINT NOT NULL, UNIQUE(tenant_id, external_id))",
-    "CREATE TABLE IF NOT EXISTS credit_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, principal_id TEXT NOT NULL, currency TEXT NOT NULL, available_micros BIGINT NOT NULL, reserved_micros BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS key_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, principal_id TEXT NOT NULL, account_id TEXT NOT NULL, alias TEXT NOT NULL, currency TEXT NOT NULL, policy_json TEXT NOT NULL, status TEXT NOT NULL, credential_generation BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS key_credentials (id TEXT PRIMARY KEY, key_id TEXT NOT NULL, generation BIGINT NOT NULL, secret_hash BYTEA NOT NULL, fingerprint TEXT NOT NULL, created_at BIGINT NOT NULL, revoked_at BIGINT, UNIQUE(key_id, generation))",
-    "CREATE TABLE IF NOT EXISTS ledger_entries (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, key_id TEXT, kind TEXT NOT NULL, amount_micros BIGINT NOT NULL, currency TEXT NOT NULL, source TEXT NOT NULL, idempotency_key TEXT UNIQUE, created_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS model_prices (id TEXT PRIMARY KEY, model TEXT NOT NULL, currency TEXT NOT NULL, input_micros_per_million BIGINT NOT NULL, output_micros_per_million BIGINT NOT NULL, source TEXT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(model, currency))",
-    "CREATE TABLE IF NOT EXISTS upstream_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, driver TEXT NOT NULL, auth_kind TEXT NOT NULL, config_json TEXT NOT NULL, status TEXT NOT NULL, credential_generation BIGINT NOT NULL, oauth_session_id TEXT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, name))",
-    "CREATE TABLE IF NOT EXISTS upstream_credentials (id TEXT PRIMARY KEY, upstream_account_id TEXT NOT NULL, generation BIGINT NOT NULL, credential_ciphertext TEXT NOT NULL, expires_at BIGINT, created_at BIGINT NOT NULL, revoked_at BIGINT, UNIQUE(upstream_account_id, generation))",
-    "CREATE TABLE IF NOT EXISTS model_routes (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, public_model TEXT NOT NULL, upstream_account_id TEXT NOT NULL, upstream_model TEXT NOT NULL, protocol TEXT NOT NULL, priority BIGINT NOT NULL, enabled BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, public_model, protocol, priority))",
-    "CREATE TABLE IF NOT EXISTS usage_reservations (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, key_id TEXT NOT NULL, price_id TEXT NOT NULL, reserved_micros BIGINT NOT NULL, reserved_tokens BIGINT NOT NULL, rate_window_start BIGINT NOT NULL, actual_micros BIGINT, status TEXT NOT NULL, created_at BIGINT NOT NULL, settled_at BIGINT)",
-    "CREATE TABLE IF NOT EXISTS rate_limit_windows (key_id TEXT NOT NULL, window_start BIGINT NOT NULL, requests BIGINT NOT NULL, tokens BIGINT NOT NULL, PRIMARY KEY(key_id, window_start))",
-    "CREATE TABLE IF NOT EXISTS key_runtime_state (key_id TEXT PRIMARY KEY, active_requests BIGINT NOT NULL, updated_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS request_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, key_id TEXT NOT NULL, created_at BIGINT NOT NULL, completed_at BIGINT, protocol TEXT NOT NULL, model TEXT NOT NULL, status_code BIGINT, duration_ms BIGINT, input_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL, error_code TEXT, request_object TEXT NOT NULL, response_object TEXT, reservation_id TEXT NOT NULL, conversation_cluster_id TEXT, upstream_account_id TEXT, model_route_id TEXT)",
-    "CREATE TABLE IF NOT EXISTS usage_daily_aggregates (key_id TEXT NOT NULL, day_bucket BIGINT NOT NULL, model TEXT NOT NULL, status_class TEXT NOT NULL, error_code TEXT NOT NULL, requests BIGINT NOT NULL, input_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL, PRIMARY KEY(key_id, day_bucket, model, status_class, error_code))",
-    "CREATE TABLE IF NOT EXISTS semantic_atoms (tenant_id TEXT NOT NULL, content_hash TEXT NOT NULL, instance_hash TEXT NOT NULL, role TEXT NOT NULL, kind TEXT NOT NULL, content_json TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY(tenant_id, content_hash))",
-    "CREATE TABLE IF NOT EXISTS context_nodes (tenant_id TEXT NOT NULL, node_hash TEXT NOT NULL, parent_hash TEXT, atom_hash TEXT NOT NULL, depth BIGINT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY(tenant_id, node_hash))",
-    "CREATE TABLE IF NOT EXISTS conversation_clusters (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, principal_id TEXT NOT NULL, explicit_session_id TEXT, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS conversation_observations (id TEXT PRIMARY KEY, cluster_id TEXT NOT NULL, request_id TEXT NOT NULL UNIQUE, key_id TEXT NOT NULL, leaf_node_hash TEXT, atom_hashes_json TEXT NOT NULL, explicit_session_id TEXT, client_name TEXT, created_at BIGINT NOT NULL, inference_version BIGINT NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS conversation_edges (id TEXT PRIMARY KEY, cluster_id TEXT NOT NULL, from_observation_id TEXT, to_observation_id TEXT NOT NULL, relation_kind TEXT NOT NULL, confidence_millis BIGINT NOT NULL, evidence_json TEXT NOT NULL, pinned BIGINT NOT NULL DEFAULT 0, inference_version BIGINT NOT NULL, created_at BIGINT NOT NULL)",
-    "CREATE INDEX IF NOT EXISTS request_records_key_time_idx ON request_records (key_id, created_at DESC, id DESC)",
-    "CREATE INDEX IF NOT EXISTS request_records_id_idx ON request_records (id)",
-    "CREATE INDEX IF NOT EXISTS request_records_tenant_time_idx ON request_records (tenant_id, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS request_records_error_idx ON request_records (tenant_id, error_code, created_at DESC) WHERE error_code IS NOT NULL",
-    "CREATE INDEX IF NOT EXISTS ledger_entries_key_time_idx ON ledger_entries (key_id, created_at DESC) WHERE key_id IS NOT NULL",
-    "CREATE INDEX IF NOT EXISTS usage_reservations_key_status_idx ON usage_reservations (key_id, status, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS upstream_accounts_tenant_driver_idx ON upstream_accounts (tenant_id, driver, status)",
-    "CREATE INDEX IF NOT EXISTS upstream_credentials_active_idx ON upstream_credentials (upstream_account_id, revoked_at, generation DESC)",
-    "CREATE INDEX IF NOT EXISTS model_routes_lookup_idx ON model_routes (tenant_id, public_model, protocol, enabled, priority)",
-    "CREATE INDEX IF NOT EXISTS conversation_observations_key_time_idx ON conversation_observations (key_id, created_at DESC)",
-    "CREATE INDEX IF NOT EXISTS conversation_observations_cluster_time_idx ON conversation_observations (cluster_id, created_at ASC)",
-    "CREATE INDEX IF NOT EXISTS conversation_edges_cluster_target_idx ON conversation_edges (cluster_id, to_observation_id)",
+struct Migration {
+    version: i64,
+    name: &'static str,
+    sql: &'static str,
+}
+
+const SQLITE_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial schema",
+        sql: include_str!("../migrations/sqlite/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "high volume query indexes",
+        sql: include_str!("../migrations/sqlite/0002_query_indexes.sql"),
+    },
+    Migration {
+        version: 3,
+        name: "scoped service credentials",
+        sql: include_str!("../migrations/common/0003_service_tokens.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "request event stream",
+        sql: include_str!("../migrations/sqlite/0004_request_events.sql"),
+    },
 ];
 
-const POSTGRES_REQUEST_RECORDS: &str = "CREATE TABLE IF NOT EXISTS request_records (id TEXT NOT NULL, tenant_id TEXT NOT NULL, key_id TEXT NOT NULL, created_at BIGINT NOT NULL, completed_at BIGINT, protocol TEXT NOT NULL, model TEXT NOT NULL, status_code BIGINT, duration_ms BIGINT, input_tokens BIGINT NOT NULL, output_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL, error_code TEXT, request_object TEXT NOT NULL, response_object TEXT, reservation_id TEXT NOT NULL, conversation_cluster_id TEXT, upstream_account_id TEXT, model_route_id TEXT) PARTITION BY RANGE (created_at)";
+const POSTGRES_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial partitioned schema",
+        sql: include_str!("../migrations/postgres/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "high volume query indexes",
+        sql: include_str!("../migrations/postgres/0002_query_indexes.sql"),
+    },
+    Migration {
+        version: 3,
+        name: "scoped service credentials",
+        sql: include_str!("../migrations/common/0003_service_tokens.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "partitioned request event stream",
+        sql: include_str!("../migrations/postgres/0004_request_events.sql"),
+    },
+];
 
 const POSTGRES_REQUEST_PARTITIONS: &str = r#"
 DO $$
@@ -1632,20 +1969,29 @@ DECLARE
     day_start bigint;
     day_end bigint;
     partition_name text;
+    event_partition_name text;
 BEGIN
     FOR day_offset IN 0..8 LOOP
         day_start := (extract(epoch FROM date_trunc('day', now() + make_interval(days => day_offset))) * 1000)::bigint;
         day_end := (extract(epoch FROM date_trunc('day', now() + make_interval(days => day_offset + 1))) * 1000)::bigint;
         partition_name := 'request_records_' || to_char(now() + make_interval(days => day_offset), 'YYYYMMDD');
+        event_partition_name := 'request_events_' || to_char(now() + make_interval(days => day_offset), 'YYYYMMDD');
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS %I PARTITION OF request_records FOR VALUES FROM (%s) TO (%s)',
             partition_name,
             day_start,
             day_end
         );
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I PARTITION OF request_events FOR VALUES FROM (%s) TO (%s)',
+            event_partition_name,
+            day_start,
+            day_end
+        );
     END LOOP;
 END $$;
 CREATE TABLE IF NOT EXISTS request_records_default PARTITION OF request_records DEFAULT;
+CREATE TABLE IF NOT EXISTS request_events_default PARTITION OF request_events DEFAULT;
 "#;
 
 #[cfg(test)]
@@ -1693,5 +2039,54 @@ mod tests {
         .unwrap()
         .is_some();
         assert!(oauth_session_present);
+    }
+
+    #[tokio::test]
+    async fn service_token_rotation_preserves_identity_and_revokes_old_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("service-token.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"a service credential pepper longer than thirty-two bytes";
+        let first = database
+            .create_service_token(
+                CreateServiceTokenInput {
+                    name: "memeloop-web".to_owned(),
+                    scopes: vec!["keys:write".to_owned(), "credits:write".to_owned()],
+                    tenant_external_id: Some("memeloop".to_owned()),
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        let authenticated = database
+            .authenticate_service_token(&first.token, pepper)
+            .await
+            .unwrap();
+        assert_eq!(authenticated.service_id, Some(first.service_id));
+        assert!(authenticated.allows("keys:write"));
+        assert!(!authenticated.allows("prices:write"));
+
+        let rotated = database
+            .rotate_service_token(first.service_id, pepper)
+            .await
+            .unwrap();
+        assert_eq!(rotated.service_id, first.service_id);
+        assert_eq!(rotated.credential_generation, 2);
+        assert!(matches!(
+            database
+                .authenticate_service_token(&first.token, pepper)
+                .await,
+            Err(AppError::Unauthorized)
+        ));
+        assert!(
+            database
+                .authenticate_service_token(&rotated.token, pepper)
+                .await
+                .is_ok()
+        );
     }
 }

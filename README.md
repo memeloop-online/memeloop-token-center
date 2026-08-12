@@ -22,10 +22,11 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 
 - OpenAI：`/v1/chat/completions`、`/v1/responses`、`/v1/embeddings`。
 - Anthropic：`/v1/messages`、`/v1/messages/count_tokens`。
-- Service：创建/轮换 key、设置同币种模型价格、幂等发放余额。
+- Service：创建/轮换 key、设置同币种模型价格、幂等发放余额；可创建 tenant 绑定、scope 最小化的服务凭据供 memeloop web 使用。服务凭据也有稳定 UUID 与 generation，轮换后旧 token 立即失效。
 - Provider：创建稳定上游账号、轮换 API/OAuth credential、建立公开模型到上游模型的路由。
 - OAuth：Cursor PKCE 登录、轮询完成和 refresh；登录状态是有时限的加密 token，可跨 K8s 副本重试。
 - Self-service：key 信息、请求列表/详情、聚合统计、逻辑会话簇/关系边。
+- Operator：`/internal/v1/request-events` 以追加式 started/finished 事件提供 SSE 尾流，跨副本从 PostgreSQL 游标续读，不加载归档正文。
 
 模型请求先按正文 token 上界与最大输出做余额预留，同时原子执行 RPM 限流；响应返回 usage 后结算实际费用并释放差额。daily、rolling-weekly 与 lifetime budget 均在调用上游前检查。
 
@@ -54,9 +55,11 @@ cargo test --test cucumber
 
 Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，不需要 PostgreSQL 或真实 S3。
 
+数据库 DDL 位于 `migrations/`，每个版本都在同一事务和 PostgreSQL advisory transaction lock 下应用。PostgreSQL 的请求与事件表按天分区，并为 key/tenant/模型/状态/错误/上游/逻辑会话尾查建立专用 B-tree 与 BRIN 索引；SQLite 保留等价的小型测试 schema。连接池默认每进程最多 8 个连接且不预热，HTTP 上游连接池也有严格空闲上限。
+
 ## 配置与插件
 
-核心、key policy、provider 账号和模型路由的 JSON Schema 位于 `schemas/`。`GET /internal/v1/provider-types` 还会返回每种 provider 贡献的配置与 credential Schema，前端可直接交给 JSON Schema 表单渲染器。API key 与 OAuth 都是同一种稳定上游账号的 credential；轮换只推进 generation，请求历史继续引用同一个账号主键。credential 使用带认证加密后再写入数据库，并且管理 API 只返回脱敏元信息。
+核心、key、service token、provider 账号和模型路由的 JSON Schema 位于 `schemas/`，并由 `GET /internal/v1/schemas` 提供。`GET /internal/v1/provider-types` 还会返回每种 provider 贡献的配置与 credential Schema，前端直接交给 JSON Schema 表单渲染器。API key 与 OAuth 都是同一种稳定上游账号的 credential；轮换只推进 generation，请求历史继续引用同一个账号主键。credential 使用带认证加密后再写入数据库，并且管理 API 只返回脱敏元信息。
 
 Cursor 登录入口为 `/internal/v1/oauth/cursor/start` 与 `/internal/v1/oauth/cursor/poll`，刷新入口为 `/internal/v1/upstreams/{account_id}/oauth/refresh`。这里负责 PKCE、token 生命周期与稳定账号；Cursor 原生 Connect/Agent Runtime 到公开协议的转换仍应由专用 provider 插件完成，不能假装成无损 OpenAI 兼容。当前内置 `http-json` driver 可用于兼容上游或独立适配 sidecar。
 

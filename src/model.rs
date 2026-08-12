@@ -88,10 +88,65 @@ pub struct KeyView {
     pub available_balance: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct AuthenticatedService {
+    pub service_id: Option<Uuid>,
+    pub scopes: Vec<String>,
+    pub tenant_external_id: Option<String>,
+}
+
+impl AuthenticatedService {
+    pub fn bootstrap() -> Self {
+        Self {
+            service_id: None,
+            scopes: vec!["*".to_owned()],
+            tenant_external_id: None,
+        }
+    }
+
+    pub fn allows(&self, required: &str) -> bool {
+        self.scopes.iter().any(|scope| {
+            scope == "*"
+                || scope == required
+                || scope
+                    .strip_suffix(":*")
+                    .is_some_and(|prefix| required.starts_with(&format!("{prefix}:")))
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct IssuedServiceToken {
+    pub service_id: Uuid,
+    pub name: String,
+    pub credential_generation: i64,
+    pub token: String,
+    pub fingerprint: String,
+    pub scopes: Vec<String>,
+    pub tenant_external_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RequestView {
     pub request_id: Uuid,
     pub created_at: i64,
+    pub protocol: String,
+    pub model: String,
+    pub status_code: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost: String,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RequestEventView {
+    pub event_id: Uuid,
+    pub request_id: Uuid,
+    pub event_at: i64,
+    pub event_kind: String,
+    pub key_id: Uuid,
     pub protocol: String,
     pub model: String,
     pub status_code: Option<i64>,
