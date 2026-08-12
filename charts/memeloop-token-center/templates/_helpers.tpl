@@ -2,7 +2,21 @@
 memeloop-token-center
 {{- end -}}
 {{- define "memeloop-token-center.fullname" -}}
-{{- printf "%s-%s" .Release.Name (include "memeloop-token-center.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name (default (include "memeloop-token-center.name" .) .Values.nameOverride) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- define "memeloop-token-center.roleName" -}}
+{{- printf "%s-%s" (include "memeloop-token-center.fullname" .root) .role | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- define "memeloop-token-center.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- default (include "memeloop-token-center.fullname" .) .Values.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.serviceAccount.name -}}
+{{- end -}}
 {{- end -}}
 {{- define "memeloop-token-center.labels" -}}
 app.kubernetes.io/name: {{ include "memeloop-token-center.name" . }}
@@ -11,3 +25,44 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
+{{- define "memeloop-token-center.env" -}}
+- name: MTC_DATABASE_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.config.databaseUrlSecret.name }}
+      key: {{ .Values.config.databaseUrlSecret.key }}
+- name: MTC_KEY_PEPPER
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.config.keyPepperSecret.name }}
+      key: {{ .Values.config.keyPepperSecret.key }}
+- name: MTC_SERVICE_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.config.serviceTokenSecret.name }}
+      key: {{ .Values.config.serviceTokenSecret.key }}
+- name: MTC_ARCHIVE_BACKEND
+  value: {{ .Values.config.archiveBackend | quote }}
+- name: MTC_S3_BUCKET
+  value: {{ .Values.config.s3.bucket | quote }}
+- name: MTC_S3_ENDPOINT
+  value: {{ .Values.config.s3.endpoint | quote }}
+- name: MTC_S3_REGION
+  value: {{ .Values.config.s3.region | quote }}
+- name: MTC_S3_ALLOW_HTTP
+  value: {{ .Values.config.s3.allowHttp | quote }}
+- name: MTC_S3_ACCESS_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.config.s3.credentialsSecret.name }}
+      key: {{ .Values.config.s3.credentialsSecret.accessKey }}
+- name: MTC_S3_SECRET_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.config.s3.credentialsSecret.name }}
+      key: {{ .Values.config.s3.credentialsSecret.secretKey }}
+- name: MTC_UPSTREAM_OPENAI_URL
+  value: {{ .Values.config.upstream.openaiUrl | quote }}
+- name: MTC_UPSTREAM_ANTHROPIC_URL
+  value: {{ .Values.config.upstream.anthropicUrl | quote }}
+{{- end -}}

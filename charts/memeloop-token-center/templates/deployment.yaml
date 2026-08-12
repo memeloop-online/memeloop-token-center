@@ -1,58 +1,60 @@
+{{- range $role := list "gateway" "control" "worker" "all" }}
+{{- $roleConfig := index $.Values.roles $role }}
+{{- if $roleConfig.enabled }}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "memeloop-token-center.fullname" . }}
+  name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
   labels:
-    {{- include "memeloop-token-center.labels" . | nindent 4 }}
+    {{- include "memeloop-token-center.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $role }}
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ $roleConfig.replicaCount }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "memeloop-token-center.name" . }}
-      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: {{ include "memeloop-token-center.name" $ }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $role }}
   template:
     metadata:
+      {{- with $.Values.podAnnotations }}
+      annotations:
+        {{- toYaml $.Values.podAnnotations | nindent 8 }}
+      {{- end }}
       labels:
-        {{- include "memeloop-token-center.labels" . | nindent 8 }}
+        {{- include "memeloop-token-center.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: {{ $role }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml $.Values.podLabels | nindent 8 }}
+        {{- end }}
     spec:
+      serviceAccountName: {{ include "memeloop-token-center.serviceAccountName" $ }}
       automountServiceAccountToken: false
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
+        runAsGroup: 10001
         fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: token-center
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["serve"]
+          image: "{{ $.Values.image.repository }}:{{ $.Values.image.tag }}"
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args: ["serve", "--role", {{ $role | quote }}]
           ports:
             - name: http
               containerPort: 8080
           env:
-            - name: MTC_DATABASE_URL
-              valueFrom: { secretKeyRef: { name: {{ .Values.config.databaseUrlSecret.name }}, key: {{ .Values.config.databaseUrlSecret.key }} } }
-            - name: MTC_KEY_PEPPER
-              valueFrom: { secretKeyRef: { name: {{ .Values.config.keyPepperSecret.name }}, key: {{ .Values.config.keyPepperSecret.key }} } }
-            - name: MTC_SERVICE_TOKEN
-              valueFrom: { secretKeyRef: { name: {{ .Values.config.serviceTokenSecret.name }}, key: {{ .Values.config.serviceTokenSecret.key }} } }
-            - name: MTC_ARCHIVE_BACKEND
-              value: {{ .Values.config.archiveBackend | quote }}
-            - name: MTC_S3_BUCKET
-              value: {{ .Values.config.s3.bucket | quote }}
-            - name: MTC_S3_ENDPOINT
-              value: {{ .Values.config.s3.endpoint | quote }}
-            - name: MTC_S3_REGION
-              value: {{ .Values.config.s3.region | quote }}
-            - name: MTC_S3_ALLOW_HTTP
-              value: {{ .Values.config.s3.allowHttp | quote }}
-            - name: MTC_S3_ACCESS_KEY
-              valueFrom: { secretKeyRef: { name: {{ .Values.config.s3.credentialsSecret.name }}, key: {{ .Values.config.s3.credentialsSecret.accessKey }} } }
-            - name: MTC_S3_SECRET_KEY
-              valueFrom: { secretKeyRef: { name: {{ .Values.config.s3.credentialsSecret.name }}, key: {{ .Values.config.s3.credentialsSecret.secretKey }} } }
-            - name: MTC_UPSTREAM_OPENAI_URL
-              value: {{ .Values.config.upstream.openaiUrl | quote }}
-            - name: MTC_UPSTREAM_ANTHROPIC_URL
-              value: {{ .Values.config.upstream.anthropicUrl | quote }}
+            {{- include "memeloop-token-center.env" $ | nindent 12 }}
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 5
@@ -64,5 +66,18 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
-
+            {{- toYaml $roleConfig.resources | nindent 12 }}
+      {{- with $.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}

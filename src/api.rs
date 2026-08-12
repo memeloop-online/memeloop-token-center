@@ -1,4 +1,4 @@
-use std::{str::FromStr, time::Instant};
+use std::{path::PathBuf, str::FromStr, time::Instant};
 
 use axum::{
     Json, Router,
@@ -20,7 +20,9 @@ use tower_http::{
 use uuid::Uuid;
 
 use crate::{
-    AppState, crypto,
+    AppState,
+    config::RuntimeRole,
+    crypto,
     db::{
         CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput, FinishRequest,
         NewRequest, unix_millis,
@@ -37,16 +39,40 @@ use crate::{
 const REQUEST_ID_HEADER: &str = "x-mtc-request-id";
 
 pub fn router(state: AppState) -> Router {
+    router_for_role(state, RuntimeRole::All)
+}
+
+pub fn router_for_role(state: AppState, role: RuntimeRole) -> Router {
     let request_id_header = header::HeaderName::from_static(REQUEST_ID_HEADER);
+    let mut application = Router::new().route("/healthz", get(health));
+    application = application.route("/ui-assets/{*path}", get(web_asset));
+    if role.serves_control() {
+        application = application.merge(control_router());
+    }
+    if role.serves_gateway() {
+        application = application.merge(gateway_router());
+    }
+    application
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
+        .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+fn control_router() -> Router<AppState> {
     Router::new()
-        .route("/healthz", get(health))
-        .route("/portal", get(portal))
+        .route("/operator", get(operator_index))
         .route("/internal/v1/keys", post(create_key))
         .route("/internal/v1/keys/{key_id}/rotate", post(rotate_key))
         .route("/internal/v1/provider-types", get(provider_types))
         .route("/internal/v1/oauth/cursor/start", post(start_cursor_oauth))
         .route("/internal/v1/oauth/cursor/poll", post(poll_cursor_oauth))
-        .route("/internal/v1/upstreams", post(create_upstream))
+        .route(
+            "/internal/v1/upstreams",
+            get(list_upstreams).post(create_upstream),
+        )
+        .route("/internal/v1/requests", get(internal_requests))
         .route(
             "/internal/v1/upstreams/{account_id}/credential",
             put(rotate_upstream_credential),
@@ -61,6 +87,11 @@ pub fn router(state: AppState) -> Router {
             "/internal/v1/accounts/{account_id}/grants",
             post(grant_balance),
         )
+}
+
+fn gateway_router() -> Router<AppState> {
+    Router::new()
+        .route("/portal", get(portal_index))
         .route("/self/v1/key", get(self_key))
         .route("/self/v1/requests", get(self_requests))
         .route("/self/v1/requests/{request_id}", get(self_request_detail))
@@ -79,19 +110,64 @@ pub fn router(state: AppState) -> Router {
             "/v1/messages/count_tokens",
             post(proxy_anthropic_count_tokens),
         )
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
-        .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
-        .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
 }
 
 async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
 
-async fn portal() -> Html<&'static str> {
-    Html(include_str!("portal.html"))
+async fn operator_index() -> Response {
+    web_index(false).await
+}
+
+async fn portal_index() -> Response {
+    web_index(true).await
+}
+
+fn web_root() -> PathBuf {
+    std::env::var_os("MTC_WEB_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/share/memeloop-token-center/web"))
+}
+
+async fn web_index(allow_fallback: bool) -> Response {
+    match tokio::fs::read(web_root().join("index.html")).await {
+        Ok(body) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response(),
+        Err(error) if allow_fallback => {
+            tracing::warn!(%error, "built web application is unavailable; serving fallback portal");
+            Html(include_str!("portal.html")).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "built operator web application is unavailable");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "operator assets are not installed",
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn web_asset(Path(path): Path<String>) -> Response {
+    if path
+        .split('/')
+        .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let content_type = mime_guess::from_path(&path).first_or_octet_stream();
+    match tokio::fs::read(web_root().join(path)).await {
+        Ok(body) => (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(content_type.as_ref())
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+            )],
+            body,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -344,6 +420,25 @@ async fn create_upstream(
         )
         .await?;
     Ok((StatusCode::CREATED, Json(account)))
+}
+
+async fn list_upstreams(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state)?;
+    Ok(Json(state.db.list_upstream_accounts("default").await?))
+}
+
+async fn internal_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RequestsQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state)?;
+    Ok(Json(
+        state.db.list_all_requests("default", query.limit).await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1047,4 +1142,73 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::config::Config;
+
+    async fn test_state() -> (AppState, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("roles.db").display()
+        );
+        let state = AppState::initialize(Config::for_test(database_url))
+            .await
+            .unwrap();
+        (state, directory)
+    }
+
+    fn json_post(path: &str) -> Request<Body> {
+        Request::post(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn gateway_and_control_have_disjoint_route_surfaces() {
+        let (state, _directory) = test_state().await;
+        let gateway = router_for_role(state.clone(), RuntimeRole::Gateway);
+        let control = router_for_role(state, RuntimeRole::Control);
+
+        let gateway_internal = gateway
+            .clone()
+            .oneshot(json_post("/internal/v1/keys"))
+            .await
+            .unwrap();
+        assert_eq!(gateway_internal.status(), StatusCode::NOT_FOUND);
+        let control_internal = control
+            .clone()
+            .oneshot(
+                Request::post("/internal/v1/keys")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"principal_external_id":"probe","alias":"probe"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control_internal.status(), StatusCode::UNAUTHORIZED);
+
+        let control_model = control
+            .oneshot(json_post("/v1/chat/completions"))
+            .await
+            .unwrap();
+        assert_eq!(control_model.status(), StatusCode::NOT_FOUND);
+        let gateway_model = gateway
+            .oneshot(json_post("/v1/chat/completions"))
+            .await
+            .unwrap();
+        assert_eq!(gateway_model.status(), StatusCode::UNAUTHORIZED);
+    }
 }

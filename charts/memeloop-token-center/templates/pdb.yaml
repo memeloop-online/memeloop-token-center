@@ -1,13 +1,20 @@
-{{- if .Values.podDisruptionBudget.enabled }}
+{{- range $role := list "gateway" "control" "worker" "all" }}
+{{- $roleConfig := index $.Values.roles $role }}
+{{- if and $roleConfig.enabled $roleConfig.podDisruptionBudget.enabled }}
+---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: {{ include "memeloop-token-center.fullname" . }}
+  name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
+  labels:
+    {{- include "memeloop-token-center.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $role }}
 spec:
-  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ $roleConfig.podDisruptionBudget.minAvailable }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "memeloop-token-center.name" . }}
-      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: {{ include "memeloop-token-center.name" $ }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $role }}
 {{- end }}
-
+{{- end }}

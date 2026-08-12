@@ -8,6 +8,7 @@ pub mod error;
 pub mod model;
 pub mod oauth;
 pub mod provider;
+pub mod worker;
 
 use std::sync::Arc;
 

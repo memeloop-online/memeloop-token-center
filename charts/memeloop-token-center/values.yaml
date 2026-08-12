@@ -1,13 +1,65 @@
-replicaCount: 2
-
 image:
   repository: ghcr.io/memeloop/memeloop-token-center
   tag: "0.1.0"
   pullPolicy: IfNotPresent
 
-service:
-  type: ClusterIP
-  port: 8080
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+roles:
+  gateway:
+    enabled: true
+    replicaCount: 2
+    service:
+      enabled: true
+      type: ClusterIP
+      port: 8080
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 20
+      targetCPUUtilizationPercentage: 70
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+  control:
+    enabled: true
+    replicaCount: 1
+    service:
+      enabled: true
+      type: ClusterIP
+      port: 8080
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+    autoscaling: { enabled: false }
+    podDisruptionBudget: { enabled: false }
+  worker:
+    enabled: true
+    replicaCount: 1
+    service: { enabled: false }
+    resources:
+      requests: { cpu: 100m, memory: 192Mi }
+    autoscaling: { enabled: false }
+    podDisruptionBudget: { enabled: false }
+  all:
+    enabled: false
+    replicaCount: 1
+    service:
+      enabled: true
+      type: ClusterIP
+      port: 8080
+    resources:
+      requests: { cpu: 100m, memory: 192Mi }
+    autoscaling: { enabled: false }
+    podDisruptionBudget: { enabled: false }
 
 config:
   databaseUrlSecret:
@@ -33,24 +85,26 @@ config:
     openaiUrl: ""
     anthropicUrl: ""
 
-resources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  gateway:
+    host: api.token-center.example.com
+    tlsSecretName: ""
+  control:
+    host: control.token-center.example.com
+    tlsSecretName: ""
 
-autoscaling:
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 20
-  targetCPUUtilizationPercentage: 70
-
-podDisruptionBudget:
-  enabled: true
-  minAvailable: 1
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
 
 networkPolicy:
   enabled: true
 
 serviceMonitor:
   enabled: false
-
+  interval: 30s

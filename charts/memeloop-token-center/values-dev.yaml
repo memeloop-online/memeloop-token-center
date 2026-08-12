@@ -1,0 +1,18 @@
+roles:
+  gateway: { enabled: false }
+  control: { enabled: false }
+  worker: { enabled: false }
+  all:
+    enabled: true
+    replicaCount: 1
+    service:
+      enabled: true
+      type: ClusterIP
+      port: 8080
+    resources:
+      requests: { cpu: 100m, memory: 192Mi }
+    autoscaling: { enabled: false }
+    podDisruptionBudget: { enabled: false }
+
+networkPolicy:
+  enabled: false

@@ -174,6 +174,15 @@ impl Database {
         Ok(())
     }
 
+    pub async fn maintain_partitions(&self) -> Result<(), sqlx::Error> {
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::raw_sql(POSTGRES_REQUEST_PARTITIONS)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn create_key(
         &self,
         input: CreateKeyInput,
@@ -559,6 +568,19 @@ impl Database {
             priority: input.priority,
             enabled: true,
         })
+    }
+
+    pub async fn list_upstream_accounts(
+        &self,
+        tenant_external_id: &str,
+    ) -> Result<Vec<UpstreamAccountView>, AppError> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE t.external_id = ? ORDER BY a.created_at DESC, a.id DESC",
+        )
+        .bind(tenant_external_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(upstream_account_view).collect()
     }
 
     pub async fn resolve_upstream(
@@ -1199,6 +1221,36 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        rows.into_iter()
+            .map(|row| {
+                Ok(RequestView {
+                    request_id: parse_uuid(row.try_get("id")?)?,
+                    created_at: row.try_get("created_at")?,
+                    protocol: row.try_get("protocol")?,
+                    model: row.try_get("model")?,
+                    status_code: row.try_get("status_code")?,
+                    duration_ms: row.try_get("duration_ms")?,
+                    input_tokens: row.try_get("input_tokens")?,
+                    output_tokens: row.try_get("output_tokens")?,
+                    cost: micros_to_decimal_string(row.try_get("cost_micros")?),
+                    error_code: row.try_get("error_code")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_all_requests(
+        &self,
+        tenant_external_id: &str,
+        limit: i64,
+    ) -> Result<Vec<RequestView>, AppError> {
+        let rows = sqlx::query(
+            "SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.output_tokens, r.cost_micros, r.error_code FROM request_records r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = ? ORDER BY r.created_at DESC, r.id DESC LIMIT ?",
+        )
+        .bind(tenant_external_id)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter()
             .map(|row| {
                 Ok(RequestView {

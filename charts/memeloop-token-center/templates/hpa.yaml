@@ -1,21 +1,27 @@
-{{- if .Values.autoscaling.enabled }}
+{{- range $role := list "gateway" "control" "worker" "all" }}
+{{- $roleConfig := index $.Values.roles $role }}
+{{- if and $roleConfig.enabled $roleConfig.autoscaling.enabled }}
+---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: {{ include "memeloop-token-center.fullname" . }}
+  name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
+  labels:
+    {{- include "memeloop-token-center.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $role }}
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: {{ include "memeloop-token-center.fullname" . }}
-  minReplicas: {{ .Values.autoscaling.minReplicas }}
-  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+    name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
+  minReplicas: {{ $roleConfig.autoscaling.minReplicas }}
+  maxReplicas: {{ $roleConfig.autoscaling.maxReplicas }}
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+          averageUtilization: {{ $roleConfig.autoscaling.targetCPUUtilizationPercentage }}
 {{- end }}
-
+{{- end }}

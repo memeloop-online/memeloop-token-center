@@ -4,6 +4,8 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 
 当前实现重点是可验证的核心纵向链路：稳定 key 身份与无迁移轮换、OpenAI/Anthropic 请求转发、请求归档、余额与只读自助统计。生产环境默认使用 PostgreSQL 与 S3；SQLite 和内存对象存储只用于测试。
 
+同一个镜像支持 `serve --role gateway|control|worker|all`。生产 Helm 默认拆分 gateway、control 与 worker；`all` 只供个人或临时测试部署。gateway 不注册 `/internal/v1/*`，control 不注册模型和 self-service 路由。
+
 ## Key 身份与权限
 
 一个逻辑 key 由不可变 UUIDv7 `key_id` 标识，密钥字符串只是它的一代 credential。轮换时只吊销旧 credential 并生成下一代，策略、余额账户、请求记录、统计和会话簇始终引用同一个 `key_id`，不复制或迁移历史。
@@ -59,3 +61,5 @@ Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，�
 Cursor 登录入口为 `/internal/v1/oauth/cursor/start` 与 `/internal/v1/oauth/cursor/poll`，刷新入口为 `/internal/v1/upstreams/{account_id}/oauth/refresh`。这里负责 PKCE、token 生命周期与稳定账号；Cursor 原生 Connect/Agent Runtime 到公开协议的转换仍应由专用 provider 插件完成，不能假装成无损 OpenAI 兼容。当前内置 `http-json` driver 可用于兼容上游或独立适配 sidecar。
 
 插件 ABI 位于 `wit/token-center.wit`；OCI 插件包格式和 capability 限制见 `plugins/README.md`。Helm Chart 位于 `charts/memeloop-token-center`，生产 values 只引用外部 PostgreSQL/S3 Secret，不把凭证写入 ConfigMap。
+
+React/Vite 管理端位于 `web/`：`/operator` 是 service token 控制面，提供实时请求、上游账号 Schema 表单、路由、key 和 OAuth；`/portal` 是下游 key 只读统计。前端静态资产在镜像构建时生成，不依赖 Node.js 运行时。

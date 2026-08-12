@@ -2,6 +2,30 @@ use std::env;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeRole {
+    Gateway,
+    Control,
+    Worker,
+    #[default]
+    All,
+}
+
+impl RuntimeRole {
+    pub fn serves_gateway(self) -> bool {
+        matches!(self, Self::Gateway | Self::All)
+    }
+
+    pub fn serves_control(self) -> bool {
+        matches!(self, Self::Control | Self::All)
+    }
+
+    pub fn runs_worker(self) -> bool {
+        matches!(self, Self::Worker | Self::All)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub listen: String,

@@ -1,16 +1,23 @@
+{{- range $role := list "gateway" "control" "all" }}
+{{- $roleConfig := index $.Values.roles $role }}
+{{- if and $roleConfig.enabled $roleConfig.service.enabled }}
+---
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "memeloop-token-center.fullname" . }}
+  name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
   labels:
-    {{- include "memeloop-token-center.labels" . | nindent 4 }}
+    {{- include "memeloop-token-center.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $role }}
 spec:
-  type: {{ .Values.service.type }}
+  type: {{ $roleConfig.service.type }}
   selector:
-    app.kubernetes.io/name: {{ include "memeloop-token-center.name" . }}
-    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: {{ include "memeloop-token-center.name" $ }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: {{ $role }}
   ports:
     - name: http
-      port: {{ .Values.service.port }}
+      port: {{ $roleConfig.service.port }}
       targetPort: http
-
+{{- end }}
+{{- end }}

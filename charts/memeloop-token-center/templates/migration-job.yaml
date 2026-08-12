@@ -17,6 +17,7 @@ spec:
     spec:
       restartPolicy: OnFailure
       automountServiceAccountToken: false
+      serviceAccountName: {{ include "memeloop-token-center.serviceAccountName" . }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -27,12 +28,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["migrate"]
           env:
-            - name: MTC_DATABASE_URL
-              valueFrom: { secretKeyRef: { name: {{ .Values.config.databaseUrlSecret.name }}, key: {{ .Values.config.databaseUrlSecret.key }} } }
-            - name: MTC_KEY_PEPPER
-              valueFrom: { secretKeyRef: { name: {{ .Values.config.keyPepperSecret.name }}, key: {{ .Values.config.keyPepperSecret.key }} } }
-            - name: MTC_SERVICE_TOKEN
-              valueFrom: { secretKeyRef: { name: {{ .Values.config.serviceTokenSecret.name }}, key: {{ .Values.config.serviceTokenSecret.key }} } }
+            {{- include "memeloop-token-center.env" . | nindent 12 }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

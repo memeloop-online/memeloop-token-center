@@ -1,7 +1,12 @@
 use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
-use memeloop_token_center::{AppState, api, config::Config, db::Database};
+use memeloop_token_center::{
+    AppState, api,
+    config::{Config, RuntimeRole},
+    db::Database,
+    worker,
+};
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -15,7 +20,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Serve,
+    Serve {
+        #[arg(long, value_enum, default_value_t)]
+        role: RuntimeRole,
+    },
     Migrate,
 }
 
@@ -35,14 +43,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             database.migrate().await?;
             info!("database schema is current");
         }
-        Command::Serve => {
+        Command::Serve { role } => {
             let state = AppState::initialize(config.clone()).await?;
+            let worker_task = role
+                .runs_worker()
+                .then(|| tokio::spawn(worker::run(state.clone())));
             let address: SocketAddr = config.listen.parse()?;
             let listener = TcpListener::bind(address).await?;
-            info!(%address, "token center listening");
-            axum::serve(listener, api::router(state))
+            info!(%address, ?role, "token center listening");
+            let result = axum::serve(listener, api::router_for_role(state, role))
                 .with_graceful_shutdown(shutdown_signal())
-                .await?;
+                .await;
+            if let Some(task) = worker_task {
+                task.abort();
+            }
+            result?;
         }
     }
 
