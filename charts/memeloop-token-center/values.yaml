@@ -7,6 +7,9 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
+migration:
+  enabled: true
+
 serviceAccount:
   create: true
   name: ""
