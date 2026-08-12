@@ -171,6 +171,15 @@ fn bearer_prefix() -> String {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthAdapterContribution {
+    pub login_url: String,
+    pub poll_url: String,
+    pub refresh_url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderType {
     pub id: String,
     pub display_name: String,
@@ -178,6 +187,9 @@ pub struct ProviderType {
     pub modalities: Vec<String>,
     pub config_schema: Value,
     pub credential_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_adapter: Option<OAuthAdapterContribution>,
+    #[serde(default)]
     pub source: String,
 }
 
@@ -260,6 +272,7 @@ impl ProviderCatalog {
             ],
             config_schema,
             credential_schema: credential_schema.clone(),
+            oauth_adapter: None,
             source: "builtin".to_owned(),
         }];
         types.push(ProviderType {
@@ -283,6 +296,7 @@ impl ProviderCatalog {
                 }
             }),
             credential_schema: credential_schema.clone(),
+            oauth_adapter: None,
             source: "builtin".to_owned(),
         });
         types.push(ProviderType {
@@ -311,6 +325,7 @@ impl ProviderCatalog {
                     "secret": {"type": "string", "minLength": 1, "writeOnly": true}
                 }
             }),
+            oauth_adapter: None,
             source: "builtin".to_owned(),
         });
         types.push(ProviderType {
@@ -329,6 +344,7 @@ impl ProviderCatalog {
                 }
             }),
             credential_schema,
+            oauth_adapter: None,
             source: "builtin".to_owned(),
         });
         Self { types }
@@ -361,6 +377,10 @@ impl ProviderCatalog {
 
     pub fn contains(&self, driver: &str) -> bool {
         self.types.iter().any(|provider| provider.id == driver)
+    }
+
+    pub fn get(&self, driver: &str) -> Option<&ProviderType> {
+        self.types.iter().find(|provider| provider.id == driver)
     }
 }
 

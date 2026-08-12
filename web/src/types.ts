@@ -73,6 +73,11 @@ export interface ProviderType {
   modalities: string[];
   config_schema: Record<string, unknown>;
   credential_schema: Record<string, unknown>;
+  oauth_adapter?: {
+    login_url: string;
+    poll_url: string;
+    refresh_url: string;
+  };
   source: string;
 }
 

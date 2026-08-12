@@ -90,6 +90,14 @@ fn control_router() -> Router<AppState> {
         .route("/internal/v1/oauth/cursor/start", post(start_cursor_oauth))
         .route("/internal/v1/oauth/cursor/poll", post(poll_cursor_oauth))
         .route(
+            "/internal/v1/oauth/provider-adapter/start",
+            post(start_provider_adapter_oauth),
+        )
+        .route(
+            "/internal/v1/oauth/provider-adapter/poll",
+            post(poll_cursor_oauth),
+        )
+        .route(
             "/internal/v1/oauth/subscription-bridge/start",
             post(start_subscription_bridge_oauth),
         )
@@ -422,6 +430,50 @@ async fn start_cursor_oauth(
             provider_driver: body.provider_driver,
             provider_config: body.provider_config,
             endpoints: body.endpoints,
+            oauth_driver: "cursor".to_owned(),
+        },
+        state.config.key_pepper.as_bytes(),
+        unix_millis(),
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct StartProviderAdapterOAuthRequest {
+    #[serde(default = "default_tenant")]
+    tenant_external_id: String,
+    account_name: String,
+    provider_driver: String,
+    provider_config: Value,
+}
+
+async fn start_provider_adapter_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StartProviderAdapterOAuthRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "oauth:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    let provider = state.providers.get(&body.provider_driver).ok_or_else(|| {
+        AppError::BadRequest(format!("unknown provider driver: {}", body.provider_driver))
+    })?;
+    let adapter = provider.oauth_adapter.as_ref().ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "provider {} does not contribute an OAuth adapter",
+            body.provider_driver
+        ))
+    })?;
+    Ok(Json(start_cursor_login(
+        StartCursorLogin {
+            tenant_external_id: body.tenant_external_id,
+            account_name: body.account_name,
+            provider_driver: body.provider_driver,
+            provider_config: body.provider_config,
+            endpoints: CursorOAuthEndpoints {
+                login_url: adapter.login_url.clone(),
+                poll_url: adapter.poll_url.clone(),
+                refresh_url: adapter.refresh_url.clone(),
+            },
+            oauth_driver: "provider_adapter".to_owned(),
         },
         state.config.key_pepper.as_bytes(),
         unix_millis(),
@@ -592,7 +644,7 @@ async fn refresh_upstream_oauth(
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("upstream OAuth refresh URL is missing".into()))?;
     let refreshed = match driver {
-        "cursor" => {
+        "cursor" | "provider_adapter" => {
             refresh_cursor_credential(&state.http, refresh_url, &credential, unix_millis()).await?
         }
         _ => {
@@ -2217,6 +2269,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(gateway_model.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
+        let (mut state, _directory) = test_state().await;
+        state
+            .providers
+            .extend([crate::provider::ProviderType {
+                id: "plugin-provider".to_owned(),
+                display_name: "Plugin provider".to_owned(),
+                protocols: vec!["openai".to_owned()],
+                modalities: vec!["text".to_owned()],
+                config_schema: json!({"type": "object"}),
+                credential_schema: json!({"type": "object"}),
+                oauth_adapter: Some(crate::provider::OAuthAdapterContribution {
+                    login_url: "http://oauth-adapter.default.svc/login".to_owned(),
+                    poll_url: "http://oauth-adapter.default.svc/poll".to_owned(),
+                    refresh_url: "http://oauth-adapter.default.svc/refresh".to_owned(),
+                }),
+                source: "plugin:test@1.0.0".to_owned(),
+            }])
+            .unwrap();
+        let response = router_for_role(state, RuntimeRole::Control)
+            .oneshot(
+                Request::post("/internal/v1/oauth/provider-adapter/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-service-token")
+                    .body(Body::from(
+                        r#"{"account_name":"plugin-primary","provider_driver":"plugin-provider","provider_config":{"base_url":"http://plugin-upstream.default.svc"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

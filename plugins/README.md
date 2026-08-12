@@ -11,6 +11,8 @@ Token Center 插件是固定 digest 的 OCI artifact。解包后的每个插件�
 
 核心 key 鉴权、账本和 tenant 边界不可被插件替换。每次 traffic policy 调用使用独立 Store，限制 32 MiB 线性内存和 500 万 fuel。HTTP host call 仅允许 `plugin.json` 明确列出的精确 origin，禁止重定向，请求和响应各限制 16 MiB；返回值是 `{status, headers, body_base64}` JSON。KV host call 必须显式声明 `{"kind":"kv"}`，数据持久化在 PostgreSQL（测试可用 SQLite）的插件 ID 命名空间中；key 只接受最多 256 字节的安全 ASCII 路径，每个 value 上限 1 MiB，每个插件总量上限 16 MiB。前端扩展保持声明式，只允许 JSON Schema、说明和动作表单，不注入任意 JavaScript。
 
+Provider contribution 可选声明 `oauth_adapter` 的 `login_url`、`poll_url` 和 `refresh_url`。控制面用固定的 `provider_adapter` PKCE 协议访问这些端点：登录请求追加 `challenge`、`uuid`、`mode=login` 和 `redirectTarget=cli`，轮询请求追加 `uuid` 与 `verifier`，轮询/刷新响应使用 `accessToken`、`refreshToken`。公网端点必须是 HTTPS；K8s 单标签、`.svc`/`.svc.cluster.local` 和私有 IP 可使用 HTTP。OAuth token 只进入核心加密 credential 表，不进入插件 KV、日志或 API 响应。
+
 最小 manifest：
 
 ```json

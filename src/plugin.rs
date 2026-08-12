@@ -435,6 +435,31 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
             }
         }
     }
+    for provider in &manifest.contributions.providers {
+        if provider.id.is_empty()
+            || !provider
+                .id
+                .chars()
+                .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || value == '-')
+            || provider.display_name.trim().is_empty()
+            || provider.protocols.is_empty()
+            || provider.modalities.is_empty()
+        {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} contributes an invalid provider",
+                manifest.id
+            )));
+        }
+        if let Some(adapter) = &provider.oauth_adapter {
+            for (field, endpoint) in [
+                ("login_url", &adapter.login_url),
+                ("poll_url", &adapter.poll_url),
+                ("refresh_url", &adapter.refresh_url),
+            ] {
+                crate::oauth::validate_oauth_endpoint(endpoint, field)?;
+            }
+        }
+    }
     Ok(())
 }
 

@@ -60,6 +60,7 @@ pub struct StartCursorLogin {
     pub provider_driver: String,
     pub provider_config: Value,
     pub endpoints: CursorOAuthEndpoints,
+    pub oauth_driver: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -324,6 +325,12 @@ pub fn start_cursor_login(
             "OAuth account name is required".into(),
         ));
     }
+    if !matches!(input.oauth_driver.as_str(), "cursor" | "provider_adapter") {
+        return Err(AppError::BadRequest(
+            "unsupported OAuth adapter protocol".into(),
+        ));
+    }
+    let oauth_driver = input.oauth_driver.clone();
     let _ = validate_config(&input.provider_config)?;
     let mut login_url = validate_oauth_endpoint(&input.endpoints.login_url, "login_url")?;
     let poll_url = validate_oauth_endpoint(&input.endpoints.poll_url, "poll_url")?;
@@ -344,7 +351,7 @@ pub fn start_cursor_login(
         config.insert(
             "oauth".to_owned(),
             json!({
-                "driver": "cursor",
+                "driver": oauth_driver.clone(),
                 "refresh_url": refresh_url.as_str()
             }),
         );
@@ -363,7 +370,7 @@ pub fn start_cursor_login(
     };
     let session_token = seal_private_json(&state, key_material, CURSOR_LOGIN_AAD)?;
     Ok(OAuthLoginStart {
-        driver: "cursor".to_owned(),
+        driver: oauth_driver,
         login_url: login_url.to_string(),
         session_token,
         expires_at,
@@ -499,17 +506,13 @@ pub async fn refresh_cursor_credential(
     })
 }
 
-fn validate_oauth_endpoint(value: &str, field: &str) -> Result<Url, AppError> {
+pub(crate) fn validate_oauth_endpoint(value: &str, field: &str) -> Result<Url, AppError> {
     let url = Url::parse(value)
         .map_err(|_| AppError::BadRequest(format!("OAuth {field} must be a URL")))?;
-    let loopback_http = url.scheme() == "http"
-        && url
-            .host_str()
-            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-            .is_some_and(|host| host.is_loopback());
-    if url.scheme() != "https" && !loopback_http {
+    let private_http = url.scheme() == "http" && url.host_str().is_some_and(is_private_oauth_host);
+    if url.scheme() != "https" && !private_http {
         return Err(AppError::BadRequest(format!(
-            "OAuth {field} must use HTTPS (loopback HTTP is allowed for tests)"
+            "OAuth {field} must use HTTPS (private cluster HTTP is allowed)"
         )));
     }
     if url.username() != "" || url.password().is_some() {
@@ -518,6 +521,22 @@ fn validate_oauth_endpoint(value: &str, field: &str) -> Result<Url, AppError> {
         )));
     }
     Ok(url)
+}
+
+fn is_private_oauth_host(host: &str) -> bool {
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        return match address {
+            std::net::IpAddr::V4(address) => {
+                address.is_private() || address.is_loopback() || address.is_link_local()
+            }
+            std::net::IpAddr::V6(address) => {
+                address.is_loopback()
+                    || address.is_unique_local()
+                    || address.is_unicast_link_local()
+            }
+        };
+    }
+    !host.contains('.') || host.ends_with(".svc") || host.ends_with(".svc.cluster.local")
 }
 
 async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
@@ -559,6 +578,7 @@ mod tests {
                 provider_driver: "http-json".to_owned(),
                 provider_config: json!({"base_url": "https://provider.example"}),
                 endpoints: CursorOAuthEndpoints::default(),
+                oauth_driver: "cursor".to_owned(),
             },
             b"test material with at least 32 bytes",
             1_000,
@@ -568,5 +588,28 @@ mod tests {
         assert!(started.login_url.contains("uuid="));
         assert!(!started.session_token.contains("cursor-one"));
         assert_eq!(started.expires_at, 601_000);
+    }
+
+    #[test]
+    fn provider_adapter_allows_private_cluster_http_but_rejects_public_http() {
+        let private = start_cursor_login(
+            StartCursorLogin {
+                tenant_external_id: "default".to_owned(),
+                account_name: "plugin-oauth".to_owned(),
+                provider_driver: "plugin-provider".to_owned(),
+                provider_config: json!({"base_url": "http://plugin-upstream.default.svc"}),
+                endpoints: CursorOAuthEndpoints {
+                    login_url: "http://oauth-adapter.default.svc/login".to_owned(),
+                    poll_url: "http://oauth-adapter.default.svc/poll".to_owned(),
+                    refresh_url: "http://oauth-adapter.default.svc/refresh".to_owned(),
+                },
+                oauth_driver: "provider_adapter".to_owned(),
+            },
+            b"test material with at least 32 bytes",
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(private.driver, "provider_adapter");
+        assert!(validate_oauth_endpoint("http://oauth.example.com/login", "login_url").is_err());
     }
 }

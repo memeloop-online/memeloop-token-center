@@ -25,7 +25,7 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 - 多模态生成：`/v1/generations`、`/v1/videos/generations`、`/v1/images/generations`；内置火山引擎 Seedance 视频任务与 ComfyUI 本地/Cloud 图片、视频工作流，统一执行模型权限、额度预留、限流、计费、轮询和 S3/CAS 归档。
 - Service：创建/轮换 key、更新模型/限流/预算 policy、设置同币种模型价格、幂等发放余额及撤销完整未消费的 grant；可创建 tenant 绑定、scope 最小化的服务凭据供 memeloop web 使用。服务凭据也有稳定 UUID 与 generation，轮换后旧 token 立即失效。
 - Provider：创建稳定上游账号、轮换 API/OAuth credential、配置无需认证的私有 ComfyUI、建立公开模型到上游模型的路由。
-- OAuth：原生接入 CPA Subscription Bridge 的 GitHub Copilot/Cursor 订阅登录、opaque handle 推理，以及 Cursor 直接 PKCE/refresh；登录状态是有时限的加密 token，可跨 K8s 副本重试。
+- OAuth：原生接入 CPA Subscription Bridge 的 GitHub Copilot/Cursor 订阅登录、opaque handle 推理，以及 Cursor 直接 PKCE/refresh；插件 provider 还能声明同协议的 OAuth Adapter。登录状态是有时限的加密 token，可跨 K8s 副本重试。
 - Self-service：key 信息、请求列表/详情、聚合统计、逻辑会话簇/关系边。
 - Operator：`/internal/v1/request-events` 以追加式 started/finished 事件提供 SSE 尾流，跨副本从 PostgreSQL 游标续读，不加载归档正文。
 
@@ -70,6 +70,6 @@ Copilot/Cursor 订阅登录入口为 `/internal/v1/oauth/subscription-bridge/sta
 
 `POST /internal/v1/imports/cpa/subscription-accounts` 可以上传 CPA 导出的 Copilot/Cursor auth JSON，并把 opaque handle 幂等迁移为稳定上游账号；API 不返回 handle、bridge secret 或原文件正文。Codex、Kimi 等 auth 文件会以 `requires_provider_adapter` 明确跳过，因为它们的私有 OAuth 执行与刷新语义不是公开 OpenAI API 契约；可以继续把 CPA 当兼容上游，或安装经过审核的 provider adapter，不能把 token 文件机械伪装成通用 OAuth。
 
-插件 ABI 位于 `wit/token-center.wit`；运行时使用 Wasmtime Component Model，每次调用限制 32 MiB 与固定 fuel，HTTP 只能访问 manifest 中由运维审核的精确 origin。声明 `kv` capability 的插件可以使用 PostgreSQL/SQLite 中按插件 ID 隔离的持久 KV，每个值上限 1 MiB、每个插件上限 16 MiB；未声明 capability 的调用会在 host 边界被拒绝。OCI 插件包格式、`plugin.json` 和 capability 限制见 `plugins/README.md`。Helm Chart 可从只读 ConfigMap/PVC 加载插件；生产 values 只引用外部 PostgreSQL/S3 Secret，不把凭证写入 ConfigMap。
+插件 ABI 位于 `wit/token-center.wit`；运行时使用 Wasmtime Component Model，每次调用限制 32 MiB 与固定 fuel，HTTP 只能访问 manifest 中由运维审核的精确 origin。声明 `kv` capability 的插件可以使用 PostgreSQL/SQLite 中按插件 ID 隔离的持久 KV，每个值上限 1 MiB、每个插件上限 16 MiB；未声明 capability 的调用会在 host 边界被拒绝。Provider contribution 可以携带 JSON Schema 和 `oauth_adapter`，由 `/internal/v1/oauth/provider-adapter/*` 执行固定的 PKCE adapter 协议，无需给插件任意进程内权限。OCI 插件包格式、`plugin.json` 和 capability 限制见 `plugins/README.md`。Helm Chart 可从只读 ConfigMap/PVC 加载插件；生产 values 只引用外部 PostgreSQL/S3 Secret，不把凭证写入 ConfigMap。
 
 React/Vite 管理端位于 `web/`：`/operator` 是 service token 控制面，提供实时请求、上游账号 Schema 表单、路由、key 和 OAuth；`/portal` 是下游 key 只读统计，可查看生成任务的状态、费用、错误和归档对象。前端静态资产在镜像构建时生成，不依赖 Node.js 运行时。
