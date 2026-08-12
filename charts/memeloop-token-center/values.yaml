@@ -25,6 +25,7 @@ roles:
       port: 8080
     resources:
       requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: "1", memory: 256Mi }
     autoscaling:
       enabled: true
       minReplicas: 2
@@ -42,6 +43,7 @@ roles:
       port: 8080
     resources:
       requests: { cpu: 50m, memory: 128Mi }
+      limits: { cpu: 500m, memory: 256Mi }
     autoscaling: { enabled: false }
     podDisruptionBudget: { enabled: false }
   worker:
@@ -50,6 +52,7 @@ roles:
     service: { enabled: false }
     resources:
       requests: { cpu: 100m, memory: 192Mi }
+      limits: { cpu: "1", memory: 384Mi }
     autoscaling: { enabled: false }
     podDisruptionBudget: { enabled: false }
   all:
@@ -61,6 +64,7 @@ roles:
       port: 8080
     resources:
       requests: { cpu: 100m, memory: 192Mi }
+      limits: { cpu: "1", memory: 512Mi }
     autoscaling: { enabled: false }
     podDisruptionBudget: { enabled: false }
 
