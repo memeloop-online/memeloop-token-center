@@ -118,24 +118,7 @@ impl PluginRuntime {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| AppError::Storage(format!("initialize plugin HTTP: {error}")))?;
-        let entries = fs::read_dir(root)
-            .map_err(|error| AppError::Storage(error.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| AppError::Storage(error.to_string()))?;
-        let mut directories = Vec::new();
-        for entry in entries {
-            if entry
-                .file_type()
-                .map_err(|error| AppError::Storage(error.to_string()))?
-                .is_dir()
-            {
-                directories.push(entry.path());
-            }
-        }
-        directories.sort();
-        if root.join("plugin.json").is_file() {
-            directories.insert(0, root.to_path_buf());
-        }
+        let directories = plugin_directories(root)?;
 
         let mut plugins = Vec::new();
         let mut providers = Vec::new();
@@ -289,6 +272,31 @@ impl PluginRuntime {
         }
         Ok(decision)
     }
+}
+
+fn plugin_directories(root: &Path) -> Result<Vec<PathBuf>, AppError> {
+    if root.join("plugin.json").is_file() {
+        return Ok(vec![root.to_path_buf()]);
+    }
+    let entries = fs::read_dir(root)
+        .map_err(|error| AppError::Storage(error.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| AppError::Storage(error.to_string()))?;
+    let mut directories = Vec::new();
+    for entry in entries {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if entry
+            .file_type()
+            .map_err(|error| AppError::Storage(error.to_string()))?
+            .is_dir()
+        {
+            directories.push(entry.path());
+        }
+    }
+    directories.sort();
+    Ok(directories)
 }
 
 impl memeloop::token_center::host::Host for HostState {
@@ -606,6 +614,12 @@ mod tests {
                 }
             }))
             .unwrap(),
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("..data")).unwrap();
+        fs::copy(
+            directory.path().join("plugin.json"),
+            directory.path().join("..data/plugin.json"),
         )
         .unwrap();
 
