@@ -86,3 +86,19 @@ Feature: Stable key identity and read-only self-service statistics
     When the bootstrap service rotates the scoped service token
     Then the old service token is rejected
     And the rotated service token retains its stable service id
+
+  Scenario: Seedance generation is permissioned, metered, polled and archived
+    Given a token center backed by SQLite and memory object storage
+    And the mock Seedance upstream completes a five second video
+    When the service creates a metered Seedance route and key
+    And the client creates a five second Seedance generation
+    Then the response status is 202
+    And the generation eventually succeeds with an archived video costing 0.5
+
+  Scenario: ComfyUI generation is permissioned, metered and archived
+    Given a token center backed by SQLite and memory object storage
+    And the mock ComfyUI upstream completes an image workflow
+    When the service creates a metered ComfyUI route and key
+    And the client creates a ComfyUI image generation
+    Then the response status is 202
+    And the ComfyUI generation eventually succeeds with an archived image costing 0.2

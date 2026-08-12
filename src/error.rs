@@ -62,3 +62,9 @@ impl From<object_store::Error> for AppError {
         Self::Storage(error.to_string())
     }
 }
+
+impl From<reqwest::Error> for AppError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Upstream(error.to_string())
+    }
+}

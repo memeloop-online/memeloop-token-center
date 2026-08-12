@@ -1,7 +1,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rust_decimal::{Decimal, prelude::ToPrimitive};
-use sqlx::{AnyPool, Row, any::AnyPoolOptions};
+use sqlx::{
+    AnyPool, Row,
+    any::{AnyPoolOptions, AnyQueryResult, AnyRow},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -10,9 +13,10 @@ use crate::{
     error::AppError,
     model::{
         AuthenticatedKey, AuthenticatedService, ConversationClusterDetail, ConversationClusterView,
-        ConversationEdgeView, IssuedKey, IssuedServiceToken, KeyPolicy, KeyView, ModelPrice,
-        RequestArchiveRefs, RequestEventView, RequestView, SelfStats, StatsBucket, StatsSummary,
-        UsageReservation, micros_to_decimal_string, priced_tokens,
+        ConversationEdgeView, GenerationJobView, GenerationJobWork, GenerationPrice, IssuedKey,
+        IssuedServiceToken, KeyPolicy, KeyView, ModelPrice, RequestArchiveRefs, RequestEventView,
+        RequestView, SelfStats, StatsBucket, StatsSummary, UsageReservation,
+        micros_to_decimal_string, priced_tokens,
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
@@ -86,6 +90,28 @@ pub struct CreateModelRouteInput {
     pub upstream_model: String,
     pub protocol: String,
     pub priority: i64,
+}
+
+pub struct CreateGenerationJobInput {
+    pub job_id: Uuid,
+    pub key: AuthenticatedKey,
+    pub upstream_account_id: Uuid,
+    pub reservation: UsageReservation,
+    pub public_model: String,
+    pub upstream_model: String,
+    pub driver: String,
+    pub request_object: String,
+    pub estimated_units: i64,
+}
+
+pub struct FinishGenerationJobInput<'a> {
+    pub job_id: Uuid,
+    pub worker_id: &'a str,
+    pub status: &'a str,
+    pub billed_units: i64,
+    pub cost_micros: i64,
+    pub result: Option<&'a serde_json::Value>,
+    pub error_code: Option<&'a str>,
 }
 
 impl Database {
@@ -662,9 +688,12 @@ impl Database {
                 "public_model and upstream_model are required".into(),
             ));
         }
-        if !matches!(input.protocol.as_str(), "openai" | "anthropic") {
+        if !matches!(
+            input.protocol.as_str(),
+            "openai" | "anthropic" | "generation"
+        ) {
             return Err(AppError::BadRequest(
-                "route protocol must be openai or anthropic".into(),
+                "route protocol must be openai, anthropic, or generation".into(),
             ));
         }
         let now = unix_millis();
@@ -774,6 +803,7 @@ impl Database {
             account_id: parse_uuid(row.try_get("account_id")?)?,
             driver: row.try_get("driver")?,
             base_url,
+            config,
             upstream_model: row.try_get("upstream_model")?,
             credential: open_credential(&ciphertext, key_material)?,
         }))
@@ -923,8 +953,310 @@ impl Database {
         })
     }
 
+    pub async fn upsert_generation_price(
+        &self,
+        model: &str,
+        currency: &str,
+        billing_unit: &str,
+        price_per_unit: Decimal,
+    ) -> Result<GenerationPrice, AppError> {
+        validate_currency(currency)?;
+        if !matches!(billing_unit, "job" | "second" | "image" | "megapixel") {
+            return Err(AppError::BadRequest(
+                "billing_unit must be job, second, image, or megapixel".into(),
+            ));
+        }
+        let micros_per_unit = decimal_to_micros(price_per_unit)?;
+        if micros_per_unit < 0 {
+            return Err(AppError::BadRequest(
+                "generation price cannot be negative".into(),
+            ));
+        }
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO generation_prices (id, model, currency, billing_unit, micros_per_unit, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(model, currency) DO UPDATE SET billing_unit = excluded.billing_unit, micros_per_unit = excluded.micros_per_unit, updated_at = excluded.updated_at",
+        )
+        .bind(id.to_string())
+        .bind(model)
+        .bind(currency.to_uppercase())
+        .bind(billing_unit)
+        .bind(micros_per_unit)
+        .bind(unix_millis())
+        .execute(&self.pool)
+        .await?;
+        self.generation_price(model, currency).await
+    }
+
+    pub async fn generation_price(
+        &self,
+        model: &str,
+        currency: &str,
+    ) -> Result<GenerationPrice, AppError> {
+        let row = sqlx::query(
+            "SELECT id, model, currency, billing_unit, micros_per_unit FROM generation_prices WHERE model = ? AND currency = ?",
+        )
+        .bind(model)
+        .bind(currency.to_uppercase())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::UnpricedModel)?;
+        let micros_per_unit: i64 = row.try_get("micros_per_unit")?;
+        Ok(GenerationPrice {
+            id: parse_uuid(row.try_get("id")?)?,
+            model: row.try_get("model")?,
+            currency: row.try_get("currency")?,
+            billing_unit: row.try_get("billing_unit")?,
+            price_per_unit: micros_to_decimal_string(micros_per_unit),
+            micros_per_unit,
+        })
+    }
+
+    pub async fn create_generation_job(
+        &self,
+        input: CreateGenerationJobInput,
+    ) -> Result<GenerationJobView, AppError> {
+        let now = unix_millis();
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO generation_jobs (id, tenant_id, key_id, upstream_account_id, reservation_id, public_model, upstream_model, driver, status, request_object, estimated_units, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+        )
+        .bind(input.job_id.to_string())
+        .bind(input.key.tenant_id.to_string())
+        .bind(input.key.key_id.to_string())
+        .bind(input.upstream_account_id.to_string())
+        .bind(input.reservation.id.to_string())
+        .bind(&input.public_model)
+        .bind(&input.upstream_model)
+        .bind(&input.driver)
+        .bind(input.request_object)
+        .bind(input.estimated_units)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, input_tokens, output_tokens, cost_micros) VALUES (?, ?, ?, ?, ?, 'started', 'generation', ?, 0, 0, 0)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(input.key.tenant_id.to_string())
+        .bind(input.key.key_id.to_string())
+        .bind(input.job_id.to_string())
+        .bind(now)
+        .bind(&input.public_model)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(GenerationJobView {
+            job_id: input.job_id,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+            model: input.public_model,
+            driver: input.driver,
+            status: "queued".to_owned(),
+            upstream_job_id: None,
+            estimated_units: input.estimated_units,
+            billed_units: None,
+            cost: "0".to_owned(),
+            error_code: None,
+            result: None,
+        })
+    }
+
+    pub async fn list_generation_jobs(
+        &self,
+        key_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<GenerationJobView>, AppError> {
+        let rows = sqlx::query(
+            "SELECT id, created_at, updated_at, completed_at, public_model, driver, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json FROM generation_jobs WHERE key_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(key_id.to_string())
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(generation_job_view).collect()
+    }
+
+    pub async fn generation_job(
+        &self,
+        key_id: Uuid,
+        job_id: Uuid,
+    ) -> Result<GenerationJobView, AppError> {
+        let row = sqlx::query(
+            "SELECT id, created_at, updated_at, completed_at, public_model, driver, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json FROM generation_jobs WHERE id = ? AND key_id = ?",
+        )
+        .bind(job_id.to_string())
+        .bind(key_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        generation_job_view(row)
+    }
+
+    pub async fn claim_generation_job(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<GenerationJobWork>, AppError> {
+        let now = unix_millis();
+        let mut transaction = self.pool.begin().await?;
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running') AND next_attempt_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at < ?) ORDER BY next_attempt_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running') AND next_attempt_at <= ? AND (lease_expires_at IS NULL OR lease_expires_at < ?) ORDER BY next_attempt_at, created_at, id LIMIT 1"
+            }
+        };
+        let candidate = sqlx::query(select)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(candidate) = candidate else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        let job_id: String = candidate.try_get("id")?;
+        let claimed = sqlx::query(
+            "UPDATE generation_jobs SET lease_owner = ?, lease_expires_at = ?, attempt_count = attempt_count + 1, updated_at = ? WHERE id = ? AND status IN ('queued', 'running') AND (lease_expires_at IS NULL OR lease_expires_at < ?)",
+        )
+        .bind(worker_id)
+        .bind(now.saturating_add(60_000))
+        .bind(now)
+        .bind(&job_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+        if claimed.rows_affected() == 0 {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT j.id, j.created_at, j.tenant_id, j.key_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, p.micros_per_unit FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id JOIN generation_prices p ON p.id = r.price_id WHERE j.id = ?",
+        )
+        .bind(&job_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        let micros_per_unit: i64 = row.try_get("micros_per_unit")?;
+        let key_id = parse_uuid(row.try_get("key_id")?)?;
+        Ok(Some(GenerationJobWork {
+            job_id: parse_uuid(row.try_get("id")?)?,
+            created_at: row.try_get("created_at")?,
+            tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+            key_id,
+            upstream_account_id: parse_uuid(row.try_get("upstream_account_id")?)?,
+            reservation: UsageReservation {
+                id: parse_uuid(row.try_get("reservation_id")?)?,
+                account_id: parse_uuid(row.try_get("account_id")?)?,
+                key_id,
+                reserved_micros: row.try_get("reserved_micros")?,
+                input_micros_per_million: 0,
+                output_micros_per_million: micros_per_unit
+                    .checked_mul(1_000_000)
+                    .ok_or(AppError::Internal)?,
+                rate_window_start: row.try_get("rate_window_start")?,
+                reserved_tokens: row.try_get("reserved_tokens")?,
+            },
+            public_model: row.try_get("public_model")?,
+            upstream_model: row.try_get("upstream_model")?,
+            driver: row.try_get("driver")?,
+            status: row.try_get("status")?,
+            request_object: row.try_get("request_object")?,
+            upstream_job_id: row.try_get("upstream_job_id")?,
+            estimated_units: row.try_get("estimated_units")?,
+            attempt_count: row.try_get("attempt_count")?,
+            failure_count: row.try_get("failure_count")?,
+        }))
+    }
+
+    pub async fn mark_generation_submitted(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        upstream_job_id: &str,
+    ) -> Result<(), AppError> {
+        generation_update_claimed(
+            sqlx::query("UPDATE generation_jobs SET status = 'running', upstream_job_id = ?, failure_count = 0, error_code = NULL, next_attempt_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND lease_owner = ?")
+                .bind(upstream_job_id)
+                .bind(unix_millis().saturating_add(2_000))
+                .bind(unix_millis())
+                .bind(job_id.to_string())
+                .bind(worker_id)
+                .execute(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn reschedule_generation_job(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        delay_ms: i64,
+        error_code: Option<&str>,
+    ) -> Result<(), AppError> {
+        let now = unix_millis();
+        generation_update_claimed(
+            sqlx::query("UPDATE generation_jobs SET next_attempt_at = ?, error_code = ?, failure_count = CASE WHEN ? IS NULL THEN 0 ELSE failure_count + 1 END, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND lease_owner = ?")
+                .bind(now.saturating_add(delay_ms.max(500)))
+                .bind(error_code)
+                .bind(error_code)
+                .bind(now)
+                .bind(job_id.to_string())
+                .bind(worker_id)
+                .execute(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn finish_generation_job(
+        &self,
+        input: FinishGenerationJobInput<'_>,
+    ) -> Result<(), AppError> {
+        if !matches!(input.status, "succeeded" | "failed" | "cancelled") {
+            return Err(AppError::Internal);
+        }
+        let now = unix_millis();
+        let result_json = input
+            .result
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| AppError::Internal)?;
+        let mut transaction = self.pool.begin().await?;
+        let updated = sqlx::query("UPDATE generation_jobs SET status = ?, billed_units = ?, cost_micros = ?, result_json = ?, error_code = ?, completed_at = ?, updated_at = ?, lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND lease_owner = ?")
+                .bind(input.status)
+                .bind(input.billed_units)
+                .bind(input.cost_micros)
+                .bind(result_json)
+                .bind(input.error_code)
+                .bind(now)
+                .bind(now)
+                .bind(input.job_id.to_string())
+                .bind(input.worker_id)
+                .execute(&mut *transaction)
+                .await?;
+        if updated.rows_affected() != 1 {
+            transaction.commit().await?;
+            return Err(AppError::NotFound);
+        }
+        sqlx::query(
+            "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT ?, tenant_id, key_id, id, ?, 'finished', 'generation', public_model, CASE WHEN status = 'succeeded' THEN 200 ELSE 502 END, ? - created_at, 0, 0, cost_micros, error_code FROM generation_jobs WHERE id = ?",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(now)
+        .bind(now)
+        .bind(input.job_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn allowed_models(&self, key: &AuthenticatedKey) -> Result<Vec<String>, AppError> {
-        let rows = sqlx::query("SELECT model FROM model_prices WHERE currency = ? ORDER BY model")
+        let rows = sqlx::query("SELECT model FROM model_prices WHERE currency = ? UNION SELECT model FROM generation_prices WHERE currency = ? ORDER BY model")
+            .bind(&key.currency)
             .bind(&key.currency)
             .fetch_all(&self.pool)
             .await?;
@@ -993,7 +1325,7 @@ impl Database {
         }
 
         let active_reserved: i64 = sqlx::query(
-            "SELECT COALESCE(SUM(reserved_micros), 0) AS amount FROM usage_reservations WHERE key_id = ? AND status = 'reserved'",
+            "SELECT CAST(COALESCE(SUM(reserved_micros), 0) AS BIGINT) AS amount FROM usage_reservations WHERE key_id = ? AND status = 'reserved'",
         )
         .bind(key.key_id.to_string())
         .fetch_one(&mut *tx)
@@ -1018,7 +1350,7 @@ impl Database {
                 Decimal::from_str_exact(configured_budget).map_err(|_| AppError::Internal)?,
             )?;
             let spent: i64 = sqlx::query(
-                "SELECT COALESCE(SUM(-amount_micros), 0) AS amount FROM ledger_entries WHERE key_id = ? AND kind = 'usage' AND created_at >= ?",
+                "SELECT CAST(COALESCE(SUM(-amount_micros), 0) AS BIGINT) AS amount FROM ledger_entries WHERE key_id = ? AND kind = 'usage' AND created_at >= ?",
             )
             .bind(key.key_id.to_string())
             .bind(since)
@@ -1089,8 +1421,13 @@ impl Database {
                 reservation.output_micros_per_million,
             ))
             .ok_or(AppError::Internal)?;
-        let released = reservation.reserved_micros.saturating_sub(actual_micros);
-        let overage = actual_micros.saturating_sub(reservation.reserved_micros);
+        let released = reservation
+            .reserved_micros
+            .saturating_sub(actual_micros)
+            .max(0);
+        let overage = actual_micros
+            .saturating_sub(reservation.reserved_micros)
+            .max(0);
         let now = unix_millis();
         let mut tx = self.pool.begin().await?;
         let claimed = sqlx::query(
@@ -1156,6 +1493,33 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok(actual_micros)
+    }
+
+    pub async fn release_orphaned_reservations(&self, limit: i64) -> Result<u64, AppError> {
+        let cutoff = unix_millis().saturating_sub(30 * 60 * 1_000);
+        let rows = sqlx::query(
+            "SELECT r.id, r.account_id, r.key_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start FROM usage_reservations r WHERE r.status = 'reserved' AND r.created_at < ? AND NOT EXISTS (SELECT 1 FROM request_records q WHERE q.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) ORDER BY r.created_at, r.id LIMIT ?",
+        )
+        .bind(cutoff)
+        .bind(limit.clamp(1, 1_000))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut released = 0_u64;
+        for row in rows {
+            let reservation = UsageReservation {
+                id: parse_uuid(row.try_get("id")?)?,
+                account_id: parse_uuid(row.try_get("account_id")?)?,
+                key_id: parse_uuid(row.try_get("key_id")?)?,
+                reserved_micros: row.try_get("reserved_micros")?,
+                input_micros_per_million: 0,
+                output_micros_per_million: 0,
+                rate_window_start: row.try_get("rate_window_start")?,
+                reserved_tokens: row.try_get("reserved_tokens")?,
+            };
+            self.settle_usage(&reservation, 0, 0).await?;
+            released = released.saturating_add(1);
+        }
+        Ok(released)
     }
 
     pub async fn grant(
@@ -1521,8 +1885,9 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<RequestView>, AppError> {
         let rows = sqlx::query(
-            "SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.output_tokens, r.cost_micros, r.error_code FROM request_records r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = ? ORDER BY r.created_at DESC, r.id DESC LIMIT ?",
+            "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM (SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.output_tokens, r.cost_micros, r.error_code FROM request_records r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = ? UNION ALL SELECT g.id, g.created_at, 'generation' AS protocol, g.public_model AS model, CASE WHEN g.status = 'succeeded' THEN 200 WHEN g.status IN ('failed', 'cancelled') THEN 502 ELSE NULL END AS status_code, CASE WHEN g.completed_at IS NULL THEN NULL ELSE g.completed_at - g.created_at END AS duration_ms, 0 AS input_tokens, 0 AS output_tokens, g.cost_micros, g.error_code FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = ?) AS all_requests ORDER BY created_at DESC, id DESC LIMIT ?",
         )
+        .bind(tenant_external_id)
         .bind(tenant_external_id)
         .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
@@ -1669,8 +2034,9 @@ impl Database {
     pub async fn stats(&self, key_id: Uuid) -> Result<SelfStats, AppError> {
         let key_id = key_id.to_string();
         let summary_row = sqlx::query(
-            "SELECT COALESCE(SUM(requests), 0) AS total_requests, COALESCE(SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END), 0) AS failed_requests, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM usage_daily_aggregates WHERE key_id = ?",
+            "SELECT CAST(COALESCE(SUM(total_requests), 0) AS BIGINT) AS total_requests, CAST(COALESCE(SUM(successful_requests), 0) AS BIGINT) AS successful_requests, CAST(COALESCE(SUM(failed_requests), 0) AS BIGINT) AS failed_requests, CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens, CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros FROM (SELECT COALESCE(SUM(requests), 0) AS total_requests, COALESCE(SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END), 0) AS failed_requests, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM usage_daily_aggregates WHERE key_id = ? UNION ALL SELECT COUNT(*) AS total_requests, COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN status IN ('failed', 'cancelled') THEN 1 ELSE 0 END), 0) AS failed_requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = ? AND status IN ('succeeded', 'failed', 'cancelled')) AS totals",
         )
+        .bind(&key_id)
         .bind(&key_id)
         .fetch_one(&self.pool)
         .await?;
@@ -1684,16 +2050,18 @@ impl Database {
         };
 
         let model_rows = sqlx::query(
-            "SELECT model AS name, SUM(requests) AS requests, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cost_micros) AS cost_micros FROM usage_daily_aggregates WHERE key_id = ? GROUP BY model ORDER BY requests DESC, model ASC",
+            "SELECT name, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT model AS name, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates WHERE key_id = ? UNION ALL SELECT public_model AS name, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = ? AND status IN ('succeeded', 'failed', 'cancelled') GROUP BY public_model) AS model_totals GROUP BY name ORDER BY requests DESC, name ASC",
         )
+        .bind(&key_id)
         .bind(&key_id)
         .fetch_all(&self.pool)
         .await?;
         let by_model = aggregate_buckets(model_rows)?;
 
         let day_rows = sqlx::query(
-            "SELECT day_bucket, SUM(requests) AS requests, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cost_micros) AS cost_micros FROM usage_daily_aggregates WHERE key_id = ? GROUP BY day_bucket ORDER BY day_bucket ASC",
+            "SELECT day_bucket, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT day_bucket, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates WHERE key_id = ? UNION ALL SELECT created_at / 86400000 AS day_bucket, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = ? AND status IN ('succeeded', 'failed', 'cancelled') GROUP BY created_at / 86400000) AS day_totals GROUP BY day_bucket ORDER BY day_bucket ASC",
         )
+        .bind(&key_id)
         .bind(&key_id)
         .fetch_all(&self.pool)
         .await?;
@@ -1709,9 +2077,10 @@ impl Database {
             .collect::<Result<Vec<_>, AppError>>()?;
 
         let error_rows = sqlx::query(
-            "SELECT error_code AS name, SUM(requests) AS requests, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cost_micros) AS cost_micros FROM usage_daily_aggregates WHERE key_id = ? AND error_code <> '' GROUP BY error_code ORDER BY requests DESC, error_code ASC",
+            "SELECT name, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT error_code AS name, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates WHERE key_id = ? AND error_code <> '' UNION ALL SELECT error_code AS name, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE key_id = ? AND status IN ('failed', 'cancelled') AND error_code IS NOT NULL AND error_code <> '' GROUP BY error_code) AS error_totals GROUP BY name ORDER BY requests DESC, name ASC",
         )
-        .bind(key_id.to_string())
+        .bind(&key_id)
+        .bind(&key_id)
         .fetch_all(&self.pool)
         .await?;
         let errors = aggregate_buckets(error_rows)?;
@@ -1922,6 +2291,35 @@ fn parse_uuid(value: String) -> Result<Uuid, AppError> {
     Uuid::parse_str(&value).map_err(|_| AppError::Internal)
 }
 
+fn generation_job_view(row: AnyRow) -> Result<GenerationJobView, AppError> {
+    let result_json: Option<String> = row.try_get("result_json")?;
+    Ok(GenerationJobView {
+        job_id: parse_uuid(row.try_get("id")?)?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        completed_at: row.try_get("completed_at")?,
+        model: row.try_get("public_model")?,
+        driver: row.try_get("driver")?,
+        status: row.try_get("status")?,
+        upstream_job_id: row.try_get("upstream_job_id")?,
+        estimated_units: row.try_get("estimated_units")?,
+        billed_units: row.try_get("billed_units")?,
+        cost: micros_to_decimal_string(row.try_get("cost_micros")?),
+        error_code: row.try_get("error_code")?,
+        result: result_json
+            .map(|value| serde_json::from_str(&value).map_err(|_| AppError::Internal))
+            .transpose()?,
+    })
+}
+
+fn generation_update_claimed(result: AnyQueryResult) -> Result<(), AppError> {
+    if result.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
 pub fn unix_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1956,6 +2354,11 @@ const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "request event stream",
         sql: include_str!("../migrations/sqlite/0004_request_events.sql"),
     },
+    Migration {
+        version: 5,
+        name: "asynchronous generation jobs",
+        sql: include_str!("../migrations/sqlite/0005_generation_jobs.sql"),
+    },
 ];
 
 const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1978,6 +2381,11 @@ const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "partitioned request event stream",
         sql: include_str!("../migrations/postgres/0004_request_events.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "asynchronous generation jobs",
+        sql: include_str!("../migrations/postgres/0005_generation_jobs.sql"),
     },
 ];
 
@@ -2107,5 +2515,102 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn maintenance_releases_old_unlinked_reservations() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("orphan-reservation.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"a downstream key pepper longer than thirty-two bytes";
+        let issued = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "tenant".to_owned(),
+                    principal_external_id: "member".to_owned(),
+                    alias: "orphan-test".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::ONE,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        let key = database
+            .authenticate_key(&issued.key, pepper)
+            .await
+            .unwrap();
+        let price = database
+            .upsert_model_price("orphan-model", "USD", Decimal::ZERO, Decimal::ONE)
+            .await
+            .unwrap();
+        let reservation = database
+            .reserve_usage(&key, &price, 0, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(reservation.reserved_micros, 1_000);
+        let reserved_account = sqlx::query(
+            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = ?",
+        )
+        .bind(issued.account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(reserved_account.get::<i64, _>("available_micros"), 999_000);
+        assert_eq!(reserved_account.get::<i64, _>("reserved_micros"), 1_000);
+        sqlx::query("UPDATE usage_reservations SET created_at = ? WHERE id = ?")
+            .bind(unix_millis().saturating_sub(31 * 60 * 1_000))
+            .bind(reservation.id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            database.release_orphaned_reservations(100).await.unwrap(),
+            1
+        );
+        let reservation_row =
+            sqlx::query("SELECT status, actual_micros FROM usage_reservations WHERE id = ?")
+                .bind(reservation.id.to_string())
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(reservation_row.get::<String, _>("status"), "settled");
+        assert_eq!(reservation_row.get::<i64, _>("actual_micros"), 0);
+        let account_row = sqlx::query(
+            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = ?",
+        )
+        .bind(issued.account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(account_row.get::<i64, _>("available_micros"), 1_000_000);
+        assert_eq!(account_row.get::<i64, _>("reserved_micros"), 0);
+
+        let overage_reservation = database
+            .reserve_usage(&key, &price, 0, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .settle_usage(&overage_reservation, 0, 2_000)
+                .await
+                .unwrap(),
+            2_000
+        );
+        let overage_account = sqlx::query(
+            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = ?",
+        )
+        .bind(issued.account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(overage_account.get::<i64, _>("available_micros"), 998_000);
+        assert_eq!(overage_account.get::<i64, _>("reserved_micros"), 0);
     }
 }

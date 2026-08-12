@@ -50,6 +50,22 @@ export interface SelfStats {
   errors: StatsBucket[];
 }
 
+export interface GenerationJob {
+  job_id: string;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
+  model: string;
+  driver: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  upstream_job_id: string | null;
+  estimated_units: number;
+  billed_units: number | null;
+  cost: string;
+  error_code: string | null;
+  result: unknown | null;
+}
+
 export interface ProviderType {
   id: string;
   display_name: string;
@@ -93,4 +109,7 @@ export interface ConfigurationSchemas {
   plugin_manifest: Record<string, unknown>;
   provider_account: Record<string, unknown>;
   service_token: Record<string, unknown>;
+  generation_create: Record<string, unknown>;
+  generation_price: Record<string, unknown>;
+  model_price: Record<string, unknown>;
 }

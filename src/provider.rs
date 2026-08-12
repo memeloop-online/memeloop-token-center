@@ -17,6 +17,7 @@ const ENVELOPE_AAD: &[u8] = b"memeloop-token-center/upstream-credential/v1";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UpstreamCredential {
+    None,
     ApiKey {
         value: String,
         #[serde(default = "authorization_header")]
@@ -39,6 +40,7 @@ pub enum UpstreamCredential {
 impl UpstreamCredential {
     pub fn auth_kind(&self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::ApiKey { .. } => "api_key",
             Self::OAuth { .. } => "oauth",
         }
@@ -46,7 +48,7 @@ impl UpstreamCredential {
 
     pub fn expires_at(&self) -> Option<i64> {
         match self {
-            Self::ApiKey { .. } => None,
+            Self::None | Self::ApiKey { .. } => None,
             Self::OAuth { expires_at, .. } => *expires_at,
         }
     }
@@ -58,6 +60,7 @@ impl UpstreamCredential {
     ) -> Result<reqwest::RequestBuilder, AppError> {
         self.validate(now)?;
         let (secret, header, prefix) = match self {
+            Self::None => return Ok(request),
             Self::ApiKey {
                 value,
                 header,
@@ -79,6 +82,7 @@ impl UpstreamCredential {
 
     pub fn validate(&self, now: i64) -> Result<(), AppError> {
         let (secret, header, prefix) = match self {
+            Self::None => return Ok(()),
             Self::ApiKey {
                 value,
                 header,
@@ -162,6 +166,15 @@ impl ProviderCatalog {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "oneOf": [
                 {
+                    "title": "No authentication",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["type"],
+                    "properties": {
+                        "type": {"const": "none"}
+                    }
+                },
+                {
                     "title": "API key",
                     "type": "object",
                     "additionalProperties": false,
@@ -189,22 +202,62 @@ impl ProviderCatalog {
                 }
             ]
         });
-        Self {
-            types: vec![ProviderType {
-                id: "http-json".to_owned(),
-                display_name: "HTTP JSON upstream".to_owned(),
-                protocols: vec!["openai".to_owned(), "anthropic".to_owned()],
-                modalities: vec![
-                    "text".to_owned(),
-                    "embedding".to_owned(),
-                    "image".to_owned(),
-                    "video".to_owned(),
-                ],
-                config_schema,
-                credential_schema,
-                source: "builtin".to_owned(),
-            }],
-        }
+        let mut types = vec![ProviderType {
+            id: "http-json".to_owned(),
+            display_name: "HTTP JSON upstream".to_owned(),
+            protocols: vec!["openai".to_owned(), "anthropic".to_owned()],
+            modalities: vec![
+                "text".to_owned(),
+                "embedding".to_owned(),
+                "image".to_owned(),
+                "video".to_owned(),
+            ],
+            config_schema,
+            credential_schema: credential_schema.clone(),
+            source: "builtin".to_owned(),
+        }];
+        types.push(ProviderType {
+            id: "volcengine-seedance".to_owned(),
+            display_name: "Volcengine Seedance".to_owned(),
+            protocols: vec!["generation".to_owned()],
+            modalities: vec!["video".to_owned()],
+            config_schema: json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["base_url"],
+                "properties": {
+                    "base_url": {"type": "string", "format": "uri", "default": "https://ark.cn-beijing.volces.com"},
+                    "result_origins": {
+                        "type": "array",
+                        "uniqueItems": true,
+                        "items": {"type": "string", "format": "uri"},
+                        "description": "Exact origins allowed for generated asset archival."
+                    }
+                }
+            }),
+            credential_schema: credential_schema.clone(),
+            source: "builtin".to_owned(),
+        });
+        types.push(ProviderType {
+            id: "comfyui".to_owned(),
+            display_name: "ComfyUI".to_owned(),
+            protocols: vec!["generation".to_owned()],
+            modalities: vec!["image".to_owned(), "video".to_owned()],
+            config_schema: json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["base_url"],
+                "properties": {
+                    "base_url": {"type": "string", "format": "uri"},
+                    "api_prefix": {"type": "string", "enum": ["", "/api"], "default": ""}
+                }
+            }),
+            credential_schema,
+            source: "builtin".to_owned(),
+        });
+        Self { types }
     }
 
     pub fn list(&self) -> &[ProviderType] {
@@ -270,6 +323,7 @@ pub struct ResolvedUpstream {
     pub account_id: Uuid,
     pub driver: String,
     pub base_url: String,
+    pub config: Value,
     pub upstream_model: String,
     pub credential: UpstreamCredential,
 }
@@ -393,5 +447,13 @@ mod tests {
         let opened = open_credential(&envelope, b"a key material with at least 32 bytes").unwrap();
         assert_eq!(opened.auth_kind(), "oauth");
         assert_eq!(opened.expires_at(), Some(42));
+    }
+
+    #[test]
+    fn unauthenticated_credential_is_valid() {
+        let credential: UpstreamCredential =
+            serde_json::from_value(json!({"type": "none"})).unwrap();
+        assert_eq!(credential.auth_kind(), "none");
+        credential.validate(42).unwrap();
     }
 }

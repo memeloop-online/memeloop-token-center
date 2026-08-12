@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memeloop.dev/token-center/schemas/generation-price.schema.json",
+  "title": "Generation price",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["billing_unit", "price_per_unit"],
+  "properties": {
+    "billing_unit": { "enum": ["job", "second", "image", "megapixel"] },
+    "price_per_unit": { "type": "string", "pattern": "^[0-9]+(?:\\.[0-9]{1,6})?$" }
+  }
+}

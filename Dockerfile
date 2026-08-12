@@ -28,7 +28,9 @@ COPY migrations ./migrations
 COPY schemas ./schemas
 COPY tests ./tests
 COPY wit ./wit
-RUN cargo build --locked --release --bin memeloop-token-center
+RUN cargo build --locked --release --bin memeloop-token-center \
+    && cp target/release/memeloop-token-center /tmp/memeloop-token-center \
+    && rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
 
 FROM ${RUNTIME_IMAGE}
 ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian
@@ -37,7 +39,7 @@ RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home token-center
-COPY --from=builder /build/target/release/memeloop-token-center /usr/local/bin/memeloop-token-center
+COPY --from=builder /tmp/memeloop-token-center /usr/local/bin/memeloop-token-center
 COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web
 USER 10001:10001
 EXPOSE 8080

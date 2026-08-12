@@ -32,8 +32,8 @@ use crate::{
     config::RuntimeRole,
     crypto,
     db::{
-        CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput, CreateUpstreamAccountInput,
-        FinishRequest, NewRequest, unix_millis,
+        CreateGenerationJobInput, CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput,
+        CreateUpstreamAccountInput, FinishRequest, NewRequest, unix_millis,
     },
     error::AppError,
     model::{AuthenticatedKey, AuthenticatedService, KeyPolicy},
@@ -101,6 +101,10 @@ fn control_router() -> Router<AppState> {
         .route("/internal/v1/model-routes", post(create_model_route))
         .route("/internal/v1/prices/{currency}/{model}", post(upsert_price))
         .route(
+            "/internal/v1/generation-prices/{currency}/{model}",
+            post(upsert_generation_price),
+        )
+        .route(
             "/internal/v1/accounts/{account_id}/grants",
             post(grant_balance),
         )
@@ -113,6 +117,8 @@ fn gateway_router() -> Router<AppState> {
         .route("/self/v1/requests", get(self_requests))
         .route("/self/v1/requests/{request_id}", get(self_request_detail))
         .route("/self/v1/stats", get(self_stats))
+        .route("/self/v1/generations", get(self_generations))
+        .route("/self/v1/generations/{job_id}", get(self_generation))
         .route("/self/v1/conversations", get(self_conversations))
         .route(
             "/self/v1/conversations/{cluster_id}",
@@ -122,6 +128,9 @@ fn gateway_router() -> Router<AppState> {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(proxy_openai_chat))
         .route("/v1/embeddings", post(proxy_openai_embeddings))
+        .route("/v1/generations", post(create_generation))
+        .route("/v1/videos/generations", post(create_generation))
+        .route("/v1/images/generations", post(create_generation))
         .route("/v1/messages", post(proxy_anthropic))
         .route(
             "/v1/messages/count_tokens",
@@ -331,6 +340,9 @@ async fn configuration_schemas(
         "core_config": schema(include_str!("../schemas/core-config.schema.json"))?,
         "key_create": schema(include_str!("../schemas/key-create.schema.json"))?,
         "key_policy": schema(include_str!("../schemas/key-policy.schema.json"))?,
+        "generation_create": schema(include_str!("../schemas/generation-create.schema.json"))?,
+        "generation_price": schema(include_str!("../schemas/generation-price.schema.json"))?,
+        "model_price": schema(include_str!("../schemas/model-price.schema.json"))?,
         "model_route": schema(include_str!("../schemas/model-route.schema.json"))?,
         "plugin_manifest": schema(include_str!("../schemas/plugin-manifest.schema.json"))?,
         "provider_account": schema(include_str!("../schemas/provider-account.schema.json"))?,
@@ -688,6 +700,30 @@ async fn upsert_price(
 }
 
 #[derive(Debug, Deserialize)]
+struct GenerationPriceRequest {
+    billing_unit: String,
+    price_per_unit: String,
+}
+
+async fn upsert_generation_price(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((currency, model)): Path<(String, String)>,
+    Json(body): Json<GenerationPriceRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "prices:write").await?;
+    require_global_service(&service)?;
+    let price = Decimal::from_str(&body.price_per_unit)
+        .map_err(|_| AppError::BadRequest("price_per_unit must be a decimal string".into()))?;
+    Ok(Json(
+        state
+            .db
+            .upsert_generation_price(&model, &currency, &body.billing_unit, price)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
 struct GrantRequest {
     amount: String,
     source: String,
@@ -850,6 +886,160 @@ async fn proxy_anthropic_count_tokens(
     body: Bytes,
 ) -> Result<Response, AppError> {
     proxy(state, headers, body, Protocol::AnthropicCountTokens).await
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateGenerationRequest {
+    model: String,
+    input: Value,
+}
+
+async fn create_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateGenerationRequest>,
+) -> Result<Response, AppError> {
+    let key = authenticate_downstream(&headers, &state).await?;
+    if !key.policy.allows_model(&body.model) {
+        return Err(AppError::Forbidden);
+    }
+    if !body.input.is_object() {
+        return Err(AppError::BadRequest(
+            "generation input must be a JSON object".into(),
+        ));
+    }
+    let route = state
+        .db
+        .resolve_upstream(
+            key.tenant_id,
+            &body.model,
+            "generation",
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?
+        .ok_or_else(|| AppError::Upstream("generation route is not configured".into()))?;
+    if !matches!(route.driver.as_str(), "volcengine-seedance" | "comfyui") {
+        return Err(AppError::Upstream(format!(
+            "generation driver {} cannot execute asynchronous jobs",
+            route.driver
+        )));
+    }
+    let generation_price = state
+        .db
+        .generation_price(&body.model, &key.currency)
+        .await?;
+    let estimated_units =
+        estimated_generation_units(&route.driver, &generation_price.billing_unit, &body.input)?;
+    let reservation_price = generation_price
+        .reservation_price()
+        .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
+    let reservation = state
+        .db
+        .reserve_usage(&key, &reservation_price, 0, estimated_units)
+        .await?;
+    let job_id = Uuid::now_v7();
+    let archived = serde_json::to_vec(&json!({
+        "model": body.model,
+        "input": body.input
+    }))
+    .map_err(|_| AppError::Internal)?;
+    let request_object = match state.archive.put_content(Bytes::from(archived)).await {
+        Ok(location) => location,
+        Err(error) => {
+            let _ = state.db.settle_usage(&reservation, 0, 0).await;
+            return Err(error);
+        }
+    };
+    let job = match state
+        .db
+        .create_generation_job(CreateGenerationJobInput {
+            job_id,
+            key,
+            upstream_account_id: route.account_id,
+            reservation: reservation.clone(),
+            public_model: body.model,
+            upstream_model: route.upstream_model,
+            driver: route.driver,
+            request_object,
+            estimated_units,
+        })
+        .await
+    {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = state.db.settle_usage(&reservation, 0, 0).await;
+            return Err(error);
+        }
+    };
+    Ok((StatusCode::ACCEPTED, Json(job)).into_response())
+}
+
+fn estimated_generation_units(
+    driver: &str,
+    billing_unit: &str,
+    input: &Value,
+) -> Result<i64, AppError> {
+    match (driver, billing_unit) {
+        ("volcengine-seedance", "second") => {
+            let units = input
+                .get("duration")
+                .and_then(Value::as_i64)
+                .or_else(|| seedance_duration_from_content(input))
+                .unwrap_or(5);
+            if !(1..=60).contains(&units) {
+                return Err(AppError::BadRequest(
+                    "Seedance duration must be between 1 and 60 seconds".into(),
+                ));
+            }
+            Ok(units)
+        }
+        ("comfyui", "job") => Ok(1),
+        ("volcengine-seedance", _) => Err(AppError::BadRequest(
+            "Seedance generation price must use second billing".into(),
+        )),
+        ("comfyui", _) => Err(AppError::BadRequest(
+            "ComfyUI generation price must use job billing".into(),
+        )),
+        _ => Err(AppError::BadRequest("unsupported generation driver".into())),
+    }
+}
+
+fn seedance_duration_from_content(input: &Value) -> Option<i64> {
+    input
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .find_map(|text| {
+            let values = text.split_whitespace().collect::<Vec<_>>();
+            values
+                .windows(2)
+                .find(|values| values[0] == "--dur")
+                .and_then(|values| values[1].parse().ok())
+        })
+}
+
+async fn self_generations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RequestsQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let key = authenticate_downstream(&headers, &state).await?;
+    Ok(Json(
+        state
+            .db
+            .list_generation_jobs(key.key_id, query.limit)
+            .await?,
+    ))
+}
+
+async fn self_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let key = authenticate_downstream(&headers, &state).await?;
+    Ok(Json(state.db.generation_job(key.key_id, job_id).await?))
 }
 
 #[derive(Clone, Copy)]

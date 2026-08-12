@@ -44,6 +44,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
+        env:
+          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
       - name: PostgreSQL migration smoke test
         env:
           MTC_DATABASE_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test

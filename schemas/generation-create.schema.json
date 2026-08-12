@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memeloop.dev/token-center/schemas/generation-create.schema.json",
+  "title": "Asynchronous multimodal generation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["model", "input"],
+  "properties": {
+    "model": { "type": "string", "minLength": 1 },
+    "input": {
+      "type": "object",
+      "description": "Provider-native Seedance task body or ComfyUI API workflow request. The routed upstream model is injected server-side."
+    }
+  }
+}

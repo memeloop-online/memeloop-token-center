@@ -2,7 +2,7 @@ use std::{fmt, str::FromStr};
 
 use cucumber::{World, given, then, when};
 use futures_util::StreamExt;
-use memeloop_token_center::{AppState, api, config::Config};
+use memeloop_token_center::{AppState, api, config::Config, worker};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -20,6 +20,7 @@ struct TokenCenterWorld {
     mock: Option<MockServer>,
     temp_dir: Option<TempDir>,
     server_task: Option<JoinHandle<()>>,
+    worker_task: Option<JoinHandle<()>>,
     current_key: String,
     old_key: String,
     stable_key_id: Option<Uuid>,
@@ -32,6 +33,7 @@ struct TokenCenterWorld {
     current_service_token: String,
     old_service_token: String,
     stable_service_id: Option<Uuid>,
+    generation_job_id: Option<Uuid>,
     status: Option<StatusCode>,
     response: Value,
 }
@@ -44,6 +46,7 @@ impl Default for TokenCenterWorld {
             mock: None,
             temp_dir: None,
             server_task: None,
+            worker_task: None,
             current_key: String::new(),
             old_key: String::new(),
             stable_key_id: None,
@@ -56,6 +59,7 @@ impl Default for TokenCenterWorld {
             current_service_token: String::new(),
             old_service_token: String::new(),
             stable_service_id: None,
+            generation_job_id: None,
             status: None,
             response: Value::Null,
         }
@@ -79,6 +83,9 @@ impl Drop for TokenCenterWorld {
         if let Some(task) = self.server_task.take() {
             task.abort();
         }
+        if let Some(task) = self.worker_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -94,6 +101,7 @@ async fn start_test_service(world: &mut TokenCenterWorld) {
     let state = AppState::initialize(config)
         .await
         .expect("initialize test service");
+    let worker_task = tokio::spawn(worker::run(state.clone()));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test server");
@@ -108,6 +116,382 @@ async fn start_test_service(world: &mut TokenCenterWorld) {
     world.mock = Some(mock);
     world.temp_dir = Some(temp_dir);
     world.server_task = Some(server_task);
+    world.worker_task = Some(worker_task);
+}
+
+#[given("the mock Seedance upstream completes a five second video")]
+async fn mock_seedance_generation(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/api/v3/contents/generations/tasks"))
+        .and(header("authorization", "Bearer seedance-secret"))
+        .and(body_partial_json(json!({"model": "seedance-upstream"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "cgt-test"})))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    Mock::given(method("GET"))
+        .and(path("/api/v3/contents/generations/tasks/cgt-test"))
+        .and(header("authorization", "Bearer seedance-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cgt-test",
+            "status": "succeeded",
+            "duration": "5",
+            "content": {"video_url": format!("{mock_url}/assets/video.mp4")},
+            "usage": {"completion_tokens": 1234, "total_tokens": 1234}
+        })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/assets/video.mp4"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "video/mp4")
+                .set_body_bytes(b"mock-video-content"),
+        )
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[when("the service creates a metered Seedance route and key")]
+async fn create_seedance_route_and_key(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/upstreams", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "name": "seedance",
+            "driver": "volcengine-seedance",
+            "config": {"base_url": mock_url},
+            "credential": {"type": "api_key", "value": "seedance-secret"}
+        }))
+        .send()
+        .await
+        .expect("create Seedance upstream");
+    let status = response.status();
+    let response_body = response.text().await.expect("Seedance account response");
+    assert!(
+        status == StatusCode::CREATED,
+        "Seedance account failed with {status}: {response_body}"
+    );
+    let account: Value = serde_json::from_str(&response_body).expect("Seedance account JSON");
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/model-routes", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "public_model": "seedance-public",
+            "upstream_account_id": account["id"],
+            "upstream_model": "seedance-upstream",
+            "protocol": "generation"
+        }))
+        .send()
+        .await
+        .expect("create Seedance route");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/generation-prices/USD/seedance-public",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"billing_unit": "second", "price_per_unit": "0.1"}))
+        .send()
+        .await
+        .expect("create Seedance price");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "principal_external_id": "video-user",
+            "alias": "video",
+            "currency": "USD",
+            "initial_balance": "10",
+            "policy": {"allowed_models": ["seedance-public"]}
+        }))
+        .send()
+        .await
+        .expect("create Seedance key");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let key: Value = response.json().await.expect("Seedance key JSON");
+    world.current_key = key["key"].as_str().expect("Seedance key").to_owned();
+}
+
+#[when("the client creates a five second Seedance generation")]
+async fn create_seedance_generation(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/v1/videos/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .json(&json!({
+            "model": "seedance-public",
+            "input": {
+                "duration": 5,
+                "content": [{"type": "text", "text": "a fox in the wind"}]
+            }
+        }))
+        .send()
+        .await
+        .expect("create Seedance generation");
+    world.status = Some(response.status());
+    world.response = response.json().await.expect("generation response JSON");
+    world.generation_job_id = world.response["job_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok());
+}
+
+#[then("the generation eventually succeeds with an archived video costing 0.5")]
+async fn generation_succeeds(world: &mut TokenCenterWorld) {
+    let job_id = world.generation_job_id.expect("generation job id");
+    for _ in 0..30 {
+        let response = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("generation status");
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = response.json().await.expect("generation status JSON");
+        if value["status"] == "succeeded" {
+            assert_eq!(value["billed_units"], 5);
+            assert_eq!(value["cost"], "0.5");
+            assert!(
+                value["result"]["archive_objects"][0]
+                    .as_str()
+                    .is_some_and(|location| location.starts_with("objects/blake3/"))
+            );
+            assert_generation_stats(world, "seedance-public", "0.5").await;
+            world.response = value;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("generation did not complete: {}", world.response);
+}
+
+#[given("the mock ComfyUI upstream completes an image workflow")]
+async fn mock_comfyui_generation(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/prompt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"prompt_id": "comfy-test"})))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/history/comfy-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "comfy-test": {
+                "status": {"status_str": "success", "completed": true},
+                "outputs": {
+                    "9": {"images": [{"filename": "result.png", "subfolder": "", "type": "output"}]}
+                }
+            }
+        })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/view"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(b"mock-png-content"),
+        )
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[when("the service creates a metered ComfyUI route and key")]
+async fn create_comfyui_route_and_key(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/upstreams", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "name": "comfyui",
+            "driver": "comfyui",
+            "config": {"base_url": mock_url, "api_prefix": ""},
+            "credential": {"type": "none"}
+        }))
+        .send()
+        .await
+        .expect("create ComfyUI upstream");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let account: Value = response.json().await.expect("ComfyUI account JSON");
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/model-routes", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "public_model": "comfy-public",
+            "upstream_account_id": account["id"],
+            "upstream_model": "workflow-v1",
+            "protocol": "generation"
+        }))
+        .send()
+        .await
+        .expect("create ComfyUI route");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/generation-prices/USD/comfy-public",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"billing_unit": "job", "price_per_unit": "0.2"}))
+        .send()
+        .await
+        .expect("create ComfyUI price");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "principal_external_id": "image-user",
+            "alias": "image",
+            "currency": "USD",
+            "initial_balance": "10",
+            "policy": {"allowed_models": ["comfy-public"]}
+        }))
+        .send()
+        .await
+        .expect("create ComfyUI key");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let key: Value = response.json().await.expect("ComfyUI key JSON");
+    world.current_key = key["key"].as_str().expect("ComfyUI key").to_owned();
+}
+
+#[when("the client creates a ComfyUI image generation")]
+async fn create_comfyui_generation(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/v1/images/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .json(&json!({
+            "model": "comfy-public",
+            "input": {
+                "3": {"class_type": "KSampler", "inputs": {"seed": 42}},
+                "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "MTC"}}
+            }
+        }))
+        .send()
+        .await
+        .expect("create ComfyUI generation");
+    world.status = Some(response.status());
+    world.response = response.json().await.expect("ComfyUI generation JSON");
+    world.generation_job_id = world.response["job_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok());
+}
+
+#[then("the ComfyUI generation eventually succeeds with an archived image costing 0.2")]
+async fn comfyui_generation_succeeds(world: &mut TokenCenterWorld) {
+    let job_id = world.generation_job_id.expect("ComfyUI generation job id");
+    for _ in 0..30 {
+        let value = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("ComfyUI generation status")
+            .json::<Value>()
+            .await
+            .expect("ComfyUI generation status JSON");
+        if value["status"] == "succeeded" {
+            assert_eq!(value["billed_units"], 1);
+            assert_eq!(value["cost"], "0.2");
+            assert!(
+                value["result"]["archive_objects"][0]
+                    .as_str()
+                    .is_some_and(|location| location.starts_with("objects/blake3/"))
+            );
+            assert_generation_stats(world, "comfy-public", "0.2").await;
+            world.response = value;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("ComfyUI generation did not complete: {}", world.response);
+}
+
+async fn assert_generation_stats(world: &TokenCenterWorld, model: &str, cost: &str) {
+    let stats = world
+        .client
+        .get(format!("{}/self/v1/stats", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("generation statistics")
+        .json::<Value>()
+        .await
+        .expect("generation statistics JSON");
+    assert_eq!(stats["summary"]["total_requests"], 1);
+    assert_eq!(stats["summary"]["successful_requests"], 1);
+    assert_eq!(stats["summary"]["total_cost"], cost);
+    assert!(stats["by_model"].as_array().is_some_and(|rows| {
+        rows.iter()
+            .any(|row| row["name"] == model && row["requests"] == 1 && row["cost"] == cost)
+    }));
+    let operator_requests = world
+        .client
+        .get(format!(
+            "{}/internal/v1/requests?limit=10",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("operator generation requests")
+        .json::<Value>()
+        .await
+        .expect("operator generation requests JSON");
+    assert!(operator_requests.as_array().is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row["protocol"] == "generation" && row["model"] == model && row["cost"] == cost
+        })
+    }));
+
+    let response = world
+        .client
+        .get(format!(
+            "{}/internal/v1/request-events?after_event_at=0",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("generation event stream");
+    let mut stream = response.bytes_stream();
+    let lifecycle = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut body = String::new();
+        while let Some(chunk) = stream.next().await {
+            body.push_str(&String::from_utf8_lossy(
+                &chunk.expect("generation SSE chunk"),
+            ));
+            if body.contains("\"protocol\":\"generation\"")
+                && body.contains("\"event_kind\":\"started\"")
+                && body.contains("\"event_kind\":\"finished\"")
+            {
+                return body;
+            }
+        }
+        body
+    })
+    .await
+    .expect("generation lifecycle events before timeout");
+    assert!(lifecycle.contains("\"protocol\":\"generation\""));
 }
 
 #[given("the mock OpenAI upstream returns a successful completion")]

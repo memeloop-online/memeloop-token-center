@@ -233,6 +233,63 @@ pub struct ModelPrice {
     pub output_micros_per_million: i64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct GenerationPrice {
+    pub id: Uuid,
+    pub model: String,
+    pub currency: String,
+    pub billing_unit: String,
+    pub price_per_unit: String,
+    #[serde(skip)]
+    pub micros_per_unit: i64,
+}
+
+impl GenerationPrice {
+    pub fn reservation_price(&self) -> Option<ModelPrice> {
+        Some(ModelPrice {
+            id: self.id,
+            input_micros_per_million: 0,
+            output_micros_per_million: self.micros_per_unit.checked_mul(1_000_000)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GenerationJobView {
+    pub job_id: Uuid,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub completed_at: Option<i64>,
+    pub model: String,
+    pub driver: String,
+    pub status: String,
+    pub upstream_job_id: Option<String>,
+    pub estimated_units: i64,
+    pub billed_units: Option<i64>,
+    pub cost: String,
+    pub error_code: Option<String>,
+    pub result: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GenerationJobWork {
+    pub job_id: Uuid,
+    pub created_at: i64,
+    pub tenant_id: Uuid,
+    pub key_id: Uuid,
+    pub upstream_account_id: Uuid,
+    pub reservation: UsageReservation,
+    pub public_model: String,
+    pub upstream_model: String,
+    pub driver: String,
+    pub status: String,
+    pub request_object: String,
+    pub upstream_job_id: Option<String>,
+    pub estimated_units: i64,
+    pub attempt_count: i64,
+    pub failure_count: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct UsageReservation {
     pub id: Uuid,

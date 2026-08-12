@@ -8,7 +8,11 @@ on:
       - "Cargo.lock"
       - "Dockerfile"
       - "src/**"
+      - "migrations/**"
+      - "schemas/**"
+      - "wit/**"
       - "web/**"
+      - "charts/**"
       - ".forgejo/workflows/build.yaml"
   workflow_dispatch:
 

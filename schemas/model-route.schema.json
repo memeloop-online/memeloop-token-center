@@ -10,7 +10,7 @@
     "public_model": { "type": "string", "minLength": 1 },
     "upstream_account_id": { "type": "string", "format": "uuid" },
     "upstream_model": { "type": "string", "minLength": 1 },
-    "protocol": { "enum": ["openai", "anthropic"] },
+    "protocol": { "enum": ["openai", "anthropic", "generation"] },
     "priority": { "type": "integer", "default": 0 }
   }
 }

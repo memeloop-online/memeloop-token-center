@@ -5,6 +5,7 @@ pub mod conversation;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod generation;
 pub mod model;
 pub mod oauth;
 pub mod plugin;

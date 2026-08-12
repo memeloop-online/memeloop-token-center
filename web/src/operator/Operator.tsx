@@ -6,9 +6,9 @@ import { api, streamSse } from '../api';
 import { RequestTable, Shell } from '../components';
 import type { ConfigurationSchemas, PluginManifest, ProviderType, RequestEvent, RequestView, UpstreamAccount } from '../types';
 
-type Tab = 'traffic' | 'upstreams' | 'routes' | 'keys' | 'oauth' | 'services' | 'plugins';
+type Tab = 'traffic' | 'upstreams' | 'routes' | 'pricing' | 'keys' | 'oauth' | 'services' | 'plugins';
 
-const tabs: Array<[Tab, string]> = [['traffic', '实时请求'], ['upstreams', '上游账号'], ['routes', '模型路由'], ['keys', '创建 Key'], ['oauth', 'OAuth'], ['services', '服务凭据'], ['plugins', '插件']];
+const tabs: Array<[Tab, string]> = [['traffic', '实时请求'], ['upstreams', '上游账号'], ['routes', '模型路由'], ['pricing', '模型计费'], ['keys', '创建 Key'], ['oauth', 'OAuth'], ['services', '服务凭据'], ['plugins', '插件']];
 
 export function Operator() {
   const [token, setToken] = useState(() => sessionStorage.getItem('mtc-service-token') ?? '');
@@ -92,6 +92,7 @@ export function Operator() {
       {tab === 'traffic' && <article className="panel"><div className="panel-title"><h2>实时请求尾流</h2><span>SSE 亚秒级尾查 · 不载入正文</span></div><RequestTable requests={requests} /></article>}
       {tab === 'upstreams' && <Upstreams token={token} providers={providers} values={upstreams} onCreated={() => void refresh()} />}
       {tab === 'routes' && <RouteForm token={token} upstreams={upstreams} />}
+      {tab === 'pricing' && <Pricing token={token} schemas={schemas} />}
       {tab === 'keys' && <KeyForm token={token} schema={schemas?.key_create} />}
       {tab === 'oauth' && <OAuth token={token} onCreated={() => void refresh()} />}
       {tab === 'services' && <ServiceTokenForm token={token} schema={schemas?.service_token} />}
@@ -114,7 +115,16 @@ function Plugins({ values }: { values: PluginManifest[] }) {
 function RouteForm({ token, upstreams }: { token: string; upstreams: UpstreamAccount[] }) {
   const [form, setForm] = useState({ public_model: '', upstream_account_id: '', upstream_model: '', protocol: 'openai', priority: 0 });
   const [message, setMessage] = useState('');
-  return <article className="panel form-panel narrow"><h2>创建模型路由</h2><label>公开模型<input value={form.public_model} onChange={(event) => setForm({ ...form, public_model: event.target.value })} /></label><label>上游账号<select value={form.upstream_account_id} onChange={(event) => setForm({ ...form, upstream_account_id: event.target.value })}><option value="">请选择</option>{upstreams.map((value) => <option key={value.id} value={value.id}>{value.name}</option>)}</select></label><label>上游模型<input value={form.upstream_model} onChange={(event) => setForm({ ...form, upstream_model: event.target.value })} /></label><label>协议<select value={form.protocol} onChange={(event) => setForm({ ...form, protocol: event.target.value })}><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select></label><button onClick={async () => { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify(form) }); setMessage('路由已创建'); }}>创建路由</button>{message && <div className="notice success">{message}</div>}</article>;
+  return <article className="panel form-panel narrow"><h2>创建模型路由</h2><label>公开模型<input value={form.public_model} onChange={(event) => setForm({ ...form, public_model: event.target.value })} /></label><label>上游账号<select value={form.upstream_account_id} onChange={(event) => setForm({ ...form, upstream_account_id: event.target.value })}><option value="">请选择</option>{upstreams.map((value) => <option key={value.id} value={value.id}>{value.name}</option>)}</select></label><label>上游模型<input value={form.upstream_model} onChange={(event) => setForm({ ...form, upstream_model: event.target.value })} /></label><label>协议<select value={form.protocol} onChange={(event) => setForm({ ...form, protocol: event.target.value })}><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="generation">异步多模态生成</option></select></label><button onClick={async () => { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify(form) }); setMessage('路由已创建'); }}>创建路由</button>{message && <div className="notice success">{message}</div>}</article>;
+}
+
+function Pricing({ token, schemas }: { token: string; schemas?: ConfigurationSchemas }) {
+  const [kind, setKind] = useState<'token' | 'generation'>('token');
+  const [model, setModel] = useState('');
+  const [currency, setCurrency] = useState('USD');
+  const [message, setMessage] = useState('');
+  const schema = kind === 'generation' ? schemas?.generation_price : schemas?.model_price;
+  return <article className="panel form-panel narrow"><h2>模型计费</h2><p className="muted">文本模型按百万 token 定价；视频、图片和工作流按 JSON Schema 选择秒、任务、图片或百万像素。</p><label>类型<select value={kind} onChange={(event) => setKind(event.target.value as 'token' | 'generation')}><option value="token">Token 模型</option><option value="generation">多模态生成</option></select></label><label>公开模型<input value={model} onChange={(event) => setModel(event.target.value)} /></label><label>币种<input value={currency} onChange={(event) => setCurrency(event.target.value.toUpperCase())} maxLength={3} /></label>{schema ? <Form key={kind} schema={schema as RJSFSchema} validator={validator} onSubmit={async ({ formData }) => { const prefix = kind === 'generation' ? 'generation-prices' : 'prices'; await api(`/internal/v1/${prefix}/${encodeURIComponent(currency)}/${encodeURIComponent(model)}`, token, { method: 'POST', body: JSON.stringify(formData) }); setMessage('价格已保存'); }}><button type="submit">保存价格</button></Form> : <div className="empty">连接管理 API 后加载 Schema</div>}{message && <div className="notice success">{message}</div>}</article>;
 }
 
 function KeyForm({ token, schema }: { token: string; schema?: Record<string, unknown> }) {
