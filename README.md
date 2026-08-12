@@ -4,6 +4,8 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 
 当前实现重点是可验证的核心纵向链路：稳定 key 身份与无迁移轮换、OpenAI/Anthropic 请求转发、Seedance/ComfyUI 异步生成、请求归档、余额与只读自助统计。生产环境默认使用 PostgreSQL 与 S3；SQLite 和内存对象存储只用于测试。
 
+客户端按公开协议接入而不是按品牌分叉：Codex 可用 Responses，Claude Code 可用 Anthropic Messages，Copilot、Cursor、WorkBuddy 及其他 OpenAI-compatible 客户端使用相同 `/v1/*` 网关。请求记录会结合客户端 session header、正文 metadata 与 Merkle 上下文前缀推断逻辑对话。
+
 同一个镜像支持 `serve --role gateway|control|worker|all`。生产 Helm 默认拆分 gateway、control 与 worker；`all` 只供个人或临时测试部署。gateway 不注册 `/internal/v1/*`，control 不注册模型和 self-service 路由。
 
 ## Key 身份与权限
