@@ -1639,6 +1639,13 @@ impl Database {
         source: &str,
         idempotency_key: &str,
     ) -> Result<String, AppError> {
+        validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
+        let source = source.trim();
+        if source.is_empty() || source.len() > 200 {
+            return Err(AppError::BadRequest(
+                "source must contain 1 to 200 characters".into(),
+            ));
+        }
         let amount_micros = decimal_to_micros(amount)?;
         if amount_micros <= 0 {
             return Err(AppError::BadRequest("grant amount must be positive".into()));
@@ -1657,7 +1664,7 @@ impl Database {
         .bind(Uuid::now_v7().to_string())
         .bind(account_id.to_string())
         .bind(amount_micros)
-        .bind(currency)
+        .bind(&currency)
         .bind(source)
         .bind(idempotency_key)
         .bind(now)
@@ -1684,6 +1691,129 @@ impl Database {
         .bind(account_id.to_string())
         .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
+        Ok(micros_to_decimal_string(amount_micros))
+    }
+
+    pub async fn reverse_grant(
+        &self,
+        account_id: Uuid,
+        grant_idempotency_key: &str,
+        source: &str,
+        idempotency_key: &str,
+    ) -> Result<String, AppError> {
+        validate_idempotency_key(grant_idempotency_key, "grant_idempotency_key")?;
+        validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
+        let source = source.trim();
+        if source.is_empty() || source.len() > 200 {
+            return Err(AppError::BadRequest(
+                "source must contain 1 to 200 characters".into(),
+            ));
+        }
+
+        let now = unix_millis();
+        let mut tx = self.pool.begin().await?;
+        let account_lock =
+            sqlx::query("UPDATE credit_accounts SET updated_at = updated_at WHERE id = ?")
+                .bind(account_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        if account_lock.rows_affected() != 1 {
+            return Err(AppError::NotFound);
+        }
+        let original = sqlx::query(
+            "SELECT id, amount_micros, currency, created_at FROM ledger_entries WHERE account_id = ? AND kind = 'grant' AND idempotency_key = ?",
+        )
+        .bind(account_id.to_string())
+        .bind(grant_idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        let original_id: String = original.try_get("id")?;
+        let amount_micros: i64 = original.try_get("amount_micros")?;
+        let currency: String = original.try_get("currency")?;
+        let granted_at: i64 = original.try_get("created_at")?;
+        let may_have_been_consumed = sqlx::query(
+            "SELECT id FROM ledger_entries WHERE account_id = ? AND kind = 'usage' AND created_at >= ? LIMIT 1",
+        )
+        .bind(account_id.to_string())
+        .bind(granted_at)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if may_have_been_consumed {
+            return Err(AppError::BadRequest(
+                "grant cannot be automatically reversed after account usage".into(),
+            ));
+        }
+
+        let inserted = sqlx::query(
+            "INSERT INTO ledger_entries (id, account_id, kind, amount_micros, currency, source, idempotency_key, reference_entry_id, created_at) VALUES (?, ?, 'grant_reversal', ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(account_id.to_string())
+        .bind(-amount_micros)
+        .bind(&currency)
+        .bind(source)
+        .bind(idempotency_key)
+        .bind(&original_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            let replay = sqlx::query(
+                "SELECT amount_micros, reference_entry_id FROM ledger_entries WHERE account_id = ? AND kind = 'grant_reversal' AND idempotency_key = ?",
+            )
+            .bind(account_id.to_string())
+            .bind(idempotency_key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(replay) = replay {
+                let replay_reference: Option<String> = replay.try_get("reference_entry_id")?;
+                if replay_reference.as_deref() != Some(original_id.as_str()) {
+                    return Err(AppError::BadRequest(
+                        "Idempotency-Key was already used for a different grant reversal".into(),
+                    ));
+                }
+                let replay_amount: i64 = replay.try_get("amount_micros")?;
+                tx.commit().await?;
+                return Ok(micros_to_decimal_string(replay_amount.saturating_abs()));
+            }
+            let existing_idempotency =
+                sqlx::query("SELECT kind FROM ledger_entries WHERE idempotency_key = ?")
+                    .bind(idempotency_key)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if existing_idempotency.is_some() {
+                return Err(AppError::BadRequest(
+                    "Idempotency-Key was already used for a different ledger operation".into(),
+                ));
+            }
+            return Err(AppError::BadRequest("grant was already reversed".into()));
+        }
+
+        let updated = sqlx::query(
+            "UPDATE credit_accounts SET available_micros = available_micros - ?, updated_at = ? WHERE id = ? AND currency = ? AND available_micros >= ?",
+        )
+        .bind(amount_micros)
+        .bind(now)
+        .bind(account_id.to_string())
+        .bind(&currency)
+        .bind(amount_micros)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            let exists = sqlx::query("SELECT id FROM credit_accounts WHERE id = ?")
+                .bind(account_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+            return Err(if exists {
+                AppError::QuotaExceeded
+            } else {
+                AppError::NotFound
+            });
+        }
         tx.commit().await?;
         Ok(micros_to_decimal_string(amount_micros))
     }
@@ -2330,6 +2460,16 @@ fn validate_currency(currency: &str) -> Result<(), AppError> {
     }
 }
 
+fn validate_idempotency_key(value: &str, field: &str) -> Result<(), AppError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 200 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(AppError::BadRequest(format!(
+            "{field} must contain at most 200 visible ASCII characters"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_service_token_input(input: &CreateServiceTokenInput) -> Result<(), AppError> {
     if input.name.trim().is_empty() || input.name.len() > 120 {
         return Err(AppError::BadRequest(
@@ -2474,6 +2614,11 @@ const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "idempotent key provisioning",
         sql: include_str!("../migrations/sqlite/0006_key_provisioning.sql"),
     },
+    Migration {
+        version: 7,
+        name: "idempotent grant reversals",
+        sql: include_str!("../migrations/sqlite/0007_grant_reversals.sql"),
+    },
 ];
 
 const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -2506,6 +2651,11 @@ const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 6,
         name: "idempotent key provisioning",
         sql: include_str!("../migrations/postgres/0006_key_provisioning.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "idempotent grant reversals",
+        sql: include_str!("../migrations/postgres/0007_grant_reversals.sql"),
     },
 ];
 
@@ -2689,6 +2839,115 @@ mod tests {
                 .try_get("issued_key_ciphertext")
                 .unwrap();
         assert!(!ciphertext.contains(&first.key));
+    }
+
+    #[tokio::test]
+    async fn grant_reversal_is_idempotent_and_only_revokes_unspent_credit() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("grant-reversal.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let issued = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "tenant".to_owned(),
+                    principal_external_id: "member".to_owned(),
+                    alias: "refund-test".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::ZERO,
+                    idempotency_key: None,
+                },
+                b"a downstream key pepper longer than thirty-two bytes",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            database
+                .grant(
+                    issued.account_id,
+                    Decimal::new(10, 0),
+                    "subscription:pro",
+                    "subscription:one:grant",
+                )
+                .await
+                .unwrap(),
+            "10"
+        );
+        assert_eq!(
+            database
+                .reverse_grant(
+                    issued.account_id,
+                    "subscription:one:grant",
+                    "subscription_cancelled",
+                    "subscription:one:reversal",
+                )
+                .await
+                .unwrap(),
+            "10"
+        );
+        assert_eq!(
+            database
+                .reverse_grant(
+                    issued.account_id,
+                    "subscription:one:grant",
+                    "subscription_cancelled",
+                    "subscription:one:reversal",
+                )
+                .await
+                .unwrap(),
+            "10"
+        );
+        assert!(matches!(
+            database
+                .reverse_grant(
+                    issued.account_id,
+                    "subscription:one:grant",
+                    "duplicate",
+                    "subscription:one:other-reversal",
+                )
+                .await,
+            Err(AppError::BadRequest(_))
+        ));
+
+        database
+            .grant(
+                issued.account_id,
+                Decimal::new(5, 0),
+                "subscription:basic",
+                "subscription:two:grant",
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE credit_accounts SET available_micros = 4000000 WHERE id = ?")
+            .bind(issued.account_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            database
+                .reverse_grant(
+                    issued.account_id,
+                    "subscription:two:grant",
+                    "subscription_cancelled",
+                    "subscription:two:reversal",
+                )
+                .await,
+            Err(AppError::QuotaExceeded)
+        ));
+        let reversals: i64 = sqlx::query(
+            "SELECT COUNT(*) AS count FROM ledger_entries WHERE kind = 'grant_reversal'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap()
+        .try_get("count")
+        .unwrap();
+        assert_eq!(reversals, 1);
     }
 
     #[tokio::test]

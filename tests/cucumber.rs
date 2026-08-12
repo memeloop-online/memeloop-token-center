@@ -24,6 +24,7 @@ struct TokenCenterWorld {
     current_key: String,
     old_key: String,
     stable_key_id: Option<Uuid>,
+    stable_account_id: Option<Uuid>,
     oauth_upstream_id: Option<Uuid>,
     oauth_generation: i64,
     cursor_session_token: String,
@@ -51,6 +52,7 @@ impl Default for TokenCenterWorld {
             current_key: String::new(),
             old_key: String::new(),
             stable_key_id: None,
+            stable_account_id: None,
             oauth_upstream_id: None,
             oauth_generation: 0,
             cursor_session_token: String::new(),
@@ -1117,6 +1119,93 @@ async fn create_key(world: &mut TokenCenterWorld, principal: String, model: Stri
     world.stable_key_id = Some(
         Uuid::from_str(world.response["key_id"].as_str().expect("key id")).expect("UUID key id"),
     );
+    world.stable_account_id = Some(
+        Uuid::from_str(world.response["account_id"].as_str().expect("account id"))
+            .expect("UUID account id"),
+    );
+}
+
+#[when("the service creates and grants an unspent subscription key")]
+async fn create_subscription_grant(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .header("idempotency-key", "registration:refund-user")
+        .json(&json!({
+            "principal_external_id": "refund-user",
+            "alias": "refund",
+            "currency": "USD",
+            "initial_balance": "0"
+        }))
+        .send()
+        .await
+        .expect("create refund key");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let issued: Value = response.json().await.expect("refund key JSON");
+    world.current_key = issued["key"].as_str().expect("refund key").to_owned();
+    world.stable_account_id = Some(
+        Uuid::from_str(issued["account_id"].as_str().expect("refund account id"))
+            .expect("UUID refund account id"),
+    );
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/accounts/{}/grants",
+            world.service_url,
+            world.stable_account_id.expect("refund account id")
+        ))
+        .bearer_auth("test-service-token")
+        .header("idempotency-key", "subscription:refund-subscription:grant")
+        .json(&json!({"amount": "7.5", "source": "subscription:pro"}))
+        .send()
+        .await
+        .expect("grant subscription credit");
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[when("the service reverses that subscription grant twice")]
+async fn reverse_subscription_grant_twice(world: &mut TokenCenterWorld) {
+    for _ in 0..2 {
+        let response = world
+            .client
+            .post(format!(
+                "{}/internal/v1/accounts/{}/grant-reversals",
+                world.service_url,
+                world.stable_account_id.expect("refund account id")
+            ))
+            .bearer_auth("test-service-token")
+            .header(
+                "idempotency-key",
+                "subscription:refund-subscription:reversal",
+            )
+            .json(&json!({
+                "grant_idempotency_key": "subscription:refund-subscription:grant",
+                "source": "subscription_cancelled"
+            }))
+            .send()
+            .await
+            .expect("reverse subscription credit");
+        world.status = Some(response.status());
+        world.response = response.json().await.expect("grant reversal JSON");
+        assert_eq!(world.response["reversed"], "7.5");
+    }
+}
+
+#[then("the subscription balance is zero after one logical reversal")]
+async fn subscription_balance_is_zero(world: &mut TokenCenterWorld) {
+    assert_eq!(world.status, Some(StatusCode::CREATED));
+    let key = world
+        .client
+        .get(format!("{}/self/v1/key", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("read refund key")
+        .json::<Value>()
+        .await
+        .expect("refund key JSON");
+    assert_eq!(key["available_balance"], "0");
 }
 
 #[when(expr = "the service creates an exhausted key allowing model {string}")]

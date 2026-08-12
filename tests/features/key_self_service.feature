@@ -28,6 +28,12 @@ Feature: Stable key identity and read-only self-service statistics
     And the client calls model "paid-model"
     Then the response status is 429
 
+  Scenario: Subscription grant reversal is durable and idempotent
+    Given a token center backed by SQLite and memory object storage
+    When the service creates and grants an unspent subscription key
+    And the service reverses that subscription grant twice
+    Then the subscription balance is zero after one logical reversal
+
   Scenario: Full-context agent requests share a logical conversation
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI upstream returns a successful completion

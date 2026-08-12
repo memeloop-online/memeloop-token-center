@@ -119,6 +119,10 @@ fn control_router() -> Router<AppState> {
             "/internal/v1/accounts/{account_id}/grants",
             post(grant_balance),
         )
+        .route(
+            "/internal/v1/accounts/{account_id}/grant-reversals",
+            post(reverse_grant_balance),
+        )
 }
 
 fn gateway_router() -> Router<AppState> {
@@ -842,6 +846,12 @@ struct GrantRequest {
     source: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ReverseGrantRequest {
+    grant_idempotency_key: String,
+    source: String,
+}
+
 async fn grant_balance(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -863,6 +873,33 @@ async fn grant_balance(
         .grant(account_id, amount, &body.source, idempotency_key)
         .await?;
     Ok((StatusCode::CREATED, Json(json!({"granted": granted}))))
+}
+
+async fn reverse_grant_balance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Json(body): Json<ReverseGrantRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "credits:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_account_tenant(account_id, tenant).await?;
+    }
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))?;
+    let reversed = state
+        .db
+        .reverse_grant(
+            account_id,
+            &body.grant_idempotency_key,
+            &body.source,
+            idempotency_key,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(json!({"reversed": reversed}))))
 }
 
 async fn self_key(
