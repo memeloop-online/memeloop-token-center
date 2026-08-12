@@ -33,7 +33,7 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 
 模型请求先按正文 token 上界与最大输出做余额预留，同时原子执行 RPM 限流；响应返回 usage 后结算实际费用并释放差额。生成任务按秒或任务等单位预留，worker 使用 PostgreSQL `FOR UPDATE SKIP LOCKED` 租约领取任务并幂等结算。daily、rolling-weekly 与 lifetime budget 均在调用上游前检查；崩溃窗口遗留且没有请求/任务引用的额度预留会由 worker 有界回收。
 
-逻辑对话会优先识别 `X-MTC-Conversation-Id`、`X-Claude-Code-Session-Id` 等显式元信息；缺少元信息时使用语义原子和 tenant-scoped Merkle 前缀树推断 continuation、retry、edit、branch 或 candidate。低置信度只进入候选会话簇，不强制合并。
+逻辑对话会优先识别 `X-MTC-Conversation-Id`、`X-MTC-Turn-Id`、`X-MTC-Parent-Turn-Id`、`X-MTC-Branch-Id`、`X-MTC-Compaction` 和 `X-Claude-Code-Session-Id` 等显式元信息。结构化 parent/branch/compaction 会保存为版本化关系证据；缺少元信息时使用语义原子和 tenant-scoped Merkle 前缀树推断 continuation、retry、edit、branch 或 candidate。低置信度只进入候选会话簇，不强制合并。
 
 ## 快速开始
 

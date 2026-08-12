@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationHints {
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub parent_turn_id: Option<String>,
+    pub branch_id: Option<String>,
+    pub compaction: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SemanticAtom {
     pub role: String,

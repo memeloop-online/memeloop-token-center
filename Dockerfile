@@ -23,11 +23,13 @@ RUN mkdir -p /usr/local/cargo \
       > /usr/local/cargo/config.toml
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src \
+RUN mkdir -p src tests \
     && printf 'pub fn dependency_cache_marker() {}\n' > src/lib.rs \
     && printf 'fn main() {}\n' > src/main.rs \
+    && printf 'fn main() {}\n' > tests/cucumber.rs \
+    && printf 'fn main() {}\n' > tests/postgres.rs \
     && cargo build --locked --release --bin memeloop-token-center \
-    && rm -rf src
+    && rm -rf src tests
 COPY src ./src
 COPY migrations ./migrations
 COPY schemas ./schemas

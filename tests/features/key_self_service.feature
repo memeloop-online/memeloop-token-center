@@ -42,6 +42,14 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 200
     And the requests form one logical conversation with a continuation edge
 
+  Scenario: Explicit turn ancestry survives client-side context compaction
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI upstream returns a successful completion
+    When the service creates a key for principal "erin" allowing model "gpt-test"
+    And the client sends a parent-linked compacted turn for model "gpt-test"
+    Then the response status is 200
+    And the compacted request is linked to its explicit parent turn
+
   Scenario: Claude Code can use the Anthropic Messages protocol
     Given a token center backed by SQLite and memory object storage
     And the mock Anthropic upstream returns a successful message

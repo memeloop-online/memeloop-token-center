@@ -1432,6 +1432,47 @@ async fn send_full_context_session(world: &mut TokenCenterWorld, model: String) 
     world.status = Some(second.status());
 }
 
+#[when(expr = "the client sends a parent-linked compacted turn for model {string}")]
+async fn send_parent_linked_compaction(world: &mut TokenCenterWorld, model: String) {
+    let first = world
+        .client
+        .post(format!("{}/v1/chat/completions", world.service_url))
+        .bearer_auth(&world.current_key)
+        .header("x-mtc-conversation-id", "structured-session-a")
+        .header("x-mtc-turn-id", "turn-a")
+        .header("x-mtc-branch-id", "main")
+        .json(&json!({
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "a long answer"},
+                {"role": "user", "content": "follow-up"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("explicit parent request");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = world
+        .client
+        .post(format!("{}/v1/chat/completions", world.service_url))
+        .bearer_auth(&world.current_key)
+        .header("x-mtc-conversation-id", "structured-session-a")
+        .header("x-mtc-turn-id", "turn-b")
+        .header("x-mtc-parent-turn-id", "turn-a")
+        .header("x-mtc-branch-id", "main")
+        .header("x-mtc-compaction", "true")
+        .json(&json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "compacted summary"}]
+        }))
+        .send()
+        .await
+        .expect("compacted child request");
+    world.status = Some(second.status());
+}
+
 #[then(expr = "the response status is {int}")]
 async fn response_status(world: &mut TokenCenterWorld, expected: u16) {
     assert_eq!(
@@ -1735,6 +1776,39 @@ async fn logical_conversation_continues(world: &mut TokenCenterWorld) {
             .unwrap_or_default()
             >= 0.95
     );
+}
+
+#[then("the compacted request is linked to its explicit parent turn")]
+async fn compacted_request_links_to_parent(world: &mut TokenCenterWorld) {
+    let clusters = world
+        .client
+        .get(format!("{}/self/v1/conversations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("structured conversation clusters")
+        .json::<Value>()
+        .await
+        .expect("structured conversation clusters JSON");
+    assert_eq!(clusters.as_array().map(Vec::len), Some(1));
+    assert_eq!(clusters[0]["request_count"], 2);
+    let cluster_id = clusters[0]["cluster_id"].as_str().expect("cluster id");
+    let detail = world
+        .client
+        .get(format!(
+            "{}/self/v1/conversations/{cluster_id}",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("structured conversation detail")
+        .json::<Value>()
+        .await
+        .expect("structured conversation detail JSON");
+    assert_eq!(detail["edges"][0]["relation"], "compacts");
+    assert_eq!(detail["edges"][0]["evidence"]["explicit_parent"], true);
+    assert_eq!(detail["edges"][0]["evidence"]["inference_version"], 2);
 }
 
 #[then("the downstream key cannot create another key")]

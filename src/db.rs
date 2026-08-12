@@ -10,7 +10,7 @@ use sqlx::{
 use uuid::Uuid;
 
 use crate::{
-    conversation::{RelationKind, build_prefix, extract_atoms},
+    conversation::{ConversationHints, RelationKind, build_prefix, extract_atoms},
     crypto,
     error::AppError,
     model::{
@@ -77,6 +77,17 @@ pub struct FinishRequest {
     pub cost_micros: i64,
     pub error_code: Option<String>,
     pub response_object: String,
+}
+
+struct ConversationSelection {
+    observation_id: String,
+    cluster_id: String,
+    relation: RelationKind,
+    confidence: i64,
+    direct_parent: bool,
+    same_turn: bool,
+    semantic_prefix: bool,
+    client_match: bool,
 }
 
 pub struct CreateUpstreamAccountInput {
@@ -1927,7 +1938,7 @@ impl Database {
         key: &AuthenticatedKey,
         request_id: Uuid,
         request_json: &serde_json::Value,
-        explicit_session_id: Option<&str>,
+        hints: &ConversationHints,
         client_name: Option<&str>,
     ) -> Result<Uuid, AppError> {
         let atoms = extract_atoms(request_json);
@@ -1968,52 +1979,113 @@ impl Database {
             .await?;
         }
 
-        let candidates = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.explicit_session_id, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 ORDER BY o.created_at DESC LIMIT 50",
+        let tenant_id = key.tenant_id.to_string();
+        let principal_id = key.principal_id.to_string();
+        let mut candidates = if hints.parent_turn_id.is_some()
+            || hints.turn_id.is_some()
+            || hints.session_id.is_some()
+        {
+            sqlx::query(
+                "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.explicit_session_id, o.turn_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND (($3 IS NOT NULL AND o.turn_id = $3) OR ($4 IS NOT NULL AND o.turn_id = $4) OR ($5 IS NOT NULL AND o.explicit_session_id = $5)) ORDER BY CASE WHEN $3 IS NOT NULL AND o.turn_id = $3 THEN 0 WHEN $4 IS NOT NULL AND o.turn_id = $4 THEN 1 ELSE 2 END, o.created_at DESC LIMIT 50",
+            )
+            .bind(&tenant_id)
+            .bind(&principal_id)
+            .bind(hints.parent_turn_id.as_deref())
+            .bind(hints.turn_id.as_deref())
+            .bind(hints.session_id.as_deref())
+            .fetch_all(&mut *tx)
+            .await?
+        } else {
+            Vec::new()
+        };
+        let recent_candidates = sqlx::query(
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.explicit_session_id, o.turn_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 ORDER BY o.created_at DESC LIMIT 50",
         )
-        .bind(key.tenant_id.to_string())
-        .bind(key.principal_id.to_string())
+        .bind(&tenant_id)
+        .bind(&principal_id)
         .fetch_all(&mut *tx)
         .await?;
+        for recent in recent_candidates {
+            let recent_id: String = recent.try_get("id")?;
+            let duplicate = candidates.iter().any(|candidate| {
+                candidate
+                    .try_get::<String, _>("id")
+                    .is_ok_and(|candidate_id| candidate_id == recent_id)
+            });
+            if !duplicate {
+                candidates.push(recent);
+            }
+        }
 
-        let mut selected: Option<(String, String, RelationKind, i64, i64)> = None;
+        let mut selected: Option<ConversationSelection> = None;
         for row in candidates {
             let candidate_session: Option<String> = row.try_get("explicit_session_id")?;
+            let candidate_turn: Option<String> = row.try_get("turn_id")?;
+            let candidate_branch: Option<String> = row.try_get("branch_id")?;
+            let candidate_client: Option<String> = row.try_get("client_name")?;
             let previous_hashes_json: String = row.try_get("atom_hashes_json")?;
             let previous_hashes: Vec<String> =
                 serde_json::from_str(&previous_hashes_json).unwrap_or_default();
             let (relation, confidence) = infer_hash_relation(&previous_hashes, &atom_hashes);
             let created_at: i64 = row.try_get("created_at")?;
-            let explicit_match = explicit_session_id.is_some()
-                && explicit_session_id == candidate_session.as_deref();
+            let direct_parent = hints.parent_turn_id.is_some()
+                && hints.parent_turn_id.as_deref() == candidate_turn.as_deref();
+            let same_turn =
+                hints.turn_id.is_some() && hints.turn_id.as_deref() == candidate_turn.as_deref();
+            let explicit_match = hints.session_id.is_some()
+                && hints.session_id.as_deref() == candidate_session.as_deref();
+            let conflicting_sessions =
+                hints.session_id.is_some() && candidate_session.is_some() && !explicit_match;
             let exact_prefix = confidence >= 700;
             let recent_candidate = now.saturating_sub(created_at) <= 30 * 60 * 1_000;
-            if explicit_match || exact_prefix || (selected.is_none() && recent_candidate) {
-                let relation = if explicit_match && atom_hashes.len() * 2 < previous_hashes.len() {
+            let same_client = client_name == candidate_client.as_deref();
+            if direct_parent
+                || same_turn
+                || explicit_match
+                || (exact_prefix && !conflicting_sessions)
+                || (selected.is_none() && recent_candidate && same_client && !conflicting_sessions)
+            {
+                let branch_changed = hints.branch_id.is_some()
+                    && candidate_branch.is_some()
+                    && hints.branch_id.as_deref() != candidate_branch.as_deref();
+                let relation = if same_turn {
+                    RelationKind::Retry
+                } else if hints.compaction
+                    || (explicit_match && atom_hashes.len() * 2 < previous_hashes.len())
+                {
                     RelationKind::Compacts
+                } else if direct_parent && branch_changed {
+                    RelationKind::Branch
+                } else if direct_parent {
+                    RelationKind::Continues
                 } else {
                     relation
                 };
-                let confidence = if explicit_match {
+                let confidence = if direct_parent || same_turn {
+                    995
+                } else if explicit_match {
                     confidence.max(990)
                 } else {
                     confidence
                 };
-                selected = Some((
-                    row.try_get("id")?,
-                    row.try_get("cluster_id")?,
+                selected = Some(ConversationSelection {
+                    observation_id: row.try_get("id")?,
+                    cluster_id: row.try_get("cluster_id")?,
                     relation,
                     confidence,
-                    created_at,
-                ));
-                if explicit_match || exact_prefix {
+                    direct_parent,
+                    same_turn,
+                    semantic_prefix: exact_prefix,
+                    client_match: client_name.is_some() && same_client,
+                });
+                if direct_parent || same_turn || explicit_match || exact_prefix {
                     break;
                 }
             }
         }
 
-        let cluster_id = if let Some((_, cluster_id, _, _, _)) = &selected {
-            parse_uuid(cluster_id.clone())?
+        let cluster_id = if let Some(selection) = &selected {
+            parse_uuid(selection.cluster_id.clone())?
         } else {
             let id = Uuid::now_v7();
             sqlx::query(
@@ -2022,7 +2094,7 @@ impl Database {
             .bind(id.to_string())
             .bind(key.tenant_id.to_string())
             .bind(key.principal_id.to_string())
-            .bind(explicit_session_id)
+            .bind(hints.session_id.as_deref())
             .bind(now)
             .bind(now)
             .execute(&mut *tx)
@@ -2031,7 +2103,7 @@ impl Database {
         };
 
         sqlx::query(
-            "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, leaf_node_hash, atom_hashes_json, explicit_session_id, client_name, created_at, inference_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)",
+            "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, leaf_node_hash, atom_hashes_json, explicit_session_id, client_name, created_at, inference_version, turn_id, parent_turn_id, branch_id, compaction) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 2, $10, $11, $12, $13)",
         )
         .bind(observation_id.to_string())
         .bind(cluster_id.to_string())
@@ -2039,33 +2111,43 @@ impl Database {
         .bind(key.key_id.to_string())
         .bind(leaf)
         .bind(atom_hashes_json)
-        .bind(explicit_session_id)
+        .bind(hints.session_id.as_deref())
         .bind(client_name)
         .bind(now)
+        .bind(hints.turn_id.as_deref())
+        .bind(hints.parent_turn_id.as_deref())
+        .bind(hints.branch_id.as_deref())
+        .bind(i64::from(hints.compaction))
         .execute(&mut *tx)
         .await?;
 
-        if let Some((previous_id, _, relation, confidence, _)) = selected {
+        if let Some(selection) = selected {
             sqlx::query(
-                "INSERT INTO conversation_edges (id, cluster_id, from_observation_id, to_observation_id, relation_kind, confidence_millis, evidence_json, pinned, inference_version, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 1, $8)",
+                "INSERT INTO conversation_edges (id, cluster_id, from_observation_id, to_observation_id, relation_kind, confidence_millis, evidence_json, pinned, inference_version, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 2, $8)",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(cluster_id.to_string())
-            .bind(previous_id)
+            .bind(selection.observation_id)
             .bind(observation_id.to_string())
-            .bind(relation_name(relation))
-            .bind(confidence)
+            .bind(relation_name(selection.relation))
+            .bind(selection.confidence)
             .bind(serde_json::json!({
-                "explicit_session": explicit_session_id.is_some(),
-                "semantic_prefix": true,
-                "inference_version": 1
+                "explicit_session": hints.session_id.is_some(),
+                "explicit_parent": selection.direct_parent,
+                "same_turn": selection.same_turn,
+                "branch": hints.branch_id.is_some(),
+                "compaction": hints.compaction,
+                "semantic_prefix": selection.semantic_prefix,
+                "client_match": selection.client_match,
+                "inference_version": 2
             }).to_string())
             .bind(now)
             .execute(&mut *tx)
             .await?;
         }
-        sqlx::query("UPDATE conversation_clusters SET updated_at = $1 WHERE id = $2")
+        sqlx::query("UPDATE conversation_clusters SET updated_at = $1, explicit_session_id = COALESCE(explicit_session_id, $2) WHERE id = $3")
             .bind(now)
+            .bind(hints.session_id.as_deref())
             .bind(cluster_id.to_string())
             .execute(&mut *tx)
             .await?;
@@ -2731,6 +2813,11 @@ const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "bounded plugin KV",
         sql: include_str!("../migrations/sqlite/0008_plugin_kv.sql"),
     },
+    Migration {
+        version: 9,
+        name: "structured conversation hints",
+        sql: include_str!("../migrations/sqlite/0009_structured_conversation_hints.sql"),
+    },
 ];
 
 const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -2773,6 +2860,11 @@ const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 8,
         name: "bounded plugin KV",
         sql: include_str!("../migrations/postgres/0008_plugin_kv.sql"),
+    },
+    Migration {
+        version: 9,
+        name: "structured conversation hints",
+        sql: include_str!("../migrations/postgres/0009_structured_conversation_hints.sql"),
     },
 ];
 
