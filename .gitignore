@@ -3,8 +3,8 @@
 /.env
 /web/node_modules/
 /web/dist/
+/web/*.tsbuildinfo
 *.db
 *.db-shm
 *.db-wal
 .DS_Store
-
