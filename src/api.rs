@@ -974,11 +974,9 @@ async fn proxy(
 
     let path = protocol.path();
     let request_id = Uuid::now_v7();
-    let prefix = format!("tenants/{}/requests/{request_id}", key.tenant_id);
-    let request_object = format!("{prefix}/request.json");
-    let response_object = format!("{prefix}/response.bin");
-    let stored_request = match state.archive.put(&request_object, body.clone()).await {
-        Ok(()) => request_object,
+    let response_staging = format!("staging/{request_id}/response.bin");
+    let stored_request = match state.archive.put_content(body.clone()).await {
+        Ok(location) => location,
         Err(error) => {
             tracing::warn!(%request_id, %error, "request archive gap");
             format!("gap://{request_id}/request")
@@ -1064,7 +1062,7 @@ async fn proxy(
     };
     let status = upstream.status();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
-    let archive_writer = match state.archive.start_writer(&response_object).await {
+    let archive_writer = match state.archive.start_writer(&response_staging).await {
         Ok(writer) => Some(writer),
         Err(error) => {
             tracing::warn!(%request_id, %error, "response archive gap");
@@ -1103,16 +1101,16 @@ async fn proxy(
                 }
             }
         }
-        let archive_complete = if let Some(writer) = archive_writer {
+        let stored_response = if let Some(writer) = archive_writer {
             match writer.finish().await {
-                Ok(()) => true,
+                Ok(location) => location,
                 Err(error) => {
                     tracing::warn!(%request_id, %error, "response archive finalize gap");
-                    false
+                    format!("gap://{request_id}/response")
                 }
             }
         } else {
-            false
+            format!("gap://{request_id}/response")
         };
         let (input_tokens, output_tokens) =
             extract_usage(&usage_capture).unwrap_or((input_token_ceiling, output_token_ceiling));
@@ -1125,11 +1123,6 @@ async fn proxy(
             .as_ref()
             .map(|_| "upstream_stream".to_owned())
             .or_else(|| (!status.is_success()).then(|| format!("http_{}", status.as_u16())));
-        let stored_response = if archive_complete {
-            response_object
-        } else {
-            format!("gap://{request_id}/response")
-        };
         if let Err(error) = background_state
             .db
             .record_request_finished(FinishRequest {
