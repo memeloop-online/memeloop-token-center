@@ -162,6 +162,7 @@ pub struct RequestArchiveRefs {
     pub view: RequestView,
     pub request_object: String,
     pub response_object: Option<String>,
+    pub response_json: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -220,6 +221,14 @@ pub struct StatsBucket {
 #[derive(Clone, Debug, Serialize)]
 pub struct SelfStats {
     pub key_id: Uuid,
+    pub summary: StatsSummary,
+    pub by_model: Vec<StatsBucket>,
+    pub by_day: Vec<StatsBucket>,
+    pub errors: Vec<StatsBucket>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OperatorStats {
     pub summary: StatsSummary,
     pub by_model: Vec<StatsBucket>,
     pub by_day: Vec<StatsBucket>,

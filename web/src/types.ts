@@ -11,6 +11,12 @@ export interface RequestView {
   error_code: string | null;
 }
 
+export interface RequestDetail extends RequestView {
+  request_body: unknown;
+  response_body: unknown;
+  archive_complete: boolean;
+}
+
 export interface RequestEvent {
   event_id: string;
   request_id: string;
@@ -45,6 +51,13 @@ export interface SelfStats {
     output_tokens: number;
     total_cost: string;
   };
+  by_model: StatsBucket[];
+  by_day: StatsBucket[];
+  errors: StatsBucket[];
+}
+
+export interface OperatorStats {
+  summary: SelfStats['summary'];
   by_model: StatsBucket[];
   by_day: StatsBucket[];
   errors: StatsBucket[];

@@ -466,6 +466,37 @@ async fn assert_generation_stats(world: &TokenCenterWorld, model: &str, cost: &s
             row["protocol"] == "generation" && row["model"] == model && row["cost"] == cost
         })
     }));
+    let job_id = world.generation_job_id.expect("generation job id");
+    for (path, token) in [
+        (
+            format!("/self/v1/requests/{job_id}"),
+            world.current_key.as_str(),
+        ),
+        (
+            format!("/internal/v1/requests/{job_id}"),
+            "test-service-token",
+        ),
+    ] {
+        let detail = world
+            .client
+            .get(format!("{}{path}", world.service_url))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("generation request detail");
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: Value = detail.json().await.expect("generation request detail JSON");
+        assert_eq!(detail["protocol"], "generation");
+        assert_eq!(detail["model"], model);
+        assert_eq!(detail["cost"], cost);
+        assert_eq!(detail["archive_complete"], true);
+        assert!(detail["request_body"].is_object());
+        assert!(
+            detail["response_body"]["archive_objects"]
+                .as_array()
+                .is_some_and(|objects| !objects.is_empty())
+        );
+    }
 
     let response = world
         .client
@@ -1511,6 +1542,51 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
     .expect("request lifecycle events before timeout");
     assert!(lifecycle.contains("\"event_kind\":\"started\""));
     assert!(lifecycle.contains("\"event_kind\":\"finished\""));
+
+    let stats = world
+        .client
+        .get(format!("{}/internal/v1/stats", world.service_url))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("operator aggregate statistics");
+    assert_eq!(stats.status(), StatusCode::OK);
+    let stats: Value = stats.json().await.expect("operator statistics JSON");
+    assert_eq!(stats["summary"]["total_requests"], 1);
+    assert_eq!(stats["summary"]["successful_requests"], 1);
+
+    let requests = world
+        .client
+        .get(format!(
+            "{}/internal/v1/requests?limit=5",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("operator requests")
+        .json::<Value>()
+        .await
+        .expect("operator requests JSON");
+    let request_id = requests[0]["request_id"].as_str().expect("request id");
+    let detail = world
+        .client
+        .get(format!(
+            "{}/internal/v1/requests/{request_id}",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("operator request detail");
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail: Value = detail.json().await.expect("operator request detail JSON");
+    assert_eq!(detail["archive_complete"], true);
+    assert_eq!(detail["request_body"]["messages"][0]["content"], "hi");
+    assert_eq!(
+        detail["response_body"]["choices"][0]["message"]["content"],
+        "hello"
+    );
 }
 
 #[when("the bootstrap service creates a tenant scoped service token")]

@@ -16,8 +16,8 @@ use crate::{
     model::{
         AuthenticatedKey, AuthenticatedService, ConversationClusterDetail, ConversationClusterView,
         ConversationEdgeView, GenerationJobView, GenerationJobWork, GenerationPrice, IssuedKey,
-        IssuedServiceToken, KeyPolicy, KeyView, ModelPrice, RequestArchiveRefs, RequestEventView,
-        RequestView, SelfStats, StatsBucket, StatsSummary, UsageReservation,
+        IssuedServiceToken, KeyPolicy, KeyView, ModelPrice, OperatorStats, RequestArchiveRefs,
+        RequestEventView, RequestView, SelfStats, StatsBucket, StatsSummary, UsageReservation,
         micros_to_decimal_string, priced_tokens,
     },
     provider::{
@@ -2313,24 +2313,55 @@ impl Database {
         .bind(request_id.to_string())
         .bind(key_id.to_string())
         .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => request_archive_refs_from_row(row),
+            None => self.generation_archive_refs(key_id, request_id).await,
+        }
+    }
+
+    pub async fn request_archive_refs_for_tenant(
+        &self,
+        tenant_external_id: &str,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        let row = sqlx::query(
+            "SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.output_tokens, r.cost_micros, r.error_code, r.request_object, r.response_object FROM request_records r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => request_archive_refs_from_row(row),
+            None => {
+                let row = sqlx::query(
+                    "SELECT g.id, g.created_at, g.completed_at, g.public_model, g.status, g.cost_micros, g.error_code, g.request_object, g.result_json FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE g.id = $1 AND t.external_id = $2",
+                )
+                .bind(request_id.to_string())
+                .bind(tenant_external_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or(AppError::NotFound)?;
+                generation_archive_refs_from_row(row)
+            }
+        }
+    }
+
+    async fn generation_archive_refs(
+        &self,
+        key_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        let row = sqlx::query(
+            "SELECT id, created_at, completed_at, public_model, status, cost_micros, error_code, request_object, result_json FROM generation_jobs WHERE id = $1 AND key_id = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(key_id.to_string())
+        .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
-        Ok(RequestArchiveRefs {
-            view: RequestView {
-                request_id: parse_uuid(row.try_get("id")?)?,
-                created_at: row.try_get("created_at")?,
-                protocol: row.try_get("protocol")?,
-                model: row.try_get("model")?,
-                status_code: row.try_get("status_code")?,
-                duration_ms: row.try_get("duration_ms")?,
-                input_tokens: row.try_get("input_tokens")?,
-                output_tokens: row.try_get("output_tokens")?,
-                cost: micros_to_decimal_string(row.try_get("cost_micros")?),
-                error_code: row.try_get("error_code")?,
-            },
-            request_object: row.try_get("request_object")?,
-            response_object: row.try_get("response_object")?,
-        })
+        generation_archive_refs_from_row(row)
     }
 
     pub async fn conversation_clusters(
@@ -2485,6 +2516,66 @@ impl Database {
             errors,
         })
     }
+
+    pub async fn operator_stats(
+        &self,
+        tenant_external_id: &str,
+    ) -> Result<OperatorStats, AppError> {
+        let summary_row = sqlx::query(
+            "SELECT CAST(COALESCE(SUM(total_requests), 0) AS BIGINT) AS total_requests, CAST(COALESCE(SUM(successful_requests), 0) AS BIGINT) AS successful_requests, CAST(COALESCE(SUM(failed_requests), 0) AS BIGINT) AS failed_requests, CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens, CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros FROM (SELECT COALESCE(SUM(a.requests), 0) AS total_requests, COALESCE(SUM(CASE WHEN a.status_class = 'success' THEN a.requests ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN a.status_class = 'failure' THEN a.requests ELSE 0 END), 0) AS failed_requests, COALESCE(SUM(a.input_tokens), 0) AS input_tokens, COALESCE(SUM(a.output_tokens), 0) AS output_tokens, COALESCE(SUM(a.cost_micros), 0) AS cost_micros FROM usage_daily_aggregates a JOIN key_records k ON k.id = a.key_id JOIN tenants t ON t.id = k.tenant_id WHERE t.external_id = $1 UNION ALL SELECT COUNT(*) AS total_requests, COALESCE(SUM(CASE WHEN g.status = 'succeeded' THEN 1 ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN g.status IN ('failed', 'cancelled') THEN 1 ELSE 0 END), 0) AS failed_requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(g.cost_micros), 0) AS cost_micros FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $2 AND g.status IN ('succeeded', 'failed', 'cancelled')) AS totals",
+        )
+        .bind(tenant_external_id)
+        .bind(tenant_external_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let summary = StatsSummary {
+            total_requests: summary_row.try_get("total_requests")?,
+            successful_requests: summary_row.try_get("successful_requests")?,
+            failed_requests: summary_row.try_get("failed_requests")?,
+            input_tokens: summary_row.try_get("input_tokens")?,
+            output_tokens: summary_row.try_get("output_tokens")?,
+            total_cost: micros_to_decimal_string(summary_row.try_get("cost_micros")?),
+        };
+        let model_rows = sqlx::query(
+            "SELECT name, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT a.model AS name, a.requests, a.input_tokens, a.output_tokens, a.cost_micros FROM usage_daily_aggregates a JOIN key_records k ON k.id = a.key_id JOIN tenants t ON t.id = k.tenant_id WHERE t.external_id = $1 UNION ALL SELECT g.public_model AS name, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(g.cost_micros), 0) AS cost_micros FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $2 AND g.status IN ('succeeded', 'failed', 'cancelled') GROUP BY g.public_model) AS model_totals GROUP BY name ORDER BY requests DESC, name ASC",
+        )
+        .bind(tenant_external_id)
+        .bind(tenant_external_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let by_model = aggregate_buckets(model_rows)?;
+        let day_rows = sqlx::query(
+            "SELECT day_bucket, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT a.day_bucket, a.requests, a.input_tokens, a.output_tokens, a.cost_micros FROM usage_daily_aggregates a JOIN key_records k ON k.id = a.key_id JOIN tenants t ON t.id = k.tenant_id WHERE t.external_id = $1 UNION ALL SELECT g.created_at / 86400000 AS day_bucket, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(g.cost_micros), 0) AS cost_micros FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $2 AND g.status IN ('succeeded', 'failed', 'cancelled') GROUP BY g.created_at / 86400000) AS day_totals GROUP BY day_bucket ORDER BY day_bucket ASC",
+        )
+        .bind(tenant_external_id)
+        .bind(tenant_external_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let by_day = day_rows
+            .into_iter()
+            .map(|row| {
+                let day_bucket: i64 = row.try_get("day_bucket")?;
+                let name = chrono::DateTime::from_timestamp(day_bucket.saturating_mul(86_400), 0)
+                    .map(|value| value.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                aggregate_bucket(row, name)
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let error_rows = sqlx::query(
+            "SELECT name, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT a.error_code AS name, a.requests, a.input_tokens, a.output_tokens, a.cost_micros FROM usage_daily_aggregates a JOIN key_records k ON k.id = a.key_id JOIN tenants t ON t.id = k.tenant_id WHERE t.external_id = $1 AND a.error_code <> '' UNION ALL SELECT g.error_code AS name, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(g.cost_micros), 0) AS cost_micros FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $2 AND g.status IN ('failed', 'cancelled') AND g.error_code IS NOT NULL AND g.error_code <> '' GROUP BY g.error_code) AS error_totals GROUP BY name ORDER BY requests DESC, name ASC",
+        )
+        .bind(tenant_external_id)
+        .bind(tenant_external_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let errors = aggregate_buckets(error_rows)?;
+        Ok(OperatorStats {
+            summary,
+            by_model,
+            by_day,
+            errors,
+        })
+    }
 }
 
 async fn apply_migration_range(
@@ -2586,6 +2677,56 @@ fn aggregate_bucket(row: sqlx::any::AnyRow, name: String) -> Result<StatsBucket,
         input_tokens: row.try_get("input_tokens")?,
         output_tokens: row.try_get("output_tokens")?,
         cost: micros_to_decimal_string(row.try_get("cost_micros")?),
+    })
+}
+
+fn request_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, AppError> {
+    Ok(RequestArchiveRefs {
+        view: RequestView {
+            request_id: parse_uuid(row.try_get("id")?)?,
+            created_at: row.try_get("created_at")?,
+            protocol: row.try_get("protocol")?,
+            model: row.try_get("model")?,
+            status_code: row.try_get("status_code")?,
+            duration_ms: row.try_get("duration_ms")?,
+            input_tokens: row.try_get("input_tokens")?,
+            output_tokens: row.try_get("output_tokens")?,
+            cost: micros_to_decimal_string(row.try_get("cost_micros")?),
+            error_code: row.try_get("error_code")?,
+        },
+        request_object: row.try_get("request_object")?,
+        response_object: row.try_get("response_object")?,
+        response_json: None,
+    })
+}
+
+fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, AppError> {
+    let created_at: i64 = row.try_get("created_at")?;
+    let completed_at: Option<i64> = row.try_get("completed_at")?;
+    let status: String = row.try_get("status")?;
+    let result_json: Option<String> = row.try_get("result_json")?;
+    Ok(RequestArchiveRefs {
+        view: RequestView {
+            request_id: parse_uuid(row.try_get("id")?)?,
+            created_at,
+            protocol: "generation".to_owned(),
+            model: row.try_get("public_model")?,
+            status_code: match status.as_str() {
+                "succeeded" => Some(200),
+                "failed" | "cancelled" => Some(502),
+                _ => None,
+            },
+            duration_ms: completed_at.map(|value| value - created_at),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: micros_to_decimal_string(row.try_get("cost_micros")?),
+            error_code: row.try_get("error_code")?,
+        },
+        request_object: row.try_get("request_object")?,
+        response_object: None,
+        response_json: result_json
+            .map(|value| serde_json::from_str(&value).map_err(|_| AppError::Internal))
+            .transpose()?,
     })
 }
 
@@ -2818,6 +2959,11 @@ const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "structured conversation hints",
         sql: include_str!("../migrations/sqlite/0009_structured_conversation_hints.sql"),
     },
+    Migration {
+        version: 10,
+        name: "operator aggregate indexes",
+        sql: include_str!("../migrations/sqlite/0010_operator_aggregate_indexes.sql"),
+    },
 ];
 
 const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -2865,6 +3011,11 @@ const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 9,
         name: "structured conversation hints",
         sql: include_str!("../migrations/postgres/0009_structured_conversation_hints.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "operator aggregate indexes",
+        sql: include_str!("../migrations/postgres/0010_operator_aggregate_indexes.sql"),
     },
 ];
 

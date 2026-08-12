@@ -115,6 +115,11 @@ fn control_router() -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(MAX_CPA_IMPORT_BODY)),
         )
         .route("/internal/v1/requests", get(internal_requests))
+        .route(
+            "/internal/v1/requests/{request_id}",
+            get(internal_request_detail),
+        )
+        .route("/internal/v1/stats", get(internal_stats))
         .route("/internal/v1/request-events", get(internal_request_events))
         .route(
             "/internal/v1/upstreams/{account_id}/credential",
@@ -883,6 +888,29 @@ async fn internal_requests(
     Ok(Json(state.db.list_all_requests(tenant, query.limit).await?))
 }
 
+async fn internal_request_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = service.tenant_external_id.as_deref().unwrap_or("default");
+    let refs = state
+        .db
+        .request_archive_refs_for_tenant(tenant, request_id)
+        .await?;
+    Ok(Json(request_detail(&state, refs).await))
+}
+
+async fn internal_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = service.tenant_external_id.as_deref().unwrap_or("default");
+    Ok(Json(state.db.operator_stats(tenant).await?))
+}
+
 #[derive(Debug, Deserialize)]
 struct RequestEventsQuery {
     after_event_at: Option<i64>,
@@ -1155,17 +1183,27 @@ async fn self_request_detail(
         .db
         .request_archive_refs(key.key_id, request_id)
         .await?;
-    let (request_body, request_complete) = archive_value(&state, &refs.request_object).await;
+    Ok(Json(request_detail(&state, refs).await))
+}
+
+async fn request_detail(
+    state: &AppState,
+    refs: crate::model::RequestArchiveRefs,
+) -> crate::model::RequestDetail {
+    let (request_body, request_complete) = archive_value(state, &refs.request_object).await;
     let (response_body, response_complete) = match refs.response_object.as_deref() {
-        Some(location) => archive_value(&state, location).await,
-        None => (Value::Null, false),
+        Some(location) => archive_value(state, location).await,
+        None => match refs.response_json {
+            Some(value) => (value, true),
+            None => (Value::Null, false),
+        },
     };
-    Ok(Json(crate::model::RequestDetail {
+    crate::model::RequestDetail {
         view: refs.view,
         request_body,
         response_body,
         archive_complete: request_complete && response_complete,
-    }))
+    }
 }
 
 async fn self_stats(

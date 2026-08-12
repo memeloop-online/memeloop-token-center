@@ -1,13 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 import { Buckets, Metric, RequestTable, Shell } from '../components';
-import type { ConversationCluster, ConversationDetail, GenerationJob, KeyView, RequestView, SelfStats } from '../types';
-
-interface RequestDetail extends RequestView {
-  request_body: unknown;
-  response_body: unknown;
-  archive_complete: boolean;
-}
+import type { ConversationCluster, ConversationDetail, GenerationJob, KeyView, RequestDetail, RequestView, SelfStats } from '../types';
 
 export function SelfPortal() {
   const [key, setKey] = useState(() => sessionStorage.getItem('mtc-key') ?? '');

@@ -118,9 +118,26 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
     assert_eq!(stats.summary.successful_requests, 1);
     assert_eq!(stats.summary.total_cost, "0.25");
     assert_eq!(stats.by_model[0].name, "video-test");
+    let operator_stats = database.operator_stats(&tenant).await.unwrap();
+    assert_eq!(operator_stats.summary.total_requests, 1);
+    assert_eq!(operator_stats.summary.successful_requests, 1);
+    assert_eq!(operator_stats.summary.total_cost, "0.25");
+    assert_eq!(operator_stats.by_model[0].name, "video-test");
     let requests = database.list_all_requests(&tenant, 10).await.unwrap();
     assert_eq!(requests[0].protocol, "generation");
     assert_eq!(requests[0].status_code, Some(200));
+    let key_detail = database
+        .request_archive_refs(key.key_id, job_id)
+        .await
+        .unwrap();
+    assert_eq!(key_detail.view.protocol, "generation");
+    assert_eq!(key_detail.response_json, Some(result.clone()));
+    let operator_detail = database
+        .request_archive_refs_for_tenant(&tenant, job_id)
+        .await
+        .unwrap();
+    assert_eq!(operator_detail.view.cost, "0.25");
+    assert_eq!(operator_detail.response_json, Some(result));
     let events = database
         .request_events_after(&tenant, 0, None, 10)
         .await

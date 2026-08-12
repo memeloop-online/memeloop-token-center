@@ -3,8 +3,8 @@ import validator from '@rjsf/validator-ajv8';
 import { useEffect, useMemo, useState } from 'react';
 import type { RJSFSchema } from '@rjsf/utils';
 import { api, streamSse } from '../api';
-import { RequestTable, Shell } from '../components';
-import type { ConfigurationSchemas, PluginManifest, ProviderType, RequestEvent, RequestView, UpstreamAccount } from '../types';
+import { Buckets, Metric, RequestTable, Shell } from '../components';
+import type { ConfigurationSchemas, OperatorStats, PluginManifest, ProviderType, RequestDetail, RequestEvent, RequestView, UpstreamAccount } from '../types';
 
 type Tab = 'traffic' | 'upstreams' | 'routes' | 'pricing' | 'keys' | 'oauth' | 'services' | 'plugins';
 
@@ -17,6 +17,8 @@ export function Operator() {
   const [plugins, setPlugins] = useState<PluginManifest[]>([]);
   const [upstreams, setUpstreams] = useState<UpstreamAccount[]>([]);
   const [requests, setRequests] = useState<RequestView[]>([]);
+  const [stats, setStats] = useState<OperatorStats>();
+  const [detail, setDetail] = useState<RequestDetail>();
   const [schemas, setSchemas] = useState<ConfigurationSchemas>();
   const [error, setError] = useState('');
 
@@ -25,17 +27,19 @@ export function Operator() {
     sessionStorage.setItem('mtc-service-token', token.trim());
     setError('');
     try {
-      const [nextProviders, nextPlugins, nextUpstreams, nextRequests, nextSchemas] = await Promise.all([
+      const [nextProviders, nextPlugins, nextUpstreams, nextRequests, nextStats, nextSchemas] = await Promise.all([
         api<ProviderType[]>('/internal/v1/provider-types', token),
         api<PluginManifest[]>('/internal/v1/plugins', token),
         api<UpstreamAccount[]>('/internal/v1/upstreams', token),
         api<RequestView[]>('/internal/v1/requests?limit=100', token),
+        api<OperatorStats>('/internal/v1/stats', token),
         api<ConfigurationSchemas>('/internal/v1/schemas', token),
       ]);
       setProviders(nextProviders);
       setPlugins(nextPlugins);
       setUpstreams(nextUpstreams);
       setRequests(nextRequests);
+      setStats(nextStats);
       setSchemas(nextSchemas);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '管理 API 请求失败');
@@ -43,6 +47,15 @@ export function Operator() {
   }
 
   useEffect(() => { if (token) void refresh(); }, []);
+
+  async function selectRequest(request: RequestView) {
+    try {
+      setError('');
+      setDetail(await api<RequestDetail>(`/internal/v1/requests/${request.request_id}`, token));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '无法读取请求归档');
+    }
+  }
   useEffect(() => {
     if (!token || tab !== 'traffic') return;
     const controller = new AbortController();
@@ -89,7 +102,23 @@ export function Operator() {
       <header className="hero compact"><div><span className="eyebrow">OPERATOR CONTROL PLANE</span><h1>Token Center</h1><p>上游、OAuth、路由、策略与流量诊断。</p></div><div className="credential"><input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="Service token" /><button onClick={() => void refresh()}>连接</button></div></header>
       <nav className="tabs">{tabs.map(([id, label]) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}>{label}</button>)}</nav>
       {error && <div className="notice error">{error}</div>}
-      {tab === 'traffic' && <article className="panel"><div className="panel-title"><h2>实时请求尾流</h2><span>SSE 亚秒级尾查 · 不载入正文</span></div><RequestTable requests={requests} /></article>}
+      {tab === 'traffic' && <>
+        {stats && <>
+          <section className="metrics" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))' }}>
+            <Metric label="总请求" value={stats.summary.total_requests} />
+            <Metric label="成功" value={stats.summary.successful_requests} tone="positive" />
+            <Metric label="失败" value={stats.summary.failed_requests} tone="negative" />
+            <Metric label="Tokens" value={stats.summary.input_tokens + stats.summary.output_tokens} />
+            <Metric label="总费用" value={stats.summary.total_cost} />
+          </section>
+          <section className="two-column">
+            <article className="panel"><h2>模型分布</h2><Buckets values={stats.by_model} /></article>
+            <article className="panel"><h2>每日趋势</h2><Buckets values={stats.by_day} /></article>
+          </section>
+          {stats.errors.length > 0 && <article className="panel"><h2>错误分布</h2><Buckets values={stats.errors} /></article>}
+        </>}
+        <article className="panel"><div className="panel-title"><h2>实时请求尾流</h2><span>SSE 亚秒级尾查 · 点击加载归档</span></div><RequestTable requests={requests} onSelect={(request) => void selectRequest(request)} /></article>
+      </>}
       {tab === 'upstreams' && <Upstreams token={token} providers={providers} values={upstreams} onCreated={() => void refresh()} />}
       {tab === 'routes' && <RouteForm token={token} upstreams={upstreams} />}
       {tab === 'pricing' && <Pricing token={token} schemas={schemas} />}
@@ -97,6 +126,7 @@ export function Operator() {
       {tab === 'oauth' && <OAuth token={token} providers={providers} onCreated={() => void refresh()} />}
       {tab === 'services' && <ServiceTokenForm token={token} schema={schemas?.service_token} />}
       {tab === 'plugins' && <Plugins values={plugins} />}
+      {detail && <div className="drawer-backdrop" onClick={() => setDetail(undefined)}><aside className="drawer" onClick={(event) => event.stopPropagation()}><button className="close" onClick={() => setDetail(undefined)}>×</button><span className="eyebrow">OPERATOR REQUEST DIAGNOSIS</span><h2>{detail.model}</h2><p className="muted">{detail.request_id} · {detail.status_code ?? '运行中'} · {detail.archive_complete ? '归档完整' : '存在归档缺口'}</p><h3>错误</h3><pre>{detail.error_code ?? '无'}</pre><h3>请求</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre><h3>响应</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre></aside></div>}
     </Shell>
   );
 }
