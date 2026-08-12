@@ -29,7 +29,7 @@ RUN mkdir -p src tests \
     && printf 'fn main() {}\n' > tests/cucumber.rs \
     && printf 'fn main() {}\n' > tests/postgres.rs \
     && cargo build --locked --release --bin memeloop-token-center \
-    && rm -rf src tests
+    && rm -rf src
 COPY src ./src
 COPY migrations ./migrations
 COPY schemas ./schemas
