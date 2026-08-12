@@ -24,7 +24,10 @@ RUN mkdir -p /usr/local/cargo \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY migrations ./migrations
+COPY schemas ./schemas
 COPY tests ./tests
+COPY wit ./wit
 RUN cargo build --locked --release --bin memeloop-token-center
 
 FROM ${RUNTIME_IMAGE}
