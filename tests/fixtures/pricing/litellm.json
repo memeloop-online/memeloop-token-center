@@ -1,0 +1,19 @@
+{
+  "openai/gpt-priority": {
+    "input_cost_per_token": "0.000003",
+    "output_cost_per_token": "0.000004"
+  },
+  "openai/gpt-fallback": {
+    "input_cost_per_token": "0.000005",
+    "cache_read_input_token_cost": "0.0000005",
+    "cache_creation_input_token_cost": "0.000007",
+    "output_cost_per_token": "0.000006"
+  },
+  "openai/gpt-manual": {
+    "input_cost_per_token": "0.000030",
+    "output_cost_per_token": "0.000040"
+  },
+  "missing-output": {
+    "input_cost_per_token": "0.000099"
+  }
+}

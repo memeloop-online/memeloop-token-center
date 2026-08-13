@@ -19,16 +19,24 @@
       "items": {
         "enum": [
           "keys:write",
+          "keys:read",
           "credits:write",
+          "credits:read",
           "requests:read",
           "providers:read",
           "providers:write",
           "plugins:read",
           "oauth:write",
           "routes:write",
+          "routes:read",
           "prices:write",
+          "prices:read",
           "service_tokens:write",
-          "schemas:read"
+          "service_tokens:read",
+          "schemas:read",
+          "metrics:read",
+          "entitlements:read",
+          "entitlements:write"
         ]
       }
     }

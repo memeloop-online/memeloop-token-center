@@ -8,14 +8,14 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{
         Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
 };
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
@@ -23,6 +23,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     trace::TraceLayer,
@@ -34,18 +35,22 @@ use crate::{
     config::RuntimeRole,
     crypto,
     db::{
-        CreateGenerationJobInput, CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput,
-        CreateUpstreamAccountInput, FinishRequest, NewRequest, unix_millis,
+        CancelEntitlementInput, CreateGenerationJobInput, CreateGenerationJobResult,
+        CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput, CreateUpstreamAccountInput,
+        EntitlementOperation, FinishRequest, GenerationJobIdempotency, NewRequest,
+        ReconcileEntitlementInput, ReplaceEntitlementInput, RequestListFilter, StatsFilter,
+        UpdateModelRouteInput, UpdateUpstreamAccountInput, unix_millis,
     },
     error::AppError,
-    model::{AuthenticatedKey, AuthenticatedService, KeyPolicy},
+    model::{AuthenticatedKey, AuthenticatedService, KeyPolicy, TokenUsage},
+    network::{self, OutboundScope},
     oauth::{
         CursorOAuthEndpoints, CursorPollResult, StartCursorLogin, StartSubscriptionBridgeLogin,
         SubscriptionBridgePollResult, poll_cursor_login, poll_subscription_bridge_login,
         refresh_cursor_credential, start_cursor_login, start_subscription_bridge_login,
     },
     plugin::memeloop::token_center::types::RequestContext,
-    provider::UpstreamCredential,
+    provider::{UpstreamCredential, validate_config},
 };
 
 const REQUEST_ID_HEADER: &str = "x-mtc-request-id";
@@ -53,6 +58,10 @@ const MAX_SUBSCRIPTION_BRIDGE_RESPONSE: usize = 16 * 1024 * 1024;
 const MAX_IMAGE_RESPONSE: usize = 16 * 1024 * 1024;
 const MAX_CPA_IMPORT_BODY: usize = 34 * 1024 * 1024;
 const MAX_ARCHIVE_DETAIL_BODY: usize = 4 * 1024 * 1024;
+const MAX_PROXY_RESPONSE_BODY: usize = 64 * 1024 * 1024;
+const MAX_DEFAULT_REQUEST_BODY: usize = 4 * 1024 * 1024;
+const MAX_IMAGE_REQUEST_BODY: usize = 16 * 1024 * 1024;
+const GATEWAY_IN_FLIGHT_REQUESTS: usize = 16;
 const MAX_REPORTED_TOKENS: i64 = 1_000_000_000;
 static IMAGE_RESPONSE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 static PLUGIN_EXECUTION_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
@@ -63,37 +72,53 @@ pub fn router(state: AppState) -> Router {
 
 pub fn router_for_role(state: AppState, role: RuntimeRole) -> Router {
     let request_id_header = header::HeaderName::from_static(REQUEST_ID_HEADER);
-    let mut application = Router::new().route("/healthz", get(health));
+    let mut application = Router::new()
+        .route("/healthz", get(deprecated_health))
+        .route("/livez", get(liveness))
+        .route("/readyz", get(readiness));
+    if matches!(role, RuntimeRole::Control | RuntimeRole::All) {
+        application = application
+            .route("/metrics", get(prometheus_metrics))
+            .route("/version", get(version));
+    }
     application = application.route("/ui-assets/{*path}", get(web_asset));
     if role.serves_control() {
-        application = application.merge(control_router());
+        application = application.merge(control_router(state.clone()));
     }
     if role.serves_gateway() {
-        application = application.merge(gateway_router());
+        application = application.merge(gateway_router(state.clone()));
     }
     application
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_DEFAULT_REQUEST_BODY))
         .layer(middleware::from_fn(security_headers))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(state.clone(), observe_http))
         .with_state(state)
 }
 
-fn control_router() -> Router<AppState> {
-    Router::new()
-        .route("/operator", get(operator_index))
-        .route("/internal/v1/keys", post(create_key))
+fn control_router(state: AppState) -> Router<AppState> {
+    let authenticated = Router::new()
+        .route("/internal/v1/keys", get(list_keys).post(create_key))
         .route("/internal/v1/keys/{key_id}/rotate", post(rotate_key))
         .route("/internal/v1/keys/{key_id}/policy", put(update_key_policy))
+        .route("/internal/v1/keys/{key_id}/status", patch(set_key_status))
         .route(
             "/internal/v1/keys/{key_id}/legacy-credentials",
             post(register_legacy_key_credential),
         )
-        .route("/internal/v1/service-tokens", post(create_service_token))
+        .route(
+            "/internal/v1/service-tokens",
+            get(list_service_tokens).post(create_service_token),
+        )
         .route(
             "/internal/v1/service-tokens/{service_id}/rotate",
             post(rotate_service_token),
+        )
+        .route(
+            "/internal/v1/service-tokens/{service_id}/status",
+            patch(set_service_token_status),
         )
         .route("/internal/v1/provider-types", get(provider_types))
         .route("/internal/v1/tenants", get(list_tenants))
@@ -138,10 +163,29 @@ fn control_router() -> Router<AppState> {
             put(rotate_upstream_credential),
         )
         .route(
+            "/internal/v1/upstreams/{account_id}",
+            put(update_upstream)
+                .patch(set_upstream_status)
+                .delete(delete_upstream),
+        )
+        .route(
+            "/internal/v1/upstreams/{account_id}/health",
+            post(probe_upstream_health),
+        )
+        .route(
             "/internal/v1/upstreams/{account_id}/oauth/refresh",
             post(refresh_upstream_oauth),
         )
-        .route("/internal/v1/model-routes", post(create_model_route))
+        .route(
+            "/internal/v1/model-routes",
+            get(list_model_routes).post(create_model_route),
+        )
+        .route(
+            "/internal/v1/model-routes/{route_id}",
+            put(update_model_route)
+                .patch(set_model_route_enabled)
+                .delete(delete_model_route),
+        )
         .route("/internal/v1/model-prices", get(list_model_prices))
         .route(
             "/internal/v1/model-prices/usage-summary",
@@ -154,6 +198,10 @@ fn control_router() -> Router<AppState> {
             post(upsert_generation_price),
         )
         .route(
+            "/internal/v1/generation-prices",
+            get(list_generation_prices),
+        )
+        .route(
             "/internal/v1/accounts/{account_id}/grants",
             post(grant_balance),
         )
@@ -161,17 +209,39 @@ fn control_router() -> Router<AppState> {
             "/internal/v1/accounts/{account_id}/grant-reversals",
             post(reverse_grant_balance),
         )
+        .route(
+            "/internal/v1/accounts/{account_id}/ledger",
+            get(list_account_ledger),
+        )
+        .route(
+            "/internal/v1/entitlements",
+            get(list_entitlements).put(reconcile_entitlement),
+        )
+        .route("/internal/v1/entitlements/cancel", post(cancel_entitlement))
+        .route(
+            "/internal/v1/entitlements/replace",
+            post(replace_entitlement),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state,
+            authenticate_control_before_body,
+        ));
+    Router::new()
+        .route("/operator", get(operator_index))
+        .merge(authenticated)
 }
 
-fn gateway_router() -> Router<AppState> {
-    Router::new()
-        .route("/portal", get(portal_index))
+fn gateway_router(state: AppState) -> Router<AppState> {
+    let authenticated = Router::new()
         .route("/self/v1/key", get(self_key))
         .route("/self/v1/requests", get(self_requests))
         .route("/self/v1/requests/{request_id}", get(self_request_detail))
         .route("/self/v1/stats", get(self_stats))
         .route("/self/v1/generations", get(self_generations))
-        .route("/self/v1/generations/{job_id}", get(self_generation))
+        .route(
+            "/self/v1/generations/{job_id}",
+            get(self_generation).delete(cancel_self_generation),
+        )
         .route("/self/v1/conversations", get(self_conversations))
         .route(
             "/self/v1/conversations/{cluster_id}",
@@ -183,16 +253,175 @@ fn gateway_router() -> Router<AppState> {
         .route("/v1/embeddings", post(proxy_openai_embeddings))
         .route("/v1/generations", post(create_generation))
         .route("/v1/videos/generations", post(create_generation))
-        .route("/v1/images/generations", post(create_image_generation))
+        .route(
+            "/v1/images/generations",
+            post(create_image_generation).layer(DefaultBodyLimit::max(MAX_IMAGE_REQUEST_BODY)),
+        )
         .route("/v1/messages", post(proxy_anthropic))
         .route(
             "/v1/messages/count_tokens",
             post(proxy_anthropic_count_tokens),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state,
+            authenticate_gateway_before_body,
+        ))
+        .layer(ConcurrencyLimitLayer::new(GATEWAY_IN_FLIGHT_REQUESTS));
+    Router::new()
+        .route("/portal", get(portal_index))
+        .merge(authenticated)
 }
 
-async fn health() -> impl IntoResponse {
+async fn authenticate_control_before_body(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let _ = authenticated_service(request.headers(), &state).await?;
+    Ok(next.run(request).await)
+}
+
+async fn authenticate_gateway_before_body(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let _ = authenticate_downstream(request.headers(), &state).await?;
+    Ok(next.run(request).await)
+}
+
+async fn liveness() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
+}
+
+async fn deprecated_health() -> Response {
+    let mut response = liveness().await.into_response();
+    response.headers_mut().insert(
+        header::HeaderName::from_static("deprecation"),
+        HeaderValue::from_static("true"),
+    );
+    response.headers_mut().insert(
+        header::LINK,
+        HeaderValue::from_static("</livez>; rel=\"successor-version\""),
+    );
+    response
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+    let database = state.db.clone();
+    let archive = state.archive.clone();
+    let (database_ready, archive_ready) = state
+        .metrics
+        .readiness(move || async move {
+            let (database, archive) = tokio::join!(
+                tokio::time::timeout(CHECK_TIMEOUT, database.readiness_check()),
+                tokio::time::timeout(CHECK_TIMEOUT, archive.readiness_check()),
+            );
+            let database_ready = matches!(database, Ok(Ok(())));
+            let archive_ready = matches!(archive, Ok(Ok(())));
+            if !database_ready {
+                tracing::warn!(
+                    timed_out = database.is_err(),
+                    "readiness database check failed"
+                );
+            }
+            if !archive_ready {
+                tracing::warn!(
+                    timed_out = archive.is_err(),
+                    "readiness archive check failed"
+                );
+            }
+            (database_ready, archive_ready)
+        })
+        .await;
+    let status = if database_ready && archive_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "status": if status.is_success() { "ready" } else { "not_ready" },
+            "checks": {
+                "database": if database_ready { "ok" } else { "failed" },
+                "archive": if archive_ready { "ok" } else { "failed" }
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn prometheus_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    require_service(&headers, &state, "metrics:read").await?;
+    let runtime = match state.db.runtime_metrics().await {
+        Ok(value) => {
+            state.metrics.set_dependency_ready("database", true);
+            Some(value)
+        }
+        Err(error) => {
+            state.metrics.set_dependency_ready("database", false);
+            tracing::warn!(%error, "database runtime metrics collection failed");
+            None
+        }
+    };
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        state.metrics.render(runtime.as_ref()),
+    )
+        .into_response())
+}
+
+async fn version(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
+    require_service(&headers, &state, "metrics:read").await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+        "service": "memeloop-token-center",
+        "version": crate::metrics::BUILD_VERSION,
+        "revision": crate::metrics::BUILD_GIT_SHA,
+        "build_timestamp": crate::metrics::BUILD_TIMESTAMP,
+        "target": crate::metrics::BUILD_TARGET,
+        "api": {
+            "current": "v1",
+            "supported": ["v1"],
+            "compatibility": "additive changes may occur within v1; removals require a documented deprecation window",
+            "deprecated": [{
+                "path": "/healthz",
+                "replacement": "/livez"
+            }]
+        }
+        })),
+    )
+        .into_response())
+}
+
+async fn observe_http(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    // `MatchedPath` is a route template, never a concrete URI containing a key,
+    // tenant, request id or other user-controlled high-cardinality value.
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("unmatched")
+        .to_owned();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    state
+        .metrics
+        .observe_http(&method, &route, response.status(), started.elapsed());
+    response
 }
 
 async fn security_headers(request: Request, next: Next) -> Response {
@@ -204,6 +433,10 @@ async fn security_headers(request: Request, next: Next) -> Response {
     let headers = response.headers_mut();
     if authenticated_api {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        headers.insert(
+            header::HeaderName::from_static("x-mtc-api-version"),
+            HeaderValue::from_static("v1"),
+        );
     }
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -294,6 +527,7 @@ async fn web_asset(Path(path): Path<String>) -> Response {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateKeyRequest {
     #[serde(default = "default_tenant")]
     tenant_external_id: String,
@@ -355,18 +589,54 @@ async fn create_key(
     Ok((StatusCode::CREATED, Json(issued)))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct KeysQuery {
+    tenant_external_id: Option<String>,
+    principal_external_id: Option<String>,
+}
+
+async fn list_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<KeysQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "keys:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let principal = query
+        .principal_external_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if principal.is_some_and(|value| value.len() > 200 || value.chars().any(char::is_control)) {
+        return Err(AppError::BadRequest(
+            "principal_external_id must contain at most 200 non-control characters".into(),
+        ));
+    }
+    Ok(Json(
+        state
+            .db
+            .list_managed_keys(tenant.as_deref(), principal)
+            .await?,
+    ))
+}
+
 async fn rotate_key(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(key_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "keys:write").await?;
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))?
+        .to_str()
+        .map_err(|_| AppError::BadRequest("Idempotency-Key must be valid ASCII".into()))?;
     if let Some(tenant) = service.tenant_external_id.as_deref() {
         state.db.require_key_tenant(key_id, tenant).await?;
     }
     let issued = state
         .db
-        .rotate_key(key_id, state.config.key_pepper.as_bytes())
+        .rotate_key(key_id, idempotency_key, state.config.key_pepper.as_bytes())
         .await?;
     Ok(Json(issued))
 }
@@ -382,6 +652,28 @@ async fn update_key_policy(
         state.db.require_key_tenant(key_id, tenant).await?;
     }
     Ok(Json(state.db.update_key_policy(key_id, policy).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusRequest {
+    status: String,
+}
+
+async fn set_key_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key_id): Path<Uuid>,
+    Json(body): Json<StatusRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "keys:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_key_tenant(key_id, tenant).await?;
+    }
+    Ok(Json(json!({
+        "key_id": key_id,
+        "status": state.db.set_key_status(key_id, &body.status).await?
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -445,6 +737,15 @@ async fn create_service_token(
     Ok((StatusCode::CREATED, Json(issued)))
 }
 
+async fn list_service_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "service_tokens:read").await?;
+    require_global_service(&service)?;
+    Ok(Json(state.db.list_service_tokens().await?))
+}
+
 async fn rotate_service_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -452,12 +753,35 @@ async fn rotate_service_token(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "service_tokens:write").await?;
     require_global_service(&service)?;
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))?
+        .to_str()
+        .map_err(|_| AppError::BadRequest("Idempotency-Key must be valid ASCII".into()))?;
     Ok(Json(
         state
             .db
-            .rotate_service_token(service_id, state.config.key_pepper.as_bytes())
+            .rotate_service_token(
+                service_id,
+                idempotency_key,
+                state.config.key_pepper.as_bytes(),
+            )
             .await?,
     ))
+}
+
+async fn set_service_token_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(service_id): Path<Uuid>,
+    Json(body): Json<StatusRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "service_tokens:write").await?;
+    require_global_service(&service)?;
+    Ok(Json(json!({
+        "service_id": service_id,
+        "status": state.db.set_service_token_status(service_id, &body.status).await?
+    })))
 }
 
 async fn provider_types(
@@ -524,6 +848,14 @@ async fn start_cursor_oauth(
             body.provider_driver
         )));
     }
+    validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
+    validate_upstream_destination(
+        &body.provider_driver,
+        &body.provider_config,
+        &service,
+        &state,
+    )
+    .await?;
     let endpoints = body.endpoints.unwrap_or_default();
     if !state.config.allow_oauth_loopback && endpoints != CursorOAuthEndpoints::default() {
         return Err(AppError::BadRequest(
@@ -569,6 +901,14 @@ async fn start_provider_adapter_oauth(
             body.provider_driver
         ))
     })?;
+    validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
+    validate_upstream_destination(
+        &body.provider_driver,
+        &body.provider_config,
+        &service,
+        &state,
+    )
+    .await?;
     Ok(Json(start_cursor_login(
         StartCursorLogin {
             tenant_external_id: body.tenant_external_id,
@@ -604,6 +944,7 @@ async fn poll_cursor_oauth(
         state.config.key_pepper.as_bytes(),
         unix_millis(),
         service.tenant_external_id.as_deref(),
+        state.config.allow_oauth_loopback,
     )
     .await?
     {
@@ -620,6 +961,19 @@ async fn poll_cursor_oauth(
         CursorPollResult::Ready(ready) => {
             let ready = *ready;
             require_service_tenant(&service, &ready.tenant_external_id)?;
+            validate_provider_schema(
+                &state,
+                &ready.provider_driver,
+                &ready.provider_config,
+                &ready.credential,
+            )?;
+            validate_upstream_destination(
+                &ready.provider_driver,
+                &ready.provider_config,
+                &service,
+                &state,
+            )
+            .await?;
             let account = state
                 .db
                 .create_upstream_account(
@@ -656,6 +1010,9 @@ async fn start_subscription_bridge_oauth(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
+    // Subscription bridges are deliberately in-cluster. Only a global operator may
+    // authorize a new private-network destination for a tenant.
+    require_global_service(&service)?;
     Ok(Json(
         start_subscription_bridge_login(
             &state.http,
@@ -664,7 +1021,8 @@ async fn start_subscription_bridge_oauth(
                 account_name: body.account_name,
                 provider_config: json!({
                     "base_url": body.base_url,
-                    "provider": body.provider
+                    "provider": body.provider,
+                    "network_scope": "private"
                 }),
                 bridge_secret: body.bridge_secret,
                 allow_loopback: state.config.allow_oauth_loopback,
@@ -706,6 +1064,19 @@ async fn poll_subscription_bridge_oauth(
         SubscriptionBridgePollResult::Ready(ready) => {
             let ready = *ready;
             require_service_tenant(&service, &ready.tenant_external_id)?;
+            validate_provider_schema(
+                &state,
+                "cpa-subscription-bridge",
+                &ready.provider_config,
+                &ready.credential,
+            )?;
+            validate_upstream_destination(
+                "cpa-subscription-bridge",
+                &ready.provider_config,
+                &service,
+                &state,
+            )
+            .await?;
             let account = state
                 .db
                 .create_upstream_account(
@@ -731,6 +1102,11 @@ async fn refresh_upstream_oauth(
     Path(account_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))?
+        .to_str()
+        .map_err(|_| AppError::BadRequest("Idempotency-Key must be valid ASCII".into()))?;
     if let Some(tenant) = service.tenant_external_id.as_deref() {
         state.db.require_upstream_tenant(account_id, tenant).await?;
     }
@@ -743,6 +1119,17 @@ async fn refresh_upstream_oauth(
             "upstream account does not use OAuth".into(),
         ));
     }
+    if let Some(replay) = state
+        .db
+        .begin_upstream_oauth_refresh(
+            account_id,
+            idempotency_key,
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?
+    {
+        return Ok(Json(replay));
+    }
     let driver = account
         .config
         .pointer("/oauth/driver")
@@ -753,9 +1140,24 @@ async fn refresh_upstream_oauth(
         .pointer("/oauth/refresh_url")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("upstream OAuth refresh URL is missing".into()))?;
+    let refresh_scope = if driver == "provider_adapter" {
+        // Plugin OAuth adapters are installed by the cluster administrator and
+        // may intentionally be in-cluster. Cursor's built-in endpoint is public.
+        OutboundScope::Private
+    } else {
+        OutboundScope::Public
+    };
+    let refresh_http = network::client_for_url(
+        &state.http,
+        refresh_url,
+        refresh_scope,
+        state.config.allow_oauth_loopback,
+    )
+    .await?;
     let refreshed = match driver {
         "cursor" | "provider_adapter" => {
-            refresh_cursor_credential(&state.http, refresh_url, &credential, unix_millis()).await?
+            refresh_cursor_credential(&refresh_http, refresh_url, &credential, unix_millis())
+                .await?
         }
         _ => {
             return Err(AppError::BadRequest(format!(
@@ -766,12 +1168,18 @@ async fn refresh_upstream_oauth(
     Ok(Json(
         state
             .db
-            .rotate_upstream_credential(account_id, refreshed, state.config.key_pepper.as_bytes())
+            .finish_upstream_oauth_refresh(
+                account_id,
+                refreshed,
+                idempotency_key,
+                state.config.key_pepper.as_bytes(),
+            )
             .await?,
     ))
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateUpstreamRequest {
     #[serde(default = "default_tenant")]
     tenant_external_id: String,
@@ -793,12 +1201,8 @@ async fn create_upstream(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
-    if !state.providers.contains(&body.driver) {
-        return Err(AppError::BadRequest(format!(
-            "unknown provider driver: {}",
-            body.driver
-        )));
-    }
+    validate_provider_schema(&state, &body.driver, &body.config, &body.credential)?;
+    validate_upstream_destination(&body.driver, &body.config, &service, &state).await?;
     body.credential.validate(unix_millis())?;
     let account = state
         .db
@@ -815,6 +1219,120 @@ async fn create_upstream(
         )
         .await?;
     Ok((StatusCode::CREATED, Json(account)))
+}
+
+fn validate_provider_schema(
+    state: &AppState,
+    driver: &str,
+    config: &Value,
+    credential: &UpstreamCredential,
+) -> Result<(), AppError> {
+    validate_provider_config_schema(state, driver, config)?;
+    let provider = state
+        .providers
+        .get(driver)
+        .ok_or_else(|| AppError::BadRequest(format!("unknown provider driver: {driver}")))?;
+    crate::schema::validate_instance(
+        &provider.credential_schema,
+        &serde_json::to_value(credential).map_err(|_| AppError::Internal)?,
+    )
+}
+
+fn validate_provider_config_schema(
+    state: &AppState,
+    driver: &str,
+    config: &Value,
+) -> Result<(), AppError> {
+    let provider = state
+        .providers
+        .get(driver)
+        .ok_or_else(|| AppError::BadRequest(format!("unknown provider driver: {driver}")))?;
+    crate::schema::validate_instance(&provider.config_schema, config)
+}
+
+async fn validate_upstream_destination(
+    driver: &str,
+    config: &Value,
+    service: &AuthenticatedService,
+    state: &AppState,
+) -> Result<(), AppError> {
+    let base_url = validate_config(config)?;
+    let scope = network::scope_from_config(config);
+    if scope == OutboundScope::Private {
+        require_global_service(service)?;
+    }
+    // Building the operation client validates and pins every public DNS answer.
+    let _ = network::client_for_url(
+        &state.http,
+        &base_url,
+        scope,
+        state.config.allow_oauth_loopback,
+    )
+    .await?;
+    validate_secondary_outbound_urls(config, scope, state).await?;
+    validate_provider_config(driver, config)
+}
+
+async fn validate_secondary_outbound_urls(
+    config: &Value,
+    scope: OutboundScope,
+    state: &AppState,
+) -> Result<(), AppError> {
+    if let Some(refresh_url) = config.pointer("/oauth/refresh_url").and_then(Value::as_str) {
+        let oauth_scope = if config.pointer("/oauth/driver").and_then(Value::as_str)
+            == Some("provider_adapter")
+        {
+            OutboundScope::Private
+        } else {
+            OutboundScope::Public
+        };
+        let _ = network::client_for_url(
+            &state.http,
+            refresh_url,
+            oauth_scope,
+            state.config.allow_oauth_loopback,
+        )
+        .await?;
+    }
+    for result_origin in config
+        .get("result_origins")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let parsed = network::checked_http_url(result_origin)?;
+        if parsed.origin().ascii_serialization() != result_origin || parsed.path() != "/" {
+            return Err(AppError::BadRequest(
+                "generation result_origins must be exact HTTP(S) origins".into(),
+            ));
+        }
+        let _ = network::client_for_url(
+            &state.http,
+            result_origin,
+            scope,
+            state.config.allow_oauth_loopback,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn validate_provider_config(driver: &str, config: &Value) -> Result<(), AppError> {
+    if driver == "comfyui"
+        && (config
+            .get("workflow_id")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty() || value.len() > 200)
+            || !config
+                .get("workflow_template")
+                .is_some_and(Value::is_object))
+    {
+        return Err(AppError::BadRequest(format!(
+            "{driver} requires an administrator-owned workflow_id and workflow_template"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -839,6 +1357,9 @@ async fn import_cpa_subscription_accounts(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
+    // Imported subscription handles always target the in-cluster bridge, so only
+    // the global operator may authorize this private-network destination.
+    require_global_service(&service)?;
     if body.auth_files.is_empty() || body.auth_files.len() > 32 {
         return Err(AppError::BadRequest(
             "auth_files must contain 1 to 32 CPA auth documents".into(),
@@ -878,6 +1399,28 @@ async fn import_cpa_subscription_accounts(
                     "{:02x}{:02x}{:02x}{:02x}",
                     digest[0], digest[1], digest[2], digest[3]
                 );
+                let provider_config = json!({
+                    "base_url": base_url.clone(),
+                    "provider": provider.clone(),
+                    "network_scope": "private"
+                });
+                let credential = UpstreamCredential::SubscriptionBridge {
+                    handle,
+                    secret: body.bridge_secret.clone(),
+                };
+                validate_provider_schema(
+                    &state,
+                    "cpa-subscription-bridge",
+                    &provider_config,
+                    &credential,
+                )?;
+                validate_upstream_destination(
+                    "cpa-subscription-bridge",
+                    &provider_config,
+                    &service,
+                    &state,
+                )
+                .await?;
                 let account = state
                     .db
                     .create_upstream_account(
@@ -885,11 +1428,8 @@ async fn import_cpa_subscription_accounts(
                             tenant_external_id: body.tenant_external_id.clone(),
                             name: format!("cpa-{provider}-{suffix}"),
                             driver: "cpa-subscription-bridge".to_owned(),
-                            config: json!({"base_url": base_url.clone(), "provider": provider.clone()}),
-                            credential: UpstreamCredential::SubscriptionBridge {
-                                handle,
-                                secret: body.bridge_secret.clone(),
-                            },
+                            config: provider_config,
+                            credential,
                             oauth_session_id: Some(oauth_session_id),
                         },
                         state.config.key_pepper.as_bytes(),
@@ -988,6 +1528,232 @@ async fn list_upstreams(
     Ok(Json(values))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateUpstreamRequest {
+    tenant_external_id: String,
+    name: String,
+    config: Value,
+    expected_updated_at: i64,
+}
+
+async fn update_upstream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Json(body): Json<UpdateUpstreamRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    state
+        .db
+        .require_upstream_tenant(account_id, &body.tenant_external_id)
+        .await?;
+    let driver = state.db.upstream_driver(account_id).await?;
+    validate_provider_config_schema(&state, &driver, &body.config)?;
+    validate_upstream_destination(&driver, &body.config, &service, &state).await?;
+    Ok(Json(
+        state
+            .db
+            .update_upstream_account(
+                account_id,
+                &body.tenant_external_id,
+                UpdateUpstreamAccountInput {
+                    name: body.name,
+                    config: body.config,
+                    expected_updated_at: body.expected_updated_at,
+                },
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetUpstreamStatusRequest {
+    tenant_external_id: String,
+    status: String,
+    expected_updated_at: i64,
+}
+
+async fn set_upstream_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Json(body): Json<SetUpstreamStatusRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    state
+        .db
+        .require_upstream_tenant(account_id, &body.tenant_external_id)
+        .await?;
+    if body.status == "active" {
+        let (_, credential) = state
+            .db
+            .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
+            .await?;
+        credential.validate(unix_millis())?;
+    }
+    Ok(Json(
+        state
+            .db
+            .set_upstream_account_status(
+                account_id,
+                &body.tenant_external_id,
+                &body.status,
+                body.expected_updated_at,
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteUpstreamQuery {
+    tenant_external_id: String,
+    expected_updated_at: i64,
+}
+
+async fn delete_upstream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<DeleteUpstreamQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:write").await?;
+    require_service_tenant(&service, &query.tenant_external_id)?;
+    state
+        .db
+        .delete_upstream_account(
+            account_id,
+            &query.tenant_external_id,
+            query.expected_updated_at,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    match driver {
+        "http-json" => {
+            if base.ends_with("/v1") {
+                format!("{base}/models")
+            } else {
+                format!("{base}/v1/models")
+            }
+        }
+        "cpa-subscription-bridge" => format!("{base}/healthz"),
+        "comfyui" => {
+            let prefix = config
+                .get("api_prefix")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!("{base}{prefix}/system_stats")
+        }
+        "volcengine-seedance" => {
+            format!("{base}/api/v3/contents/generations/tasks/__mtc_health_probe__")
+        }
+        _ => base.to_owned(),
+    }
+}
+
+async fn probe_upstream_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<ManagementTenantQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:write").await?;
+    if let Some(tenant) = query
+        .tenant_external_id
+        .as_deref()
+        .or(service.tenant_external_id.as_deref())
+    {
+        require_service_tenant(&service, tenant)?;
+        state.db.require_upstream_tenant(account_id, tenant).await?;
+    }
+    let (account, credential) = state
+        .db
+        .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
+        .await?;
+    if credential.validate(unix_millis()).is_err() {
+        return Ok(Json(json!({
+            "account_id": account_id,
+            "status": "unhealthy",
+            "error_code": "credential_invalid",
+            "checked_at": unix_millis()
+        })));
+    }
+    let base_url = validate_config(&account.config)?;
+    let outbound = match network::client_for_config_url(
+        &state.http,
+        &base_url,
+        &account.config,
+        state.config.allow_oauth_loopback,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(_) => {
+            return Ok(Json(json!({
+                "account_id": account_id,
+                "status": "unhealthy",
+                "error_code": "destination_invalid",
+                "checked_at": unix_millis()
+            })));
+        }
+    };
+    let probe_url = upstream_health_probe_url(&account.driver, &account.config, &base_url);
+    let started = Instant::now();
+    let request = outbound
+        .get(probe_url)
+        .header(header::ACCEPT, "application/json")
+        .timeout(Duration::from_secs(5));
+    let request = match credential.apply(request, unix_millis()) {
+        Ok(request) => request,
+        Err(_) => {
+            return Ok(Json(json!({
+                "account_id": account_id,
+                "status": "unhealthy",
+                "error_code": "credential_invalid",
+                "checked_at": unix_millis()
+            })));
+        }
+    };
+    let response = request.send().await;
+    let latency_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let checked_at = unix_millis();
+    match response {
+        Ok(response) => {
+            // Dropping the response without reading its body makes the probe
+            // bounded and prevents provider error text or secrets from being
+            // copied into logs or the management response.
+            let upstream_status = response.status();
+            let authentication_failed = matches!(
+                upstream_status,
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            );
+            let healthy = !authentication_failed && !upstream_status.is_server_error();
+            Ok(Json(json!({
+                "account_id": account_id,
+                "status": if healthy { "healthy" } else { "unhealthy" },
+                "error_code": if healthy { Value::Null } else if authentication_failed { json!("authentication_failed") } else { json!("upstream_unavailable") },
+                "upstream_status": upstream_status.as_u16(),
+                "latency_ms": latency_ms,
+                "checked_at": checked_at
+            })))
+        }
+        Err(_) => Ok(Json(json!({
+            "account_id": account_id,
+            "status": "unhealthy",
+            "error_code": "connection_failed",
+            "latency_ms": latency_ms,
+            "checked_at": checked_at
+        }))),
+    }
+}
+
 async fn list_tenants(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1006,10 +1772,11 @@ async fn internal_requests(
     Query(query): Query<RequestsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
-    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
+    let filter = query.to_filter(true)?;
     let values = match tenant {
-        Some(tenant) => state.db.list_all_requests(&tenant, query.limit).await?,
-        None => state.db.list_global_requests(query.limit).await?,
+        Some(tenant) => state.db.list_all_requests_filtered(&tenant, filter).await?,
+        None => state.db.list_global_requests_filtered(filter).await?,
     };
     Ok(Json(values))
 }
@@ -1037,13 +1804,14 @@ async fn internal_request_detail(
 async fn internal_stats(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ManagementTenantQuery>,
+    Query(query): Query<StatsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
-    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
+    let filter = query.to_filter(true, None)?;
     let stats = match tenant {
-        Some(tenant) => state.db.operator_stats(&tenant).await?,
-        None => state.db.global_operator_stats().await?,
+        Some(tenant) => state.db.operator_stats_filtered(&tenant, filter).await?,
+        None => state.db.global_operator_stats_filtered(filter).await?,
     };
     Ok(Json(stats))
 }
@@ -1132,9 +1900,23 @@ async fn rotate_upstream_credential(
     Json(body): Json<RotateUpstreamCredentialRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:write").await?;
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))?
+        .to_str()
+        .map_err(|_| AppError::BadRequest("Idempotency-Key must be valid ASCII".into()))?;
     if let Some(tenant) = service.tenant_external_id.as_deref() {
         state.db.require_upstream_tenant(account_id, tenant).await?;
     }
+    let driver = state.db.upstream_driver(account_id).await?;
+    let provider = state
+        .providers
+        .get(&driver)
+        .ok_or_else(|| AppError::BadRequest(format!("unknown provider driver: {driver}")))?;
+    crate::schema::validate_instance(
+        &provider.credential_schema,
+        &serde_json::to_value(&body.credential).map_err(|_| AppError::Internal)?,
+    )?;
     body.credential.validate(unix_millis())?;
     Ok(Json(
         state
@@ -1142,6 +1924,7 @@ async fn rotate_upstream_credential(
             .rotate_upstream_credential(
                 account_id,
                 body.credential,
+                idempotency_key,
                 state.config.key_pepper.as_bytes(),
             )
             .await?,
@@ -1167,6 +1950,25 @@ async fn create_model_route(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "routes:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
+    state
+        .db
+        .require_upstream_tenant(body.upstream_account_id, &body.tenant_external_id)
+        .await?;
+    let driver = state.db.upstream_driver(body.upstream_account_id).await?;
+    let provider = state
+        .providers
+        .get(&driver)
+        .ok_or_else(|| AppError::BadRequest(format!("unknown provider driver: {driver}")))?;
+    if !provider
+        .protocols
+        .iter()
+        .any(|value| value == &body.protocol)
+    {
+        return Err(AppError::BadRequest(format!(
+            "provider {driver} does not support the {} protocol",
+            body.protocol
+        )));
+    }
     let route = state
         .db
         .create_model_route(CreateModelRouteInput {
@@ -1181,10 +1983,131 @@ async fn create_model_route(
     Ok((StatusCode::CREATED, Json(route)))
 }
 
+async fn list_model_routes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ManagementTenantQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "routes:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    Ok(Json(state.db.list_model_routes(tenant.as_deref()).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateModelRouteRequest {
+    tenant_external_id: String,
+    public_model: String,
+    upstream_account_id: Uuid,
+    upstream_model: String,
+    protocol: String,
+    priority: i64,
+    expected_updated_at: i64,
+}
+
+async fn update_model_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+    Json(body): Json<UpdateModelRouteRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "routes:write").await?;
+    let tenant = management_tenant(&service, Some(body.tenant_external_id))?
+        .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
+    state
+        .db
+        .require_upstream_tenant(body.upstream_account_id, &tenant)
+        .await?;
+    let driver = state.db.upstream_driver(body.upstream_account_id).await?;
+    let provider = state
+        .providers
+        .get(&driver)
+        .ok_or_else(|| AppError::BadRequest(format!("unknown provider driver: {driver}")))?;
+    if !provider
+        .protocols
+        .iter()
+        .any(|value| value == &body.protocol)
+    {
+        return Err(AppError::BadRequest(format!(
+            "provider {driver} does not support the {} protocol",
+            body.protocol
+        )));
+    }
+    Ok(Json(
+        state
+            .db
+            .update_model_route(
+                route_id,
+                &tenant,
+                UpdateModelRouteInput {
+                    public_model: body.public_model,
+                    upstream_account_id: body.upstream_account_id,
+                    upstream_model: body.upstream_model,
+                    protocol: body.protocol,
+                    priority: body.priority,
+                    expected_updated_at: body.expected_updated_at,
+                },
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetModelRouteEnabledRequest {
+    tenant_external_id: String,
+    enabled: bool,
+    expected_updated_at: i64,
+}
+
+async fn set_model_route_enabled(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+    Json(body): Json<SetModelRouteEnabledRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "routes:write").await?;
+    let tenant = management_tenant(&service, Some(body.tenant_external_id))?
+        .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
+    Ok(Json(
+        state
+            .db
+            .set_model_route_enabled(route_id, &tenant, body.enabled, body.expected_updated_at)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteModelRouteQuery {
+    tenant_external_id: String,
+    expected_updated_at: i64,
+}
+
+async fn delete_model_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+    Query(query): Query<DeleteModelRouteQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "routes:write").await?;
+    let tenant = management_tenant(&service, Some(query.tenant_external_id))?
+        .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
+    state
+        .db
+        .delete_model_route(route_id, &tenant, query.expected_updated_at)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Debug, Deserialize)]
 struct PriceRequest {
     input_per_million: String,
     output_per_million: String,
+    #[serde(default = "default_service_tier")]
+    service_tier: String,
+    cached_input_per_million: Option<String>,
+    cache_write_per_million: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1205,13 +2128,14 @@ async fn list_model_prices(
 async fn model_price_usage_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ManagementTenantQuery>,
+    Query(query): Query<StatsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
-    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
+    let filter = query.to_filter(true, None)?;
     let stats = match tenant {
-        Some(tenant) => state.db.operator_stats(&tenant).await?,
-        None => state.db.global_operator_stats().await?,
+        Some(tenant) => state.db.operator_stats_filtered(&tenant, filter).await?,
+        None => state.db.global_operator_stats_filtered(filter).await?,
     };
     Ok(Json(json!({
         "models": stats.by_model.into_iter().map(|bucket| json!({
@@ -1238,6 +2162,7 @@ async fn sync_model_prices(
     Json(body): Json<ModelPriceSyncRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "prices:write").await?;
+    require_global_service(&service)?;
     let tenant = management_tenant(&service, body.tenant_external_id)?;
     let models = if body.models.is_empty() {
         state.db.pricing_models(tenant.as_deref()).await?
@@ -1259,17 +2184,37 @@ async fn upsert_price(
     require_global_service(&service)?;
     let input = parse_decimal(&body.input_per_million, "input_per_million")?;
     let output = parse_decimal(&body.output_per_million, "output_per_million")?;
+    let cached_input = body
+        .cached_input_per_million
+        .as_deref()
+        .map(|value| parse_decimal(value, "cached_input_per_million"))
+        .transpose()?
+        .unwrap_or(input);
+    let cache_write = body
+        .cache_write_per_million
+        .as_deref()
+        .map(|value| parse_decimal(value, "cache_write_per_million"))
+        .transpose()?
+        .unwrap_or(input);
     let price = state
         .db
-        .upsert_model_price(&model, &currency, input, output)
+        .upsert_model_price_tier(
+            &model,
+            &currency,
+            &body.service_tier,
+            input,
+            cached_input,
+            cache_write,
+            output,
+            body.cached_input_per_million.is_none() || body.cache_write_per_million.is_none(),
+        )
         .await?;
-    Ok(Json(json!({
-        "price_id": price.id,
-        "model": model,
-        "currency": currency.to_uppercase(),
-        "input_per_million": body.input_per_million,
-        "output_per_million": body.output_per_million
-    })))
+    let _ = price;
+    Ok(Json(state.db.model_price_view(&model, &currency).await?))
+}
+
+fn default_service_tier() -> String {
+    "default".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1293,6 +2238,17 @@ async fn upsert_generation_price(
             .db
             .upsert_generation_price(&model, &currency, &body.billing_unit, price)
             .await?,
+    ))
+}
+
+async fn list_generation_prices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ModelPricesQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state, "prices:read").await?;
+    Ok(Json(
+        state.db.list_generation_prices(&query.currency).await?,
     ))
 }
 
@@ -1358,6 +2314,221 @@ async fn reverse_grant_balance(
     Ok((StatusCode::CREATED, Json(json!({"reversed": reversed}))))
 }
 
+#[derive(Debug, Deserialize)]
+struct LedgerQuery {
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+async fn list_account_ledger(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<LedgerQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "credits:read").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_account_tenant(account_id, tenant).await?;
+    }
+    Ok(Json(
+        state
+            .db
+            .list_account_ledger(account_id, query.limit)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntitlementQuery {
+    tenant_external_id: Option<String>,
+    provider: Option<String>,
+    external_subscription_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconcileEntitlementRequest {
+    tenant_external_id: Option<String>,
+    account_id: Uuid,
+    provider: String,
+    external_subscription_id: String,
+    external_cycle_id: String,
+    period_start: i64,
+    period_end: i64,
+    currency: String,
+    desired: String,
+    version: i64,
+    source: String,
+    proration: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelEntitlementRequest {
+    tenant_external_id: Option<String>,
+    provider: String,
+    external_subscription_id: String,
+    external_cycle_id: Option<String>,
+    version: i64,
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaceEntitlementRequest {
+    tenant_external_id: Option<String>,
+    provider: String,
+    external_subscription_id: String,
+    version: i64,
+    source: String,
+    replacement: ReconcileEntitlementRequest,
+}
+
+fn required_idempotency_key(headers: &HeaderMap) -> Result<&str, AppError> {
+    headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))
+}
+
+fn entitlement_reconcile_input(
+    tenant_external_id: String,
+    body: ReconcileEntitlementRequest,
+) -> Result<ReconcileEntitlementInput, AppError> {
+    let desired = parse_decimal(&body.desired, "desired")?;
+    let desired_micros = desired
+        .checked_mul(Decimal::from(crate::model::MONEY_SCALE))
+        .filter(|value| value.fract().is_zero())
+        .and_then(|value| value.to_string().parse::<i64>().ok())
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "desired must have at most 6 decimal places and fit monetary range".into(),
+            )
+        })?;
+    Ok(ReconcileEntitlementInput {
+        tenant_external_id,
+        account_id: body.account_id,
+        provider: body.provider,
+        external_subscription_id: body.external_subscription_id,
+        external_cycle_id: body.external_cycle_id,
+        period_start: body.period_start,
+        period_end: body.period_end,
+        currency: body.currency,
+        desired_micros,
+        version: body.version,
+        source: body.source,
+        proration_json: body
+            .proration
+            .map(|value| serde_json::to_string(&value).map_err(|_| AppError::Internal))
+            .transpose()?,
+    })
+}
+
+async fn list_entitlements(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EntitlementQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "entitlements:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    Ok(Json(
+        state
+            .db
+            .list_entitlements(
+                tenant.as_deref(),
+                query.provider.as_deref(),
+                query.external_subscription_id.as_deref(),
+            )
+            .await?,
+    ))
+}
+
+async fn reconcile_entitlement(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ReconcileEntitlementRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "entitlements:write").await?;
+    let tenant = management_tenant(&service, body.tenant_external_id.clone())?
+        .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
+    state
+        .db
+        .require_account_tenant(body.account_id, &tenant)
+        .await?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let result = state
+        .db
+        .reconcile_entitlement(
+            EntitlementOperation::Reconcile(entitlement_reconcile_input(tenant, body)?),
+            idempotency_key,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+async fn cancel_entitlement(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CancelEntitlementRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "entitlements:write").await?;
+    let tenant = management_tenant(&service, body.tenant_external_id)?
+        .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
+    let result = state
+        .db
+        .reconcile_entitlement(
+            EntitlementOperation::Cancel(CancelEntitlementInput {
+                tenant_external_id: tenant,
+                provider: body.provider,
+                external_subscription_id: body.external_subscription_id,
+                external_cycle_id: body.external_cycle_id,
+                version: body.version,
+                source: body.source,
+            }),
+            required_idempotency_key(&headers)?,
+        )
+        .await?;
+    Ok(Json(result))
+}
+
+async fn replace_entitlement(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ReplaceEntitlementRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "entitlements:write").await?;
+    let tenant = management_tenant(&service, body.tenant_external_id.clone())?
+        .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
+    let replacement_tenant =
+        management_tenant(&service, body.replacement.tenant_external_id.clone())?
+            .unwrap_or_else(|| tenant.clone());
+    if replacement_tenant != tenant {
+        return Err(AppError::Forbidden);
+    }
+    state
+        .db
+        .require_account_tenant(body.replacement.account_id, &tenant)
+        .await?;
+    let replacement = entitlement_reconcile_input(replacement_tenant, body.replacement)?;
+    let result = state
+        .db
+        .reconcile_entitlement(
+            EntitlementOperation::Replace(ReplaceEntitlementInput {
+                tenant_external_id: tenant,
+                provider: body.provider,
+                external_subscription_id: body.external_subscription_id,
+                version: body.version,
+                source: body.source,
+                replacement,
+            }),
+            required_idempotency_key(&headers)?,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
 async fn self_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1371,6 +2542,114 @@ struct RequestsQuery {
     #[serde(default = "default_limit")]
     limit: i64,
     tenant_external_id: Option<String>,
+    from_created_at: Option<i64>,
+    to_created_at: Option<i64>,
+    before_created_at: Option<i64>,
+    before_id: Option<Uuid>,
+    key_id: Option<Uuid>,
+    model: Option<String>,
+    protocol: Option<String>,
+    status: Option<String>,
+    error_code: Option<String>,
+    upstream_account_id: Option<Uuid>,
+    route_id: Option<Uuid>,
+    min_duration_ms: Option<i64>,
+    max_duration_ms: Option<i64>,
+    min_cost: Option<String>,
+    max_cost: Option<String>,
+    key_alias: Option<String>,
+    principal: Option<String>,
+}
+
+impl RequestsQuery {
+    fn to_filter(&self, operator: bool) -> Result<RequestListFilter, AppError> {
+        Ok(RequestListFilter {
+            limit: self.limit,
+            from_created_at: self.from_created_at,
+            to_created_at: self.to_created_at,
+            before_created_at: self.before_created_at,
+            before_id: self.before_id,
+            key_id: self.key_id,
+            model: self.model.clone(),
+            protocol: self.protocol.clone(),
+            status: self.status.clone(),
+            error_code: self.error_code.clone(),
+            upstream_account_id: self.upstream_account_id,
+            route_id: self.route_id,
+            min_duration_ms: self.min_duration_ms,
+            max_duration_ms: self.max_duration_ms,
+            min_cost_micros: self
+                .min_cost
+                .as_deref()
+                .map(|value| parse_money_micros(value, "min_cost"))
+                .transpose()?,
+            max_cost_micros: self
+                .max_cost
+                .as_deref()
+                .map(|value| parse_money_micros(value, "max_cost"))
+                .transpose()?,
+            key_alias: operator.then(|| self.key_alias.clone()).flatten(),
+            principal: operator.then(|| self.principal.clone()).flatten(),
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StatsQuery {
+    tenant_external_id: Option<String>,
+    from_created_at: Option<i64>,
+    to_created_at: Option<i64>,
+    key_id: Option<Uuid>,
+    model: Option<String>,
+    protocol: Option<String>,
+    status: Option<String>,
+    error_code: Option<String>,
+    upstream_account_id: Option<Uuid>,
+    route_id: Option<Uuid>,
+    min_duration_ms: Option<i64>,
+    max_duration_ms: Option<i64>,
+    min_cost: Option<String>,
+    max_cost: Option<String>,
+    key_alias: Option<String>,
+    principal: Option<String>,
+}
+
+impl StatsQuery {
+    fn to_filter(
+        &self,
+        operator: bool,
+        authenticated_key: Option<Uuid>,
+    ) -> Result<StatsFilter, AppError> {
+        let to_created_at = self.to_created_at.unwrap_or_else(unix_millis);
+        let from_created_at = self
+            .from_created_at
+            .unwrap_or_else(|| to_created_at.saturating_sub(30 * 86_400_000));
+        Ok(StatsFilter {
+            from_created_at: Some(from_created_at),
+            to_created_at: Some(to_created_at),
+            key_id: authenticated_key.or(operator.then_some(self.key_id).flatten()),
+            model: self.model.clone(),
+            protocol: self.protocol.clone(),
+            status: self.status.clone(),
+            error_code: self.error_code.clone(),
+            upstream_account_id: self.upstream_account_id,
+            route_id: self.route_id,
+            min_duration_ms: self.min_duration_ms,
+            max_duration_ms: self.max_duration_ms,
+            min_cost_micros: self
+                .min_cost
+                .as_deref()
+                .map(|value| parse_money_micros(value, "min_cost"))
+                .transpose()?,
+            max_cost_micros: self
+                .max_cost
+                .as_deref()
+                .map(|value| parse_money_micros(value, "max_cost"))
+                .transpose()?,
+            key_alias: operator.then(|| self.key_alias.clone()).flatten(),
+            principal: operator.then(|| self.principal.clone()).flatten(),
+        })
+    }
 }
 
 fn default_limit() -> i64 {
@@ -1383,7 +2662,12 @@ async fn self_requests(
     Query(query): Query<RequestsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    Ok(Json(state.db.list_requests(key.key_id, query.limit).await?))
+    Ok(Json(
+        state
+            .db
+            .list_requests_filtered(key.key_id, query.to_filter(false)?)
+            .await?,
+    ))
 }
 
 async fn self_request_detail(
@@ -1422,9 +2706,15 @@ async fn request_detail(
 async fn self_stats(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<StatsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    Ok(Json(state.db.stats(key.key_id).await?))
+    Ok(Json(
+        state
+            .db
+            .stats_filtered(key.key_id, query.to_filter(false, Some(key.key_id))?)
+            .await?,
+    ))
 }
 
 async fn self_conversations(
@@ -1602,7 +2892,7 @@ async fn proxy_openai_image_generation(
     let request_object = match state.archive.put_content(body).await {
         Ok(location) => location,
         Err(error) => {
-            let _ = state.db.settle_usage(&reservation, 0, 0).await;
+            state.db.settle_usage(&reservation, 0, 0).await?;
             return Err(error);
         }
     };
@@ -1640,9 +2930,15 @@ async fn proxy_openai_image_generation(
     } else {
         None
     };
+    let outbound_http = network::client_for_config_url(
+        &state.http,
+        &route.base_url,
+        &route.config,
+        state.config.allow_oauth_loopback,
+    )
+    .await?;
     let started = Instant::now();
-    let mut request = state
-        .http
+    let mut request = outbound_http
         .post(format!(
             "{}{}",
             route.base_url.trim_end_matches('/'),
@@ -1650,10 +2946,17 @@ async fn proxy_openai_image_generation(
         ))
         .json(&forwarded);
     request = route.credential.apply(request, unix_millis())?;
-    let upstream = match request.send().await {
+    let upstream_result = request.send().await;
+    state.metrics.observe_upstream(
+        &route.driver,
+        "image",
+        upstream_result.as_ref().ok().map(reqwest::Response::status),
+        started.elapsed(),
+    );
+    let upstream = match upstream_result {
         Ok(response) => response,
         Err(error) => {
-            let _ = state.db.settle_usage(&reservation, 0, 0).await;
+            state.db.settle_usage(&reservation, 0, 0).await?;
             state
                 .db
                 .record_request_finished(FinishRequest {
@@ -1705,7 +3008,17 @@ async fn proxy_openai_image_generation(
                             }
                         }
                     }
-                    let _ = body_sender.send(Ok::<Bytes, std::io::Error>(chunk)).await;
+                    if body_sender
+                        .send(Ok::<Bytes, std::io::Error>(chunk))
+                        .await
+                        .is_err()
+                    {
+                        transport_error = true;
+                        if let Some(active) = writer.take() {
+                            let _ = active.abort().await;
+                        }
+                        break;
+                    }
                 }
                 Err(error) => {
                     transport_error = true;
@@ -1725,11 +3038,17 @@ async fn proxy_openai_image_generation(
             format!("gap://{request_id}/response")
         };
         let success = status.is_success() && !transport_error;
-        let cost_micros = background_state
+        let cost_micros = match background_state
             .db
             .settle_usage(&reservation, 0, if success { billed_units } else { 0 })
             .await
-            .unwrap_or(0);
+        {
+            Ok(cost) => cost,
+            Err(error) => {
+                tracing::error!(%request_id, %error, "failed to settle image usage");
+                return;
+            }
+        };
         let error_code = if transport_error {
             Some("upstream_stream".to_owned())
         } else if status.is_success() {
@@ -1741,7 +3060,11 @@ async fn proxy_openai_image_generation(
             .db
             .record_request_finished(FinishRequest {
                 request_id,
-                status_code: i64::from(status.as_u16()),
+                status_code: if transport_error {
+                    502
+                } else {
+                    i64::from(status.as_u16())
+                },
                 duration_ms: started.elapsed().as_millis() as i64,
                 input_tokens: 0,
                 output_tokens: 0,
@@ -1832,7 +3155,7 @@ async fn finish_responses_tool_image(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
-                let _ = state.db.settle_usage(reservation, 0, 0).await;
+                state.db.settle_usage(reservation, 0, 0).await?;
                 state
                     .db
                     .record_request_finished(FinishRequest {
@@ -1850,7 +3173,7 @@ async fn finish_responses_tool_image(
             }
         };
         if bytes.len().saturating_add(chunk.len()) > MAX_IMAGE_RESPONSE {
-            let _ = state.db.settle_usage(reservation, 0, 0).await;
+            state.db.settle_usage(reservation, 0, 0).await?;
             state
                 .db
                 .record_request_finished(FinishRequest {
@@ -1982,6 +3305,29 @@ async fn create_generation(
             "generation input must be a JSON object".into(),
         ));
     }
+    let idempotency = headers
+        .get("idempotency-key")
+        .map(|value| {
+            let value = value
+                .to_str()
+                .map_err(|_| AppError::BadRequest("Idempotency-Key must be valid ASCII".into()))?;
+            Ok::<_, AppError>(GenerationJobIdempotency {
+                key: value.to_owned(),
+                request_hash: crate::generation::generation_request_hash(&body.model, &body.input),
+            })
+        })
+        .transpose()?;
+    if let Some(existing) = match idempotency.as_ref() {
+        Some(idempotency) => {
+            state
+                .db
+                .generation_job_by_idempotency(key.key_id, idempotency)
+                .await?
+        }
+        None => None,
+    } {
+        return Ok((StatusCode::OK, Json(existing)).into_response());
+    }
     let route = state
         .db
         .resolve_upstream(
@@ -2020,32 +3366,41 @@ async fn create_generation(
     let request_object = match state.archive.put_content(Bytes::from(archived)).await {
         Ok(location) => location,
         Err(error) => {
-            let _ = state.db.settle_usage(&reservation, 0, 0).await;
+            state.db.settle_usage(&reservation, 0, 0).await?;
             return Err(error);
         }
     };
-    let job = match state
+    match state
         .db
-        .create_generation_job(CreateGenerationJobInput {
-            job_id,
-            key,
-            upstream_account_id: route.account_id,
-            reservation: reservation.clone(),
-            public_model: body.model,
-            upstream_model: route.upstream_model,
-            driver: route.driver,
-            request_object,
-            estimated_units,
-        })
+        .create_generation_job_idempotent(
+            CreateGenerationJobInput {
+                job_id,
+                key,
+                upstream_account_id: route.account_id,
+                reservation: reservation.clone(),
+                public_model: body.model,
+                upstream_model: route.upstream_model,
+                driver: route.driver,
+                request_object,
+                estimated_units,
+                billing_unit: generation_price.billing_unit,
+                micros_per_unit: generation_price.micros_per_unit,
+            },
+            idempotency.as_ref(),
+        )
         .await
     {
-        Ok(job) => job,
-        Err(error) => {
-            let _ = state.db.settle_usage(&reservation, 0, 0).await;
-            return Err(error);
+        Ok(CreateGenerationJobResult::Created(job)) => {
+            Ok((StatusCode::ACCEPTED, Json(job)).into_response())
         }
-    };
-    Ok((StatusCode::ACCEPTED, Json(job)).into_response())
+        Ok(CreateGenerationJobResult::Replayed(job)) => {
+            Ok((StatusCode::OK, Json(job)).into_response())
+        }
+        Err(error) => {
+            state.db.settle_usage(&reservation, 0, 0).await?;
+            Err(error)
+        }
+    }
 }
 
 fn estimated_generation_units(
@@ -2116,6 +3471,20 @@ async fn self_generation(
     Ok(Json(state.db.generation_job(key.key_id, job_id).await?))
 }
 
+async fn cancel_self_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let key = authenticate_downstream(&headers, &state).await?;
+    Ok(Json(
+        state
+            .db
+            .cancel_queued_generation_job(key.key_id, job_id)
+            .await?,
+    ))
+}
+
 #[derive(Clone, Copy)]
 enum Protocol {
     OpenAiChat,
@@ -2178,10 +3547,11 @@ async fn proxy(
         model: requested_model.clone(),
         config_json: "{}".to_owned(),
     };
-    let plugin_permit = PLUGIN_EXECUTION_PERMITS
-        .acquire()
-        .await
-        .map_err(|_| AppError::Internal)?;
+    let plugin_permit =
+        tokio::time::timeout(Duration::from_secs(1), PLUGIN_EXECUTION_PERMITS.acquire())
+            .await
+            .map_err(|_| AppError::Upstream("plugin execution capacity is exhausted".into()))?
+            .map_err(|_| AppError::Internal)?;
     let plugin_task = tokio::task::spawn_blocking(move || {
         let _plugin_permit = plugin_permit;
         plugins.apply_traffic(plugin_context, &plugin_request)
@@ -2308,10 +3678,21 @@ async fn proxy(
     };
     let output_token_ceiling = request_json
         .get("max_output_tokens")
+        .or_else(|| request_json.get("max_completion_tokens"))
         .or_else(|| request_json.get("max_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(default_output_token_ceiling)
         .max(0);
+    let requested_service_tier = match request_json.get("service_tier") {
+        None => None,
+        Some(Value::String(tier)) if is_supported_service_tier(tier) => Some(tier.clone()),
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "service_tier must be default, auto, priority, flex, scale, batch, or standard_only"
+                    .into(),
+            ));
+        }
+    };
     let reservation = state
         .db
         .reserve_usage(&key, &price, input_token_ceiling, output_token_ceiling)
@@ -2342,7 +3723,10 @@ async fn proxy(
         .await?;
     let conversation_hints = conversation_hints(&headers, &original_request_json);
     let client_name = client_name(&headers);
-    if let Err(error) = state
+    if matches!(
+        protocol,
+        Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::AnthropicMessages
+    ) && let Err(error) = state
         .db
         .record_conversation_observation(
             &key,
@@ -2389,8 +3773,21 @@ async fn proxy(
     } else {
         (protocol.path(), forwarded_body)
     };
-    let mut request = state
-        .http
+    let outbound_http = match route_config.as_ref() {
+        Some(config) => {
+            network::client_for_config_url(
+                &state.http,
+                &base_url,
+                config,
+                state.config.allow_oauth_loopback,
+            )
+            .await?
+        }
+        // Legacy environment configuration is cluster-administrator owned and
+        // may intentionally name an internal CPA service.
+        None => state.http.clone(),
+    };
+    let mut request = outbound_http
         .post(format!(
             "{}{}",
             base_url.trim_end_matches('/'),
@@ -2417,11 +3814,21 @@ async fn proxy(
     if let Some(version) = headers.get("anthropic-version") {
         request = request.header("anthropic-version", version);
     }
+    if let Some(beta) = headers.get("anthropic-beta") {
+        request = request.header("anthropic-beta", beta);
+    }
 
-    let upstream = match request.send().await {
+    let upstream_result = request.send().await;
+    state.metrics.observe_upstream(
+        route_driver.as_deref().unwrap_or("legacy"),
+        "proxy",
+        upstream_result.as_ref().ok().map(reqwest::Response::status),
+        started.elapsed(),
+    );
+    let upstream = match upstream_result {
         Ok(response) => response,
         Err(error) => {
-            let _ = state.db.settle_usage(&reservation, 0, 0).await;
+            state.db.settle_usage(&reservation, 0, 0).await?;
             state
                 .db
                 .record_request_finished(FinishRequest {
@@ -2470,9 +3877,23 @@ async fn proxy(
         let mut archive_writer = archive_writer;
         let mut usage_capture = Vec::new();
         let mut transport_error = None;
+        let mut response_bytes = 0_usize;
         while let Some(next) = upstream_stream.next().await {
             match next {
                 Ok(chunk) => {
+                    response_bytes = response_bytes.saturating_add(chunk.len());
+                    if response_bytes > MAX_PROXY_RESPONSE_BODY {
+                        transport_error = Some("upstream response exceeded 64 MiB".to_owned());
+                        if let Some(writer) = archive_writer.take() {
+                            let _ = writer.abort().await;
+                        }
+                        let _ = body_sender
+                            .send(Err(std::io::Error::other(
+                                "upstream response exceeded 64 MiB",
+                            )))
+                            .await;
+                        break;
+                    }
                     append_bounded(&mut usage_capture, &chunk, 2 * 1024 * 1024);
                     if let Some(mut writer) = archive_writer.take() {
                         match writer.write(chunk.clone()).await {
@@ -2483,7 +3904,17 @@ async fn proxy(
                             }
                         }
                     }
-                    let _ = body_sender.send(Ok::<Bytes, std::io::Error>(chunk)).await;
+                    if body_sender
+                        .send(Ok::<Bytes, std::io::Error>(chunk))
+                        .await
+                        .is_err()
+                    {
+                        transport_error = Some("downstream disconnected".to_owned());
+                        if let Some(writer) = archive_writer.take() {
+                            let _ = writer.abort().await;
+                        }
+                        break;
+                    }
                 }
                 Err(error) => {
                     transport_error = Some(error.to_string());
@@ -2505,16 +3936,40 @@ async fn proxy(
         } else {
             format!("gap://{request_id}/response")
         };
-        let (input_tokens, output_tokens) = if status.is_success() {
-            extract_usage(&usage_capture).unwrap_or((input_token_ceiling, output_token_ceiling))
+        let mut usage = if status.is_success() {
+            extract_usage(&usage_capture).unwrap_or(TokenUsage {
+                input_tokens: input_token_ceiling,
+                output_tokens: output_token_ceiling,
+                ..TokenUsage::default()
+            })
         } else {
-            (0, 0)
+            TokenUsage::default()
         };
-        let actual_cost_micros = background_state
+        if usage.service_tier.is_none() {
+            usage.service_tier = requested_service_tier;
+        }
+        let input_tokens = usage.total_input_tokens();
+        let output_tokens = usage.output_tokens;
+        if matches!(protocol, Protocol::OpenAiResponses)
+            && let Some(response_id) = extract_response_id(&usage_capture)
+            && let Err(error) = background_state
+                .db
+                .attach_conversation_upstream_response(request_id, &response_id)
+                .await
+        {
+            tracing::warn!(%request_id, %error, "failed to attach upstream response id to logical conversation");
+        }
+        let actual_cost_micros = match background_state
             .db
-            .settle_usage(&reservation, input_tokens, output_tokens)
+            .settle_token_usage(&reservation, &usage)
             .await
-            .unwrap_or(reservation.reserved_micros);
+        {
+            Ok(cost) => cost,
+            Err(error) => {
+                tracing::error!(%request_id, %error, "failed to settle request usage");
+                return;
+            }
+        };
         let error_code = transport_error
             .as_ref()
             .map(|_| "upstream_stream".to_owned())
@@ -2523,7 +3978,11 @@ async fn proxy(
             .db
             .record_request_finished(FinishRequest {
                 request_id,
-                status_code,
+                status_code: if transport_error.is_some() {
+                    502
+                } else {
+                    status_code
+                },
                 duration_ms: started.elapsed().as_millis() as i64,
                 input_tokens,
                 output_tokens,
@@ -2574,8 +4033,7 @@ async fn finish_subscription_bridge_response(
                     b"{\"error\":{\"message\":\"subscription bridge response failed\"}}",
                 ),
                 "application/json",
-                0,
-                0,
+                TokenUsage::default(),
                 Some("upstream_stream".to_owned()),
             )
             .await;
@@ -2589,8 +4047,7 @@ async fn finish_subscription_bridge_response(
                 b"{\"error\":{\"message\":\"subscription bridge rejected the request\"}}",
             ),
             "application/json",
-            0,
-            0,
+            TokenUsage::default(),
             Some(format!("http_{}", upstream_status.as_u16())),
         )
         .await;
@@ -2605,8 +4062,7 @@ async fn finish_subscription_bridge_response(
                     b"{\"error\":{\"message\":\"subscription bridge returned invalid JSON\"}}",
                 ),
                 "application/json",
-                0,
-                0,
+                TokenUsage::default(),
                 Some("upstream_invalid_json".to_owned()),
             )
             .await;
@@ -2621,32 +4077,21 @@ async fn finish_subscription_bridge_response(
                 StatusCode::BAD_GATEWAY,
                 Bytes::from_static(b"{\"error\":{\"message\":\"subscription bridge returned an invalid response\"}}"),
                 "application/json",
-                0,
-                0,
+                TokenUsage::default(),
                 Some("upstream_invalid_response".to_owned()),
             )
             .await;
         }
     };
-    let (input_tokens, output_tokens) = extract_usage(&body)
-        .filter(|(input, output)| input.saturating_add(*output) > 0)
-        .unwrap_or_else(|| {
-            (
-                estimated_tokens(input_token_ceiling),
-                estimated_tokens(i64::try_from(body.len()).unwrap_or(i64::MAX))
-                    .min(output_token_ceiling),
-            )
+    let usage = extract_usage(&body)
+        .filter(|usage| usage.total_tokens() > 0)
+        .unwrap_or_else(|| TokenUsage {
+            input_tokens: estimated_tokens(input_token_ceiling),
+            output_tokens: estimated_tokens(i64::try_from(body.len()).unwrap_or(i64::MAX))
+                .min(output_token_ceiling),
+            ..TokenUsage::default()
         });
-    finish_buffered_request(
-        &request,
-        StatusCode::OK,
-        body,
-        content_type,
-        input_tokens,
-        output_tokens,
-        None,
-    )
-    .await
+    finish_buffered_request(&request, StatusCode::OK, body, content_type, usage, None).await
 }
 
 fn unwrap_subscription_bridge_body(
@@ -2687,8 +4132,7 @@ async fn finish_buffered_request(
     status: StatusCode,
     body: Bytes,
     content_type: &'static str,
-    input_tokens: i64,
-    output_tokens: i64,
+    usage: TokenUsage,
     error_code: Option<String>,
 ) -> Result<Response, AppError> {
     let request_id = request.request_id;
@@ -2702,7 +4146,7 @@ async fn finish_buffered_request(
     let actual_cost_micros = request
         .state
         .db
-        .settle_usage(&request.reservation, input_tokens, output_tokens)
+        .settle_token_usage(&request.reservation, &usage)
         .await?;
     request
         .state
@@ -2711,8 +4155,8 @@ async fn finish_buffered_request(
             request_id,
             status_code: i64::from(status.as_u16()),
             duration_ms: request.started.elapsed().as_millis() as i64,
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.total_input_tokens(),
+            output_tokens: usage.output_tokens,
             cost_micros: actual_cost_micros,
             error_code,
             response_object: stored_response,
@@ -2752,29 +4196,81 @@ fn estimated_tokens(bytes: i64) -> i64 {
     bytes.max(0).saturating_add(3) / 4
 }
 
-fn extract_usage(body: &[u8]) -> Option<(i64, i64)> {
+fn extract_usage(body: &[u8]) -> Option<TokenUsage> {
     if let Ok(value) = serde_json::from_slice::<Value>(body) {
         return usage_from_value(&value);
     }
-    let mut input: Option<i64> = None;
-    let mut output: Option<i64> = None;
+    let mut result: Option<TokenUsage> = None;
     for line in body.split(|byte| *byte == b'\n') {
         let line = line.strip_prefix(b"data: ").unwrap_or(line);
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
-        if let Some((next_input, next_output)) = usage_from_value(&value) {
-            input = Some(input.unwrap_or_default().max(next_input));
-            output = Some(output.unwrap_or_default().max(next_output));
+        if let Some(next) = usage_from_value(&value) {
+            let current = result.get_or_insert_with(TokenUsage::default);
+            current.input_tokens = current.input_tokens.max(next.input_tokens);
+            current.cached_input_tokens = current.cached_input_tokens.max(next.cached_input_tokens);
+            current.cache_write_tokens = current.cache_write_tokens.max(next.cache_write_tokens);
+            current.output_tokens = current.output_tokens.max(next.output_tokens);
+            if next.service_tier.is_some() {
+                current.service_tier = next.service_tier;
+            }
         }
     }
-    input.zip(output)
+    result
 }
 
-fn usage_from_value(value: &Value) -> Option<(i64, i64)> {
+fn extract_response_id(body: &[u8]) -> Option<String> {
+    const MAX_RESPONSE_ID_SCAN_BYTES: usize = 2 * 1024 * 1024;
+
+    fn id_from_value(value: &Value) -> Option<String> {
+        value
+            .pointer("/response/id")
+            .or_else(|| value.get("id"))
+            .and_then(Value::as_str)
+            .and_then(safe_conversation_hint)
+    }
+
+    let body = body.get(..body.len().min(MAX_RESPONSE_ID_SCAN_BYTES))?;
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        return id_from_value(&value);
+    }
+
+    let mut top_level_id = None;
+    for line in body.split(|byte| *byte == b'\n') {
+        let Some(data) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        let data = data.strip_prefix(b" ").unwrap_or(data);
+        let data = data.strip_suffix(b"\r").unwrap_or(data);
+        if data == b"[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(data) else {
+            continue;
+        };
+        if let Some(response_id) = value
+            .pointer("/response/id")
+            .and_then(Value::as_str)
+            .and_then(safe_conversation_hint)
+        {
+            return Some(response_id);
+        }
+        if top_level_id.is_none() {
+            top_level_id = value
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(safe_conversation_hint);
+        }
+    }
+    top_level_id
+}
+
+fn usage_from_value(value: &Value) -> Option<TokenUsage> {
     let usage = value
         .get("usage")
         .or_else(|| value.pointer("/message/usage"))
+        .or_else(|| value.pointer("/response/usage"))
         .unwrap_or(&Value::Null);
     let input = usage
         .get("input_tokens")
@@ -2784,17 +4280,76 @@ fn usage_from_value(value: &Value) -> Option<(i64, i64)> {
         .get("output_tokens")
         .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_i64);
-    let usage = match (input, output) {
-        (Some(input), Some(output)) => Some((input, output)),
-        (Some(input), None) => Some((input, 0)),
-        (None, Some(output)) => Some((0, output)),
-        (None, None) => None,
-    }?;
-    (usage.0 >= 0
-        && usage.0 <= MAX_REPORTED_TOKENS
-        && usage.1 >= 0
-        && usage.1 <= MAX_REPORTED_TOKENS)
-        .then_some(usage)
+    let (reported_input, output) = match (input, output) {
+        (Some(input), Some(output)) => (input, output),
+        (Some(input), None) => (input, 0),
+        (None, Some(output)) => (0, output),
+        (None, None) => return None,
+    };
+    let cached_input = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let cache_write = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            let details = usage.get("cache_creation")?;
+            Some(
+                details
+                    .get("ephemeral_5m_input_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default()
+                    .saturating_add(
+                        details
+                            .get("ephemeral_1h_input_tokens")
+                            .and_then(Value::as_i64)
+                            .unwrap_or_default(),
+                    ),
+            )
+        })
+        .unwrap_or_default();
+    // OpenAI prompt/input counts include cached tokens; Anthropic input_tokens
+    // excludes its separately reported cache read/write counters.
+    let input_includes_cache = usage.get("input_tokens_details").is_some()
+        || usage.get("prompt_tokens_details").is_some()
+        || usage.get("prompt_tokens").is_some();
+    let uncached_input = if input_includes_cache {
+        reported_input.checked_sub(cached_input)?
+    } else {
+        reported_input
+    };
+    let service_tier = value
+        .get("service_tier")
+        .or_else(|| value.pointer("/response/service_tier"))
+        .and_then(Value::as_str)
+        .filter(|tier| is_supported_service_tier(tier))
+        .map(str::to_owned);
+    let parsed = TokenUsage {
+        input_tokens: uncached_input,
+        cached_input_tokens: cached_input,
+        cache_write_tokens: cache_write,
+        output_tokens: output,
+        service_tier,
+    };
+    [
+        parsed.input_tokens,
+        parsed.cached_input_tokens,
+        parsed.cache_write_tokens,
+        parsed.output_tokens,
+    ]
+    .into_iter()
+    .all(|tokens| (0..=MAX_REPORTED_TOKENS).contains(&tokens))
+    .then_some(parsed)
+}
+
+fn is_supported_service_tier(tier: &str) -> bool {
+    matches!(
+        tier,
+        "default" | "auto" | "priority" | "flex" | "scale" | "batch" | "standard_only"
+    )
 }
 
 fn append_bounded(capture: &mut Vec<u8>, chunk: &[u8], maximum: usize) {
@@ -2938,10 +4493,39 @@ fn parse_decimal(value: &str, field: &str) -> Result<Decimal, AppError> {
         .map_err(|_| AppError::BadRequest(format!("{field} must be a decimal string")))
 }
 
+fn parse_money_micros(value: &str, field: &str) -> Result<i64, AppError> {
+    let decimal = parse_decimal(value, field)?;
+    if decimal.is_sign_negative() {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not be negative"
+        )));
+    }
+    decimal
+        .checked_mul(Decimal::from(crate::model::MONEY_SCALE))
+        .filter(|scaled| scaled.fract().is_zero())
+        .and_then(|scaled| scaled.to_string().parse::<i64>().ok())
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "{field} must have at most 6 decimal places and fit monetary range"
+            ))
+        })
+}
+
 async fn require_service(
     headers: &HeaderMap,
     state: &AppState,
     scope: &str,
+) -> Result<AuthenticatedService, AppError> {
+    let service = authenticated_service(headers, state).await?;
+    if !service.allows(scope) {
+        return Err(AppError::Forbidden);
+    }
+    Ok(service)
+}
+
+async fn authenticated_service(
+    headers: &HeaderMap,
+    state: &AppState,
 ) -> Result<AuthenticatedService, AppError> {
     let provided = bearer(headers).ok_or(AppError::Unauthorized)?;
     let service =
@@ -2953,9 +4537,6 @@ async fn require_service(
                 .authenticate_service_token(provided, state.config.key_pepper.as_bytes())
                 .await?
         };
-    if !service.allows(scope) {
-        return Err(AppError::Forbidden);
-    }
     Ok(service)
 }
 
@@ -3007,7 +4588,13 @@ async fn authenticate_downstream(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<AuthenticatedKey, AppError> {
-    let provided = bearer(headers).ok_or(AppError::Unauthorized)?;
+    let provided = bearer(headers)
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
+        .ok_or(AppError::Unauthorized)?;
     state
         .db
         .authenticate_key(provided, state.config.key_pepper.as_bytes())
@@ -3091,6 +4678,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authentication_rejects_requests_before_json_body_parsing() {
+        let (state, _directory) = test_state().await;
+        let control = router_for_role(state.clone(), RuntimeRole::Control)
+            .oneshot(
+                Request::post("/internal/v1/keys")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control.status(), StatusCode::UNAUTHORIZED);
+
+        let gateway = router_for_role(state, RuntimeRole::Gateway)
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gateway.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn public_responses_include_browser_security_headers() {
         let (state, _directory) = test_state().await;
         let response = router_for_role(state, RuntimeRole::Gateway)
@@ -3126,7 +4739,15 @@ mod tests {
                 display_name: "Plugin provider".to_owned(),
                 protocols: vec!["openai".to_owned()],
                 modalities: vec!["text".to_owned()],
-                config_schema: json!({"type": "object"}),
+                config_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["base_url", "network_scope"],
+                    "properties": {
+                        "base_url": {"type": "string", "format": "uri"},
+                        "network_scope": {"const": "private"}
+                    }
+                }),
                 credential_schema: json!({"type": "object"}),
                 oauth_adapter: Some(crate::provider::OAuthAdapterContribution {
                     login_url: "http://oauth-adapter.default.svc/login".to_owned(),
@@ -3142,7 +4763,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::AUTHORIZATION, "Bearer test-service-token")
                     .body(Body::from(
-                        r#"{"account_name":"plugin-primary","provider_driver":"plugin-provider","provider_config":{"base_url":"http://plugin-upstream.default.svc"}}"#,
+                        r#"{"account_name":"plugin-primary","provider_driver":"plugin-provider","provider_config":{"base_url":"http://plugin-upstream.default.svc","network_scope":"private"}}"#,
                     ))
                     .unwrap(),
             )
@@ -3193,7 +4814,11 @@ mod tests {
     fn upstream_usage_rejects_negative_and_extreme_token_counts() {
         assert_eq!(
             usage_from_value(&json!({"usage":{"input_tokens":12,"output_tokens":34}})),
-            Some((12, 34))
+            Some(TokenUsage {
+                input_tokens: 12,
+                output_tokens: 34,
+                ..TokenUsage::default()
+            })
         );
         assert_eq!(
             usage_from_value(&json!({"usage":{"input_tokens":-1,"output_tokens":34}})),
@@ -3203,5 +4828,86 @@ mod tests {
             usage_from_value(&json!({"usage":{"input_tokens":12,"output_tokens":1000000001_i64}})),
             None
         );
+        assert_eq!(
+            usage_from_value(&json!({
+                "service_tier": "priority",
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "prompt_tokens_details": {"cached_tokens": 40}
+                }
+            })),
+            Some(TokenUsage {
+                input_tokens: 60,
+                cached_input_tokens: 40,
+                cache_write_tokens: 0,
+                output_tokens: 20,
+                service_tier: Some("priority".to_owned()),
+            })
+        );
+        assert_eq!(
+            usage_from_value(&json!({
+                "type": "message_start",
+                "message": {"usage": {
+                    "input_tokens": 60,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 7,
+                        "ephemeral_1h_input_tokens": 3
+                    },
+                    "output_tokens": 2
+                }}
+            })),
+            Some(TokenUsage {
+                input_tokens: 60,
+                cached_input_tokens: 30,
+                cache_write_tokens: 10,
+                output_tokens: 2,
+                service_tier: None,
+            })
+        );
+        assert_eq!(
+            usage_from_value(&json!({
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "prompt_tokens_details": {"cached_tokens": 11}
+                }
+            })),
+            None,
+            "an inclusive OpenAI input count cannot be smaller than cached input"
+        );
+    }
+
+    #[test]
+    fn response_id_supports_buffered_and_sse_responses_without_scanning_plain_text() {
+        assert_eq!(
+            extract_response_id(br#"{"id":"resp-buffered","object":"response"}"#).as_deref(),
+            Some("resp-buffered")
+        );
+        assert_eq!(
+            extract_response_id(
+                b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-streamed\"}}\n\ndata: [DONE]\n"
+            )
+            .as_deref(),
+            Some("resp-streamed")
+        );
+        assert_eq!(
+            extract_response_id(
+                b"data: {\"type\":\"response.output_item.added\",\"id\":\"item-id\"}\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-preferred\"}}\n"
+            )
+            .as_deref(),
+            Some("resp-preferred")
+        );
+        assert_eq!(
+            extract_response_id(
+                b"ordinary text data: {\"response\":{\"id\":\"forged\"}}\ndata: [DONE]\n"
+            ),
+            None
+        );
+        let mut outside_scan_limit = vec![b'x'; 2 * 1024 * 1024];
+        outside_scan_limit
+            .extend_from_slice(b"\ndata: {\"response\":{\"id\":\"outside-scan-limit\"}}\n");
+        assert_eq!(extract_response_id(&outside_scan_limit), None);
     }
 }

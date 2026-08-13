@@ -5,16 +5,27 @@ metadata:
   name: {{ include "memeloop-token-center.fullname" . }}-migrate
   labels:
     {{- include "memeloop-token-center.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-5"
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    {{- with .Values.migration.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
-  backoffLimit: 4
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.migration.ttlSecondsAfterFinished }}
   template:
     metadata:
+      {{- with .Values.migration.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       labels:
         {{- include "memeloop-token-center.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
     spec:
       restartPolicy: OnFailure
       automountServiceAccountToken: false
@@ -24,6 +35,7 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
+        runAsGroup: 10001
         fsGroup: 10001
         seccompProfile: { type: RuntimeDefault }
       containers:
@@ -32,7 +44,20 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["migrate"]
           env:
-            {{- include "memeloop-token-center.env" . | nindent 12 }}
+            - name: MTC_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.databaseUrlSecret.name }}
+                  key: {{ .Values.config.databaseUrlSecret.key }}
+            - name: MTC_DATABASE_MAX_CONNECTIONS
+              value: {{ .Values.config.databaseMaxConnections | quote }}
+            # Config parsing currently requires a pepper even though the migrate
+            # command never authenticates a downstream credential.
+            - name: MTC_KEY_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.keyPepperSecret.name }}
+                  key: {{ .Values.config.keyPepperSecret.key }}
             - name: MTC_SERVICE_TOKEN
               value: "bootstrap-disabled-for-migration"
           securityContext:
@@ -40,6 +65,5 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
           resources:
-            requests: { cpu: 25m, memory: 32Mi }
-            limits: { cpu: 250m, memory: 128Mi }
+            {{- toYaml .Values.migration.resources | nindent 12 }}
 {{- end }}

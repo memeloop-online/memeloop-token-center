@@ -9,3 +9,7 @@
 *.db-shm
 *.db-wal
 .DS_Store
+web/test-results/
+web/playwright-report/
+/tests/load/results/*-latest.json
+/tests/load/results/local-*.json

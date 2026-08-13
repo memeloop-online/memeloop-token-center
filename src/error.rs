@@ -15,6 +15,8 @@ pub enum AppError {
     RateLimited,
     #[error("resource not found")]
     NotFound,
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("invalid request: {0}")]
     BadRequest(String),
     #[error("configured upstream is unavailable: {0}")]
@@ -27,20 +29,38 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        let (status, code) = match self {
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
-            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
-            Self::UnpricedModel => (StatusCode::FAILED_DEPENDENCY, "unpriced_model"),
-            Self::QuotaExceeded => (StatusCode::TOO_MANY_REQUESTS, "insufficient_quota"),
-            Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded"),
-            Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
-            Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
-            Self::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
-            Self::Storage(_) | Self::Internal => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
-            }
+        let (status, code, message) = match &self {
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized", self.to_string()),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden", self.to_string()),
+            Self::UnpricedModel => (
+                StatusCode::FAILED_DEPENDENCY,
+                "unpriced_model",
+                self.to_string(),
+            ),
+            Self::QuotaExceeded => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "insufficient_quota",
+                self.to_string(),
+            ),
+            Self::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_exceeded",
+                self.to_string(),
+            ),
+            Self::NotFound => (StatusCode::NOT_FOUND, "not_found", self.to_string()),
+            Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", self.to_string()),
+            Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request", self.to_string()),
+            Self::Upstream(_) => (
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "configured upstream is unavailable".to_owned(),
+            ),
+            Self::Storage(_) | Self::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "internal error".to_owned(),
+            ),
         };
-        let message = self.to_string();
         (
             status,
             Json(json!({"error": {"code": code, "message": message}})),
@@ -65,6 +85,11 @@ impl From<object_store::Error> for AppError {
 
 impl From<reqwest::Error> for AppError {
     fn from(error: reqwest::Error) -> Self {
+        tracing::warn!(
+            is_timeout = error.is_timeout(),
+            is_connect = error.is_connect(),
+            "upstream HTTP operation failed"
+        );
         Self::Upstream(error.to_string())
     }
 }

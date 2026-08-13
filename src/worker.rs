@@ -37,6 +37,24 @@ pub async fn run(state: AppState) {
                         tracing::error!(%error, "worker failed to expire key provisioning responses");
                     }
                 }
+                match state.db.delete_expired_rate_windows(100_000).await {
+                    Ok(deleted) if deleted > 0 => {
+                        tracing::info!(deleted, "worker deleted expired rate limit windows");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "worker failed to delete expired rate limit windows");
+                    }
+                }
+                match state.db.delete_expired_budget_rollups(100_000).await {
+                    Ok(deleted) if deleted > 0 => {
+                        tracing::info!(deleted, "worker deleted expired budget rollup detail");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "worker failed to delete expired budget rollup detail");
+                    }
+                }
             }
             _ = generations.tick() => {
                 if let Err(error) = generation::process_one(&state, &worker_id).await {

@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Component as PathComponent, Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -13,12 +14,22 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config as WasmtimeConfig, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use self::memeloop::token_center::types;
-use crate::{db::Database, error::AppError, provider::ProviderType};
+use crate::{
+    db::Database,
+    error::AppError,
+    network::{self, OutboundScope},
+    provider::ProviderType,
+};
 
 const PLUGIN_FUEL: u64 = 5_000_000;
 const PLUGIN_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 const PLUGIN_TABLE_ELEMENTS: usize = 100_000;
 const PLUGIN_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+const PLUGIN_MANIFEST_BYTES: u64 = 1024 * 1024;
+const PLUGIN_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
+const PLUGIN_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+const PLUGIN_EPOCH_TICK: Duration = Duration::from_millis(10);
+const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.1.0, <0.2.0";
 
 wasmtime::component::bindgen!({
     world: "plugin",
@@ -79,6 +90,8 @@ pub struct PluginRuntime {
     kv: Option<PluginKv>,
     plugins: Arc<Vec<LoadedPlugin>>,
     providers: Arc<Vec<ProviderType>>,
+    execution_timeout: Duration,
+    fuel: u64,
 }
 
 #[derive(Clone)]
@@ -93,6 +106,7 @@ struct HostState {
     runtime: tokio::runtime::Handle,
     kv: Option<PluginKv>,
     limits: StoreLimits,
+    deadline: Instant,
 }
 
 impl PluginRuntime {
@@ -111,29 +125,55 @@ impl PluginRuntime {
         let mut engine_config = WasmtimeConfig::new();
         engine_config.wasm_component_model(true);
         engine_config.consume_fuel(true);
+        engine_config.epoch_interruption(true);
         let engine = Engine::new(&engine_config)
             .map_err(|error| AppError::Storage(format!("initialize plugin runtime: {error}")))?;
+        let epoch_engine = engine.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(PLUGIN_EPOCH_TICK);
+            loop {
+                interval.tick().await;
+                epoch_engine.increment_epoch();
+            }
+        });
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| AppError::Storage(format!("initialize plugin HTTP: {error}")))?;
-        let directories = plugin_directories(root)?;
+        let canonical_root = fs::canonicalize(root)
+            .map_err(|error| AppError::Storage(format!("resolve plugin directory: {error}")))?;
+        let directories = plugin_directories(&canonical_root)?;
 
         let mut plugins = Vec::new();
         let mut providers = Vec::new();
         for directory in directories {
             let manifest_path = directory.join("plugin.json");
             if !manifest_path.is_file() {
-                continue;
+                return Err(AppError::BadRequest(format!(
+                    "plugin package has no plugin.json: {}",
+                    directory.display()
+                )));
             }
+            require_file_size(&manifest_path, PLUGIN_MANIFEST_BYTES, "plugin manifest")?;
             let manifest: PluginManifest = serde_json::from_slice(
                 &fs::read(&manifest_path).map_err(|error| AppError::Storage(error.to_string()))?,
             )
             .map_err(|error| {
                 AppError::BadRequest(format!("{}: {error}", manifest_path.display()))
             })?;
+            let mut manifest_schema: Value =
+                serde_json::from_str(include_str!("../schemas/plugin-manifest.schema.json"))
+                    .map_err(|_| AppError::Internal)?;
+            manifest_schema
+                .as_object_mut()
+                .ok_or(AppError::Internal)?
+                .remove("$id");
+            crate::schema::validate_instance(
+                &manifest_schema,
+                &serde_json::to_value(&manifest).map_err(|_| AppError::Internal)?,
+            )?;
             validate_manifest(&manifest)?;
             if plugins
                 .iter()
@@ -147,6 +187,16 @@ impl PluginRuntime {
             for provider in &manifest.contributions.providers {
                 let mut provider = provider.clone();
                 provider.source = format!("plugin:{}@{}", manifest.id, manifest.version);
+                validate_provider_contribution(&manifest.id, &provider)?;
+                if providers
+                    .iter()
+                    .any(|existing: &ProviderType| existing.id == provider.id)
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "duplicate plugin provider type: {}",
+                        provider.id
+                    )));
+                }
                 providers.push(provider);
             }
             let component = manifest
@@ -154,6 +204,7 @@ impl PluginRuntime {
                 .as_deref()
                 .map(|wasm| {
                     let wasm_path = safe_child(&directory, wasm)?;
+                    require_file_size(&wasm_path, PLUGIN_COMPONENT_BYTES, "plugin component")?;
                     Component::from_file(&engine, &wasm_path).map_err(|error| {
                         AppError::BadRequest(format!("compile {}: {error}", wasm_path.display()))
                     })
@@ -172,6 +223,8 @@ impl PluginRuntime {
             kv: Some(PluginKv { database }),
             plugins: Arc::new(plugins),
             providers: Arc::new(providers),
+            execution_timeout: PLUGIN_EXECUTION_TIMEOUT,
+            fuel: PLUGIN_FUEL,
         })
     }
 
@@ -218,7 +271,9 @@ impl PluginRuntime {
             let limits = StoreLimitsBuilder::new()
                 .memory_size(PLUGIN_MEMORY_BYTES)
                 .table_elements(PLUGIN_TABLE_ELEMENTS)
-                .instances(1)
+                // Component-model instantiation uses more than one internal
+                // instance. Keep it functional but tightly bounded.
+                .instances(8)
                 .tables(2)
                 .memories(2)
                 .build();
@@ -231,11 +286,13 @@ impl PluginRuntime {
                     runtime: runtime.clone(),
                     kv: self.kv.clone(),
                     limits,
+                    deadline: Instant::now() + self.execution_timeout,
                 },
             );
             store.limiter(|state| &mut state.limits);
+            store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
             store
-                .set_fuel(PLUGIN_FUEL)
+                .set_fuel(self.fuel)
                 .map_err(|error| AppError::Storage(error.to_string()))?;
             let mut linker = Linker::new(engine);
             Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
@@ -275,6 +332,95 @@ impl PluginRuntime {
         }
         Ok(decision)
     }
+
+    /// Invokes the component-side provider discovery contribution, when the
+    /// declaring plugin ships executable provider logic. Manifest-only HTTP
+    /// providers deliberately return `None` and use the core HTTP driver.
+    pub fn list_provider_models(
+        &self,
+        provider_id: &str,
+        config: &Value,
+    ) -> Result<Option<Value>, AppError> {
+        let Some(plugin) = self.plugins.iter().find(|plugin| {
+            plugin
+                .manifest
+                .contributions
+                .providers
+                .iter()
+                .any(|provider| provider.id == provider_id)
+        }) else {
+            return Ok(None);
+        };
+        let Some(component) = plugin.component.as_ref() else {
+            return Ok(None);
+        };
+        let engine = self.engine.as_ref().ok_or(AppError::Internal)?;
+        let http = self.http.as_ref().ok_or(AppError::Internal)?;
+        let runtime = self.runtime.as_ref().ok_or(AppError::Internal)?;
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(PLUGIN_MEMORY_BYTES)
+            .table_elements(PLUGIN_TABLE_ELEMENTS)
+            .instances(8)
+            .tables(2)
+            .memories(2)
+            .build();
+        let mut store = Store::new(
+            engine,
+            HostState {
+                plugin_id: plugin.manifest.id.clone(),
+                capabilities: plugin.manifest.capabilities.clone(),
+                http: http.clone(),
+                runtime: runtime.clone(),
+                kv: self.kv.clone(),
+                limits,
+                deadline: Instant::now() + self.execution_timeout,
+            },
+        );
+        store.limiter(|state| &mut state.limits);
+        store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
+        store
+            .set_fuel(self.fuel)
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let mut linker = Linker::new(engine);
+        Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let bindings = Plugin::instantiate(&mut store, component, &linker)
+            .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
+        let config_json = serde_json::to_string(config).map_err(|_| AppError::Internal)?;
+        let models_json = bindings
+            .memeloop_token_center_upstream_provider()
+            .call_list_models(&mut store, &config_json)
+            .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
+            .map_err(|error| {
+                AppError::Upstream(format!("plugin {}: {error}", plugin.manifest.id))
+            })?;
+        let models: Value = serde_json::from_str(&models_json).map_err(|_| {
+            AppError::Upstream(format!(
+                "plugin {} returned invalid models JSON",
+                plugin.manifest.id
+            ))
+        })?;
+        if !models.is_array() {
+            return Err(AppError::Upstream(format!(
+                "plugin {} models response must be a JSON array",
+                plugin.manifest.id
+            )));
+        }
+        Ok(Some(models))
+    }
+
+    #[doc(hidden)]
+    pub fn set_execution_limits_for_tests(&mut self, timeout: Duration, fuel: u64) {
+        self.execution_timeout = timeout;
+        self.fuel = fuel;
+    }
+}
+
+fn epoch_deadline_ticks(timeout: Duration) -> u64 {
+    let tick_millis = PLUGIN_EPOCH_TICK.as_millis();
+    u64::try_from(timeout.as_millis().div_ceil(tick_millis))
+        .unwrap_or(u64::MAX)
+        .max(1)
 }
 
 fn plugin_directories(root: &Path) -> Result<Vec<PathBuf>, AppError> {
@@ -290,12 +436,19 @@ fn plugin_directories(root: &Path) -> Result<Vec<PathBuf>, AppError> {
         if entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
-        if entry
+        let file_type = entry
             .file_type()
-            .map_err(|error| AppError::Storage(error.to_string()))?
-            .is_dir()
-        {
-            directories.push(entry.path());
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        if file_type.is_symlink() {
+            return Err(AppError::BadRequest(format!(
+                "plugin package directory cannot be a symlink: {}",
+                entry.path().display()
+            )));
+        }
+        if file_type.is_dir() {
+            directories.push(fs::canonicalize(entry.path()).map_err(|error| {
+                AppError::Storage(format!("resolve plugin package directory: {error}"))
+            })?);
         }
     }
     directories.sort();
@@ -304,6 +457,13 @@ fn plugin_directories(root: &Path) -> Result<Vec<PathBuf>, AppError> {
 
 impl memeloop::token_center::host::Host for HostState {
     fn log(&mut self, level: String, message: String) {
+        if !self
+            .capabilities
+            .iter()
+            .any(|capability| matches!(capability, PluginCapability::Log))
+        {
+            return;
+        }
         match level.as_str() {
             "error" => tracing::error!(plugin_id = %self.plugin_id, %message, "plugin"),
             "warn" => tracing::warn!(plugin_id = %self.plugin_id, %message, "plugin"),
@@ -378,7 +538,26 @@ impl memeloop::token_center::host::Host for HostState {
             .map_err(|_| "plugin HTTP method is invalid".to_owned())?;
         let headers: BTreeMap<String, String> = serde_json::from_str(&headers_json)
             .map_err(|_| "plugin HTTP headers must be a string map".to_owned())?;
-        let mut request = self.http.request(method, url).body(body);
+        // Plugin packages currently have no global-operator approval metadata
+        // for private destinations. Until that exists, HTTP capability is
+        // deliberately public-only and its DNS result is pinned per call.
+        let outbound_http = self
+            .runtime
+            .block_on(network::client_for_url(
+                &self.http,
+                url.as_str(),
+                OutboundScope::Public,
+                false,
+            ))
+            .map_err(|_| "plugin HTTP destination is unavailable or unsafe".to_owned())?;
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "plugin execution deadline exceeded".to_owned())?;
+        let mut request = outbound_http
+            .request(method, url)
+            .timeout(remaining)
+            .body(body);
         for (name, value) in headers {
             let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| "plugin HTTP header name is invalid".to_owned())?;
@@ -432,7 +611,13 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
             "plugin id must contain lowercase ASCII letters, digits, or hyphens".into(),
         ));
     }
-    if manifest.version.trim().is_empty() || manifest.wit_version != "0.1.0" {
+    if semver::Version::parse(&manifest.version).is_err()
+        || !semver::VersionReq::parse(SUPPORTED_WIT_REQUIREMENT)
+            .map_err(|_| AppError::Internal)?
+            .matches(&semver::Version::parse(&manifest.wit_version).map_err(|_| {
+                AppError::BadRequest(format!("plugin {} has an invalid WIT version", manifest.id))
+            })?)
+    {
         return Err(AppError::BadRequest(format!(
             "plugin {} has an unsupported version or WIT version",
             manifest.id
@@ -459,7 +644,7 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
                         manifest.id
                     ))
                 })?;
-                if !matches!(parsed.scheme(), "http" | "https")
+                if parsed.scheme() != "https"
                     || parsed.host_str().is_none()
                     || parsed.origin().ascii_serialization() != *origin
                     || parsed.path() != "/"
@@ -467,7 +652,7 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
                     || parsed.fragment().is_some()
                 {
                     return Err(AppError::BadRequest(format!(
-                        "plugin {} HTTP allowlist entries must be exact origins",
+                        "plugin {} HTTP allowlist entries must be exact public HTTPS origins",
                         manifest.id
                     )));
                 }
@@ -475,28 +660,47 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
         }
     }
     for provider in &manifest.contributions.providers {
-        if provider.id.is_empty()
-            || !provider
-                .id
-                .chars()
-                .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || value == '-')
-            || provider.display_name.trim().is_empty()
-            || provider.protocols.is_empty()
-            || provider.modalities.is_empty()
-        {
-            return Err(AppError::BadRequest(format!(
-                "plugin {} contributes an invalid provider",
-                manifest.id
-            )));
-        }
-        if let Some(adapter) = &provider.oauth_adapter {
-            for (field, endpoint) in [
-                ("login_url", &adapter.login_url),
-                ("poll_url", &adapter.poll_url),
-                ("refresh_url", &adapter.refresh_url),
-            ] {
-                crate::oauth::validate_oauth_endpoint(endpoint, field)?;
-            }
+        validate_provider_contribution(&manifest.id, provider)?;
+    }
+    Ok(())
+}
+
+fn validate_provider_contribution(
+    plugin_id: &str,
+    provider: &ProviderType,
+) -> Result<(), AppError> {
+    const PROTOCOLS: &[&str] = &["openai", "anthropic", "generation"];
+    const MODALITIES: &[&str] = &["text", "embedding", "image", "video", "audio"];
+    if provider.id.is_empty()
+        || !provider
+            .id
+            .chars()
+            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || value == '-')
+        || provider.display_name.trim().is_empty()
+        || provider.protocols.is_empty()
+        || provider
+            .protocols
+            .iter()
+            .any(|protocol| !PROTOCOLS.contains(&protocol.as_str()))
+        || provider.modalities.is_empty()
+        || provider
+            .modalities
+            .iter()
+            .any(|modality| !MODALITIES.contains(&modality.as_str()))
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} contributes an invalid provider"
+        )));
+    }
+    crate::schema::validate_definition(&provider.config_schema)?;
+    crate::schema::validate_definition(&provider.credential_schema)?;
+    if let Some(adapter) = &provider.oauth_adapter {
+        for (field, endpoint) in [
+            ("login_url", &adapter.login_url),
+            ("poll_url", &adapter.poll_url),
+            ("refresh_url", &adapter.refresh_url),
+        ] {
+            crate::oauth::validate_oauth_endpoint(endpoint, field)?;
         }
     }
     Ok(())
@@ -516,7 +720,28 @@ fn safe_child(root: &Path, child: &str) -> Result<PathBuf, AppError> {
             "plugin wasm path must stay inside its package".into(),
         ));
     }
-    Ok(root.join(child))
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|error| AppError::Storage(format!("resolve plugin package: {error}")))?;
+    let canonical_child = fs::canonicalize(root.join(child))
+        .map_err(|error| AppError::Storage(format!("resolve plugin component: {error}")))?;
+    if !canonical_child.starts_with(&canonical_root) {
+        return Err(AppError::BadRequest(
+            "plugin wasm path must stay inside its package".into(),
+        ));
+    }
+    Ok(canonical_child)
+}
+
+fn require_file_size(path: &Path, maximum: u64, kind: &str) -> Result<(), AppError> {
+    let length = fs::metadata(path)
+        .map_err(|error| AppError::Storage(format!("inspect {}: {error}", path.display())))?
+        .len();
+    if length > maximum {
+        return Err(AppError::BadRequest(format!(
+            "{kind} exceeds the {maximum} byte limit"
+        )));
+    }
+    Ok(())
 }
 
 fn default_wasm_file() -> Option<String> {
@@ -533,12 +758,27 @@ mod tests {
 
     #[test]
     fn rejects_plugin_paths_that_escape_the_package() {
-        assert!(safe_child(Path::new("/plugins/test"), "../secret.wasm").is_err());
-        assert!(safe_child(Path::new("/plugins/test"), "/secret.wasm").is_err());
+        let parent = tempfile::tempdir().unwrap();
+        let package = parent.path().join("package");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("plugin.wasm"), []).unwrap();
+        fs::write(parent.path().join("secret.wasm"), []).unwrap();
+        assert!(safe_child(&package, "../secret.wasm").is_err());
+        assert!(safe_child(&package, "/secret.wasm").is_err());
         assert_eq!(
-            safe_child(Path::new("/plugins/test"), "plugin.wasm").expect("safe path"),
-            Path::new("/plugins/test/plugin.wasm")
+            safe_child(&package, "plugin.wasm").expect("safe path"),
+            fs::canonicalize(package.join("plugin.wasm")).unwrap()
         );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                parent.path().join("secret.wasm"),
+                package.join("link.wasm"),
+            )
+            .unwrap();
+            assert!(safe_child(&package, "link.wasm").is_err());
+        }
     }
 
     #[test]
@@ -550,6 +790,22 @@ mod tests {
             wasm: Some("plugin.wasm".to_owned()),
             capabilities: vec![PluginCapability::Http {
                 allowed_origins: vec!["https://example.com/oauth/token".to_owned()],
+            }],
+            contributions: PluginContributions::default(),
+        };
+
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn rejects_private_http_plugin_capability_without_operator_approval_metadata() {
+        let manifest = PluginManifest {
+            id: "test-plugin".to_owned(),
+            version: "1.0.0".to_owned(),
+            wit_version: "0.1.0".to_owned(),
+            wasm: Some("plugin.wasm".to_owned()),
+            capabilities: vec![PluginCapability::Http {
+                allowed_origins: vec!["http://metadata.internal".to_owned()],
             }],
             contributions: PluginContributions::default(),
         };
@@ -634,5 +890,47 @@ mod tests {
             "plugin:config-map-provider@1.0.0"
         );
         drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn undeclared_kv_and_http_capabilities_have_no_effect() {
+        let mut state = HostState {
+            plugin_id: "least-privilege-plugin".to_owned(),
+            capabilities: Vec::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            runtime: tokio::runtime::Handle::current(),
+            kv: None,
+            limits: StoreLimitsBuilder::new().build(),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        assert!(
+            memeloop::token_center::host::Host::kv_get(&mut state, "secret".to_owned()).is_err()
+        );
+        assert!(
+            memeloop::token_center::host::Host::http_request(
+                &mut state,
+                "GET".to_owned(),
+                "https://example.com/".to_owned(),
+                "{}".to_owned(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+
+        state.capabilities = vec![PluginCapability::Http {
+            allowed_origins: vec!["https://allowed.example".to_owned()],
+        }];
+        let error = memeloop::token_center::host::Host::http_request(
+            &mut state,
+            "GET".to_owned(),
+            "https://blocked.example/path".to_owned(),
+            "{}".to_owned(),
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.contains("not allowed"));
     }
 }

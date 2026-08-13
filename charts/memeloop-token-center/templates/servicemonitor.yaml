@@ -1,0 +1,48 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{- if not (or (and .Values.roles.control.enabled .Values.roles.control.service.enabled) (and .Values.roles.all.enabled .Values.roles.all.service.enabled)) }}
+{{- fail "serviceMonitor.enabled requires a Service for the control or all role because gateway does not expose /metrics" }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "memeloop-token-center.fullname" . }}
+  {{- with .Values.serviceMonitor.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "memeloop-token-center.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.serviceMonitor.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  sampleLimit: {{ .Values.serviceMonitor.sampleLimit }}
+  targetLabels:
+    - app.kubernetes.io/component
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "memeloop-token-center.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: {{ ternary "control" "all" (and .Values.roles.control.enabled .Values.roles.control.service.enabled) | quote }}
+  namespaceSelector:
+    {{- if .Values.serviceMonitor.namespaceSelector }}
+    {{- toYaml .Values.serviceMonitor.namespaceSelector | nindent 4 }}
+    {{- else }}
+    matchNames: [{{ .Release.Namespace | quote }}]
+    {{- end }}
+  endpoints:
+    - port: http
+      path: {{ .Values.serviceMonitor.path | quote }}
+      scheme: {{ .Values.serviceMonitor.scheme | quote }}
+      interval: {{ .Values.serviceMonitor.interval | quote }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout | quote }}
+      honorLabels: {{ .Values.serviceMonitor.honorLabels }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ .Values.serviceMonitor.authorizationSecret.name | quote }}
+          key: {{ .Values.serviceMonitor.authorizationSecret.key | quote }}
+{{- end }}

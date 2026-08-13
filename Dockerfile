@@ -14,6 +14,9 @@ RUN npm run build
 FROM ${RUST_IMAGE} AS builder
 ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian
 ARG CARGO_REGISTRY=sparse+https://rsproxy.cn/index/
+ARG MTC_BUILD_GIT_SHA=unknown
+ARG MTC_BUILD_TIMESTAMP=unknown
+ARG MTC_BUILD_TARGET=unknown
 RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends cmake clang perl pkg-config \
@@ -34,8 +37,12 @@ COPY src ./src
 COPY migrations ./migrations
 COPY schemas ./schemas
 COPY wit ./wit
-RUN cargo build --locked --release --bin memeloop-token-center \
+RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA}" \
+    MTC_BUILD_TIMESTAMP="${MTC_BUILD_TIMESTAMP}" \
+    MTC_BUILD_TARGET="${MTC_BUILD_TARGET}" \
+    cargo build --locked --release --bin memeloop-token-center --bin import-cpa-session-archive \
     && cp target/release/memeloop-token-center /tmp/memeloop-token-center \
+    && cp target/release/import-cpa-session-archive /tmp/import-cpa-session-archive \
     && rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
 
 FROM ${RUNTIME_IMAGE}
@@ -46,6 +53,7 @@ RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home token-center
 COPY --from=builder /tmp/memeloop-token-center /usr/local/bin/memeloop-token-center
+COPY --from=builder /tmp/import-cpa-session-archive /usr/local/bin/import-cpa-session-archive
 COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web
 USER 10001:10001
 EXPOSE 8080

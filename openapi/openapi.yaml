@@ -1,0 +1,3181 @@
+openapi: 3.1.0
+info:
+  title: Memeloop Token Center API
+  version: 0.1.0
+  summary: Multi-protocol AI gateway, credential, quota, and archive API
+  description: |
+    Contract for the API surface implemented by `src/api.rs`.
+
+    The production Helm deployment separates the **control** and **gateway** roles.
+    `/internal/v1/*` is served only by the control role. `/self/v1/*` and `/v1/*`
+    are served only by the gateway role. `/healthz` is present on every HTTP-serving
+    role. `/livez` is process liveness and `/readyz` checks PostgreSQL plus archive
+    readiness. `/healthz` is a deprecated compatibility alias for `/livez`.
+
+    All monetary amounts are decimal strings with at most six fractional digits.
+    All timestamps named `*_at` are Unix epoch milliseconds unless stated otherwise.
+    Successful and error responses under `/internal`, `/self`, and `/v1` include
+    `X-MTC-API-Version: v1`.
+    Issued client and service credential secrets are returned only by create/rotate
+    operations and must be stored by the caller immediately.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: https://token-center.api.onetwo.website:24450
+    description: Gateway role
+  - url: https://token-center.k3s.onetwo.website
+    description: Control role
+tags:
+  - name: System
+    description: Process status and runtime-discovered schemas/plugins.
+  - name: Client credentials
+    description: Stable downstream identities, secrets, policy, status, and CPA compatibility.
+  - name: Service credentials
+    description: Least-privilege control-plane credentials for internal integrations.
+  - name: Upstream providers
+    description: Unified upstream identities independent of their authentication method.
+  - name: Routes and pricing
+    description: Public-model routing and token/multimodal price configuration.
+  - name: Credits
+    description: Idempotent account grants, reversals, and ledger inspection.
+  - name: Entitlements
+    description: Exact, versioned subscription credit reconciliation for memeloop web.
+  - name: Operator traffic
+    description: Tenant/global traffic statistics, request detail, and live events.
+  - name: Self service
+    description: Credential-scoped, read-only usage and logical-conversation views.
+  - name: OpenAI compatible
+    description: OpenAI-compatible model, chat, Responses, and embedding routes.
+  - name: Anthropic compatible
+    description: Anthropic Messages-compatible routes used by Claude Code.
+  - name: Multimodal generation
+    description: Synchronous image and asynchronous image/video generation routes.
+paths:
+  /healthz:
+    get:
+      tags: [System]
+      operationId: getHealth
+      summary: Deprecated process-liveness compatibility alias
+      description: Use `/livez`. This compatibility route does not check dependencies.
+      security: []
+      responses:
+        '200':
+          description: Process is serving HTTP.
+          headers:
+            Deprecation:
+              description: Always `true` for this deprecated alias.
+              schema: { const: 'true' }
+            Link:
+              description: Successor endpoint relation.
+              schema: { const: '</livez>; rel="successor-version"' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /livez:
+    get:
+      tags: [System]
+      operationId: getLiveness
+      summary: Report process liveness without probing dependencies
+      security: []
+      responses:
+        '200':
+          description: Process is serving HTTP.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+  /readyz:
+    get:
+      tags: [System]
+      operationId: getReadiness
+      summary: Probe database and archive readiness
+      description: |
+        Available on every HTTP role for Kubernetes probes. PostgreSQL and archive
+        checks run concurrently with a two-second bound and a five-second singleflight
+        cache, so probe bursts do not amplify dependency traffic.
+      security: []
+      responses:
+        '200':
+          description: Both dependencies are ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: PostgreSQL or archive readiness failed or timed out.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+  /metrics:
+    get:
+      tags: [System]
+      operationId: getPrometheusMetrics
+      summary: Export bounded-cardinality operational metrics
+      description: |
+        Registered only by the control/all role. Labels are restricted to controlled
+        methods, matched route templates, status classes, providers, operations,
+        dependencies, pool states, and generation states. Tenant, credential, model,
+        URL, resource ID, and error-text labels are deliberately excluded.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: metrics:read
+      responses:
+        '200':
+          description: Prometheus text exposition.
+          headers:
+            Cache-Control:
+              schema: { const: no-store }
+          content:
+            'text/plain; version=0.0.4; charset=utf-8':
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /version:
+    get:
+      tags: [System]
+      operationId: getBuildVersion
+      summary: Read build and API compatibility metadata
+      description: Registered only by the control/all role. Local builds may report `unknown` for injected build fields.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: metrics:read
+      responses:
+        '200':
+          description: Build identity and supported API versions.
+          headers:
+            Cache-Control:
+              schema: { const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VersionInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/keys:
+    get:
+      tags: [Client credentials]
+      operationId: listClientCredentials
+      summary: List stable client credential identities
+      description: |
+        A tenant-scoped service credential is always restricted to its bound tenant.
+        A global credential may omit `tenant_external_id` to inspect all tenants.
+        The implementation currently returns at most 500 records and has no cursor.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - name: principal_external_id
+          in: query
+          schema: { type: string, maxLength: 200 }
+      responses:
+        '200':
+          description: Stable identities; never contains credential secrets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ManagedClientCredential' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Client credentials]
+      operationId: createClientCredential
+      summary: Provision a stable client identity and its first credential
+      description: |
+        Creates or reuses the tenant and principal, creates a credit account and stable
+        `key_id`, then returns the one-time `mtc_…` secret. When `Idempotency-Key` is
+        supplied, an identical request may replay the same response for 24 hours; use
+        of the same key with a different normalized request is rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters:
+        - $ref: '#/components/parameters/OptionalIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateClientCredentialRequest' }
+      responses:
+        '201':
+          description: Newly issued or idempotently replayed one-time credential.
+          headers:
+            X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssuedClientCredential' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/keys/{key_id}/rotate:
+    post:
+      tags: [Client credentials]
+      operationId: rotateClientCredential
+      summary: Replace a client credential secret without migrating its identity
+      description: |
+        Revokes all previous native and legacy secrets. Policy, balance, requests, and
+        conversations remain attached to the same `key_id`. `Idempotency-Key` is required;
+        replaying the same rotation key within 24 hours returns the same generation and
+        the same one-time secret rather than rotating again. Idempotency keys are global
+        across client and service credential rotations and must not be reused for another
+        resource.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters:
+        - $ref: '#/components/parameters/KeyId'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      responses:
+        '200':
+          description: One-time replacement credential.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssuedClientCredential' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/keys/{key_id}/policy:
+    put:
+      tags: [Client credentials]
+      operationId: replaceClientCredentialPolicy
+      summary: Replace model permissions, rate limits, and budgets
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters: [{ $ref: '#/components/parameters/KeyId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CredentialPolicy' }
+      responses:
+        '200':
+          description: Stored replacement policy.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CredentialPolicy' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/keys/{key_id}/status:
+    patch:
+      tags: [Client credentials]
+      operationId: setClientCredentialStatus
+      summary: Activate, suspend, or permanently revoke a client identity
+      description: "`revoked` is terminal and revokes all credential generations. A suspended identity may be returned to active."
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters: [{ $ref: '#/components/parameters/KeyId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StatusRequest' }
+      responses:
+        '200':
+          description: Current status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key_id, status]
+                properties:
+                  key_id: { type: string, format: uuid }
+                  status: { $ref: '#/components/schemas/CredentialStatus' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/keys/{key_id}/legacy-credentials:
+    post:
+      tags: [Client credentials]
+      operationId: attachLegacyClientCredential
+      summary: Attach an unchanged CPA credential to a stable identity
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters: [{ $ref: '#/components/parameters/KeyId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [credential, source_hash]
+              properties:
+                credential: { type: string, writeOnly: true, minLength: 1 }
+                source_hash: { type: string, minLength: 1 }
+      responses:
+        '201':
+          description: Legacy credential metadata; no plaintext secret.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LegacyCredential' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/service-tokens:
+    get:
+      tags: [Service credentials]
+      operationId: listServiceCredentials
+      summary: List service credential identities
+      description: Global service credentials only. Secrets are never returned.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: service_tokens:read
+      responses:
+        '200':
+          description: Service credential metadata.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ServiceCredential' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Service credentials]
+      operationId: createServiceCredential
+      summary: Create a least-privilege service credential
+      description: Global service credentials only. Bind normal integrations to one tenant.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: service_tokens:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateServiceCredentialRequest' }
+      responses:
+        '201':
+          description: One-time service credential secret.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssuedServiceCredential' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/service-tokens/{service_id}/rotate:
+    post:
+      tags: [Service credentials]
+      operationId: rotateServiceCredential
+      summary: Rotate a service credential while retaining its identity and scopes
+      description: |
+        `Idempotency-Key` is required. Replaying the same rotation key within 24 hours
+        returns the same generation and one-time token rather than rotating again.
+        Idempotency keys are global across client and service credential rotations and
+        must not be reused for another resource.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: service_tokens:write
+      parameters:
+        - $ref: '#/components/parameters/ServiceId'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      responses:
+        '200':
+          description: One-time replacement service credential.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IssuedServiceCredential' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/service-tokens/{service_id}/status:
+    patch:
+      tags: [Service credentials]
+      operationId: setServiceCredentialStatus
+      summary: Activate, suspend, or permanently revoke a service credential
+      security: [{ serviceBearer: [] }]
+      x-required-scope: service_tokens:write
+      parameters: [{ $ref: '#/components/parameters/ServiceId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StatusRequest' }
+      responses:
+        '200':
+          description: Current status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [service_id, status]
+                properties:
+                  service_id: { type: string, format: uuid }
+                  status: { $ref: '#/components/schemas/CredentialStatus' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/provider-types:
+    get:
+      tags: [Upstream providers]
+      operationId: listProviderTypes
+      summary: List built-in and plugin-contributed provider types and JSON Schemas
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      responses:
+        '200':
+          description: Provider contributions available in this process.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ProviderType' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/tenants:
+    get:
+      tags: [System]
+      operationId: listTenants
+      summary: List visible tenant external IDs
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      responses:
+        '200':
+          description: A scoped credential sees only its own tenant.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [external_id]
+                  properties:
+                    external_id: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/plugins:
+    get:
+      tags: [System]
+      operationId: listPlugins
+      summary: List loaded plugin manifests
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:read
+      responses:
+        '200':
+          description: Sanitized loaded manifests.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PluginManifest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/schemas:
+    get:
+      tags: [System]
+      operationId: getConfigurationSchemas
+      summary: Return JSON Schemas used by the operator UI
+      description: These schemas are UI/discovery documents. Provider-specific schemas are also returned by `/internal/v1/provider-types`.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: schemas:read
+      responses:
+        '200':
+          description: Named JSON Schema documents.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: { type: [object, boolean] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/upstreams:
+    get:
+      tags: [Upstream providers]
+      operationId: listUpstreamProviders
+      summary: List unified upstream provider accounts
+      description: API credentials, OAuth, subscription bridges, and no-auth connections are authentication methods of the same upstream account resource.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      parameters: [{ $ref: '#/components/parameters/TenantFilter' }]
+      responses:
+        '200':
+          description: Upstream account metadata without secrets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/UpstreamProvider' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Upstream providers]
+      operationId: createUpstreamProvider
+      summary: Create an upstream provider account with a direct credential
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateUpstreamProviderRequest' }
+      responses:
+        '201':
+          description: Stable upstream provider identity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/upstreams/{account_id}:
+    put:
+      tags: [Upstream providers]
+      operationId: replaceUpstreamProviderConfiguration
+      summary: Replace the editable configuration of one unified upstream
+      description: |
+        Keeps the stable upstream identity, provider driver, authentication method,
+        routes, and history. `expected_updated_at` provides optimistic concurrency.
+        Repeating an already-applied identical representation is safe; a stale,
+        non-identical representation returns 409. Provider JSON Schema and outbound
+        destination policy are revalidated before the write.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters: [{ $ref: '#/components/parameters/AccountId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceUpstreamProviderRequest' }
+      responses:
+        '200':
+          description: Updated upstream account metadata without secrets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    patch:
+      tags: [Upstream providers]
+      operationId: setUpstreamProviderStatus
+      summary: Activate or disable one unified upstream
+      description: |
+        Disabling immediately removes the account from route resolution without
+        deleting routes or audit history. Activation revalidates the current
+        credential. Repeating the current status is safe; a stale non-identical
+        transition returns 409.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters: [{ $ref: '#/components/parameters/AccountId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetUpstreamProviderStatusRequest' }
+      responses:
+        '200':
+          description: Upstream account in the requested state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Upstream providers]
+      operationId: deleteUpstreamProvider
+      summary: Delete a disabled, unreferenced unified upstream
+      description: |
+        The account must be disabled, have no model routes, and have no text or
+        generation request history. Otherwise it must remain disabled for audit and
+        the operation returns 409. A missing account, including a repeated successful
+        delete, returns 204.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredTenant'
+        - $ref: '#/components/parameters/ExpectedUpdatedAt'
+      responses:
+        '204': { description: Upstream deleted or already absent. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/upstreams/{account_id}/health:
+    post:
+      tags: [Upstream providers]
+      operationId: probeUpstreamProviderHealth
+      summary: Probe one upstream without returning its response body
+      description: |
+        Performs a bounded provider-specific read using the current credential. The
+        upstream response body is never read, logged, or returned. Transport and
+        authentication failures are represented by `status: unhealthy` in a 200
+        management response; they are not proxy responses.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/TenantFilter'
+      responses:
+        '200':
+          description: Sanitized health result.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamHealthResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/upstreams/{account_id}/credential:
+    put:
+      tags: [Upstream providers]
+      operationId: rotateUpstreamCredential
+      summary: Replace an upstream authentication method while retaining its account identity
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      description: |
+        `Idempotency-Key` is required. Replaying the same key for the same account and
+        credential within 24 hours returns the stored generation. Reuse for another
+        resource or different credential is rejected. The stable upstream ID, routes,
+        and request history do not change.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [credential]
+              properties:
+                credential: { $ref: '#/components/schemas/UpstreamCredential' }
+      responses:
+        '200':
+          description: Updated upstream metadata.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/upstreams/{account_id}/oauth/refresh:
+    post:
+      tags: [Upstream providers]
+      operationId: refreshUpstreamOAuthCredential
+      summary: Refresh an OAuth upstream and advance its credential generation
+      description: |
+        `Idempotency-Key` is required and claims the refresh before the authorization
+        server is called, so an ambiguous timeout can be replayed without refreshing
+        twice. The stored result is replayable for 24 hours. Reuse outside the same
+        upstream refresh operation is rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      responses:
+        '200':
+          description: Updated stable upstream identity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/oauth/cursor/start:
+    post:
+      tags: [Upstream providers]
+      operationId: startCursorOAuth
+      summary: Start direct Cursor PKCE authorization
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartCursorOAuthRequest' }
+      responses:
+        '200':
+          description: Opaque, expiring login state and authorization URL.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthLoginStart' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/oauth/cursor/poll:
+    post:
+      tags: [Upstream providers]
+      operationId: pollCursorOAuth
+      summary: Poll direct Cursor authorization and create the upstream when ready
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OAuthPollRequest' }
+      responses:
+        '201':
+          description: Authorization completed and stable upstream created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '202':
+          description: Authorization is still pending.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthPending' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/oauth/provider-adapter/start:
+    post:
+      tags: [Upstream providers]
+      operationId: startProviderAdapterOAuth
+      summary: Start OAuth through a plugin-contributed provider adapter
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartProviderAdapterOAuthRequest' }
+      responses:
+        '200':
+          description: Opaque, expiring login state and authorization URL.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthLoginStart' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/oauth/provider-adapter/poll:
+    post:
+      tags: [Upstream providers]
+      operationId: pollProviderAdapterOAuth
+      summary: Poll plugin-adapter OAuth and create the upstream when ready
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OAuthPollRequest' }
+      responses:
+        '201':
+          description: Authorization completed and stable upstream created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '202':
+          description: Authorization is still pending.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthPending' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/oauth/subscription-bridge/start:
+    post:
+      tags: [Upstream providers]
+      operationId: startSubscriptionBridgeOAuth
+      summary: Start Copilot or Cursor authorization through CPA Subscription Bridge
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartSubscriptionBridgeRequest' }
+      responses:
+        '200':
+          description: Opaque, expiring login state and authorization URL.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthLoginStart' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/oauth/subscription-bridge/poll:
+    post:
+      tags: [Upstream providers]
+      operationId: pollSubscriptionBridgeOAuth
+      summary: Poll subscription authorization and create the upstream when ready
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OAuthPollRequest' }
+      responses:
+        '201':
+          description: Authorization completed and stable upstream created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '202':
+          description: Authorization is still pending.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthPending' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/imports/cpa/subscription-accounts:
+    post:
+      tags: [Upstream providers]
+      operationId: importCpaSubscriptionAccounts
+      summary: Import supported CPA subscription account documents
+      description: Accepts 1–32 documents, each at most 1 MiB. Unsupported private OAuth formats are reported as skipped and their contents are not echoed.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CpaSubscriptionImportRequest' }
+      responses:
+        '201':
+          description: Imported and skipped records.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CpaSubscriptionImportResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/model-routes:
+    get:
+      tags: [Routes and pricing]
+      operationId: listModelRoutes
+      summary: List model routes visible to the caller
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:read
+      parameters: [{ $ref: '#/components/parameters/TenantFilter' }]
+      responses:
+        '200':
+          description: Routes ordered by public model and priority.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ModelRoute' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Routes and pricing]
+      operationId: createModelRoute
+      summary: Route a public model to a unified upstream provider
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateModelRouteRequest' }
+      responses:
+        '201':
+          description: Enabled model route. An identical create replays the existing route with the same status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelRoute' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/model-routes/{route_id}:
+    put:
+      tags: [Routes and pricing]
+      operationId: replaceModelRoute
+      summary: Replace a model route using optimistic concurrency
+      description: |
+        The upstream must be active, belong to the selected tenant, and support the
+        requested protocol. Repeating the already-applied target values returns the
+        current route even if `expected_updated_at` is the older value. A stale version
+        for a different change, or a conflicting route uniqueness key, returns 409.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/RouteId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceModelRouteRequest' }
+      responses:
+        '200':
+          description: Updated route or idempotent replay of the already-applied values.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelRoute' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    patch:
+      tags: [Routes and pricing]
+      operationId: setModelRouteEnabled
+      summary: Enable or disable a model route using optimistic concurrency
+      description: Repeating the current target state is idempotent; a stale version for a real state change returns 409.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/RouteId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetModelRouteEnabledRequest' }
+      responses:
+        '200':
+          description: Route in the requested state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelRoute' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Routes and pricing]
+      operationId: deleteModelRoute
+      summary: Delete a disabled, unreferenced model route
+      description: |
+        The route must first be disabled and must not be referenced by request history.
+        A stale `expected_updated_at`, enabled route, or historical reference returns
+        409. A missing route, including a repeated successful delete, returns 204.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters:
+        - $ref: '#/components/parameters/RouteId'
+        - $ref: '#/components/parameters/RequiredTenant'
+        - $ref: '#/components/parameters/ExpectedUpdatedAt'
+      responses:
+        '204': { description: Route deleted or already absent. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/model-prices:
+    get:
+      tags: [Routes and pricing]
+      operationId: listTokenModelPrices
+      summary: List configured token prices
+      description: Returns every service tier with uncached input, cached input, cache-write and output dimensions plus source/estimated metadata.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters: [{ $ref: '#/components/parameters/Currency' }]
+      responses:
+        '200':
+          description: Prices for the requested currency.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ModelPrice' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/model-prices/usage-summary:
+    get:
+      tags: [Routes and pricing]
+      operationId: getPricingUsageSummary
+      summary: Discover models used in traffic for price synchronization
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      description: |
+        Applies the same bounded statistics contract: omitted `to_created_at`
+        means request time, omitted `from_created_at` means 30 days before the
+        effective upper bound, the resulting interval may not exceed 93 days, and
+        all supplied dimensions are combined with AND.
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/FromCreatedAt'
+        - $ref: '#/components/parameters/ToCreatedAt'
+        - $ref: '#/components/parameters/KeyFilter'
+        - $ref: '#/components/parameters/ModelFilter'
+        - $ref: '#/components/parameters/ProtocolFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/ErrorCodeFilter'
+        - $ref: '#/components/parameters/UpstreamAccountFilter'
+        - $ref: '#/components/parameters/RouteFilter'
+        - $ref: '#/components/parameters/MinDurationFilter'
+        - $ref: '#/components/parameters/MaxDurationFilter'
+        - $ref: '#/components/parameters/MinCostFilter'
+        - $ref: '#/components/parameters/MaxCostFilter'
+        - $ref: '#/components/parameters/KeyAliasFilter'
+        - $ref: '#/components/parameters/PrincipalFilter'
+      responses:
+        '200':
+          description: Model usage totals.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelUsageSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/model-prices/sync:
+    post:
+      tags: [Routes and pricing]
+      operationId: synchronizeModelPrices
+      summary: Synchronize token prices from fixed public catalogs
+      description: |
+        Global service credentials only. Fetches models.dev, LiteLLM, and OpenRouter
+        from server-controlled URLs. Manual prices are preserved. Ambiguous matches are
+        returned as candidates and are not written automatically.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: prices:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelPriceSyncRequest' }
+      responses:
+        '200':
+          description: Source outcomes, matches, candidates, and current prices.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelPriceSyncResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/prices/{currency}/{model}:
+    post:
+      tags: [Routes and pricing]
+      operationId: upsertTokenModelPrice
+      summary: Create or replace one manual service-tier token price
+      description: |
+        Global service credentials only. The stable key is
+        `(model, currency, service_tier)`. Omitting either cache dimension uses
+        the uncached input price and marks that fallback as estimated.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: prices:write
+      parameters:
+        - $ref: '#/components/parameters/CurrencyPath'
+        - $ref: '#/components/parameters/ModelPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TokenPriceRequest' }
+      responses:
+        '200':
+          description: Complete model price view including every configured tier.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelPriceWriteResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/generation-prices:
+    get:
+      tags: [Routes and pricing]
+      operationId: listGenerationPrices
+      summary: List configured multimodal generation prices
+      security: [{ serviceBearer: [] }]
+      x-required-scope: prices:read
+      parameters: [{ $ref: '#/components/parameters/Currency' }]
+      responses:
+        '200':
+          description: Generation prices for the requested currency.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/GenerationPrice' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/generation-prices/{currency}/{model}:
+    post:
+      tags: [Routes and pricing]
+      operationId: upsertGenerationPrice
+      summary: Create or replace a multimodal generation price
+      description: Global service credentials only.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: prices:write
+      parameters:
+        - $ref: '#/components/parameters/CurrencyPath'
+        - $ref: '#/components/parameters/ModelPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GenerationPriceRequest' }
+      responses:
+        '200':
+          description: Stored generation price.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GenerationPrice' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/accounts/{account_id}/grants:
+    post:
+      tags: [Credits]
+      operationId: grantAccountCredit
+      summary: Add an idempotent credit grant to an account
+      description: The same `Idempotency-Key` must not be reused for a different grant request.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: credits:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GrantRequest' }
+      responses:
+        '201':
+          description: Amount granted by this logical operation.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [granted]
+                properties:
+                  granted: { $ref: '#/components/schemas/Money' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/accounts/{account_id}/grant-reversals:
+    post:
+      tags: [Credits]
+      operationId: reverseAccountGrant
+      summary: Reverse one complete, unconsumed grant
+      description: |
+        The current implementation refuses automatic reversal if the account has any
+        usage at or after the original grant. Use `/internal/v1/entitlements/*` for
+        subscription lifecycle changes after partial consumption.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: credits:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GrantReversalRequest' }
+      responses:
+        '201':
+          description: Reversed amount.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [reversed]
+                properties:
+                  reversed: { $ref: '#/components/schemas/Money' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/accounts/{account_id}/ledger:
+    get:
+      tags: [Credits]
+      operationId: listAccountLedger
+      summary: List recent account ledger entries
+      description: Returns at most 500 entries; cursor pagination is not yet implemented.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: credits:read
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/Limit500'
+      responses:
+        '200':
+          description: Ledger entries newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/LedgerEntry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/entitlements:
+    get:
+      tags: [Entitlements]
+      operationId: listEntitlements
+      summary: List current subscription entitlement cycles
+      description: |
+        Returns at most 500 rows newest first. A tenant-scoped service credential is
+        automatically bound to its tenant; explicitly selecting another tenant returns
+        403. A global credential may omit the tenant to list across tenants.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: entitlements:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - name: provider
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/EntitlementIdentity' }
+        - name: external_subscription_id
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/EntitlementIdentity' }
+      responses:
+        '200':
+          description: Current-cycle entitlement views matching every supplied filter.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 500
+                items: { $ref: '#/components/schemas/Entitlement' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Entitlements]
+      operationId: reconcileEntitlement
+      summary: Reconcile one exact external subscription-cycle entitlement
+      description: |
+        Sets the desired funded amount for a stable provider/subscription and billing
+        cycle. A higher version is required after the first successful operation. A
+        cancelled entitlement may be reactivated only with an explicitly higher version;
+        a replaced identity can never be reactivated. Stable subscriptions cannot move
+        accounts and stable cycle IDs cannot change period or currency.
+
+        The replay namespace is `(tenant, Idempotency-Key)`. The same canonical payload
+        returns the original response; reuse with another payload returns 409.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: entitlements:write
+      parameters: [{ $ref: '#/components/parameters/RequiredIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReconcileEntitlementRequest' }
+      responses:
+        '201':
+          description: Created or updated entitlement snapshot, including its exact net ledger movement.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EntitlementResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/entitlements/cancel:
+    post:
+      tags: [Entitlements]
+      operationId: cancelEntitlement
+      summary: Cancel an external subscription without revoking consumed credit
+      description: |
+        Requires a version higher than the current entitlement. Only the current cycle's
+        unconsumed remainder is withdrawn; `desired` and `consumed` remain auditable and
+        `remaining` becomes zero. Optional `external_cycle_id` rejects a stale-cycle
+        cancellation. The `(tenant, Idempotency-Key)` replay and 409 mismatch rules are
+        the same as reconciliation.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: entitlements:write
+      parameters: [{ $ref: '#/components/parameters/RequiredIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelEntitlementRequest' }
+      responses:
+        '200':
+          description: Cancelled entitlement and negative-or-zero ledger delta.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EntitlementResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/entitlements/replace:
+    post:
+      tags: [Entitlements]
+      operationId: replaceEntitlement
+      summary: Atomically replace one stable subscription with another
+      description: |
+        Requires a higher version for the old identity. The operation withdraws only the
+        old cycle's unconsumed remainder, marks the old entitlement `replaced`, and funds
+        a new active subscription/cycle in the same tenant and stable credit account.
+        The replacement provider/subscription identity must differ and must not already
+        exist. The `(tenant, Idempotency-Key)` replay and 409 mismatch rules are the same
+        as reconciliation.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: entitlements:write
+      parameters: [{ $ref: '#/components/parameters/RequiredIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceEntitlementRequest' }
+      responses:
+        '201':
+          description: New active entitlement plus the replaced stable entitlement ID and net ledger delta.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EntitlementResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/requests:
+    get:
+      tags: [Operator traffic]
+      operationId: listOperatorRequests
+      summary: List recent requests and generation jobs
+      description: |
+        Returns at most 500 records ordered by `(created_at, request_id)` descending.
+        Use `before_created_at` and `before_id` together as the exclusive keyset cursor
+        from the last returned row. Time bounds are inclusive; all supplied filters are
+        combined with AND. Generation jobs appear with protocol `generation`.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/Limit500'
+        - $ref: '#/components/parameters/FromCreatedAt'
+        - $ref: '#/components/parameters/ToCreatedAt'
+        - $ref: '#/components/parameters/BeforeCreatedAt'
+        - $ref: '#/components/parameters/BeforeId'
+        - $ref: '#/components/parameters/KeyFilter'
+        - $ref: '#/components/parameters/ModelFilter'
+        - $ref: '#/components/parameters/ProtocolFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/ErrorCodeFilter'
+        - $ref: '#/components/parameters/UpstreamAccountFilter'
+        - $ref: '#/components/parameters/RouteFilter'
+        - $ref: '#/components/parameters/MinDurationFilter'
+        - $ref: '#/components/parameters/MaxDurationFilter'
+        - $ref: '#/components/parameters/MinCostFilter'
+        - $ref: '#/components/parameters/MaxCostFilter'
+        - $ref: '#/components/parameters/KeyAliasFilter'
+        - $ref: '#/components/parameters/PrincipalFilter'
+      responses:
+        '200':
+          description: Recent request summaries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RequestSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/requests/{request_id}:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorRequest
+      summary: Load one request and its bounded archive detail
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+      responses:
+        '200':
+          description: Request summary and archived bodies.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/stats:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorStatistics
+      summary: Get bounded, filtered tenant or global aggregates
+      description: |
+        Uses the same applicable filters as the operator request list. Omitted
+        `to_created_at` means request time; omitted `from_created_at` means 30 days
+        before the effective upper bound. The resulting inclusive interval may not
+        exceed 93 days. All filters are combined with AND.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/FromCreatedAt'
+        - $ref: '#/components/parameters/ToCreatedAt'
+        - $ref: '#/components/parameters/KeyFilter'
+        - $ref: '#/components/parameters/ModelFilter'
+        - $ref: '#/components/parameters/ProtocolFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/ErrorCodeFilter'
+        - $ref: '#/components/parameters/UpstreamAccountFilter'
+        - $ref: '#/components/parameters/RouteFilter'
+        - $ref: '#/components/parameters/MinDurationFilter'
+        - $ref: '#/components/parameters/MaxDurationFilter'
+        - $ref: '#/components/parameters/MinCostFilter'
+        - $ref: '#/components/parameters/MaxCostFilter'
+        - $ref: '#/components/parameters/KeyAliasFilter'
+        - $ref: '#/components/parameters/PrincipalFilter'
+      responses:
+        '200':
+          description: Request, token, cost, model, day, and error aggregates.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Statistics' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/request-events:
+    get:
+      tags: [Operator traffic]
+      operationId: streamRequestEvents
+      summary: Tail started and finished request events over SSE
+      description: Use the `(after_event_at, after_event_id)` pair as the durable resume cursor. Event names are `request.started` and `request.finished`.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - name: after_event_at
+          in: query
+          schema: { type: integer, format: int64, description: Unix epoch milliseconds. }
+        - name: after_event_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: SSE stream. Each `data` field is a RequestEvent JSON object.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /portal:
+    get:
+      tags: [Self service]
+      operationId: getSelfServicePortal
+      summary: Load the browser self-service application
+      security: []
+      responses:
+        '200':
+          description: HTML application shell.
+          content:
+            text/html:
+              schema: { type: string }
+
+  /self/v1/key:
+    get:
+      tags: [Self service]
+      operationId: getCurrentClientCredential
+      summary: Read the current stable identity, policy, and available balance
+      security: [{ clientBearer: [] }]
+      responses:
+        '200':
+          description: Data belonging only to the authenticated stable client identity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SelfCredential' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /self/v1/requests:
+    get:
+      tags: [Self service]
+      operationId: listOwnRequests
+      summary: List recent requests for the current stable identity
+      description: |
+        Returns at most 100 text/protocol request records ordered by `(created_at,
+        request_id)` descending. The authenticated `key_id` is always applied and cannot
+        be overridden. Use `before_created_at` and `before_id` together as the exclusive
+        keyset cursor. Time bounds are inclusive and all supplied filters are combined
+        with AND. Generation jobs are listed separately under `/self/v1/generations`.
+      security: [{ clientBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Limit100'
+        - $ref: '#/components/parameters/FromCreatedAt'
+        - $ref: '#/components/parameters/ToCreatedAt'
+        - $ref: '#/components/parameters/BeforeCreatedAt'
+        - $ref: '#/components/parameters/BeforeId'
+        - $ref: '#/components/parameters/ModelFilter'
+        - $ref: '#/components/parameters/ProtocolFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/ErrorCodeFilter'
+        - $ref: '#/components/parameters/UpstreamAccountFilter'
+        - $ref: '#/components/parameters/RouteFilter'
+        - $ref: '#/components/parameters/MinDurationFilter'
+        - $ref: '#/components/parameters/MaxDurationFilter'
+        - $ref: '#/components/parameters/MinCostFilter'
+        - $ref: '#/components/parameters/MaxCostFilter'
+      responses:
+        '200':
+          description: Own request summaries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RequestSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /self/v1/requests/{request_id}:
+    get:
+      tags: [Self service]
+      operationId: getOwnRequest
+      summary: Load one owned request and its bounded archive detail
+      security: [{ clientBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/RequestIdPath' }]
+      responses:
+        '200':
+          description: Request detail only when owned by the authenticated stable identity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /self/v1/stats:
+    get:
+      tags: [Self service]
+      operationId: getOwnStatistics
+      summary: Get bounded, filtered usage for the current stable identity
+      description: |
+        Always binds the authenticated stable `key_id`. Omitted `to_created_at`
+        means request time; omitted `from_created_at` means 30 days before the
+        effective upper bound. The resulting inclusive interval may not exceed 93
+        days. All supplied filters are combined with AND.
+      security: [{ clientBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/FromCreatedAt'
+        - $ref: '#/components/parameters/ToCreatedAt'
+        - $ref: '#/components/parameters/ModelFilter'
+        - $ref: '#/components/parameters/ProtocolFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/ErrorCodeFilter'
+        - $ref: '#/components/parameters/UpstreamAccountFilter'
+        - $ref: '#/components/parameters/RouteFilter'
+        - $ref: '#/components/parameters/MinDurationFilter'
+        - $ref: '#/components/parameters/MaxDurationFilter'
+        - $ref: '#/components/parameters/MinCostFilter'
+        - $ref: '#/components/parameters/MaxCostFilter'
+      responses:
+        '200':
+          description: Own aggregate usage.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Statistics'
+                  - type: object
+                    required: [key_id]
+                    properties:
+                      key_id: { type: string, format: uuid }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /self/v1/generations:
+    get:
+      tags: [Self service]
+      operationId: listOwnGenerationJobs
+      summary: List recent multimodal generation jobs
+      security: [{ clientBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/Limit100' }]
+      responses:
+        '200':
+          description: Own generation jobs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/GenerationJob' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /self/v1/generations/{job_id}:
+    get:
+      tags: [Self service]
+      operationId: getOwnGenerationJob
+      summary: Read one owned multimodal generation job
+      security: [{ clientBearer: [] }]
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Owned generation job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GenerationJob' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Self service]
+      operationId: cancelOwnGenerationJob
+      summary: Cancel one owned generation job before upstream submission
+      description: |
+        Only a queued job without an active worker lease can be cancelled. Cancellation
+        atomically settles its reservation at zero, refunds the reserved balance, and
+        returns the job with status `cancelled` and error code `cancelled_by_user`.
+        Repeating cancellation of that cancelled job is idempotent. A running, completed,
+        failed, or actively leased job returns 400 because provider-specific upstream
+        cancellation is not implemented.
+      security: [{ clientBearer: [] }]
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Cancelled job, or the same job from an idempotent cancellation replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GenerationJob' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /self/v1/conversations:
+    get:
+      tags: [Self service]
+      operationId: listOwnLogicalConversations
+      summary: List inferred logical conversation clusters
+      security: [{ clientBearer: [] }]
+      responses:
+        '200':
+          description: Conversation clusters containing requests owned by the stable identity.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ConversationCluster' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /self/v1/conversations/{cluster_id}:
+    get:
+      tags: [Self service]
+      operationId: getOwnLogicalConversation
+      summary: Read one logical conversation and relation evidence
+      security: [{ clientBearer: [] }]
+      parameters:
+        - name: cluster_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Owned requests and relation edges.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/models:
+    get:
+      tags: [OpenAI compatible]
+      operationId: listAllowedModels
+      summary: List priced models allowed by the current client policy
+      security: [{ clientBearer: [] }]
+      responses:
+        '200':
+          description: OpenAI-compatible model list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpenAIModelList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/chat/completions:
+    post:
+      tags: [OpenAI compatible]
+      operationId: createChatCompletion
+      summary: Proxy an OpenAI-compatible chat completion
+      description: The body is forwarded after policy/plugin rewriting. Both JSON and SSE responses are supported and metered.
+      security: [{ clientBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OpenAIChatRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ProxySuccess' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /v1/responses:
+    post:
+      tags: [OpenAI compatible]
+      operationId: createResponse
+      summary: Proxy an OpenAI-compatible Responses request
+      security: [{ clientBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OpenAIResponseRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ProxySuccess' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /v1/embeddings:
+    post:
+      tags: [OpenAI compatible]
+      operationId: createEmbeddings
+      summary: Proxy an OpenAI-compatible embeddings request
+      security: [{ clientBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OpenAIEmbeddingRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ProxySuccess' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /v1/messages:
+    post:
+      tags: [Anthropic compatible]
+      operationId: createAnthropicMessage
+      summary: Proxy an Anthropic Messages request
+      security: [{ clientBearer: [] }]
+      parameters:
+        - name: anthropic-version
+          in: header
+          required: false
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnthropicMessageRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ProxySuccess' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /v1/messages/count_tokens:
+    post:
+      tags: [Anthropic compatible]
+      operationId: countAnthropicTokens
+      summary: Proxy an Anthropic token-count request
+      security: [{ clientBearer: [] }]
+      parameters:
+        - name: anthropic-version
+          in: header
+          required: false
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnthropicMessageRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/ProxySuccess' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /v1/generations:
+    post:
+      tags: [Multimodal generation]
+      operationId: createMultimodalGeneration
+      summary: Queue a provider-native Seedance or ComfyUI generation job
+      description: |
+        `Idempotency-Key` is optional. Its namespace is scoped to the authenticated stable
+        client identity. The first request is accepted with 202; replaying the same key
+        with the same canonical `model` and `input` returns the same job with 200 and does
+        not reserve quota twice. Reusing it with different content returns 400.
+      security: [{ clientBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/OptionalIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AsyncGenerationRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/GenerationReplayed' }
+        '202': { $ref: '#/components/responses/GenerationAccepted' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /v1/videos/generations:
+    post:
+      tags: [Multimodal generation]
+      operationId: createVideoGeneration
+      summary: Queue a provider-native video generation job
+      description: |
+        `Idempotency-Key` is optional. Its namespace is scoped to the authenticated stable
+        client identity. The first request is accepted with 202; replaying the same key
+        with the same canonical `model` and `input` returns the same job with 200 and does
+        not reserve quota twice. Reusing it with different content returns 400.
+      security: [{ clientBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/OptionalIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AsyncGenerationRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/GenerationReplayed' }
+        '202': { $ref: '#/components/responses/GenerationAccepted' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /v1/images/generations:
+    post:
+      tags: [Multimodal generation]
+      operationId: createImageGeneration
+      summary: Generate an image synchronously or queue a provider-native job
+      description: |
+        When the body contains `input`, it uses the asynchronous generation contract and
+        accepts optional `Idempotency-Key`: the first submission returns 202, an identical
+        replay returns the same job with 200 without a second reservation, and reuse with
+        different `model` or `input` returns 400. Without `input`, this endpoint proxies
+        the synchronous OpenAI Images API or a configured Codex Responses image tool;
+        `Idempotency-Key` does not currently provide replay semantics for that synchronous path.
+      security: [{ clientBearer: [] }]
+      parameters: [{ $ref: '#/components/parameters/OptionalIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/AsyncGenerationRequest'
+                - $ref: '#/components/schemas/OpenAIImageRequest'
+      responses:
+        '200': { $ref: '#/components/responses/ImageSuccessOrGenerationReplay' }
+        '202': { $ref: '#/components/responses/GenerationAccepted' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '424': { $ref: '#/components/responses/UnpricedModel' }
+        '429': { $ref: '#/components/responses/UsageRejected' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+components:
+  securitySchemes:
+    serviceBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: mts_…
+      description: Bootstrap service token or a stored service credential with the required scope and tenant boundary.
+    clientBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: mtc_… or migrated CPA credential
+      description: Current native generation or an active migrated CPA credential attached to one stable client identity.
+
+  headers:
+    RequestId:
+      description: Server-generated request correlation identifier.
+      schema: { type: string, format: uuid }
+    ApiVersion:
+      description: API contract version selected for this response.
+      schema: { const: v1 }
+
+  parameters:
+    TenantFilter:
+      name: tenant_external_id
+      in: query
+      required: false
+      description: Global service credentials may select a tenant or omit it for all tenants. Scoped credentials may omit it or repeat only their bound tenant.
+      schema: { type: string, maxLength: 200 }
+    KeyId:
+      name: key_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ServiceId:
+      name: service_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    AccountId:
+      name: account_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RequestIdPath:
+      name: request_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RouteId:
+      name: route_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RequiredTenant:
+      name: tenant_external_id
+      in: query
+      required: true
+      description: Global credentials select the owning tenant; scoped credentials may specify only their bound tenant.
+      schema: { type: string, minLength: 1, maxLength: 200 }
+    ExpectedUpdatedAt:
+      name: expected_updated_at
+      in: query
+      required: true
+      description: Optimistic-concurrency version from the resource's most recently read `updated_at` value.
+      schema: { type: integer, format: int64 }
+    FromCreatedAt:
+      name: from_created_at
+      in: query
+      required: false
+      description: Inclusive lower bound for creation time, in Unix epoch milliseconds.
+      schema: { type: integer, format: int64 }
+    ToCreatedAt:
+      name: to_created_at
+      in: query
+      required: false
+      description: Inclusive upper bound for creation time, in Unix epoch milliseconds. Must not be less than `from_created_at`.
+      schema: { type: integer, format: int64 }
+    BeforeCreatedAt:
+      name: before_created_at
+      in: query
+      required: false
+      description: Creation timestamp from the last row of the prior page. Use together with `before_id` as an exclusive descending keyset cursor.
+      schema: { type: integer, format: int64 }
+    BeforeId:
+      name: before_id
+      in: query
+      required: false
+      description: Request or generation UUID from the last row of the prior page. Use together with `before_created_at`.
+      schema: { type: string, format: uuid }
+    KeyFilter:
+      name: key_id
+      in: query
+      required: false
+      description: Restrict an operator request list to one stable client credential identity. Tenant authorization still applies.
+      schema: { type: string, format: uuid }
+    ModelFilter:
+      name: model
+      in: query
+      required: false
+      description: Exact public-model match.
+      schema: { type: string, minLength: 1, maxLength: 200 }
+    ProtocolFilter:
+      name: protocol
+      in: query
+      required: false
+      description: Exact recorded protocol match, for example `openai`, `anthropic`, `openai-image`, or `generation`.
+      schema: { type: string, minLength: 1, maxLength: 200 }
+    StatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Logical status. Success includes HTTP 2xx/3xx; error includes HTTP 4xx/5xx or failed/cancelled generation; pending includes unfinished requests or queued/running generation.
+      schema: { type: string, enum: [success, error, pending] }
+    ErrorCodeFilter:
+      name: error_code
+      in: query
+      required: false
+      description: Exact recorded error-code match.
+      schema: { type: string, minLength: 1, maxLength: 200 }
+    UpstreamAccountFilter:
+      name: upstream_account_id
+      in: query
+      required: false
+      description: Restrict results to one stable unified upstream provider identity.
+      schema: { type: string, format: uuid }
+    RouteFilter:
+      name: route_id
+      in: query
+      required: false
+      description: Restrict text/protocol records to one stable model route. Generation records do not carry route IDs and cannot match this filter.
+      schema: { type: string, format: uuid }
+    MinDurationFilter:
+      name: min_duration_ms
+      in: query
+      required: false
+      description: Inclusive lower duration bound in milliseconds.
+      schema: { type: integer, format: int64, minimum: 0 }
+    MaxDurationFilter:
+      name: max_duration_ms
+      in: query
+      required: false
+      description: Inclusive upper duration bound in milliseconds; must not be less than `min_duration_ms`.
+      schema: { type: integer, format: int64, minimum: 0 }
+    MinCostFilter:
+      name: min_cost
+      in: query
+      required: false
+      description: Inclusive lower settled-cost bound as a non-negative decimal string.
+      schema: { $ref: '#/components/schemas/NonNegativeMoney' }
+    MaxCostFilter:
+      name: max_cost
+      in: query
+      required: false
+      description: Inclusive upper settled-cost bound; must not be less than `min_cost`.
+      schema: { $ref: '#/components/schemas/NonNegativeMoney' }
+    KeyAliasFilter:
+      name: key_alias
+      in: query
+      required: false
+      description: Operator-only, case-insensitive prefix search over the stable client credential alias. SQL wildcard characters are treated literally.
+      schema: { type: string, minLength: 1, maxLength: 200 }
+    PrincipalFilter:
+      name: principal
+      in: query
+      required: false
+      description: Operator-only, case-insensitive prefix search over the tenant principal identifier. SQL wildcard characters are treated literally.
+      schema: { type: string, minLength: 1, maxLength: 200 }
+    OptionalIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, minLength: 1, maxLength: 200, pattern: '^[!-~]+$' }
+    RequiredIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 200, pattern: '^[!-~]+$' }
+    Currency:
+      name: currency
+      in: query
+      required: false
+      schema: { $ref: '#/components/schemas/Currency' }
+    CurrencyPath:
+      name: currency
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Currency' }
+    ModelPath:
+      name: model
+      in: path
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 200 }
+    Limit100:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, format: int64, minimum: 1, maximum: 100, default: 50 }
+    Limit500:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, format: int64, minimum: 1, maximum: 500, default: 50 }
+
+  responses:
+    InvalidRequest:
+      description: Invalid JSON, field, state transition, idempotency reuse, or unsupported operation.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unauthorized:
+      description: Missing, malformed, revoked, expired, or invalid bearer credential.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Forbidden:
+      description: Credential lacks the required scope, tenant boundary, or model permission.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound:
+      description: Resource is absent or not visible to the authenticated identity.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Conflict:
+      description: The idempotency key has another payload, a version is stale, or the requested stable identity/state conflicts with existing history.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    UnpricedModel:
+      description: Model has no price in the client's currency.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    UsageRejected:
+      description: Rate limit, concurrency, balance, or configured budget rejected the request before upstream execution.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    UpstreamError:
+      description: Configured upstream or OAuth provider was unavailable. Sensitive upstream detail is not returned.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    ProxySuccess:
+      description: Upstream response. Content type and streaming semantics follow the selected protocol/provider.
+      content:
+        application/json:
+          schema: { type: object, additionalProperties: true }
+        text/event-stream:
+          schema: { type: string }
+    GenerationAccepted:
+      description: Job was priced, reserved, archived, and queued.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/GenerationJob' }
+    GenerationReplayed:
+      description: Existing job returned by an idempotent replay; no second job or quota reservation was created.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/GenerationJob' }
+    ImageSuccessOrGenerationReplay:
+      description: Synchronous image-provider response, or an existing asynchronous job returned by an idempotent replay.
+      content:
+        application/json:
+          schema: { type: object, additionalProperties: true }
+
+  schemas:
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { const: ok }
+    Readiness:
+      type: object
+      additionalProperties: false
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        checks:
+          type: object
+          additionalProperties: false
+          required: [database, archive]
+          properties:
+            database: { type: string, enum: [ok, failed] }
+            archive: { type: string, enum: [ok, failed] }
+    VersionInfo:
+      type: object
+      additionalProperties: false
+      required: [service, version, revision, build_timestamp, target, api]
+      properties:
+        service: { const: memeloop-token-center }
+        version: { type: string }
+        revision: { type: string }
+        build_timestamp: { type: string }
+        target: { type: string }
+        api:
+          type: object
+          additionalProperties: false
+          required: [current, supported, compatibility, deprecated]
+          properties:
+            current: { const: v1 }
+            supported:
+              type: array
+              items: { const: v1 }
+            compatibility: { type: string }
+            deprecated:
+              type: array
+              items:
+                type: object
+                additionalProperties: false
+                required: [path, replacement]
+                properties:
+                  path: { type: string }
+                  replacement: { type: string }
+    Money:
+      type: string
+      pattern: '^-?(0|[1-9][0-9]*)(\.[0-9]{1,6})?$'
+      examples: ['10', '0.125', '-5']
+    NonNegativeMoney:
+      type: string
+      pattern: '^(0|[1-9][0-9]*)(\.[0-9]{1,6})?$'
+    Currency:
+      type: string
+      enum: [USD, CNY]
+    ServiceTier:
+      type: string
+      enum: [default, auto, priority, flex, scale, batch, standard_only]
+      description: Recorded/requested upstream service tier. Unknown reported tiers are settled conservatively against the maximum snapshotted tier price.
+      default: USD
+    CredentialStatus:
+      type: string
+      enum: [active, suspended, revoked]
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [unauthorized, forbidden, unpriced_model, insufficient_quota, rate_limit_exceeded, not_found, conflict, invalid_request, upstream_error, internal_error]
+            message: { type: string }
+    CredentialPolicy:
+      type: object
+      additionalProperties: false
+      properties:
+        allowed_models:
+          type: array
+          maxItems: 500
+          description: Empty denies every model. Use `*` to permit all priced/routed models.
+          items: { type: string, minLength: 1, maxLength: 200 }
+          default: []
+        requests_per_minute: { type: integer, format: int32, minimum: 1, default: 60 }
+        tokens_per_minute: { type: integer, format: int64, minimum: 1, default: 100000 }
+        max_concurrency: { type: integer, format: int32, minimum: 1, default: 4 }
+        daily_budget: { oneOf: [{ $ref: '#/components/schemas/NonNegativeMoney' }, { type: 'null' }] }
+        weekly_budget: { oneOf: [{ $ref: '#/components/schemas/NonNegativeMoney' }, { type: 'null' }] }
+        lifetime_budget: { oneOf: [{ $ref: '#/components/schemas/NonNegativeMoney' }, { type: 'null' }] }
+    CreateClientCredentialRequest:
+      type: object
+      additionalProperties: false
+      required: [principal_external_id, alias]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200, default: default }
+        principal_external_id: { type: string, minLength: 1, maxLength: 200 }
+        alias: { type: string, minLength: 1, maxLength: 200 }
+        currency: { $ref: '#/components/schemas/Currency' }
+        policy: { $ref: '#/components/schemas/CredentialPolicy' }
+        initial_balance: { $ref: '#/components/schemas/NonNegativeMoney' }
+    IssuedClientCredential:
+      type: object
+      additionalProperties: false
+      required: [key_id, account_id, alias, currency, credential_generation, key, fingerprint]
+      properties:
+        key_id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        alias: { type: string }
+        currency: { $ref: '#/components/schemas/Currency' }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+        key: { type: string, writeOnly: true, description: One-time native credential secret. }
+        fingerprint: { type: string }
+    ManagedClientCredential:
+      type: object
+      additionalProperties: false
+      required: [key_id, account_id, tenant_external_id, principal_external_id, alias, currency, status, credential_generation, created_at, updated_at, policy, available_balance, reserved_balance]
+      properties:
+        key_id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        tenant_external_id: { type: string }
+        principal_external_id: { type: string }
+        alias: { type: string }
+        currency: { $ref: '#/components/schemas/Currency' }
+        status: { $ref: '#/components/schemas/CredentialStatus' }
+        credential_generation: { type: integer, format: int64 }
+        fingerprint: { type: [string, 'null'] }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+        policy: { $ref: '#/components/schemas/CredentialPolicy' }
+        available_balance: { $ref: '#/components/schemas/Money' }
+        reserved_balance: { $ref: '#/components/schemas/Money' }
+    SelfCredential:
+      type: object
+      additionalProperties: false
+      required: [key_id, alias, currency, credential_generation, created_at, policy, available_balance]
+      properties:
+        key_id: { type: string, format: uuid }
+        alias: { type: string }
+        currency: { $ref: '#/components/schemas/Currency' }
+        credential_generation: { type: integer, format: int64 }
+        created_at: { type: integer, format: int64 }
+        policy: { $ref: '#/components/schemas/CredentialPolicy' }
+        available_balance: { $ref: '#/components/schemas/Money' }
+    LegacyCredential:
+      type: object
+      additionalProperties: false
+      required: [key_id, generation, fingerprint, source_hash]
+      properties:
+        key_id: { type: string, format: uuid }
+        generation: { type: integer, format: int64 }
+        fingerprint: { type: string }
+        source_hash: { type: string }
+    StatusRequest:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/CredentialStatus' }
+    ServiceScope:
+      type: string
+      enum:
+        - keys:read
+        - keys:write
+        - credits:read
+        - credits:write
+        - entitlements:read
+        - entitlements:write
+        - requests:read
+        - providers:read
+        - providers:write
+        - plugins:read
+        - oauth:write
+        - routes:read
+        - routes:write
+        - prices:read
+        - prices:write
+        - service_tokens:read
+        - service_tokens:write
+        - schemas:read
+        - metrics:read
+    CreateServiceCredentialRequest:
+      type: object
+      additionalProperties: false
+      required: [name, scopes]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        scopes:
+          type: array
+          minItems: 1
+          maxItems: 32
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/ServiceScope' }
+        tenant_external_id:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 200
+          description: Null creates a global operator credential; normal application integrations should be tenant-bound.
+    IssuedServiceCredential:
+      type: object
+      additionalProperties: false
+      required: [service_id, name, credential_generation, token, fingerprint, scopes, tenant_external_id]
+      properties:
+        service_id: { type: string, format: uuid }
+        name: { type: string }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+        token: { type: string, writeOnly: true, description: One-time service credential secret. }
+        fingerprint: { type: string }
+        scopes:
+          type: array
+          items: { $ref: '#/components/schemas/ServiceScope' }
+        tenant_external_id: { type: [string, 'null'] }
+    ServiceCredential:
+      type: object
+      additionalProperties: false
+      required: [service_id, name, status, credential_generation, fingerprint, scopes, tenant_external_id, created_at, updated_at]
+      properties:
+        service_id: { type: string, format: uuid }
+        name: { type: string }
+        status: { $ref: '#/components/schemas/CredentialStatus' }
+        credential_generation: { type: integer, format: int64 }
+        fingerprint: { type: string }
+        scopes:
+          type: array
+          items: { $ref: '#/components/schemas/ServiceScope' }
+        tenant_external_id: { type: [string, 'null'] }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+    JsonSchema:
+      oneOf:
+        - type: object
+          additionalProperties: true
+        - type: boolean
+    OAuthAdapterContribution:
+      type: object
+      additionalProperties: false
+      required: [login_url, poll_url, refresh_url]
+      properties:
+        login_url: { type: string, format: uri }
+        poll_url: { type: string, format: uri }
+        refresh_url: { type: string, format: uri }
+    ProviderType:
+      type: object
+      additionalProperties: false
+      required: [id, display_name, protocols, modalities, config_schema, credential_schema, source]
+      properties:
+        id: { type: string }
+        display_name: { type: string }
+        protocols:
+          type: array
+          items: { type: string, enum: [openai, anthropic, generation] }
+        modalities:
+          type: array
+          items: { type: string, enum: [text, embedding, image, video, audio] }
+        config_schema: { $ref: '#/components/schemas/JsonSchema' }
+        credential_schema: { $ref: '#/components/schemas/JsonSchema' }
+        oauth_adapter:
+          oneOf:
+            - $ref: '#/components/schemas/OAuthAdapterContribution'
+            - type: 'null'
+        source: { type: string }
+    ApiKeyCredential:
+      type: object
+      additionalProperties: false
+      required: [type, value]
+      properties:
+        type: { const: api_key }
+        value: { type: string, minLength: 1, writeOnly: true }
+        header: { type: string, default: authorization }
+        prefix: { type: string, default: 'Bearer ' }
+    OAuthCredential:
+      type: object
+      additionalProperties: false
+      required: [type, access_token]
+      properties:
+        type: { const: oauth }
+        access_token: { type: string, minLength: 1, writeOnly: true }
+        refresh_token: { type: [string, 'null'], writeOnly: true }
+        expires_at: { type: [integer, 'null'], format: int64 }
+        header: { type: string, default: authorization }
+        prefix: { type: string, default: 'Bearer ' }
+    NoAuthCredential:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type: { const: none }
+    SubscriptionBridgeCredential:
+      type: object
+      additionalProperties: false
+      required: [type, handle]
+      properties:
+        type: { const: subscription_bridge }
+        handle: { type: string, pattern: '^[A-Za-z0-9]{1,80}$', writeOnly: true }
+        secret: { type: [string, 'null'], writeOnly: true }
+    UpstreamCredential:
+      oneOf:
+        - $ref: '#/components/schemas/NoAuthCredential'
+        - $ref: '#/components/schemas/ApiKeyCredential'
+        - $ref: '#/components/schemas/OAuthCredential'
+        - $ref: '#/components/schemas/SubscriptionBridgeCredential'
+      discriminator:
+        propertyName: type
+        mapping:
+          none: '#/components/schemas/NoAuthCredential'
+          api_key: '#/components/schemas/ApiKeyCredential'
+          oauth: '#/components/schemas/OAuthCredential'
+          subscription_bridge: '#/components/schemas/SubscriptionBridgeCredential'
+    CreateUpstreamProviderRequest:
+      type: object
+      additionalProperties: false
+      required: [name, config, credential]
+      properties:
+        tenant_external_id: { type: string, default: default, minLength: 1, maxLength: 200 }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        driver: { type: string, default: http-json }
+        config:
+          type: object
+          required: [base_url]
+          additionalProperties: true
+          properties:
+            base_url: { type: string, format: uri }
+        credential: { $ref: '#/components/schemas/UpstreamCredential' }
+    ReplaceUpstreamProviderRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, name, config, expected_updated_at]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        config:
+          type: object
+          additionalProperties: true
+          description: Complete provider configuration, validated against the existing driver's JSON Schema. Authentication material is not accepted here.
+        expected_updated_at: { type: integer, format: int64 }
+    SetUpstreamProviderStatusRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, status, expected_updated_at]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        status: { type: string, enum: [active, disabled] }
+        expected_updated_at: { type: integer, format: int64 }
+    UpstreamProvider:
+      type: object
+      additionalProperties: false
+      required: [id, tenant_id, tenant_external_id, name, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, route_count, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        tenant_external_id: { type: [string, 'null'] }
+        name: { type: string }
+        driver: { type: string }
+        auth_kind: { type: string, enum: [none, api_key, oauth], description: Stored authentication family. Subscription bridges use the OAuth family internally. }
+        connection_method: { type: string, enum: [none, api_key, oauth, subscription_bridge], description: Presentation/discovery metadata; every value remains the same unified upstream resource. }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+        status: { type: string, enum: [active, disabled] }
+        config: { type: object, additionalProperties: true }
+        credential_expires_at: { type: [integer, 'null'], format: int64 }
+        route_count: { type: integer, format: int64, minimum: 0, description: Includes disabled routes retained for audit. }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+    UpstreamHealthResult:
+      type: object
+      additionalProperties: false
+      required: [account_id, status, checked_at]
+      properties:
+        account_id: { type: string, format: uuid }
+        status: { type: string, enum: [healthy, unhealthy] }
+        error_code:
+          type: [string, 'null']
+          enum: [credential_invalid, destination_invalid, authentication_failed, upstream_unavailable, connection_failed, null]
+        upstream_status: { type: integer, minimum: 100, maximum: 599, description: Present when an HTTP response was received; its body is discarded. }
+        latency_ms: { type: integer, format: int64, minimum: 0, description: Present when a network probe was attempted. }
+        checked_at: { type: integer, format: int64 }
+    StartCursorOAuthRequest:
+      type: object
+      additionalProperties: false
+      required: [account_name, provider_config]
+      properties:
+        tenant_external_id: { type: string, default: default }
+        account_name: { type: string, minLength: 1 }
+        provider_driver: { type: string, default: http-json }
+        provider_config: { type: object, additionalProperties: true }
+        endpoints:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [login_url, poll_url, refresh_url]
+          properties:
+            login_url: { type: string, format: uri }
+            poll_url: { type: string, format: uri }
+            refresh_url: { type: string, format: uri }
+          description: Custom endpoints are accepted only when the server explicitly enables loopback OAuth for tests.
+    StartProviderAdapterOAuthRequest:
+      type: object
+      additionalProperties: false
+      required: [account_name, provider_driver, provider_config]
+      properties:
+        tenant_external_id: { type: string, default: default }
+        account_name: { type: string, minLength: 1 }
+        provider_driver: { type: string, minLength: 1 }
+        provider_config: { type: object, additionalProperties: true }
+    StartSubscriptionBridgeRequest:
+      type: object
+      additionalProperties: false
+      required: [account_name, provider, base_url]
+      properties:
+        tenant_external_id: { type: string, default: default }
+        account_name: { type: string, minLength: 1 }
+        provider: { type: string, enum: [copilot, cursor] }
+        base_url: { type: string, format: uri }
+        bridge_secret: { type: [string, 'null'], writeOnly: true }
+    OAuthLoginStart:
+      type: object
+      additionalProperties: false
+      required: [driver, login_url, session_token, expires_at, poll_after_seconds]
+      properties:
+        driver: { type: string }
+        login_url: { type: string, format: uri }
+        session_token: { type: string, writeOnly: true, description: "Authenticated, encrypted login state." }
+        expires_at: { type: integer, format: int64 }
+        poll_after_seconds: { type: integer, format: int64, minimum: 0 }
+    OAuthPollRequest:
+      type: object
+      required: [session_token]
+      properties:
+        session_token: { type: string, writeOnly: true }
+    OAuthPending:
+      type: object
+      required: [status, retry_after_seconds]
+      properties:
+        status: { const: pending }
+        retry_after_seconds: { type: integer, format: int64, minimum: 0 }
+        message: { type: [string, 'null'] }
+    CpaSubscriptionImportRequest:
+      type: object
+      required: [bridge_base_url, auth_files]
+      properties:
+        tenant_external_id: { type: string, default: default }
+        bridge_base_url: { type: string, format: uri }
+        bridge_secret: { type: [string, 'null'], writeOnly: true }
+        auth_files:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: object
+            required: [filename, document]
+            properties:
+              filename: { type: string, pattern: '^[^/\\]{1,200}\.json$' }
+              document: { type: object, additionalProperties: true, writeOnly: true }
+    CpaSubscriptionImportResult:
+      type: object
+      required: [imported, skipped]
+      properties:
+        imported:
+          type: array
+          items:
+            type: object
+            required: [source_fingerprint, provider, account]
+            properties:
+              source_fingerprint: { type: string }
+              provider: { type: string, enum: [copilot, cursor] }
+              label: { type: [string, 'null'] }
+              account: { $ref: '#/components/schemas/UpstreamProvider' }
+        skipped:
+          type: array
+          items:
+            type: object
+            required: [source_fingerprint, reason]
+            properties:
+              source_fingerprint: { type: string }
+              reason: { const: requires_provider_adapter }
+    PluginManifest:
+      type: object
+      required: [id, version, wit_version, capabilities, contributions]
+      properties:
+        id: { type: string }
+        version: { type: string }
+        wit_version: { type: string }
+        wasm: { type: [string, 'null'] }
+        capabilities:
+          type: array
+          items: { type: object, additionalProperties: true }
+        contributions:
+          type: object
+          required: [traffic_policy, providers]
+          properties:
+            traffic_policy: { type: boolean }
+            providers:
+              type: array
+              items: { $ref: '#/components/schemas/ProviderType' }
+    CreateModelRouteRequest:
+      type: object
+      additionalProperties: false
+      required: [public_model, upstream_account_id, upstream_model, protocol]
+      properties:
+        tenant_external_id: { type: string, default: default }
+        public_model: { type: string, minLength: 1 }
+        upstream_account_id: { type: string, format: uuid }
+        upstream_model: { type: string, minLength: 1 }
+        protocol: { type: string, enum: [openai, anthropic, generation] }
+        priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000, default: 0 }
+    ReplaceModelRouteRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, public_model, upstream_account_id, upstream_model, protocol, priority, expected_updated_at]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        public_model: { type: string, minLength: 1, maxLength: 200 }
+        upstream_account_id: { type: string, format: uuid }
+        upstream_model: { type: string, minLength: 1, maxLength: 200 }
+        protocol: { type: string, enum: [openai, anthropic, generation] }
+        priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000 }
+        expected_updated_at: { type: integer, format: int64 }
+    SetModelRouteEnabledRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, enabled, expected_updated_at]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        enabled: { type: boolean }
+        expected_updated_at: { type: integer, format: int64 }
+    ModelRoute:
+      type: object
+      additionalProperties: false
+      required: [id, tenant_id, tenant_external_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        tenant_external_id: { type: [string, 'null'] }
+        public_model: { type: string }
+        upstream_account_id: { type: string, format: uuid }
+        upstream_model: { type: string }
+        protocol: { type: string, enum: [openai, anthropic, generation] }
+        priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000 }
+        enabled: { type: boolean }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+    TokenPriceRequest:
+      type: object
+      additionalProperties: false
+      required: [input_per_million, output_per_million]
+      properties:
+        input_per_million: { $ref: '#/components/schemas/NonNegativeMoney' }
+        cached_input_per_million:
+          $ref: '#/components/schemas/NonNegativeMoney'
+          description: Defaults to `input_per_million`; that fallback is marked estimated in the stored tier.
+        cache_write_per_million:
+          $ref: '#/components/schemas/NonNegativeMoney'
+          description: Defaults to `input_per_million`; that fallback is marked estimated in the stored tier.
+        output_per_million: { $ref: '#/components/schemas/NonNegativeMoney' }
+        service_tier:
+          allOf: [{ $ref: '#/components/schemas/ServiceTier' }]
+          default: default
+    ModelPrice:
+      type: object
+      additionalProperties: false
+      required: [model, currency, input_per_million, output_per_million, source, updated_at, tiers]
+      properties:
+        model: { type: string }
+        currency: { $ref: '#/components/schemas/Currency' }
+        input_per_million: { $ref: '#/components/schemas/NonNegativeMoney' }
+        output_per_million: { $ref: '#/components/schemas/NonNegativeMoney' }
+        source: { type: string, description: "`manual`, `models.dev`, `litellm`, or `openrouter`." }
+        updated_at: { type: integer, format: int64 }
+        tiers:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/ModelPriceTier' }
+    ModelPriceTier:
+      type: object
+      additionalProperties: false
+      required: [service_tier, input_per_million, cached_input_per_million, cache_write_per_million, output_per_million, source, updated_at, cache_price_estimated]
+      properties:
+        service_tier: { $ref: '#/components/schemas/ServiceTier' }
+        input_per_million: { $ref: '#/components/schemas/NonNegativeMoney' }
+        cached_input_per_million: { $ref: '#/components/schemas/NonNegativeMoney' }
+        cache_write_per_million: { $ref: '#/components/schemas/NonNegativeMoney' }
+        output_per_million: { $ref: '#/components/schemas/NonNegativeMoney' }
+        source: { type: string, description: "`manual`, `models.dev`, `litellm`, or `openrouter`." }
+        updated_at: { type: integer, format: int64 }
+        cache_price_estimated: { type: boolean, description: True when a source omitted cache read or write pricing and the input price was used conservatively. }
+    ModelPriceWriteResult:
+      $ref: '#/components/schemas/ModelPrice'
+    ModelUsageSummary:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items:
+            type: object
+            required: [model, calls, input_tokens, output_tokens]
+            properties:
+              model: { type: string }
+              calls: { type: integer, format: int64 }
+              input_tokens: { type: integer, format: int64 }
+              output_tokens: { type: integer, format: int64 }
+    ModelPriceSyncRequest:
+      type: object
+      properties:
+        models:
+          type: array
+          items: { type: string, minLength: 1 }
+          default: []
+        currency: { $ref: '#/components/schemas/Currency' }
+        tenant_external_id: { type: [string, 'null'] }
+    ModelPriceSyncResult:
+      type: object
+      required: [source, sources, imported, matched, candidates, unmatched, preserved, sourceResults, prices]
+      properties:
+        source: { type: string }
+        sources:
+          type: array
+          items: { type: string }
+        imported: { type: integer, minimum: 0 }
+        matched:
+          type: array
+          items: { type: string }
+        candidates:
+          type: array
+          items:
+            type: object
+            required: [model, candidates]
+            properties:
+              model: { type: string }
+              candidates:
+                type: array
+                items:
+                  type: object
+                  required: [sourceModelId, source, reason, inputPerMillion, outputPerMillion, serviceTier]
+                  properties:
+                    sourceModelId: { type: string }
+                    source: { type: string }
+                    reason: { type: string }
+                    inputPerMillion: { $ref: '#/components/schemas/NonNegativeMoney' }
+                    outputPerMillion: { $ref: '#/components/schemas/NonNegativeMoney' }
+                    serviceTier: { $ref: '#/components/schemas/ServiceTier' }
+        unmatched:
+          type: array
+          items: { type: string }
+        preserved:
+          type: array
+          items: { type: string }
+        sourceResults:
+          type: array
+          items:
+            type: object
+            required: [source, models, skipped]
+            properties:
+              source: { type: string }
+              models: { type: integer, minimum: 0 }
+              skipped: { type: integer, minimum: 0 }
+              error: { type: string }
+        prices:
+          type: array
+          items: { $ref: '#/components/schemas/ModelPrice' }
+    GenerationPriceRequest:
+      type: object
+      required: [billing_unit, price_per_unit]
+      properties:
+        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        price_per_unit: { $ref: '#/components/schemas/NonNegativeMoney' }
+    GenerationPrice:
+      type: object
+      required: [id, model, currency, billing_unit, price_per_unit]
+      properties:
+        id: { type: string, format: uuid }
+        model: { type: string }
+        currency: { $ref: '#/components/schemas/Currency' }
+        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        price_per_unit: { $ref: '#/components/schemas/NonNegativeMoney' }
+    GrantRequest:
+      type: object
+      required: [amount, source]
+      properties:
+        amount: { $ref: '#/components/schemas/NonNegativeMoney' }
+        source: { type: string, minLength: 1, maxLength: 200 }
+    GrantReversalRequest:
+      type: object
+      required: [grant_idempotency_key, source]
+      properties:
+        grant_idempotency_key: { type: string, minLength: 1, maxLength: 200 }
+        source: { type: string, minLength: 1, maxLength: 200 }
+    LedgerEntry:
+      type: object
+      required: [entry_id, kind, amount, currency, source, idempotency_key, created_at]
+      properties:
+        entry_id: { type: string, format: uuid }
+        kind: { type: string, enum: [grant, grant_reversal, usage, entitlement_adjustment] }
+        amount: { $ref: '#/components/schemas/Money' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        source: { type: string }
+        idempotency_key: { type: [string, 'null'] }
+        created_at: { type: integer, format: int64 }
+    EntitlementIdentity:
+      type: string
+      minLength: 1
+      maxLength: 200
+      pattern: '^[A-Za-z0-9._:-]+$'
+    ReconcileEntitlementRequest:
+      type: object
+      additionalProperties: false
+      required: [account_id, provider, external_subscription_id, external_cycle_id, period_start, period_end, currency, desired, version, source]
+      properties:
+        tenant_external_id:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 200
+          description: Required for a global service credential; a scoped credential may omit it and is always bound to its own tenant.
+        account_id: { type: string, format: uuid }
+        provider: { $ref: '#/components/schemas/EntitlementIdentity' }
+        external_subscription_id: { $ref: '#/components/schemas/EntitlementIdentity' }
+        external_cycle_id: { $ref: '#/components/schemas/EntitlementIdentity' }
+        period_start: { type: integer, format: int64, minimum: 0 }
+        period_end: { type: integer, format: int64, minimum: 1, description: Must be greater than `period_start`. }
+        currency: { $ref: '#/components/schemas/Currency' }
+        desired: { $ref: '#/components/schemas/NonNegativeMoney' }
+        version: { type: integer, format: int64, minimum: 1 }
+        source: { type: string, minLength: 1, maxLength: 200 }
+        proration:
+          description: Optional provider/business proration evidence, stored canonically; serialized size is limited to 4 KiB.
+    CancelEntitlementRequest:
+      type: object
+      additionalProperties: false
+      required: [provider, external_subscription_id, version, source]
+      properties:
+        tenant_external_id:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 200
+          description: Required for a global service credential; a scoped credential may omit it.
+        provider: { $ref: '#/components/schemas/EntitlementIdentity' }
+        external_subscription_id: { $ref: '#/components/schemas/EntitlementIdentity' }
+        external_cycle_id:
+          oneOf:
+            - $ref: '#/components/schemas/EntitlementIdentity'
+            - type: 'null'
+          description: Optional stale-cycle guard for the current billing cycle.
+        version: { type: integer, format: int64, minimum: 1 }
+        source: { type: string, minLength: 1, maxLength: 200 }
+    ReplaceEntitlementRequest:
+      type: object
+      additionalProperties: false
+      required: [provider, external_subscription_id, version, source, replacement]
+      properties:
+        tenant_external_id:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 200
+          description: Required for a global service credential; a scoped credential may omit it.
+        provider: { $ref: '#/components/schemas/EntitlementIdentity' }
+        external_subscription_id: { $ref: '#/components/schemas/EntitlementIdentity' }
+        version: { type: integer, format: int64, minimum: 1, description: New version for the old stable subscription identity. }
+        source: { type: string, minLength: 1, maxLength: 200 }
+        replacement:
+          allOf:
+            - $ref: '#/components/schemas/ReconcileEntitlementRequest'
+          description: Full snapshot for a different stable subscription identity in the same tenant and account.
+    Entitlement:
+      type: object
+      required: [entitlement_id, cycle_id, tenant_external_id, account_id, provider, external_subscription_id, external_cycle_id, period_start, period_end, currency, desired, consumed, remaining, status, version, replaced_by_entitlement_id, created_at, updated_at]
+      properties:
+        entitlement_id: { type: string, format: uuid, description: Stable provider/subscription identity. }
+        cycle_id: { type: string, format: uuid, description: Stable current billing-cycle identity. }
+        tenant_external_id: { type: string }
+        account_id: { type: string, format: uuid }
+        provider: { type: string }
+        external_subscription_id: { type: string }
+        external_cycle_id: { type: string }
+        period_start: { type: integer, format: int64 }
+        period_end: { type: integer, format: int64 }
+        currency: { $ref: '#/components/schemas/Currency' }
+        desired: { $ref: '#/components/schemas/NonNegativeMoney' }
+        consumed:
+          $ref: '#/components/schemas/NonNegativeMoney'
+          description: Settled usage attributed FIFO to entitlement cycles active for this stable account.
+        remaining: { $ref: '#/components/schemas/NonNegativeMoney' }
+        status: { type: string, enum: [active, cancelled, replaced] }
+        version: { type: integer, format: int64, minimum: 1 }
+        replaced_by_entitlement_id: { type: [string, 'null'], format: uuid }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+    EntitlementResult:
+      allOf:
+        - $ref: '#/components/schemas/Entitlement'
+        - type: object
+          required: [ledger_delta, replaced_entitlement_id]
+          properties:
+            ledger_delta:
+              $ref: '#/components/schemas/Money'
+              description: Net account movement from this atomic operation; a negative value withdraws unused entitlement credit.
+            replaced_entitlement_id:
+              type: [string, 'null']
+              format: uuid
+              description: Old stable subscription identity, populated only by replace.
+    RequestSummary:
+      type: object
+      required: [request_id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost, error_code]
+      properties:
+        request_id: { type: string, format: uuid }
+        created_at: { type: integer, format: int64 }
+        protocol: { type: string }
+        model: { type: string }
+        status_code: { type: [integer, 'null'], format: int64 }
+        duration_ms: { type: [integer, 'null'], format: int64 }
+        input_tokens: { type: integer, format: int64 }
+        output_tokens: { type: integer, format: int64 }
+        cost: { $ref: '#/components/schemas/Money' }
+        error_code: { type: [string, 'null'] }
+    RequestDetail:
+      allOf:
+        - $ref: '#/components/schemas/RequestSummary'
+        - type: object
+          required: [request_body, response_body, archive_complete]
+          properties:
+            request_body: true
+            response_body: true
+            archive_complete: { type: boolean }
+    StatisticsSummary:
+      type: object
+      required: [total_requests, successful_requests, failed_requests, input_tokens, output_tokens, total_cost]
+      properties:
+        total_requests: { type: integer, format: int64 }
+        successful_requests: { type: integer, format: int64 }
+        failed_requests: { type: integer, format: int64 }
+        input_tokens: { type: integer, format: int64 }
+        output_tokens: { type: integer, format: int64 }
+        total_cost: { $ref: '#/components/schemas/Money' }
+    StatisticsBucket:
+      type: object
+      required: [name, requests, input_tokens, output_tokens, cost]
+      properties:
+        name: { type: string }
+        requests: { type: integer, format: int64 }
+        input_tokens: { type: integer, format: int64 }
+        output_tokens: { type: integer, format: int64 }
+        cost: { $ref: '#/components/schemas/Money' }
+    Statistics:
+      type: object
+      required: [summary, by_model, by_day, errors]
+      properties:
+        summary: { $ref: '#/components/schemas/StatisticsSummary' }
+        by_model:
+          type: array
+          items: { $ref: '#/components/schemas/StatisticsBucket' }
+        by_day:
+          type: array
+          items: { $ref: '#/components/schemas/StatisticsBucket' }
+        errors:
+          type: array
+          items: { $ref: '#/components/schemas/StatisticsBucket' }
+    GenerationJob:
+      type: object
+      required: [job_id, created_at, updated_at, completed_at, model, driver, status, upstream_job_id, estimated_units, billed_units, cost, error_code, result]
+      properties:
+        job_id: { type: string, format: uuid }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+        completed_at: { type: [integer, 'null'], format: int64 }
+        model: { type: string }
+        driver: { type: string }
+        status: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
+        upstream_job_id: { type: [string, 'null'] }
+        estimated_units: { type: integer, format: int64 }
+        billed_units: { type: [integer, 'null'], format: int64 }
+        cost: { $ref: '#/components/schemas/Money' }
+        error_code: { type: [string, 'null'] }
+        result: true
+    ConversationCluster:
+      type: object
+      required: [cluster_id, explicit_session_id, updated_at, request_count, candidate_edge_count]
+      properties:
+        cluster_id: { type: string, format: uuid }
+        explicit_session_id: { type: [string, 'null'] }
+        updated_at: { type: integer, format: int64 }
+        request_count: { type: integer, format: int64 }
+        candidate_edge_count: { type: integer, format: int64 }
+    ConversationEdge:
+      type: object
+      required: [from_request_id, to_request_id, relation, confidence, evidence]
+      properties:
+        from_request_id: { type: [string, 'null'], format: uuid }
+        to_request_id: { type: string, format: uuid }
+        relation: { type: string, enum: [continues, retry, edit, branch, compacts, subagent, candidate] }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        evidence: { type: object, additionalProperties: true }
+    ConversationDetail:
+      type: object
+      required: [cluster, requests, edges]
+      properties:
+        cluster: { $ref: '#/components/schemas/ConversationCluster' }
+        requests:
+          type: array
+          items: { $ref: '#/components/schemas/RequestSummary' }
+        edges:
+          type: array
+          items: { $ref: '#/components/schemas/ConversationEdge' }
+    OpenAIModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object: { const: list }
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, object, owned_by]
+            properties:
+              id: { type: string }
+              object: { const: model }
+              owned_by: { const: memeloop-token-center }
+    OpenAIChatRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: true
+      properties:
+        model: { type: string, minLength: 1 }
+        messages: { type: array, items: true }
+        stream: { type: boolean }
+    OpenAIResponseRequest:
+      type: object
+      required: [model, input]
+      additionalProperties: true
+      properties:
+        model: { type: string, minLength: 1 }
+        input: true
+        stream: { type: boolean }
+        previous_response_id:
+          type: [string, 'null']
+          maxLength: 256
+          description: |
+            OpenAI Responses continuation identifier. Schema v16 stores a successful
+            upstream response `id` on the prior logical-conversation observation, so a
+            later request can use this value as direct parent evidence even when the
+            client does not send Token Center-specific turn headers.
+    OpenAIEmbeddingRequest:
+      type: object
+      required: [model, input]
+      additionalProperties: true
+      properties:
+        model: { type: string, minLength: 1 }
+        input: true
+    AnthropicMessageRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: true
+      properties:
+        model: { type: string, minLength: 1 }
+        messages: { type: array, items: true }
+        max_tokens: { type: integer, minimum: 1 }
+        stream: { type: boolean }
+    AsyncGenerationRequest:
+      type: object
+      additionalProperties: false
+      required: [model, input]
+      properties:
+        model: { type: string, minLength: 1, maxLength: 200 }
+        input: { type: object, additionalProperties: true, description: Provider-native Seedance task body or administrator-owned ComfyUI workflow inputs. }
+    OpenAIImageRequest:
+      type: object
+      required: [model, prompt]
+      additionalProperties: true
+      properties:
+        model: { type: string, minLength: 1, maxLength: 200 }
+        prompt: { type: string, minLength: 1, maxLength: 32000 }

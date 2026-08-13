@@ -2,6 +2,7 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public readonly status: number,
+    public readonly code?: string,
   ) {
     super(message);
   }
@@ -21,13 +22,17 @@ export async function api<T>(
     },
   });
   const text = await response.text();
-  const body = text ? (JSON.parse(text) as T | { error?: { message?: string } }) : ({} as T);
+  let body: T | { error?: { code?: string; message?: string } } = {} as T;
+  if (text) {
+    try { body = JSON.parse(text) as T | { error?: { code?: string; message?: string } }; }
+    catch {
+      if (!response.ok) throw new ApiError(`HTTP ${response.status}`, response.status);
+      throw new ApiError(`HTTP ${response.status}: invalid JSON response`, response.status);
+    }
+  }
   if (!response.ok) {
-    const message =
-      typeof body === 'object' && body && 'error' in body
-        ? body.error?.message
-        : undefined;
-    throw new ApiError(message ?? `HTTP ${response.status}`, response.status);
+    const error = typeof body === 'object' && body && 'error' in body ? body.error : undefined;
+    throw new ApiError(error?.message ?? `HTTP ${response.status}`, response.status, error?.code);
   }
   return body as T;
 }

@@ -1,0 +1,16 @@
+{
+  "data": [
+    {
+      "id": "openai/gpt-priority",
+      "pricing": { "prompt": "0.000011", "completion": "0.000012" }
+    },
+    {
+      "id": "openai/gpt-openrouter",
+      "pricing": { "prompt": "0.000013", "input_cache_read": "0.0000013", "input_cache_write": "0.000015", "completion": "0.000014" }
+    },
+    {
+      "id": "missing-output",
+      "pricing": { "prompt": "0.000099" }
+    }
+  ]
+}

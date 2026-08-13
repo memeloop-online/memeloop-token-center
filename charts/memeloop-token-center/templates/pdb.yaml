@@ -10,7 +10,11 @@ metadata:
     {{- include "memeloop-token-center.labels" $ | nindent 4 }}
     app.kubernetes.io/component: {{ $role }}
 spec:
+  {{- if hasKey $roleConfig.podDisruptionBudget "maxUnavailable" }}
+  maxUnavailable: {{ $roleConfig.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
   minAvailable: {{ $roleConfig.podDisruptionBudget.minAvailable }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "memeloop-token-center.name" $ }}

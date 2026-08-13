@@ -9,6 +9,16 @@ fullnameOverride: ""
 
 migration:
   enabled: true
+  # The hook is the only component that applies schema migrations. Application
+  # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
+  backoffLimit: 4
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 3600
+  annotations: {}
+  podAnnotations: {}
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 250m, memory: 128Mi }
 
 serviceAccount:
   create: true
@@ -27,10 +37,18 @@ roles:
       requests: { cpu: 100m, memory: 128Mi }
       limits: { cpu: "1", memory: 256Mi }
     autoscaling:
-      enabled: true
+      # Size this together with config.databaseMaxConnections and the database
+      # connection budget before enabling.
+      enabled: false
       minReplicas: 2
       maxReplicas: 20
       targetCPUUtilizationPercentage: 70
+      metrics: []
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+        scaleUp:
+          stabilizationWindowSeconds: 30
     podDisruptionBudget:
       enabled: true
       minAvailable: 1
@@ -44,8 +62,14 @@ roles:
     resources:
       requests: { cpu: 50m, memory: 128Mi }
       limits: { cpu: 500m, memory: 256Mi }
-    autoscaling: { enabled: false }
-    podDisruptionBudget: { enabled: false }
+    autoscaling:
+      enabled: false
+      minReplicas: 1
+      maxReplicas: 3
+      targetCPUUtilizationPercentage: 70
+      metrics: []
+      behavior: {}
+    podDisruptionBudget: { enabled: false, minAvailable: 1 }
   worker:
     enabled: true
     replicaCount: 1
@@ -53,8 +77,14 @@ roles:
     resources:
       requests: { cpu: 100m, memory: 192Mi }
       limits: { cpu: "1", memory: 384Mi }
-    autoscaling: { enabled: false }
-    podDisruptionBudget: { enabled: false }
+    autoscaling:
+      enabled: false
+      minReplicas: 1
+      maxReplicas: 3
+      targetCPUUtilizationPercentage: 70
+      metrics: []
+      behavior: {}
+    podDisruptionBudget: { enabled: false, minAvailable: 1 }
   all:
     enabled: false
     replicaCount: 1
@@ -65,10 +95,18 @@ roles:
     resources:
       requests: { cpu: 100m, memory: 192Mi }
       limits: { cpu: "1", memory: 512Mi }
-    autoscaling: { enabled: false }
-    podDisruptionBudget: { enabled: false }
+    autoscaling:
+      enabled: false
+      minReplicas: 1
+      maxReplicas: 3
+      targetCPUUtilizationPercentage: 70
+      metrics: []
+      behavior: {}
+    podDisruptionBudget: { enabled: false, minAvailable: 1 }
 
 config:
+  # Keep the sum across replicas below the PostgreSQL/PgBouncer connection budget.
+  databaseMaxConnections: 4
   databaseUrlSecret:
     name: memeloop-token-center-secrets
     key: database-url
@@ -119,10 +157,119 @@ podLabels: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
+topologySpreadConstraints: []
+# Shared upstream requests may run for up to ten minutes. Keep enough time for
+# Axum's graceful shutdown to drain them during a rollout.
+terminationGracePeriodSeconds: 660
+revisionHistoryLimit: 5
+
+# Startup and liveness prove the process is responsive. Readiness additionally
+# checks PostgreSQL and archive bucket access before receiving traffic.
+probes:
+  startup:
+    path: /healthz
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 30
+  readiness:
+    path: /readyz
+    periodSeconds: 5
+    timeoutSeconds: 1
+    failureThreshold: 3
+  liveness:
+    path: /livez
+    periodSeconds: 10
+    timeoutSeconds: 1
+    failureThreshold: 3
 
 networkPolicy:
   enabled: true
+  ingress:
+    # Namespace-local callers are allowed by default. When Ingress or Prometheus
+    # runs elsewhere, add tightly scoped rules below.
+    allowSameNamespace: true
+    # Fail closed for cross-namespace ingress. Prefer an extraRule that selects
+    # both the controller namespace and its gateway pods. As a compatibility
+    # escape hatch, controllerNamespaces allows every pod in a named namespace.
+    controllerNamespaces: []
+    extraRules: []
+    # Example:
+    # extraRules:
+    #   - from:
+    #       - namespaceSelector:
+    #           matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+    #         podSelector:
+    #           matchLabels: { app.kubernetes.io/component: controller }
+    #     ports: [{ protocol: TCP, port: 8080 }]
+  egress:
+    dns:
+      enabled: true
+      namespaceSelector:
+        matchLabels: { kubernetes.io/metadata.name: kube-system }
+      podSelector:
+        matchLabels: { k8s-app: kube-dns }
+    # Application roles do not need to call one another directly. Define
+    # selector-based extraRules for same- or cross-namespace PostgreSQL/S3.
+    allowSameNamespace: false
+    # Private cluster CIDRs vary and a whole-RFC1918 allowlist is too broad.
+    # Keep this disabled and use selector-based extraRules in deployment values.
+    clusterDependencies:
+      enabled: false
+      cidrs: []
+      ports: []
+    # Enable only when config.outboundProxy.url is configured, and narrow the
+    # CIDR to the actual proxy endpoint whenever it is stable.
+    outboundProxy:
+      enabled: false
+      cidrs: []
+      ports: []
+    # Public OAuth, pricing catalogs and API providers normally use HTTPS.
+    # Private and carrier-grade NAT ranges remain excluded and must be granted
+    # explicitly with extraRules for PostgreSQL, S3, proxies or private upstreams.
+    publicInternet:
+      enabled: true
+      cidrs:
+        - cidr: 0.0.0.0/0
+          except:
+            - 10.0.0.0/8
+            - 100.64.0.0/10
+            - 127.0.0.0/8
+            - 169.254.0.0/16
+            - 172.16.0.0/12
+            - 192.168.0.0/16
+            - 198.18.0.0/15
+            - 224.0.0.0/4
+            - 240.0.0.0/4
+      ports:
+        - { protocol: TCP, port: 80 }
+        - { protocol: TCP, port: 443 }
+    extraRules: []
+    # Private production dependencies must be explicit. Example:
+    # extraRules:
+    #   - to:
+    #       - namespaceSelector:
+    #           matchLabels: { kubernetes.io/metadata.name: database }
+    #         podSelector:
+    #           matchLabels: { cnpg.io/cluster: token-center-pg }
+    #     ports: [{ protocol: TCP, port: 5432 }]
+    #   - to: [{ ipBlock: { cidr: 100.64.0.2/32 } }]
+    #     ports: [{ protocol: TCP, port: 1080 }]
 
 serviceMonitor:
   enabled: false
   interval: 30s
+  scrapeTimeout: 10s
+  sampleLimit: 10000
+  path: /metrics
+  scheme: http
+  labels: {}
+  annotations: {}
+  namespace: ""
+  namespaceSelector: {}
+  scraperNamespaces: [monitoring]
+  honorLabels: false
+  # Prefer a dedicated service credential with only `metrics:read`. The
+  # bootstrap service credential remains the zero-extra-secret default.
+  authorizationSecret:
+    name: memeloop-token-center-secrets
+    key: service-token

@@ -1,17 +1,104 @@
 {{- if .Values.networkPolicy.enabled }}
+{{- $ingress := .Values.networkPolicy.ingress }}
+{{- $egress := .Values.networkPolicy.egress }}
+{{- $serviceMonitor := .Values.serviceMonitor }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "memeloop-token-center.fullname" . }}
+  labels:
+    {{- include "memeloop-token-center.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
       app.kubernetes.io/name: {{ include "memeloop-token-center.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
   policyTypes: [Ingress, Egress]
+  {{- if or $ingress.allowSameNamespace (gt (len $ingress.controllerNamespaces) 0) (and $serviceMonitor.enabled (gt (len $serviceMonitor.scraperNamespaces) 0)) (gt (len $ingress.extraRules) 0) }}
   ingress:
-    - ports: [{ protocol: TCP, port: 8080 }]
+    {{- if $ingress.allowSameNamespace }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace | quote }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+    {{- end }}
+    {{- if gt (len $ingress.controllerNamespaces) 0 }}
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values:
+                  {{- toYaml $ingress.controllerNamespaces | nindent 18 }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+    {{- end }}
+    {{- if and $serviceMonitor.enabled (gt (len $serviceMonitor.scraperNamespaces) 0) }}
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values:
+                  {{- toYaml $serviceMonitor.scraperNamespaces | nindent 18 }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+    {{- end }}
+    {{- range $rule := $ingress.extraRules }}
+    - {{- toYaml $rule | nindent 6 }}
+    {{- end }}
+  {{- else }}
+  ingress: []
+  {{- end }}
+  {{- if or $egress.dns.enabled $egress.allowSameNamespace $egress.clusterDependencies.enabled $egress.outboundProxy.enabled $egress.publicInternet.enabled (gt (len $egress.extraRules) 0) }}
   egress:
-    - {}
+    {{- if $egress.dns.enabled }}
+    - to:
+        - namespaceSelector:
+            {{- toYaml $egress.dns.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml $egress.dns.podSelector | nindent 12 }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    {{- end }}
+    {{- if $egress.allowSameNamespace }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace | quote }}
+    {{- end }}
+    {{- if $egress.clusterDependencies.enabled }}
+    - to:
+        {{- range $cidr := $egress.clusterDependencies.cidrs }}
+        - ipBlock: { cidr: {{ $cidr | quote }} }
+        {{- end }}
+      ports:
+        {{- toYaml $egress.clusterDependencies.ports | nindent 8 }}
+    {{- end }}
+    {{- if $egress.outboundProxy.enabled }}
+    - to:
+        {{- range $cidr := $egress.outboundProxy.cidrs }}
+        - ipBlock: { cidr: {{ $cidr | quote }} }
+        {{- end }}
+      ports:
+        {{- toYaml $egress.outboundProxy.ports | nindent 8 }}
+    {{- end }}
+    {{- if $egress.publicInternet.enabled }}
+    - to:
+        {{- range $cidr := $egress.publicInternet.cidrs }}
+        - ipBlock:
+            {{- toYaml $cidr | nindent 12 }}
+        {{- end }}
+      ports:
+        {{- toYaml $egress.publicInternet.ports | nindent 8 }}
+    {{- end }}
+    {{- range $rule := $egress.extraRules }}
+    - {{- toYaml $rule | nindent 6 }}
+    {{- end }}
+  {{- else }}
+  egress: []
+  {{- end }}
 {{- end }}
-

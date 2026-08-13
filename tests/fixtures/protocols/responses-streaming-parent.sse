@@ -1,0 +1,7 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp-streaming-parent","object":"response"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp-streaming-parent","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}
+
+data: [DONE]

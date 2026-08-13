@@ -1,0 +1,31 @@
+{
+  "providers": {
+    "openai": {
+      "models": {
+        "gpt-priority": {
+          "cost": { "input": "1.25", "cache_read": "0.25", "cache_write": "1.5", "output": "2.5" }
+        },
+        "gpt-manual": {
+          "cost": { "input": "10", "output": "20" }
+        },
+        "gpt-missing-output": {
+          "cost": { "input": "99" }
+        }
+      }
+    },
+    "azure": {
+      "models": {
+        "gpt-conflict": {
+          "cost": { "input": "7", "output": "8" }
+        }
+      }
+    },
+    "other": {
+      "models": {
+        "gpt-conflict": {
+          "cost": { "input": "9", "output": "10" }
+        }
+      }
+    }
+  }
+}

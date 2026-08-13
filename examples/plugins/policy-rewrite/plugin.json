@@ -1,0 +1,68 @@
+{
+  "id": "example-policy-rewrite",
+  "version": "1.0.0",
+  "wit_version": "0.1.0",
+  "wasm": "plugin.wasm",
+  "capabilities": [],
+  "contributions": {
+    "traffic_policy": true,
+    "providers": [
+      {
+        "id": "example-oauth-http",
+        "display_name": "Example OAuth HTTP",
+        "protocols": ["openai", "anthropic"],
+        "modalities": ["text", "embedding"],
+        "config_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["base_url"],
+          "properties": {
+            "base_url": {
+              "type": "string",
+              "format": "uri",
+              "title": "API base URL"
+            },
+            "network_scope": {
+              "type": "string",
+              "enum": ["public", "private"],
+              "default": "public"
+            }
+          }
+        },
+        "credential_schema": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "oneOf": [
+            {
+              "title": "API credential",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type", "value"],
+              "properties": {
+                "type": { "const": "api_key" },
+                "value": { "type": "string", "minLength": 1, "writeOnly": true }
+              }
+            },
+            {
+              "title": "OAuth credential",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type", "access_token"],
+              "properties": {
+                "type": { "const": "oauth" },
+                "access_token": { "type": "string", "minLength": 1, "writeOnly": true },
+                "refresh_token": { "type": "string", "writeOnly": true },
+                "expires_at": { "type": "integer" }
+              }
+            }
+          ]
+        },
+        "oauth_adapter": {
+          "login_url": "https://oauth.example.com/device/login",
+          "poll_url": "https://oauth.example.com/device/poll",
+          "refresh_url": "https://oauth.example.com/token/refresh"
+        }
+      }
+    ]
+  }
+}

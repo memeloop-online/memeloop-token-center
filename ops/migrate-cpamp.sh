@@ -8,12 +8,15 @@ set -eu
 : "${PGDATABASE:?PGDATABASE is required}"
 : "${CPAMP_SQLITE_PATH:=/source/usage.sqlite}"
 : "${IMPORT_TENANT_EXTERNAL_ID:=cpa-dogfood-import}"
+: "${CPAMP_IMPORT_SOURCE:=cpamp-usage-events-v1}"
 : "${CPAMP_OVERLAP_MS:=86400000}"
 : "${CPAMP_RESET_IMPORT:=false}"
 : "${CPAMP_RESET_CONFIRM:=}"
+: "${CPAMP_ALLOW_UNMAPPED:=false}"
 
 case "$CPAMP_OVERLAP_MS" in *[!0-9]*|'') echo "CPAMP_OVERLAP_MS must be an integer" >&2; exit 2;; esac
 case "$CPAMP_RESET_IMPORT" in true|false) ;; *) echo "CPAMP_RESET_IMPORT must be true or false" >&2; exit 2;; esac
+case "$CPAMP_ALLOW_UNMAPPED" in true|false) ;; *) echo "CPAMP_ALLOW_UNMAPPED must be true or false" >&2; exit 2;; esac
 [ "$CPAMP_RESET_IMPORT" = false ] || [ "$IMPORT_TENANT_EXTERNAL_ID" = "cpa-dogfood-import" ] || {
   echo "reset is only allowed for the cpa-dogfood-import tenant" >&2
   exit 2
@@ -23,23 +26,92 @@ case "$CPAMP_RESET_IMPORT" in true|false) ;; *) echo "CPAMP_RESET_IMPORT must be
   exit 2
 }
 [ -r "$CPAMP_SQLITE_PATH" ] || { echo "CPAMP SQLite database is not readable" >&2; exit 2; }
+case "$CPAMP_IMPORT_SOURCE" in *[!A-Za-z0-9._:-]*|'') echo "CPAMP_IMPORT_SOURCE contains unsupported characters" >&2; exit 2;; esac
 
 # Use libpq's individual environment variables so credentials never appear in
 # argv and the Debian psql wrapper never interprets a URI as a local database.
 export PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE
 
+cleanup_import_lock() {
+  if [ -n "${CPAMP_LOCK_PID:-}" ]; then
+    kill "$CPAMP_LOCK_PID" 2>/dev/null || true
+    wait "$CPAMP_LOCK_PID" 2>/dev/null || true
+  fi
+  if [ -n "${CPAMP_LOCK_APP:-}" ]; then
+    psql_target -v lock_app="$CPAMP_LOCK_APP" -At >/dev/null 2>&1 <<'SQL' || true
+SELECT pg_terminate_backend(pid)
+  FROM pg_stat_activity
+ WHERE application_name = :'lock_app'
+   AND usename = current_user
+   AND pid <> pg_backend_pid();
+SQL
+  fi
+  if [ -n "${CPAMP_LOCK_STATUS_FILE:-}" ]; then
+    rm -f "$CPAMP_LOCK_STATUS_FILE"
+  fi
+}
+trap cleanup_import_lock EXIT HUP INT TERM
+
+# Hold a session-level advisory lock across SQLite extraction and the final transaction.
+# This prevents two CronJobs from truncating or mixing the shared staging tables.
 psql_target() {
   psql -X -v ON_ERROR_STOP=1 --no-psqlrc "$@"
 }
 
-psql_target <<'SQL'
+# The staging tables are intentionally shared to keep COPY fast, so imports for
+# different tenants and sources must also serialize on one global lock.
+lock_key="memeloop-token-center:cpamp:global-staging-v1"
+CPAMP_LOCK_STATUS_FILE=$(mktemp /tmp/mtc-cpamp-lock.XXXXXX)
+CPAMP_LOCK_APP="mtc-cpamp-lock-${CPAMP_LOCK_STATUS_FILE##*.}"
+lock_app=$CPAMP_LOCK_APP
+PGAPPNAME="$lock_app" psql -X -v ON_ERROR_STOP=1 --no-psqlrc \
+  -v lock_key="$lock_key" -At >/dev/null <<SQL &
+SET lock_timeout = '30s';
+SELECT pg_advisory_lock(hashtextextended(:'lock_key', 734627102948313));
+SELECT pg_sleep(86400);
+SQL
+CPAMP_LOCK_PID=$!
+lock_acquired=false
+attempt=0
+while [ "$attempt" -lt 30 ]; do
+  lock_ready=$(psql_target -v lock_app="$lock_app" -At <<'SQL'
+SELECT EXISTS (
+  SELECT 1 FROM pg_stat_activity
+   WHERE application_name = :'lock_app' AND wait_event = 'PgSleep'
+);
+SQL
+)
+  if [ "$lock_ready" = t ]; then
+    lock_acquired=true
+    break
+  fi
+  kill -0 "$CPAMP_LOCK_PID" 2>/dev/null || break
+  attempt=$((attempt + 1))
+  sleep 1
+done
+[ "$lock_acquired" = true ] || { echo "another CPAMP import is running or the import lock failed" >&2; exit 2; }
+
+psql_target -v tenant_external_id="$IMPORT_TENANT_EXTERNAL_ID" <<'SQL'
 CREATE TABLE IF NOT EXISTS cpamp_import_checkpoints (
-  source text PRIMARY KEY,
+  tenant_external_id text NOT NULL,
+  source text NOT NULL,
   watermark_ms bigint NOT NULL,
   watermark_hash text NOT NULL,
   imported_events bigint NOT NULL,
-  updated_at bigint NOT NULL
+  updated_at bigint NOT NULL,
+  PRIMARY KEY (tenant_external_id, source)
 );
+ALTER TABLE cpamp_import_checkpoints
+  ADD COLUMN IF NOT EXISTS tenant_external_id text;
+UPDATE cpamp_import_checkpoints
+   SET tenant_external_id = :'tenant_external_id'
+ WHERE tenant_external_id IS NULL;
+ALTER TABLE cpamp_import_checkpoints
+  ALTER COLUMN tenant_external_id SET NOT NULL;
+ALTER TABLE cpamp_import_checkpoints
+  DROP CONSTRAINT IF EXISTS cpamp_import_checkpoints_pkey;
+ALTER TABLE cpamp_import_checkpoints
+  ADD CONSTRAINT cpamp_import_checkpoints_pkey PRIMARY KEY (tenant_external_id, source);
 CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_usage (
   event_hash text, request_id text, timestamp_ms bigint, provider text,
   model text, endpoint text, api_key_hash text, input_tokens bigint,
@@ -64,8 +136,10 @@ TRUNCATE cpamp_import_usage, cpamp_import_aliases, cpamp_import_prices,
 SQL
 
 if [ "$CPAMP_RESET_IMPORT" = true ]; then
-  psql_target -v tenant_external_id="$IMPORT_TENANT_EXTERNAL_ID" <<'SQL'
+  psql_target -v tenant_external_id="$IMPORT_TENANT_EXTERNAL_ID" -v import_source="$CPAMP_IMPORT_SOURCE" <<'SQL'
 BEGIN;
+DELETE FROM request_event_locators
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
 DELETE FROM request_events
  WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
 DELETE FROM conversation_edges
@@ -91,6 +165,8 @@ DELETE FROM usage_daily_aggregates
    SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id
     WHERE t.external_id = :'tenant_external_id'
  ) OR key_id LIKE 'cpamp-key-%';
+DELETE FROM request_record_locators
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
 DELETE FROM request_records
  WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
 DELETE FROM legacy_key_credentials
@@ -126,7 +202,7 @@ DELETE FROM ledger_entries
 DELETE FROM model_routes
  WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
 DELETE FROM upstream_credentials
- WHERE account_id IN (
+ WHERE upstream_account_id IN (
    SELECT u.id FROM upstream_accounts u JOIN tenants t ON t.id = u.tenant_id
     WHERE t.external_id = :'tenant_external_id'
  );
@@ -139,12 +215,19 @@ DELETE FROM credit_accounts
 DELETE FROM principals
  WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
 DELETE FROM tenants WHERE external_id = :'tenant_external_id';
-DELETE FROM cpamp_import_checkpoints WHERE source = 'cpamp-usage-events-v1';
+DELETE FROM cpamp_import_checkpoints
+ WHERE tenant_external_id = :'tenant_external_id' AND source = :'import_source';
 COMMIT;
 SQL
 fi
 
-watermark_ms=$(psql_target -Atc "SELECT COALESCE((SELECT watermark_ms FROM cpamp_import_checkpoints WHERE source = 'cpamp-usage-events-v1'), 0)")
+watermark_ms=$(psql_target -v tenant_external_id="$IMPORT_TENANT_EXTERNAL_ID" -v import_source="$CPAMP_IMPORT_SOURCE" -At <<'SQL'
+SELECT COALESCE((
+  SELECT watermark_ms FROM cpamp_import_checkpoints
+   WHERE tenant_external_id = :'tenant_external_id' AND source = :'import_source'
+), 0);
+SQL
+)
 case "$watermark_ms" in *[!0-9]*|'') echo "invalid PostgreSQL import watermark" >&2; exit 2;; esac
 if [ "$watermark_ms" -gt "$CPAMP_OVERLAP_MS" ]; then
   lower_bound_ms=$((watermark_ms - CPAMP_OVERLAP_MS))
@@ -173,7 +256,17 @@ sqlite3 -header -csv "$CPAMP_SQLITE_PATH" \
      FROM model_prices;" \
   | psql_target -c "\\copy cpamp_import_prices FROM STDIN WITH (FORMAT csv, HEADER true)"
 
-psql_target -v tenant_external_id="$IMPORT_TENANT_EXTERNAL_ID" <<'SQL'
+staged_count=$(psql_target -Atc "SELECT count(*) FROM cpamp_import_usage")
+unmapped_count=$(psql_target -Atc "SELECT count(*) FROM cpamp_import_usage WHERE api_key_hash IS NULL OR length(api_key_hash) <> 64")
+duplicate_count=$(psql_target -Atc "SELECT COALESCE(sum(events - 1), 0) FROM (SELECT count(*) AS events FROM cpamp_import_usage GROUP BY event_hash HAVING count(*) > 1) duplicates")
+case "$staged_count:$unmapped_count:$duplicate_count" in *[!0-9:]*|'') echo "invalid CPAMP staging validation result" >&2; exit 2;; esac
+if [ "$unmapped_count" -gt 0 ] && [ "$CPAMP_ALLOW_UNMAPPED" != true ]; then
+  echo "CPAMP import stopped: $unmapped_count staged events have no supported key identity; set CPAMP_ALLOW_UNMAPPED=true only after accepting that data loss" >&2
+  exit 2
+fi
+echo "CPAMP staged=$staged_count unmapped=$unmapped_count duplicate_event_hashes=$duplicate_count" >&2
+
+psql_target -v tenant_external_id="$IMPORT_TENANT_EXTERNAL_ID" -v import_source="$CPAMP_IMPORT_SOURCE" <<'SQL'
 BEGIN;
 
 WITH digest AS (SELECT md5('tenant:' || :'tenant_external_id') AS value)
@@ -258,17 +351,96 @@ SELECT substr(r.value,1,8)||'-'||substr(r.value,9,4)||'-5'||substr(r.value,14,3)
             THEN 'inline-json:' || jsonb_build_object('source','cpamp','error',u.fail_summary)::text
             ELSE 'gap://cpamp/' || u.event_hash END,
        'cpamp-import:' || u.event_hash
-  FROM cpamp_import_usage u
+  FROM (SELECT DISTINCT ON (event_hash) * FROM cpamp_import_usage
+         ORDER BY event_hash, timestamp_ms DESC, request_id DESC) u
   JOIN cpamp_import_identities i USING (api_key_hash)
   JOIN tenants t ON t.external_id = :'tenant_external_id'
   LEFT JOIN model_prices p ON p.model = u.model AND p.currency = 'USD'
-  CROSS JOIN LATERAL (SELECT md5('request:cpamp:' || u.event_hash) AS value) r
- WHERE NOT EXISTS (
-       SELECT 1 FROM request_records existing
-        WHERE existing.id = substr(r.value,1,8)||'-'||substr(r.value,9,4)||'-5'||substr(r.value,14,3)||'-a'||substr(r.value,18,3)||'-'||substr(r.value,21,12)
- );
+  CROSS JOIN LATERAL (SELECT md5('request:cpamp:' ||
+    CASE WHEN :'tenant_external_id' = 'cpa-dogfood-import' AND :'import_source' = 'cpamp-usage-events-v1'
+         THEN '' ELSE :'tenant_external_id' || ':' || :'import_source' || ':' END || u.event_hash) AS value) r
+;
+
+CREATE TEMP TABLE cpamp_import_claimed_requests (
+  id text PRIMARY KEY
+) ON COMMIT DROP;
+WITH claimed AS (
+  INSERT INTO request_record_locators (id, created_at, tenant_id, key_id)
+  SELECT id, created_at, tenant_id, key_id
+    FROM cpamp_import_new_requests
+  ON CONFLICT (id) DO NOTHING
+  RETURNING id
+)
+INSERT INTO cpamp_import_claimed_requests (id)
+SELECT id FROM claimed;
+
+-- A replay is accepted only when the stable routing coordinates are identical
+-- and the pointed-to leaf row exists.  The CHECK makes every other collision
+-- abort the surrounding transaction instead of silently selecting one row.
+CREATE TEMP TABLE cpamp_import_locator_conflicts (
+  id text,
+  invalid boolean NOT NULL CHECK (invalid = false)
+) ON COMMIT DROP;
+INSERT INTO cpamp_import_locator_conflicts (id, invalid)
+SELECT n.id, true
+  FROM cpamp_import_new_requests n
+  JOIN request_record_locators l ON l.id = n.id
+ WHERE l.created_at <> n.created_at
+    OR l.tenant_id <> n.tenant_id
+    OR l.key_id <> n.key_id
+    OR (
+      NOT EXISTS (SELECT 1 FROM cpamp_import_claimed_requests c WHERE c.id = n.id)
+      AND NOT EXISTS (
+        SELECT 1 FROM request_records r
+         WHERE r.id = l.id AND r.created_at = l.created_at
+           AND r.tenant_id = l.tenant_id AND r.key_id = l.key_id
+      )
+    );
+
+-- Only the transaction that won the locator claim may create the partitioned
+-- leaf and contribute aggregates.  Exact-coordinate replays remain no-ops.
+DELETE FROM cpamp_import_new_requests n
+ WHERE NOT EXISTS (SELECT 1 FROM cpamp_import_claimed_requests c WHERE c.id = n.id);
 
 INSERT INTO request_records SELECT * FROM cpamp_import_new_requests;
+
+-- Preserve the source request identity independently from the deterministic target UUID.
+-- cpa-session-archive uses the same CPA request id; keeping the CPAMP event hash, timestamp,
+-- model and key hash here lets its body importer fail closed instead of guessing by time.
+INSERT INTO import_request_links
+  (tenant_id, source, external_event_hash, external_request_id, source_key_hash,
+   target_request_id, source_created_at, source_model, created_at)
+SELECT t.id, :'import_source', u.event_hash, u.request_id, u.api_key_hash,
+       substr(r.value,1,8)||'-'||substr(r.value,9,4)||'-5'||substr(r.value,14,3)||'-a'||substr(r.value,18,3)||'-'||substr(r.value,21,12),
+       u.timestamp_ms, COALESCE(NULLIF(u.model, ''), '-'),
+       (extract(epoch from clock_timestamp()) * 1000)::bigint
+  FROM (SELECT DISTINCT ON (event_hash) * FROM cpamp_import_usage
+         ORDER BY event_hash, timestamp_ms DESC, request_id DESC) u
+  JOIN tenants t ON t.external_id = :'tenant_external_id'
+  CROSS JOIN LATERAL (SELECT md5('request:cpamp:' ||
+    CASE WHEN :'tenant_external_id' = 'cpa-dogfood-import' AND :'import_source' = 'cpamp-usage-events-v1'
+         THEN '' ELSE :'tenant_external_id' || ':' || :'import_source' || ':' END || u.event_hash) AS value) r
+ WHERE COALESCE(u.request_id, '') <> '' AND length(COALESCE(u.api_key_hash, '')) = 64
+ON CONFLICT (tenant_id, source, external_event_hash) DO UPDATE SET
+  external_request_id = excluded.external_request_id,
+  source_key_hash = excluded.source_key_hash,
+  target_request_id = excluded.target_request_id,
+  source_created_at = excluded.source_created_at,
+  source_model = excluded.source_model;
+
+-- Earlier CPAMP imports stored a tiny synthetic inline-json marker instead of a body.
+-- Only rows proven by the link above are normalized to an explicit gap. The archive importer
+-- subsequently replaces gap:// values only and therefore can never overwrite a real object.
+UPDATE request_records r
+   SET request_object = 'gap://cpamp/' || l.external_event_hash || '/request'
+  FROM import_request_links l
+  JOIN request_record_locators rl
+    ON rl.id = l.target_request_id AND rl.tenant_id = l.tenant_id
+ WHERE l.tenant_id = r.tenant_id
+   AND l.target_request_id = r.id
+   AND rl.created_at = r.created_at
+   AND l.source = :'import_source'
+   AND r.request_object LIKE 'inline-json:%';
 
 INSERT INTO usage_daily_aggregates
   (key_id, day_bucket, model, status_class, error_code, requests,
@@ -287,13 +459,13 @@ ON CONFLICT (key_id, day_bucket, model, status_class, error_code) DO UPDATE SET
   cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros;
 
 INSERT INTO cpamp_import_checkpoints
-  (source, watermark_ms, watermark_hash, imported_events, updated_at)
-SELECT 'cpamp-usage-events-v1', COALESCE(max(timestamp_ms), 0),
+  (tenant_external_id, source, watermark_ms, watermark_hash, imported_events, updated_at)
+SELECT :'tenant_external_id', :'import_source', COALESCE(max(timestamp_ms), 0),
        COALESCE((array_agg(event_hash ORDER BY timestamp_ms DESC, event_hash DESC))[1], ''),
        (SELECT count(*) FROM cpamp_import_new_requests),
        (extract(epoch from clock_timestamp()) * 1000)::bigint
   FROM cpamp_import_usage
-ON CONFLICT (source) DO UPDATE SET
+ON CONFLICT (tenant_external_id, source) DO UPDATE SET
   watermark_ms = GREATEST(cpamp_import_checkpoints.watermark_ms, excluded.watermark_ms),
   watermark_hash = CASE WHEN excluded.watermark_ms >= cpamp_import_checkpoints.watermark_ms
                         THEN excluded.watermark_hash ELSE cpamp_import_checkpoints.watermark_hash END,
@@ -304,5 +476,6 @@ COMMIT;
 ANALYZE request_records;
 ANALYZE usage_daily_aggregates;
 SELECT imported_events AS total_imported_events, watermark_ms
-  FROM cpamp_import_checkpoints WHERE source = 'cpamp-usage-events-v1';
+  FROM cpamp_import_checkpoints
+ WHERE tenant_external_id = :'tenant_external_id' AND source = :'import_source';
 SQL

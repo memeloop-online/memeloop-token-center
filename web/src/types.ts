@@ -72,6 +72,16 @@ export interface ModelPriceView {
   output_per_million: string;
   source: 'manual' | 'models.dev' | 'litellm' | 'openrouter' | string;
   updated_at: number;
+  tiers: Array<{
+    service_tier: string;
+    input_per_million: string;
+    cached_input_per_million: string;
+    cache_write_per_million: string;
+    output_per_million: string;
+    source: 'manual' | 'models.dev' | 'litellm' | 'openrouter' | string;
+    updated_at: number;
+    cache_price_estimated: boolean;
+  }>;
 }
 
 export interface ModelPriceUsageSummary {
@@ -83,7 +93,7 @@ export interface ModelPriceSyncResult {
   sources: string[];
   imported: number;
   matched: string[];
-  candidates: Array<{ model: string; candidates: Array<{ sourceModelId: string; source: string; reason: string; inputPerMillion: string; outputPerMillion: string }> }>;
+  candidates: Array<{ model: string; candidates: Array<{ sourceModelId: string; source: string; reason: string; inputPerMillion: string; outputPerMillion: string; serviceTier: string }> }>;
   unmatched: string[];
   preserved: string[];
   sourceResults: Array<{ source: string; models: number; skipped: number; error?: string }>;
@@ -92,7 +102,11 @@ export interface ModelPriceSyncResult {
 
 export interface KeyView {
   key_id: string;
+  account_id?: string;
+  tenant_external_id?: string;
+  principal_external_id?: string;
   alias: string;
+  status?: string;
   currency: string;
   credential_generation: number;
   created_at: number;
@@ -106,6 +120,42 @@ export interface KeyView {
     lifetime_budget: string | null;
   };
   available_balance: string;
+  reserved_balance?: string;
+  updated_at?: number;
+  fingerprint?: string | null;
+}
+
+export interface ServiceTokenView {
+  service_id: string;
+  name: string;
+  credential_generation: number;
+  fingerprint: string;
+  scopes: string[];
+  tenant_external_id: string | null;
+  status?: string;
+  created_at?: number;
+}
+
+export interface ModelRouteView {
+  id: string;
+  tenant_id?: string;
+  tenant_external_id?: string;
+  public_model: string;
+  upstream_account_id: string;
+  upstream_model: string;
+  protocol: string;
+  priority: number;
+  enabled: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface GenerationPriceView {
+  id?: string;
+  model: string;
+  currency: string;
+  billing_unit: string;
+  price_per_unit: string;
 }
 
 export interface ConversationCluster {
@@ -182,12 +232,23 @@ export interface UpstreamAccount {
   name: string;
   driver: string;
   auth_kind: string;
+  connection_method: 'api_key' | 'oauth' | 'subscription_bridge' | 'none' | string;
   credential_generation: number;
   status: string;
   credential_expires_at: number | null;
+  route_count: number;
   config: Record<string, unknown>;
   created_at: number;
   updated_at: number;
+}
+
+export interface UpstreamHealth {
+  account_id: string;
+  status: 'healthy' | 'unhealthy';
+  error_code?: string | null;
+  upstream_status?: number;
+  latency_ms?: number;
+  checked_at: number;
 }
 
 export interface ConfigurationSchemas {

@@ -6,11 +6,15 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod generation;
+pub mod metrics;
 pub mod model;
+pub mod network;
 pub mod oauth;
 pub mod plugin;
 pub mod pricing;
 pub mod provider;
+pub mod schema;
+pub mod session_archive_import;
 pub mod worker;
 
 use std::{sync::Arc, time::Duration};
@@ -36,12 +40,16 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub providers: ProviderCatalog,
     pub plugins: PluginRuntime,
+    pub metrics: metrics::Metrics,
 }
 
 impl AppState {
     pub async fn initialize(config: Config) -> anyhow_free::Result<Self> {
-        let db = Database::connect(&config.database_url).await?;
-        db.migrate().await?;
+        let db = Database::connect_with_max(&config.database_url, config.database_max_connections)
+            .await?;
+        if config.run_migrations_on_start {
+            db.migrate().await?;
+        }
         let archive = ArchiveStore::from_config(&config).await?;
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())?;
         let mut providers = ProviderCatalog::builtins();
@@ -53,19 +61,38 @@ impl AppState {
             archive,
             providers,
             plugins,
+            metrics: metrics::Metrics::default(),
             http: build_http_client()?,
         })
     }
 }
 
-fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
+fn base_http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(HTTP_READ_TIMEOUT)
         .timeout(HTTP_REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
+        // An inherited proxy would perform its own DNS lookup and bypass
+        // resolve_to_addrs pinning. A future trusted proxy must be explicit.
+        .no_proxy()
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(30))
+}
+
+pub(crate) fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    base_http_client_builder().build()
+}
+
+pub(crate) fn build_pinned_http_client(
+    hostname: &str,
+    addresses: &[std::net::SocketAddr],
+) -> Result<reqwest::Client, reqwest::Error> {
+    base_http_client_builder()
+        // These clients live for one outbound operation. Do not retain a pool
+        // for arbitrary provider hostnames after the operation is dropped.
+        .pool_max_idle_per_host(0)
+        .resolve_to_addrs(hostname, addresses)
         .build()
 }
 
@@ -76,9 +103,12 @@ mod anyhow_free {
 #[cfg(test)]
 mod tests {
     use reqwest::StatusCode;
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, path},
+    };
 
-    use super::build_http_client;
+    use super::{build_http_client, build_pinned_http_client};
 
     #[tokio::test]
     async fn shared_http_client_does_not_follow_redirects() {
@@ -96,5 +126,30 @@ mod tests {
             .expect("redirect response");
 
         assert_eq!(response.status(), StatusCode::FOUND);
+    }
+
+    #[tokio::test]
+    async fn pinned_client_keeps_the_original_http_host() {
+        let server = MockServer::start().await;
+        let expected_host = format!("pin-test.invalid:{}", server.address().port());
+        Mock::given(path("/probe"))
+            .and(header("host", expected_host))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_pinned_http_client("pin-test.invalid", &[*server.address()])
+            .expect("pinned HTTP client");
+        let response = client
+            .get(format!(
+                "http://pin-test.invalid:{}/probe",
+                server.address().port()
+            ))
+            .send()
+            .await
+            .expect("pinned request");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 }

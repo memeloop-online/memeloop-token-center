@@ -31,6 +31,8 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
     secretKeyRef:
       name: {{ .Values.config.databaseUrlSecret.name }}
       key: {{ .Values.config.databaseUrlSecret.key }}
+- name: MTC_DATABASE_MAX_CONNECTIONS
+  value: {{ .Values.config.databaseMaxConnections | quote }}
 - name: MTC_KEY_PEPPER
   valueFrom:
     secretKeyRef:

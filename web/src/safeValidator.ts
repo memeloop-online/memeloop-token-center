@@ -75,7 +75,7 @@ function validate(schema: Schema, value: unknown, root: Schema, path: Array<stri
     addError(errors, 'type', `must be ${types.join(' or ')}`, path, `${schemaPath}/type`, { type: schema.type });
     return false;
   }
-  if (schema.const !== undefined && !deepEquals(value, schema.const)) addError(errors, 'const', 'must equal the configured value', path, `${schemaPath}/const`);
+  if (schema.const !== undefined && !deepEquals(value, schema.const)) addError(errors, 'const', 'must equal the configured value', path, `${schemaPath}/const`, { allowedValue: schema.const });
   if (schema.enum && !schema.enum.some((item) => deepEquals(value, item))) addError(errors, 'enum', 'must be one of the allowed values', path, `${schemaPath}/enum`);
 
   schema.allOf?.forEach((entry, index) => validate(entry, value, root, path, `${schemaPath}/allOf/${index}`, errors, depth + 1));
@@ -89,23 +89,23 @@ function validate(schema: Schema, value: unknown, root: Schema, path: Array<stri
   }
 
   if (typeof value === 'string') {
-    if (schema.minLength !== undefined && value.length < schema.minLength) addError(errors, 'minLength', `must contain at least ${schema.minLength} characters`, path, `${schemaPath}/minLength`);
-    if (schema.maxLength !== undefined && value.length > schema.maxLength) addError(errors, 'maxLength', `must contain at most ${schema.maxLength} characters`, path, `${schemaPath}/maxLength`);
+    if (schema.minLength !== undefined && value.length < schema.minLength) addError(errors, 'minLength', `must contain at least ${schema.minLength} characters`, path, `${schemaPath}/minLength`, { limit: schema.minLength });
+    if (schema.maxLength !== undefined && value.length > schema.maxLength) addError(errors, 'maxLength', `must contain at most ${schema.maxLength} characters`, path, `${schemaPath}/maxLength`, { limit: schema.maxLength });
     if (schema.pattern) {
       if (!validPattern(schema.pattern, value)) addError(errors, 'pattern', 'has an invalid or unsafe format constraint', path, `${schemaPath}/pattern`);
     }
-    if (schema.format && !validFormat(schema.format, value)) addError(errors, 'format', `must be a valid ${schema.format}`, path, `${schemaPath}/format`);
+    if (schema.format && !validFormat(schema.format, value)) addError(errors, 'format', `must be a valid ${schema.format}`, path, `${schemaPath}/format`, { format: schema.format });
   }
   if (typeof value === 'number') {
-    if (schema.minimum !== undefined && value < schema.minimum) addError(errors, 'minimum', `must be at least ${schema.minimum}`, path, `${schemaPath}/minimum`);
-    if (schema.maximum !== undefined && value > schema.maximum) addError(errors, 'maximum', `must be at most ${schema.maximum}`, path, `${schemaPath}/maximum`);
-    if (schema.exclusiveMinimum !== undefined && value <= Number(schema.exclusiveMinimum)) addError(errors, 'exclusiveMinimum', `must be greater than ${schema.exclusiveMinimum}`, path, `${schemaPath}/exclusiveMinimum`);
-    if (schema.exclusiveMaximum !== undefined && value >= Number(schema.exclusiveMaximum)) addError(errors, 'exclusiveMaximum', `must be less than ${schema.exclusiveMaximum}`, path, `${schemaPath}/exclusiveMaximum`);
-    if (schema.multipleOf !== undefined && Math.abs(value / schema.multipleOf - Math.round(value / schema.multipleOf)) > 1e-9) addError(errors, 'multipleOf', `must be a multiple of ${schema.multipleOf}`, path, `${schemaPath}/multipleOf`);
+    if (schema.minimum !== undefined && value < schema.minimum) addError(errors, 'minimum', `must be at least ${schema.minimum}`, path, `${schemaPath}/minimum`, { limit: schema.minimum });
+    if (schema.maximum !== undefined && value > schema.maximum) addError(errors, 'maximum', `must be at most ${schema.maximum}`, path, `${schemaPath}/maximum`, { limit: schema.maximum });
+    if (schema.exclusiveMinimum !== undefined && value <= Number(schema.exclusiveMinimum)) addError(errors, 'exclusiveMinimum', `must be greater than ${schema.exclusiveMinimum}`, path, `${schemaPath}/exclusiveMinimum`, { limit: schema.exclusiveMinimum });
+    if (schema.exclusiveMaximum !== undefined && value >= Number(schema.exclusiveMaximum)) addError(errors, 'exclusiveMaximum', `must be less than ${schema.exclusiveMaximum}`, path, `${schemaPath}/exclusiveMaximum`, { limit: schema.exclusiveMaximum });
+    if (schema.multipleOf !== undefined && Math.abs(value / schema.multipleOf - Math.round(value / schema.multipleOf)) > 1e-9) addError(errors, 'multipleOf', `must be a multiple of ${schema.multipleOf}`, path, `${schemaPath}/multipleOf`, { limit: schema.multipleOf });
   }
   if (Array.isArray(value)) {
-    if (schema.minItems !== undefined && value.length < schema.minItems) addError(errors, 'minItems', `must contain at least ${schema.minItems} items`, path, `${schemaPath}/minItems`);
-    if (schema.maxItems !== undefined && value.length > schema.maxItems) addError(errors, 'maxItems', `must contain at most ${schema.maxItems} items`, path, `${schemaPath}/maxItems`);
+    if (schema.minItems !== undefined && value.length < schema.minItems) addError(errors, 'minItems', `must contain at least ${schema.minItems} items`, path, `${schemaPath}/minItems`, { limit: schema.minItems });
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) addError(errors, 'maxItems', `must contain at most ${schema.maxItems} items`, path, `${schemaPath}/maxItems`, { limit: schema.maxItems });
     if (schema.uniqueItems && new Set(value.map((item) => JSON.stringify(item))).size !== value.length) addError(errors, 'uniqueItems', 'must not contain duplicate items', path, `${schemaPath}/uniqueItems`);
     if (schema.items && !Array.isArray(schema.items)) value.forEach((item, index) => validate(schema.items as Schema, item, root, [...path, index], `${schemaPath}/items`, errors, depth + 1));
   }

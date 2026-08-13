@@ -30,6 +30,8 @@ impl RuntimeRole {
 pub struct Config {
     pub listen: String,
     pub database_url: String,
+    pub database_max_connections: u32,
+    pub run_migrations_on_start: bool,
     pub key_pepper: String,
     pub service_token: String,
     pub archive_backend: ArchiveBackend,
@@ -76,6 +78,8 @@ impl Config {
                 "MTC_DATABASE_URL",
                 "postgres://postgres:postgres@127.0.0.1:5432/memeloop_token_center",
             ),
+            database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
+            run_migrations_on_start: env_bool("MTC_RUN_MIGRATIONS_ON_START", true),
             key_pepper,
             service_token: required("MTC_SERVICE_TOKEN")?,
             archive_backend,
@@ -99,6 +103,8 @@ impl Config {
         Self {
             listen: "127.0.0.1:0".to_owned(),
             database_url,
+            database_max_connections: 8,
+            run_migrations_on_start: true,
             key_pepper: "test-pepper-must-have-at-least-32-bytes".to_owned(),
             service_token: "test-service-token".to_owned(),
             archive_backend: ArchiveBackend::Memory,
@@ -134,6 +140,15 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_u32(name: &'static str, default: u32) -> Result<u32, ConfigError> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|_| ConfigError::InvalidInteger(name, value)),
+        Err(_) => Ok(default),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("missing required environment variable {0}")]
@@ -142,4 +157,6 @@ pub enum ConfigError {
     WeakKeyPepper,
     #[error("unsupported archive backend: {0}")]
     InvalidArchiveBackend(String),
+    #[error("{0} must be an unsigned integer, received {1}")]
+    InvalidInteger(&'static str, String),
 }

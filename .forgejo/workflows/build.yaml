@@ -47,6 +47,8 @@ jobs:
           SHORT_SHA=$(printf '%s' "${FORGEJO_SHA}" | cut -c1-7)
           DATE_TAG=$(date -u +%Y%m%d)
           IMAGE_TAG="${DATE_TAG}-${SHORT_SHA}"
+          BUILD_TIMESTAMP=$(git show -s --format=%cI "${FORGEJO_SHA}")
+          BUILD_TARGET="linux/$(uname -m)"
           AUTH=$(printf '%s' "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" | base64 | tr -d '\n')
           export DOCKER_CONFIG=/kaniko/.docker
           mkdir -p "${DOCKER_CONFIG}"
@@ -57,6 +59,9 @@ jobs:
             --dockerfile="${ROOT}/Dockerfile" \
             --destination="${HARBOR_HOST}/library/memeloop-token-center:${IMAGE_TAG}" \
             --destination="${HARBOR_HOST}/library/memeloop-token-center:${DATE_TAG}" \
+            --build-arg=MTC_BUILD_GIT_SHA="${FORGEJO_SHA}" \
+            --build-arg=MTC_BUILD_TIMESTAMP="${BUILD_TIMESTAMP}" \
+            --build-arg=MTC_BUILD_TARGET="${BUILD_TARGET}" \
             --cache=false \
             --insecure \
             --skip-tls-verify \

@@ -10,7 +10,10 @@ metadata:
     {{- include "memeloop-token-center.labels" $ | nindent 4 }}
     app.kubernetes.io/component: {{ $role }}
 spec:
+  revisionHistoryLimit: {{ $.Values.revisionHistoryLimit }}
+  {{- if not $roleConfig.autoscaling.enabled }}
   replicas: {{ $roleConfig.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "memeloop-token-center.name" $ }}
@@ -29,6 +32,7 @@ spec:
         {{- toYaml $.Values.podLabels | nindent 8 }}
         {{- end }}
     spec:
+      terminationGracePeriodSeconds: {{ $.Values.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "memeloop-token-center.serviceAccountName" $ }}
       automountServiceAccountToken: false
       {{- with $.Values.imagePullSecrets }}
@@ -51,6 +55,8 @@ spec:
               containerPort: 8080
           env:
             {{- include "memeloop-token-center.env" $ | nindent 12 }}
+            - name: MTC_RUN_MIGRATIONS_ON_START
+              value: "false"
             {{- include "memeloop-token-center.proxyEnv" $ | nindent 12 }}
             {{- if or (eq $role "control") (eq $role "all") }}
             - name: MTC_SERVICE_TOKEN
@@ -63,15 +69,20 @@ spec:
               value: "bootstrap-disabled-for-this-role"
             {{- end }}
           startupProbe:
-            httpGet: { path: /healthz, port: http }
-            periodSeconds: 2
-            failureThreshold: 30
+            httpGet: { path: {{ $.Values.probes.startup.path | quote }}, port: http }
+            periodSeconds: {{ $.Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ $.Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ $.Values.probes.startup.failureThreshold }}
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
-            periodSeconds: 5
+            httpGet: { path: {{ $.Values.probes.readiness.path | quote }}, port: http }
+            periodSeconds: {{ $.Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $.Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ $.Values.probes.readiness.failureThreshold }}
           livenessProbe:
-            httpGet: { path: /healthz, port: http }
-            periodSeconds: 10
+            httpGet: { path: {{ $.Values.probes.liveness.path | quote }}, port: http }
+            periodSeconds: {{ $.Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $.Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ $.Values.probes.liveness.failureThreshold }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -103,6 +114,10 @@ spec:
       {{- end }}
       {{- with $.Values.affinity }}
       affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with $.Values.tolerations }}

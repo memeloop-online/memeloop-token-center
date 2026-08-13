@@ -1,6 +1,6 @@
 # Plugin packages
 
-Token Center 插件是固定 digest 的 OCI artifact。解包后的每个插件各占一个目录，至少包含：
+本版本使用本地只读挂载作为简化且可审计的插件分发策略。每个插件各占一个目录，至少包含：
 
 - `plugin.json`：插件 id、版本、WIT API 版本、扩展点、capability allowlist 和 JSON Schema provider contribution。
 - `README.md`：使用说明。
@@ -8,6 +8,8 @@ Token Center 插件是固定 digest 的 OCI artifact。解包后的每个插件�
 - 可选 `icon.png` 与配置 JSON Schema。
 
 设置 `MTC_PLUGIN_DIR` 后，服务会在启动时编译目录下的组件；同名 provider 或不兼容的 `wit_version` 会让启动失败。Helm 用 `plugins.existingConfigMap` 或 `plugins.existingClaim` 只读挂载该目录：ConfigMap 可把一个插件包直接挂在根目录，PVC 则可在多个子目录放置多个插件包。
+
+发现过程是 fail-closed 的：可见的一级子目录必须包含 `plugin.json`，目录符号链接、逃逸包目录的 Wasm 路径、重复插件/provider ID、无效 SemVer、与 `0.1.x` 不兼容的 WIT 版本、未知 manifest 字段和不受支持的 JSON Schema 都会阻止服务启动。升级插件应先在独立实例挂载新目录并重启验收；运行中的插件目录不可原地修改。OCI 拉取和签名验证不属于本版核心，部署系统应负责校验只读挂载内容的来源和 digest。
 
 核心 key 鉴权、账本和 tenant 边界不可被插件替换。每次 traffic policy 调用使用独立 Store，限制 32 MiB 线性内存和 500 万 fuel。HTTP host call 仅允许 `plugin.json` 明确列出的精确 origin，禁止重定向，请求和响应各限制 16 MiB；返回值是 `{status, headers, body_base64}` JSON。KV host call 必须显式声明 `{"kind":"kv"}`，数据持久化在 PostgreSQL（测试可用 SQLite）的插件 ID 命名空间中；key 只接受最多 256 字节的安全 ASCII 路径，每个 value 上限 1 MiB，每个插件总量上限 16 MiB。前端扩展保持声明式，只允许 JSON Schema、说明和动作表单，不注入任意 JavaScript。
 
@@ -31,3 +33,5 @@ Provider contribution 可选声明 `oauth_adapter` 的 `login_url`、`poll_url` 
   }
 }
 ```
+
+可直接运行的 provider + OAuth + traffic policy + request rewrite 示例位于 `examples/plugins/policy-rewrite`。其中提交了可加载的 Component Model 二进制，也保留等价 WAT 供复核和可重现构建。

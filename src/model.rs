@@ -4,6 +4,7 @@ use uuid::Uuid;
 pub const MONEY_SCALE: i64 = 1_000_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyPolicy {
     #[serde(default)]
     pub allowed_models: Vec<String>,
@@ -34,11 +35,9 @@ impl Default for KeyPolicy {
 
 impl KeyPolicy {
     pub fn allows_model(&self, model: &str) -> bool {
-        self.allowed_models.is_empty()
-            || self
-                .allowed_models
-                .iter()
-                .any(|allowed| allowed == "*" || allowed == model)
+        self.allowed_models
+            .iter()
+            .any(|allowed| allowed == "*" || allowed == model)
     }
 }
 
@@ -89,6 +88,24 @@ pub struct KeyView {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct ManagedKeyView {
+    pub key_id: Uuid,
+    pub account_id: Uuid,
+    pub tenant_external_id: String,
+    pub principal_external_id: String,
+    pub alias: String,
+    pub currency: String,
+    pub status: String,
+    pub credential_generation: i64,
+    pub fingerprint: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub policy: KeyPolicy,
+    pub available_balance: String,
+    pub reserved_balance: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct LegacyCredentialView {
     pub key_id: Uuid,
     pub generation: i64,
@@ -132,6 +149,65 @@ pub struct IssuedServiceToken {
     pub fingerprint: String,
     pub scopes: Vec<String>,
     pub tenant_external_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ServiceTokenView {
+    pub service_id: Uuid,
+    pub name: String,
+    pub status: String,
+    pub credential_generation: i64,
+    pub fingerprint: String,
+    pub scopes: Vec<String>,
+    pub tenant_external_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LedgerEntryView {
+    pub entry_id: Uuid,
+    pub kind: String,
+    pub amount: String,
+    pub currency: String,
+    pub source: String,
+    pub idempotency_key: Option<String>,
+    pub created_at: i64,
+}
+
+/// Stable subscription identity plus the currently effective billing-cycle
+/// entitlement. Rotating downstream credentials never changes either ID.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntitlementView {
+    pub entitlement_id: Uuid,
+    pub cycle_id: Uuid,
+    pub tenant_external_id: String,
+    pub account_id: Uuid,
+    pub provider: String,
+    pub external_subscription_id: String,
+    pub external_cycle_id: String,
+    pub period_start: i64,
+    pub period_end: i64,
+    pub currency: String,
+    pub desired: String,
+    pub consumed: String,
+    pub remaining: String,
+    pub status: String,
+    pub version: i64,
+    pub replaced_by_entitlement_id: Option<Uuid>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntitlementReconcileResult {
+    #[serde(flatten)]
+    pub entitlement: EntitlementView,
+    /// Net credit-account movement caused by this atomic operation. A negative
+    /// value is the unused entitlement that was revoked.
+    pub ledger_delta: String,
+    /// Populated by `replace`; it identifies the old stable subscription.
+    pub replaced_entitlement_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -248,11 +324,46 @@ pub struct TenantView {
     pub external_id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelPrice {
     pub id: Uuid,
     pub input_micros_per_million: i64,
     pub output_micros_per_million: i64,
+    #[serde(default)]
+    pub tiers: Vec<ModelPriceTier>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelPriceTier {
+    pub service_tier: String,
+    pub input_micros_per_million: i64,
+    pub cached_input_micros_per_million: i64,
+    pub cache_write_micros_per_million: i64,
+    pub output_micros_per_million: i64,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Uncached input tokens. Protocol parsers normalize OpenAI's inclusive
+    /// prompt count before constructing this value.
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub output_tokens: i64,
+    pub service_tier: Option<String>,
+}
+
+impl TokenUsage {
+    pub fn total_input_tokens(&self) -> i64 {
+        self.input_tokens
+            .saturating_add(self.cached_input_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
+
+    pub fn total_tokens(&self) -> i64 {
+        self.total_input_tokens().saturating_add(self.output_tokens)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -263,6 +374,19 @@ pub struct ModelPriceView {
     pub output_per_million: String,
     pub source: String,
     pub updated_at: i64,
+    pub tiers: Vec<ModelPriceTierView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelPriceTierView {
+    pub service_tier: String,
+    pub input_per_million: String,
+    pub cached_input_per_million: String,
+    pub cache_write_per_million: String,
+    pub output_per_million: String,
+    pub source: String,
+    pub updated_at: i64,
+    pub cache_price_estimated: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -282,6 +406,7 @@ impl GenerationPrice {
             id: self.id,
             input_micros_per_million: 0,
             output_micros_per_million: self.micros_per_unit.checked_mul(1_000_000)?,
+            tiers: Vec::new(),
         })
     }
 }
@@ -330,6 +455,7 @@ pub struct UsageReservation {
     pub reserved_micros: i64,
     pub input_micros_per_million: i64,
     pub output_micros_per_million: i64,
+    pub price_tiers: Vec<ModelPriceTier>,
     pub rate_window_start: i64,
     pub reserved_tokens: i64,
 }

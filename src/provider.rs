@@ -207,6 +207,13 @@ impl ProviderCatalog {
             "required": ["base_url"],
             "properties": {
                 "base_url": {"type": "string", "format": "uri", "title": "Base URL"},
+                "network_scope": {
+                    "title": "Network scope",
+                    "type": "string",
+                    "enum": ["public", "private"],
+                    "default": "public",
+                    "description": "Private destinations require a global operator credential."
+                },
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "default": 120},
                 "image_api_mode": {
                     "title": "Image generation API",
@@ -304,6 +311,13 @@ impl ProviderCatalog {
                 "required": ["base_url"],
                 "properties": {
                     "base_url": {"type": "string", "format": "uri", "default": "https://ark.cn-beijing.volces.com"},
+                    "network_scope": {
+                        "title": "Network scope",
+                        "type": "string",
+                        "enum": ["public", "private"],
+                        "default": "public",
+                        "description": "Private Seedance destinations require a global operator credential."
+                    },
                     "result_origins": {
                         "type": "array",
                         "uniqueItems": true,
@@ -328,7 +342,8 @@ impl ProviderCatalog {
                 "required": ["base_url", "provider"],
                 "properties": {
                     "base_url": {"type": "string", "format": "uri"},
-                    "provider": {"type": "string", "enum": ["copilot", "cursor"]}
+                    "provider": {"type": "string", "enum": ["copilot", "cursor"]},
+                    "network_scope": {"const": "private", "readOnly": true}
                 }
             }),
             credential_schema: json!({
@@ -354,10 +369,22 @@ impl ProviderCatalog {
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["base_url"],
+                "required": ["base_url", "workflow_id", "workflow_template"],
                 "properties": {
                     "base_url": {"type": "string", "format": "uri"},
-                    "api_prefix": {"type": "string", "enum": ["", "/api"], "default": ""}
+                    "network_scope": {
+                        "title": "Network scope",
+                        "type": "string",
+                        "enum": ["public", "private"],
+                        "default": "private",
+                        "description": "Private ComfyUI destinations require a global operator credential."
+                    },
+                    "api_prefix": {"type": "string", "enum": ["", "/api"], "default": ""},
+                    "workflow_id": {"type": "string", "minLength": 1},
+                    "workflow_template": {
+                        "type": "object",
+                        "description": "Versioned administrator-owned graph. Use {\"$mtc_param\":\"name\"} placeholders for downstream scalar parameters."
+                    }
                 }
             }),
             credential_schema,
@@ -387,6 +414,8 @@ impl ProviderCatalog {
                     contribution.id
                 )));
             }
+            crate::schema::validate_definition(&contribution.config_schema)?;
+            crate::schema::validate_definition(&contribution.credential_schema)?;
             self.types.push(contribution);
         }
         Ok(())
@@ -401,7 +430,7 @@ impl ProviderCatalog {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UpstreamAccountView {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -409,24 +438,33 @@ pub struct UpstreamAccountView {
     pub name: String,
     pub driver: String,
     pub auth_kind: String,
+    /// How this provider was connected. This is presentation metadata only;
+    /// API keys, OAuth and subscription bridges remain the same account model.
+    pub connection_method: String,
     pub credential_generation: i64,
     pub status: String,
     pub config: Value,
     pub credential_expires_at: Option<i64>,
+    /// Number of model routes that still reference this stable upstream
+    /// identity, including disabled routes retained for audit purposes.
+    pub route_count: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ModelRouteView {
     pub id: Uuid,
     pub tenant_id: Uuid,
+    pub tenant_external_id: Option<String>,
     pub public_model: String,
     pub upstream_account_id: Uuid,
     pub upstream_model: String,
     pub protocol: String,
     pub priority: i64,
     pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -452,9 +490,13 @@ pub fn validate_config(config: &Value) -> Result<String, AppError> {
             "upstream base_url must be an HTTP(S) origin".into(),
         ));
     }
-    if parsed.username() != "" || parsed.password().is_some() || parsed.query().is_some() {
+    if parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
         return Err(AppError::BadRequest(
-            "upstream base_url cannot contain credentials or a query".into(),
+            "upstream base_url cannot contain credentials, a query, or a fragment".into(),
         ));
     }
     Ok(base_url.trim_end_matches('/').to_owned())

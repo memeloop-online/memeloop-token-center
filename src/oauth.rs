@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
+    network::{self, OutboundScope},
     provider::{UpstreamCredential, open_private_json, seal_private_json, validate_config},
 };
 
@@ -412,6 +413,7 @@ pub async fn poll_cursor_login(
     key_material: &[u8],
     now: i64,
     required_tenant: Option<&str>,
+    allow_test_loopback: bool,
 ) -> Result<CursorPollResult, AppError> {
     let state: CursorLoginState = open_private_json(session_token, key_material, CURSOR_LOGIN_AAD)
         .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
@@ -426,7 +428,21 @@ pub async fn poll_cursor_login(
         .query_pairs_mut()
         .append_pair("uuid", &state.uuid)
         .append_pair("verifier", &state.verifier);
-    let response = http
+    let scope = if state
+        .provider_config
+        .pointer("/oauth/driver")
+        .and_then(Value::as_str)
+        == Some("provider_adapter")
+    {
+        // Plugin adapters are installed by the cluster administrator and may
+        // intentionally expose their poll endpoint only inside the cluster.
+        OutboundScope::Private
+    } else {
+        OutboundScope::Public
+    };
+    let outbound_http =
+        network::client_for_url(http, poll_url.as_str(), scope, allow_test_loopback).await?;
+    let response = outbound_http
         .get(poll_url)
         .send()
         .await
@@ -668,6 +684,7 @@ mod tests {
             key_material,
             2_000,
             Some("tenant-b"),
+            true,
         )
         .await
         .expect_err("cross-tenant polling must be rejected before I/O");

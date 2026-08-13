@@ -135,6 +135,39 @@
   border-color: #86b9b1;
 }
 
+:root[data-theme='light'] .notice.error {
+  color: #8c2424;
+  background: #fff1f1;
+  border-color: #d69a9a;
+}
+
+:root[data-theme='light'] .notice.success {
+  color: #17624f;
+  background: #edf9f4;
+  border-color: #8bc8b7;
+}
+
+:root[data-theme='light'] .notice.warning {
+  color: #79590e;
+  background: #fff8e8;
+  border-color: #d6b96c;
+}
+
+:root[data-theme='light'] .status.ok {
+  color: #17624f;
+  border-color: #6eae9c;
+}
+
+:root[data-theme='light'] .status.bad {
+  color: #962f2f;
+  border-color: #cf8e8e;
+}
+
+:root[data-theme='light'] .status.pending {
+  color: #755a16;
+  border-color: #c4a858;
+}
+
 @media (width <= 900px) {
   .mobile-controls {
     display: flex;

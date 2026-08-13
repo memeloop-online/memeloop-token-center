@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "memeloop-token-center Helm values",
+  "type": "object",
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "migration": {
+      "type": "object",
+      "required": ["enabled", "backoffLimit", "activeDeadlineSeconds", "ttlSecondsAfterFinished", "resources"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "backoffLimit": { "type": "integer", "minimum": 0, "maximum": 20 },
+        "activeDeadlineSeconds": { "type": "integer", "minimum": 30 },
+        "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
+        "annotations": { "type": "object" },
+        "podAnnotations": { "type": "object" },
+        "resources": { "type": "object" }
+      }
+    },
+    "config": {
+      "type": "object",
+      "required": ["databaseMaxConnections", "databaseUrlSecret", "keyPepperSecret", "serviceTokenSecret", "archiveBackend", "s3"],
+      "properties": {
+        "databaseMaxConnections": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "archiveBackend": { "enum": ["s3", "filesystem", "memory"] },
+        "databaseUrlSecret": { "$ref": "#/definitions/secretKeyRef" },
+        "keyPepperSecret": { "$ref": "#/definitions/secretKeyRef" },
+        "serviceTokenSecret": { "$ref": "#/definitions/secretKeyRef" },
+        "s3": {
+          "type": "object",
+          "required": ["bucket", "region", "allowHttp", "credentialsSecret"],
+          "properties": {
+            "bucket": { "type": "string", "minLength": 1 },
+            "endpoint": { "type": "string" },
+            "region": { "type": "string", "minLength": 1 },
+            "allowHttp": { "type": "boolean" },
+            "credentialsSecret": {
+              "type": "object",
+              "required": ["name", "accessKey", "secretKey"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "accessKey": { "type": "string", "minLength": 1 },
+                "secretKey": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "probes": {
+      "type": "object",
+      "required": ["startup", "readiness", "liveness"],
+      "properties": {
+        "startup": { "$ref": "#/definitions/probe" },
+        "readiness": { "$ref": "#/definitions/probe" },
+        "liveness": { "$ref": "#/definitions/probe" }
+      }
+    },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+    "revisionHistoryLimit": { "type": "integer", "minimum": 0 },
+    "networkPolicy": {
+      "type": "object",
+      "required": ["enabled", "ingress", "egress"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ingress": {
+          "type": "object",
+          "required": ["allowSameNamespace", "controllerNamespaces", "extraRules"],
+          "properties": {
+            "allowSameNamespace": { "type": "boolean" },
+            "controllerNamespaces": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+            "extraRules": { "type": "array", "items": { "type": "object" } }
+          }
+        },
+        "egress": {
+          "type": "object",
+          "required": ["dns", "allowSameNamespace", "clusterDependencies", "outboundProxy", "publicInternet", "extraRules"],
+          "properties": {
+            "allowSameNamespace": { "type": "boolean" },
+            "dns": {
+              "type": "object",
+              "required": ["enabled", "namespaceSelector", "podSelector"],
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "namespaceSelector": { "$ref": "#/definitions/nonEmptyLabelSelector" },
+                "podSelector": { "$ref": "#/definitions/nonEmptyLabelSelector" }
+              }
+            },
+            "clusterDependencies": { "$ref": "#/definitions/cidrPortRule" },
+            "outboundProxy": { "$ref": "#/definitions/cidrPortRule" },
+            "publicInternet": {
+              "type": "object",
+              "required": ["enabled", "cidrs", "ports"],
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "cidrs": { "type": "array", "items": { "type": "object", "required": ["cidr"] } },
+                "ports": { "$ref": "#/definitions/ports" }
+              },
+              "allOf": [
+                {
+                  "if": { "properties": { "enabled": { "const": true } } },
+                  "then": {
+                    "properties": {
+                      "cidrs": { "minItems": 1 },
+                      "ports": { "minItems": 1 }
+                    }
+                  }
+                }
+              ]
+            },
+            "extraRules": { "type": "array", "items": { "type": "object" } }
+          }
+        }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "required": ["enabled", "interval", "scrapeTimeout", "sampleLimit", "path", "scheme", "authorizationSecret"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "interval": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
+        "scrapeTimeout": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
+        "sampleLimit": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "path": { "type": "string", "pattern": "^/" },
+        "scheme": { "enum": ["http", "https"] },
+        "labels": { "type": "object" },
+        "annotations": { "type": "object" },
+        "namespace": { "type": "string" },
+        "namespaceSelector": { "type": "object" },
+        "scraperNamespaces": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "honorLabels": { "type": "boolean" },
+        "authorizationSecret": { "$ref": "#/definitions/secretKeyRef" }
+      }
+    }
+  },
+  "definitions": {
+    "secretKeyRef": {
+      "type": "object",
+      "required": ["name", "key"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "key": { "type": "string", "minLength": 1 }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "required": ["path", "periodSeconds", "timeoutSeconds", "failureThreshold"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^/" },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "ports": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["protocol", "port"],
+        "properties": {
+          "protocol": { "enum": ["TCP", "UDP", "SCTP"] },
+          "port": { "oneOf": [{ "type": "integer", "minimum": 1, "maximum": 65535 }, { "type": "string", "minLength": 1 }] }
+        }
+      }
+    },
+    "cidrPortRule": {
+      "type": "object",
+      "required": ["enabled", "cidrs", "ports"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "cidrs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "ports": { "$ref": "#/definitions/ports" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "enabled": { "const": true } } },
+          "then": {
+            "properties": {
+              "cidrs": { "minItems": 1 },
+              "ports": { "minItems": 1 }
+            }
+          }
+        }
+      ]
+    },
+    "nonEmptyLabelSelector": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "anyOf": [
+        { "required": ["matchLabels"] },
+        { "required": ["matchExpressions"] }
+      ],
+      "properties": {
+        "matchLabels": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        },
+        "matchExpressions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["key", "operator"],
+            "additionalProperties": false,
+            "properties": {
+              "key": { "type": "string", "minLength": 1 },
+              "operator": { "enum": ["In", "NotIn", "Exists", "DoesNotExist"] },
+              "values": {
+                "type": "array",
+                "items": { "type": "string" },
+                "uniqueItems": true
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

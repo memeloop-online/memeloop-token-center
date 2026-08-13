@@ -34,12 +34,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .json()
         .init();
 
+    info!(
+        version = memeloop_token_center::metrics::BUILD_VERSION,
+        revision = memeloop_token_center::metrics::BUILD_GIT_SHA,
+        build_timestamp = memeloop_token_center::metrics::BUILD_TIMESTAMP,
+        target = memeloop_token_center::metrics::BUILD_TARGET,
+        "token center build"
+    );
+
     let cli = Cli::parse();
     let config = Config::from_env()?;
 
     match cli.command {
         Command::Migrate => {
-            let database = Database::connect(&config.database_url).await?;
+            let database =
+                Database::connect_with_max(&config.database_url, config.database_max_connections)
+                    .await?;
             database.migrate().await?;
             info!("database schema is current");
         }

@@ -1,9 +1,10 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use object_store::{
-    ObjectStore, ObjectStoreExt, PutPayload, aws::AmazonS3Builder, memory::InMemory, path::Path,
+    ObjectStore, ObjectStoreExt, PutPayload, RetryConfig, aws::AmazonS3Builder, memory::InMemory,
+    path::Path,
 };
 
 use crate::{
@@ -47,7 +48,12 @@ impl ArchiveStore {
                             AppError::BadRequest("MTC_S3_BUCKET is required".into())
                         })?)
                         .with_region(&config.s3_region)
-                        .with_allow_http(config.s3_allow_http);
+                        .with_allow_http(config.s3_allow_http)
+                        .with_retry(RetryConfig {
+                            max_retries: 3,
+                            retry_timeout: Duration::from_secs(10),
+                            ..RetryConfig::default()
+                        });
                     if let Some(endpoint) = &config.s3_endpoint {
                         builder = builder.with_endpoint(endpoint);
                     }
@@ -69,8 +75,9 @@ impl ArchiveStore {
     }
 
     pub async fn put(&self, location: &str, data: Bytes) -> Result<(), AppError> {
+        let location = archive_path(location)?;
         self.inner
-            .put(&Path::from(location), PutPayload::from_bytes(data))
+            .put(&location, PutPayload::from_bytes(data))
             .await?;
         Ok(())
     }
@@ -81,8 +88,27 @@ impl ArchiveStore {
         Ok(location)
     }
 
+    pub async fn delete(&self, location: &str) -> Result<(), AppError> {
+        self.inner.delete(&archive_path(location)?).await?;
+        Ok(())
+    }
+
+    pub async fn delete_prefix(&self, prefix: &str) -> Result<(), AppError> {
+        let prefix = archive_path(prefix)?;
+        let locations = self
+            .inner
+            .list(Some(&prefix))
+            .map_ok(|metadata| metadata.location)
+            .boxed();
+        self.inner
+            .delete_stream(locations)
+            .try_collect::<Vec<Path>>()
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_bounded(&self, location: &str, maximum: usize) -> Result<Bytes, AppError> {
-        let path = Path::from(location);
+        let path = archive_path(location)?;
         let metadata = self.inner.head(&path).await?;
         if metadata.size > maximum as u64 {
             return Err(AppError::Storage(format!(
@@ -110,8 +136,24 @@ impl ArchiveStore {
         self.get_bounded(location, DEFAULT_ARCHIVE_READ_LIMIT).await
     }
 
+    pub async fn readiness_check(&self) -> Result<(), AppError> {
+        // A listing is non-mutating but still verifies endpoint reachability,
+        // authentication and bucket access for both S3 and test backends.
+        // Keep this below the chart's one-second probe deadline. Dropping the timed-out
+        // future also prevents failed S3 probes from accumulating retrying requests.
+        tokio::time::timeout(Duration::from_millis(750), async {
+            let mut objects = self.inner.list(None);
+            if let Some(first) = objects.next().await {
+                first?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| AppError::Storage("archive readiness check timed out".to_owned()))?
+    }
+
     pub async fn start_writer(&self, location: &str) -> Result<ArchiveWriter, AppError> {
-        let staging = Path::from(location);
+        let staging = archive_path(location)?;
         let upload = self.inner.put_multipart(&staging).await?;
         Ok(ArchiveWriter {
             store: self.inner.clone(),
@@ -139,7 +181,7 @@ impl ArchiveWriter {
         } = self;
         inner.finish().await?;
         let location = content_location(hasher.finalize().to_hex().as_str());
-        let destination = Path::from(location.as_str());
+        let destination = archive_path(&location)?;
         store.copy(&staging, &destination).await?;
         store.delete(&staging).await?;
         Ok(location)
@@ -153,6 +195,27 @@ impl ArchiveWriter {
 
 fn content_location(hash: &str) -> String {
     format!("objects/blake3/{}/{hash}", &hash[..2])
+}
+
+fn archive_path(location: &str) -> Result<Path, AppError> {
+    // Object locations are internal identifiers, not filesystem paths or URLs. Keeping
+    // their alphabet deliberately small gives every backend (especially the local test
+    // backend) the same traversal and separator semantics.
+    let has_only_safe_bytes = location
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'));
+    if location.is_empty()
+        || location.starts_with('/')
+        || location.ends_with('/')
+        || !has_only_safe_bytes
+    {
+        return Err(AppError::BadRequest(
+            "invalid archive object location".to_owned(),
+        ));
+    }
+
+    Path::parse(location)
+        .map_err(|_| AppError::BadRequest("invalid archive object location".to_owned()))
 }
 
 #[cfg(test)]
@@ -239,5 +302,38 @@ mod tests {
             .await
             .expect_err("object over limit must be rejected");
         assert!(error.to_string().contains("read limit"));
+    }
+
+    #[tokio::test]
+    async fn object_locations_reject_traversal_and_ambiguous_separators() {
+        let store = ArchiveStore {
+            inner: Arc::new(InMemory::new()),
+        };
+
+        for location in [
+            "../escape",
+            "tenant/../escape",
+            "tenant/./object",
+            "/absolute/object",
+            "tenant//object",
+            "tenant/object/",
+            "tenant\\object",
+            "tenant/%2e%2e/object",
+        ] {
+            let error = store
+                .put(location, Bytes::from_static(b"must not be stored"))
+                .await
+                .expect_err("unsafe location must be rejected");
+            assert!(matches!(error, AppError::BadRequest(_)), "{location}");
+            assert!(!error.to_string().contains(location));
+        }
+
+        store
+            .put(
+                "tenants/tenant-019f/objects/request_01.bin",
+                Bytes::from_static(b"safe"),
+            )
+            .await
+            .expect("safe tenant object location");
     }
 }

@@ -7,8 +7,15 @@
   "required": ["id", "version", "wit_version"],
   "properties": {
     "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
-    "version": { "type": "string", "minLength": 1 },
-    "wit_version": { "const": "0.1.0" },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "wit_version": {
+      "type": "string",
+      "pattern": "^0\\.1\\.(0|[1-9][0-9]*)$",
+      "description": "Compatible Token Center 0.1 WIT contract version."
+    },
     "wasm": {
       "type": ["string", "null"],
       "default": "plugin.wasm",

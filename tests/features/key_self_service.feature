@@ -83,6 +83,15 @@ Feature: Stable key identity and read-only self-service statistics
     And the client calls model "gpt-test" twice
     Then the response status is 429
 
+  Scenario: Cached tokens and service tiers are charged from one immutable snapshot
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI upstream returns cached priority usage
+    When the service creates a key for principal "cache-tier-user" allowing model "cache-tier-model"
+    And the operator configures cache-aware default and priority prices for model "cache-tier-model"
+    And the client calls priority model "cache-tier-model"
+    Then the response status is 200
+    And the cache-aware priority request costs 0.00046 for 120 tokens
+
   Scenario: API key and OAuth credentials share stable upstream routing
     Given a token center backed by SQLite and memory object storage
     And the mock routed upstream accepts API key and OAuth credentials
@@ -127,6 +136,23 @@ Feature: Stable key identity and read-only self-service statistics
     And the client creates a five second Seedance generation
     Then the response status is 202
     And the generation eventually succeeds with an archived video costing 0.5
+
+  Scenario: A permanently rejected Seedance generation is refunded without retries
+    Given a token center backed by SQLite and memory object storage
+    And the mock Seedance upstream rejects the generation request
+    When the service creates a metered Seedance route and key
+    And the client creates a five second Seedance generation
+    Then the response status is 202
+    And the rejected generation fails once and refunds its entire reservation
+
+  Scenario: A retried Seedance submission keeps one upstream idempotency identity
+    Given a token center backed by SQLite and memory object storage
+    And the mock Seedance upstream transiently fails once and then completes
+    When the service creates a metered Seedance route and key
+    And the client creates a five second Seedance generation
+    Then the response status is 202
+    And the generation eventually succeeds with an archived video costing 0.5
+    And both Seedance submission attempts use the same upstream idempotency key
 
   Scenario: ComfyUI generation is permissioned, metered and archived
     Given a token center backed by SQLite and memory object storage

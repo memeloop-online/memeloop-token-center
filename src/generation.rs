@@ -7,6 +7,7 @@ use crate::{
     db::{FinishGenerationJobInput, unix_millis},
     error::AppError,
     model::GenerationJobWork,
+    network,
     provider::{ResolvedUpstream, UpstreamCredential},
 };
 
@@ -20,7 +21,11 @@ pub async fn process_one(state: &AppState, worker_id: &str) -> Result<bool, AppE
     let Some(job) = state.db.claim_generation_job(worker_id).await? else {
         return Ok(false);
     };
-    if let Err(error) = process_claimed(state, worker_id, &job).await {
+    // An outer error means the lease could no longer be renewed. In that case
+    // the in-flight upstream future is dropped and this worker must not settle,
+    // reschedule, or otherwise mutate a job that another worker may now own.
+    let outcome = process_claimed_with_lease(state, worker_id, &job).await?;
+    if let Err(error) = outcome {
         let next_failure = job.failure_count.saturating_add(1);
         tracing::warn!(job_id = %job.job_id, attempt = job.attempt_count, failure = next_failure, %error, "generation job attempt failed");
         if next_failure >= MAX_FAILURES {
@@ -52,6 +57,35 @@ pub async fn process_one(state: &AppState, worker_id: &str) -> Result<bool, AppE
         }
     }
     Ok(true)
+}
+
+async fn process_claimed_with_lease(
+    state: &AppState,
+    worker_id: &str,
+    job: &GenerationJobWork,
+) -> Result<Result<(), AppError>, AppError> {
+    let attempt = process_claimed(state, worker_id, job);
+    tokio::pin!(attempt);
+    let period = std::time::Duration::from_secs(20);
+    let start = tokio::time::Instant::now() + period;
+    let mut heartbeat = tokio::time::interval_at(start, period);
+    loop {
+        tokio::select! {
+            outcome = &mut attempt => return Ok(outcome),
+            _ = heartbeat.tick() => {
+                state.db.renew_generation_lease(job.job_id, worker_id).await?;
+            }
+        }
+    }
+}
+
+pub fn generation_request_hash(model: &str, input: &Value) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"memeloop-token-center/generation-request/v1\0");
+    hasher.update(model.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&serde_json::to_vec(input).expect("serializing a JSON value cannot fail"));
+    hasher.finalize().to_hex().to_string()
 }
 
 async fn process_claimed(
@@ -111,30 +145,70 @@ async fn submit(
         }
         "comfyui" => {
             let prefix = comfy_prefix(route)?;
-            if !input.contains_key("prompt") {
-                input = Map::from_iter([("prompt".to_owned(), Value::Object(input))]);
+            let workflow_id = route
+                .config
+                .get("workflow_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AppError::Storage("ComfyUI workflow id is missing".into()))?;
+            if workflow_id != job.upstream_model {
+                return Err(AppError::Upstream(
+                    "ComfyUI route does not match its versioned workflow".into(),
+                ));
             }
+            let parameters = input
+                .remove("parameters")
+                .and_then(|value| value.as_object().cloned())
+                .ok_or_else(|| AppError::BadRequest("ComfyUI parameters are required".into()))?;
+            if !input.is_empty()
+                || parameters.len() > 100
+                || parameters
+                    .values()
+                    .any(|value| value.is_array() || value.is_object())
+            {
+                return Err(AppError::BadRequest(
+                    "ComfyUI accepts at most 100 scalar workflow parameters".into(),
+                ));
+            }
+            let mut workflow = route
+                .config
+                .get("workflow_template")
+                .cloned()
+                .ok_or_else(|| AppError::Storage("ComfyUI workflow template is missing".into()))?;
+            apply_workflow_parameters(&mut workflow, &parameters)?;
+            input = Map::from_iter([("prompt".to_owned(), workflow)]);
             (format!("{prefix}/prompt"), "prompt_id")
         }
         _ => return Err(AppError::Upstream("unsupported generation driver".into())),
     };
-    let request = state
-        .http
+    let outbound_http = route_http(state, route, &route.base_url).await?;
+    let request = outbound_http
         .post(format!("{}{}", route.base_url, path))
+        .header("idempotency-key", job.job_id.to_string())
         .json(&input);
-    let response = route
-        .credential
-        .apply(request, unix_millis())?
-        .send()
-        .await?;
+    let upstream_started = std::time::Instant::now();
+    let response_result = route.credential.apply(request, unix_millis())?.send().await;
+    state.metrics.observe_upstream(
+        &route.driver,
+        "generation_submit",
+        response_result.as_ref().ok().map(reqwest::Response::status),
+        upstream_started.elapsed(),
+    );
+    let response = response_result
+        .map_err(|error| sanitized_http_error(&error, "generation submit request"))?;
     let status = response.status();
-    let body = bounded_json(response).await?;
+    let body = bounded_json(response).await;
     if !status.is_success() {
+        if status.is_client_error() && !matches!(status.as_u16(), 408 | 425 | 429) {
+            let result = body.unwrap_or_else(|_| json!({"http_status": status.as_u16()}));
+            return terminal_failure(state, worker_id, job, "generation_rejected", Some(&result))
+                .await;
+        }
         return Err(AppError::Upstream(format!(
             "generation submit returned HTTP {}",
             status.as_u16()
         )));
     }
+    let body = body?;
     let upstream_job_id = body
         .get(id_field)
         .and_then(Value::as_str)
@@ -143,6 +217,34 @@ async fn submit(
         .db
         .mark_generation_submitted(job.job_id, worker_id, upstream_job_id)
         .await
+}
+
+fn apply_workflow_parameters(
+    value: &mut Value,
+    parameters: &Map<String, Value>,
+) -> Result<(), AppError> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                apply_workflow_parameters(value, parameters)?;
+            }
+        }
+        Value::Object(object) => {
+            if object.len() == 1
+                && let Some(name) = object.get("$mtc_param").and_then(Value::as_str)
+            {
+                *value = parameters.get(name).cloned().ok_or_else(|| {
+                    AppError::BadRequest(format!("missing ComfyUI workflow parameter: {name}"))
+                })?;
+                return Ok(());
+            }
+            for value in object.values_mut() {
+                apply_workflow_parameters(value, parameters)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn poll(
@@ -166,15 +268,22 @@ async fn poll_seedance(
     route: &ResolvedUpstream,
     upstream_job_id: &str,
 ) -> Result<(), AppError> {
-    let request = state.http.get(format!(
+    let poll_url = format!(
         "{}/api/v3/contents/generations/tasks/{upstream_job_id}",
         route.base_url
-    ));
-    let response = route
-        .credential
-        .apply(request, unix_millis())?
-        .send()
-        .await?;
+    );
+    let outbound_http = route_http(state, route, &poll_url).await?;
+    let request = outbound_http.get(poll_url);
+    let upstream_started = std::time::Instant::now();
+    let response_result = route.credential.apply(request, unix_millis())?.send().await;
+    state.metrics.observe_upstream(
+        &route.driver,
+        "generation_poll",
+        response_result.as_ref().ok().map(reqwest::Response::status),
+        upstream_started.elapsed(),
+    );
+    let response =
+        response_result.map_err(|error| sanitized_http_error(&error, "Seedance poll request"))?;
     let status = response.status();
     let mut body = bounded_json(response).await?;
     if !status.is_success() {
@@ -228,7 +337,7 @@ async fn poll_comfy(
     if prefix == "/api" {
         let status_body = authenticated_json(
             state,
-            &route.credential,
+            route,
             format!("{}/api/job/{upstream_job_id}/status", route.base_url),
         )
         .await?;
@@ -258,7 +367,7 @@ async fn poll_comfy(
         }
     }
     let history_path = format!("{}{}/history/{upstream_job_id}", route.base_url, prefix);
-    let history = authenticated_json(state, &route.credential, history_path).await?;
+    let history = authenticated_json(state, route, history_path).await?;
     let entry = if let Some(entry) = history.get(upstream_job_id) {
         entry.clone()
     } else if prefix == "/api" {
@@ -309,11 +418,23 @@ async fn poll_comfy(
 
 async fn authenticated_json(
     state: &AppState,
-    credential: &UpstreamCredential,
+    route: &ResolvedUpstream,
     url: String,
 ) -> Result<Value, AppError> {
-    let request = credential.apply(state.http.get(url), unix_millis())?;
-    let response = request.send().await?;
+    let outbound_http = route_http(state, route, &url).await?;
+    let request = route
+        .credential
+        .apply(outbound_http.get(url), unix_millis())?;
+    let upstream_started = std::time::Instant::now();
+    let response_result = request.send().await;
+    state.metrics.observe_upstream(
+        &route.driver,
+        "generation_poll",
+        response_result.as_ref().ok().map(reqwest::Response::status),
+        upstream_started.elapsed(),
+    );
+    let response =
+        response_result.map_err(|error| sanitized_http_error(&error, "generation poll request"))?;
     let status = response.status();
     let body = bounded_json(response).await?;
     if status.is_success() {
@@ -330,7 +451,8 @@ async fn bounded_json(response: Response) -> Result<Value, AppError> {
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| AppError::Upstream(error.to_string()))?;
+        let chunk =
+            chunk.map_err(|error| sanitized_http_error(&error, "generation control response"))?;
         if bytes.len().saturating_add(chunk.len()) > MAX_CONTROL_BODY {
             return Err(AppError::Upstream(
                 "generation control response exceeds 4 MiB".into(),
@@ -354,7 +476,8 @@ async fn archive_asset(
     let asset = url::Url::parse(url)
         .map_err(|_| AppError::Upstream("generation asset URL is invalid".into()))?;
     let base = url::Url::parse(&route.base_url).map_err(|_| AppError::Internal)?;
-    let request = state.http.get(url);
+    let outbound_http = route_http(state, route, url).await?;
+    let request = outbound_http.get(url);
     // A provider credential may be needed for same-origin ComfyUI assets. Signed
     // Seedance result URLs are often hosted on a configured CDN origin, where
     // forwarding that credential would disclose it to another service.
@@ -363,7 +486,16 @@ async fn archive_asset(
     } else {
         request
     };
-    let response = request.send().await?;
+    let upstream_started = std::time::Instant::now();
+    let response_result = request.send().await;
+    state.metrics.observe_upstream(
+        &route.driver,
+        "generation_asset",
+        response_result.as_ref().ok().map(reqwest::Response::status),
+        upstream_started.elapsed(),
+    );
+    let response = response_result
+        .map_err(|error| sanitized_http_error(&error, "generation asset request"))?;
     if !response.status().is_success() {
         return Err(AppError::Upstream(format!(
             "generation asset returned HTTP {}",
@@ -377,7 +509,8 @@ async fn archive_asset(
     let mut total = 0_usize;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| AppError::Upstream(error.to_string()))?;
+        let chunk =
+            chunk.map_err(|error| sanitized_http_error(&error, "generation asset response"))?;
         total = total.saturating_add(chunk.len());
         if total > MAX_ASSET_BODY {
             writer.abort().await?;
@@ -388,6 +521,33 @@ async fn archive_asset(
         writer.write(chunk).await?;
     }
     writer.finish().await
+}
+
+async fn route_http(
+    state: &AppState,
+    route: &ResolvedUpstream,
+    url: &str,
+) -> Result<reqwest::Client, AppError> {
+    network::client_for_config_url(
+        &state.http,
+        url,
+        &route.config,
+        state.config.allow_oauth_loopback,
+    )
+    .await
+}
+
+fn sanitized_http_error(error: &reqwest::Error, operation: &'static str) -> AppError {
+    // reqwest error displays may contain the complete URL. Generation asset
+    // URLs are commonly signed, so log only non-secret classifications and
+    // return an operation label that is safe for the worker retry log.
+    tracing::warn!(
+        operation,
+        is_timeout = error.is_timeout(),
+        is_connect = error.is_connect(),
+        "generation upstream HTTP operation failed"
+    );
+    AppError::Upstream(format!("{operation} failed"))
 }
 
 fn ensure_asset_origin(route: &ResolvedUpstream, asset: &str) -> Result<(), AppError> {
@@ -562,5 +722,29 @@ mod tests {
                 kind: "output".to_owned()
             }]
         );
+    }
+
+    #[test]
+    fn generation_request_hash_is_stable_for_json_object_key_order() {
+        assert_eq!(
+            generation_request_hash("image-test", &json!({"prompt": "cat", "count": 1})),
+            generation_request_hash("image-test", &json!({"count": 1, "prompt": "cat"})),
+        );
+        assert_ne!(
+            generation_request_hash("image-test", &json!({"prompt": "cat"})),
+            generation_request_hash("image-test", &json!({"prompt": "dog"})),
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_asset_url_is_not_copied_into_retry_error() {
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:0/asset?token=must-not-leak")
+            .send()
+            .await
+            .expect_err("port zero must fail");
+        let message = sanitized_http_error(&error, "generation asset request").to_string();
+        assert!(message.contains("generation asset request failed"));
+        assert!(!message.contains("must-not-leak"));
     }
 }
