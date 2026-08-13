@@ -90,7 +90,10 @@ async fn submit(
     job: &GenerationJobWork,
     route: &ResolvedUpstream,
 ) -> Result<(), AppError> {
-    let archived = state.archive.get(&job.request_object).await?;
+    let archived = state
+        .archive
+        .get_bounded(&job.request_object, MAX_CONTROL_BODY)
+        .await?;
     let outer: Value = serde_json::from_slice(&archived)
         .map_err(|_| AppError::Storage("generation request archive is invalid".into()))?;
     let mut input = outer

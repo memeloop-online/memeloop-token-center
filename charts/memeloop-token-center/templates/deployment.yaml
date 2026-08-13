@@ -51,6 +51,16 @@ spec:
               containerPort: 8080
           env:
             {{- include "memeloop-token-center.env" $ | nindent 12 }}
+            {{- if or (eq $role "control") (eq $role "all") }}
+            - name: MTC_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.config.serviceTokenSecret.name }}
+                  key: {{ $.Values.config.serviceTokenSecret.key }}
+            {{- else }}
+            - name: MTC_SERVICE_TOKEN
+              value: "bootstrap-disabled-for-this-role"
+            {{- end }}
           startupProbe:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 2

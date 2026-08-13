@@ -338,5 +338,16 @@ pub fn priced_tokens(tokens: i64, micros_per_million: i64) -> i64 {
         return 0;
     }
     let numerator = i128::from(tokens) * i128::from(micros_per_million);
-    ((numerator + 999_999) / 1_000_000) as i64
+    i64::try_from((numerator + 999_999) / 1_000_000).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::priced_tokens;
+
+    #[test]
+    fn token_price_saturates_instead_of_wrapping() {
+        assert_eq!(priced_tokens(i64::MAX, i64::MAX), i64::MAX);
+        assert_eq!(priced_tokens(-1, i64::MAX), 0);
+    }
 }

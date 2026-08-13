@@ -17,6 +17,7 @@ use crate::{db::Database, error::AppError, provider::ProviderType};
 
 const PLUGIN_FUEL: u64 = 5_000_000;
 const PLUGIN_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+const PLUGIN_TABLE_ELEMENTS: usize = 100_000;
 const PLUGIN_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 wasmtime::component::bindgen!({
@@ -216,7 +217,9 @@ impl PluginRuntime {
             })?;
             let limits = StoreLimitsBuilder::new()
                 .memory_size(PLUGIN_MEMORY_BYTES)
+                .table_elements(PLUGIN_TABLE_ELEMENTS)
                 .instances(1)
+                .tables(2)
                 .memories(2)
                 .build();
             let mut store = Store::new(

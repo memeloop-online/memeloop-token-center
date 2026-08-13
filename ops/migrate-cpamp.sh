@@ -6,13 +6,27 @@ set -eu
 : "${IMPORT_TENANT_EXTERNAL_ID:=cpa-dogfood-import}"
 : "${CPAMP_OVERLAP_MS:=86400000}"
 : "${CPAMP_RESET_IMPORT:=false}"
+: "${CPAMP_RESET_CONFIRM:=}"
 
 case "$CPAMP_OVERLAP_MS" in *[!0-9]*|'') echo "CPAMP_OVERLAP_MS must be an integer" >&2; exit 2;; esac
 case "$CPAMP_RESET_IMPORT" in true|false) ;; *) echo "CPAMP_RESET_IMPORT must be true or false" >&2; exit 2;; esac
+[ "$CPAMP_RESET_IMPORT" = false ] || [ "$IMPORT_TENANT_EXTERNAL_ID" = "cpa-dogfood-import" ] || {
+  echo "reset is only allowed for the cpa-dogfood-import tenant" >&2
+  exit 2
+}
+[ "$CPAMP_RESET_IMPORT" = false ] || [ "$CPAMP_RESET_CONFIRM" = "DELETE_CPA_DOGFOOD_IMPORT" ] || {
+  echo "CPAMP_RESET_CONFIRM=DELETE_CPA_DOGFOOD_IMPORT is required for a reset" >&2
+  exit 2
+}
 [ -r "$CPAMP_SQLITE_PATH" ] || { echo "CPAMP SQLite database is not readable" >&2; exit 2; }
 
+# libpq expands a connection URI supplied through PGDATABASE. Keeping the URI
+# out of argv prevents database credentials from appearing in process listings.
+export PGDATABASE="$DATABASE_URL"
+unset DATABASE_URL
+
 psql_target() {
-  psql -X -v ON_ERROR_STOP=1 --no-psqlrc "$DATABASE_URL" "$@"
+  psql -X -v ON_ERROR_STOP=1 --no-psqlrc "$@"
 }
 
 psql_target <<'SQL'
@@ -49,12 +63,72 @@ SQL
 if [ "$CPAMP_RESET_IMPORT" = true ]; then
   psql_target -v tenant_external_id="$IMPORT_TENANT_EXTERNAL_ID" <<'SQL'
 BEGIN;
+DELETE FROM request_events
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
+DELETE FROM conversation_edges
+ WHERE cluster_id IN (
+   SELECT id FROM conversation_clusters
+    WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id')
+ );
+DELETE FROM conversation_observations
+ WHERE key_id IN (
+   SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id
+    WHERE t.external_id = :'tenant_external_id'
+ );
+DELETE FROM conversation_clusters
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
+DELETE FROM context_nodes
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
+DELETE FROM semantic_atoms
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
+DELETE FROM generation_jobs
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
 DELETE FROM usage_daily_aggregates
  WHERE key_id IN (
    SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id
     WHERE t.external_id = :'tenant_external_id'
  ) OR key_id LIKE 'cpamp-key-%';
-DELETE FROM request_records WHERE reservation_id LIKE 'cpamp-import:%';
+DELETE FROM request_records
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
+DELETE FROM legacy_key_credentials
+ WHERE key_id IN (
+   SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id
+    WHERE t.external_id = :'tenant_external_id'
+ );
+DELETE FROM key_credentials
+ WHERE key_id IN (
+   SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id
+    WHERE t.external_id = :'tenant_external_id'
+ );
+DELETE FROM rate_limit_windows
+ WHERE key_id IN (
+   SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id
+    WHERE t.external_id = :'tenant_external_id'
+ );
+DELETE FROM key_runtime_state
+ WHERE key_id IN (
+   SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id
+    WHERE t.external_id = :'tenant_external_id'
+ );
+DELETE FROM usage_reservations
+ WHERE account_id IN (
+   SELECT a.id FROM credit_accounts a JOIN tenants t ON t.id = a.tenant_id
+    WHERE t.external_id = :'tenant_external_id'
+ );
+DELETE FROM ledger_entries
+ WHERE account_id IN (
+   SELECT a.id FROM credit_accounts a JOIN tenants t ON t.id = a.tenant_id
+    WHERE t.external_id = :'tenant_external_id'
+ );
+DELETE FROM model_routes
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
+DELETE FROM upstream_credentials
+ WHERE account_id IN (
+   SELECT u.id FROM upstream_accounts u JOIN tenants t ON t.id = u.tenant_id
+    WHERE t.external_id = :'tenant_external_id'
+ );
+DELETE FROM upstream_accounts
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
 DELETE FROM key_records
  WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
 DELETE FROM credit_accounts
@@ -84,7 +158,7 @@ sqlite3 -header -csv "$CPAMP_SQLITE_PATH" \
           COALESCE(fail_status_code, 0), COALESCE(fail_summary, '')
      FROM usage_events
     WHERE event_hash <> '' AND timestamp_ms >= $lower_bound_ms
-    ORDER BY timestamp_ms, event_hash;" \
+    ;" \
   | psql_target -c "\\copy cpamp_import_usage FROM STDIN WITH (FORMAT csv, HEADER true)"
 
 sqlite3 -header -csv "$CPAMP_SQLITE_PATH" \

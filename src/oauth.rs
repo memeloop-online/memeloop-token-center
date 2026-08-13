@@ -21,7 +21,7 @@ pub const DEFAULT_CURSOR_LOGIN_URL: &str = "https://cursor.com/loginDeepControl"
 pub const DEFAULT_CURSOR_POLL_URL: &str = "https://api2.cursor.sh/auth/poll";
 pub const DEFAULT_CURSOR_REFRESH_URL: &str = "https://api2.cursor.sh/auth/exchange_user_api_key";
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CursorOAuthEndpoints {
     #[serde(default = "default_login_url")]
     pub login_url: String,
@@ -108,6 +108,7 @@ pub struct StartSubscriptionBridgeLogin {
     pub account_name: String,
     pub provider_config: Value,
     pub bridge_secret: Option<String>,
+    pub allow_loopback: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,7 +151,8 @@ pub async fn start_subscription_bridge_login(
             "OAuth account name is required".into(),
         ));
     }
-    let base_url = validate_config(&input.provider_config)?;
+    let base_url =
+        validate_subscription_bridge_base_url(&input.provider_config, input.allow_loopback)?;
     let provider = subscription_provider(&input.provider_config)?.to_owned();
     validate_optional_bridge_secret(input.bridge_secret.as_deref())?;
     let response = subscription_bridge_call(
@@ -196,10 +198,14 @@ pub async fn poll_subscription_bridge_login(
     session_token: &str,
     key_material: &[u8],
     now: i64,
+    required_tenant: Option<&str>,
 ) -> Result<SubscriptionBridgePollResult, AppError> {
     let state: SubscriptionBridgeLoginState =
         open_private_json(session_token, key_material, SUBSCRIPTION_BRIDGE_LOGIN_AAD)
             .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
+    if required_tenant.is_some_and(|tenant| tenant != state.tenant_external_id) {
+        return Err(AppError::Forbidden);
+    }
     if state.expires_at <= now {
         return Err(AppError::BadRequest("OAuth login session expired".into()));
     }
@@ -272,6 +278,28 @@ fn subscription_provider(config: &Value) -> Result<&str, AppError> {
             "subscription bridge config.provider must be copilot or cursor".into(),
         )),
     }
+}
+
+fn validate_subscription_bridge_base_url(
+    config: &Value,
+    allow_loopback: bool,
+) -> Result<String, AppError> {
+    let base_url = validate_config(config)?;
+    let parsed = Url::parse(&base_url).map_err(|_| AppError::Internal)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::BadRequest("subscription bridge host is required".into()))?;
+    let cluster_service = host.ends_with(".svc") || host.ends_with(".svc.cluster.local");
+    let loopback = allow_loopback
+        && host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !cluster_service && !loopback {
+        return Err(AppError::BadRequest(
+            "subscription bridge must use an in-cluster service origin".into(),
+        ));
+    }
+    Ok(base_url)
 }
 
 fn validate_optional_bridge_secret(secret: Option<&str>) -> Result<(), AppError> {
@@ -383,9 +411,13 @@ pub async fn poll_cursor_login(
     session_token: &str,
     key_material: &[u8],
     now: i64,
+    required_tenant: Option<&str>,
 ) -> Result<CursorPollResult, AppError> {
     let state: CursorLoginState = open_private_json(session_token, key_material, CURSOR_LOGIN_AAD)
         .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
+    if required_tenant.is_some_and(|tenant| tenant != state.tenant_external_id) {
+        return Err(AppError::Forbidden);
+    }
     if state.expires_at <= now {
         return Err(AppError::BadRequest("OAuth login session expired".into()));
     }
@@ -611,5 +643,45 @@ mod tests {
         .unwrap();
         assert_eq!(private.driver, "provider_adapter");
         assert!(validate_oauth_endpoint("http://oauth.example.com/login", "login_url").is_err());
+    }
+
+    #[tokio::test]
+    async fn cursor_poll_checks_tenant_before_network_io() {
+        let key_material = b"test material with at least 32 bytes";
+        let started = start_cursor_login(
+            StartCursorLogin {
+                tenant_external_id: "tenant-a".to_owned(),
+                account_name: "cursor-one".to_owned(),
+                provider_driver: "http-json".to_owned(),
+                provider_config: json!({"base_url": "https://provider.example"}),
+                endpoints: CursorOAuthEndpoints::default(),
+                oauth_driver: "cursor".to_owned(),
+            },
+            key_material,
+            1_000,
+        )
+        .unwrap();
+
+        let error = poll_cursor_login(
+            &reqwest::Client::new(),
+            &started.session_token,
+            key_material,
+            2_000,
+            Some("tenant-b"),
+        )
+        .await
+        .expect_err("cross-tenant polling must be rejected before I/O");
+        assert!(matches!(error, AppError::Forbidden));
+    }
+
+    #[test]
+    fn subscription_bridge_accepts_only_cluster_services_or_test_loopback() {
+        let cluster = json!({"base_url":"http://cpa-bridge.cliproxyapi.svc.cluster.local"});
+        assert!(validate_subscription_bridge_base_url(&cluster, false).is_ok());
+        let loopback = json!({"base_url":"http://127.0.0.1:1234"});
+        assert!(validate_subscription_bridge_base_url(&loopback, false).is_err());
+        assert!(validate_subscription_bridge_base_url(&loopback, true).is_ok());
+        let public = json!({"base_url":"https://example.com"});
+        assert!(validate_subscription_bridge_base_url(&public, false).is_err());
     }
 }

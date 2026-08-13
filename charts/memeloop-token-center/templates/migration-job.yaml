@@ -25,6 +25,7 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: migrate
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -32,8 +33,13 @@ spec:
           args: ["migrate"]
           env:
             {{- include "memeloop-token-center.env" . | nindent 12 }}
+            - name: MTC_SERVICE_TOKEN
+              value: "bootstrap-disabled-for-migration"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { cpu: 250m, memory: 128Mi }
 {{- end }}

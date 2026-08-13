@@ -62,9 +62,9 @@ Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，�
 
 memeloop web 对余额发放使用 `POST /internal/v1/accounts/{account_id}/grants`；取消或替换订阅时使用 `POST /internal/v1/accounts/{account_id}/grant-reversals`，body 指向原 grant 的幂等键，且 reversal 自己必须使用新的 `Idempotency-Key`。为避免对已经消费的服务做隐式退款，当前只允许撤销仍完整未消费的 grant；部分消费后的退款需要由业务侧人工或后续按 grant lot 结算。
 
-数据库 DDL 位于 `migrations/`，每个版本都在同一事务和 PostgreSQL advisory transaction lock 下应用。PostgreSQL 的请求与事件表按天分区，并为 key/tenant/模型/状态/错误/上游/逻辑会话尾查建立专用 B-tree 与 BRIN 索引；生成任务有领取、稳定 key 时间线、上游任务和预留关联索引。SQLite 保留等价的小型测试 schema。连接池默认每进程最多 8 个连接且不预热，HTTP 上游连接池也有严格空闲上限；Codex 生图响应限制为 16 MiB、每副本最多两个并发缓冲，其他大对象继续流式归档，避免重现 CPA 的高内存占用。
+数据库 DDL 位于 `migrations/`，当前 schema 版本为 v12；每个版本都在同一事务和 PostgreSQL advisory transaction lock 下应用。PostgreSQL 的请求与事件表按天分区，并为 key/tenant/模型/状态/错误/上游/逻辑会话尾查建立专用 B-tree 与 BRIN 索引；生成任务有领取、稳定 key 时间线、上游任务和预留关联索引。SQLite 保留等价的小型测试 schema。连接池默认每进程最多 8 个连接且不预热，HTTP 上游连接池也有严格空闲上限；Codex 生图响应限制为 16 MiB、每副本最多两个并发缓冲，其他大对象继续流式归档，避免重现 CPA 的高内存占用。
 
-`ops/migrate-cpamp.sh` 是 PostgreSQL 增量导入器：首次导入所有 CPAMP usage/alias/price，之后从 checkpoint watermark 回看默认 24 小时，只把尚未存在的 event hash 写入请求表和日聚合表。回看窗口用于覆盖 CPAMP 延迟刷盘；确定性 UUID 与幂等插入保证周末切换前可以反复运行。`CPAMP_RESET_IMPORT=true` 仅用于重建 dogfood 导入租户，不应在生产增量切换中使用。
+`ops/migrate-cpamp.sh` 是 PostgreSQL 增量导入器：首次导入所有 CPAMP usage/alias/price，之后从 checkpoint watermark 回看默认 24 小时，只把尚未存在的 event hash 写入请求表和日聚合表。回看窗口用于覆盖 CPAMP 延迟刷盘；确定性 UUID 与幂等插入保证周末切换前可以反复运行。`ops/kubernetes/cpamp-import-job.yaml` 提供了只读挂载 CPA Manager Plus PVC 的 K8s Job 模板，默认就是增量模式。`CPAMP_RESET_IMPORT=true` 仅用于重建 dogfood 导入租户，不应在生产增量切换中使用。
 
 ## 配置与插件
 

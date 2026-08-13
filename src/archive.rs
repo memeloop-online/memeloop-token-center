@@ -1,6 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
 use object_store::{
     ObjectStore, ObjectStoreExt, PutPayload, aws::AmazonS3Builder, memory::InMemory, path::Path,
 };
@@ -9,6 +10,8 @@ use crate::{
     config::{ArchiveBackend, Config},
     error::AppError,
 };
+
+const DEFAULT_ARCHIVE_READ_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ArchiveStore {
@@ -78,8 +81,33 @@ impl ArchiveStore {
         Ok(location)
     }
 
+    pub async fn get_bounded(&self, location: &str, maximum: usize) -> Result<Bytes, AppError> {
+        let path = Path::from(location);
+        let metadata = self.inner.head(&path).await?;
+        if metadata.size > maximum as u64 {
+            return Err(AppError::Storage(format!(
+                "archive object exceeds {maximum} byte read limit"
+            )));
+        }
+
+        let initial_capacity = usize::try_from(metadata.size)
+            .map_err(|_| AppError::Storage("archive object size exceeds this platform".into()))?;
+        let mut body = BytesMut::with_capacity(initial_capacity);
+        let mut stream = self.inner.get(&path).await?.into_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if body.len().saturating_add(chunk.len()) > maximum {
+                return Err(AppError::Storage(format!(
+                    "archive object exceeds {maximum} byte read limit"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body.freeze())
+    }
+
     pub async fn get(&self, location: &str) -> Result<Bytes, AppError> {
-        Ok(self.inner.get(&Path::from(location)).await?.bytes().await?)
+        self.get_bounded(location, DEFAULT_ARCHIVE_READ_LIMIT).await
     }
 
     pub async fn start_writer(&self, location: &str) -> Result<ArchiveWriter, AppError> {
@@ -143,7 +171,13 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(first.starts_with("objects/blake3/"));
-        assert_eq!(store.get(&first).await.expect("stored content"), body);
+        assert_eq!(
+            store
+                .get_bounded(&first, body.len())
+                .await
+                .expect("stored content"),
+            body
+        );
     }
 
     #[tokio::test]
@@ -166,9 +200,44 @@ mod tests {
 
         assert!(location.starts_with("objects/blake3/"));
         assert_eq!(
-            store.get(&location).await.expect("stored stream"),
+            store
+                .get_bounded(&location, b"stream body".len())
+                .await
+                .expect("stored stream"),
             Bytes::from_static(b"stream body")
         );
         assert!(store.inner.head(&Path::from(staging)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_read_accepts_an_object_exactly_at_the_limit() {
+        let store = ArchiveStore {
+            inner: Arc::new(InMemory::new()),
+        };
+        let body = Bytes::from_static(b"exactly-at-limit");
+        let location = store.put_content(body.clone()).await.expect("put content");
+
+        assert_eq!(
+            store
+                .get_bounded(&location, body.len())
+                .await
+                .expect("read at exact limit"),
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_read_rejects_an_object_over_the_limit() {
+        let store = ArchiveStore {
+            inner: Arc::new(InMemory::new()),
+        };
+        let body = Bytes::from_static(b"one-byte-too-large");
+        let location = store.put_content(body.clone()).await.expect("put content");
+
+        let error = store
+            .get_bounded(&location, body.len() - 1)
+            .await
+            .expect_err("object over limit must be rejected");
+        assert!(error.to_string().contains("read limit"));
     }
 }

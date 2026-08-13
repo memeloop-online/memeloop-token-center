@@ -45,6 +45,7 @@ pub struct Config {
     pub upstream_anthropic_url: Option<String>,
     pub upstream_anthropic_key: Option<String>,
     pub plugin_dir: Option<String>,
+    pub allow_oauth_loopback: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,6 +91,7 @@ impl Config {
             upstream_anthropic_url: env::var("MTC_UPSTREAM_ANTHROPIC_URL").ok(),
             upstream_anthropic_key: env::var("MTC_UPSTREAM_ANTHROPIC_KEY").ok(),
             plugin_dir: env::var("MTC_PLUGIN_DIR").ok(),
+            allow_oauth_loopback: env_bool("MTC_ALLOW_OAUTH_LOOPBACK", false),
         })
     }
 
@@ -112,6 +114,7 @@ impl Config {
             upstream_anthropic_url: None,
             upstream_anthropic_key: None,
             plugin_dir: None,
+            allow_oauth_loopback: true,
         }
     }
 }

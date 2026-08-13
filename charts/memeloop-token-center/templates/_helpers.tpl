@@ -36,11 +36,6 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
     secretKeyRef:
       name: {{ .Values.config.keyPepperSecret.name }}
       key: {{ .Values.config.keyPepperSecret.key }}
-- name: MTC_SERVICE_TOKEN
-  valueFrom:
-    secretKeyRef:
-      name: {{ .Values.config.serviceTokenSecret.name }}
-      key: {{ .Values.config.serviceTokenSecret.key }}
 - name: MTC_ARCHIVE_BACKEND
   value: {{ .Values.config.archiveBackend | quote }}
 - name: MTC_S3_BUCKET

@@ -12,13 +12,17 @@ pub mod plugin;
 pub mod provider;
 pub mod worker;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use archive::ArchiveStore;
 use config::Config;
 use db::Database;
 use plugin::PluginRuntime;
 use provider::ProviderCatalog;
+
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -45,15 +49,48 @@ impl AppState {
             archive,
             providers,
             plugins,
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .pool_max_idle_per_host(8)
-                .pool_idle_timeout(std::time::Duration::from_secs(30))
-                .build()?,
+            http: build_http_client()?,
         })
     }
 }
 
+fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .read_timeout(HTTP_READ_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(8)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build()
+}
+
 mod anyhow_free {
     pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::StatusCode;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+    use super::build_http_client;
+
+    #[tokio::test]
+    async fn shared_http_client_does_not_follow_redirects() {
+        let server = MockServer::start().await;
+        Mock::given(path("/redirect"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/target"))
+            .mount(&server)
+            .await;
+
+        let response = build_http_client()
+            .expect("shared HTTP client")
+            .get(format!("{}/redirect", server.uri()))
+            .send()
+            .await
+            .expect("redirect response");
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+    }
 }

@@ -52,7 +52,10 @@ const REQUEST_ID_HEADER: &str = "x-mtc-request-id";
 const MAX_SUBSCRIPTION_BRIDGE_RESPONSE: usize = 16 * 1024 * 1024;
 const MAX_IMAGE_RESPONSE: usize = 16 * 1024 * 1024;
 const MAX_CPA_IMPORT_BODY: usize = 34 * 1024 * 1024;
+const MAX_ARCHIVE_DETAIL_BODY: usize = 4 * 1024 * 1024;
+const MAX_REPORTED_TOKENS: i64 = 1_000_000_000;
 static IMAGE_RESPONSE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+static PLUGIN_EXECUTION_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 pub fn router(state: AppState) -> Router {
     router_for_role(state, RuntimeRole::All)
@@ -186,8 +189,15 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn security_headers(request: Request, next: Next) -> Response {
+    let authenticated_api = matches!(
+        request.uri().path().split('/').nth(1),
+        Some("internal" | "self" | "v1")
+    );
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
+    if authenticated_api {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -243,7 +253,7 @@ async fn web_index(allow_fallback: bool) -> Response {
     response.headers_mut().insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
+            "default-src 'none'; script-src 'self' 'sha256-XON9Vo1xKu4g0Ro9kQujwC0clU/XLRu/4dTJ6h2ZH0c='; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
         ),
     );
     response
@@ -482,6 +492,7 @@ async fn configuration_schemas(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartCursorOAuthRequest {
     #[serde(default = "default_tenant")]
     tenant_external_id: String,
@@ -490,7 +501,7 @@ struct StartCursorOAuthRequest {
     provider_driver: String,
     provider_config: Value,
     #[serde(default)]
-    endpoints: CursorOAuthEndpoints,
+    endpoints: Option<CursorOAuthEndpoints>,
 }
 
 async fn start_cursor_oauth(
@@ -506,13 +517,19 @@ async fn start_cursor_oauth(
             body.provider_driver
         )));
     }
+    let endpoints = body.endpoints.unwrap_or_default();
+    if !state.config.allow_oauth_loopback && endpoints != CursorOAuthEndpoints::default() {
+        return Err(AppError::BadRequest(
+            "custom Cursor OAuth endpoints are disabled".into(),
+        ));
+    }
     Ok(Json(start_cursor_login(
         StartCursorLogin {
             tenant_external_id: body.tenant_external_id,
             account_name: body.account_name,
             provider_driver: body.provider_driver,
             provider_config: body.provider_config,
-            endpoints: body.endpoints,
+            endpoints,
             oauth_driver: "cursor".to_owned(),
         },
         state.config.key_pepper.as_bytes(),
@@ -579,6 +596,7 @@ async fn poll_cursor_oauth(
         &body.session_token,
         state.config.key_pepper.as_bytes(),
         unix_millis(),
+        service.tenant_external_id.as_deref(),
     )
     .await?
     {
@@ -642,6 +660,7 @@ async fn start_subscription_bridge_oauth(
                     "provider": body.provider
                 }),
                 bridge_secret: body.bridge_secret,
+                allow_loopback: state.config.allow_oauth_loopback,
             },
             state.config.key_pepper.as_bytes(),
             unix_millis(),
@@ -661,6 +680,7 @@ async fn poll_subscription_bridge_oauth(
         &body.session_token,
         state.config.key_pepper.as_bytes(),
         unix_millis(),
+        service.tenant_external_id.as_deref(),
     )
     .await?
     {
@@ -2043,10 +2063,18 @@ async fn proxy(
         model: requested_model.clone(),
         config_json: "{}".to_owned(),
     };
-    let plugin_decision =
-        tokio::task::spawn_blocking(move || plugins.apply_traffic(plugin_context, &plugin_request))
-            .await
-            .map_err(|error| AppError::Upstream(format!("plugin task failed: {error}")))??;
+    let plugin_permit = PLUGIN_EXECUTION_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| AppError::Internal)?;
+    let plugin_task = tokio::task::spawn_blocking(move || {
+        let _plugin_permit = plugin_permit;
+        plugins.apply_traffic(plugin_context, &plugin_request)
+    });
+    let plugin_decision = tokio::time::timeout(Duration::from_secs(35), plugin_task)
+        .await
+        .map_err(|_| AppError::Upstream("plugin execution timed out".into()))?
+        .map_err(|error| AppError::Upstream(format!("plugin task failed: {error}")))??;
     if !plugin_decision.allow {
         tracing::warn!(reason = ?plugin_decision.reason, "traffic policy plugin denied request");
         return Err(AppError::Forbidden);
@@ -2641,12 +2669,17 @@ fn usage_from_value(value: &Value) -> Option<(i64, i64)> {
         .get("output_tokens")
         .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_i64);
-    match (input, output) {
+    let usage = match (input, output) {
         (Some(input), Some(output)) => Some((input, output)),
         (Some(input), None) => Some((input, 0)),
         (None, Some(output)) => Some((0, output)),
         (None, None) => None,
-    }
+    }?;
+    (usage.0 >= 0
+        && usage.0 <= MAX_REPORTED_TOKENS
+        && usage.1 >= 0
+        && usage.1 <= MAX_REPORTED_TOKENS)
+        .then_some(usage)
 }
 
 fn append_bounded(capture: &mut Vec<u8>, chunk: &[u8], maximum: usize) {
@@ -2766,7 +2799,11 @@ async fn archive_value(state: &AppState, location: &str) -> (Value, bool) {
     if location.starts_with("gap://") {
         return (Value::Null, false);
     }
-    match state.archive.get(location).await {
+    match state
+        .archive
+        .get_bounded(location, MAX_ARCHIVE_DETAIL_BODY)
+        .await
+    {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(value) => (value, true),
             Err(_) => (
@@ -3012,5 +3049,21 @@ mod tests {
         assert!(cpa_subscription_account(&json!({"upstream": "cursor"})).is_err());
         assert!(validate_cpa_auth_filename("../credential.json").is_err());
         assert!(validate_cpa_auth_filename("cursor-account.json").is_ok());
+    }
+
+    #[test]
+    fn upstream_usage_rejects_negative_and_extreme_token_counts() {
+        assert_eq!(
+            usage_from_value(&json!({"usage":{"input_tokens":12,"output_tokens":34}})),
+            Some((12, 34))
+        );
+        assert_eq!(
+            usage_from_value(&json!({"usage":{"input_tokens":-1,"output_tokens":34}})),
+            None
+        );
+        assert_eq!(
+            usage_from_value(&json!({"usage":{"input_tokens":12,"output_tokens":1000000001_i64}})),
+            None
+        );
     }
 }

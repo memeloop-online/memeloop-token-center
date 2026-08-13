@@ -283,14 +283,18 @@ impl Database {
         if let Some(idempotency_key) = idempotency_key {
             if matches!(self.backend, DatabaseBackend::PostgreSql) {
                 sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948312))")
-                    .bind(idempotency_key)
+                    .bind(format!(
+                        "{}:{idempotency_key}",
+                        input.tenant_external_id.trim()
+                    ))
                     .execute(&mut *tx)
                     .await?;
             }
             let existing = sqlx::query(
-                "SELECT provisioning_request_hash, issued_key_ciphertext FROM key_records WHERE provisioning_idempotency_key = $1",
+                "SELECT k.provisioning_request_hash, k.issued_key_ciphertext FROM key_records k JOIN tenants t ON t.id = k.tenant_id WHERE k.provisioning_idempotency_key = $1 AND t.external_id = $2",
             )
             .bind(idempotency_key)
+            .bind(input.tenant_external_id.trim())
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(existing) = existing {
@@ -1615,12 +1619,36 @@ impl Database {
         input_tokens: i64,
         output_tokens: i64,
     ) -> Result<i64, AppError> {
-        let actual_micros = priced_tokens(input_tokens, reservation.input_micros_per_million)
+        let calculated_micros = priced_tokens(input_tokens, reservation.input_micros_per_million)
             .checked_add(priced_tokens(
                 output_tokens,
                 reservation.output_micros_per_million,
             ))
             .ok_or(AppError::Internal)?;
+        let now = unix_millis();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE credit_accounts SET updated_at = updated_at WHERE id = $1")
+            .bind(reservation.account_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let available_micros: i64 =
+            sqlx::query("SELECT available_micros FROM credit_accounts WHERE id = $1")
+                .bind(reservation.account_id.to_string())
+                .fetch_one(&mut *tx)
+                .await?
+                .try_get("available_micros")?;
+        let maximum_charge = available_micros
+            .max(0)
+            .saturating_add(reservation.reserved_micros);
+        let actual_micros = calculated_micros.min(maximum_charge);
+        if actual_micros != calculated_micros {
+            tracing::warn!(
+                reservation_id = %reservation.id,
+                calculated_micros,
+                charged_micros = actual_micros,
+                "upstream usage exceeded the account hard balance limit"
+            );
+        }
         let released = reservation
             .reserved_micros
             .saturating_sub(actual_micros)
@@ -1628,8 +1656,6 @@ impl Database {
         let overage = actual_micros
             .saturating_sub(reservation.reserved_micros)
             .max(0);
-        let now = unix_millis();
-        let mut tx = self.pool.begin().await?;
         let claimed = sqlx::query(
             "UPDATE usage_reservations SET actual_micros = $1, status = 'settled', settled_at = $2 WHERE id = $3 AND status = 'reserved'",
         )
@@ -1698,7 +1724,7 @@ impl Database {
     pub async fn release_orphaned_reservations(&self, limit: i64) -> Result<u64, AppError> {
         let cutoff = unix_millis().saturating_sub(30 * 60 * 1_000);
         let rows = sqlx::query(
-            "SELECT r.id, r.account_id, r.key_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start FROM usage_reservations r WHERE r.status = 'reserved' AND r.created_at < $1 AND NOT EXISTS (SELECT 1 FROM request_records q WHERE q.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) ORDER BY r.created_at, r.id LIMIT $2",
+            "SELECT r.id, r.account_id, r.key_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE r.status = 'reserved' AND r.created_at < $1 AND q.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) ORDER BY r.created_at, r.id LIMIT $2",
         )
         .bind(cutoff)
         .bind(limit.clamp(1, 1_000))
@@ -1706,6 +1732,11 @@ impl Database {
         .await?;
         let mut released = 0_u64;
         for row in rows {
+            let request_id = row
+                .try_get::<Option<String>, _>("request_id")?
+                .map(parse_uuid)
+                .transpose()?;
+            let request_created_at = row.try_get::<Option<i64>, _>("request_created_at")?;
             let reservation = UsageReservation {
                 id: parse_uuid(row.try_get("id")?)?,
                 account_id: parse_uuid(row.try_get("account_id")?)?,
@@ -1717,6 +1748,21 @@ impl Database {
                 reserved_tokens: row.try_get("reserved_tokens")?,
             };
             self.settle_usage(&reservation, 0, 0).await?;
+            if let Some(request_id) = request_id {
+                self.record_request_finished(FinishRequest {
+                    request_id,
+                    status_code: 504,
+                    duration_ms: request_created_at
+                        .map(|created_at| unix_millis().saturating_sub(created_at))
+                        .unwrap_or_default(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_micros: 0,
+                    error_code: Some("request_expired".to_owned()),
+                    response_object: format!("gap://{request_id}/response"),
+                })
+                .await?;
+            }
             released = released.saturating_add(1);
         }
         Ok(released)
@@ -1830,7 +1876,7 @@ impl Database {
             .ok_or(AppError::NotFound)?;
         let currency: String = row.try_get("currency")?;
         let inserted = sqlx::query(
-            "INSERT INTO ledger_entries (id, account_id, kind, amount_micros, currency, source, idempotency_key, created_at) VALUES ($1, $2, 'grant', $3, $4, $5, $6, $7) ON CONFLICT(idempotency_key) DO NOTHING",
+            "INSERT INTO ledger_entries (id, account_id, kind, amount_micros, currency, source, idempotency_key, created_at) VALUES ($1, $2, 'grant', $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(account_id.to_string())
@@ -1950,11 +1996,13 @@ impl Database {
                 tx.commit().await?;
                 return Ok(micros_to_decimal_string(replay_amount.saturating_abs()));
             }
-            let existing_idempotency =
-                sqlx::query("SELECT kind FROM ledger_entries WHERE idempotency_key = $1")
-                    .bind(idempotency_key)
-                    .fetch_optional(&mut *tx)
-                    .await?;
+            let existing_idempotency = sqlx::query(
+                "SELECT kind FROM ledger_entries WHERE account_id = $1 AND idempotency_key = $2",
+            )
+            .bind(account_id.to_string())
+            .bind(idempotency_key)
+            .fetch_optional(&mut *tx)
+            .await?;
             if existing_idempotency.is_some() {
                 return Err(AppError::BadRequest(
                     "Idempotency-Key was already used for a different ledger operation".into(),
@@ -3059,6 +3107,11 @@ const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "legacy key credentials",
         sql: include_str!("../migrations/sqlite/0011_legacy_key_credentials.sql"),
     },
+    Migration {
+        version: 12,
+        name: "tenant scoped idempotency",
+        sql: include_str!("../migrations/sqlite/0012_tenant_idempotency.sql"),
+    },
 ];
 
 const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -3116,6 +3169,11 @@ const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 11,
         name: "legacy key credentials",
         sql: include_str!("../migrations/postgres/0011_legacy_key_credentials.sql"),
+    },
+    Migration {
+        version: 12,
+        name: "tenant scoped idempotency",
+        sql: include_str!("../migrations/postgres/0012_tenant_idempotency.sql"),
     },
 ];
 
@@ -3304,6 +3362,23 @@ mod tests {
                 .try_get("issued_key_ciphertext")
                 .unwrap();
         assert!(!ciphertext.contains(&first.key));
+
+        let other_tenant = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "other-tenant".to_owned(),
+                    principal_external_id: "member".to_owned(),
+                    alias: "primary".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::ONE,
+                    idempotency_key: Some("registration-event-1".to_owned()),
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        assert_ne!(other_tenant.key_id, first.key_id);
     }
 
     #[tokio::test]
@@ -3330,11 +3405,38 @@ mod tests {
             )
             .await
             .unwrap();
+        let other_account = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "other-tenant".to_owned(),
+                    principal_external_id: "member".to_owned(),
+                    alias: "refund-test".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::ZERO,
+                    idempotency_key: None,
+                },
+                b"a downstream key pepper longer than thirty-two bytes",
+            )
+            .await
+            .unwrap();
 
         assert_eq!(
             database
                 .grant(
                     issued.account_id,
+                    Decimal::new(10, 0),
+                    "subscription:pro",
+                    "subscription:one:grant",
+                )
+                .await
+                .unwrap(),
+            "10"
+        );
+        assert_eq!(
+            database
+                .grant(
+                    other_account.account_id,
                     Decimal::new(10, 0),
                     "subscription:pro",
                     "subscription:one:grant",
@@ -3544,6 +3646,53 @@ mod tests {
         assert_eq!(account_row.get::<i64, _>("available_micros"), 1_000_000);
         assert_eq!(account_row.get::<i64, _>("reserved_micros"), 0);
 
+        let linked_reservation = database
+            .reserve_usage(&key, &price, 0, 1_000)
+            .await
+            .unwrap();
+        let linked_request_id = Uuid::now_v7();
+        database
+            .record_request_started(NewRequest {
+                request_id: linked_request_id,
+                key_id: key.key_id,
+                tenant_id: key.tenant_id,
+                protocol: "openai".to_owned(),
+                model: "orphan-model".to_owned(),
+                request_object: format!("gap://{linked_request_id}/request"),
+                reservation_id: linked_reservation.id,
+                upstream_account_id: None,
+                model_route_id: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE usage_reservations SET created_at = $1 WHERE id = $2")
+            .bind(unix_millis().saturating_sub(31 * 60 * 1_000))
+            .bind(linked_reservation.id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            database.release_orphaned_reservations(100).await.unwrap(),
+            1
+        );
+        let expired_request = sqlx::query(
+            "SELECT status_code, error_code, completed_at FROM request_records WHERE id = $1",
+        )
+        .bind(linked_request_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(expired_request.get::<i64, _>("status_code"), 504);
+        assert_eq!(
+            expired_request.get::<String, _>("error_code"),
+            "request_expired"
+        );
+        assert!(
+            expired_request
+                .get::<Option<i64>, _>("completed_at")
+                .is_some()
+        );
+
         let overage_reservation = database
             .reserve_usage(&key, &price, 0, 1_000)
             .await
@@ -3564,5 +3713,26 @@ mod tests {
         .unwrap();
         assert_eq!(overage_account.get::<i64, _>("available_micros"), 998_000);
         assert_eq!(overage_account.get::<i64, _>("reserved_micros"), 0);
+
+        let capped_reservation = database
+            .reserve_usage(&key, &price, 0, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .settle_usage(&capped_reservation, 0, 2_000_000_000)
+                .await
+                .unwrap(),
+            998_000
+        );
+        let capped_account = sqlx::query(
+            "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+        )
+        .bind(issued.account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(capped_account.get::<i64, _>("available_micros"), 0);
+        assert_eq!(capped_account.get::<i64, _>("reserved_micros"), 0);
     }
 }
