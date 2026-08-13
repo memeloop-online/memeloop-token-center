@@ -70,24 +70,49 @@ ambient proxy inheritance.
 
 ## Open findings and deployment requirements
 
-### Medium: readiness probes can be reached through a catch-all ingress
+### P2: readiness probes can be reached through a catch-all ingress
 
-`/readyz` performs bounded database and archive checks and returns only coarse
-status, but the default Ingress forwards every path. Repeated public probes can
-still create avoidable dependency traffic. Production ingress or edge policy
-should expose `/readyz` only to the cluster/load-balancer health checker. The
-same restriction should cover `/livez` and the deprecated `/healthz` where
-practical. `/metrics` requires a `metrics:read` service credential and is not
-served by the gateway-only role.
+`/readyz` already has application-level amplification bounds: database and
+archive checks run in parallel with an independent two-second timeout, their
+result is cached for five seconds, and a non-blocking singleflight lock prevents
+concurrent probes from building a waiter queue or starting duplicate checks.
+The response exposes only coarse ready/failed state.
 
-### Medium: operator bearer token is browser-readable
+The default Ingress nevertheless forwards the path anonymously. An Internet
+caller can still trigger at most one database query and one S3 check per process
+per five-second cache window, compete with the real load-balancer probe, and
+observe dependency availability/timing. This is bounded operational traffic and
+coarse information disclosure, not a direct privilege-boundary bypass, so it is
+P2 rather than P1. Production ingress or edge policy should expose `/readyz`
+only to the cluster/load-balancer health checker. The same restriction should
+cover `/livez` and the deprecated `/healthz` where practical. `/metrics`
+requires a `metrics:read` service credential and is not served by the
+gateway-only role.
+
+### P2: operator bearer token is browser-readable
 
 The operator UI keeps its service credential in `sessionStorage`. The CSP
-reduces the XSS attack surface, but any same-origin script compromise could
-still read the token. For broad Internet exposure, place the operator UI behind
-SSO and prefer a short-lived, scoped, `HttpOnly; Secure; SameSite=Strict` session
-over a long-lived bootstrap bearer. Do not give the operator hostname to
-untrusted tenants.
+reduces the XSS attack surface, but any same-origin script compromise can read a
+long-lived token. Moving the token to React/process memory is the recommended
+near-term P2 fix: reload or browser restart requires another login/paste, and a
+token is no longer recoverable from browser storage after the page is gone.
+Memory-only storage does not stop active same-origin XSS, which can inspect
+runtime state or intercept authenticated requests.
+
+An `HttpOnly; Secure; SameSite=Strict` cookie would provide the stronger browser
+boundary, but the service currently has no server-side operator session. That
+design requires short session expiry, rotation/revocation, origin and CSRF
+controls, and must not translate the current long-lived bootstrap bearer
+directly into a persistent cookie.
+
+### P1 deployment condition: an unrestricted public control plane
+
+Regardless of token storage, exposing the control hostname to arbitrary
+Internet clients while operators use a long-lived global service credential is
+a P1 deployment blocker. Keep it behind SSO, VPN or a strict source allowlist;
+the tenant gateway can remain the public product endpoint. With that perimeter
+in place, the `sessionStorage` and readiness findings above remain P2 hardening
+items rather than release blockers.
 
 ### Operational requirements
 
@@ -96,6 +121,9 @@ untrusted tenants.
 - Keep Kubernetes NetworkPolicies enabled and allow only PostgreSQL, approved S3
   endpoints and required upstream egress. A NetworkPolicy is defense in depth;
   the application destination policy remains required.
+- MinIO root credentials belong only to the MinIO server. Give each application
+  environment an independent identity restricted to its own bucket and use that
+  environment's dedicated Kubernetes Secret.
 - Use managed/SOPS-backed Secrets, no plaintext Git values and no
   `last-applied-configuration` copy of secret material. Follow
   `docs/operations/secret-management.md` for rotation.

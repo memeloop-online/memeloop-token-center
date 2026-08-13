@@ -3315,7 +3315,7 @@ async fn assert_cpamp_import_state(
         .expect("imported tenant")
         .get("id");
     let request_row = sqlx::query(
-        "SELECT COUNT(*) AS requests, COUNT(DISTINCT reservation_id) AS distinct_events, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM request_records WHERE tenant_id = $1",
+        "SELECT COUNT(*) AS requests, COUNT(DISTINCT reservation_id) AS distinct_events, COALESCE(SUM(input_tokens), 0)::BIGINT AS input_tokens, COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens, COALESCE(SUM(cost_micros), 0)::BIGINT AS cost_micros FROM request_records WHERE tenant_id = $1",
     )
     .bind(&tenant_id)
     .fetch_one(&pool)
@@ -3341,7 +3341,7 @@ async fn assert_cpamp_import_state(
     );
 
     let aggregate_row = sqlx::query(
-        "SELECT COALESCE(SUM(a.requests), 0) AS requests, COALESCE(SUM(a.input_tokens), 0) AS input_tokens, COALESCE(SUM(a.output_tokens), 0) AS output_tokens, COALESCE(SUM(a.cost_micros), 0) AS cost_micros FROM usage_daily_aggregates a JOIN key_records k ON k.id = a.key_id WHERE k.tenant_id = $1",
+        "SELECT COALESCE(SUM(a.requests), 0)::BIGINT AS requests, COALESCE(SUM(a.input_tokens), 0)::BIGINT AS input_tokens, COALESCE(SUM(a.output_tokens), 0)::BIGINT AS output_tokens, COALESCE(SUM(a.cost_micros), 0)::BIGINT AS cost_micros FROM usage_daily_aggregates a JOIN key_records k ON k.id = a.key_id WHERE k.tenant_id = $1",
     )
     .bind(&tenant_id)
     .fetch_one(&pool)
