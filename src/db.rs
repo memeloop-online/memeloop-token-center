@@ -16,9 +16,9 @@ use crate::{
     model::{
         AuthenticatedKey, AuthenticatedService, ConversationClusterDetail, ConversationClusterView,
         ConversationEdgeView, GenerationJobView, GenerationJobWork, GenerationPrice, IssuedKey,
-        IssuedServiceToken, KeyPolicy, KeyView, ModelPrice, OperatorStats, RequestArchiveRefs,
-        RequestEventView, RequestView, SelfStats, StatsBucket, StatsSummary, UsageReservation,
-        micros_to_decimal_string, priced_tokens,
+        IssuedServiceToken, KeyPolicy, KeyView, LegacyCredentialView, ModelPrice, OperatorStats,
+        RequestArchiveRefs, RequestEventView, RequestView, SelfStats, StatsBucket, StatsSummary,
+        UsageReservation, micros_to_decimal_string, priced_tokens,
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
@@ -593,6 +593,13 @@ impl Database {
         .bind(key_id.to_string())
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE legacy_key_credentials SET revoked_at = $1 WHERE key_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(key_id.to_string())
+        .execute(&mut *tx)
+        .await?;
         insert_credential(&mut tx, &issued, generation, now).await?;
         sqlx::query(
             "UPDATE key_records SET credential_generation = $1, updated_at = $2 WHERE id = $3",
@@ -924,13 +931,25 @@ impl Database {
         value: &str,
         pepper: &[u8],
     ) -> Result<AuthenticatedKey, AppError> {
-        let parsed = crypto::parse_credential(value).ok_or(AppError::Unauthorized)?;
-        let row = sqlx::query(
-            "SELECT k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_records k JOIN key_credentials c ON c.key_id = k.id WHERE k.id = $1 AND c.revoked_at IS NULL ORDER BY c.generation DESC",
-        )
-        .bind(parsed.key_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?
+        let row = if let Some(parsed) = crypto::parse_credential(value) {
+            sqlx::query(
+                "SELECT k.id AS key_id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_records k JOIN key_credentials c ON c.key_id = k.id WHERE k.id = $1 AND c.revoked_at IS NULL ORDER BY c.generation DESC",
+            )
+            .bind(parsed.key_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            if value.len() < 16 || value.len() > 512 || value.contains(['\r', '\n']) {
+                return Err(AppError::Unauthorized);
+            }
+            let (secret_hash, _) = crypto::hash_credential(value, pepper);
+            sqlx::query(
+                "SELECT k.id AS key_id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_records k JOIN legacy_key_credentials c ON c.key_id = k.id WHERE c.secret_hash = $1 AND c.revoked_at IS NULL",
+            )
+            .bind(secret_hash)
+            .fetch_optional(&self.pool)
+            .await?
+        }
         .ok_or(AppError::Unauthorized)?;
         let status: String = row.try_get("status")?;
         let expected: Vec<u8> = row.try_get("secret_hash")?;
@@ -940,7 +959,7 @@ impl Database {
 
         let policy_json: String = row.try_get("policy_json")?;
         Ok(AuthenticatedKey {
-            key_id: parsed.key_id,
+            key_id: parse_uuid(row.try_get("key_id")?)?,
             tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
             principal_id: parse_uuid(row.try_get("principal_id")?)?,
             account_id: parse_uuid(row.try_get("account_id")?)?,
@@ -948,6 +967,77 @@ impl Database {
             currency: row.try_get("currency")?,
             credential_generation: row.try_get("generation")?,
             policy: serde_json::from_str(&policy_json).map_err(|_| AppError::Internal)?,
+        })
+    }
+
+    pub async fn register_legacy_key_credential(
+        &self,
+        key_id: Uuid,
+        credential: &str,
+        source_hash: &str,
+        pepper: &[u8],
+    ) -> Result<LegacyCredentialView, AppError> {
+        let source_hash = source_hash.trim().to_ascii_lowercase();
+        if credential.len() < 16
+            || credential.len() > 512
+            || credential.contains(['\r', '\n'])
+            || source_hash.len() != 64
+            || !source_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(AppError::BadRequest(
+                "legacy credential or source_hash is invalid".into(),
+            ));
+        }
+        let actual_source_hash = format!("{:x}", Sha256::digest(credential.trim().as_bytes()));
+        if actual_source_hash != source_hash {
+            return Err(AppError::BadRequest(
+                "legacy credential does not match source_hash".into(),
+            ));
+        }
+        let existing = sqlx::query(
+            "SELECT key_id, generation, fingerprint FROM legacy_key_credentials WHERE source_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(&source_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = existing {
+            let existing_key_id = parse_uuid(row.try_get("key_id")?)?;
+            if existing_key_id != key_id {
+                return Err(AppError::Forbidden);
+            }
+            return Ok(LegacyCredentialView {
+                key_id,
+                generation: row.try_get("generation")?,
+                fingerprint: row.try_get("fingerprint")?,
+                source_hash,
+            });
+        }
+        let generation = sqlx::query(
+            "SELECT credential_generation FROM key_records WHERE id = $1 AND status = 'active'",
+        )
+        .bind(key_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?
+        .try_get("credential_generation")?;
+        let (secret_hash, fingerprint) = crypto::hash_credential(credential.trim(), pepper);
+        sqlx::query(
+            "INSERT INTO legacy_key_credentials (id, key_id, generation, secret_hash, fingerprint, source_hash, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(key_id.to_string())
+        .bind(generation)
+        .bind(secret_hash)
+        .bind(&fingerprint)
+        .bind(&source_hash)
+        .bind(unix_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(LegacyCredentialView {
+            key_id,
+            generation,
+            fingerprint,
+            source_hash,
         })
     }
 
@@ -2964,6 +3054,11 @@ const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "operator aggregate indexes",
         sql: include_str!("../migrations/sqlite/0010_operator_aggregate_indexes.sql"),
     },
+    Migration {
+        version: 11,
+        name: "legacy key credentials",
+        sql: include_str!("../migrations/sqlite/0011_legacy_key_credentials.sql"),
+    },
 ];
 
 const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -3016,6 +3111,11 @@ const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 10,
         name: "operator aggregate indexes",
         sql: include_str!("../migrations/postgres/0010_operator_aggregate_indexes.sql"),
+    },
+    Migration {
+        version: 11,
+        name: "legacy key credentials",
+        sql: include_str!("../migrations/postgres/0011_legacy_key_credentials.sql"),
     },
 ];
 

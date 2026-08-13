@@ -1,15 +1,41 @@
-import type { ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import type { RequestView, StatsBucket } from './types';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
+  const [theme, setTheme] = useState<'dark' | 'light'>(() =>
+    document.documentElement.dataset.theme === 'light' ? 'light' : 'dark',
+  );
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem('mtc-theme', theme);
+  }, [theme]);
   return (
     <div className="app-shell">
       <aside className="rail">
-        <div className="brand-mark">M</div>
+        <div className="brand-mark"><img src="/ui-assets/token-center-icon-32.png" alt="Memeloop Token Center" /></div>
         <div className="rail-line" />
+        <button
+          className="theme-toggle"
+          type="button"
+          aria-label={theme === 'dark' ? '切换到亮色主题' : '切换到暗色主题'}
+          title={theme === 'dark' ? '亮色主题' : '暗色主题'}
+          onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}
+        >
+          {theme === 'dark' ? '☀' : '☾'}
+        </button>
         <div className="rail-label">{operator ? 'OP' : 'SELF'}</div>
       </aside>
-      <main className="main">{children}</main>
+      <main className="main">
+        <button
+          className="theme-toggle mobile-theme-toggle"
+          type="button"
+          aria-label={theme === 'dark' ? '切换到亮色主题' : '切换到暗色主题'}
+          onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}
+        >
+          {theme === 'dark' ? '☀' : '☾'}
+        </button>
+        {children}
+      </main>
     </div>
   );
 }

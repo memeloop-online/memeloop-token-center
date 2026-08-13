@@ -46,6 +46,7 @@ impl AppState {
             providers,
             plugins,
             http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .pool_max_idle_per_host(8)
                 .pool_idle_timeout(std::time::Duration::from_secs(30))
                 .build()?,

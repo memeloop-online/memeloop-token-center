@@ -1,6 +1,6 @@
 use std::{
     convert::Infallible,
-    path::PathBuf,
+    path::{Component, PathBuf},
     str::FromStr,
     time::{Duration, Instant},
 };
@@ -8,8 +8,9 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{
         Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -49,7 +50,9 @@ use crate::{
 
 const REQUEST_ID_HEADER: &str = "x-mtc-request-id";
 const MAX_SUBSCRIPTION_BRIDGE_RESPONSE: usize = 16 * 1024 * 1024;
+const MAX_IMAGE_RESPONSE: usize = 16 * 1024 * 1024;
 const MAX_CPA_IMPORT_BODY: usize = 34 * 1024 * 1024;
+static IMAGE_RESPONSE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 pub fn router(state: AppState) -> Router {
     router_for_role(state, RuntimeRole::All)
@@ -67,6 +70,7 @@ pub fn router_for_role(state: AppState, role: RuntimeRole) -> Router {
     }
     application
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(middleware::from_fn(security_headers))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
@@ -79,6 +83,10 @@ fn control_router() -> Router<AppState> {
         .route("/internal/v1/keys", post(create_key))
         .route("/internal/v1/keys/{key_id}/rotate", post(rotate_key))
         .route("/internal/v1/keys/{key_id}/policy", put(update_key_policy))
+        .route(
+            "/internal/v1/keys/{key_id}/legacy-credentials",
+            post(register_legacy_key_credential),
+        )
         .route("/internal/v1/service-tokens", post(create_service_token))
         .route(
             "/internal/v1/service-tokens/{service_id}/rotate",
@@ -165,7 +173,7 @@ fn gateway_router() -> Router<AppState> {
         .route("/v1/embeddings", post(proxy_openai_embeddings))
         .route("/v1/generations", post(create_generation))
         .route("/v1/videos/generations", post(create_generation))
-        .route("/v1/images/generations", post(create_generation))
+        .route("/v1/images/generations", post(create_image_generation))
         .route("/v1/messages", post(proxy_anthropic))
         .route(
             "/v1/messages/count_tokens",
@@ -175,6 +183,31 @@ fn gateway_router() -> Router<AppState> {
 
 async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
+}
+
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static(
+            "accelerometer=(), camera=(), geolocation=(), microphone=(), payment=(), usb=()",
+        ),
+    );
+    response
 }
 
 async fn operator_index() -> Response {
@@ -192,7 +225,7 @@ fn web_root() -> PathBuf {
 }
 
 async fn web_index(allow_fallback: bool) -> Response {
-    match tokio::fs::read(web_root().join("index.html")).await {
+    let mut response = match tokio::fs::read(web_root().join("index.html")).await {
         Ok(body) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response(),
         Err(error) if allow_fallback => {
             tracing::warn!(%error, "built web application is unavailable; serving fallback portal");
@@ -206,13 +239,25 @@ async fn web_index(allow_fallback: bool) -> Response {
             )
                 .into_response()
         }
-    }
+    };
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
+        ),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn web_asset(Path(path): Path<String>) -> Response {
-    if path
-        .split('/')
-        .any(|component| component.is_empty() || component == "." || component == "..")
+    let relative = std::path::Path::new(&path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
     {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -320,6 +365,39 @@ async fn update_key_policy(
         state.db.require_key_tenant(key_id, tenant).await?;
     }
     Ok(Json(state.db.update_key_policy(key_id, policy).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterLegacyKeyCredentialRequest {
+    credential: String,
+    source_hash: String,
+}
+
+async fn register_legacy_key_credential(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key_id): Path<Uuid>,
+    Json(body): Json<RegisterLegacyKeyCredentialRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "keys:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_key_tenant(key_id, tenant).await?;
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            state
+                .db
+                .register_legacy_key_credential(
+                    key_id,
+                    &body.credential,
+                    &body.source_hash,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await?,
+        ),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1298,6 +1376,463 @@ struct CreateGenerationRequest {
     input: Value,
 }
 
+async fn create_image_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let value: Value = serde_json::from_slice(&body)
+        .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
+    if value.get("input").is_some() {
+        let request = serde_json::from_value(value)
+            .map_err(|_| AppError::BadRequest("model and generation input are required".into()))?;
+        return create_generation(State(state), headers, Json(request)).await;
+    }
+    proxy_openai_image_generation(state, headers, body, value).await
+}
+
+async fn proxy_openai_image_generation(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    request_json: Value,
+) -> Result<Response, AppError> {
+    let key = authenticate_downstream(&headers, &state).await?;
+    let model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 200)
+        .ok_or_else(|| AppError::BadRequest("model is required".into()))?
+        .to_owned();
+    let prompt = request_json
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 32_000)
+        .ok_or_else(|| AppError::BadRequest("prompt is required".into()))?;
+    if prompt.contains('\0') {
+        return Err(AppError::BadRequest("prompt contains invalid data".into()));
+    }
+    if !key.policy.allows_model(&model) {
+        return Err(AppError::Forbidden);
+    }
+    let image_count = request_json.get("n").and_then(Value::as_i64).unwrap_or(1);
+    if !(1..=10).contains(&image_count) {
+        return Err(AppError::BadRequest("n must be between 1 and 10".into()));
+    }
+    let route = state
+        .db
+        .resolve_upstream(
+            key.tenant_id,
+            &model,
+            "generation",
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?
+        .ok_or_else(|| AppError::Upstream("image generation route is not configured".into()))?;
+    if route.driver != "http-json" {
+        return Err(AppError::Upstream(format!(
+            "generation driver {} does not implement the OpenAI Images API",
+            route.driver
+        )));
+    }
+    let price = state.db.generation_price(&model, &key.currency).await?;
+    if !matches!(price.billing_unit.as_str(), "image" | "job") {
+        return Err(AppError::BadRequest(
+            "OpenAI image generation must be billed per image or job".into(),
+        ));
+    }
+    let billed_units = if price.billing_unit == "job" {
+        1
+    } else {
+        image_count
+    };
+    let responses_tool_mode = route
+        .config
+        .get("image_api_mode")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "responses-tool");
+    if responses_tool_mode && image_count != 1 {
+        return Err(AppError::BadRequest(
+            "responses-tool image routes currently require n=1".into(),
+        ));
+    }
+    let reservation_price = price
+        .reservation_price()
+        .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
+    let reservation = state
+        .db
+        .reserve_usage(&key, &reservation_price, 0, billed_units)
+        .await?;
+    let request_id = Uuid::now_v7();
+    let request_object = match state.archive.put_content(body).await {
+        Ok(location) => location,
+        Err(error) => {
+            let _ = state.db.settle_usage(&reservation, 0, 0).await;
+            return Err(error);
+        }
+    };
+    state
+        .db
+        .record_request_started(NewRequest {
+            request_id,
+            key_id: key.key_id,
+            tenant_id: key.tenant_id,
+            protocol: "openai-image".to_owned(),
+            model: model.clone(),
+            request_object,
+            reservation_id: reservation.id,
+            upstream_account_id: Some(route.account_id),
+            model_route_id: Some(route.route_id),
+        })
+        .await?;
+    let (upstream_path, forwarded) = if responses_tool_mode {
+        (
+            "/v1/responses",
+            responses_tool_image_request(&route.config, &route.upstream_model, &request_json)?,
+        )
+    } else {
+        let mut forwarded = request_json;
+        forwarded["model"] = Value::String(route.upstream_model);
+        ("/v1/images/generations", forwarded)
+    };
+    let _image_response_permit = if responses_tool_mode {
+        Some(
+            IMAGE_RESPONSE_PERMITS
+                .acquire()
+                .await
+                .map_err(|_| AppError::Internal)?,
+        )
+    } else {
+        None
+    };
+    let started = Instant::now();
+    let mut request = state
+        .http
+        .post(format!(
+            "{}{}",
+            route.base_url.trim_end_matches('/'),
+            upstream_path
+        ))
+        .json(&forwarded);
+    request = route.credential.apply(request, unix_millis())?;
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = state.db.settle_usage(&reservation, 0, 0).await;
+            state
+                .db
+                .record_request_finished(FinishRequest {
+                    request_id,
+                    status_code: 502,
+                    duration_ms: started.elapsed().as_millis() as i64,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_micros: 0,
+                    error_code: Some("upstream_connection".to_owned()),
+                    response_object: format!("gap://{request_id}/response"),
+                })
+                .await?;
+            return Err(AppError::Upstream(error.to_string()));
+        }
+    };
+    if responses_tool_mode {
+        return finish_responses_tool_image(
+            &state,
+            upstream,
+            &reservation,
+            request_id,
+            started,
+            billed_units,
+        )
+        .await;
+    }
+    let status = upstream.status();
+    let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+    let archive_writer = state
+        .archive
+        .start_writer(&format!("staging/{request_id}/response.bin"))
+        .await
+        .ok();
+    let (body_sender, body_receiver) = tokio::sync::mpsc::channel(8);
+    let background_state = state.clone();
+    tokio::spawn(async move {
+        let mut stream = upstream.bytes_stream();
+        let mut writer = archive_writer;
+        let mut transport_error = false;
+        while let Some(next) = stream.next().await {
+            match next {
+                Ok(chunk) => {
+                    if let Some(mut active) = writer.take() {
+                        match active.write(chunk.clone()).await {
+                            Ok(()) => writer = Some(active),
+                            Err(_) => {
+                                let _ = active.abort().await;
+                            }
+                        }
+                    }
+                    let _ = body_sender.send(Ok::<Bytes, std::io::Error>(chunk)).await;
+                }
+                Err(error) => {
+                    transport_error = true;
+                    let _ = body_sender
+                        .send(Err(std::io::Error::other(error.to_string())))
+                        .await;
+                    break;
+                }
+            }
+        }
+        let response_object = if let Some(writer) = writer {
+            writer
+                .finish()
+                .await
+                .unwrap_or_else(|_| format!("gap://{request_id}/response"))
+        } else {
+            format!("gap://{request_id}/response")
+        };
+        let success = status.is_success() && !transport_error;
+        let cost_micros = background_state
+            .db
+            .settle_usage(&reservation, 0, if success { billed_units } else { 0 })
+            .await
+            .unwrap_or(0);
+        let error_code = if transport_error {
+            Some("upstream_stream".to_owned())
+        } else if status.is_success() {
+            None
+        } else {
+            Some(format!("http_{}", status.as_u16()))
+        };
+        if let Err(error) = background_state
+            .db
+            .record_request_finished(FinishRequest {
+                request_id,
+                status_code: i64::from(status.as_u16()),
+                duration_ms: started.elapsed().as_millis() as i64,
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_micros,
+                error_code,
+                response_object,
+            })
+            .await
+        {
+            tracing::error!(%request_id, %error, "failed to finalize image generation request");
+        }
+    });
+    let mut response = Response::builder()
+        .status(status)
+        .header(REQUEST_ID_HEADER, request_id.to_string());
+    if let Some(content_type) = content_type {
+        response = response.header(header::CONTENT_TYPE, content_type);
+    }
+    response
+        .body(Body::from_stream(ReceiverStream::new(body_receiver)))
+        .map_err(|_| AppError::Internal)
+}
+
+fn responses_tool_image_request(
+    config: &Value,
+    image_model: &str,
+    request: &Value,
+) -> Result<Value, AppError> {
+    let main_model = config
+        .get("image_main_model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 200)
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "responses-tool image routes require config.image_main_model".into(),
+            )
+        })?;
+    let prompt = request
+        .get("prompt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("prompt is required".into()))?;
+    let mut tool = json!({
+        "type": "image_generation",
+        "model": image_model,
+        "action": "generate"
+    });
+    for field in [
+        "size",
+        "quality",
+        "background",
+        "output_format",
+        "moderation",
+    ] {
+        if let Some(value) = request.get(field) {
+            tool[field] = value.clone();
+        }
+    }
+    for field in ["output_compression", "partial_images"] {
+        if let Some(value) = request.get(field).filter(|value| value.is_number()) {
+            tool[field] = value.clone();
+        }
+    }
+    Ok(json!({
+        "model": main_model,
+        "input": [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": prompt}]
+        }],
+        "tools": [tool],
+        "tool_choice": {"type": "image_generation"},
+        "stream": false,
+        "store": false
+    }))
+}
+
+async fn finish_responses_tool_image(
+    state: &AppState,
+    upstream: reqwest::Response,
+    reservation: &crate::model::UsageReservation,
+    request_id: Uuid,
+    started: Instant,
+    billed_units: i64,
+) -> Result<Response, AppError> {
+    let upstream_status = upstream.status();
+    let mut bytes = Vec::new();
+    let mut stream = upstream.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let _ = state.db.settle_usage(reservation, 0, 0).await;
+                state
+                    .db
+                    .record_request_finished(FinishRequest {
+                        request_id,
+                        status_code: 502,
+                        duration_ms: started.elapsed().as_millis() as i64,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_micros: 0,
+                        error_code: Some("upstream_stream".to_owned()),
+                        response_object: format!("gap://{request_id}/response"),
+                    })
+                    .await?;
+                return Err(AppError::Upstream(error.to_string()));
+            }
+        };
+        if bytes.len().saturating_add(chunk.len()) > MAX_IMAGE_RESPONSE {
+            let _ = state.db.settle_usage(reservation, 0, 0).await;
+            state
+                .db
+                .record_request_finished(FinishRequest {
+                    request_id,
+                    status_code: 502,
+                    duration_ms: started.elapsed().as_millis() as i64,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_micros: 0,
+                    error_code: Some("upstream_image_too_large".to_owned()),
+                    response_object: format!("gap://{request_id}/response"),
+                })
+                .await?;
+            return Err(AppError::Upstream("image response exceeded 16 MiB".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    let (status, response_bytes, error_code, billed) = if upstream_status.is_success() {
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(response) => {
+                let mut images = Vec::new();
+                collect_image_results(&response, &mut images);
+                if images.is_empty() {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        bytes,
+                        Some("upstream_image_missing".to_owned()),
+                        false,
+                    )
+                } else {
+                    let usage = response.get("usage").cloned();
+                    let mut transformed = json!({
+                        "created": unix_millis() / 1_000,
+                        "data": images.into_iter().map(|image| json!({"b64_json": image})).collect::<Vec<_>>()
+                    });
+                    if let Some(usage) = usage {
+                        transformed["usage"] = usage;
+                    }
+                    (
+                        StatusCode::OK,
+                        serde_json::to_vec(&transformed)
+                            .expect("image response is JSON serializable"),
+                        None,
+                        true,
+                    )
+                }
+            }
+            Err(_) => (
+                StatusCode::BAD_GATEWAY,
+                bytes,
+                Some("upstream_image_invalid_json".to_owned()),
+                false,
+            ),
+        }
+    } else {
+        (
+            upstream_status,
+            bytes,
+            Some(format!("http_{}", upstream_status.as_u16())),
+            false,
+        )
+    };
+    let response_object = state
+        .archive
+        .put_content(Bytes::copy_from_slice(&response_bytes))
+        .await
+        .unwrap_or_else(|_| format!("gap://{request_id}/response"));
+    let cost_micros = state
+        .db
+        .settle_usage(reservation, 0, if billed { billed_units } else { 0 })
+        .await?;
+    state
+        .db
+        .record_request_finished(FinishRequest {
+            request_id,
+            status_code: i64::from(status.as_u16()),
+            duration_ms: started.elapsed().as_millis() as i64,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_micros,
+            error_code,
+            response_object,
+        })
+        .await?;
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(REQUEST_ID_HEADER, request_id.to_string())
+        .body(Body::from(response_bytes))
+        .map_err(|_| AppError::Internal)
+}
+
+fn collect_image_results(value: &Value, images: &mut Vec<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_image_results(value, images);
+            }
+        }
+        Value::Object(object) => {
+            if object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "image_generation_call")
+                && let Some(result) = object.get("result").and_then(Value::as_str)
+            {
+                images.push(result.to_owned());
+            }
+            for value in object.values() {
+                collect_image_results(value, images);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn create_generation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2222,6 +2757,12 @@ fn safe_conversation_hint(value: &str) -> Option<String> {
 }
 
 async fn archive_value(state: &AppState, location: &str) -> (Value, bool) {
+    if let Some(value) = location.strip_prefix("inline-json:") {
+        return match serde_json::from_str(value) {
+            Ok(value) => (value, true),
+            Err(_) => (Value::Null, false),
+        };
+    }
     if location.starts_with("gap://") {
         return (Value::Null, false);
     }
@@ -2372,6 +2913,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(gateway_model.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn public_responses_include_browser_security_headers() {
+        let (state, _directory) = test_state().await;
+        let response = router_for_role(state, RuntimeRole::Gateway)
+            .oneshot(
+                Request::get("/healthz")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert_eq!(
+            response.headers().get(header::X_FRAME_OPTIONS),
+            Some(&HeaderValue::from_static("DENY"))
+        );
+        assert_eq!(
+            response.headers().get(header::REFERRER_POLICY),
+            Some(&HeaderValue::from_static("no-referrer"))
+        );
     }
 
     #[tokio::test]

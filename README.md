@@ -10,7 +10,7 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 
 ## Key 身份与权限
 
-一个逻辑 key 由不可变 UUIDv7 `key_id` 标识，密钥字符串只是它的一代 credential。轮换时只吊销旧 credential 并生成下一代，策略、余额账户、请求记录、统计和会话簇始终引用同一个 `key_id`，不复制或迁移历史。
+一个逻辑 key 由不可变 UUIDv7 `key_id` 标识，密钥字符串只是它的一代 credential。轮换时只吊销旧 credential 并生成下一代，策略、余额账户、请求记录、统计和会话簇始终引用同一个 `key_id`，不复制或迁移历史。迁移 CPA 时还可把原 Key 以 peppered HMAC credential 绑定到这个稳定身份；不会保存明文，也不要求客户端切换 Key。
 
 下游 key 只能访问：
 
@@ -24,7 +24,7 @@ PostgreSQL-first、低内存、可扩展的多协议 AI 网关和额度中心。
 
 - OpenAI：`/v1/chat/completions`、`/v1/responses`、`/v1/embeddings`。
 - Anthropic：`/v1/messages`、`/v1/messages/count_tokens`。
-- 多模态生成：`/v1/generations`、`/v1/videos/generations`、`/v1/images/generations`；内置火山引擎 Seedance 视频任务与 ComfyUI 本地/Cloud 图片、视频工作流，统一执行模型权限、额度预留、限流、计费、轮询和 S3/CAS 归档。
+- 多模态生成：`/v1/generations`、`/v1/videos/generations`、`/v1/images/generations`；内置火山引擎 Seedance 视频任务、ComfyUI 本地/Cloud 工作流、OpenAI Images API，以及把 Codex Responses `image_generation` 工具映射为标准 Images API 的路由模式，统一执行模型权限、额度预留、限流、计费和 S3/CAS 归档。
 - Service：创建/轮换 key、更新模型/限流/预算 policy、设置同币种模型价格、幂等发放余额及撤销完整未消费的 grant；可创建 tenant 绑定、scope 最小化的服务凭据供 memeloop web 使用。服务凭据也有稳定 UUID 与 generation，轮换后旧 token 立即失效。
 - Provider：创建稳定上游账号、轮换 API/OAuth credential、配置无需认证的私有 ComfyUI、建立公开模型到上游模型的路由。
 - OAuth：原生接入 CPA Subscription Bridge 的 GitHub Copilot/Cursor 订阅登录、opaque handle 推理，以及 Cursor 直接 PKCE/refresh；插件 provider 还能声明同协议的 OAuth Adapter。登录状态是有时限的加密 token，可跨 K8s 副本重试。
@@ -58,11 +58,13 @@ cargo test
 cargo test --test cucumber
 ```
 
-Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，不需要 PostgreSQL 或真实 S3。当前覆盖 15 个场景、99 个步骤，包括稳定 key 轮换、权限/额度/限流、订阅 grant 幂等撤销、OpenAI/Anthropic、API/OAuth 同管线、Cursor PKCE、Copilot/Cursor subscription bridge、CPA 账号安全导入、逻辑会话以及 Seedance/ComfyUI 异步生成、计费与统一排障详情。`MTC_TEST_POSTGRES_URL` 可启用真实 PostgreSQL v1–v10 迁移、队列、聚合、事件与详情查询测试。
+Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，不需要 PostgreSQL 或真实 S3。当前覆盖 18 个场景、121 个步骤，包括稳定 key 轮换、CPA 原 Key 兼容、权限/额度/限流、订阅 grant 幂等撤销、OpenAI/Anthropic、API/OAuth 同管线、Cursor PKCE、Copilot/Cursor subscription bridge、CPA 账号安全导入、逻辑会话，以及 Seedance、ComfyUI、OpenAI Images、Codex Responses 生图的转发、归档和计费。`MTC_TEST_POSTGRES_URL` 可启用真实 PostgreSQL v1–v11 迁移、队列、聚合、事件与详情查询测试。
 
 memeloop web 对余额发放使用 `POST /internal/v1/accounts/{account_id}/grants`；取消或替换订阅时使用 `POST /internal/v1/accounts/{account_id}/grant-reversals`，body 指向原 grant 的幂等键，且 reversal 自己必须使用新的 `Idempotency-Key`。为避免对已经消费的服务做隐式退款，当前只允许撤销仍完整未消费的 grant；部分消费后的退款需要由业务侧人工或后续按 grant lot 结算。
 
-数据库 DDL 位于 `migrations/`，每个版本都在同一事务和 PostgreSQL advisory transaction lock 下应用。PostgreSQL 的请求与事件表按天分区，并为 key/tenant/模型/状态/错误/上游/逻辑会话尾查建立专用 B-tree 与 BRIN 索引；生成任务有领取、稳定 key 时间线、上游任务和预留关联索引。SQLite 保留等价的小型测试 schema。连接池默认每进程最多 8 个连接且不预热，HTTP 上游连接池也有严格空闲上限；控制响应与生成文件分别有 4 MiB 和 512 MiB 流式上限。
+数据库 DDL 位于 `migrations/`，每个版本都在同一事务和 PostgreSQL advisory transaction lock 下应用。PostgreSQL 的请求与事件表按天分区，并为 key/tenant/模型/状态/错误/上游/逻辑会话尾查建立专用 B-tree 与 BRIN 索引；生成任务有领取、稳定 key 时间线、上游任务和预留关联索引。SQLite 保留等价的小型测试 schema。连接池默认每进程最多 8 个连接且不预热，HTTP 上游连接池也有严格空闲上限；Codex 生图响应限制为 16 MiB、每副本最多两个并发缓冲，其他大对象继续流式归档，避免重现 CPA 的高内存占用。
+
+`ops/migrate-cpamp.sh` 是 PostgreSQL 增量导入器：首次导入所有 CPAMP usage/alias/price，之后从 checkpoint watermark 回看默认 24 小时，只把尚未存在的 event hash 写入请求表和日聚合表。回看窗口用于覆盖 CPAMP 延迟刷盘；确定性 UUID 与幂等插入保证周末切换前可以反复运行。`CPAMP_RESET_IMPORT=true` 仅用于重建 dogfood 导入租户，不应在生产增量切换中使用。
 
 ## 配置与插件
 

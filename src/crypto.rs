@@ -71,6 +71,12 @@ pub fn verify_credential(value: &str, pepper: &[u8], expected: &[u8]) -> bool {
     actual.as_slice().ct_eq(expected).into()
 }
 
+pub fn hash_credential(value: &str, pepper: &[u8]) -> (Vec<u8>, String) {
+    let secret_hash = keyed_hash(pepper, value.as_bytes());
+    let fingerprint = hex_prefix(&secret_hash, 8);
+    (secret_hash, fingerprint)
+}
+
 pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     left.ct_eq(right).into()
 }

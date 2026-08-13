@@ -1,0 +1,131 @@
+:root {
+  color-scheme: dark;
+}
+
+.theme-toggle {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  color: #72d8c9;
+  background: transparent;
+  border-color: #2c4b4c;
+  font-size: 17px;
+}
+
+.brand-mark {
+  overflow: hidden;
+  border-radius: 9px;
+}
+
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.mobile-theme-toggle {
+  display: none;
+}
+
+:root[data-theme='light'] {
+  color: #173238;
+  color-scheme: light;
+  background: #f4f7f5;
+}
+
+:root[data-theme='light'] body {
+  color: #173238;
+  background:
+    radial-gradient(circle at 18% -10%, #d7f2ec 0, transparent 36%),
+    radial-gradient(circle at 100% 20%, #e5ebf6 0, transparent 30%),
+    #f4f7f5;
+}
+
+:root[data-theme='light'] .rail {
+  background: #f8fbf9;
+  border-color: #cddbd8;
+}
+
+:root[data-theme='light'] .brand-mark,
+:root[data-theme='light'] .eyebrow,
+:root[data-theme='light'] .tabs button.active {
+  color: #087d70;
+}
+
+:root[data-theme='light'] .brand-mark,
+:root[data-theme='light'] .tabs button.active {
+  border-color: #168f81;
+}
+
+:root[data-theme='light'] .hero p,
+:root[data-theme='light'] .muted,
+:root[data-theme='light'] .bucket span,
+:root[data-theme='light'] .panel-title span,
+:root[data-theme='light'] .empty,
+:root[data-theme='light'] .account span,
+:root[data-theme='light'] .form-panel .field-description {
+  color: #62767b;
+}
+
+:root[data-theme='light'] input,
+:root[data-theme='light'] select,
+:root[data-theme='light'] textarea,
+:root[data-theme='light'] .metric,
+:root[data-theme='light'] .policy-grid span,
+:root[data-theme='light'] .conversation {
+  color: #173238;
+  background: #fff;
+  border-color: #b9ceca;
+}
+
+:root[data-theme='light'] .panel {
+  background: #fffffff2;
+  border-color: #c5d6d2;
+  box-shadow: 0 18px 52px #36554a1a;
+}
+
+:root[data-theme='light'] .metrics,
+:root[data-theme='light'] .policy-grid {
+  background: #c8d8d5;
+  border-color: #c8d8d5;
+}
+
+:root[data-theme='light'] .tabs,
+:root[data-theme='light'] th,
+:root[data-theme='light'] td,
+:root[data-theme='light'] .edge {
+  border-color: #d4dfdc;
+}
+
+:root[data-theme='light'] .tabs button {
+  color: #576d72;
+}
+
+:root[data-theme='light'] .clickable:hover {
+  background: #edf6f3;
+}
+
+:root[data-theme='light'] .drawer {
+  color: #173238;
+  background: #f8fbf9;
+  border-color: #b9ceca;
+}
+
+:root[data-theme='light'] .drawer pre {
+  color: #29474d;
+  background: #eef4f2;
+  border-color: #c8d8d5;
+}
+
+:root[data-theme='light'] .theme-toggle,
+:root[data-theme='light'] .secondary {
+  color: #087d70;
+  border-color: #86b9b1;
+}
+
+@media (width <= 900px) {
+  .mobile-theme-toggle {
+    display: inline-flex;
+    margin: 0 0 14px auto;
+  }
+}

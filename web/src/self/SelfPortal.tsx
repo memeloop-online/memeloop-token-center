@@ -51,7 +51,7 @@ export function SelfPortal() {
     <Shell>
       <header className="hero">
         <div><span className="eyebrow">KEY OBSERVABILITY</span><h1>请求与用量</h1><p>凭当前 API key 只读查看它的稳定身份、历史、错误和逻辑会话。</p></div>
-        <div className="credential"><input type="password" value={key} onChange={(event) => setKey(event.target.value)} placeholder="mtc_…" /><button onClick={() => void load()}>载入</button></div>
+        <div className="credential"><input type="password" value={key} onChange={(event) => setKey(event.target.value)} placeholder="CPA 原 Key 或 mtc_…" /><button onClick={() => void load()}>载入</button></div>
       </header>
       {error && <div className="notice error">{error}</div>}
       {stats && <>

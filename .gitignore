@@ -4,6 +4,7 @@
 /web/node_modules/
 /web/dist/
 /web/*.tsbuildinfo
+/output/
 *.db
 *.db-shm
 *.db-wal

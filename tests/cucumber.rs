@@ -5,6 +5,7 @@ use futures_util::StreamExt;
 use memeloop_token_center::{AppState, api, config::Config, worker};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
@@ -428,6 +429,275 @@ async fn comfyui_generation_succeeds(world: &mut TokenCenterWorld) {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     panic!("ComfyUI generation did not complete: {}", world.response);
+}
+
+#[given("the mock OpenAI Images upstream returns a generated icon")]
+async fn mock_openai_image_generation(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(body_partial_json(json!({
+            "model": "gpt-image-upstream",
+            "prompt": "a compact token loop icon"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "data": [{"b64_json": "bW9jay1wbmc="}]
+        })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[when("the service creates a metered OpenAI Images route and key")]
+async fn create_openai_image_route_and_key(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/upstreams", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "name": "openai-images",
+            "driver": "http-json",
+            "config": {"base_url": mock_url},
+            "credential": {"type": "api_key", "value": "image-secret"}
+        }))
+        .send()
+        .await
+        .expect("create Images upstream");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let account: Value = response.json().await.expect("Images account JSON");
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/model-routes", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "public_model": "gpt-image-public",
+            "upstream_account_id": account["id"],
+            "upstream_model": "gpt-image-upstream",
+            "protocol": "generation"
+        }))
+        .send()
+        .await
+        .expect("create Images route");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/generation-prices/USD/gpt-image-public",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"billing_unit": "image", "price_per_unit": "0.3"}))
+        .send()
+        .await
+        .expect("create Images price");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "principal_external_id": "image-api-user",
+            "alias": "image-api",
+            "currency": "USD",
+            "initial_balance": "10",
+            "policy": {"allowed_models": ["gpt-image-public"]}
+        }))
+        .send()
+        .await
+        .expect("create Images key");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let key: Value = response.json().await.expect("Images key JSON");
+    world.current_key = key["key"].as_str().expect("Images key").to_owned();
+    world.stable_key_id = key["key_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok());
+}
+
+#[when("the client creates an OpenAI-compatible image")]
+async fn create_openai_compatible_image(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/v1/images/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .json(&json!({
+            "model": "gpt-image-public",
+            "prompt": "a compact token loop icon",
+            "n": 1,
+            "size": "1024x1024"
+        }))
+        .send()
+        .await
+        .expect("create OpenAI-compatible image");
+    world.status = Some(response.status());
+    world.response = response.json().await.expect("Images response JSON");
+}
+
+#[then("the OpenAI image response is archived and costs 0.3")]
+async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
+    assert_eq!(world.response["data"][0]["b64_json"], "bW9jay1wbmc=");
+    for _ in 0..30 {
+        let stats: Value = world
+            .client
+            .get(format!("{}/self/v1/stats", world.service_url))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("image stats")
+            .json()
+            .await
+            .expect("image stats JSON");
+        if stats["summary"]["total_requests"] == 1 {
+            assert_eq!(stats["summary"]["total_cost"], "0.3");
+            let requests: Value = world
+                .client
+                .get(format!("{}/self/v1/requests?limit=1", world.service_url))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("image request history")
+                .json()
+                .await
+                .expect("image request history JSON");
+            assert_eq!(requests[0]["protocol"], "openai-image");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("OpenAI image request was not metered");
+}
+
+#[given("the mock Codex Responses upstream returns a generated icon")]
+async fn mock_codex_responses_image_generation(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer codex-image-secret"))
+        .and(body_partial_json(json!({
+            "model": "gpt-5.6-sol",
+            "tools": [{"type": "image_generation", "model": "gpt-image-2"}],
+            "tool_choice": {"type": "image_generation"},
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_image_test",
+            "output": [{
+                "type": "image_generation_call",
+                "id": "ig_test",
+                "result": "Y29kZXgtbW9jay1wbmc="
+            }],
+            "usage": {"input_tokens": 12, "output_tokens": 34, "total_tokens": 46}
+        })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[when("the service creates a metered Codex Responses image route and key")]
+async fn create_codex_responses_image_route_and_key(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/upstreams", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "name": "codex-responses-images",
+            "driver": "http-json",
+            "config": {
+                "base_url": mock_url,
+                "image_api_mode": "responses-tool",
+                "image_main_model": "gpt-5.6-sol"
+            },
+            "credential": {"type": "api_key", "value": "codex-image-secret"}
+        }))
+        .send()
+        .await
+        .expect("create Codex Responses Images upstream");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let account: Value = response.json().await.expect("Codex Images account JSON");
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/model-routes", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "public_model": "codex-image-public",
+            "upstream_account_id": account["id"],
+            "upstream_model": "gpt-image-2",
+            "protocol": "generation"
+        }))
+        .send()
+        .await
+        .expect("create Codex Responses Images route");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/generation-prices/USD/codex-image-public",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"billing_unit": "image", "price_per_unit": "0.4"}))
+        .send()
+        .await
+        .expect("create Codex Responses Images price");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "principal_external_id": "codex-image-api-user",
+            "alias": "codex-image-api",
+            "currency": "USD",
+            "initial_balance": "10",
+            "policy": {"allowed_models": ["codex-image-public"]}
+        }))
+        .send()
+        .await
+        .expect("create Codex Responses Images key");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let key: Value = response.json().await.expect("Codex Images key JSON");
+    world.current_key = key["key"].as_str().expect("Codex Images key").to_owned();
+}
+
+#[when("the client creates a Codex-backed OpenAI-compatible image")]
+async fn create_codex_backed_openai_image(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/v1/images/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .json(&json!({
+            "model": "codex-image-public",
+            "prompt": "a compact token loop icon",
+            "n": 1,
+            "size": "1024x1024",
+            "quality": "medium",
+            "output_format": "png"
+        }))
+        .send()
+        .await
+        .expect("create Codex-backed OpenAI-compatible image");
+    world.status = Some(response.status());
+    world.response = response.json().await.expect("Codex Images response JSON");
+}
+
+#[then("the Codex-backed image response is archived and costs 0.4")]
+async fn codex_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
+    assert_eq!(
+        world.response["data"][0]["b64_json"],
+        "Y29kZXgtbW9jay1wbmc="
+    );
+    let stats: Value = world
+        .client
+        .get(format!("{}/self/v1/stats", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("Codex image stats")
+        .json()
+        .await
+        .expect("Codex image stats JSON");
+    assert_eq!(stats["summary"]["total_requests"], 1);
+    assert_eq!(stats["summary"]["successful_requests"], 1);
+    assert_eq!(stats["summary"]["total_cost"], "0.4");
 }
 
 async fn assert_generation_stats(world: &TokenCenterWorld, model: &str, cost: &str) {
@@ -1225,6 +1495,31 @@ async fn create_key(world: &mut TokenCenterWorld, principal: String, model: Stri
         Uuid::from_str(world.response["account_id"].as_str().expect("account id"))
             .expect("UUID account id"),
     );
+}
+
+#[when("the service attaches an unchanged legacy CPA key")]
+async fn attach_legacy_cpa_key(world: &mut TokenCenterWorld) {
+    let legacy = "sk-cpa-linux-codex-unchanged-credential-1234567890";
+    let source_hash = format!("{:x}", Sha256::digest(legacy.as_bytes()));
+    let key_id = world.stable_key_id.expect("stable key id");
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/keys/{key_id}/legacy-credentials",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"credential": legacy, "source_hash": source_hash}))
+        .send()
+        .await
+        .expect("register legacy CPA credential");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    world.current_key = legacy.to_owned();
+}
+
+#[when("the client views statistics with the legacy CPA key")]
+async fn view_stats_with_legacy_cpa_key(world: &mut TokenCenterWorld) {
+    view_stats(world).await;
 }
 
 #[when("the service creates and grants an unspent subscription key")]

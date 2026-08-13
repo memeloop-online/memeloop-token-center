@@ -22,6 +22,18 @@ Feature: Stable key identity and read-only self-service statistics
     And the client calls model "denied-model"
     Then the response status is 403
 
+  Scenario: A migrated CPA key keeps its exact credential and historical identity
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI upstream returns a successful completion
+    When the service creates a key for principal "legacy-linux" allowing model "gpt-test"
+    And the service attaches an unchanged legacy CPA key
+    And the client calls model "gpt-test"
+    Then the response status is 200
+    When the client views statistics with the legacy CPA key
+    Then the statistics contain 1 request and 10 tokens
+    When the service rotates the key
+    Then the old credential is rejected
+
   Scenario: Balance is reserved before calling the upstream
     Given a token center backed by SQLite and memory object storage
     When the service creates an exhausted key allowing model "paid-model"
@@ -116,6 +128,22 @@ Feature: Stable key identity and read-only self-service statistics
     And the client creates a ComfyUI image generation
     Then the response status is 202
     And the ComfyUI generation eventually succeeds with an archived image costing 0.2
+
+  Scenario: OpenAI-compatible image generation is forwarded and metered
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images upstream returns a generated icon
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
+    Then the response status is 200
+    And the OpenAI image response is archived and costs 0.3
+
+  Scenario: Codex Responses image tools are exposed as the OpenAI Images API
+    Given a token center backed by SQLite and memory object storage
+    And the mock Codex Responses upstream returns a generated icon
+    When the service creates a metered Codex Responses image route and key
+    And the client creates a Codex-backed OpenAI-compatible image
+    Then the response status is 200
+    And the Codex-backed image response is archived and costs 0.4
 
   Scenario: Copilot subscription OAuth uses an opaque bridge handle
     Given a token center backed by SQLite and memory object storage

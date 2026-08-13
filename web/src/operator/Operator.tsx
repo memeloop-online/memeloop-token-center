@@ -27,7 +27,7 @@ export function Operator() {
     sessionStorage.setItem('mtc-service-token', token.trim());
     setError('');
     try {
-      const [nextProviders, nextPlugins, nextUpstreams, nextRequests, nextStats, nextSchemas] = await Promise.all([
+      const [nextProviders, nextPlugins, nextUpstreams, nextRequests, nextStats, nextSchemas] = await Promise.allSettled([
         api<ProviderType[]>('/internal/v1/provider-types', token),
         api<PluginManifest[]>('/internal/v1/plugins', token),
         api<UpstreamAccount[]>('/internal/v1/upstreams', token),
@@ -35,12 +35,16 @@ export function Operator() {
         api<OperatorStats>('/internal/v1/stats', token),
         api<ConfigurationSchemas>('/internal/v1/schemas', token),
       ]);
-      setProviders(nextProviders);
-      setPlugins(nextPlugins);
-      setUpstreams(nextUpstreams);
-      setRequests(nextRequests);
-      setStats(nextStats);
-      setSchemas(nextSchemas);
+      const results = [nextProviders, nextPlugins, nextUpstreams, nextRequests, nextStats, nextSchemas];
+      const failures = results.filter((result) => result.status === 'rejected');
+      if (failures.length === results.length) throw failures[0].reason;
+      if (nextProviders.status === 'fulfilled') setProviders(nextProviders.value);
+      if (nextPlugins.status === 'fulfilled') setPlugins(nextPlugins.value);
+      if (nextUpstreams.status === 'fulfilled') setUpstreams(nextUpstreams.value);
+      if (nextRequests.status === 'fulfilled') setRequests(nextRequests.value);
+      if (nextStats.status === 'fulfilled') setStats(nextStats.value);
+      if (nextSchemas.status === 'fulfilled') setSchemas(nextSchemas.value);
+      if (failures.length) setError(`当前凭据没有 ${failures.length} 项管理资源的读取权限；其余只读数据已加载。`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '管理 API 请求失败');
     }
@@ -99,7 +103,7 @@ export function Operator() {
 
   return (
     <Shell operator>
-      <header className="hero compact"><div><span className="eyebrow">OPERATOR CONTROL PLANE</span><h1>Token Center</h1><p>上游、OAuth、路由、策略与流量诊断。</p></div><div className="credential"><input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="Service token" /><button onClick={() => void refresh()}>连接</button></div></header>
+      <header className="hero compact"><div><span className="eyebrow">OPERATOR CONTROL PLANE</span><h1>Token Center</h1><p>上游、OAuth、路由、策略与流量诊断。</p></div><div className="credential"><input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="mts_… service token" /><button onClick={() => void refresh()}>连接</button></div></header>
       <nav className="tabs">{tabs.map(([id, label]) => <button key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)}>{label}</button>)}</nav>
       {error && <div className="notice error">{error}</div>}
       {tab === 'traffic' && <>

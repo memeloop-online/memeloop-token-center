@@ -208,6 +208,17 @@ impl ProviderCatalog {
             "properties": {
                 "base_url": {"type": "string", "format": "uri"},
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "default": 120},
+                "image_api_mode": {
+                    "type": "string",
+                    "enum": ["images", "responses-tool"],
+                    "default": "images",
+                    "description": "Use responses-tool when a Codex-compatible upstream exposes image_generation through /v1/responses."
+                },
+                "image_main_model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Responses model used to invoke image_generation when image_api_mode is responses-tool."
+                },
                 "oauth": {
                     "type": "object",
                     "readOnly": true,
@@ -263,7 +274,11 @@ impl ProviderCatalog {
         let mut types = vec![ProviderType {
             id: "http-json".to_owned(),
             display_name: "HTTP JSON upstream".to_owned(),
-            protocols: vec!["openai".to_owned(), "anthropic".to_owned()],
+            protocols: vec![
+                "openai".to_owned(),
+                "anthropic".to_owned(),
+                "generation".to_owned(),
+            ],
             modalities: vec![
                 "text".to_owned(),
                 "embedding".to_owned(),
