@@ -80,12 +80,16 @@ async function seedThroughHttp(api: APIRequestContext): Promise<SeedState> {
     messages: [{ role: 'user', content: 'Create one observable browser test request.' }],
     max_tokens: 32,
   });
-  for (let batchStart = 0; batchStart < 49; batchStart += 2) {
-    await Promise.all(Array.from({ length: Math.min(2, 49 - batchStart) }, (_, offset) => json(api, 'post', '/v1/chat/completions', client.key, {
+  // This scenario validates the browser workflow, not SQLite write concurrency.
+  // Send fixture traffic sequentially so the temporary SQLite backend cannot
+  // leave an asynchronous finalizer pending under a slow shared CI runner;
+  // reservation concurrency is covered independently against PostgreSQL.
+  for (let requestNumber = 2; requestNumber <= 50; requestNumber += 1) {
+    await json(api, 'post', '/v1/chat/completions', client.key, {
       model,
-      messages: [{ role: 'user', content: `Create observable browser test request ${batchStart + offset + 2}.` }],
+      messages: [{ role: 'user', content: `Create observable browser test request ${requestNumber}.` }],
       max_tokens: 32,
-    })));
+    });
   }
   const failed = await api.post('/v1/chat/completions', {
     headers: { Authorization: `Bearer ${client.key}` },

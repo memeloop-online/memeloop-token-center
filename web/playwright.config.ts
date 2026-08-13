@@ -6,7 +6,10 @@ export default defineConfig({
   testDir: './e2e',
   fullyParallel: false,
   workers: 1,
-  retries: process.env.CI ? 1 : 0,
+  // The serial suite provisions state through the public API. Retrying against
+  // the same running service would reuse those resources and hide the original
+  // failure behind expected uniqueness conflicts.
+  retries: 0,
   reporter: process.env.CI ? [['github'], ['list']] : 'list',
   timeout: 45_000,
   expect: { timeout: 10_000 },
