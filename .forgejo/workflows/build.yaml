@@ -7,12 +7,14 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile"
+      - "Dockerfile.importer"
       - "src/**"
       - "migrations/**"
       - "schemas/**"
       - "wit/**"
       - "web/**"
       - "charts/**"
+      - "ops/**"
       - ".forgejo/workflows/build.yaml"
   workflow_dispatch:
 
@@ -65,3 +67,14 @@ jobs:
             --registry-map=registry.k8s.io="${HARBOR_HOST}"/k8s-io \
             --registry-map=quay.io="${HARBOR_HOST}"/quay-io
           echo "pushed library/memeloop-token-center:${IMAGE_TAG}"
+          "${KANIKO_BIN}" \
+            --context="${ROOT}" \
+            --dockerfile="${ROOT}/Dockerfile.importer" \
+            --destination="${HARBOR_HOST}/library/memeloop-token-center-importer:${IMAGE_TAG}" \
+            --cache=false \
+            --insecure \
+            --skip-tls-verify \
+            --insecure-registry="${HARBOR_HOST}" \
+            --image-download-retry=5 \
+            --registry-map=index.docker.io="${HARBOR_HOST}"/docker-io
+          echo "pushed library/memeloop-token-center-importer:${IMAGE_TAG}"
