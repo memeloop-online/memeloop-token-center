@@ -9,6 +9,7 @@ pub mod generation;
 pub mod model;
 pub mod oauth;
 pub mod plugin;
+pub mod pricing;
 pub mod provider;
 pub mod worker;
 

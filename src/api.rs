@@ -96,6 +96,7 @@ fn control_router() -> Router<AppState> {
             post(rotate_service_token),
         )
         .route("/internal/v1/provider-types", get(provider_types))
+        .route("/internal/v1/tenants", get(list_tenants))
         .route("/internal/v1/plugins", get(plugin_manifests))
         .route("/internal/v1/schemas", get(configuration_schemas))
         .route("/internal/v1/oauth/cursor/start", post(start_cursor_oauth))
@@ -141,6 +142,12 @@ fn control_router() -> Router<AppState> {
             post(refresh_upstream_oauth),
         )
         .route("/internal/v1/model-routes", post(create_model_route))
+        .route("/internal/v1/model-prices", get(list_model_prices))
+        .route(
+            "/internal/v1/model-prices/usage-summary",
+            get(model_price_usage_summary),
+        )
+        .route("/internal/v1/model-prices/sync", post(sync_model_prices))
         .route("/internal/v1/prices/{currency}/{model}", post(upsert_price))
         .route(
             "/internal/v1/generation-prices/{currency}/{model}",
@@ -970,10 +977,27 @@ fn cpa_subscription_account(
 async fn list_upstreams(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ManagementTenantQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:read").await?;
-    let tenant = service.tenant_external_id.as_deref().unwrap_or("default");
-    Ok(Json(state.db.list_upstream_accounts(tenant).await?))
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let values = match tenant {
+        Some(tenant) => state.db.list_upstream_accounts(&tenant).await?,
+        None => state.db.list_all_upstream_accounts().await?,
+    };
+    Ok(Json(values))
+}
+
+async fn list_tenants(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let mut tenants = state.db.list_tenants().await?;
+    if let Some(scoped_tenant) = service.tenant_external_id {
+        tenants.retain(|tenant| tenant.external_id == scoped_tenant);
+    }
+    Ok(Json(tenants))
 }
 
 async fn internal_requests(
@@ -982,37 +1006,58 @@ async fn internal_requests(
     Query(query): Query<RequestsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
-    let tenant = service.tenant_external_id.as_deref().unwrap_or("default");
-    Ok(Json(state.db.list_all_requests(tenant, query.limit).await?))
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let values = match tenant {
+        Some(tenant) => state.db.list_all_requests(&tenant, query.limit).await?,
+        None => state.db.list_global_requests(query.limit).await?,
+    };
+    Ok(Json(values))
 }
 
 async fn internal_request_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(request_id): Path<Uuid>,
+    Query(query): Query<ManagementTenantQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
-    let tenant = service.tenant_external_id.as_deref().unwrap_or("default");
-    let refs = state
-        .db
-        .request_archive_refs_for_tenant(tenant, request_id)
-        .await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let refs = match tenant {
+        Some(tenant) => {
+            state
+                .db
+                .request_archive_refs_for_tenant(&tenant, request_id)
+                .await?
+        }
+        None => state.db.request_archive_refs_global(request_id).await?,
+    };
     Ok(Json(request_detail(&state, refs).await))
 }
 
 async fn internal_stats(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ManagementTenantQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
-    let tenant = service.tenant_external_id.as_deref().unwrap_or("default");
-    Ok(Json(state.db.operator_stats(tenant).await?))
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let stats = match tenant {
+        Some(tenant) => state.db.operator_stats(&tenant).await?,
+        None => state.db.global_operator_stats().await?,
+    };
+    Ok(Json(stats))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ManagementTenantQuery {
+    tenant_external_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RequestEventsQuery {
     after_event_at: Option<i64>,
     after_event_id: Option<Uuid>,
+    tenant_external_id: Option<String>,
 }
 
 async fn internal_request_events(
@@ -1021,9 +1066,7 @@ async fn internal_request_events(
     Query(query): Query<RequestEventsQuery>,
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
-    let tenant = service
-        .tenant_external_id
-        .unwrap_or_else(|| "default".to_owned());
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
     let database = state.db.clone();
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
     tokio::spawn(async move {
@@ -1032,10 +1075,19 @@ async fn internal_request_events(
             .unwrap_or_else(|| unix_millis().saturating_sub(5_000));
         let mut event_id = query.after_event_id;
         loop {
-            match database
-                .request_events_after(&tenant, event_at, event_id, 500)
-                .await
-            {
+            let result = match tenant.as_deref() {
+                Some(tenant) => {
+                    database
+                        .request_events_after(tenant, event_at, event_id, 500)
+                        .await
+                }
+                None => {
+                    database
+                        .all_request_events_after(event_at, event_id, 500)
+                        .await
+                }
+            };
+            match result {
                 Ok(events) => {
                     for request_event in events {
                         event_at = request_event.event_at;
@@ -1053,7 +1105,7 @@ async fn internal_request_events(
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(%error, %tenant, "request event tail query failed");
+                    tracing::warn!(%error, tenant = ?tenant, "request event tail query failed");
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1133,6 +1185,68 @@ async fn create_model_route(
 struct PriceRequest {
     input_per_million: String,
     output_per_million: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelPricesQuery {
+    #[serde(default = "default_currency")]
+    currency: String,
+}
+
+async fn list_model_prices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ModelPricesQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    require_service(&headers, &state, "requests:read").await?;
+    Ok(Json(state.db.list_model_prices(&query.currency).await?))
+}
+
+async fn model_price_usage_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ManagementTenantQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let stats = match tenant {
+        Some(tenant) => state.db.operator_stats(&tenant).await?,
+        None => state.db.global_operator_stats().await?,
+    };
+    Ok(Json(json!({
+        "models": stats.by_model.into_iter().map(|bucket| json!({
+            "model": bucket.name,
+            "calls": bucket.requests,
+            "input_tokens": bucket.input_tokens,
+            "output_tokens": bucket.output_tokens
+        })).collect::<Vec<_>>()
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelPriceSyncRequest {
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default = "default_currency")]
+    currency: String,
+    tenant_external_id: Option<String>,
+}
+
+async fn sync_model_prices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ModelPriceSyncRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "prices:write").await?;
+    let tenant = management_tenant(&service, body.tenant_external_id)?;
+    let models = if body.models.is_empty() {
+        state.db.pricing_models(tenant.as_deref()).await?
+    } else {
+        body.models
+    };
+    Ok(Json(
+        crate::pricing::sync_model_prices(&state.db, &state.http, models, &body.currency).await?,
+    ))
 }
 
 async fn upsert_price(
@@ -1256,6 +1370,7 @@ async fn self_key(
 struct RequestsQuery {
     #[serde(default = "default_limit")]
     limit: i64,
+    tenant_external_id: Option<String>,
 }
 
 fn default_limit() -> i64 {
@@ -2856,6 +2971,29 @@ fn require_service_tenant(
         return Err(AppError::Forbidden);
     }
     Ok(())
+}
+
+fn management_tenant(
+    service: &AuthenticatedService,
+    requested: Option<String>,
+) -> Result<Option<String>, AppError> {
+    let requested = requested
+        .map(|tenant| tenant.trim().to_owned())
+        .filter(|tenant| !tenant.is_empty());
+    if requested.as_ref().is_some_and(|tenant| tenant.len() > 200) {
+        return Err(AppError::BadRequest(
+            "tenant_external_id must contain at most 200 characters".into(),
+        ));
+    }
+    match service.tenant_external_id.as_deref() {
+        Some(scoped) => {
+            if requested.as_deref().is_some_and(|tenant| tenant != scoped) {
+                return Err(AppError::Forbidden);
+            }
+            Ok(Some(scoped.to_owned()))
+        }
+        None => Ok(requested),
+    }
 }
 
 fn require_global_service(service: &AuthenticatedService) -> Result<(), AppError> {

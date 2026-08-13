@@ -1,0 +1,181 @@
+.operator-credential {
+  align-items: end;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.tenant-picker {
+  min-width: 190px;
+}
+
+.tenant-picker span {
+  color: #72878e;
+  display: block;
+  font-size: 10px;
+  letter-spacing: .08em;
+  margin-bottom: 5px;
+  text-transform: uppercase;
+}
+
+.provider-layout {
+  align-items: start;
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(360px, .95fr) minmax(420px, 1.05fr);
+}
+
+.provider-list .panel-title,
+.pricing-overview .panel-title {
+  align-items: flex-start;
+  gap: 20px;
+}
+
+.provider-list .panel-title h2,
+.pricing-overview .panel-title h2 {
+  margin-bottom: 7px;
+}
+
+.provider-account small {
+  color: #52686f;
+  display: block;
+  font-family: monospace;
+  font-size: 9px;
+  margin-top: 7px;
+}
+
+.account-meta {
+  align-items: flex-end;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.segmented {
+  background: #071115;
+  border: 1px solid #24383e;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  margin-bottom: 18px;
+  padding: 3px;
+}
+
+.segmented button {
+  background: transparent;
+  border-color: transparent;
+  color: #788d94;
+  margin: 0;
+}
+
+.segmented button.active {
+  background: #16312f;
+  border-color: #2c6e64;
+  color: #79dfcf;
+}
+
+.authorization-form > .button-row {
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+.pricing-page {
+  max-width: 1240px;
+}
+
+.pricing-summary,
+.source-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 16px 0;
+}
+
+.pricing-summary span,
+.source-card {
+  background: #0d1d21;
+  border: 1px solid #2a3c42;
+  color: #799096;
+  font-size: 11px;
+  padding: 8px 10px;
+}
+
+.source-card {
+  display: grid;
+  gap: 3px;
+  min-width: 180px;
+}
+
+.source-card b {
+  color: #bdd0d4;
+}
+
+.source-card.healthy {
+  border-color: #286454;
+}
+
+.source-card.failed {
+  border-color: #6d4c33;
+}
+
+.source-card.failed span {
+  color: #d6ad72;
+}
+
+.manual-pricing {
+  padding: 0;
+}
+
+.manual-pricing summary {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  list-style: none;
+  padding: 18px 20px;
+}
+
+.manual-pricing summary small {
+  color: #70858d;
+  display: block;
+  font-weight: 400;
+  margin-top: 5px;
+}
+
+.manual-pricing-body {
+  border-top: 1px solid #27373c;
+  max-width: 760px;
+  padding: 8px 20px 20px;
+}
+
+:root[data-theme='light'] .segmented,
+:root[data-theme='light'] .pricing-summary span,
+:root[data-theme='light'] .source-card {
+  background: #f3f8f6;
+  border-color: #c5d6d2;
+}
+
+:root[data-theme='light'] .segmented button.active {
+  background: #dcefeb;
+  color: #087d70;
+}
+
+:root[data-theme='light'] .source-card b {
+  color: #24444a;
+}
+
+@media (width <= 1000px) {
+  .provider-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (width <= 900px) {
+  .operator-credential {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .operator-credential input,
+  .tenant-picker {
+    width: 100%;
+  }
+}

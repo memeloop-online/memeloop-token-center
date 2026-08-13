@@ -243,11 +243,26 @@ pub struct OperatorStats {
     pub errors: Vec<StatsBucket>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct TenantView {
+    pub external_id: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ModelPrice {
     pub id: Uuid,
     pub input_micros_per_million: i64,
     pub output_micros_per_million: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelPriceView {
+    pub model: String,
+    pub currency: String,
+    pub input_per_million: String,
+    pub output_per_million: String,
+    pub source: String,
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]

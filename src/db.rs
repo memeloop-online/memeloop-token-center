@@ -16,9 +16,9 @@ use crate::{
     model::{
         AuthenticatedKey, AuthenticatedService, ConversationClusterDetail, ConversationClusterView,
         ConversationEdgeView, GenerationJobView, GenerationJobWork, GenerationPrice, IssuedKey,
-        IssuedServiceToken, KeyPolicy, KeyView, LegacyCredentialView, ModelPrice, OperatorStats,
-        RequestArchiveRefs, RequestEventView, RequestView, SelfStats, StatsBucket, StatsSummary,
-        UsageReservation, micros_to_decimal_string, priced_tokens,
+        IssuedServiceToken, KeyPolicy, KeyView, LegacyCredentialView, ModelPrice, ModelPriceView,
+        OperatorStats, RequestArchiveRefs, RequestEventView, RequestView, SelfStats, StatsBucket,
+        StatsSummary, TenantView, UsageReservation, micros_to_decimal_string, priced_tokens,
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
@@ -131,6 +131,18 @@ pub struct FinishGenerationJobInput<'a> {
 }
 
 impl Database {
+    pub async fn list_tenants(&self) -> Result<Vec<TenantView>, AppError> {
+        let rows = sqlx::query("SELECT external_id FROM tenants ORDER BY external_id ASC")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TenantView {
+                    external_id: row.try_get("external_id")?,
+                })
+            })
+            .collect()
+    }
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         // `$n` placeholders are accepted by both PostgreSQL and SQLite. `sqlx::Any` deliberately
         // does not translate `?` into PostgreSQL placeholders, so all queries in this module use
@@ -700,6 +712,7 @@ impl Database {
         Ok(UpstreamAccountView {
             id: account_id,
             tenant_id: parse_uuid(tenant_id)?,
+            tenant_external_id: Some(input.tenant_external_id.clone()),
             name: input.name.trim().to_owned(),
             driver: input.driver,
             auth_kind: auth_kind.to_owned(),
@@ -771,6 +784,7 @@ impl Database {
         Ok(UpstreamAccountView {
             id: account_id,
             tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+            tenant_external_id: None,
             name: row.try_get("name")?,
             driver: row.try_get("driver")?,
             auth_kind,
@@ -869,9 +883,21 @@ impl Database {
         tenant_external_id: &str,
     ) -> Result<Vec<UpstreamAccountView>, AppError> {
         let rows = sqlx::query(
-            "SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE t.external_id = $1 ORDER BY a.created_at DESC, a.id DESC",
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE t.external_id = $1 ORDER BY a.created_at DESC, a.id DESC",
         )
         .bind(tenant_external_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(upstream_account_view).collect()
+    }
+
+    /// Lists every upstream account for a global operator. Tenant-scoped
+    /// operators must use `list_upstream_accounts` so the authorization scope
+    /// remains visible at the call site.
+    pub async fn list_all_upstream_accounts(&self) -> Result<Vec<UpstreamAccountView>, AppError> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.created_at, a.updated_at, c.expires_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL ORDER BY a.created_at DESC, a.id DESC",
+        )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(upstream_account_view).collect()
@@ -1128,7 +1154,7 @@ impl Database {
         }
         let id = Uuid::now_v7();
         sqlx::query(
-            "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES ($1, $2, $3, $4, $5, 'manual', $6) ON CONFLICT(model, currency) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, updated_at = excluded.updated_at",
+            "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES ($1, $2, $3, $4, $5, 'manual', $6) ON CONFLICT(model, currency) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, source = excluded.source, updated_at = excluded.updated_at",
         )
         .bind(id.to_string())
         .bind(model)
@@ -1139,6 +1165,92 @@ impl Database {
         .execute(&self.pool)
         .await?;
         self.model_price(model, currency).await
+    }
+
+    pub async fn upsert_synced_model_price(
+        &self,
+        model: &str,
+        currency: &str,
+        input_per_million: Decimal,
+        output_per_million: Decimal,
+        source: &str,
+    ) -> Result<ModelPriceView, AppError> {
+        validate_currency(currency)?;
+        if !matches!(source, "models.dev" | "litellm" | "openrouter") {
+            return Err(AppError::BadRequest("unsupported price source".into()));
+        }
+        let input_micros = decimal_to_micros(input_per_million)?;
+        let output_micros = decimal_to_micros(output_per_million)?;
+        if input_micros < 0 || output_micros < 0 {
+            return Err(AppError::BadRequest(
+                "model prices cannot be negative".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO model_prices (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(model, currency) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, source = excluded.source, updated_at = excluded.updated_at",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(model)
+        .bind(currency.to_uppercase())
+        .bind(input_micros)
+        .bind(output_micros)
+        .bind(source)
+        .bind(unix_millis())
+        .execute(&self.pool)
+        .await?;
+        self.model_price_view(model, currency).await
+    }
+
+    pub async fn list_model_prices(&self, currency: &str) -> Result<Vec<ModelPriceView>, AppError> {
+        validate_currency(currency)?;
+        let rows = sqlx::query(
+            "SELECT model, currency, input_micros_per_million, output_micros_per_million, source, updated_at FROM model_prices WHERE currency = $1 ORDER BY model ASC",
+        )
+        .bind(currency.to_uppercase())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(model_price_view_from_row).collect()
+    }
+
+    pub async fn model_price_view(
+        &self,
+        model: &str,
+        currency: &str,
+    ) -> Result<ModelPriceView, AppError> {
+        let row = sqlx::query(
+            "SELECT model, currency, input_micros_per_million, output_micros_per_million, source, updated_at FROM model_prices WHERE model = $1 AND currency = $2",
+        )
+        .bind(model)
+        .bind(currency.to_uppercase())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::UnpricedModel)?;
+        model_price_view_from_row(row)
+    }
+
+    pub async fn pricing_models(
+        &self,
+        tenant_external_id: Option<&str>,
+    ) -> Result<Vec<String>, AppError> {
+        let rows = if let Some(tenant) = tenant_external_id {
+            sqlx::query(
+                "SELECT model FROM model_prices UNION SELECT a.model FROM usage_daily_aggregates a JOIN key_records k ON k.id = a.key_id JOIN tenants t ON t.id = k.tenant_id WHERE t.external_id = $1 UNION SELECT g.public_model AS model FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $2 UNION SELECT r.public_model AS model FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = $3 ORDER BY model ASC",
+            )
+            .bind(tenant)
+            .bind(tenant)
+            .bind(tenant)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT model FROM model_prices UNION SELECT model FROM usage_daily_aggregates UNION SELECT public_model AS model FROM generation_jobs UNION SELECT public_model AS model FROM model_routes ORDER BY model ASC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+        rows.into_iter()
+            .map(|row| row.try_get("model").map_err(AppError::from))
+            .collect()
     }
 
     pub async fn model_price(&self, model: &str, currency: &str) -> Result<ModelPrice, AppError> {
@@ -2378,6 +2490,27 @@ impl Database {
             .collect()
     }
 
+    pub async fn all_request_events_after(
+        &self,
+        after_event_at: i64,
+        after_event_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<RequestEventView>, AppError> {
+        let after_event_id = after_event_id
+            .map(|event_id| event_id.to_string())
+            .unwrap_or_default();
+        let rows = sqlx::query(
+            "SELECT event_id, request_id, event_at, event_kind, key_id, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_events WHERE (event_at > $1 OR (event_at = $2 AND event_id > $3)) ORDER BY event_at ASC, event_id ASC LIMIT $4",
+        )
+        .bind(after_event_at)
+        .bind(after_event_at)
+        .bind(after_event_id)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        request_event_views(rows)
+    }
+
     pub async fn list_requests(
         &self,
         key_id: Uuid,
@@ -2440,6 +2573,16 @@ impl Database {
             .collect()
     }
 
+    pub async fn list_global_requests(&self, limit: i64) -> Result<Vec<RequestView>, AppError> {
+        let rows = sqlx::query(
+            "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_records UNION ALL SELECT id, created_at, 'generation' AS protocol, public_model AS model, CASE WHEN status = 'succeeded' THEN 200 WHEN status IN ('failed', 'cancelled') THEN 502 ELSE NULL END AS status_code, CASE WHEN completed_at IS NULL THEN NULL ELSE completed_at - created_at END AS duration_ms, 0 AS input_tokens, 0 AS output_tokens, cost_micros, error_code FROM generation_jobs) AS all_requests ORDER BY created_at DESC, id DESC LIMIT $1",
+        )
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        request_views(rows)
+    }
+
     pub async fn request_archive_refs(
         &self,
         key_id: Uuid,
@@ -2478,6 +2621,31 @@ impl Database {
                 )
                 .bind(request_id.to_string())
                 .bind(tenant_external_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or(AppError::NotFound)?;
+                generation_archive_refs_from_row(row)
+            }
+        }
+    }
+
+    pub async fn request_archive_refs_global(
+        &self,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        let row = sqlx::query(
+            "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code, request_object, response_object FROM request_records WHERE id = $1",
+        )
+        .bind(request_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => request_archive_refs_from_row(row),
+            None => {
+                let row = sqlx::query(
+                    "SELECT id, created_at, completed_at, public_model, status, cost_micros, error_code, request_object, result_json FROM generation_jobs WHERE id = $1",
+                )
+                .bind(request_id.to_string())
                 .fetch_optional(&self.pool)
                 .await?
                 .ok_or(AppError::NotFound)?;
@@ -2714,6 +2882,54 @@ impl Database {
             errors,
         })
     }
+
+    pub async fn global_operator_stats(&self) -> Result<OperatorStats, AppError> {
+        let summary_row = sqlx::query(
+            "SELECT CAST(COALESCE(SUM(total_requests), 0) AS BIGINT) AS total_requests, CAST(COALESCE(SUM(successful_requests), 0) AS BIGINT) AS successful_requests, CAST(COALESCE(SUM(failed_requests), 0) AS BIGINT) AS failed_requests, CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens, CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros FROM (SELECT COALESCE(SUM(requests), 0) AS total_requests, COALESCE(SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END), 0) AS failed_requests, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM usage_daily_aggregates UNION ALL SELECT COUNT(*) AS total_requests, COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN status IN ('failed', 'cancelled') THEN 1 ELSE 0 END), 0) AS failed_requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE status IN ('succeeded', 'failed', 'cancelled')) AS totals",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let summary = StatsSummary {
+            total_requests: summary_row.try_get("total_requests")?,
+            successful_requests: summary_row.try_get("successful_requests")?,
+            failed_requests: summary_row.try_get("failed_requests")?,
+            input_tokens: summary_row.try_get("input_tokens")?,
+            output_tokens: summary_row.try_get("output_tokens")?,
+            total_cost: micros_to_decimal_string(summary_row.try_get("cost_micros")?),
+        };
+        let model_rows = sqlx::query(
+            "SELECT name, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT model AS name, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates UNION ALL SELECT public_model AS name, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE status IN ('succeeded', 'failed', 'cancelled') GROUP BY public_model) AS model_totals GROUP BY name ORDER BY requests DESC, name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let by_model = aggregate_buckets(model_rows)?;
+        let day_rows = sqlx::query(
+            "SELECT day_bucket, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT day_bucket, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates UNION ALL SELECT created_at / 86400000 AS day_bucket, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE status IN ('succeeded', 'failed', 'cancelled') GROUP BY created_at / 86400000) AS day_totals GROUP BY day_bucket ORDER BY day_bucket ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let by_day = day_rows
+            .into_iter()
+            .map(|row| {
+                let day_bucket: i64 = row.try_get("day_bucket")?;
+                let name = chrono::DateTime::from_timestamp(day_bucket.saturating_mul(86_400), 0)
+                    .map(|value| value.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                aggregate_bucket(row, name)
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let error_rows = sqlx::query(
+            "SELECT name, CAST(SUM(requests) AS BIGINT) AS requests, CAST(SUM(input_tokens) AS BIGINT) AS input_tokens, CAST(SUM(output_tokens) AS BIGINT) AS output_tokens, CAST(SUM(cost_micros) AS BIGINT) AS cost_micros FROM (SELECT error_code AS name, requests, input_tokens, output_tokens, cost_micros FROM usage_daily_aggregates WHERE error_code <> '' UNION ALL SELECT error_code AS name, COUNT(*) AS requests, 0 AS input_tokens, 0 AS output_tokens, COALESCE(SUM(cost_micros), 0) AS cost_micros FROM generation_jobs WHERE status IN ('failed', 'cancelled') AND error_code IS NOT NULL AND error_code <> '' GROUP BY error_code) AS error_totals GROUP BY name ORDER BY requests DESC, name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(OperatorStats {
+            summary,
+            by_model,
+            by_day,
+            errors: aggregate_buckets(error_rows)?,
+        })
+    }
 }
 
 async fn apply_migration_range(
@@ -2791,11 +3007,64 @@ fn aggregate_buckets(rows: Vec<sqlx::any::AnyRow>) -> Result<Vec<StatsBucket>, A
         .collect()
 }
 
+fn request_views(rows: Vec<AnyRow>) -> Result<Vec<RequestView>, AppError> {
+    rows.into_iter()
+        .map(|row| {
+            Ok(RequestView {
+                request_id: parse_uuid(row.try_get("id")?)?,
+                created_at: row.try_get("created_at")?,
+                protocol: row.try_get("protocol")?,
+                model: row.try_get("model")?,
+                status_code: row.try_get("status_code")?,
+                duration_ms: row.try_get("duration_ms")?,
+                input_tokens: row.try_get("input_tokens")?,
+                output_tokens: row.try_get("output_tokens")?,
+                cost: micros_to_decimal_string(row.try_get("cost_micros")?),
+                error_code: row.try_get("error_code")?,
+            })
+        })
+        .collect()
+}
+
+fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppError> {
+    rows.into_iter()
+        .map(|row| {
+            Ok(RequestEventView {
+                event_id: parse_uuid(row.try_get("event_id")?)?,
+                request_id: parse_uuid(row.try_get("request_id")?)?,
+                event_at: row.try_get("event_at")?,
+                event_kind: row.try_get("event_kind")?,
+                key_id: parse_uuid(row.try_get("key_id")?)?,
+                protocol: row.try_get("protocol")?,
+                model: row.try_get("model")?,
+                status_code: row.try_get("status_code")?,
+                duration_ms: row.try_get("duration_ms")?,
+                input_tokens: row.try_get("input_tokens")?,
+                output_tokens: row.try_get("output_tokens")?,
+                cost: micros_to_decimal_string(row.try_get("cost_micros")?),
+                error_code: row.try_get("error_code")?,
+            })
+        })
+        .collect()
+}
+
+fn model_price_view_from_row(row: AnyRow) -> Result<ModelPriceView, AppError> {
+    Ok(ModelPriceView {
+        model: row.try_get("model")?,
+        currency: row.try_get("currency")?,
+        input_per_million: micros_to_decimal_string(row.try_get("input_micros_per_million")?),
+        output_per_million: micros_to_decimal_string(row.try_get("output_micros_per_million")?),
+        source: row.try_get("source")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn upstream_account_view(row: sqlx::any::AnyRow) -> Result<UpstreamAccountView, AppError> {
     let config_json: String = row.try_get("config_json")?;
     Ok(UpstreamAccountView {
         id: parse_uuid(row.try_get("id")?)?,
         tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+        tenant_external_id: row.try_get("tenant_external_id").ok(),
         name: row.try_get("name")?,
         driver: row.try_get("driver")?,
         auth_kind: row.try_get("auth_kind")?,

@@ -1035,6 +1035,109 @@ async fn mock_successful_openai(world: &mut TokenCenterWorld) {
         .await;
 }
 
+#[when(expr = "the service records requests for tenants {string} and {string}")]
+async fn record_requests_for_two_tenants(
+    world: &mut TokenCenterWorld,
+    first_tenant: String,
+    second_tenant: String,
+) {
+    let service = world
+        .client
+        .post(format!("{}/internal/v1/service-tokens", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "name": "review-operator",
+            "scopes": ["requests:read"]
+        }))
+        .send()
+        .await
+        .expect("create issued global operator credential");
+    assert_eq!(service.status(), StatusCode::CREATED);
+    let service: Value = service
+        .json()
+        .await
+        .expect("global operator credential JSON");
+    world.current_service_token = service["token"]
+        .as_str()
+        .expect("issued global service credential")
+        .to_owned();
+    let price = world
+        .client
+        .post(format!(
+            "{}/internal/v1/prices/USD/global-stats-model",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"input_per_million": "1", "output_per_million": "1"}))
+        .send()
+        .await
+        .expect("create global stats price");
+    assert_eq!(price.status(), StatusCode::OK);
+    for tenant in [first_tenant, second_tenant] {
+        let response = world
+            .client
+            .post(format!("{}/internal/v1/keys", world.service_url))
+            .bearer_auth("test-service-token")
+            .json(&json!({
+                "tenant_external_id": tenant,
+                "principal_external_id": format!("{tenant}-user"),
+                "alias": "imported",
+                "currency": "USD",
+                "initial_balance": "10",
+                "policy": {"allowed_models": ["global-stats-model"]}
+            }))
+            .send()
+            .await
+            .expect("create tenant credential");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = response.json().await.expect("tenant credential JSON");
+        let credential = body["key"].as_str().expect("tenant credential");
+        let response = world
+            .client
+            .post(format!("{}/v1/chat/completions", world.service_url))
+            .bearer_auth(credential)
+            .json(&json!({
+                "model": "global-stats-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .expect("call tenant model");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[then("global operator statistics contain both tenant requests")]
+async fn global_operator_stats_contain_both(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .get(format!("{}/internal/v1/stats", world.service_url))
+        .bearer_auth(&world.current_service_token)
+        .send()
+        .await
+        .expect("global operator stats");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("global operator stats JSON");
+    assert_eq!(body["summary"]["total_requests"], 2);
+}
+
+#[then(expr = "tenant filtered operator statistics contain only {string}")]
+async fn tenant_filtered_operator_stats(world: &mut TokenCenterWorld, tenant: String) {
+    let response = world
+        .client
+        .get(format!(
+            "{}/internal/v1/stats?tenant_external_id={tenant}",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_service_token)
+        .send()
+        .await
+        .expect("tenant operator stats");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("tenant operator stats JSON");
+    assert_eq!(body["summary"]["total_requests"], 1);
+}
+
 #[given("the mock Anthropic upstream returns a successful message")]
 async fn mock_successful_anthropic(world: &mut TokenCenterWorld) {
     Mock::given(method("POST"))

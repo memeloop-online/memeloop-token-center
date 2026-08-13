@@ -63,6 +63,33 @@ export interface OperatorStats {
   errors: StatsBucket[];
 }
 
+export interface TenantView { external_id: string }
+
+export interface ModelPriceView {
+  model: string;
+  currency: string;
+  input_per_million: string;
+  output_per_million: string;
+  source: 'manual' | 'models.dev' | 'litellm' | 'openrouter' | string;
+  updated_at: number;
+}
+
+export interface ModelPriceUsageSummary {
+  models: Array<{ model: string; calls: number; input_tokens: number; output_tokens: number }>;
+}
+
+export interface ModelPriceSyncResult {
+  source: string;
+  sources: string[];
+  imported: number;
+  matched: string[];
+  candidates: Array<{ model: string; candidates: Array<{ sourceModelId: string; source: string; reason: string; inputPerMillion: string; outputPerMillion: string }> }>;
+  unmatched: string[];
+  preserved: string[];
+  sourceResults: Array<{ source: string; models: number; skipped: number; error?: string }>;
+  prices: ModelPriceView[];
+}
+
 export interface KeyView {
   key_id: string;
   alias: string;
@@ -150,6 +177,8 @@ export interface PluginManifest {
 
 export interface UpstreamAccount {
   id: string;
+  tenant_id: string;
+  tenant_external_id?: string;
   name: string;
   driver: string;
   auth_kind: string;
@@ -157,6 +186,8 @@ export interface UpstreamAccount {
   status: string;
   credential_expires_at: number | null;
   config: Record<string, unknown>;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface ConfigurationSchemas {

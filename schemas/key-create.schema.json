@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://memeloop.dev/token-center/schemas/key-create.schema.json",
-  "title": "Downstream key",
+  "title": "Downstream credential",
   "type": "object",
   "additionalProperties": false,
   "required": ["principal_external_id", "alias", "currency"],
   "properties": {
     "tenant_external_id": { "type": "string", "default": "default", "title": "Tenant" },
     "principal_external_id": { "type": "string", "minLength": 1, "title": "Principal" },
-    "alias": { "type": "string", "minLength": 1, "title": "Key alias" },
+    "alias": { "type": "string", "minLength": 1, "title": "Credential alias" },
     "currency": { "enum": ["USD", "CNY"], "default": "USD" },
     "initial_balance": {
       "type": "string",
@@ -43,4 +43,3 @@
     }
   }
 }
-

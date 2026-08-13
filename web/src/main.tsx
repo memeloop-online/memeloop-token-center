@@ -1,6 +1,7 @@
 import { lazy, StrictMode, Suspense } from 'react';
 import { createRoot } from 'react-dom/client';
 import { SelfPortal } from './self/SelfPortal';
+import { I18nProvider } from './i18n';
 import './styles.css';
 import './theme.css';
 
@@ -9,6 +10,8 @@ const Operator = lazy(() => import('./operator/Operator').then((module) => ({ de
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    {isOperator ? <Suspense fallback={<div className="boot">正在加载控制面…</div>}><Operator /></Suspense> : <SelfPortal />}
+    <I18nProvider>
+      {isOperator ? <Suspense fallback={<div className="boot">Loading…</div>}><Operator /></Suspense> : <SelfPortal />}
+    </I18nProvider>
   </StrictMode>,
 );

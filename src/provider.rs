@@ -403,6 +403,7 @@ impl ProviderCatalog {
 pub struct UpstreamAccountView {
     pub id: Uuid,
     pub tenant_id: Uuid,
+    pub tenant_external_id: Option<String>,
     pub name: String,
     pub driver: String,
     pub auth_kind: String,

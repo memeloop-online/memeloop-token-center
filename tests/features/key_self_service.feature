@@ -16,6 +16,13 @@ Feature: Stable key identity and read-only self-service statistics
     And the request detail contains the archived prompt and response
     And the downstream key cannot create another key
 
+  Scenario: A global operator credential sees imported-style history across tenants
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI upstream returns a successful completion
+    When the service records requests for tenants "first-import" and "second-import"
+    Then global operator statistics contain both tenant requests
+    And tenant filtered operator statistics contain only "first-import"
+
   Scenario: Model permission is enforced before proxying
     Given a token center backed by SQLite and memory object storage
     When the service creates a key for principal "bob" allowing model "allowed-model"

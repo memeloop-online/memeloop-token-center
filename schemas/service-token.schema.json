@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://memeloop.dev/token-center/schemas/service-token.schema.json",
-  "title": "Service token",
+  "title": "Service credential",
   "type": "object",
   "additionalProperties": false,
   "required": ["name", "scopes"],

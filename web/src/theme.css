@@ -23,8 +23,19 @@
   height: 100%;
 }
 
-.mobile-theme-toggle {
+.mobile-controls {
   display: none;
+}
+
+.language-toggle {
+  width: 36px;
+  height: 28px;
+  padding: 0;
+  color: #8bb9b3;
+  background: transparent;
+  border-color: #2c4b4c;
+  font-size: 10px;
+  letter-spacing: .08em;
 }
 
 :root[data-theme='light'] {
@@ -118,14 +129,16 @@
 }
 
 :root[data-theme='light'] .theme-toggle,
+:root[data-theme='light'] .language-toggle,
 :root[data-theme='light'] .secondary {
   color: #087d70;
   border-color: #86b9b1;
 }
 
 @media (width <= 900px) {
-  .mobile-theme-toggle {
-    display: inline-flex;
+  .mobile-controls {
+    display: flex;
+    gap: 8px;
     margin: 0 0 14px auto;
   }
 }

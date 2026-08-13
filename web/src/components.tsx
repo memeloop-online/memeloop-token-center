@@ -1,7 +1,9 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import type { RequestView, StatsBucket } from './types';
+import { useI18n } from './i18n';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
+  const { locale, setLocale, t } = useI18n();
   const [theme, setTheme] = useState<'dark' | 'light'>(() =>
     document.documentElement.dataset.theme === 'light' ? 'light' : 'dark',
   );
@@ -17,23 +19,22 @@ export function Shell({ children, operator = false }: { children: ReactNode; ope
         <button
           className="theme-toggle"
           type="button"
-          aria-label={theme === 'dark' ? '切换到亮色主题' : '切换到暗色主题'}
-          title={theme === 'dark' ? '亮色主题' : '暗色主题'}
+          aria-label={theme === 'dark' ? t('theme.light') : t('theme.dark')}
+          title={theme === 'dark' ? t('theme.light') : t('theme.dark')}
           onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}
         >
           {theme === 'dark' ? '☀' : '☾'}
+        </button>
+        <button className="language-toggle" type="button" onClick={() => setLocale(locale === 'zh-CN' ? 'en' : 'zh-CN')} title={locale === 'zh-CN' ? t('language.en') : t('language.zh')}>
+          {locale === 'zh-CN' ? 'EN' : '中'}
         </button>
         <div className="rail-label">{operator ? 'OP' : 'SELF'}</div>
       </aside>
       <main className="main">
-        <button
-          className="theme-toggle mobile-theme-toggle"
-          type="button"
-          aria-label={theme === 'dark' ? '切换到亮色主题' : '切换到暗色主题'}
-          onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}
-        >
-          {theme === 'dark' ? '☀' : '☾'}
-        </button>
+        <div className="mobile-controls">
+          <button className="theme-toggle" type="button" aria-label={theme === 'dark' ? t('theme.light') : t('theme.dark')} onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? '☀' : '☾'}</button>
+          <button className="language-toggle" type="button" onClick={() => setLocale(locale === 'zh-CN' ? 'en' : 'zh-CN')}>{locale === 'zh-CN' ? 'EN' : '中'}</button>
+        </div>
         {children}
       </main>
     </div>
@@ -50,15 +51,16 @@ export function Metric({ label, value, tone }: { label: string; value: ReactNode
 }
 
 export function Buckets({ values }: { values: StatsBucket[] }) {
+  const { t } = useI18n();
   const maximum = Math.max(1, ...values.map((value) => value.requests));
-  if (!values.length) return <div className="empty">暂无数据</div>;
+  if (!values.length) return <div className="empty">{t('common.noData')}</div>;
   return (
     <div className="bucket-list">
       {values.map((value) => (
         <div className="bucket" key={value.name}>
           <div>
             <b>{value.name}</b>
-            <span>{value.requests} 次 · {value.input_tokens + value.output_tokens} tokens</span>
+            <span>{t('request.count', { count: value.requests })} · {value.input_tokens + value.output_tokens} tokens</span>
           </div>
           <div className="bar"><i style={{ width: `${(value.requests / maximum) * 100}%` }} /></div>
         </div>
@@ -74,18 +76,19 @@ export function RequestTable({
   requests: RequestView[];
   onSelect?: (request: RequestView) => void;
 }) {
-  if (!requests.length) return <div className="empty">暂无请求</div>;
+  const { locale, t } = useI18n();
+  if (!requests.length) return <div className="empty">{t('common.noRequests')}</div>;
   return (
     <div className="table-scroll">
       <table>
-        <thead><tr><th>时间</th><th>模型</th><th>协议</th><th>状态</th><th>耗时</th><th>Tokens</th><th>费用</th></tr></thead>
+        <thead><tr><th>{t('request.time')}</th><th>{t('request.model')}</th><th>{t('request.protocol')}</th><th>{t('request.status')}</th><th>{t('request.duration')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th></tr></thead>
         <tbody>
           {requests.map((request) => (
             <tr key={request.request_id} onClick={() => onSelect?.(request)} className={onSelect ? 'clickable' : ''}>
-              <td>{new Date(request.created_at).toLocaleString()}</td>
+              <td>{new Date(request.created_at).toLocaleString(locale)}</td>
               <td><code>{request.model}</code></td>
               <td>{request.protocol}</td>
-              <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : 'bad'}`}>{request.status_code ?? '运行中'}</span></td>
+              <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
               <td>{request.duration_ms ?? '—'} ms</td>
               <td>{request.input_tokens + request.output_tokens}</td>
               <td>{request.cost}</td>
