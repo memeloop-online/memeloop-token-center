@@ -21,7 +21,10 @@ use plugin::PluginRuntime;
 use provider::ProviderCatalog;
 
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
+// Synchronous image providers may legitimately stay silent while generating.
+// The image path has its own 2-request concurrency and 16 MiB body bounds, so
+// matching the read timeout to the overall deadline does not make it unbounded.
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone)]
