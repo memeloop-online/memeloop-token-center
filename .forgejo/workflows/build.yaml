@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  service:
     runs-on: docker
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +67,40 @@ jobs:
             --registry-map=registry.k8s.io="${HARBOR_HOST}"/k8s-io \
             --registry-map=quay.io="${HARBOR_HOST}"/quay-io
           echo "pushed library/memeloop-token-center:${IMAGE_TAG}"
+
+  importer:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and push immutable importer image
+        env:
+          FORGEJO_SHA: ${{ forgejo.sha }}
+          HARBOR_HOST: harbor-core.harbor.svc.cluster.local
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -eu
+          if [ -x /opt/kaniko/executor ]; then
+            KANIKO_BIN=/opt/kaniko/executor
+          elif [ -x /kaniko/executor ]; then
+            KANIKO_BIN=/kaniko/executor
+          else
+            echo "kaniko executable is missing"
+            exit 1
+          fi
+          if [ -z "${HARBOR_USERNAME:-}" ] || [ -z "${HARBOR_PASSWORD:-}" ]; then
+            echo "Harbor credentials are empty"
+            exit 1
+          fi
+          ROOT="${FORGEJO_WORKSPACE:-${GITHUB_WORKSPACE:-$PWD}}"
+          SHORT_SHA=$(printf '%s' "${FORGEJO_SHA}" | cut -c1-7)
+          DATE_TAG=$(date -u +%Y%m%d)
+          IMAGE_TAG="${DATE_TAG}-${SHORT_SHA}"
+          AUTH=$(printf '%s' "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" | base64 | tr -d '\n')
+          export DOCKER_CONFIG=/kaniko/.docker
+          mkdir -p "${DOCKER_CONFIG}"
+          printf '{"auths":{"%s":{"auth":"%s"}}}\n' \
+            "${HARBOR_HOST}" "${AUTH}" > "${DOCKER_CONFIG}/config.json"
           "${KANIKO_BIN}" \
             --context="${ROOT}" \
             --dockerfile="${ROOT}/Dockerfile.importer" \

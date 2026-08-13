@@ -23,7 +23,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: importer
-          image: harbor.k3s.onetwo.website/library/memeloop-token-center-importer:20260813-8ecebf4
+          image: harbor.k3s.onetwo.website/library/memeloop-token-center-importer:REPLACE_WITH_IMMUTABLE_TAG
           imagePullPolicy: IfNotPresent
           env:
             - name: PGDATABASE
