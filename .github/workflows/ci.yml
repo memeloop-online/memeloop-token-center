@@ -100,7 +100,7 @@ jobs:
           MTC_KEY_PEPPER: ci-key-pepper-with-more-than-thirty-two-bytes
           MTC_SERVICE_TOKEN: ci-service-token
           MTC_ARCHIVE_BACKEND: memory
-        run: cargo run -- migrate
+        run: cargo run --bin memeloop-token-center -- migrate
 
   packaging:
     runs-on: ubuntu-latest
