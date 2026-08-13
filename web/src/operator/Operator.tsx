@@ -1,10 +1,10 @@
 import Form from '@rjsf/core';
-import validator from '@rjsf/validator-ajv8';
 import type { RJSFSchema } from '@rjsf/utils';
 import { useEffect, useMemo, useState } from 'react';
 import { api, streamSse } from '../api';
 import { Buckets, Metric, RequestTable, Shell } from '../components';
 import { localizeSchema, useI18n } from '../i18n';
+import { safeValidator as validator } from '../safeValidator';
 import type {
   ConfigurationSchemas, ModelPriceSyncResult, ModelPriceUsageSummary, ModelPriceView,
   OperatorStats, PluginManifest, ProviderType, RequestDetail, RequestEvent, RequestView,
