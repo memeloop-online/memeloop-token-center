@@ -62,7 +62,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes postgresql-client sqlite3
       - name: Start MinIO and create integration-test bucket
         run: |
+          # Rust/Wasmtime debug artifacts can leave a hosted runner below
+          # MinIO's filesystem free-space safety threshold by test time. Keep
+          # the tiny integration bucket on an isolated sparse tmpfs so the
+          # storage test measures S3 behavior instead of runner disk pressure.
           docker run --detach --name mtc-test-minio --publish 9000:9000 \
+            --tmpfs /data:rw,size=2g \
             --env MINIO_ROOT_USER=token-center-test \
             --env MINIO_ROOT_PASSWORD=token-center-test-secret \
             minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
