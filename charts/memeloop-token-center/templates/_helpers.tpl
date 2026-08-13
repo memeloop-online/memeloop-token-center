@@ -65,3 +65,22 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ .Values.plugins.mountPath | quote }}
 {{- end }}
 {{- end -}}
+
+{{- define "memeloop-token-center.proxyEnv" -}}
+{{- with .Values.config.outboundProxy }}
+{{- if .url }}
+- name: HTTP_PROXY
+  value: {{ .url | quote }}
+- name: HTTPS_PROXY
+  value: {{ .url | quote }}
+- name: NO_PROXY
+  value: {{ .noProxy | quote }}
+- name: http_proxy
+  value: {{ .url | quote }}
+- name: https_proxy
+  value: {{ .url | quote }}
+- name: no_proxy
+  value: {{ .noProxy | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}

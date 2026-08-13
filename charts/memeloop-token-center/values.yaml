@@ -91,6 +91,11 @@ config:
   upstream:
     openaiUrl: ""
     anthropicUrl: ""
+  # Optional egress proxy for public OAuth/API and pricing catalog traffic.
+  # Cluster-local PostgreSQL, S3, and Services remain direct via noProxy.
+  outboundProxy:
+    url: ""
+    noProxy: "localhost,127.0.0.1,::1,.svc,.cluster.local,10.0.0.0/8,100.64.0.0/10"
 
 plugins:
   enabled: false

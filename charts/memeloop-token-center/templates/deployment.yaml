@@ -51,6 +51,7 @@ spec:
               containerPort: 8080
           env:
             {{- include "memeloop-token-center.env" $ | nindent 12 }}
+            {{- include "memeloop-token-center.proxyEnv" $ | nindent 12 }}
             {{- if or (eq $role "control") (eq $role "all") }}
             - name: MTC_SERVICE_TOKEN
               valueFrom:
