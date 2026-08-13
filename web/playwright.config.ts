@@ -26,6 +26,9 @@ export default defineConfig({
     command: 'node e2e/server.mjs',
     url: `${baseURL}/healthz`,
     reuseExistingServer: false,
-    timeout: 180_000,
+    // CI performs an explicit cold build first, but allow enough startup time for
+    // slower shared runners and cache misses without conflating build latency
+    // with a browser assertion failure.
+    timeout: 300_000,
   },
 });
