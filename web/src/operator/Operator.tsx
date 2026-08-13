@@ -160,13 +160,35 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
   const [method, setMethod] = useState<'direct' | 'authorization'>('direct');
   const [driver, setDriver] = useState('');
   const provider = providers.find((value) => value.id === driver) ?? providers[0];
-  const schema = useMemo<RJSFSchema | undefined>(() => provider ? localizeSchema({
-    type: 'object', required: ['name', 'config', 'credential'], properties: {
-      name: { type: 'string', title: t('providers.name') },
-      driver: { type: 'string', default: provider.id, readOnly: true },
-      config: provider.config_schema, credential: provider.credential_schema,
-    },
-  } as RJSFSchema, locale) : undefined, [provider, locale]);
+  const schema = useMemo<RJSFSchema | undefined>(() => {
+    if (!provider) return undefined;
+    const config = structuredClone(provider.config_schema) as { properties?: Record<string, unknown> };
+    if (provider.id === 'http-json' && config.properties) {
+      delete config.properties.oauth;
+      delete config.properties.timeout_seconds;
+    }
+    const credential = structuredClone(provider.credential_schema) as { oneOf?: Array<Record<string, unknown>> };
+    if (provider.id === 'http-json' && credential.oneOf) {
+      credential.oneOf = credential.oneOf
+        .filter((option) => option.title !== 'OAuth')
+        .sort((left) => left.title === 'API key' ? -1 : 1)
+        .map((option) => {
+          if (option.title !== 'API key') return option;
+          const compact = structuredClone(option) as { properties?: Record<string, unknown> };
+          if (compact.properties) { delete compact.properties.header; delete compact.properties.prefix; }
+          return compact;
+        });
+    }
+    return localizeSchema({
+      type: 'object', required: ['name', 'config', 'credential'], properties: {
+        name: { type: 'string', title: t('providers.name') },
+        driver: { type: 'string', default: provider.id, readOnly: true },
+        config: { ...config, title: 'Connection configuration' },
+        credential: { ...credential, title: 'Access credential' },
+      },
+    } as RJSFSchema, locale);
+  }, [provider, locale]);
+  const uiSchema = { driver: { 'ui:widget': 'hidden' }, config: { oauth: { 'ui:widget': 'hidden' }, timeout_seconds: { 'ui:widget': 'hidden' } } };
   return <section className="provider-layout">
     <article className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><span>{values.length}</span></div>
       <div className="account-list">{values.length === 0 && <div className="empty">{t('providers.empty')}</div>}{values.map((value) => <div className="account provider-account" key={value.id}><div><b>{value.name}</b><span>{value.driver} · {t('providers.authKind')}: {value.auth_kind}{value.tenant_external_id ? ` · ${value.tenant_external_id}` : ''}</span><small>{value.id}</small></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{value.status}</span><span className="pill">{t('providers.generation')} {value.credential_generation}</span></div></div>)}</div>
@@ -175,7 +197,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
       <div className="segmented"><button className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</button><button className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</button></div>
       {method === 'direct' ? <>
         <label>{t('providers.provider')}<select value={provider?.id ?? ''} onChange={(event) => setDriver(event.target.value)}>{providers.map((value) => <option key={value.id} value={value.id}>{value.display_name} · {value.source}</option>)}</select></label>
-        {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} validator={validator} onSubmit={async ({ formData }) => { await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant }) }); await onChanged(); }}><button type="submit">{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+        {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} uiSchema={uiSchema} validator={validator} onSubmit={async ({ formData }) => { await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant }) }); await onChanged(); }}><button type="submit">{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
       </> : <AuthorizationConnection token={token} tenant={tenant} providers={providers} onChanged={onChanged} />}
     </article>
   </section>;
@@ -256,7 +278,7 @@ function Pricing({ token, tenant, schemas }: { token: string; tenant: string; sc
     finally { setSyncing(false); }
   };
   return <div className="pricing-page">
-    <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><button onClick={() => void sync()} disabled={syncing || usage.models.length === 0}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</button></div>
+    <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><button onClick={() => void sync()} disabled={syncing}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</button></div>
       <div className="pricing-summary"><span>{t('pricing.usedModels', { count: usage.models.length })}</span><span>{t('pricing.saved', { count: prices.length })}</span><span>{t('pricing.sourceOrder')}: models.dev → LiteLLM → OpenRouter</span></div>
       {error && <div className="notice error">{error}</div>}
       {syncResult && <><div className="source-status">{syncResult.sourceResults.map((source) => <div className={`source-card ${source.error ? 'failed' : 'healthy'}`} key={source.source}><b>{source.source}</b><span>{source.error ? t('pricing.sourceFailed') : t('pricing.sourceHealthy', { count: source.models })}</span></div>)}</div><div className="notice success"><b>{t('pricing.result')}</b> · {t('pricing.imported', { count: syncResult.imported })} · {t('pricing.candidates', { count: syncResult.candidates.length })} · {t('pricing.unmatched', { count: syncResult.unmatched.length })} · {t('pricing.preserved', { count: syncResult.preserved.length })}</div></>}

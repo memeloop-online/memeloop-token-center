@@ -67,6 +67,12 @@ const zh: Record<string, string> = {
   'schema.Allowed models': '允许模型', 'schema.Credential policy': '凭据策略', 'schema.Requests per minute': '每分钟请求数',
   'schema.Tokens per minute': '每分钟 Token 数', 'schema.Maximum concurrency': '最大并发数',
   'schema.Token model price': 'Token 模型价格', 'schema.Generation price': '多模态生成价格',
+  'schema.Connection configuration': '连接配置', 'schema.Access credential': '接入凭据',
+  'schema.Base URL': '基础 URL', 'schema.Image generation API': '图片生成接口',
+  'schema.Image generation model': '图片生成模型', 'schema.Credential type': '凭据类型',
+  'schema.Credential value': '凭据内容', 'schema.API key': 'API 凭据', 'schema.No authentication': '无需认证',
+  'schema.Use responses-tool when a Codex-compatible upstream exposes image_generation through /v1/responses.': '当兼容 Codex 的上游通过 /v1/responses 暴露 image_generation 时选择 responses-tool。',
+  'schema.Responses model used to invoke image_generation when image_api_mode is responses-tool.': '选择 responses-tool 时调用 image_generation 使用的模型。',
   'schema.Service credential': '服务凭据', 'schema.Restrict to tenant': '限制到租户',
   'schema.Leave empty only for a global operator integration.': '仅全局管理集成可以留空。',
 };
@@ -130,8 +136,26 @@ const en: Record<string, string> = {
   'schema.Allowed models': 'Allowed models', 'schema.Credential policy': 'Credential policy', 'schema.Requests per minute': 'Requests per minute',
   'schema.Tokens per minute': 'Tokens per minute', 'schema.Maximum concurrency': 'Maximum concurrency',
   'schema.Token model price': 'Token model price', 'schema.Generation price': 'Generation price',
+  'schema.Connection configuration': 'Connection configuration', 'schema.Access credential': 'Access credential',
+  'schema.Base URL': 'Base URL', 'schema.Image generation API': 'Image generation API',
+  'schema.Image generation model': 'Image generation model', 'schema.Credential type': 'Credential type',
+  'schema.Credential value': 'Credential value', 'schema.API key': 'API credential', 'schema.No authentication': 'No authentication',
+  'schema.Use responses-tool when a Codex-compatible upstream exposes image_generation through /v1/responses.': 'Use responses-tool when a Codex-compatible upstream exposes image_generation through /v1/responses.',
+  'schema.Responses model used to invoke image_generation when image_api_mode is responses-tool.': 'Responses model used to invoke image_generation when image_api_mode is responses-tool.',
   'schema.Service credential': 'Service credential', 'schema.Restrict to tenant': 'Restrict to tenant',
   'schema.Leave empty only for a global operator integration.': 'Leave empty only for a global operator integration.',
+};
+
+const schemaFields: Record<string, [string, string]> = {
+  tenant_external_id: ['租户', 'Tenant'], principal_external_id: ['用户主体', 'Principal'], alias: ['凭据别名', 'Credential alias'],
+  currency: ['币种', 'Currency'], initial_balance: ['初始额度', 'Initial credit'], policy: ['权限与限流策略', 'Policy and rate limits'],
+  allowed_models: ['允许模型', 'Allowed models'], requests_per_minute: ['每分钟请求数', 'Requests per minute'],
+  tokens_per_minute: ['每分钟 Token 数', 'Tokens per minute'], max_concurrency: ['最大并发数', 'Maximum concurrency'],
+  daily_budget: ['每日额度', 'Daily budget'], weekly_budget: ['每周额度', 'Weekly budget'], lifetime_budget: ['总可用额度', 'Lifetime budget'],
+  base_url: ['基础 URL', 'Base URL'], image_api_mode: ['图片生成接口', 'Image generation API'], image_main_model: ['图片生成模型', 'Image generation model'],
+  type: ['凭据类型', 'Credential type'], value: ['凭据内容', 'Credential value'], input_per_million: ['输入 / 百万 Token', 'Input / million tokens'],
+  output_per_million: ['输出 / 百万 Token', 'Output / million tokens'], billing_unit: ['计费单位', 'Billing unit'],
+  price_per_unit: ['单位价格', 'Price per unit'], name: ['名称', 'Name'], scopes: ['权限范围', 'Scopes'],
 };
 
 interface I18nValue { locale: Locale; setLocale: (locale: Locale) => void; t: (key: string, variables?: Variables) => string }
@@ -162,13 +186,19 @@ export function useI18n() {
 }
 
 export function localizeSchema<T>(schema: T, locale: Locale): T {
-  if (locale === 'en' || !schema || typeof schema !== 'object') return schema;
+  if (!schema || typeof schema !== 'object') return schema;
   if (Array.isArray(schema)) return schema.map((item) => localizeSchema(item, locale)) as T;
   const source = schema as Record<string, unknown>;
   const localized: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(source)) {
     if ((key === 'title' || key === 'description') && typeof value === 'string') {
-      localized[key] = zh[`schema.${value}`] ?? value;
+      localized[key] = (locale === 'zh-CN' ? zh : en)[`schema.${value}`] ?? value;
+    } else if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
+      localized[key] = Object.fromEntries(Object.entries(value).map(([property, definition]) => {
+        const next = localizeSchema(definition, locale) as Record<string, unknown>;
+        if (!next.title && schemaFields[property]) next.title = schemaFields[property][locale === 'zh-CN' ? 0 : 1];
+        return [property, next];
+      }));
     } else {
       localized[key] = localizeSchema(value, locale);
     }

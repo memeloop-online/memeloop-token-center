@@ -206,15 +206,17 @@ impl ProviderCatalog {
             "additionalProperties": false,
             "required": ["base_url"],
             "properties": {
-                "base_url": {"type": "string", "format": "uri"},
+                "base_url": {"type": "string", "format": "uri", "title": "Base URL"},
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "default": 120},
                 "image_api_mode": {
+                    "title": "Image generation API",
                     "type": "string",
                     "enum": ["images", "responses-tool"],
                     "default": "images",
                     "description": "Use responses-tool when a Codex-compatible upstream exposes image_generation through /v1/responses."
                 },
                 "image_main_model": {
+                    "title": "Image generation model",
                     "type": "string",
                     "minLength": 1,
                     "description": "Responses model used to invoke image_generation when image_api_mode is responses-tool."
@@ -240,7 +242,7 @@ impl ProviderCatalog {
                     "additionalProperties": false,
                     "required": ["type"],
                     "properties": {
-                        "type": {"const": "none"}
+                        "type": {"const": "none", "title": "Credential type"}
                     }
                 },
                 {
@@ -249,8 +251,8 @@ impl ProviderCatalog {
                     "additionalProperties": false,
                     "required": ["type", "value"],
                     "properties": {
-                        "type": {"const": "api_key"},
-                        "value": {"type": "string", "minLength": 1, "writeOnly": true},
+                        "type": {"const": "api_key", "title": "Credential type"},
+                        "value": {"type": "string", "minLength": 1, "writeOnly": true, "title": "Credential value"},
                         "header": {"type": "string", "default": "authorization"},
                         "prefix": {"type": "string", "default": "Bearer "}
                     }
