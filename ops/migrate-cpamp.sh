@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-: "${DATABASE_URL:?DATABASE_URL is required}"
+: "${PGDATABASE:=${DATABASE_URL:-}}"
+: "${PGDATABASE:?PGDATABASE or DATABASE_URL is required}"
 : "${CPAMP_SQLITE_PATH:=/source/usage.sqlite}"
 : "${IMPORT_TENANT_EXTERNAL_ID:=cpa-dogfood-import}"
 : "${CPAMP_OVERLAP_MS:=86400000}"
@@ -20,9 +21,11 @@ case "$CPAMP_RESET_IMPORT" in true|false) ;; *) echo "CPAMP_RESET_IMPORT must be
 }
 [ -r "$CPAMP_SQLITE_PATH" ] || { echo "CPAMP SQLite database is not readable" >&2; exit 2; }
 
-# libpq expands a connection URI supplied through PGDATABASE. Keeping the URI
-# out of argv prevents database credentials from appearing in process listings.
-export PGDATABASE="$DATABASE_URL"
+# libpq expands a connection URI supplied through PGDATABASE. The Kubernetes
+# Job injects that standard variable directly; DATABASE_URL remains a local
+# compatibility fallback. Keeping the URI out of argv prevents credentials
+# from appearing in process listings.
+export PGDATABASE
 unset DATABASE_URL
 
 psql_target() {

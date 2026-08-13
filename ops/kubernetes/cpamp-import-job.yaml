@@ -29,7 +29,7 @@ spec:
             - -ec
             - apk add --no-cache postgresql-client sqlite && exec /ops/migrate-cpamp.sh
           env:
-            - name: DATABASE_URL
+            - name: PGDATABASE
               valueFrom:
                 secretKeyRef:
                   name: memeloop-token-center-cpamp-import
