@@ -129,7 +129,10 @@ SELECT 'cpamp:' || u.event_hash, t.id,
        GREATEST(COALESCE(u.output_tokens, 0), 0),
        round((GREATEST(COALESCE(u.input_tokens, 0), 0) * COALESCE(p.input_micros_per_million, 0)
             + GREATEST(COALESCE(u.output_tokens, 0), 0) * COALESCE(p.output_micros_per_million, 0)) / 1000000.0)::bigint,
-       CASE WHEN u.failed <> 0 THEN COALESCE(NULLIF(u.fail_summary, ''), 'upstream_error') END,
+       CASE WHEN u.failed <> 0 THEN
+         CASE WHEN u.fail_status_code > 0 THEN 'http_' || u.fail_status_code::text
+              ELSE 'upstream_error' END
+       END,
        jsonb_build_object('source', 'cpamp', 'request_id', u.request_id,
                           'endpoint', u.endpoint)::text,
        CASE WHEN u.failed <> 0 THEN jsonb_build_object('error', u.fail_summary)::text END,
