@@ -18,7 +18,9 @@ spec:
     spec:
       restartPolicy: OnFailure
       automountServiceAccountToken: false
-      serviceAccountName: {{ include "memeloop-token-center.serviceAccountName" . }}
+      # This is a pre-install hook, so the release ServiceAccount does not
+      # exist yet. The migrator only needs network and Secret access.
+      serviceAccountName: default
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
