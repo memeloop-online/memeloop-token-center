@@ -1,8 +1,11 @@
 #!/bin/sh
 set -eu
 
-: "${PGDATABASE:=${DATABASE_URL:-}}"
-: "${PGDATABASE:?PGDATABASE or DATABASE_URL is required}"
+: "${PGHOST:?PGHOST is required}"
+: "${PGPORT:=5432}"
+: "${PGUSER:?PGUSER is required}"
+: "${PGPASSWORD:?PGPASSWORD is required}"
+: "${PGDATABASE:?PGDATABASE is required}"
 : "${CPAMP_SQLITE_PATH:=/source/usage.sqlite}"
 : "${IMPORT_TENANT_EXTERNAL_ID:=cpa-dogfood-import}"
 : "${CPAMP_OVERLAP_MS:=86400000}"
@@ -21,12 +24,9 @@ case "$CPAMP_RESET_IMPORT" in true|false) ;; *) echo "CPAMP_RESET_IMPORT must be
 }
 [ -r "$CPAMP_SQLITE_PATH" ] || { echo "CPAMP SQLite database is not readable" >&2; exit 2; }
 
-# libpq expands a connection URI supplied through PGDATABASE. The Kubernetes
-# Job injects that standard variable directly; DATABASE_URL remains a local
-# compatibility fallback. Keeping the URI out of argv prevents credentials
-# from appearing in process listings.
-export PGDATABASE
-unset DATABASE_URL
+# Use libpq's individual environment variables so credentials never appear in
+# argv and the Debian psql wrapper never interprets a URI as a local database.
+export PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE
 
 psql_target() {
   psql -X -v ON_ERROR_STOP=1 --no-psqlrc "$@"

@@ -26,11 +26,19 @@ spec:
           image: harbor.k3s.onetwo.website/library/memeloop-token-center-importer:20260813-1e49f74
           imagePullPolicy: IfNotPresent
           env:
-            - name: PGDATABASE
+            - name: PGHOST
+              value: memeloop-token-center-pg-rw.memeloop-token-center-dev.svc.cluster.local
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              value: token_center
+            - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
                   name: memeloop-token-center-cpamp-import
-                  key: database-url
+                  key: database-password
+            - name: PGDATABASE
+              value: memeloop_token_center_dogfood
             - name: CPAMP_SQLITE_PATH
               value: /source/usage.sqlite
             - name: IMPORT_TENANT_EXTERNAL_ID
