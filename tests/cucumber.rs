@@ -1109,16 +1109,24 @@ async fn record_requests_for_two_tenants(
 
 #[then("global operator statistics contain both tenant requests")]
 async fn global_operator_stats_contain_both(world: &mut TokenCenterWorld) {
-    let response = world
-        .client
-        .get(format!("{}/internal/v1/stats", world.service_url))
-        .bearer_auth(&world.current_service_token)
-        .send()
-        .await
-        .expect("global operator stats");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("global operator stats JSON");
-    assert_eq!(body["summary"]["total_requests"], 2);
+    let mut observed = 0;
+    for _ in 0..20 {
+        let response = world
+            .client
+            .get(format!("{}/internal/v1/stats", world.service_url))
+            .bearer_auth(&world.current_service_token)
+            .send()
+            .await
+            .expect("global operator stats");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.expect("global operator stats JSON");
+        observed = body["summary"]["total_requests"].as_i64().unwrap_or(0);
+        if observed == 2 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(observed, 2);
 }
 
 #[then(expr = "tenant filtered operator statistics contain only {string}")]
