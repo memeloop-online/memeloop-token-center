@@ -94,13 +94,31 @@ jobs:
           MTC_TEST_S3_BUCKET: memeloop-token-center-test
           MTC_TEST_S3_ACCESS_KEY: token-center-test
           MTC_TEST_S3_SECRET_KEY: token-center-test-secret
+
+  migration-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: memeloop_token_center_test
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U token_center -d memeloop_token_center_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: PostgreSQL migration smoke test
         env:
           MTC_DATABASE_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
           MTC_KEY_PEPPER: ci-key-pepper-with-more-than-thirty-two-bytes
           MTC_SERVICE_TOKEN: ci-service-token
           MTC_ARCHIVE_BACKEND: memory
-        run: cargo run --bin memeloop-token-center -- migrate
+        run: cargo run --locked --bin memeloop-token-center -- migrate
 
   packaging:
     runs-on: ubuntu-latest
