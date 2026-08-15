@@ -112,10 +112,19 @@ fresh put/read before production dogfood rollout.
 
 ## Gate 1: identify immutable images
 
-The Forgejo workflow builds the service and importer on `master`. The immutable
-tag is UTC build date plus the first seven characters of the commit. Discover
-the tag from Harbor instead of guessing the date, especially around UTC
-midnight:
+The GitHub `ci` workflow validates every `master` push first, then its
+`publish-ghcr` matrix builds the service and importer and publishes both to
+GHCR as `sha-<full commit>` plus the moving `master` tag. The publish job uses
+the repository-scoped `GITHUB_TOKEN`, emits an SBOM and provenance, and records
+the registry digest. A private repository can publish these packages; private
+packages require an image pull credential, while public GHCR container packages
+allow anonymous pulls.
+
+The Forgejo workflow remains a Harbor fallback and builds the same service and
+importer on `master`. Its date/short-SHA tag is a discovery label, not an
+immutability boundary: this Harbor project currently permits tag replacement.
+Discover the tag instead of guessing the UTC date, verify its digest, and deploy
+as `repository:tag@sha256:digest`:
 
 ```bash
 export MTC_REPO=/home/chenshuangfeng/Github/memeloop-token-center
