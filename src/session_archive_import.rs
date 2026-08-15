@@ -87,8 +87,9 @@ pub async fn import_session_archive(
         )
         .await?;
 
-    // Pass one never writes. A missing/ambiguous CPAMP identity therefore stops the
-    // entire batch before any target object or relational row can be changed.
+    // Pass one never writes. A missing/ambiguous CPAMP identity or a protected
+    // request/response locator therefore stops the entire batch before any target
+    // object or relational row can be changed.
     let mut stats = SessionArchiveImportStats::default();
     let mut reader = open_reader(options.input).await?;
     while let Some(line) = read_bounded_line(&mut reader, options.max_line_bytes).await? {
@@ -104,6 +105,7 @@ pub async fn import_session_archive(
         stats.eligible += 1;
         match match_record(db, options, &record, &digest).await {
             Ok(target) => {
+                preflight_gap_compatibility(db, options, &record, &target).await?;
                 stats.mapped += 1;
                 stats.replayed += u64::from(target.replay);
             }
@@ -201,6 +203,47 @@ async fn match_record(
         time_tolerance_ms: options.time_tolerance_ms,
     })
     .await
+}
+
+async fn preflight_gap_compatibility(
+    db: &Database,
+    options: &SessionArchiveImportOptions<'_>,
+    record: &ArchiveRecord,
+    target: &SessionArchiveTarget,
+) -> Result<(), AppError> {
+    if target.replay {
+        return Ok(());
+    }
+
+    let request_object = payload_content_location(&record.request)?;
+    let response_object = payload_content_location(&record.response)?;
+    let current = db
+        .request_archive_refs_for_tenant(options.tenant_external_id, target.target_request_id)
+        .await?;
+    gap_compatible(&current.request_object, request_object.as_deref())?;
+    if let Some(current_response) = current.response_object.as_deref() {
+        gap_compatible(current_response, response_object.as_deref())?;
+    }
+    Ok(())
+}
+
+fn payload_content_location(value: &Value) -> Result<Option<String>, AppError> {
+    payload_bytes(value)
+        .map(|body| body.map(|body| content_location(&digest(&body))))
+        .map_err(|_| AppError::Internal)
+}
+
+fn content_location(digest: &str) -> String {
+    format!("objects/blake3/{}/{digest}", &digest[..2])
+}
+
+fn gap_compatible(current: &str, replacement: Option<&str>) -> Result<(), AppError> {
+    if replacement.is_none() || current.starts_with("gap://") || Some(current) == replacement {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(
+        "archive import refused to overwrite an existing object".into(),
+    ))
 }
 
 fn parse_record(

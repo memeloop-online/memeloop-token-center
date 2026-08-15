@@ -140,6 +140,99 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
     assert!(refs.request_object.starts_with("gap://"));
     assert!(refs.response_object.unwrap().starts_with("gap://"));
 
+    let protected_request_id = Uuid::now_v7();
+    let protected_event_hash = "d".repeat(64);
+    db.record_request_started(NewRequest {
+        request_id: protected_request_id,
+        key_id: key.key_id,
+        tenant_id: key.tenant_id,
+        protocol: "openai-responses".into(),
+        model: "gpt-fixture".into(),
+        request_object: format!("gap://cpamp/{protected_event_hash}/request"),
+        reservation_id: Uuid::now_v7(),
+        upstream_account_id: None,
+        model_route_id: None,
+    })
+    .await
+    .expect("insert protected target");
+    sqlx::query(
+        "UPDATE request_records SET created_at = $1, completed_at = $2, status_code = 200, response_object = $3 WHERE id = $4",
+    )
+    .bind(started_at + 2000)
+    .bind(started_at + 3000)
+    .bind(r#"inline-json:{"id":"live-response"}"#)
+    .bind(protected_request_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("complete protected target");
+    sqlx::query("UPDATE request_record_locators SET created_at = $1 WHERE id = $2")
+        .bind(started_at + 2000)
+        .bind(protected_request_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("route protected target through locator");
+    sqlx::query(
+        "INSERT INTO import_request_links (tenant_id, source, external_event_hash, external_request_id, source_key_hash, target_request_id, source_created_at, source_model, created_at) VALUES ($1, 'cpamp-usage-events-v1', $2, 'cpa-source-request-2', $3, $4, $5, 'gpt-fixture', $6)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(&protected_event_hash)
+    .bind(&source_key_hash)
+    .bind(protected_request_id.to_string())
+    .bind(started_at + 2000)
+    .bind(started_at + 2000)
+    .execute(&pool)
+    .await
+    .expect("insert protected CPAMP link");
+    let protected = json!({
+        "schema_version": 2,
+        "session_id": "durable-thread-2",
+        "request_id": "cpa-source-request-2",
+        "started_at": "2026-08-12T00:00:02Z",
+        "completed_at": "2026-08-12T00:00:03Z",
+        "credential_hash": source_key_hash,
+        "requested_model": "gpt-fixture",
+        "model": "gpt-fixture",
+        "outcome": "succeeded",
+        "status_code": 200,
+        "request": {"input":"request would otherwise be archived"},
+        "response": {"output":"must not replace the live inline response"}
+    });
+    let prospective_objects = [
+        content_location(&good["request"]),
+        content_location(&good["response"]),
+        content_location(&protected["request"]),
+        content_location(&protected["response"]),
+    ];
+    let protected_mixed = jsonl(&[good.clone(), protected]);
+
+    let error = import_session_archive(&db, &archive, &options(&protected_mixed, false))
+        .await
+        .expect_err("dry run must preflight protected locators");
+    assert!(error.to_string().contains("refused to overwrite"));
+    assert_failed_batch_unchanged(
+        &db,
+        &archive,
+        &pool,
+        request_id,
+        protected_request_id,
+        &prospective_objects,
+    )
+    .await;
+
+    let error = import_session_archive(&db, &archive, &options(&protected_mixed, true))
+        .await
+        .expect_err("later protected locator must fail apply before writes");
+    assert!(error.to_string().contains("refused to overwrite"));
+    assert_failed_batch_unchanged(
+        &db,
+        &archive,
+        &pool,
+        request_id,
+        protected_request_id,
+        &prospective_objects,
+    )
+    .await;
+
     let input = jsonl(&[good]);
     let dry_run = import_session_archive(&db, &archive, &options(&input, false))
         .await
@@ -203,77 +296,64 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
         .expect("checkpoint excludes records before the overlap window");
     assert_eq!(skipped.before_overlap, 1);
     assert_eq!(skipped.unmapped, 0);
+}
 
-    let protected_request_id = Uuid::now_v7();
-    let protected_event_hash = "d".repeat(64);
-    db.record_request_started(NewRequest {
-        request_id: protected_request_id,
-        key_id: key.key_id,
-        tenant_id: key.tenant_id,
-        protocol: "openai-responses".into(),
-        model: "gpt-fixture".into(),
-        request_object: "objects/blake3/al/already-real".into(),
-        reservation_id: Uuid::now_v7(),
-        upstream_account_id: None,
-        model_route_id: None,
-    })
-    .await
-    .expect("insert protected target");
-    sqlx::query(
-        "UPDATE request_records SET created_at = $1, completed_at = $2, status_code = 200, response_object = $3 WHERE id = $4",
-    )
-    .bind(started_at + 2000)
-    .bind(started_at + 3000)
-    .bind(format!("gap://cpamp/{protected_event_hash}"))
-    .bind(protected_request_id.to_string())
-    .execute(&pool)
-    .await
-    .expect("complete protected target");
-    sqlx::query("UPDATE request_record_locators SET created_at = $1 WHERE id = $2")
-        .bind(started_at + 2000)
-        .bind(protected_request_id.to_string())
-        .execute(&pool)
+async fn assert_failed_batch_unchanged(
+    db: &Database,
+    archive: &ArchiveStore,
+    pool: &sqlx::AnyPool,
+    gap_request_id: Uuid,
+    protected_request_id: Uuid,
+    prospective_objects: &[String],
+) {
+    let gap_refs = db
+        .request_archive_refs_for_tenant("archive-fixture", gap_request_id)
         .await
-        .expect("route protected target through locator");
-    sqlx::query(
-        "INSERT INTO import_request_links (tenant_id, source, external_event_hash, external_request_id, source_key_hash, target_request_id, source_created_at, source_model, created_at) VALUES ($1, 'cpamp-usage-events-v1', $2, 'cpa-source-request-2', $3, $4, $5, 'gpt-fixture', $6)",
-    )
-    .bind(key.tenant_id.to_string())
-    .bind(&protected_event_hash)
-    .bind(&source_key_hash)
-    .bind(protected_request_id.to_string())
-    .bind(started_at + 2000)
-    .bind(started_at + 2000)
-    .execute(&pool)
-    .await
-    .expect("insert protected CPAMP link");
-    let protected = json!({
-        "schema_version": 2,
-        "session_id": "durable-thread-2",
-        "request_id": "cpa-source-request-2",
-        "started_at": "2026-08-12T00:00:02Z",
-        "completed_at": "2026-08-12T00:00:03Z",
-        "credential_hash": source_key_hash,
-        "requested_model": "gpt-fixture",
-        "model": "gpt-fixture",
-        "outcome": "succeeded",
-        "status_code": 200,
-        "request": {"input":"must not replace a real object"},
-        "response": {"output":"response"}
-    });
-    let protected_input = jsonl(&[protected]);
-    let error = import_session_archive(&db, &archive, &options(&protected_input, true))
-        .await
-        .expect_err("real target objects cannot be overwritten");
-    assert!(error.to_string().contains("refused to overwrite"));
+        .expect("gap target references");
+    assert!(gap_refs.request_object.starts_with("gap://"));
+    assert!(gap_refs.response_object.unwrap().starts_with("gap://"));
+
     let protected_refs = db
         .request_archive_refs_for_tenant("archive-fixture", protected_request_id)
         .await
         .expect("protected target references");
+    assert!(protected_refs.request_object.starts_with("gap://"));
     assert_eq!(
-        protected_refs.request_object,
-        "objects/blake3/al/already-real"
+        protected_refs.response_object.as_deref(),
+        Some(r#"inline-json:{"id":"live-response"}"#)
     );
+
+    let imported: i64 = sqlx::query_scalar("SELECT count(*) FROM session_archive_import_records")
+        .fetch_one(pool)
+        .await
+        .expect("count import records");
+    let checkpoints: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM session_archive_import_checkpoints")
+            .fetch_one(pool)
+            .await
+            .expect("count import checkpoints");
+    let observations: i64 = sqlx::query_scalar("SELECT count(*) FROM conversation_observations")
+        .fetch_one(pool)
+        .await
+        .expect("count conversation observations");
+    assert_eq!(imported, 0);
+    assert_eq!(checkpoints, 0);
+    assert_eq!(observations, 0);
+    for location in prospective_objects {
+        assert!(
+            archive.get(location).await.is_err(),
+            "preflight failure must not create {location}"
+        );
+    }
+}
+
+fn content_location(value: &serde_json::Value) -> String {
+    let body = match value {
+        serde_json::Value::String(value) => value.as_bytes().to_vec(),
+        value => serde_json::to_vec(value).expect("serialize fixture payload"),
+    };
+    let digest = blake3::hash(&body).to_hex().to_string();
+    format!("objects/blake3/{}/{digest}", &digest[..2])
 }
 
 fn jsonl(values: &[serde_json::Value]) -> NamedTempFile {
