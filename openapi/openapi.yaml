@@ -22,7 +22,7 @@ info:
     name: Apache-2.0
     identifier: Apache-2.0
 servers:
-  - url: https://token-center.api.onetwo.website:24450
+  - url: https://token-center.api.onetwo.website
     description: Gateway role
   - url: https://token-center.k3s.onetwo.website
     description: Control role

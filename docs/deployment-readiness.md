@@ -68,13 +68,11 @@ The current public/review surfaces are intentionally different:
 - private operator ingress:
   `https://token-center.k3s.onetwo.website/operator`;
 - public gateway/self portal:
-  `https://token-center.api.onetwo.website:24450/portal`.
+  `https://token-center.api.onetwo.website/portal`.
 
-The dedicated `24450` Envoy listener allows only `/v1`, `/self`, `/portal`,
-`/ui-assets` and `/healthz`. It rejects `/operator` and `/internal`, and a wrong
-SNI is reset. This is the correct public address. The same hostname on ordinary
-port 443 is not the advertised gateway and was not a valid substitute in the
-audit environment.
+The public TLS ingress on port 443 allows only `/v1`, `/self`, `/portal`,
+`/ui-assets` and health/readiness paths. It returns 404 for `/operator` and
+`/internal`; the operator surface remains on the private ingress only.
 
 ## What the next chart changes
 
@@ -508,7 +506,7 @@ Only after Gates 1-4 and the backup checks pass:
    manifest tag.
 9. Run Playwright dogfooding locally and from the Windows Codex browser proxy.
    Public testing must include the path allowlist: `/operator` and `/internal`
-   on `:24450` remain 404, while `/portal`, `/ui-assets`, `/self` authentication
+   on the public origin remain 404, while `/portal`, `/ui-assets`, `/self` authentication
    and model routes work.
 
 Useful read-only checks:
@@ -523,11 +521,11 @@ ssh "$OPS_HOST" '
   kubectl -n memeloop-token-center top pod
 '
 
-curl --fail --silent https://token-center.api.onetwo.website:24450/healthz
+curl --fail --silent https://token-center.api.onetwo.website/healthz
 test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
-  https://token-center.api.onetwo.website:24450/operator)" = 404
+  https://token-center.api.onetwo.website/operator)" = 404
 test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
-  https://token-center.api.onetwo.website:24450/internal/v1/schemas)" = 404
+  https://token-center.api.onetwo.website/internal/v1/schemas)" = 404
 ```
 
 The baseline already contains one SQLx warning where a gateway connection took

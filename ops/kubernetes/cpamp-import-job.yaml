@@ -23,7 +23,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: importer
-          image: harbor.k3s.onetwo.website/library/memeloop-token-center-importer:20260813-1e49f74
+          image: harbor.k3s.onetwo.website/library/memeloop-token-center-importer@sha256:22ef4d7a1e5af0e1cdea84536a52098734117b96917a6ee2e2df67ac317295f7
           imagePullPolicy: IfNotPresent
           env:
             - name: PGHOST
@@ -65,8 +65,13 @@ spec:
             - name: source
               mountPath: /source
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: source
           persistentVolumeClaim:
             claimName: cpa-manager-plus-data
             readOnly: true
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
