@@ -128,8 +128,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      attestations: write
-      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -170,12 +168,6 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
           provenance: mode=max
           sbom: true
-      - name: Attest published image
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-name: ${{ matrix.image }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
 
   packaging:
     runs-on: ubuntu-latest
