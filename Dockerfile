@@ -37,6 +37,10 @@ COPY src ./src
 COPY migrations ./migrations
 COPY schemas ./schemas
 COPY wit ./wit
+# The dependency-cache stage compiles a stub copy of this package. Remove only
+# this package's stale artifacts so Cargo cannot reuse the stub library for the
+# real service and archive-import binaries while retaining dependency builds.
+RUN cargo clean -p memeloop-token-center
 RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA}" \
     MTC_BUILD_TIMESTAMP="${MTC_BUILD_TIMESTAMP}" \
     MTC_BUILD_TARGET="${MTC_BUILD_TARGET}" \
