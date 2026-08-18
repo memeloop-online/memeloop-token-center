@@ -247,7 +247,7 @@ class PsqlIdentitySession:
         if not TENANT_ID.fullmatch(tenant_external_id):
             raise ImportFailure("tenant external id contains unsupported characters")
         self.tenant_external_id = tenant_external_id
-        self._stderr: list[str] = []
+        self._closed = False
         psql_environment = os.environ.copy()
         psql_environment.setdefault("PGCONNECT_TIMEOUT", "10")
         psql_environment.setdefault("PGAPPNAME", "mtc-legacy-credential-import")
@@ -290,18 +290,64 @@ class PsqlIdentitySession:
 
     def _drain_stderr(self) -> None:
         assert self.process.stderr is not None
-        for line in self.process.stderr:
-            # SQL is constant and contains no credential. Keep only a bounded diagnostic.
-            if sum(len(item) for item in self._stderr) < 16 * 1024:
-                self._stderr.append(line.rstrip())
+        # stderr can contain connection settings or database-provided text. Drain it so
+        # psql cannot block, but never decode, retain, or echo it.
+        while self.process.stderr.buffer.read(4096):
+            pass
 
     def _write(self, value: str) -> None:
         assert self.process.stdin is not None
         try:
             self.process.stdin.write(value)
             self.process.stdin.flush()
-        except (BrokenPipeError, OSError) as error:
+        except (BrokenPipeError, OSError, ValueError) as error:
             raise ImportFailure("PostgreSQL identity session ended unexpectedly") from error
+
+    def _finish_after_output_eof(self) -> int:
+        """Reap psql and its stderr reader before classifying a closed stdout."""
+        assert self.process.stdin is not None
+        if not self.process.stdin.closed:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
+        try:
+            return_code = self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            return_code = self.process.wait()
+        self._finish_pipes()
+        return return_code
+
+    def _finish_pipes(self) -> None:
+        # Once the direct psql child has exited, both pipe writers are closed and
+        # the drain thread must reach EOF. Joining without a race preserves that
+        # lifecycle guarantee before Python reports the failure or exits.
+        self._stderr_thread.join()
+        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        self._closed = True
+
+    @staticmethod
+    def _closed_output_message(return_code: int) -> str:
+        # psql documents 1 as a client-side fatal error, 2 as a bad server
+        # connection, and 3 as an ON_ERROR_STOP script error. Do not include
+        # stderr here: it can contain connection or database-provided material.
+        if return_code == 0:
+            return "psql closed PostgreSQL identity output before completion"
+        if return_code == 1:
+            return "psql failed before completing the PostgreSQL identity query (status 1)"
+        if return_code == 2:
+            return "PostgreSQL identity connection was lost (psql status 2)"
+        if return_code == 3:
+            return "PostgreSQL rejected the identity query (psql status 3)"
+        if return_code < 0:
+            return f"psql was terminated by signal {-return_code} during the identity query"
+        return f"psql exited unexpectedly during the identity query (status {return_code})"
 
     def _readline(self) -> str:
         assert self.process.stdout is not None
@@ -310,7 +356,8 @@ class PsqlIdentitySession:
         except (OSError, UnicodeError) as error:
             raise ImportFailure("PostgreSQL identity output is invalid") from error
         if value == "":
-            raise ImportFailure("PostgreSQL identity query failed")
+            return_code = self._finish_after_output_eof()
+            raise ImportFailure(self._closed_output_message(return_code))
         return value.rstrip("\r\n")
 
     def mappings(self) -> tuple[list[Identity], list[Identity], list[Identity]]:
@@ -361,15 +408,16 @@ class PsqlIdentitySession:
         return identities, existing, revoked
 
     def close(self) -> None:
-        if not hasattr(self, "process") or self.process.poll() is not None:
+        if not hasattr(self, "process") or self._closed:
             return
-        try:
-            self._write(f"SELECT {UNLOCK_SQL};\n\\quit\n")
-            self.process.wait(timeout=5)
-        except (ImportFailure, subprocess.TimeoutExpired, ValueError):
-            self.process.kill()
-            self.process.wait()
-        self._stderr_thread.join(timeout=1)
+        if self.process.poll() is None:
+            try:
+                self._write(f"SELECT {UNLOCK_SQL};\n\\quit\n")
+                self.process.wait(timeout=5)
+            except (ImportFailure, subprocess.TimeoutExpired):
+                self.process.kill()
+                self.process.wait()
+        self._finish_pipes()
 
     def __enter__(self) -> "PsqlIdentitySession":
         return self

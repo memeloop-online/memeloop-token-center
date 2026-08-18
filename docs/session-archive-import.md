@@ -19,9 +19,14 @@ request or aggregate rows.
 Schema-1 records require a full 64-character credential SHA-256 in legacy
 `key_id`; `credential_hash` is not part of that schema and is never used to rescue
 a missing or human-labelled schema-1 key. Schema-2 records prefer their explicit
-`credential_hash` and use a valid legacy `key_id` only when the new field is
-absent. Apply cpa-session-archive's identity mapping backfill before exporting
+`credential_hash`, accepting either 64 hexadecimal characters or the strict
+`sha256:<64hex>` form, and use a valid legacy `key_id` only when the new field is
+absent. The importer strips only that exact prefix and canonicalizes the digest;
+an invalid explicit field is never rescued by `key_id`. Apply
+cpa-session-archive's identity mapping backfill before exporting
 records that only have a human label. The importer does not guess caller identity.
+It treats source `principal_id` as untrusted source data and never uses it for
+authorization or correlation.
 The hash must prove exactly one stable `key_id` and `principal_id`, through the
 legacy credential source-hash registry, CPAMP source links, or both. A missing or
 conflicting identity proof rejects the complete eligible batch before relational
@@ -97,8 +102,10 @@ two session-list projections.
 An archive request UUID is not assumed to equal CPAMP's short request id. A
 globally proven one-to-one edge is recorded as `exact`; only that disposition may
 replace a CPAMP `gap://` locator. A record with a proven stable caller but no
-unique edge is recorded as `unlinked` archive-only provenance. No closest-time,
-file-order or arbitrary tie break is permitted.
+target, or with multiple compatible targets, is recorded as `unlinked`
+archive-only provenance. A claimed target id whose candidates all conflict on
+timestamp, model, credential hash or available usage evidence is rejected as
+inconsistent. No closest-time, file-order or arbitrary tie break is permitted.
 
 ## Safe execution
 

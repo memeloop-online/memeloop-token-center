@@ -60,6 +60,13 @@ pub enum SessionArchiveCorrelation {
     Unlinked(SessionArchiveUnlinkedTarget),
 }
 
+enum SessionArchiveTargetMatch {
+    Exact(Box<SessionArchiveTarget>),
+    Ambiguous,
+    Incompatible,
+    Absent,
+}
+
 pub struct SessionArchiveImportLock {
     postgres: Option<(AnyConnection, String)>,
     sqlite: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -113,6 +120,39 @@ impl Database {
         &self,
         input: SessionArchiveMatchInput<'_>,
     ) -> Result<SessionArchiveTarget, AppError> {
+        let source_key_hash =
+            normalize_archive_source_key_hash(input.source_key_hash).ok_or_else(|| {
+                AppError::BadRequest("archive request has no verified credential hash".into())
+            })?;
+        let input = SessionArchiveMatchInput {
+            source_key_hash: &source_key_hash,
+            ..input
+        };
+        match self.classify_session_archive_request(&input).await? {
+            SessionArchiveTargetMatch::Exact(target) => {
+                let target = *target;
+                let (verified_key, _) = self
+                    .resolve_session_archive_identity(
+                        input.tenant_external_id,
+                        input.cpamp_source,
+                        input.source_key_hash,
+                    )
+                    .await?;
+                ensure_archive_target_identity(&target, &verified_key)?;
+                Ok(target)
+            }
+            SessionArchiveTargetMatch::Ambiguous
+            | SessionArchiveTargetMatch::Incompatible
+            | SessionArchiveTargetMatch::Absent => Err(AppError::BadRequest(
+                "archive request does not map uniquely to a CPAMP event".into(),
+            )),
+        }
+    }
+
+    async fn classify_session_archive_request(
+        &self,
+        input: &SessionArchiveMatchInput<'_>,
+    ) -> Result<SessionArchiveTargetMatch, AppError> {
         let rows = sqlx::query(
             "SELECT t.id AS tenant_id, l.target_request_id, rl.created_at AS request_created_at, l.external_event_hash, l.source_created_at, l.source_model, l.source_key_hash, r.input_tokens, r.output_tokens, r.key_id, k.principal_id, k.account_id, k.alias, k.currency, k.credential_generation, k.policy_json FROM import_request_links l JOIN tenants t ON t.id = l.tenant_id JOIN request_record_locators rl ON rl.id = l.target_request_id AND rl.tenant_id = l.tenant_id JOIN request_records r ON r.id = rl.id AND r.created_at = rl.created_at AND r.tenant_id = rl.tenant_id JOIN key_records k ON k.id = r.key_id AND k.tenant_id = l.tenant_id WHERE t.external_id = $1 AND l.source = $2 AND l.external_request_id = $3 ORDER BY l.source_created_at, l.external_event_hash",
         )
@@ -121,12 +161,6 @@ impl Database {
         .bind(input.external_request_id)
         .fetch_all(&self.pool)
         .await?;
-
-        if !is_sha256_hex(input.source_key_hash) {
-            return Err(AppError::BadRequest(
-                "archive request has no verified credential hash".into(),
-            ));
-        }
 
         let mut matches = Vec::new();
         for row in rows {
@@ -168,10 +202,23 @@ impl Database {
                 matches = usage_matches;
             }
         }
-        if matches.len() != 1 {
-            return Err(AppError::BadRequest(
-                "archive request does not map uniquely to a CPAMP event".into(),
-            ));
+        if matches.len() > 1 {
+            return Ok(SessionArchiveTargetMatch::Ambiguous);
+        }
+        if matches.is_empty() {
+            let raw_candidates: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM import_request_links l JOIN tenants t ON t.id = l.tenant_id WHERE t.external_id = $1 AND l.source = $2 AND l.external_request_id = $3",
+            )
+            .bind(input.tenant_external_id)
+            .bind(input.cpamp_source)
+            .bind(input.external_request_id)
+            .fetch_one(&self.pool)
+            .await?;
+            return Ok(if raw_candidates == 0 {
+                SessionArchiveTargetMatch::Absent
+            } else {
+                SessionArchiveTargetMatch::Incompatible
+            });
         }
         let (row, source_created_at, source_model) = matches.pop().expect("one match");
         let tenant_id = parse_uuid(row.try_get("tenant_id")?)?;
@@ -203,25 +250,27 @@ impl Database {
             false
         };
 
-        Ok(SessionArchiveTarget {
-            tenant_id,
-            target_request_id,
-            request_created_at: row.try_get("request_created_at")?,
-            key: AuthenticatedKey {
-                key_id,
+        Ok(SessionArchiveTargetMatch::Exact(Box::new(
+            SessionArchiveTarget {
                 tenant_id,
-                principal_id: parse_uuid(row.try_get("principal_id")?)?,
-                account_id: parse_uuid(row.try_get("account_id")?)?,
-                alias: row.try_get("alias")?,
-                currency: row.try_get("currency")?,
-                credential_generation: row.try_get("credential_generation")?,
-                policy,
+                target_request_id,
+                request_created_at: row.try_get("request_created_at")?,
+                key: AuthenticatedKey {
+                    key_id,
+                    tenant_id,
+                    principal_id: parse_uuid(row.try_get("principal_id")?)?,
+                    account_id: parse_uuid(row.try_get("account_id")?)?,
+                    alias: row.try_get("alias")?,
+                    currency: row.try_get("currency")?,
+                    credential_generation: row.try_get("credential_generation")?,
+                    policy,
+                },
+                external_event_hash: row.try_get("external_event_hash")?,
+                source_created_at,
+                source_model,
+                replay,
             },
-            external_event_hash: row.try_get("external_event_hash")?,
-            source_created_at,
-            source_model,
-            replay,
-        })
+        )))
     }
 
     /// Correlate an archive record without inventing a CPAMP edge.  An exact
@@ -232,8 +281,16 @@ impl Database {
         &self,
         input: SessionArchiveMatchInput<'_>,
     ) -> Result<SessionArchiveCorrelation, AppError> {
-        if !is_sha256_hex(input.source_key_hash)
-            || !is_sha256_hex(input.record_digest)
+        let Some(source_key_hash) = normalize_archive_source_key_hash(input.source_key_hash) else {
+            return Err(AppError::BadRequest(
+                "archive correlation proof input is invalid".into(),
+            ));
+        };
+        let input = SessionArchiveMatchInput {
+            source_key_hash: &source_key_hash,
+            ..input
+        };
+        if !is_sha256_hex(input.record_digest)
             || !valid_archive_identifier(input.cpamp_source, 256)
             || !valid_archive_identifier(input.archive_source, 256)
             || !valid_archive_identifier(input.external_request_id, 512)
@@ -243,12 +300,28 @@ impl Database {
             ));
         }
 
-        if let Some(existing) = self.existing_session_archive_correlation(&input).await? {
+        // Caller identity is independent of request-edge correlation.  Both exact
+        // and archive-only dispositions require this hash to prove one tenant-
+        // scoped key/principal before any target is considered.
+        let (verified_key, identity_proof_kind) = self
+            .resolve_session_archive_identity(
+                input.tenant_external_id,
+                input.cpamp_source,
+                input.source_key_hash,
+            )
+            .await?;
+
+        if let Some(existing) = self
+            .existing_session_archive_correlation(&input, &verified_key, &identity_proof_kind)
+            .await?
+        {
             return Ok(existing);
         }
 
-        match self.match_session_archive_request(input.clone()).await {
-            Ok(target) => {
+        match self.classify_session_archive_request(&input).await? {
+            SessionArchiveTargetMatch::Exact(target) => {
+                let target = *target;
+                ensure_archive_target_identity(&target, &verified_key)?;
                 let identity_proof_kind = "cpamp-exact-target-v1".to_owned();
                 let identity_proof_digest = archive_proof_digest(
                     "memeloop-session-archive-identity-v1",
@@ -283,7 +356,9 @@ impl Database {
                     correlation_proof_digest,
                 })
             }
-            Err(error @ AppError::BadRequest(_)) => {
+            disposition @ (SessionArchiveTargetMatch::Ambiguous
+            | SessionArchiveTargetMatch::Incompatible
+            | SessionArchiveTargetMatch::Absent) => {
                 // A provenance row from a previous exact import is authoritative.
                 // Never downgrade a changed exact replay to archive-only.
                 let prior_exact: i64 = sqlx::query_scalar(
@@ -299,27 +374,15 @@ impl Database {
                         "existing exact archive provenance no longer verifies".into(),
                     ));
                 }
-                let raw_exact_candidates: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM import_request_links l JOIN tenants t ON t.id = l.tenant_id WHERE t.external_id = $1 AND l.source = $2 AND l.external_request_id = $3",
-                )
-                .bind(input.tenant_external_id)
-                .bind(input.cpamp_source)
-                .bind(input.external_request_id)
-                .fetch_one(&self.pool)
-                .await?;
-                if raw_exact_candidates != 0 {
-                    // A source row that claims an exact CPAMP id but changes its
-                    // model/time/key evidence is inconsistent, not archive-only.
-                    return Err(error);
+                if matches!(disposition, SessionArchiveTargetMatch::Incompatible) {
+                    // A claimed target whose time/model/hash/usage evidence is
+                    // incompatible is corruption, not an ambiguous edge.
+                    return Err(AppError::BadRequest(
+                        "archive request conflicts with its CPAMP target candidates".into(),
+                    ));
                 }
 
-                let (key, identity_proof_kind) = self
-                    .resolve_session_archive_identity(
-                        input.tenant_external_id,
-                        input.cpamp_source,
-                        input.source_key_hash,
-                    )
-                    .await?;
+                let key = verified_key;
                 let identity_proof_digest = archive_proof_digest(
                     "memeloop-session-archive-identity-v1",
                     &[
@@ -361,13 +424,14 @@ impl Database {
                     },
                 ))
             }
-            Err(error) => Err(error),
         }
     }
 
     async fn existing_session_archive_correlation(
         &self,
         input: &SessionArchiveMatchInput<'_>,
+        verified_key: &AuthenticatedKey,
+        verified_identity_proof_kind: &str,
     ) -> Result<Option<SessionArchiveCorrelation>, AppError> {
         let row = sqlx::query(
             "SELECT c.tenant_id, c.disposition, c.key_id, c.principal_id, c.target_request_id, c.target_request_created_at, c.external_event_hash, c.record_digest, c.proof_digest, c.identity_proof_kind, c.identity_proof_digest, c.source_started_at, c.source_model, u.archive_request_id, k.account_id, k.alias, k.currency, k.credential_generation, k.policy_json FROM session_archive_correlations c JOIN tenants t ON t.id = c.tenant_id JOIN key_records k ON k.id = c.key_id AND k.tenant_id = c.tenant_id LEFT JOIN session_archive_unlinked_requests u ON u.tenant_id = c.tenant_id AND u.source = c.source AND u.external_request_id = c.external_request_id WHERE t.external_id = $1 AND c.source = $2 AND c.external_request_id = $3",
@@ -429,7 +493,10 @@ impl Database {
                         &expected_identity,
                     ],
                 );
-                if identity_proof_kind != "cpamp-exact-target-v1"
+                if verified_key.tenant_id != key.tenant_id
+                    || verified_key.key_id != key.key_id
+                    || verified_key.principal_id != key.principal_id
+                    || identity_proof_kind != "cpamp-exact-target-v1"
                     || identity_proof_digest != expected_identity
                     || correlation_proof_digest != expected_correlation
                 {
@@ -456,13 +523,6 @@ impl Database {
                 }))
             }
             "unlinked" => {
-                let (verified_key, expected_kind) = self
-                    .resolve_session_archive_identity(
-                        input.tenant_external_id,
-                        input.cpamp_source,
-                        input.source_key_hash,
-                    )
-                    .await?;
                 let expected_identity = archive_proof_digest(
                     "memeloop-session-archive-identity-v1",
                     &[
@@ -471,7 +531,7 @@ impl Database {
                         input.source_key_hash,
                         &key.key_id.to_string(),
                         &key.principal_id.to_string(),
-                        &expected_kind,
+                        verified_identity_proof_kind,
                     ],
                 );
                 let expected_correlation = archive_proof_digest(
@@ -496,9 +556,10 @@ impl Database {
                     row.try_get::<Option<String>, _>("archive_request_id")?
                         .ok_or(AppError::Internal)?,
                 )?;
-                if verified_key.key_id != key.key_id
+                if verified_key.tenant_id != key.tenant_id
+                    || verified_key.key_id != key.key_id
                     || verified_key.principal_id != key.principal_id
-                    || identity_proof_kind != expected_kind
+                    || identity_proof_kind != verified_identity_proof_kind
                     || identity_proof_digest != expected_identity
                     || correlation_proof_digest != expected_correlation
                     || archive_request_id != expected_request_id
@@ -704,6 +765,22 @@ fn archive_authenticated_key(row: &AnyRow) -> Result<AuthenticatedKey, AppError>
     })
 }
 
+fn ensure_archive_target_identity(
+    target: &SessionArchiveTarget,
+    verified_key: &AuthenticatedKey,
+) -> Result<(), AppError> {
+    if target.key.tenant_id == verified_key.tenant_id
+        && target.key.key_id == verified_key.key_id
+        && target.key.principal_id == verified_key.principal_id
+    {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "archive target does not match the proven caller identity".into(),
+        ))
+    }
+}
+
 fn archive_proof_digest(domain: &str, fields: &[&str]) -> String {
     let mut digest = Sha256::new();
     digest.update(domain.as_bytes());
@@ -737,6 +814,11 @@ fn deterministic_archive_request_id(
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
+}
+
+fn normalize_archive_source_key_hash(value: &str) -> Option<String> {
+    let value = value.strip_prefix("sha256:").unwrap_or(value);
+    is_sha256_hex(value).then(|| value.to_ascii_lowercase())
 }
 
 pub(crate) fn valid_archive_identifier(value: &str, max_bytes: usize) -> bool {

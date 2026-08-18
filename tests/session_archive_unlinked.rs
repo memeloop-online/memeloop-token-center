@@ -454,6 +454,51 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
         db.commit_session_archive_request(changed_replay).await,
         Err(AppError::BadRequest(_))
     ));
+
+    let conflicting_identity_request = Uuid::now_v7();
+    db.record_request_started(NewRequest {
+        request_id: conflicting_identity_request,
+        key_id: second_key.key_id,
+        tenant_id: second_key.tenant_id,
+        protocol: "openai-responses".into(),
+        model: "gpt-fixture".into(),
+        request_object: "gap://cpamp/conflicting-identity".into(),
+        reservation_id: Uuid::now_v7(),
+        upstream_account_id: None,
+        model_route_id: None,
+    })
+    .await
+    .expect("create conflicting identity target");
+    sqlx::query(
+        "INSERT INTO import_request_links (tenant_id, source, external_event_hash, external_request_id, source_key_hash, target_request_id, source_created_at, source_model, created_at) VALUES ($1, 'cpamp-usage-events-v1', $2, 'conflicting-identity', $3, $4, $5, 'gpt-fixture', $5)",
+    )
+    .bind(second_key.tenant_id.to_string())
+    .bind("5".repeat(64))
+    .bind(&source_key_hash)
+    .bind(conflicting_identity_request.to_string())
+    .bind(started_at)
+    .execute(&pool)
+    .await
+    .expect("insert conflicting identity proof");
+    let conflicting_record_digest = "6".repeat(64);
+    assert!(matches!(
+        db.correlate_session_archive_request(SessionArchiveMatchInput {
+            tenant_external_id: "archive-only-tenant",
+            cpamp_source: "cpamp-usage-events-v1",
+            archive_source: "credential-conflict-test",
+            external_request_id: "conflicting-identity",
+            started_at,
+            requested_model: Some("gpt-fixture"),
+            resolved_model: Some("gpt-fixture"),
+            source_key_hash: &source_key_hash,
+            input_tokens: None,
+            output_tokens: None,
+            record_digest: &conflicting_record_digest,
+            time_tolerance_ms: 5_000,
+        })
+        .await,
+        Err(AppError::BadRequest(_))
+    ));
 }
 
 #[tokio::test]
@@ -561,6 +606,71 @@ async fn postgres_archive_only_commit_and_conversation_union_use_native_types() 
     .execute(&pool)
     .await
     .expect("insert PostgreSQL CPAMP proof");
+    let second_cpamp_request_id = Uuid::now_v7();
+    db.record_request_started(NewRequest {
+        request_id: second_cpamp_request_id,
+        key_id: key.key_id,
+        tenant_id: key.tenant_id,
+        protocol: "openai-responses".into(),
+        model: "gpt-pg-archive".into(),
+        request_object: "gap://cpamp/postgres/ambiguous-request".into(),
+        reservation_id: Uuid::now_v7(),
+        upstream_account_id: None,
+        model_route_id: None,
+    })
+    .await
+    .expect("create second PostgreSQL CPAMP request");
+    sqlx::query(
+        "INSERT INTO import_request_links (tenant_id, source, external_event_hash, external_request_id, source_key_hash, target_request_id, source_created_at, source_model, created_at) VALUES ($1, 'cpamp-usage-events-v1', $2, 'pg8abcd0', $3, $4, $5, 'gpt-pg-archive', $5)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind("9".repeat(64))
+    .bind(&source_key_hash)
+    .bind(second_cpamp_request_id.to_string())
+    .bind(started_at)
+    .execute(&pool)
+    .await
+    .expect("insert second PostgreSQL CPAMP proof");
+
+    let ambiguous_record_digest = "a".repeat(64);
+    let ambiguous_archive_source = format!("{archive_source}-ambiguous");
+    let ambiguous = db
+        .correlate_session_archive_request(SessionArchiveMatchInput {
+            tenant_external_id: &tenant_external_id,
+            cpamp_source: "cpamp-usage-events-v1",
+            archive_source: &ambiguous_archive_source,
+            external_request_id: "pg8abcd0",
+            started_at,
+            requested_model: Some("gpt-pg-archive"),
+            resolved_model: Some("gpt-pg-archive"),
+            source_key_hash: &source_key_hash,
+            input_tokens: None,
+            output_tokens: None,
+            record_digest: &ambiguous_record_digest,
+            time_tolerance_ms: 5_000,
+        })
+        .await
+        .expect("PostgreSQL compatible ambiguity must become archive-only");
+    assert!(matches!(ambiguous, SessionArchiveCorrelation::Unlinked(_)));
+    let incompatible_archive_source = format!("{archive_source}-incompatible");
+    assert!(matches!(
+        db.correlate_session_archive_request(SessionArchiveMatchInput {
+            tenant_external_id: &tenant_external_id,
+            cpamp_source: "cpamp-usage-events-v1",
+            archive_source: &incompatible_archive_source,
+            external_request_id: "pg8abcd0",
+            started_at,
+            requested_model: Some("tampered-model"),
+            resolved_model: Some("tampered-model"),
+            source_key_hash: &source_key_hash,
+            input_tokens: None,
+            output_tokens: None,
+            record_digest: &ambiguous_record_digest,
+            time_tolerance_ms: 5_000,
+        })
+        .await,
+        Err(AppError::BadRequest(_))
+    ));
     let external_request_id = unique.to_string();
     let record_digest = "8".repeat(64);
     let correlation = db
@@ -650,5 +760,5 @@ async fn postgres_archive_only_commit_and_conversation_union_use_native_types() 
     .fetch_one(&pool)
     .await
     .expect("PostgreSQL archive counts");
-    assert_eq!(counts, (1, 1, 1));
+    assert_eq!(counts, (1, 1, 2));
 }

@@ -1196,7 +1196,7 @@ async fn match_record(
         started_at: record.started_at.timestamp_millis(),
         requested_model: nonempty(&record.requested_model),
         resolved_model: nonempty(&record.model),
-        source_key_hash,
+        source_key_hash: &source_key_hash,
         input_tokens: None,
         output_tokens: None,
         record_digest,
@@ -1284,21 +1284,32 @@ fn archive_record_inside_overlap(record: &ArchiveRecord, lower_bound: i64) -> bo
     started_at >= lower_bound || completed_at >= lower_bound
 }
 
-fn archived_credential_hash(record: &ArchiveRecord) -> Result<&str, AppError> {
-    let value = match record.schema_version {
-        1 => nonempty(&record.key_id),
-        2 => nonempty(&record.credential_hash).or_else(|| nonempty(&record.key_id)),
+fn archived_credential_hash(record: &ArchiveRecord) -> Result<String, AppError> {
+    let normalized = match record.schema_version {
+        // Schema 1 defines key_id itself as the legacy bare digest.  Do not
+        // broaden that older envelope by interpreting labels or prefixes.
+        1 => nonempty(&record.key_id).and_then(normalize_bare_sha256),
+        2 => match nonempty(&record.credential_hash) {
+            // An explicit schema-2 field is authoritative: malformed data must
+            // not fall back to key_id.  Only the specified sha256 prefix is
+            // stripped, and the digest is canonicalized for proof stability.
+            Some(value) => normalize_schema_v2_sha256(value),
+            None => nonempty(&record.key_id).and_then(normalize_bare_sha256),
+        },
         _ => None,
-    }
-    .ok_or_else(|| {
+    };
+    normalized.ok_or_else(|| {
         AppError::BadRequest("archive request has no verified credential hash".into())
-    })?;
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(AppError::BadRequest(
-            "archive request has no verified credential hash".into(),
-        ));
-    }
-    Ok(value)
+    })
+}
+
+fn normalize_bare_sha256(value: &str) -> Option<String> {
+    (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| value.to_ascii_lowercase())
+}
+
+fn normalize_schema_v2_sha256(value: &str) -> Option<String> {
+    normalize_bare_sha256(value.strip_prefix("sha256:").unwrap_or(value))
 }
 
 fn payload_bytes(value: &Value) -> Result<Option<Vec<u8>>, serde_json::Error> {
@@ -1496,10 +1507,27 @@ mod tests {
             "started_at": "2026-08-12T00:00:00Z",
             "completed_at": "2026-08-12T00:00:01Z",
             "key_id": "a".repeat(64),
-            "credential_hash": "b".repeat(64)
+            "credential_hash": "b".repeat(64),
+            "principal_id": "untrusted-source-principal"
         }))
         .expect("schema-v2 fixture");
         assert_eq!(archived_credential_hash(&v2).unwrap(), "b".repeat(64));
+
+        let v2_prefixed: ArchiveRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "session_id": "s",
+            "request_id": "r",
+            "started_at": "2026-08-12T00:00:00Z",
+            "completed_at": "2026-08-12T00:00:01Z",
+            "key_id": "human-label",
+            "principal_id": "another-untrusted-source-principal",
+            "credential_hash": format!("sha256:{}", "A".repeat(64))
+        }))
+        .expect("prefixed schema-v2 fixture");
+        assert_eq!(
+            archived_credential_hash(&v2_prefixed).unwrap(),
+            "a".repeat(64)
+        );
 
         let v2_legacy_fallback: ArchiveRecord = serde_json::from_value(serde_json::json!({
             "schema_version": 2,
@@ -1526,6 +1554,18 @@ mod tests {
         }))
         .expect("schema-v2 invalid explicit fixture");
         assert!(archived_credential_hash(&v2_invalid_explicit).is_err());
+
+        let v2_unknown_prefix: ArchiveRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "session_id": "s",
+            "request_id": "r",
+            "started_at": "2026-08-12T00:00:00Z",
+            "completed_at": "2026-08-12T00:00:01Z",
+            "key_id": "c".repeat(64),
+            "credential_hash": format!("SHA256:{}", "d".repeat(64))
+        }))
+        .expect("unknown prefix schema-v2 fixture");
+        assert!(archived_credential_hash(&v2_unknown_prefix).is_err());
 
         let invalid_v1: ArchiveRecord = serde_json::from_value(serde_json::json!({
             "schema_version": 1,

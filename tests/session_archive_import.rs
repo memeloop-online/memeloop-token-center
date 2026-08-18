@@ -5,7 +5,8 @@ use memeloop_token_center::{
     config::Config,
     conversation::ConversationHints,
     db::{
-        CreateKeyInput, Database, NewRequest, SessionArchiveCommitInput, SessionArchiveMatchInput,
+        CreateKeyInput, Database, NewRequest, SessionArchiveCommitInput, SessionArchiveCorrelation,
+        SessionArchiveMatchInput,
     },
     error::AppError,
     model::KeyPolicy,
@@ -459,6 +460,7 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
         3,
     )
     .await;
+    let ambiguity_record_digest = "4".repeat(64);
     let match_input = |input_tokens, output_tokens| SessionArchiveMatchInput {
         tenant_external_id: "archive-fixture",
         cpamp_source: "cpamp-usage-events-v1",
@@ -470,12 +472,53 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
         source_key_hash: &source_key_hash,
         input_tokens,
         output_tokens,
-        record_digest: "token-disambiguation-record",
+        record_digest: &ambiguity_record_digest,
         time_tolerance_ms: 0,
     };
     db.match_session_archive_request(match_input(None, None))
         .await
         .expect_err("multiple exact coordinates without archive usage must fail closed");
+    let prefixed_source_key_hash = format!("sha256:{}", source_key_hash.to_ascii_uppercase());
+    let ambiguous = db
+        .correlate_session_archive_request(SessionArchiveMatchInput {
+            tenant_external_id: "archive-fixture",
+            cpamp_source: "cpamp-usage-events-v1",
+            archive_source: "ambiguous-target-test",
+            external_request_id: source_request_id,
+            started_at,
+            requested_model: Some("gpt-fixture"),
+            resolved_model: Some("gpt-fixture"),
+            source_key_hash: &prefixed_source_key_hash,
+            input_tokens: None,
+            output_tokens: None,
+            record_digest: &ambiguity_record_digest,
+            time_tolerance_ms: 0,
+        })
+        .await
+        .expect("multiple compatible targets must become archive-only");
+    let SessionArchiveCorrelation::Unlinked(ambiguous_target) = ambiguous else {
+        panic!("an ambiguous edge must never select an exact target");
+    };
+    assert_eq!(ambiguous_target.key.key_id, key.key_id);
+    assert_eq!(ambiguous_target.key.principal_id, key.principal_id);
+    assert!(matches!(
+        db.correlate_session_archive_request(SessionArchiveMatchInput {
+            tenant_external_id: "archive-fixture",
+            cpamp_source: "cpamp-usage-events-v1",
+            archive_source: "incompatible-target-test",
+            external_request_id: source_request_id,
+            started_at,
+            requested_model: Some("tampered-model"),
+            resolved_model: Some("tampered-model"),
+            source_key_hash: &source_key_hash,
+            input_tokens: None,
+            output_tokens: None,
+            record_digest: &ambiguity_record_digest,
+            time_tolerance_ms: 0,
+        })
+        .await,
+        Err(AppError::BadRequest(_))
+    ));
     let usage_match = db
         .match_session_archive_request(match_input(Some(7), Some(3)))
         .await
