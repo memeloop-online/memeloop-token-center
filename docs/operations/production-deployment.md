@@ -222,9 +222,10 @@ objects under `staging/`: successfully bound request, response, result, and asse
 locators intentionally remain in that namespace for their full retention life.
 The fenced archive reaper removes only unreferenced typed attempt segments.
 
-Archive download rate limiting belongs at Higress. Do not add an application
-download limiter to compensate for a missing gateway policy; validate the
-Higress route policy and its client-facing rejection behavior before cutover.
+Optional archive download rate, bandwidth and connection limits belong at
+Higress. Do not add an application download limiter to compensate for a missing
+gateway policy. Operators that need those limits configure and validate them at
+the Kubernetes edge; they are not a Token Center release or cutover gate.
 
 The Helm schema accepts only `config.archiveBackend=s3`. Although the binary's
 filesystem and memory implementations remain useful for isolated tests, the
