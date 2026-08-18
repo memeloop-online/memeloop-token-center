@@ -73,6 +73,10 @@ jobs:
             --ignore RUSTSEC-2026-0235
       - name: Install PostgreSQL and SQLite migration clients
         run: sudo apt-get update && sudo apt-get install --yes postgresql-client sqlite3
+      - name: Run legacy credential operator failure-mode acceptance
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 tests/ops/test_legacy_credentials_bulk.py
       - name: Run isolated legacy credential PostgreSQL operator acceptance
         id: isolated_legacy_pg
         env:

@@ -350,8 +350,8 @@ class LegacyCredentialBulkTests(unittest.TestCase):
                         fake_psql.write_text(
                             "#!/usr/bin/env python3\n"
                             "import json, os, pathlib, sys, time\n"
-                            "script = sys.stdin.read()\n"
-                            "for line in script.splitlines():\n"
+                            "stop = pathlib.Path(os.environ['FAKE_PSQL_STOP'])\n"
+                            "for line in sys.stdin:\n"
                             "    if 'pg_try_advisory_lock' in line:\n"
                             "        print('1', flush=True)\n"
                             "    elif line.startswith('SELECT json_build_array'):\n"
@@ -359,14 +359,13 @@ class LegacyCredentialBulkTests(unittest.TestCase):
                             "            print(json.dumps(row, separators=(',', ':')), flush=True)\n"
                             "    elif line.startswith('\\\\echo __MTC_LEGACY_IDENTITIES_END__'):\n"
                             "        print('__MTC_LEGACY_IDENTITIES_END__', flush=True)\n"
-                            "stop = pathlib.Path(os.environ['FAKE_PSQL_STOP'])\n"
-                            "while not stop.exists():\n"
-                            "    print('__MTC_LEGACY_IDENTITY_HEARTBEAT__', flush=True)\n"
-                            "    time.sleep(0.01)\n"
-                            "if os.environ['FAKE_PSQL_BEHAVIOR'] == 'exit':\n"
-                            "    raise SystemExit(2)\n"
-                            "while True:\n"
-                            "    time.sleep(60)\n"
+                            "    elif '__MTC_LEGACY_IDENTITY_HEARTBEAT__' in line:\n"
+                            "        if stop.exists():\n"
+                            "            if os.environ['FAKE_PSQL_BEHAVIOR'] == 'exit':\n"
+                            "                raise SystemExit(2)\n"
+                            "            while True:\n"
+                            "                time.sleep(60)\n"
+                            "        print('__MTC_LEGACY_IDENTITY_HEARTBEAT__', flush=True)\n"
                         )
                         fake_psql.chmod(0o500)
                         candidate_file = root / "api-keys.json"
@@ -433,16 +432,18 @@ class LegacyCredentialBulkTests(unittest.TestCase):
                 rows_file = FIXTURES / "cpamp-identities.csv"
                 fake_psql.write_text(
                     "#!/usr/bin/env python3\n"
-                    "import csv, json, os, pathlib, signal, sys, time\n"
-                    "script = sys.stdin.read()\n"
-                    "with pathlib.Path(os.environ['FAKE_PSQL_SCRIPT_LOG']).open('a') as output:\n"
-                    "    output.write(script + '\\0')\n"
+                    "import csv, json, os, pathlib, signal, sys\n"
+                    "script_log = pathlib.Path(os.environ['FAKE_PSQL_SCRIPT_LOG'])\n"
                     "def terminate(_signal, _frame):\n"
+                    "    with script_log.open('a') as output:\n"
+                    "        output.write('\\0')\n"
                     "    with pathlib.Path(os.environ['FAKE_PSQL_CLOSE_LOG']).open('a') as output:\n"
                     "        output.write('closed\\n')\n"
                     "    raise SystemExit(0)\n"
                     "signal.signal(signal.SIGTERM, terminate)\n"
-                    "for line in script.splitlines():\n"
+                    "for line in sys.stdin:\n"
+                    "    with script_log.open('a') as output:\n"
+                    "        output.write(line)\n"
                     "    if 'pg_try_advisory_lock' in line:\n"
                     "        print('1', flush=True)\n"
                     "    elif line.startswith('SELECT json_build_array'):\n"
@@ -451,9 +452,8 @@ class LegacyCredentialBulkTests(unittest.TestCase):
                     "            print(json.dumps(row, separators=(',', ':')), flush=True)\n"
                     "    elif line.startswith('\\\\echo __MTC_LEGACY_IDENTITIES_END__'):\n"
                     "        print('__MTC_LEGACY_IDENTITIES_END__', flush=True)\n"
-                    "while True:\n"
-                    "    print('__MTC_LEGACY_IDENTITY_HEARTBEAT__', flush=True)\n"
-                    "    time.sleep(0.01)\n"
+                    "    elif '__MTC_LEGACY_IDENTITY_HEARTBEAT__' in line:\n"
+                    "        print('__MTC_LEGACY_IDENTITY_HEARTBEAT__', flush=True)\n"
                 )
                 fake_psql.chmod(0o500)
                 service_token_file = root / "service-token"
@@ -525,17 +525,18 @@ class LegacyCredentialBulkTests(unittest.TestCase):
                 scripts = script_log.read_text().split("\0")[:-1]
                 self.assertEqual(len(scripts), 3)
                 self.assertEqual(close_log.read_text().splitlines(), ["closed"] * 3)
-                for script in scripts:
+                for index, script in enumerate(scripts):
                     self.assertEqual(script.count("pg_try_advisory_lock"), 1)
                     self.assertEqual(script.count("SELECT json_build_array"), 1)
                     self.assertEqual(script.count(legacy_import.IDENTITIES_END), 1)
-                    self.assertEqual(script.count(legacy_import.IDENTITY_HEARTBEAT), 1)
-                    self.assertTrue(
-                        script.endswith(
-                            "SELECT '__MTC_LEGACY_IDENTITY_HEARTBEAT__';\n"
-                            "\\watch 0.2\n"
-                        )
+                    self.assertEqual(
+                        script.count(legacy_import.IDENTITY_HEARTBEAT),
+                        1 if index == 0 else 5,
                     )
+                    self.assertTrue(
+                        script.endswith("SELECT '__MTC_LEGACY_IDENTITY_HEARTBEAT__';\n")
+                    )
+                    self.assertNotIn("\\watch", script)
                     self.assertNotIn("pg_advisory_unlock", script)
                     self.assertNotIn("\\quit", script)
                 combined_output = "".join(

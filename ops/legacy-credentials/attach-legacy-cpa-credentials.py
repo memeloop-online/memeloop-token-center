@@ -302,10 +302,7 @@ class PsqlIdentitySession:
                 ") mappings "
                 "ORDER BY kind, source_hash, key_id;\n"
                 f"\\echo {IDENTITIES_END}\n"
-                f"SELECT '{IDENTITY_HEARTBEAT}';\n"
-                "\\watch 0.2\n"
             )
-            self.process.stdin.close()
             lock_result = self._read_identity_line()
         except (ImportFailure, OSError) as error:
             self.close()
@@ -451,28 +448,17 @@ class PsqlIdentitySession:
 
     def confirm_heartbeat(self) -> None:
         """Confirm a fresh server round-trip on the session that owns the lock."""
-        while True:
-            try:
-                line = self._readline(0.0)
-            except TimeoutError:
-                break
-            if line != IDENTITY_HEARTBEAT:
-                raise ImportFailure("PostgreSQL identity heartbeat output is invalid")
-        # At most one PostgreSQL query can already be in flight after the pipe was
-        # drained. Requiring two new results proves a round-trip began after this check.
-        for _ in range(2):
-            try:
-                line = self._readline(HEARTBEAT_TIMEOUT_SECONDS)
-            except TimeoutError as error:
-                return_code = self.process.poll()
-                if return_code is not None:
-                    self._finish_pipes()
-                    raise ImportFailure(
-                        self._closed_output_message(return_code)
-                    ) from error
-                raise ImportFailure("PostgreSQL identity heartbeat timed out") from error
-            if line != IDENTITY_HEARTBEAT:
-                raise ImportFailure("PostgreSQL identity heartbeat output is invalid")
+        self._write(f"SELECT '{IDENTITY_HEARTBEAT}';\n")
+        try:
+            line = self._readline(HEARTBEAT_TIMEOUT_SECONDS)
+        except TimeoutError as error:
+            return_code = self.process.poll()
+            if return_code is not None:
+                self._finish_pipes()
+                raise ImportFailure(self._closed_output_message(return_code)) from error
+            raise ImportFailure("PostgreSQL identity heartbeat timed out") from error
+        if line != IDENTITY_HEARTBEAT:
+            raise ImportFailure("PostgreSQL identity heartbeat output is invalid")
 
     def close(self) -> None:
         if not hasattr(self, "process") or self._closed:
