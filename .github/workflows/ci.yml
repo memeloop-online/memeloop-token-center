@@ -33,6 +33,15 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
+    # Wasmtime plus every integration-test binary can exhaust the hosted
+    # runner while lld mmaps debug sections. CI does not consume test debug
+    # symbols, so keep the release gate deterministic and bounded without
+    # changing assertions, features, targets, or test coverage.
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     services:
       postgres:
         image: postgres:16-alpine
