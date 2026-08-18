@@ -3521,7 +3521,12 @@ async fn prepare_authorization_matrix(world: &mut TokenCenterWorld) {
             .send()
             .await
             .expect("send authorization-matrix model request");
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
+        let _ = response
+            .bytes()
+            .await
+            .expect("consume authorization-matrix model response");
+        assert_eq!(status, StatusCode::OK);
     }
     world.matrix_first_request_id = Some(matrix_request_id(world, "matrix-first").await);
     world.matrix_second_request_id = Some(matrix_request_id(world, "matrix-second").await);

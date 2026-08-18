@@ -639,6 +639,36 @@ async fn authentication_precedes_body_parsing(world: &mut TokenCenterWorld) {
     }
 }
 
+async fn wait_for_own_conversation_cluster(world: &TokenCenterWorld, key: &str) -> String {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let response = world
+            .client
+            .get(format!("{}/self/v1/conversations", world.service_url))
+            .bearer_auth(key)
+            .send()
+            .await
+            .expect("credential conversations");
+        assert_eq!(response.status(), StatusCode::OK);
+        let conversations = response
+            .json::<Value>()
+            .await
+            .expect("credential conversations JSON");
+        if let Some(cluster_id) = conversations
+            .as_array()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row["cluster_id"].as_str())
+        {
+            return cluster_id.to_owned();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "credential conversation finalization exceeded three seconds: {conversations}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 #[then("self-service object and filter access remains bound to the authenticated credential")]
 async fn self_service_idor_is_closed(world: &mut TokenCenterWorld) {
     let managed = world
@@ -684,21 +714,7 @@ async fn self_service_idor_is_closed(world: &mut TokenCenterWorld) {
         "self-service must ignore an attacker-controlled key_id and remain bound to the authenticated key"
     );
 
-    let second_conversations = world
-        .client
-        .get(format!("{}/self/v1/conversations", world.service_url))
-        .bearer_auth(&world.matrix_second_key)
-        .send()
-        .await
-        .expect("second credential conversations")
-        .json::<Value>()
-        .await
-        .expect("second credential conversations JSON");
-    let cluster_id = second_conversations
-        .as_array()
-        .and_then(|rows| rows.first())
-        .and_then(|row| row["cluster_id"].as_str())
-        .expect("second credential conversation cluster");
+    let cluster_id = wait_for_own_conversation_cluster(world, &world.matrix_second_key).await;
     let conversation_idor = world
         .client
         .get(format!(
