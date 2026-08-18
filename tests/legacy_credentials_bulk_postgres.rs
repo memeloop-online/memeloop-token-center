@@ -5,6 +5,7 @@ use std::{
     process::Command,
 };
 
+use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -21,7 +22,39 @@ async fn execute(pool: &PgPool, sql: &str) {
     sqlx::query(sql).execute(pool).await.unwrap();
 }
 
+fn decoded_url_component(value: &str, label: &str) -> String {
+    percent_decode_str(value)
+        .decode_utf8()
+        .unwrap_or_else(|_| panic!("MTC_TEST_POSTGRES_URL contains an invalid UTF-8 {label}"))
+        .into_owned()
+}
+
 fn importer_command(database_url: &str, schema: &str, input_file: &Path) -> Command {
+    let url = url::Url::parse(database_url)
+        .expect("MTC_TEST_POSTGRES_URL must be a valid PostgreSQL URL");
+    assert!(
+        matches!(url.scheme(), "postgres" | "postgresql"),
+        "MTC_TEST_POSTGRES_URL must use postgres:// or postgresql://"
+    );
+    assert!(
+        url.query().is_none() && url.fragment().is_none(),
+        "legacy credential PostgreSQL acceptance requires a URL without query or fragment"
+    );
+    let host = url
+        .host_str()
+        .expect("MTC_TEST_POSTGRES_URL must include a host");
+    let username = decoded_url_component(url.username(), "username");
+    assert!(
+        !username.is_empty(),
+        "MTC_TEST_POSTGRES_URL must include a username"
+    );
+    let password = decoded_url_component(url.password().unwrap_or_default(), "password");
+    let database = decoded_url_component(url.path().trim_start_matches('/'), "database name");
+    assert!(
+        !database.is_empty(),
+        "MTC_TEST_POSTGRES_URL must include a database name"
+    );
+
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut command = Command::new("python3");
     command
@@ -30,17 +63,66 @@ fn importer_command(database_url: &str, schema: &str, input_file: &Path) -> Comm
         .arg("--input-file")
         .arg(input_file)
         .env("PYTHONDONTWRITEBYTECODE", "1")
-        // libpq treats a URI in PGDATABASE as a connection string. Keeping it
-        // out of argv prevents test infrastructure credentials entering ps(1).
-        .env("PGDATABASE", database_url)
+        // libpq does not expand a URI supplied only through the PGDATABASE
+        // environment default. Keep credentials out of argv while giving psql
+        // the same discrete connection parameters as the production Job.
+        .env("PGHOST", host)
+        .env(
+            "PGPORT",
+            url.port_or_known_default().unwrap_or(5432).to_string(),
+        )
+        .env("PGUSER", username)
+        .env("PGPASSWORD", password)
+        .env("PGDATABASE", database)
         .env("PGOPTIONS", format!("-csearch_path={schema}"))
-        .env_remove("PGHOST")
-        .env_remove("PGPORT")
-        .env_remove("PGUSER")
-        .env_remove("PGPASSWORD")
         .env_remove("PGSERVICE")
         .env_remove("PGSERVICEFILE");
     command
+}
+
+#[test]
+fn importer_command_decodes_connection_fields_without_argv_secrets() {
+    let command = importer_command(
+        "postgres://fixture%40user:s3cr%25et@127.0.0.1:55432/db%2Dname",
+        "fixture_schema",
+        Path::new("/fixture/input.json"),
+    );
+    let environment = command
+        .get_envs()
+        .filter_map(|(key, value)| {
+            value.map(|value| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        environment.get("PGHOST").map(String::as_str),
+        Some("127.0.0.1")
+    );
+    assert_eq!(environment.get("PGPORT").map(String::as_str), Some("55432"));
+    assert_eq!(
+        environment.get("PGUSER").map(String::as_str),
+        Some("fixture@user")
+    );
+    assert_eq!(
+        environment.get("PGPASSWORD").map(String::as_str),
+        Some("s3cr%et")
+    );
+    assert_eq!(
+        environment.get("PGDATABASE").map(String::as_str),
+        Some("db-name")
+    );
+    let arguments = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(!arguments.contains("fixture@user"));
+    assert!(!arguments.contains("s3cr%et"));
+    assert!(!arguments.contains("postgres://"));
 }
 
 #[tokio::test]

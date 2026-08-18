@@ -2042,6 +2042,7 @@ dependencies = [
  "http",
  "mime_guess",
  "object_store",
+ "percent-encoding",
  "regex",
  "reqwest",
  "rust_decimal",
