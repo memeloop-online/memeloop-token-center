@@ -15,6 +15,7 @@ const SECOND_CREDENTIAL: &str = "fixture-only-cpa-claude-code-key-0002";
 const FIRST_KEY_ID: &str = "10000000-0000-4000-8000-000000000001";
 const SECOND_KEY_ID: &str = "20000000-0000-4000-8000-000000000002";
 const IDENTITIES_END: &str = "__MTC_LEGACY_IDENTITIES_END__";
+const CI_ISOLATED_OPT_OUT: &str = "MTC_CI_SKIP_ISOLATED_LEGACY_CREDENTIALS_POSTGRES";
 
 async fn execute(pool: &PgPool, sql: &str) {
     sqlx::query(sql).execute(pool).await.unwrap();
@@ -44,6 +45,15 @@ fn importer_command(database_url: &str, schema: &str, input_file: &Path) -> Comm
 
 #[tokio::test]
 async fn postgres_identity_query_is_locked_exact_and_rejects_revoked_mappings() {
+    // CI runs this binary once at a clean PostgreSQL boundary before the monolithic
+    // suite. Only that later CI step opts out; local/default MTC_TEST_POSTGRES_URL
+    // behavior remains unchanged.
+    if env::var("CI").as_deref() == Ok("true")
+        && env::var(CI_ISOLATED_OPT_OUT).as_deref() == Ok("1")
+    {
+        eprintln!("skipping legacy credential PostgreSQL acceptance already run in isolation");
+        return;
+    }
     let Ok(database_url) = env::var("MTC_TEST_POSTGRES_URL") else {
         eprintln!("MTC_TEST_POSTGRES_URL is unset; skipping PostgreSQL operator acceptance");
         return;

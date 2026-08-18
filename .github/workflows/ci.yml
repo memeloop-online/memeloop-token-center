@@ -73,6 +73,37 @@ jobs:
             --ignore RUSTSEC-2026-0235
       - name: Install PostgreSQL and SQLite migration clients
         run: sudo apt-get update && sudo apt-get install --yes postgresql-client sqlite3
+      - name: Run isolated legacy credential PostgreSQL operator acceptance
+        id: isolated_legacy_pg
+        env:
+          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+        run: |
+          psql --version
+          cargo test --locked --test legacy_credentials_bulk_postgres -- \
+            --exact postgres_identity_query_is_locked_exact_and_rejects_revoked_mappings \
+            --nocapture
+      - name: Diagnose isolated PostgreSQL acceptance failure
+        if: failure() && steps.isolated_legacy_pg.outcome == 'failure'
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGDATABASE: memeloop_token_center_test
+          PGUSER: token_center
+          PGPASSWORD: token_center
+        run: |
+          # Emit only aggregate/test-service state; never query statement text or rows.
+          psql -X -qAt --no-password <<'SQL' || true
+          SELECT current_setting('server_version');
+          SELECT application_name, state, COALESCE(wait_event_type, ''),
+                 COALESCE(wait_event, ''), count(*)
+            FROM pg_stat_activity
+           WHERE datname = current_database()
+           GROUP BY application_name, state, wait_event_type, wait_event
+           ORDER BY application_name, state, wait_event_type, wait_event;
+          SQL
+          docker logs "${{ job.services.postgres.id }}" 2>&1 \
+            | grep -E 'database system is|ready to accept|checkpoint|FATAL:|PANIC:|terminating connection|unexpected EOF|could not receive data' \
+            | tail -n 200 || true
       - name: Start MinIO and create integration-test bucket
         run: |
           # Rust/Wasmtime debug artifacts can leave a hosted runner below
@@ -106,6 +137,9 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets --all-features
         env:
+          # This binary already ran above against the clean service boundary. Keep all
+          # other PostgreSQL integration tests enabled in the monolithic suite.
+          MTC_CI_SKIP_ISOLATED_LEGACY_CREDENTIALS_POSTGRES: "1"
           MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
           MTC_TEST_S3_ENDPOINT: http://127.0.0.1:9000
           MTC_TEST_S3_BUCKET: memeloop-token-center-test
