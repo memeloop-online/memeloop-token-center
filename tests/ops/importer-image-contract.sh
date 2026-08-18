@@ -187,4 +187,18 @@ if grep -Eq '^[[:space:]]*-[[:space:]]*name:[[:space:]]*PGPASSWORD[[:space:]]*$'
   exit 1
 fi
 
-echo 'Importer image and legacy credential Job contract OK'
+cpamp_job="$repository/ops/kubernetes/cpamp-import-job.yaml"
+grep -Fq 'image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center-importer@sha256:REPLACE_DIGEST' "$cpamp_job"
+grep -Fq 'automountServiceAccountToken: false' "$cpamp_job"
+grep -Fq 'readOnlyRootFilesystem: true' "$cpamp_job"
+grep -Fq 'allowPrivilegeEscalation: false' "$cpamp_job"
+grep -Fq 'runAsUser: 10001' "$cpamp_job"
+grep -Fq 'readOnly: true' "$cpamp_job"
+grep -Fq 'name: CPAMP_RESET_IMPORT' "$cpamp_job"
+grep -A1 -F 'name: CPAMP_RESET_IMPORT' "$cpamp_job" | grep -Fq 'value: "false"'
+if grep -Eq 'image:[[:space:]]+[^[:space:]]+@sha256:[0-9a-f]{64}' "$cpamp_job"; then
+  echo 'checked-in CPAMP Job must use a release-time digest placeholder' >&2
+  exit 1
+fi
+
+echo 'Importer image and import Job contracts OK'
