@@ -6,12 +6,15 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 
 REPOSITORY = pathlib.Path(__file__).resolve().parents[2]
@@ -305,6 +308,112 @@ class LegacyCredentialBulkTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_apply_stops_after_holder_exits_or_stops_heartbeat(self) -> None:
+        credentials = legacy_import.parse_candidates(FixtureHandler.fixture, "cpa-json")
+        hashes = [hashlib.sha256(item.encode()).hexdigest() for item in credentials]
+        key_ids = [
+            "10000000-0000-4000-8000-000000000001",
+            "20000000-0000-4000-8000-000000000002",
+        ]
+        rows = json.dumps(
+            [
+                ["identity", hashes[0], key_ids[0]],
+                ["identity", hashes[1], key_ids[1]],
+            ],
+            separators=(",", ":"),
+        )
+        for behavior, expected_error in (
+            ("exit", "PostgreSQL identity connection was lost (psql status 2)"),
+            ("stall", "PostgreSQL identity heartbeat timed out"),
+        ):
+            with self.subTest(behavior=behavior):
+                state = TargetState()
+
+                class HolderLossHandler(FixtureHandler):
+                    holder_stop: pathlib.Path
+
+                    def do_POST(self) -> None:  # noqa: N802
+                        self.holder_stop.write_text("stop")
+                        time.sleep(0.1)
+                        super().do_POST()
+
+                HolderLossHandler.state = state
+                server = ThreadingHTTPServer(("127.0.0.1", 0), HolderLossHandler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = pathlib.Path(temporary)
+                        holder_stop = root / "stop-holder"
+                        HolderLossHandler.holder_stop = holder_stop
+                        fake_psql = root / "psql"
+                        fake_psql.write_text(
+                            "#!/usr/bin/env python3\n"
+                            "import json, os, pathlib, sys, time\n"
+                            "script = sys.stdin.read()\n"
+                            "for line in script.splitlines():\n"
+                            "    if 'pg_try_advisory_lock' in line:\n"
+                            "        print('1', flush=True)\n"
+                            "    elif line.startswith('SELECT json_build_array'):\n"
+                            "        for row in json.loads(os.environ['FAKE_PSQL_ROWS']):\n"
+                            "            print(json.dumps(row, separators=(',', ':')), flush=True)\n"
+                            "    elif line.startswith('\\\\echo __MTC_LEGACY_IDENTITIES_END__'):\n"
+                            "        print('__MTC_LEGACY_IDENTITIES_END__', flush=True)\n"
+                            "stop = pathlib.Path(os.environ['FAKE_PSQL_STOP'])\n"
+                            "while not stop.exists():\n"
+                            "    print('__MTC_LEGACY_IDENTITY_HEARTBEAT__', flush=True)\n"
+                            "    time.sleep(0.01)\n"
+                            "if os.environ['FAKE_PSQL_BEHAVIOR'] == 'exit':\n"
+                            "    raise SystemExit(2)\n"
+                            "while True:\n"
+                            "    time.sleep(60)\n"
+                        )
+                        fake_psql.chmod(0o500)
+                        candidate_file = root / "api-keys.json"
+                        candidate_file.write_bytes(FixtureHandler.fixture)
+                        candidate_file.chmod(0o400)
+                        token_file = root / "service-token"
+                        token_file.write_text("fixture-service-token\n")
+                        token_file.chmod(0o400)
+                        arguments = legacy_import.argument_parser().parse_args(
+                            [
+                                "--tenant-external-id",
+                                "fixture-tenant",
+                                "--input-file",
+                                str(candidate_file),
+                                "--psql-binary",
+                                str(fake_psql),
+                                "--apply",
+                                "--target-api-base-url",
+                                f"http://127.0.0.1:{server.server_port}",
+                                "--allow-http-target",
+                                "--service-token-file",
+                                str(token_file),
+                            ]
+                        )
+                        environment = {
+                            "FAKE_PSQL_ROWS": rows,
+                            "FAKE_PSQL_STOP": str(holder_stop),
+                            "FAKE_PSQL_BEHAVIOR": behavior,
+                        }
+                        with (
+                            mock.patch.dict(os.environ, environment),
+                            mock.patch.object(
+                                legacy_import, "HEARTBEAT_TIMEOUT_SECONDS", 0.2
+                            ),
+                            self.assertRaisesRegex(
+                                legacy_import.ImportFailure, re.escape(expected_error)
+                            ) as failure,
+                        ):
+                            legacy_import.run(arguments)
+                    self.assertEqual(state.post_count, 1)
+                    for forbidden in credentials + hashes + key_ids:
+                        self.assertNotIn(forbidden, str(failure.exception))
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join()
+
     def test_cli_defaults_to_dry_run_then_apply_replays_without_secret_output(self) -> None:
         state = TargetState()
         FixtureHandler.state = state
@@ -324,8 +433,16 @@ class LegacyCredentialBulkTests(unittest.TestCase):
                 rows_file = FIXTURES / "cpamp-identities.csv"
                 fake_psql.write_text(
                     "#!/usr/bin/env python3\n"
-                    "import csv, json, os, pathlib, sys\n"
-                    "for line in sys.stdin:\n"
+                    "import csv, json, os, pathlib, signal, sys, time\n"
+                    "script = sys.stdin.read()\n"
+                    "with pathlib.Path(os.environ['FAKE_PSQL_SCRIPT_LOG']).open('a') as output:\n"
+                    "    output.write(script + '\\0')\n"
+                    "def terminate(_signal, _frame):\n"
+                    "    with pathlib.Path(os.environ['FAKE_PSQL_CLOSE_LOG']).open('a') as output:\n"
+                    "        output.write('closed\\n')\n"
+                    "    raise SystemExit(0)\n"
+                    "signal.signal(signal.SIGTERM, terminate)\n"
+                    "for line in script.splitlines():\n"
                     "    if 'pg_try_advisory_lock' in line:\n"
                     "        print('1', flush=True)\n"
                     "    elif line.startswith('SELECT json_build_array'):\n"
@@ -334,8 +451,9 @@ class LegacyCredentialBulkTests(unittest.TestCase):
                     "            print(json.dumps(row, separators=(',', ':')), flush=True)\n"
                     "    elif line.startswith('\\\\echo __MTC_LEGACY_IDENTITIES_END__'):\n"
                     "        print('__MTC_LEGACY_IDENTITIES_END__', flush=True)\n"
-                    "    elif line.startswith('\\\\quit'):\n"
-                    "        break\n"
+                    "while True:\n"
+                    "    print('__MTC_LEGACY_IDENTITY_HEARTBEAT__', flush=True)\n"
+                    "    time.sleep(0.01)\n"
                 )
                 fake_psql.chmod(0o500)
                 service_token_file = root / "service-token"
@@ -356,6 +474,10 @@ class LegacyCredentialBulkTests(unittest.TestCase):
                 ]
                 environment = os.environ.copy()
                 environment["FAKE_PSQL_ROWS"] = str(rows_file)
+                script_log = root / "psql-scripts"
+                close_log = root / "psql-closes"
+                environment["FAKE_PSQL_SCRIPT_LOG"] = str(script_log)
+                environment["FAKE_PSQL_CLOSE_LOG"] = str(close_log)
                 dry_run = subprocess.run(
                     common,
                     check=False,
@@ -400,6 +522,22 @@ class LegacyCredentialBulkTests(unittest.TestCase):
                 self.assertEqual(first_apply.stdout, second_apply.stdout)
                 self.assertEqual(state.post_count, 4)
                 self.assertEqual(len(state.mappings), 2)
+                scripts = script_log.read_text().split("\0")[:-1]
+                self.assertEqual(len(scripts), 3)
+                self.assertEqual(close_log.read_text().splitlines(), ["closed"] * 3)
+                for script in scripts:
+                    self.assertEqual(script.count("pg_try_advisory_lock"), 1)
+                    self.assertEqual(script.count("SELECT json_build_array"), 1)
+                    self.assertEqual(script.count(legacy_import.IDENTITIES_END), 1)
+                    self.assertEqual(script.count(legacy_import.IDENTITY_HEARTBEAT), 1)
+                    self.assertTrue(
+                        script.endswith(
+                            "SELECT '__MTC_LEGACY_IDENTITY_HEARTBEAT__';\n"
+                            "\\watch 0.2\n"
+                        )
+                    )
+                    self.assertNotIn("pg_advisory_unlock", script)
+                    self.assertNotIn("\\quit", script)
                 combined_output = "".join(
                     (
                         dry_run.stdout,

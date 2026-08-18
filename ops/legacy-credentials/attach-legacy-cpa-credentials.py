@@ -15,11 +15,13 @@ import os
 import pathlib
 import re
 import resource
+import select
 import ssl
 import stat
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,11 +37,11 @@ LOCK_SQL = (
     "pg_try_advisory_lock(hashtextextended("
     "'memeloop-token-center:legacy-cpa-credentials', 734627102948314))"
 )
-UNLOCK_SQL = (
-    "pg_advisory_unlock(hashtextextended("
-    "'memeloop-token-center:legacy-cpa-credentials', 734627102948314))"
-)
 IDENTITIES_END = "__MTC_LEGACY_IDENTITIES_END__"
+IDENTITY_HEARTBEAT = "__MTC_LEGACY_IDENTITY_HEARTBEAT__"
+MAPPING_TIMEOUT_SECONDS = 30.0
+HEARTBEAT_TIMEOUT_SECONDS = 5.0
+MAX_PSQL_LINE_BYTES = 4 * 1024 * 1024
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 TENANT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 
@@ -264,10 +266,7 @@ class PsqlIdentitySession:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="strict",
-                bufsize=1,
+                bufsize=0,
                 env=psql_environment,
             )
         except OSError as error:
@@ -275,14 +274,44 @@ class PsqlIdentitySession:
         if self.process.stdin is None or self.process.stdout is None or self.process.stderr is None:
             self.process.kill()
             raise ImportFailure("psql pipes could not be created")
+        self._stdout_buffer = bytearray()
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thread.start()
         try:
-            self._write(f"SELECT CASE WHEN {LOCK_SQL} THEN '1' ELSE '0' END;\n")
-            lock_result = self._readline()
-        except ImportFailure:
+            self._write(
+                f"SELECT CASE WHEN {LOCK_SQL} THEN '1' ELSE '0' END;\n"
+                "SELECT json_build_array(kind, source_hash, key_id)::text "
+                "FROM ("
+                "SELECT 'identity' AS kind, lower(i.api_key_hash) AS source_hash, "
+                "i.key_id AS key_id "
+                "FROM cpamp_import_identities i "
+                "JOIN key_records k ON k.id = i.key_id AND k.status = 'active' "
+                "JOIN tenants t ON t.id = k.tenant_id "
+                "WHERE t.external_id = :'tenant_external_id' "
+                "UNION ALL "
+                "SELECT CASE WHEN c.revoked_at IS NULL THEN 'existing' ELSE 'revoked' END "
+                "AS kind, lower(c.source_hash) AS source_hash, c.key_id AS key_id "
+                "FROM legacy_key_credentials c "
+                "WHERE EXISTS ("
+                "SELECT 1 FROM cpamp_import_identities i "
+                "JOIN key_records k ON k.id = i.key_id "
+                "JOIN tenants t ON t.id = k.tenant_id "
+                "WHERE t.external_id = :'tenant_external_id' "
+                "AND (lower(c.source_hash) = lower(i.api_key_hash) OR c.key_id = i.key_id)"
+                ") "
+                ") mappings "
+                "ORDER BY kind, source_hash, key_id;\n"
+                f"\\echo {IDENTITIES_END}\n"
+                f"SELECT '{IDENTITY_HEARTBEAT}';\n"
+                "\\watch 0.2\n"
+            )
+            self.process.stdin.close()
+            lock_result = self._read_identity_line()
+        except (ImportFailure, OSError) as error:
             self.close()
-            raise
+            if isinstance(error, ImportFailure):
+                raise
+            raise ImportFailure("PostgreSQL identity session ended unexpectedly") from error
         if lock_result != "1":
             self.close()
             raise ImportFailure("another legacy credential import holds the advisory lock")
@@ -291,13 +320,13 @@ class PsqlIdentitySession:
         assert self.process.stderr is not None
         # stderr can contain connection settings or database-provided text. Drain it so
         # psql cannot block, but never decode, retain, or echo it.
-        while self.process.stderr.buffer.read(4096):
+        while self.process.stderr.read(4096):
             pass
 
     def _write(self, value: str) -> None:
         assert self.process.stdin is not None
         try:
-            self.process.stdin.write(value)
+            self.process.stdin.write(value.encode("utf-8"))
             self.process.stdin.flush()
         except (BrokenPipeError, OSError, ValueError) as error:
             raise ImportFailure("PostgreSQL identity session ended unexpectedly") from error
@@ -348,47 +377,53 @@ class PsqlIdentitySession:
             return f"psql was terminated by signal {-return_code} during the identity query"
         return f"psql exited unexpectedly during the identity query (status {return_code})"
 
-    def _readline(self) -> str:
+    def _readline(self, timeout: float | None = None) -> str:
         assert self.process.stdout is not None
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while b"\n" not in self._stdout_buffer:
+            remaining = None
+            if deadline is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+            try:
+                readable, _, _ = select.select(
+                    [self.process.stdout.fileno()], [], [], remaining
+                )
+            except (OSError, ValueError) as error:
+                raise ImportFailure("PostgreSQL identity output is invalid") from error
+            if not readable:
+                raise TimeoutError
+            try:
+                chunk = os.read(self.process.stdout.fileno(), 4096)
+            except OSError as error:
+                raise ImportFailure("PostgreSQL identity output is invalid") from error
+            if not chunk:
+                return_code = self._finish_after_output_eof()
+                raise ImportFailure(self._closed_output_message(return_code))
+            self._stdout_buffer.extend(chunk)
+            if len(self._stdout_buffer) > MAX_PSQL_LINE_BYTES:
+                raise ImportFailure("PostgreSQL identity output is invalid")
+        newline = self._stdout_buffer.index(b"\n")
+        raw = bytes(self._stdout_buffer[:newline])
+        del self._stdout_buffer[: newline + 1]
+        if raw.endswith(b"\r"):
+            raw = raw[:-1]
         try:
-            value = self.process.stdout.readline()
-        except (OSError, UnicodeError) as error:
+            return raw.decode("utf-8", errors="strict")
+        except UnicodeError as error:
             raise ImportFailure("PostgreSQL identity output is invalid") from error
-        if value == "":
-            return_code = self._finish_after_output_eof()
-            raise ImportFailure(self._closed_output_message(return_code))
-        return value.rstrip("\r\n")
+
+    def _read_identity_line(self) -> str:
+        try:
+            return self._readline(MAPPING_TIMEOUT_SECONDS)
+        except TimeoutError as error:
+            raise ImportFailure("PostgreSQL identity query timed out") from error
 
     def mappings(self) -> tuple[list[Identity], list[Identity], list[Identity]]:
-        self._write(
-            "SELECT json_build_array(kind, source_hash, key_id)::text "
-            "FROM ("
-            "SELECT 'identity' AS kind, lower(i.api_key_hash) AS source_hash, "
-            "i.key_id AS key_id "
-            "FROM cpamp_import_identities i "
-            "JOIN key_records k ON k.id = i.key_id AND k.status = 'active' "
-            "JOIN tenants t ON t.id = k.tenant_id "
-            "WHERE t.external_id = :'tenant_external_id' "
-            "UNION ALL "
-            "SELECT CASE WHEN c.revoked_at IS NULL THEN 'existing' ELSE 'revoked' END "
-            "AS kind, lower(c.source_hash) AS source_hash, c.key_id AS key_id "
-            "FROM legacy_key_credentials c "
-            "WHERE EXISTS ("
-            "SELECT 1 FROM cpamp_import_identities i "
-            "JOIN key_records k ON k.id = i.key_id "
-            "JOIN tenants t ON t.id = k.tenant_id "
-            "WHERE t.external_id = :'tenant_external_id' "
-            "AND (lower(c.source_hash) = lower(i.api_key_hash) OR c.key_id = i.key_id)"
-            ") "
-            ") mappings "
-            "ORDER BY kind, source_hash, key_id;\n"
-            f"\\echo {IDENTITIES_END}\n"
-        )
         identities: list[Identity] = []
         existing: list[Identity] = []
         revoked: list[Identity] = []
         while True:
-            line = self._readline()
+            line = self._read_identity_line()
             if line == IDENTITIES_END:
                 break
             try:
@@ -411,16 +446,42 @@ class PsqlIdentitySession:
                 revoked.append(identity)
             if len(identities) + len(existing) + len(revoked) > MAX_IDENTITIES:
                 raise ImportFailure("PostgreSQL identity result exceeds the allowed size")
+        self.confirm_heartbeat()
         return identities, existing, revoked
+
+    def confirm_heartbeat(self) -> None:
+        """Confirm a fresh server round-trip on the session that owns the lock."""
+        while True:
+            try:
+                line = self._readline(0.0)
+            except TimeoutError:
+                break
+            if line != IDENTITY_HEARTBEAT:
+                raise ImportFailure("PostgreSQL identity heartbeat output is invalid")
+        # At most one PostgreSQL query can already be in flight after the pipe was
+        # drained. Requiring two new results proves a round-trip began after this check.
+        for _ in range(2):
+            try:
+                line = self._readline(HEARTBEAT_TIMEOUT_SECONDS)
+            except TimeoutError as error:
+                return_code = self.process.poll()
+                if return_code is not None:
+                    self._finish_pipes()
+                    raise ImportFailure(
+                        self._closed_output_message(return_code)
+                    ) from error
+                raise ImportFailure("PostgreSQL identity heartbeat timed out") from error
+            if line != IDENTITY_HEARTBEAT:
+                raise ImportFailure("PostgreSQL identity heartbeat output is invalid")
 
     def close(self) -> None:
         if not hasattr(self, "process") or self._closed:
             return
         if self.process.poll() is None:
+            self.process.terminate()
             try:
-                self._write(f"SELECT {UNLOCK_SQL};\n\\quit\n")
                 self.process.wait(timeout=5)
-            except (ImportFailure, subprocess.TimeoutExpired):
+            except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
         self._finish_pipes()
@@ -643,9 +704,11 @@ def run(arguments: argparse.Namespace) -> str:
         assert target_opener is not None
         attached_verified = 0
         for credential, identity in plan.candidates:
+            database.confirm_heartbeat()
             attach_one(
                 target_opener, target_url, service_token, credential, identity
             )
+            database.confirm_heartbeat()
             attached_verified += 1
         return summary(plan, "apply", attached_verified)
 
