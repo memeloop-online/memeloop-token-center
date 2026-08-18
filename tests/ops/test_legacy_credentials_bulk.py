@@ -177,7 +177,7 @@ class LegacyCredentialBulkTests(unittest.TestCase):
                 "for line in sys.stdin:\n"
                 "    if 'pg_try_advisory_lock' in line:\n"
                 "        print('1', flush=True)\n"
-                "    elif line.startswith('COPY ('):\n"
+                "    elif line.startswith('SELECT json_build_array'):\n"
                 "        sys.stdout.close()\n"
                 "        time.sleep(0.05)\n"
                 "        print(os.environ['FAKE_PSQL_PRIVATE_STDERR'], file=sys.stderr, flush=True)\n"
@@ -216,6 +216,67 @@ class LegacyCredentialBulkTests(unittest.TestCase):
             combined_output = result.stdout + result.stderr
             for forbidden in (credential, source_hash, key_id):
                 self.assertNotIn(forbidden, combined_output)
+
+    def test_psql_json_framing_rejects_control_marker_and_non_string_fields(self) -> None:
+        credential = "fixture-only-cpa-linux-codex-key-0001"
+        source_hash = hashlib.sha256(credential.encode()).hexdigest()
+        key_id = "10000000-0000-4000-8000-000000000001"
+        cases = (
+            (
+                json.dumps(
+                    ["identity", f"invalid\n{legacy_import.IDENTITIES_END}\t", key_id]
+                ),
+                "invalid source hash",
+            ),
+            (json.dumps(["identity", source_hash, f"{key_id}\t"]), "invalid target key id"),
+            (json.dumps(["identity", source_hash, 7]), "identity output is invalid"),
+        )
+        for output_row, expected_error in cases:
+            with self.subTest(expected_error=expected_error):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = pathlib.Path(temporary)
+                    fake_psql = root / "psql"
+                    fake_psql.write_text(
+                        "#!/usr/bin/env python3\n"
+                        "import os, sys\n"
+                        "for line in sys.stdin:\n"
+                        "    if 'pg_try_advisory_lock' in line:\n"
+                        "        print('1', flush=True)\n"
+                        "    elif line.startswith('SELECT json_build_array'):\n"
+                        "        print(os.environ['FAKE_PSQL_ROW'], flush=True)\n"
+                        "    elif line.startswith('\\\\echo __MTC_LEGACY_IDENTITIES_END__'):\n"
+                        "        print('__MTC_LEGACY_IDENTITIES_END__', flush=True)\n"
+                        "    elif line.startswith('\\\\quit'):\n"
+                        "        break\n"
+                    )
+                    fake_psql.chmod(0o500)
+                    candidate_file = root / "api-keys.json"
+                    candidate_file.write_bytes(FixtureHandler.fixture)
+                    candidate_file.chmod(0o400)
+                    environment = os.environ.copy()
+                    environment["FAKE_PSQL_ROW"] = output_row
+                    result = subprocess.run(
+                        [
+                            "python3",
+                            str(SCRIPT),
+                            "--tenant-external-id",
+                            "fixture-tenant",
+                            "--input-file",
+                            str(candidate_file),
+                            "--psql-binary",
+                            str(fake_psql),
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                        timeout=20,
+                    )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(expected_error, result.stderr)
+                self.assertEqual(result.stdout, "")
+                for forbidden in (credential, source_hash, key_id, output_row):
+                    self.assertNotIn(forbidden, result.stderr)
 
     def test_read_only_cpa_management_export_uses_secret_file(self) -> None:
         state = TargetState()
@@ -263,13 +324,14 @@ class LegacyCredentialBulkTests(unittest.TestCase):
                 rows_file = FIXTURES / "cpamp-identities.csv"
                 fake_psql.write_text(
                     "#!/usr/bin/env python3\n"
-                    "import os, pathlib, sys\n"
+                    "import csv, json, os, pathlib, sys\n"
                     "for line in sys.stdin:\n"
                     "    if 'pg_try_advisory_lock' in line:\n"
                     "        print('1', flush=True)\n"
-                    "    elif line.startswith('COPY ('):\n"
-                    "        for row in pathlib.Path(os.environ['FAKE_PSQL_ROWS']).read_text().splitlines():\n"
-                    "            print(row, flush=True)\n"
+                    "    elif line.startswith('SELECT json_build_array'):\n"
+                    "        rows = pathlib.Path(os.environ['FAKE_PSQL_ROWS']).read_text().splitlines()\n"
+                    "        for row in csv.reader(rows):\n"
+                    "            print(json.dumps(row, separators=(',', ':')), flush=True)\n"
                     "    elif line.startswith('\\\\echo __MTC_LEGACY_IDENTITIES_END__'):\n"
                     "        print('__MTC_LEGACY_IDENTITIES_END__', flush=True)\n"
                     "    elif line.startswith('\\\\quit'):\n"

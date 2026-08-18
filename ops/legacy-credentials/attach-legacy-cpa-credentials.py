@@ -9,7 +9,6 @@ never placed in argv, environment variables, output, or temporary files.
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import os
@@ -362,15 +361,17 @@ class PsqlIdentitySession:
 
     def mappings(self) -> tuple[list[Identity], list[Identity], list[Identity]]:
         self._write(
-            "COPY ("
-            "SELECT 'identity', lower(i.api_key_hash), i.key_id "
+            "SELECT json_build_array(kind, source_hash, key_id)::text "
+            "FROM ("
+            "SELECT 'identity' AS kind, lower(i.api_key_hash) AS source_hash, "
+            "i.key_id AS key_id "
             "FROM cpamp_import_identities i "
             "JOIN key_records k ON k.id = i.key_id AND k.status = 'active' "
             "JOIN tenants t ON t.id = k.tenant_id "
             "WHERE t.external_id = :'tenant_external_id' "
             "UNION ALL "
-            "SELECT CASE WHEN c.revoked_at IS NULL THEN 'existing' ELSE 'revoked' END, "
-            "lower(c.source_hash), c.key_id "
+            "SELECT CASE WHEN c.revoked_at IS NULL THEN 'existing' ELSE 'revoked' END "
+            "AS kind, lower(c.source_hash) AS source_hash, c.key_id AS key_id "
             "FROM legacy_key_credentials c "
             "WHERE EXISTS ("
             "SELECT 1 FROM cpamp_import_identities i "
@@ -379,8 +380,8 @@ class PsqlIdentitySession:
             "WHERE t.external_id = :'tenant_external_id' "
             "AND (lower(c.source_hash) = lower(i.api_key_hash) OR c.key_id = i.key_id)"
             ") "
-            "ORDER BY 1, 2, 3"
-            ") TO STDOUT WITH (FORMAT csv);\n"
+            ") mappings "
+            "ORDER BY kind, source_hash, key_id;\n"
             f"\\echo {IDENTITIES_END}\n"
         )
         identities: list[Identity] = []
@@ -391,10 +392,15 @@ class PsqlIdentitySession:
             if line == IDENTITIES_END:
                 break
             try:
-                row = next(csv.reader([line], strict=True))
-            except (csv.Error, StopIteration) as error:
+                row = json.loads(line)
+            except (json.JSONDecodeError, RecursionError) as error:
                 raise ImportFailure("PostgreSQL identity output is invalid") from error
-            if len(row) != 3 or row[0] not in {"identity", "existing", "revoked"}:
+            if (
+                not isinstance(row, list)
+                or len(row) != 3
+                or any(not isinstance(item, str) for item in row)
+                or row[0] not in {"identity", "existing", "revoked"}
+            ):
                 raise ImportFailure("PostgreSQL identity output is invalid")
             identity = checked_identity(row[1], row[2])
             if row[0] == "identity":

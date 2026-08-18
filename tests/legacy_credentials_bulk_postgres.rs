@@ -14,6 +14,7 @@ const FIRST_CREDENTIAL: &str = "fixture-only-cpa-linux-codex-key-0001";
 const SECOND_CREDENTIAL: &str = "fixture-only-cpa-claude-code-key-0002";
 const FIRST_KEY_ID: &str = "10000000-0000-4000-8000-000000000001";
 const SECOND_KEY_ID: &str = "20000000-0000-4000-8000-000000000002";
+const IDENTITIES_END: &str = "__MTC_LEGACY_IDENTITIES_END__";
 
 async fn execute(pool: &PgPool, sql: &str) {
     sqlx::query(sql).execute(pool).await.unwrap();
@@ -183,6 +184,50 @@ async fn postgres_identity_query_is_locked_exact_and_rejects_revoked_mappings() 
                 .any(|window| window == forbidden)
             {
                 return Err("rejection output exposed a credential".into());
+            }
+        }
+
+        sqlx::query(&format!(
+            "DELETE FROM {schema}.legacy_key_credentials WHERE source_hash = $1 AND revoked_at IS NOT NULL"
+        ))
+        .bind(&second_hash)
+        .execute(&pool)
+        .await
+        .map_err(|error| format!("revoked fixture cleanup failed: {error}"))?;
+        let malicious_source = format!("valid-prefix\n{IDENTITIES_END}\nignored-suffix\t");
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.cpamp_import_identities VALUES ($1, $2)"
+        ))
+        .bind(&malicious_source)
+        .bind(FIRST_KEY_ID)
+        .execute(&pool)
+        .await
+        .map_err(|error| format!("framing fixture insert failed: {error}"))?;
+        let framed = importer_command(&database_url, &schema, &input_file)
+            .output()
+            .map_err(|error| format!("framing importer did not start: {error}"))?;
+        if framed.status.success()
+            || !String::from_utf8_lossy(&framed.stderr).contains("invalid source hash")
+        {
+            return Err("JSON identity framing accepted a control or marker injection".into());
+        }
+        let framed_output = [framed.stdout, framed.stderr].concat();
+        for forbidden in [
+            FIRST_CREDENTIAL.as_bytes(),
+            SECOND_CREDENTIAL.as_bytes(),
+            first_hash.as_bytes(),
+            second_hash.as_bytes(),
+            FIRST_KEY_ID.as_bytes(),
+            SECOND_KEY_ID.as_bytes(),
+            b"valid-prefix",
+            IDENTITIES_END.as_bytes(),
+            b"ignored-suffix",
+        ] {
+            if framed_output
+                .windows(forbidden.len())
+                .any(|window| window == forbidden)
+            {
+                return Err("framing rejection exposed credential identity material".into());
             }
         }
         Ok(())
