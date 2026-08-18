@@ -67,7 +67,7 @@ impl Database {
                 "service credential status must be active, suspended, or revoked".into(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let current = sqlx::query("SELECT status FROM service_principals WHERE id = $1")
             .bind(service_id.to_string())
             .fetch_optional(&mut *transaction)

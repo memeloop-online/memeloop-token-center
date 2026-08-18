@@ -158,6 +158,21 @@ impl Database {
         Ok(Self { pool, backend })
     }
 
+    async fn begin_write_transaction(&self) -> Result<Transaction<'static, Any>, sqlx::Error> {
+        // SQLite's default deferred transaction can fail immediately with
+        // SQLITE_BUSY when a read-before-write transaction races another
+        // writer: the shared lock cannot be upgraded after that writer has
+        // reserved the database. Claim the SQLite write reservation at BEGIN
+        // so the configured busy handler can wait and serialize test/local
+        // writers. PostgreSQL keeps its normal transaction semantics.
+        self.pool
+            .begin_with(match self.backend {
+                DatabaseBackend::PostgreSql => "BEGIN",
+                DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
+            })
+            .await
+    }
+
     pub async fn require_account_tenant(
         &self,
         account_id: Uuid,

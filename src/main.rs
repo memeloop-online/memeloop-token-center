@@ -15,6 +15,24 @@ use tracing_subscriber::EnvFilter;
 #[cfg(not(target_env = "msvc"))]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+union JemallocConfigPointer {
+    byte: &'static u8,
+    character: &'static std::ffi::c_char,
+}
+
+// This gateway favors a predictable container footprint over maximum allocator
+// throughput. A small arena count limits fragmentation, while the background
+// purger and short decay release transient stream/image pages promptly.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static JEMALLOC_CONFIG: Option<&'static std::ffi::c_char> = Some(unsafe {
+    JemallocConfigPointer {
+        byte: &b"abort_conf:true,background_thread:true,narenas:2,tcache_max:4096,dirty_decay_ms:1000,muzzy_decay_ms:0\0"[0],
+    }
+    .character
+});
+
 #[derive(Debug, Parser)]
 #[command(name = "memeloop-token-center")]
 struct Cli {
