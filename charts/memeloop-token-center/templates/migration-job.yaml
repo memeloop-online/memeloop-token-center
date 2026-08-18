@@ -40,7 +40,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: migrate
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "memeloop-token-center.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["migrate"]
           env:
@@ -51,8 +51,9 @@ spec:
                   key: {{ .Values.config.databaseUrlSecret.key }}
             - name: MTC_DATABASE_MAX_CONNECTIONS
               value: {{ .Values.config.databaseMaxConnections | quote }}
-            # Config parsing currently requires a pepper even though the migrate
-            # command never authenticates a downstream credential.
+            # Config parsing currently requires credentials even though the
+            # migrate command never authenticates them. The token below is a
+            # non-authenticating 32-byte sentinel that satisfies config parsing.
             - name: MTC_KEY_PEPPER
               valueFrom:
                 secretKeyRef:

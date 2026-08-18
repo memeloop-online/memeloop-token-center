@@ -14,6 +14,7 @@ const mockPort = Number(process.env.MTC_E2E_MOCK_PORT ?? 41740);
 const testDirectory = mkdtempSync(join(tmpdir(), 'memeloop-token-center-e2e-'));
 let application;
 let stopping = false;
+let stopPromise;
 
 const upstream = createServer((request, response) => {
   const chunks = [];
@@ -57,13 +58,46 @@ const upstream = createServer((request, response) => {
   });
 });
 
+function closeUpstream() {
+  return new Promise((resolveClose) => upstream.close(() => resolveClose()));
+}
+
+function signalApplication(signal) {
+  if (!application || application.exitCode !== null || application.signalCode !== null) return;
+  try {
+    if (process.platform === 'win32') application.kill(signal);
+    else process.kill(-application.pid, signal);
+  } catch (error) {
+    if (error?.code !== 'ESRCH') throw error;
+  }
+}
+
+function waitForApplication(timeoutMilliseconds) {
+  if (!application || application.exitCode !== null || application.signalCode !== null) return Promise.resolve(true);
+  return Promise.race([
+    new Promise((resolveExit) => application.once('exit', () => resolveExit(true))),
+    new Promise((resolveTimeout) => setTimeout(() => resolveTimeout(false), timeoutMilliseconds)),
+  ]);
+}
+
 function stop(exitCode = 0) {
-  if (stopping) return;
+  if (stopPromise) return stopPromise;
   stopping = true;
-  upstream.close();
-  if (application && !application.killed) application.kill('SIGTERM');
-  rmSync(testDirectory, { recursive: true, force: true });
-  setTimeout(() => process.exit(exitCode), 100).unref();
+  stopPromise = (async () => {
+    const closingUpstream = closeUpstream();
+    signalApplication('SIGTERM');
+    if (!(await waitForApplication(10_000))) {
+      signalApplication('SIGKILL');
+      await waitForApplication(5_000);
+    }
+    await closingUpstream;
+    rmSync(testDirectory, { recursive: true, force: true });
+    process.exitCode = exitCode;
+  })().catch((error) => {
+    process.stderr.write(`browser e2e cleanup failed: ${error.message}\n`);
+    process.exitCode = 1;
+  });
+  return stopPromise;
 }
 
 upstream.on('error', (error) => {
@@ -72,6 +106,7 @@ upstream.on('error', (error) => {
 });
 
 upstream.listen(mockPort, '127.0.0.1', () => {
+  process.send?.({ type: 'mock-listening' });
   application = spawn(
     'cargo',
     ['run', '--quiet', '--manifest-path', join(repositoryRoot, 'Cargo.toml'), '--bin', 'memeloop-token-center', '--', 'serve', '--role', 'all'],
@@ -90,6 +125,7 @@ upstream.listen(mockPort, '127.0.0.1', () => {
         RUST_LOG: process.env.RUST_LOG ?? 'warn',
       },
       stdio: 'inherit',
+      detached: process.platform !== 'win32',
     },
   );
   application.on('exit', (code, signal) => {

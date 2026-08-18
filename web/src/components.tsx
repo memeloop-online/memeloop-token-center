@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import type { RequestView, StatsBucket } from './types';
 import { useI18n } from './i18n';
+import { formatCurrency, formatNumber } from './format';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
   const { locale, setLocale, t } = useI18n();
@@ -60,8 +61,8 @@ export function Buckets({ values, onSelect }: { values: StatsBucket[]; onSelect?
       {values.map((value) => (
         <div className="bucket" key={value.name}>
           {onSelect
-            ? <button className="bucket-heading" type="button" onClick={() => onSelect(value)} aria-label={t('request.filterBy', { name: value.name })}><b>{value.name}</b><span>{t('request.count', { count: value.requests.toLocaleString(locale) })} · {(value.input_tokens + value.output_tokens).toLocaleString(locale)} {t('request.tokenUnit')}</span></button>
-            : <div className="bucket-heading"><b>{value.name}</b><span>{t('request.count', { count: value.requests.toLocaleString(locale) })} · {(value.input_tokens + value.output_tokens).toLocaleString(locale)} {t('request.tokenUnit')}</span></div>}
+            ? <button className="bucket-heading" type="button" onClick={() => onSelect(value)} aria-label={t('request.filterBy', { name: value.name })}><b>{value.name}</b><span>{t('request.count', { count: formatNumber(value.requests, locale) })} · {formatNumber(value.input_tokens + value.output_tokens, locale)} {t('request.tokenUnit')}</span></button>
+            : <div className="bucket-heading"><b>{value.name}</b><span>{t('request.count', { count: formatNumber(value.requests, locale) })} · {formatNumber(value.input_tokens + value.output_tokens, locale)} {t('request.tokenUnit')}</span></div>}
           <div className="bar"><i style={{ width: `${(value.requests / maximum) * 100}%` }} /></div>
         </div>
       ))}
@@ -72,9 +73,11 @@ export function Buckets({ values, onSelect }: { values: StatsBucket[]; onSelect?
 export function RequestTable({
   requests,
   onSelect,
+  currency,
 }: {
   requests: RequestView[];
   onSelect?: (request: RequestView) => void;
+  currency?: string;
 }) {
   const { locale, t } = useI18n();
   if (!requests.length) return <div className="empty">{t('common.noRequests')}</div>;
@@ -89,9 +92,9 @@ export function RequestTable({
               <td><code>{request.model}</code></td>
               <td>{request.protocol}</td>
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
-              <td>{request.duration_ms === null ? '—' : `${request.duration_ms.toLocaleString(locale)} ms`}</td>
-              <td>{(request.input_tokens + request.output_tokens).toLocaleString(locale)}</td>
-              <td>{request.cost}</td>
+              <td>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</td>
+              <td>{formatNumber(request.input_tokens + request.output_tokens, locale)}</td>
+              <td>{currency ? formatCurrency(request.cost, currency, locale) : request.cost}</td>
               <td>{request.error_code ? <code className="error-code">{request.error_code}</code> : '—'}</td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>

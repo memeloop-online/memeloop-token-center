@@ -80,7 +80,13 @@ def explain(database_url: str, name: str, query: str, timeout_ms: int) -> dict[s
             for node in nodes
             if node.get("Node Type") == "Seq Scan"
             and str(node.get("Relation Name", "")).startswith(
-                ("request_records", "request_events")
+                (
+                    "request_records",
+                    "request_events",
+                    "request_stats_facts",
+                    "usage_analysis_hourly",
+                    "usage_analysis_daily",
+                )
             )
         }
     )
@@ -163,6 +169,35 @@ def main() -> int:
     try:
         request_rows = int(scalar(database_url, "SELECT count(*) FROM request_records;", args.statement_timeout_ms))
         event_rows = int(scalar(database_url, "SELECT count(*) FROM request_events;", args.statement_timeout_ms))
+        fact_rows = int(scalar(database_url, "SELECT count(*) FROM request_stats_facts;", args.statement_timeout_ms))
+        terminal_request_rows = int(scalar(database_url, "SELECT count(*) FROM request_records WHERE completed_at IS NOT NULL AND status_code IS NOT NULL;", args.statement_timeout_ms))
+        valid_required_cursor_indexes = int(
+            scalar(
+                database_url,
+                "SELECT count(*) FROM pg_index WHERE indexrelid IN "
+                "(to_regclass('public.request_records_recent_idx'), "
+                "to_regclass('public.request_events_global_cursor_idx')) "
+                "AND indisvalid AND indisready;",
+                args.statement_timeout_ms,
+            )
+        )
+        unattached_required_cursor_leaves = int(
+            scalar(
+                database_url,
+                "WITH required(parent_table, parent_index) AS (VALUES "
+                "('request_records', 'request_records_recent_idx'), "
+                "('request_events', 'request_events_global_cursor_idx')) "
+                "SELECT count(*) FROM required r "
+                "JOIN pg_inherits table_inheritance "
+                "ON table_inheritance.inhparent = to_regclass('public.' || r.parent_table) "
+                "WHERE NOT EXISTS (SELECT 1 FROM pg_inherits index_inheritance "
+                "JOIN pg_index child_index ON child_index.indexrelid = index_inheritance.inhrelid "
+                "WHERE index_inheritance.inhparent = to_regclass('public.' || r.parent_index) "
+                "AND child_index.indrelid = table_inheritance.inhrelid "
+                "AND child_index.indisvalid AND child_index.indisready);",
+                args.statement_timeout_ms,
+            )
+        )
         key_id = scalar(
             database_url,
             "SELECT key_id FROM request_records GROUP BY key_id ORDER BY count(*) DESC LIMIT 1;",
@@ -188,6 +223,94 @@ def main() -> int:
             "SELECT error_code FROM request_records WHERE error_code IS NOT NULL GROUP BY error_code ORDER BY count(*) DESC LIMIT 1",
             args.statement_timeout_ms,
         )
+        stats_day_bounds = scalar(
+            database_url,
+            "SELECT min(day_bucket)::text || '|' || max(day_bucket)::text "
+            f"FROM request_daily_aggregates WHERE tenant_id = '{tenant_id}';",
+            args.statement_timeout_ms,
+        )
+        try:
+            stats_min_day, stats_max_day = (int(value) for value in stats_day_bounds.split("|", 1))
+        except (TypeError, ValueError) as error:
+            raise PrerequisiteFailure("request daily aggregates are absent for the sample tenant") from error
+        stats_from_day = max(stats_min_day, stats_max_day - 92)
+        stats_from = stats_from_day * 86_400_000 + 1
+        stats_to = (stats_max_day + 1) * 86_400_000 - 2
+        stats_full_day_from = (stats_from + 86_400_000 - 1) // 86_400_000 * 86_400_000
+        stats_full_day_to = (stats_to + 1) // 86_400_000 * 86_400_000
+        filtered_stats_query = (
+            "WITH filtered_activity AS MATERIALIZED ("
+            "SELECT day_bucket * 86400000 AS created_at, model, status_class, error_code, "
+            "requests, input_tokens, output_tokens, cost_micros "
+            "FROM request_daily_aggregates "
+            f"WHERE tenant_id = '{tenant_id}' "
+            f"AND day_bucket >= {stats_full_day_from} / 86400000 "
+            f"AND day_bucket < {stats_full_day_to} / 86400000 "
+            "UNION ALL "
+            "SELECT created_at, model, status_class, error_code, 1, input_tokens, "
+            "output_tokens, cost_micros FROM request_stats_facts "
+            f"WHERE tenant_id = '{tenant_id}' AND created_at >= {stats_from} "
+            f"AND created_at <= {stats_to} "
+            f"AND (created_at < {stats_full_day_from} OR created_at >= {stats_full_day_to})"
+            "), enriched AS (SELECT model, created_at / 86400000 AS day_bucket, "
+            "NULLIF(error_code, '') AS error_bucket, status_class, requests, input_tokens, "
+            "output_tokens, cost_micros FROM filtered_activity) "
+            "SELECT model, day_bucket, error_bucket, SUM(requests), SUM(input_tokens), "
+            "SUM(output_tokens), SUM(cost_micros) FROM enriched "
+            "GROUP BY GROUPING SETS ((), (model), (day_bucket), (error_bucket)) "
+            "HAVING GROUPING(error_bucket) = 1 OR error_bucket IS NOT NULL"
+        )
+        usage_day_bounds = scalar(
+            database_url,
+            "SELECT min(day_bucket)::text || '|' || max(day_bucket)::text "
+            f"FROM usage_analysis_daily WHERE tenant_id = '{tenant_id}';",
+            args.statement_timeout_ms,
+        )
+        try:
+            usage_min_day, usage_max_day = (
+                int(value) for value in usage_day_bounds.split("|", 1)
+            )
+        except (TypeError, ValueError) as error:
+            raise PrerequisiteFailure(
+                "usage analysis daily rollups are absent for the sample tenant"
+            ) from error
+        usage_from_day = max(usage_min_day, usage_max_day - 92)
+        usage_daily_query = (
+            "WITH filtered_activity AS MATERIALIZED ("
+            "SELECT * FROM usage_analysis_daily "
+            f"WHERE tenant_id = '{tenant_id}' AND day_bucket >= {usage_from_day} "
+            f"AND day_bucket <= {usage_max_day}) "
+            "SELECT currency, SUM(requests), "
+            "SUM(input_tokens), SUM(cached_input_tokens), SUM(cache_write_tokens), "
+            "SUM(generation_units), SUM(duration_sum_ms), SUM(cost_micros) "
+            "FROM filtered_activity GROUP BY GROUPING SETS "
+            "((currency), (day_bucket, currency), (model, currency), "
+            "(key_id, currency), (upstream_account_id, currency), "
+            "(protocol, currency), (status_class, currency), (error_code, currency))"
+        )
+        usage_hour_bounds = scalar(
+            database_url,
+            "SELECT min(hour_bucket)::text || '|' || max(hour_bucket)::text "
+            f"FROM usage_analysis_hourly WHERE tenant_id = '{tenant_id}';",
+            args.statement_timeout_ms,
+        )
+        try:
+            usage_min_hour, usage_max_hour = (
+                int(value) for value in usage_hour_bounds.split("|", 1)
+            )
+        except (TypeError, ValueError) as error:
+            raise PrerequisiteFailure(
+                "usage analysis hourly rollups are absent for the sample tenant"
+            ) from error
+        usage_from_hour = max(usage_min_hour, usage_max_hour - 31 * 24)
+        usage_hourly_query = (
+            "SELECT hour_bucket, currency, protocol, SUM(requests), SUM(input_tokens), "
+            "SUM(cached_input_tokens), SUM(cache_write_tokens), SUM(cost_micros) "
+            "FROM usage_analysis_hourly "
+            f"WHERE tenant_id = '{tenant_id}' AND hour_bucket >= {usage_from_hour} "
+            f"AND hour_bucket <= {usage_max_hour} "
+            "GROUP BY hour_bucket, currency, protocol ORDER BY hour_bucket, currency, protocol"
+        )
 
         queries: list[tuple[str, str]] = [
             (
@@ -211,6 +334,9 @@ def main() -> int:
                 "SUM(cost_micros) FROM usage_daily_aggregates "
                 f"WHERE key_id = '{key_id}' GROUP BY day_bucket ORDER BY day_bucket",
             ),
+            ("tenant_filtered_stats", filtered_stats_query),
+            ("tenant_usage_analysis_daily_93d", usage_daily_query),
+            ("tenant_usage_analysis_hourly_31d", usage_hourly_query),
         ]
         if error_code is not None:
             queries.append(
@@ -241,7 +367,28 @@ def main() -> int:
                 "operator": ">=",
                 "expected": args.min_request_rows,
                 "passed": request_rows >= args.min_request_rows,
-            }
+            },
+            {
+                "name": "terminal request fact coverage",
+                "actual": fact_rows,
+                "operator": "==",
+                "expected": terminal_request_rows,
+                "passed": fact_rows == terminal_request_rows,
+            },
+            {
+                "name": "required global cursor parent indexes are ready",
+                "actual": valid_required_cursor_indexes,
+                "operator": "==",
+                "expected": 2,
+                "passed": valid_required_cursor_indexes == 2,
+            },
+            {
+                "name": "required global cursor indexes cover every partition",
+                "actual": unattached_required_cursor_leaves,
+                "operator": "==",
+                "expected": 0,
+                "passed": unattached_required_cursor_leaves == 0,
+            },
         ]
         for result in results:
             checks.append(
@@ -264,11 +411,16 @@ def main() -> int:
                     }
                 )
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "benchmark": "memeloop-token-center-postgres-explain",
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "postgres_version": scalar(database_url, "SHOW server_version;", args.statement_timeout_ms),
-            "dataset": {"request_rows": request_rows, "event_rows": event_rows},
+            "dataset": {
+                "request_rows": request_rows,
+                "terminal_request_rows": terminal_request_rows,
+                "request_fact_rows": fact_rows,
+                "event_rows": event_rows,
+            },
             "thresholds": {
                 "max_execution_ms": args.max_execution_ms,
                 "min_request_rows": args.min_request_rows,

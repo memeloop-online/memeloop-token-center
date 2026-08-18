@@ -237,6 +237,62 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/keys/{key_id}/alias:
+    patch:
+      tags: [Client credentials]
+      operationId: renameClientCredential
+      summary: Rename a stable client credential without changing its identity
+      description: The trimmed alias is display metadata. The stable key, principal, policy, balance, request history, and credential generations remain unchanged.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters: [{ $ref: '#/components/parameters/KeyId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [alias]
+              properties:
+                alias: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
+      responses:
+        '200':
+          description: Updated key-local display metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [key_id, alias, updated_at]
+                properties:
+                  key_id: { type: string, format: uuid }
+                  alias: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
+                  updated_at: { type: integer, format: int64 }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/keys/{key_id}/limits:
+    get:
+      tags: [Client credentials]
+      operationId: getClientCredentialLimitSnapshot
+      summary: Read current rate, concurrency, budget, and balance headroom
+      description: The snapshot is captured for the selected stable key. A tenant-scoped service credential cannot select a key in another tenant.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:read
+      parameters: [{ $ref: '#/components/parameters/KeyId' }]
+      responses:
+        '200':
+          description: Current configured limits and transactional consumption.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClientCredentialLimitSnapshot' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/keys/{key_id}/policy:
     put:
       tags: [Client credentials]
@@ -308,8 +364,8 @@ paths:
               additionalProperties: false
               required: [credential, source_hash]
               properties:
-                credential: { type: string, writeOnly: true, minLength: 1 }
-                source_hash: { type: string, minLength: 1 }
+                credential: { type: string, writeOnly: true, minLength: 16, maxLength: 512, pattern: '^[^\r\n]+$' }
+                source_hash: { type: string, minLength: 64, maxLength: 64, pattern: '^[0-9A-Fa-f]{64}$' }
       responses:
         '201':
           description: Legacy credential metadata; no plaintext secret.
@@ -320,6 +376,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /internal/v1/service-tokens:
     get:
@@ -874,6 +931,65 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/imports/cpa/managed-oauth/capabilities:
+    get:
+      tags: [Upstream providers]
+      operationId: getCpaManagedOAuthImportCapabilities
+      summary: Preflight the server-installed CPA managed OAuth source types
+      description: |
+        Global-operator preflight for fail-closed import planning. The stable
+        response contains only the contract version and sorted source type names;
+        provider drivers, adapter destinations, and internal topology are omitted.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: imports:cpa:write
+      x-global-service-only: true
+      responses:
+        '200':
+          description: Stable managed OAuth import capabilities without adapter metadata.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CpaManagedOAuthImportCapabilities' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/imports/cpa/managed-oauth:
+    post:
+      tags: [Upstream providers]
+      operationId: importCpaManagedOAuthAccount
+      summary: Import one CPA managed OAuth document through a server-installed adapter
+      description: |
+        Global-only import with a 1 MiB canonical-document limit and a bounded
+        64 KiB JSON envelope allowance. The source path is used only in a keyed
+        provenance identity and is never stored, logged, or returned.
+        Exact immutable replays return the current account without resolving or
+        calling an adapter; changed material under the same source returns 409.
+        Driver, account configuration, credentials, and adapter destinations are
+        derived by the current server catalog and cannot be supplied by the caller.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: imports:cpa:write
+      x-global-service-only: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CpaManagedOAuthImportRequest' }
+      responses:
+        '200':
+          description: Exact or concurrently won replay of the existing account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CpaManagedOAuthImportResult' }
+        '201':
+          description: Managed OAuth account created atomically.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CpaManagedOAuthImportResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
 
   /internal/v1/model-routes:
     get:
@@ -1431,6 +1547,65 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/requests/{request_id}/assets/{asset_id}:
+    get:
+      tags: [Operator traffic]
+      operationId: downloadOperatorRequestAsset
+      summary: Stream one archived synchronous-generation asset with optional byte range
+      description: |
+        Resolves the asset only through its request and asset UUIDs; the internal archive
+        locator is never accepted or returned. Global service credentials may select a
+        tenant. A tenant-scoped credential is fixed to its tenant, and a cross-tenant or
+        otherwise invisible request/asset pair returns 404. Exactly one byte range is
+        supported; multiple, malformed, or unsatisfiable ranges return 416.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      x-authorization-contract:
+        identity: service-credential
+        tenant-isolation-failure: 404
+        object-binding: request-id-and-asset-id
+        archive-locator-exposed: false
+      parameters:
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/AssetIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/OptionalByteRange'
+      responses:
+        '200': { $ref: '#/components/responses/GenerationAssetFull' }
+        '206': { $ref: '#/components/responses/GenerationAssetPartial' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /internal/v1/generations/{job_id}/assets/{asset_id}:
+    get:
+      tags: [Operator traffic]
+      operationId: downloadOperatorGenerationAsset
+      summary: Stream one archived generation asset with optional byte range
+      description: |
+        Resolves the asset only through its job and asset UUIDs; the internal archive
+        locator is never accepted or returned. Global service credentials may select a
+        tenant. A tenant-scoped credential is fixed to its tenant, and a cross-tenant or
+        otherwise invisible asset returns 404. Exactly one RFC 7233 byte range is
+        supported; multiple or unsatisfiable ranges return 416.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/JobIdPath'
+        - $ref: '#/components/parameters/AssetIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/OptionalByteRange'
+      responses:
+        '200': { $ref: '#/components/responses/GenerationAssetFull' }
+        '206': { $ref: '#/components/responses/GenerationAssetPartial' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /internal/v1/stats:
     get:
       tags: [Operator traffic]
@@ -1466,6 +1641,63 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Statistics' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/usage-analysis:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorUsageAnalysis
+      summary: Analyze bounded tenant or global usage from hourly or daily rollups
+      description: |
+        Reads only compact terminal request and generation rollups; it never scans the raw
+        request table. `auto` selects hourly buckets through 31 days and daily buckets for
+        longer ranges. Omitted bounds default to the last 24 hours (`auto`/`hour`) or seven
+        days (`day`). The inclusive interval may not exceed 93 days, and explicit hourly
+        intervals may not exceed 31 days. Bucket starts and heatmap coordinates are UTC.
+        Costs are returned as a currency-keyed array and are never added across currencies.
+        Duration P95 values are bounded-histogram approximations capped at 60000 ms.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/FromCreatedAt'
+        - $ref: '#/components/parameters/ToCreatedAt'
+        - name: granularity
+          in: query
+          required: false
+          schema: { type: string, enum: [auto, hour, day], default: auto }
+        - $ref: '#/components/parameters/KeyFilter'
+        - $ref: '#/components/parameters/ModelFilter'
+        - name: protocol
+          in: query
+          required: false
+          description: Exact canonical protocol family.
+          schema: { type: string, enum: [openai, anthropic, openai-image, generation] }
+        - name: status
+          in: query
+          required: false
+          description: Terminal logical status; pending traffic is intentionally absent from usage rollups.
+          schema: { type: string, enum: [success, error] }
+        - $ref: '#/components/parameters/ErrorCodeFilter'
+        - name: upstream_account_id
+          in: query
+          required: false
+          description: One stable upstream UUID, or `unassigned` for terminal activity recorded without an upstream.
+          schema:
+            oneOf:
+              - { type: string, format: uuid }
+              - { type: string, const: unassigned }
+        - $ref: '#/components/parameters/RouteFilter'
+        - $ref: '#/components/parameters/KeyAliasFilter'
+        - $ref: '#/components/parameters/PrincipalFilter'
+      responses:
+        '200':
+          description: Currency-safe terminal usage projections and UTC time buckets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageAnalysis' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
@@ -1521,6 +1753,20 @@ paths:
               schema: { $ref: '#/components/schemas/SelfCredential' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  /self/v1/key/limits:
+    get:
+      tags: [Self service]
+      operationId: getOwnClientCredentialLimitSnapshot
+      summary: Read current limits and headroom for the authenticated stable key
+      security: [{ clientBearer: [] }]
+      responses:
+        '200':
+          description: Snapshot bound to the authenticated key; no request parameter can select another credential.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClientCredentialLimitSnapshot' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   /self/v1/requests:
     get:
       tags: [Self service]
@@ -1574,6 +1820,35 @@ paths:
               schema: { $ref: '#/components/schemas/RequestDetail' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /self/v1/requests/{request_id}/assets/{asset_id}:
+    get:
+      tags: [Self service]
+      operationId: downloadOwnRequestAsset
+      summary: Stream one owned synchronous-generation asset with optional byte range
+      description: |
+        The authenticated stable key identity must own both the request and asset. A
+        mismatched request/asset pair, an asset owned by another identity, or a missing
+        database record returns 404. The internal archive locator is never accepted or
+        returned. Exactly one byte range is supported; multiple, malformed, or
+        unsatisfiable ranges return 416.
+      security: [{ clientBearer: [] }]
+      x-authorization-contract:
+        identity: stable-key-id
+        ownership-failure: 404
+        object-binding: request-id-and-asset-id
+        archive-locator-exposed: false
+      parameters:
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/AssetIdPath'
+        - $ref: '#/components/parameters/OptionalByteRange'
+      responses:
+        '200': { $ref: '#/components/responses/GenerationAssetFull' }
+        '206': { $ref: '#/components/responses/GenerationAssetPartial' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /self/v1/stats:
     get:
@@ -1676,12 +1951,47 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /self/v1/generations/{job_id}/assets/{asset_id}:
+    get:
+      tags: [Self service]
+      operationId: downloadOwnGenerationAsset
+      summary: Stream one owned archived generation asset with optional byte range
+      description: |
+        The authenticated stable key identity must own the job and asset; an asset owned
+        by another identity returns 404. The internal archive locator is never accepted or
+        returned. Exactly one RFC 7233 byte range is supported; multiple or unsatisfiable
+        ranges return 416.
+      security: [{ clientBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/JobIdPath'
+        - $ref: '#/components/parameters/AssetIdPath'
+        - $ref: '#/components/parameters/OptionalByteRange'
+      responses:
+        '200': { $ref: '#/components/responses/GenerationAssetFull' }
+        '206': { $ref: '#/components/responses/GenerationAssetPartial' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /self/v1/conversations:
     get:
       tags: [Self service]
       operationId: listOwnLogicalConversations
       summary: List inferred logical conversation clusters
       security: [{ clientBearer: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: before_updated_at
+          in: query
+          description: Exclusive descending keyset cursor; must be paired with `before_cluster_id`.
+          schema: { type: integer, format: int64 }
+        - name: before_cluster_id
+          in: query
+          description: Exclusive descending keyset cursor; must be paired with `before_updated_at`.
+          schema: { type: string, format: uuid }
       responses:
         '200':
           description: Conversation clusters containing requests owned by the stable identity.
@@ -1702,6 +2012,18 @@ paths:
         - name: cluster_id
           in: path
           required: true
+          schema: { type: string, format: uuid }
+        - name: limit
+          in: query
+          description: Maximum requests returned in this bounded conversation page.
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+        - name: before_created_at
+          in: query
+          description: Exclusive descending request cursor; must be paired with `before_request_id`.
+          schema: { type: integer, format: int64 }
+        - name: before_request_id
+          in: query
+          description: Exclusive descending request cursor; must be paired with `before_created_at`.
           schema: { type: string, format: uuid }
       responses:
         '200':
@@ -1901,9 +2223,45 @@ paths:
         accepts optional `Idempotency-Key`: the first submission returns 202, an identical
         replay returns the same job with 200 without a second reservation, and reuse with
         different `model` or `input` returns 400. Without `input`, this endpoint proxies
-        the synchronous OpenAI Images API or a configured Codex Responses image tool;
-        `Idempotency-Key` does not currently provide replay semantics for that synchronous path.
+        the synchronous OpenAI Images API or a configured Codex Responses image tool.
+
+        Synchronous idempotency is isolated by the authenticated stable `key_id` and uses
+        the canonical post-policy model/request payload. Authentication and traffic-policy
+        evaluation precede the replay lookup, while route/price resolution and outbound
+        client validation run only for a newly claimed execution. A completed same-payload
+        replay therefore remains available after its route or price changes and returns the
+        exact archived status, sanitized JSON body, and original request ID; it creates no
+        request record, makes no upstream call, and consumes no additional quota/billing
+        reservation, per-key rate-limit window, or image execution permit. Reusing the key
+        with a different payload returns 400. An identical active request returns 409; an
+        expired pending lease is atomically reclaimed for a fresh execution. For URL-mode
+        results, Token Center downloads the object before success and persists, returns,
+        and replays only a relative
+        `/self/v1/requests/{request_id}/assets/{asset_id}` reference plus sanitized asset
+        metadata—never the provider URL or internal archive locator.
       security: [{ clientBearer: [] }]
+      x-idempotency-contract:
+        namespace: stable-key-id
+        fingerprint: post-policy-canonical-model-and-request
+        completed-replay: exact-status-body-and-request-id
+        different-payload-status: 400
+        in-progress-status: 409
+        replay-preconditions:
+          - authentication
+          - traffic-policy-evaluation
+        fresh-execution-only:
+          - route-resolution
+          - price-lookup
+          - outbound-client-validation
+        expired-pending: atomically-reclaimed
+        completed-replay-effects:
+          - no-request-record
+          - no-upstream-request
+          - no-quota-reservation
+          - no-usage-settlement
+          - no-key-rate-limit-window-consumption
+          - no-image-execution-permit
+        persisted-url-results: mtc-request-asset-reference-only
       parameters: [{ $ref: '#/components/parameters/OptionalIdempotencyKey' }]
       requestBody:
         required: true
@@ -1919,6 +2277,7 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '424': { $ref: '#/components/responses/UnpricedModel' }
         '429': { $ref: '#/components/responses/UsageRejected' }
         '502': { $ref: '#/components/responses/UpstreamError' }
@@ -1971,6 +2330,22 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    JobIdPath:
+      name: job_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    AssetIdPath:
+      name: asset_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    OptionalByteRange:
+      name: Range
+      in: header
+      required: false
+      description: One byte range, for example `bytes=0-1048575`, `bytes=1048576-`, or `bytes=-1048576`.
+      schema: { type: string, pattern: '^bytes=([0-9]+-[0-9]*|-[1-9][0-9]*)$' }
     RouteId:
       name: route_id
       in: path
@@ -2174,14 +2549,88 @@ components:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
     UsageRejected:
       description: Rate limit, concurrency, balance, or configured budget rejected the request before upstream execution.
+      headers:
+        Retry-After:
+          description: Seconds until the next meaningful retry for retryable dimensions. Permanent balance/lifetime failures omit this header.
+          schema: { type: integer, minimum: 1 }
       content:
         application/json:
-          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          schema: { $ref: '#/components/schemas/UsageLimitErrorResponse' }
     UpstreamError:
       description: Configured upstream or OAuth provider was unavailable. Sensitive upstream detail is not returned.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
+    InternalError:
+      description: An archive, database, or other internal dependency failed. Sensitive dependency detail is not returned.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    GenerationAssetFull:
+      description: Complete archived asset. Content-Type is reduced to the service allowlist and Content-Disposition uses a sanitized attachment filename.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+        Accept-Ranges: { schema: { const: bytes } }
+        Cache-Control: { schema: { const: no-store } }
+        Content-Length: { schema: { type: integer, format: int64, minimum: 0 } }
+        Content-Disposition: { schema: { type: string } }
+      content:
+        application/octet-stream:
+          schema: { type: string, format: binary }
+        image/png:
+          schema: { type: string, format: binary }
+        image/jpeg:
+          schema: { type: string, format: binary }
+        image/webp:
+          schema: { type: string, format: binary }
+        image/gif:
+          schema: { type: string, format: binary }
+        video/mp4:
+          schema: { type: string, format: binary }
+        video/webm:
+          schema: { type: string, format: binary }
+        video/quicktime:
+          schema: { type: string, format: binary }
+    GenerationAssetPartial:
+      description: Requested inclusive byte range from the archived asset.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+        Accept-Ranges: { schema: { const: bytes } }
+        Cache-Control: { schema: { const: no-store } }
+        Content-Length: { schema: { type: integer, format: int64, minimum: 0 } }
+        Content-Range: { schema: { type: string, pattern: '^bytes [0-9]+-[0-9]+/[0-9]+$' } }
+        Content-Disposition: { schema: { type: string } }
+      content:
+        application/octet-stream:
+          schema: { type: string, format: binary }
+        image/png:
+          schema: { type: string, format: binary }
+        image/jpeg:
+          schema: { type: string, format: binary }
+        image/webp:
+          schema: { type: string, format: binary }
+        image/gif:
+          schema: { type: string, format: binary }
+        video/mp4:
+          schema: { type: string, format: binary }
+        video/webm:
+          schema: { type: string, format: binary }
+        video/quicktime:
+          schema: { type: string, format: binary }
+    RangeNotSatisfiable:
+      description: The range was malformed, multiple, empty for a zero-size asset, or outside the archived object.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+        Accept-Ranges: { schema: { const: bytes } }
+        Cache-Control: { schema: { const: no-store } }
+        Content-Length: { schema: { const: 0 } }
+        Content-Range: { schema: { type: string, pattern: '^bytes \*/[0-9]+$' } }
     ProxySuccess:
       description: Upstream response. Content type and streaming semantics follow the selected protocol/provider.
       content:
@@ -2200,7 +2649,14 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/GenerationJob' }
     ImageSuccessOrGenerationReplay:
-      description: Synchronous image-provider response, or an existing asynchronous job returned by an idempotent replay.
+      description: |
+        Sanitized synchronous image response, exact completed synchronous replay, or an
+        existing asynchronous job returned by an idempotent replay. Synchronous URL-mode
+        results contain only Token Center request-asset references, never provider URLs or
+        internal archive locators.
+      headers:
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
       content:
         application/json:
           schema: { type: object, additionalProperties: true }
@@ -2268,7 +2724,7 @@ components:
       type: string
       enum: [default, auto, priority, flex, scale, batch, standard_only]
       description: Recorded/requested upstream service tier. Unknown reported tiers are settled conservatively against the maximum snapshotted tier price.
-      default: USD
+      default: default
     CredentialStatus:
       type: string
       enum: [active, suspended, revoked]
@@ -2286,6 +2742,22 @@ components:
               type: string
               enum: [unauthorized, forbidden, unpriced_model, insufficient_quota, rate_limit_exceeded, not_found, conflict, invalid_request, upstream_error, internal_error]
             message: { type: string }
+    UsageLimitErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, reason, retryable]
+          properties:
+            code: { type: string, enum: [insufficient_quota, rate_limit_exceeded] }
+            message: { type: string }
+            reason:
+              type: string
+              enum: [balance_exhausted, daily_budget_exhausted, weekly_budget_exhausted, lifetime_budget_exhausted, rpm_exhausted, tpm_exhausted, concurrency_exhausted]
+            retryable: { type: boolean }
     CredentialPolicy:
       type: object
       additionalProperties: false
@@ -2294,11 +2766,11 @@ components:
           type: array
           maxItems: 500
           description: Empty denies every model. Use `*` to permit all priced/routed models.
-          items: { type: string, minLength: 1, maxLength: 200 }
+          items: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
           default: []
-        requests_per_minute: { type: integer, format: int32, minimum: 1, default: 60 }
-        tokens_per_minute: { type: integer, format: int64, minimum: 1, default: 100000 }
-        max_concurrency: { type: integer, format: int32, minimum: 1, default: 4 }
+        requests_per_minute: { type: integer, format: int64, minimum: 1, maximum: 4294967295, default: 60 }
+        tokens_per_minute: { type: integer, format: int64, minimum: 1, maximum: 9007199254740991, default: 100000 }
+        max_concurrency: { type: integer, format: int64, minimum: 1, maximum: 4294967295, default: 4 }
         daily_budget: { oneOf: [{ $ref: '#/components/schemas/NonNegativeMoney' }, { type: 'null' }] }
         weekly_budget: { oneOf: [{ $ref: '#/components/schemas/NonNegativeMoney' }, { type: 'null' }] }
         lifetime_budget: { oneOf: [{ $ref: '#/components/schemas/NonNegativeMoney' }, { type: 'null' }] }
@@ -2307,9 +2779,9 @@ components:
       additionalProperties: false
       required: [principal_external_id, alias]
       properties:
-        tenant_external_id: { type: string, minLength: 1, maxLength: 200, default: default }
-        principal_external_id: { type: string, minLength: 1, maxLength: 200 }
-        alias: { type: string, minLength: 1, maxLength: 200 }
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$', default: default }
+        principal_external_id: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
+        alias: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
         currency: { $ref: '#/components/schemas/Currency' }
         policy: { $ref: '#/components/schemas/CredentialPolicy' }
         initial_balance: { $ref: '#/components/schemas/NonNegativeMoney' }
@@ -2356,6 +2828,52 @@ components:
         created_at: { type: integer, format: int64 }
         policy: { $ref: '#/components/schemas/CredentialPolicy' }
         available_balance: { $ref: '#/components/schemas/Money' }
+    ClientCredentialRateLimitSnapshot:
+      type: object
+      additionalProperties: false
+      required: [limit, used, remaining, reset_at]
+      properties:
+        limit: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        used: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        remaining: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        reset_at: { type: integer, format: int64, description: Unix epoch milliseconds. }
+    ClientCredentialConcurrencySnapshot:
+      type: object
+      additionalProperties: false
+      required: [limit, active, remaining]
+      properties:
+        limit: { type: integer, format: int32, minimum: 0 }
+        active: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        remaining: { type: integer, minimum: 0, maximum: 9007199254740991 }
+    ClientCredentialBudgetSnapshot:
+      type: object
+      additionalProperties: false
+      required: [limit, settled, reserved, remaining, reset_at]
+      properties:
+        limit:
+          oneOf: [{ $ref: '#/components/schemas/NonNegativeMoney' }, { type: 'null' }]
+        settled: { $ref: '#/components/schemas/NonNegativeMoney' }
+        reserved: { $ref: '#/components/schemas/NonNegativeMoney' }
+        remaining:
+          oneOf: [{ $ref: '#/components/schemas/NonNegativeMoney' }, { type: 'null' }]
+        reset_at:
+          oneOf: [{ type: integer, format: int64, description: Unix epoch milliseconds. }, { type: 'null' }]
+    ClientCredentialLimitSnapshot:
+      type: object
+      additionalProperties: false
+      required: [key_id, captured_at, currency, available_balance, reserved_balance, rpm, tpm, concurrency, daily_budget, weekly_budget, lifetime_budget]
+      properties:
+        key_id: { type: string, format: uuid }
+        captured_at: { type: integer, format: int64, description: Unix epoch milliseconds. }
+        currency: { $ref: '#/components/schemas/Currency' }
+        available_balance: { $ref: '#/components/schemas/Money' }
+        reserved_balance: { $ref: '#/components/schemas/Money' }
+        rpm: { $ref: '#/components/schemas/ClientCredentialRateLimitSnapshot' }
+        tpm: { $ref: '#/components/schemas/ClientCredentialRateLimitSnapshot' }
+        concurrency: { $ref: '#/components/schemas/ClientCredentialConcurrencySnapshot' }
+        daily_budget: { $ref: '#/components/schemas/ClientCredentialBudgetSnapshot' }
+        weekly_budget: { $ref: '#/components/schemas/ClientCredentialBudgetSnapshot' }
+        lifetime_budget: { $ref: '#/components/schemas/ClientCredentialBudgetSnapshot' }
     LegacyCredential:
       type: object
       additionalProperties: false
@@ -2385,6 +2903,7 @@ components:
         - providers:write
         - plugins:read
         - oauth:write
+        - imports:cpa:write
         - routes:read
         - routes:write
         - prices:read
@@ -2448,11 +2967,20 @@ components:
     OAuthAdapterContribution:
       type: object
       additionalProperties: false
-      required: [login_url, poll_url, refresh_url]
+      required: [api_version, flow_kind, login_url, poll_url, refresh_url]
       properties:
+        api_version: { type: string, enum: [oauth-adapter-v1] }
+        flow_kind: { type: string, enum: [cursor_pkce] }
         login_url: { type: string, format: uri }
         poll_url: { type: string, format: uri }
         refresh_url: { type: string, format: uri }
+    ComponentAdapterContribution:
+      type: object
+      additionalProperties: false
+      required: [api_version, max_response_bytes]
+      properties:
+        api_version: { type: string, enum: [buffered-v1] }
+        max_response_bytes: { type: integer, minimum: 1, maximum: 4194304 }
     ProviderType:
       type: object
       additionalProperties: false
@@ -2471,6 +2999,10 @@ components:
         oauth_adapter:
           oneOf:
             - $ref: '#/components/schemas/OAuthAdapterContribution'
+            - type: 'null'
+        component_adapter:
+          oneOf:
+            - $ref: '#/components/schemas/ComponentAdapterContribution'
             - type: 'null'
         source: { type: string }
     ApiKeyCredential:
@@ -2558,7 +3090,7 @@ components:
     UpstreamProvider:
       type: object
       additionalProperties: false
-      required: [id, tenant_id, tenant_external_id, name, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, route_count, created_at, updated_at]
+      required: [id, tenant_id, tenant_external_id, name, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, can_refresh, can_rotate, can_reauthorize, route_count, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
@@ -2571,6 +3103,9 @@ components:
         status: { type: string, enum: [active, disabled] }
         config: { type: object, additionalProperties: true }
         credential_expires_at: { type: [integer, 'null'], format: int64 }
+        can_refresh: { type: boolean, description: Managed OAuth refresh is available for the active generation. }
+        can_rotate: { type: boolean, description: The credential may be replaced without changing the stable account identity. }
+        can_reauthorize: { type: boolean, description: An interactive reauthorization endpoint is available. }
         route_count: { type: integer, format: int64, minimum: 0, description: Includes disabled routes retained for audit. }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
@@ -2685,6 +3220,46 @@ components:
             properties:
               source_fingerprint: { type: string }
               reason: { const: requires_provider_adapter }
+    CpaManagedOAuthImportCapabilities:
+      type: object
+      additionalProperties: false
+      required: [contract_version, source_types]
+      properties:
+        contract_version: { const: 1 }
+        source_types:
+          type: array
+          uniqueItems: true
+          items: { type: string, pattern: '^[a-z0-9._-]{1,64}$' }
+          description: Sorted source types contributed by the active server catalog.
+    CpaManagedOAuthImportRequest:
+      type: object
+      additionalProperties: false
+      required: [contract_version, tenant_external_id, source, source_type, document]
+      properties:
+        contract_version: { const: 1 }
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        source:
+          type: object
+          additionalProperties: false
+          required: [kind, relative_path]
+          properties:
+            kind: { const: auth_file }
+            relative_path:
+              type: string
+              minLength: 1
+              maxLength: 512
+              description: Strict POSIX relative path; absolute paths, empty/dot segments, backslashes, NUL, and control characters are rejected and never echoed.
+        source_type: { type: string, pattern: '^[a-z0-9._-]{1,64}$' }
+        document:
+          writeOnly: true
+          description: Opaque adapter input. The canonical encoded document is limited to 1 MiB; the complete request has a bounded 64 KiB JSON envelope allowance.
+    CpaManagedOAuthImportResult:
+      type: object
+      additionalProperties: false
+      required: [disposition, account]
+      properties:
+        disposition: { type: string, enum: [created, replayed] }
+        account: { $ref: '#/components/schemas/UpstreamProvider' }
     PluginManifest:
       type: object
       required: [id, version, wit_version, capabilities, contributions]
@@ -3032,6 +3607,20 @@ components:
             request_body: true
             response_body: true
             archive_complete: { type: boolean }
+            provenance:
+              oneOf:
+                - $ref: '#/components/schemas/RequestProvenance'
+                - type: 'null'
+    RequestProvenance:
+      type: object
+      additionalProperties: false
+      required: [source, disposition, unlinked, external_request_id, proof_digest]
+      properties:
+        source: { type: string, minLength: 1 }
+        disposition: { type: string, enum: [exact, unlinked] }
+        unlinked: { type: boolean }
+        external_request_id: { type: string, minLength: 1, maxLength: 512 }
+        proof_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
     StatisticsSummary:
       type: object
       required: [total_requests, successful_requests, failed_requests, input_tokens, output_tokens, total_cost]
@@ -3065,9 +3654,143 @@ components:
         errors:
           type: array
           items: { $ref: '#/components/schemas/StatisticsBucket' }
+    UsageAnalysisCost:
+      type: object
+      additionalProperties: false
+      required: [currency, cost]
+      properties:
+        currency: { $ref: '#/components/schemas/Currency' }
+        cost: { $ref: '#/components/schemas/NonNegativeMoney' }
+    UsageAnalysisMetrics:
+      type: object
+      required: [requests, success, failed, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, avg_duration_ms, p95_duration_ms, costs]
+      properties:
+        requests: { type: integer, format: int64, minimum: 0 }
+        success: { type: integer, format: int64, minimum: 0 }
+        failed: { type: integer, format: int64, minimum: 0 }
+        input_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Uncached input tokens; cached reads and writes are separate fields.
+        output_tokens: { type: integer, format: int64, minimum: 0 }
+        cached_input_tokens: { type: integer, format: int64, minimum: 0 }
+        cache_write_tokens: { type: integer, format: int64, minimum: 0 }
+        generation_units: { type: integer, format: int64, minimum: 0 }
+        avg_duration_ms: { type: [number, 'null'], format: double, minimum: 0 }
+        p95_duration_ms:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+          maximum: 60000
+          description: Fixed-histogram approximation; values above 60000 ms are capped.
+        costs:
+          type: array
+          description: Stable ascending currency order; amounts from different currencies are never added.
+          items: { $ref: '#/components/schemas/UsageAnalysisCost' }
+    UsageAnalysisDimensionBucket:
+      unevaluatedProperties: false
+      allOf:
+        - type: object
+          required: [id, label]
+          properties:
+            id: { type: string, minLength: 1 }
+            label: { type: string, minLength: 1 }
+        - $ref: '#/components/schemas/UsageAnalysisMetrics'
+    UsageAnalysisTimeBucket:
+      unevaluatedProperties: false
+      allOf:
+        - type: object
+          required: [bucket_start]
+          properties:
+            bucket_start:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Inclusive UTC bucket start as Unix epoch milliseconds.
+        - $ref: '#/components/schemas/UsageAnalysisMetrics'
+    UsageAnalysisHeatmapBucket:
+      unevaluatedProperties: false
+      allOf:
+        - type: object
+          required: [hour_of_week]
+          properties:
+            hour_of_week:
+              type: integer
+              minimum: 0
+              maximum: 167
+              description: Monday 00:00 UTC is 0; Sunday 23:00 UTC is 167.
+        - $ref: '#/components/schemas/UsageAnalysisMetrics'
+    UsageAnalysis:
+      type: object
+      additionalProperties: false
+      required: [from_created_at, to_created_at, granularity, time_zone, p95_is_approximate, p95_method, summary, time_series, by_model, by_key, by_upstream, by_protocol, by_status, errors, heatmap]
+      properties:
+        from_created_at: { type: integer, format: int64, minimum: 0 }
+        to_created_at: { type: integer, format: int64, minimum: 0 }
+        granularity: { type: string, enum: [hour, day] }
+        time_zone: { type: string, const: UTC }
+        p95_is_approximate: { type: boolean, const: true }
+        p95_method: { type: string, const: fixed_histogram_upper_bound_capped_60000ms }
+        summary: { $ref: '#/components/schemas/UsageAnalysisMetrics' }
+        time_series:
+          type: array
+          items: { $ref: '#/components/schemas/UsageAnalysisTimeBucket' }
+        by_model:
+          type: array
+          maxItems: 100
+          description: >-
+            `id` is the exact model value accepted by the `model` query filter;
+            `label` is the same user-visible model name.
+          items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
+        by_key:
+          type: array
+          maxItems: 100
+          description: >-
+            `id` is the stable client-credential UUID accepted by `key_id`;
+            `label` is its current alias and is never used as filter identity.
+          items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
+        by_upstream:
+          type: array
+          maxItems: 100
+          description: >-
+            `id` is a stable upstream UUID or the `unassigned` sentinel, both
+            accepted by this operation's `upstream_account_id` filter. Clients
+            localize the sentinel label.
+          items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
+        by_protocol:
+          type: array
+          maxItems: 100
+          description: >-
+            `id` is one canonical protocol family accepted by `protocol`:
+            `openai`, `anthropic`, `openai-image`, or `generation`.
+          items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
+        by_status:
+          type: array
+          maxItems: 100
+          description: >-
+            `id` is the public logical filter value `success` or `error`; the
+            internal rollup value `failure` is never exposed.
+          items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
+        errors:
+          type: array
+          maxItems: 100
+          description: >-
+            `id` is an exact non-empty value accepted by `error_code`. Empty
+            success sentinels are omitted. Ordering is request count descending,
+            then error id ascending.
+          items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
+        heatmap:
+          type: array
+          maxItems: 168
+          description: >-
+            `hour_of_week` is a UTC display coordinate, not a query-filter
+            sentinel. Missing coordinates mean zero activity and are filled by
+            the client.
+          items: { $ref: '#/components/schemas/UsageAnalysisHeatmapBucket' }
     GenerationJob:
       type: object
-      required: [job_id, created_at, updated_at, completed_at, model, driver, status, upstream_job_id, estimated_units, billed_units, cost, error_code, result]
+      required: [job_id, created_at, updated_at, completed_at, model, driver, status, upstream_job_id, estimated_units, billed_units, cost, error_code, result, assets]
       properties:
         job_id: { type: string, format: uuid }
         created_at: { type: integer, format: int64 }
@@ -3082,6 +3805,19 @@ components:
         cost: { $ref: '#/components/schemas/Money' }
         error_code: { type: [string, 'null'] }
         result: true
+        assets:
+          type: array
+          items: { $ref: '#/components/schemas/GenerationAsset' }
+    GenerationAsset:
+      type: object
+      additionalProperties: false
+      required: [asset_id, index, mime_type, size_bytes, filename]
+      properties:
+        asset_id: { type: string, format: uuid }
+        index: { type: integer, format: int64, minimum: 0 }
+        mime_type: { type: string, minLength: 1 }
+        size_bytes: { type: integer, format: int64, minimum: 0 }
+        filename: { type: string, minLength: 1 }
     ConversationCluster:
       type: object
       required: [cluster_id, explicit_session_id, updated_at, request_count, candidate_edge_count]
@@ -3100,17 +3836,44 @@ components:
         relation: { type: string, enum: [continues, retry, edit, branch, compacts, subagent, candidate] }
         confidence: { type: number, minimum: 0, maximum: 1 }
         evidence: { type: object, additionalProperties: true }
+    ConversationRequest:
+      allOf:
+        - $ref: '#/components/schemas/RequestSummary'
+        - type: object
+          required: [source, provenance, unlinked]
+          properties:
+            source: { type: string, enum: [live, session_archive] }
+            provenance: { type: string, enum: [native, archive_unlinked] }
+            unlinked: { type: boolean }
+            archive_source: { type: string }
+            external_request_id: { type: string, maxLength: 512 }
     ConversationDetail:
       type: object
-      required: [cluster, requests, edges]
+      required: [cluster, requests, edges, has_more, next_cursor, edges_truncated]
       properties:
         cluster: { $ref: '#/components/schemas/ConversationCluster' }
         requests:
           type: array
-          items: { $ref: '#/components/schemas/RequestSummary' }
+          items: { $ref: '#/components/schemas/ConversationRequest' }
         edges:
           type: array
           items: { $ref: '#/components/schemas/ConversationEdge' }
+        has_more:
+          type: boolean
+          description: Whether an older request page remains.
+        next_cursor:
+          oneOf:
+            - $ref: '#/components/schemas/ConversationCursor'
+            - type: 'null'
+        edges_truncated:
+          type: boolean
+          description: Whether the hard per-page edge bound omitted additional edges.
+    ConversationCursor:
+      type: object
+      required: [before_created_at, before_request_id]
+      properties:
+        before_created_at: { type: integer, format: int64 }
+        before_request_id: { type: string, format: uuid }
     OpenAIModelList:
       type: object
       required: [object, data]

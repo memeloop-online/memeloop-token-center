@@ -3,8 +3,8 @@ use memeloop_token_center::{
         CreateGenerationJobInput, CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput,
         CreateUpstreamAccountInput, Database, FinishGenerationJobInput,
     },
-    error::AppError,
-    model::KeyPolicy,
+    error::{AppError, LimitReason},
+    model::{ArchivedGenerationAsset, GenerationStagedAssets, KeyPolicy},
     provider::UpstreamCredential,
 };
 use rust_decimal::Decimal;
@@ -66,7 +66,7 @@ async fn postgres_budget_reservations_and_settlement_replays_are_serialized() {
     for task in tasks {
         match task.await.unwrap() {
             Ok(value) => reservation = Some(value),
-            Err(AppError::QuotaExceeded) => rejected += 1,
+            Err(AppError::LimitExceeded { .. }) => rejected += 1,
             result => panic!("unexpected PostgreSQL budget result: {result:?}"),
         }
     }
@@ -94,6 +94,92 @@ async fn postgres_budget_reservations_and_settlement_replays_are_serialized() {
         .filter(|entry| entry.kind == "usage")
         .count();
     assert_eq!(usage_entries, 1);
+}
+
+#[tokio::test]
+async fn postgres_long_running_reservations_enforce_authoritative_concurrency() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let database = Database::connect_with_max(&database_url, 16).await.unwrap();
+    database.migrate().await.unwrap();
+    let unique = Uuid::now_v7();
+    let pepper = b"postgres concurrency pepper longer than thirty-two bytes";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("postgres-concurrency-{unique}"),
+                principal_external_id: "member".to_owned(),
+                alias: "long-task".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    requests_per_minute: 100,
+                    tokens_per_minute: 100_000,
+                    max_concurrency: 1,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(
+            &format!("postgres-concurrency-{unique}"),
+            "USD",
+            Decimal::ZERO,
+            Decimal::ONE,
+        )
+        .await
+        .unwrap();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let database = database.clone();
+        let key = key.clone();
+        let price = price.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            database.reserve_usage(&key, &price, 0, 100).await
+        }));
+    }
+    let mut accepted = Vec::new();
+    let mut rejected = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(reservation) => accepted.push(reservation),
+            Err(AppError::LimitExceeded {
+                reason: LimitReason::ConcurrencyExhausted,
+                retry_after_seconds: Some(1),
+            }) => rejected += 1,
+            result => panic!("unexpected PostgreSQL concurrency result: {result:?}"),
+        }
+    }
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(rejected, 7);
+    let snapshot = database.key_limit_snapshot(issued.key_id).await.unwrap();
+    assert_eq!(snapshot.concurrency.active, 1);
+    assert_eq!(snapshot.concurrency.remaining, 0);
+
+    database.settle_usage(&accepted[0], 0, 100).await.unwrap();
+    assert_eq!(
+        database
+            .key_limit_snapshot(issued.key_id)
+            .await
+            .unwrap()
+            .concurrency
+            .active,
+        0
+    );
+    let next = database.reserve_usage(&key, &price, 0, 100).await.unwrap();
+    database.settle_usage(&next, 0, 100).await.unwrap();
 }
 
 #[tokio::test]
@@ -213,6 +299,91 @@ async fn postgres_credential_rotations_are_locked_and_idempotent() {
 }
 
 #[tokio::test]
+async fn postgres_oauth_refresh_has_one_account_generation_lease() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let database = Database::connect_with_max(&database_url, 16).await.unwrap();
+    database.migrate().await.unwrap();
+    let unique = Uuid::now_v7();
+    let pepper: &'static [u8] = b"postgres OAuth lease pepper longer than thirty-two bytes";
+    let account = database
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: format!("postgres-oauth-lease-{unique}"),
+                name: "managed-oauth".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url": "https://api.example.test"}),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "postgres-access-v1".into(),
+                    refresh_token: Some("postgres-refresh-v1".into()),
+                    expires_at: Some(memeloop_token_center::db::unix_millis() + 60_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: None,
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("cursor".into()),
+                oauth_refresh_url: Some("https://oauth.example.test/refresh".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = Vec::new();
+    for index in 0..8 {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        let key = format!("postgres-oauth-{unique}-{index}");
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let result = database
+                .begin_upstream_oauth_refresh(account.id, &key, pepper)
+                .await;
+            (key, result)
+        }));
+    }
+    let mut winner = None;
+    let mut conflicts = 0;
+    for task in tasks {
+        let (key, result) = task.await.unwrap();
+        match result {
+            Ok(None) => winner = Some(key),
+            Err(AppError::Conflict(_)) => conflicts += 1,
+            other => panic!("unexpected PostgreSQL OAuth lease result: {other:?}"),
+        }
+    }
+    assert_eq!(conflicts, 7);
+    let winner = winner.expect("one refresh lease winner");
+    let refreshed = database
+        .finish_upstream_oauth_refresh(
+            account.id,
+            UpstreamCredential::OAuth {
+                access_token: "postgres-access-v2".into(),
+                refresh_token: Some("postgres-refresh-v2".into()),
+                expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: None,
+            },
+            &winner,
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshed.id, account.id);
+    assert_eq!(refreshed.credential_generation, 2);
+    let replay = database
+        .begin_upstream_oauth_refresh(account.id, &winner, pepper)
+        .await
+        .unwrap()
+        .expect("PostgreSQL exact committed replay");
+    assert_eq!(replay.id, account.id);
+    assert_eq!(replay.credential_generation, 2);
+}
+
+#[tokio::test]
 async fn postgres_migrations_queue_aggregates_and_events_work_together() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
@@ -220,6 +391,19 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
     let database = Database::connect(&database_url).await.unwrap();
     database.migrate().await.unwrap();
     database.maintain_partitions().await.unwrap();
+
+    let index_pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let default_history_indexes_ready: bool = sqlx::query_scalar(
+        "SELECT to_regclass(current_schema() || '.request_records_recent_idx') IS NOT NULL AND to_regclass(current_schema() || '.request_events_global_cursor_idx') IS NOT NULL",
+    )
+    .fetch_one(&index_pool)
+    .await
+    .unwrap();
+    assert!(
+        default_history_indexes_ready,
+        "fresh PostgreSQL migrations must install global request and SSE cursor indexes"
+    );
+    index_pool.close().await;
 
     let unique = Uuid::now_v7();
     let tenant = format!("postgres-test-{unique}");
@@ -255,6 +439,8 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
                 config: json!({"base_url": "http://comfy.example.test", "api_prefix": ""}),
                 credential: UpstreamCredential::None,
                 oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
             },
             pepper,
         )
@@ -302,20 +488,92 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
         .unwrap()
         .expect("queued generation job");
     assert_eq!(claimed.job_id, job_id);
-    let cost = database.settle_usage(&reservation, 0, 1).await.unwrap();
-    let result = json!({"archive_objects": ["objects/blake3/test-result"]});
+    let submission_nonce = Uuid::now_v7();
     database
+        .mark_generation_submitting(job_id, "postgres-integration-worker", submission_nonce)
+        .await
+        .unwrap();
+    database
+        .mark_generation_submitted(
+            job_id,
+            "postgres-integration-worker",
+            submission_nonce,
+            "postgres-upstream-generation-job",
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2_050)).await;
+    let claimed = database
+        .claim_generation_job("postgres-integration-worker")
+        .await
+        .unwrap()
+        .expect("running generation job");
+    assert_eq!(claimed.job_id, job_id);
+    let attempt_nonce = Uuid::now_v7();
+    let asset = ArchivedGenerationAsset {
+        asset_id: Uuid::now_v7(),
+        index: 0,
+        object_locator: format!("staging/generation/{job_id}/{attempt_nonce}/asset-0"),
+        mime_type: "image/png".to_owned(),
+        size_bytes: 17,
+        filename: "test-result.png".to_owned(),
+    };
+    let manifest = GenerationStagedAssets {
+        attempt_nonce,
+        billed_units: 1,
+        assets: vec![asset.clone()],
+    };
+    database
+        .save_generation_staged_assets(job_id, "postgres-integration-worker", &manifest)
+        .await
+        .unwrap();
+    let cost = database
         .finish_generation_job(FinishGenerationJobInput {
             job_id,
             worker_id: "postgres-integration-worker",
             status: "succeeded",
             billed_units: 1,
-            cost_micros: cost,
-            result: Some(&result),
             error_code: None,
+            assets: std::slice::from_ref(&asset),
+            staged_assets: Some(&manifest),
         })
         .await
         .unwrap();
+    assert_eq!(cost, 250_000);
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let mut terminal_replays = Vec::new();
+    for _ in 0..8 {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        let replay_manifest = manifest.clone();
+        terminal_replays.push(tokio::spawn(async move {
+            barrier.wait().await;
+            database
+                .finish_generation_job(FinishGenerationJobInput {
+                    job_id,
+                    worker_id: "postgres-integration-worker",
+                    status: "succeeded",
+                    billed_units: 1,
+                    error_code: None,
+                    assets: &replay_manifest.assets,
+                    staged_assets: Some(&replay_manifest),
+                })
+                .await
+        }));
+    }
+    for replay in terminal_replays {
+        assert_eq!(replay.await.unwrap().unwrap(), 250_000);
+    }
+    assert_eq!(
+        database
+            .list_account_ledger(issued.account_id, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.kind == "usage" && entry.source == reservation.id.to_string())
+            .count(),
+        1
+    );
 
     let stats = database.stats(key.key_id).await.unwrap();
     assert_eq!(stats.summary.total_requests, 1);
@@ -335,6 +593,16 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
         .await
         .unwrap();
     assert_eq!(key_detail.view.protocol, "generation");
+    let result = json!({
+        "provider": {"status": "success"},
+        "assets": [{
+            "asset_id": asset.asset_id,
+            "index": 0,
+            "mime_type": "image/png",
+            "size_bytes": 17,
+            "filename": "test-result.png"
+        }]
+    });
     assert_eq!(key_detail.response_json, Some(result.clone()));
     let operator_detail = database
         .request_archive_refs_for_tenant(&tenant, job_id)

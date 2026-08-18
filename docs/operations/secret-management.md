@@ -11,11 +11,21 @@ The default Secret references contain:
 
 - `database-url`;
 - `key-pepper`;
-- `service-token` bootstrap credential;
+- `service-token` bootstrap credential, generated from at least 32 random bytes
+  and encoded without Unicode whitespace or `Cc` control characters;
 - `s3-access-key` and `s3-secret-key`.
 
 Upstream credentials and issued review credentials are separate operational
 secrets and must have an owner, purpose and expiry.
+
+The application enforces the `service-token` format at startup: its encoded
+value must be at least 32 bytes and must not contain Unicode whitespace or
+Unicode General Category `Cc` control characters anywhere. Rejecting them
+avoids ambiguity from Secret-file line endings and invisible characters in a
+copied bearer credential. Generate the token in the secret manager when
+possible; `openssl rand -hex 32` is an offline equivalent that generates 32
+random bytes and encodes them as 64 printable ASCII characters. This check is a
+minimum format rule and does not measure the value's entropy.
 
 ## Avoid last-applied disclosure
 

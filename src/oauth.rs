@@ -7,16 +7,27 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
+pub mod managed;
+
 use crate::{
     error::AppError,
     network::{self, OutboundScope},
-    provider::{UpstreamCredential, open_private_json, seal_private_json, validate_config},
+    provider::{
+        MANAGED_OAUTH_ADAPTER_API_VERSION, ManagedOAuthAdapterBackend, ProviderCatalog,
+        ResolvedManagedOAuthAdapter, UpstreamCredential, open_private_json, seal_private_json,
+        validate_config,
+    },
 };
 
 const CURSOR_LOGIN_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-login/v1";
 const SUBSCRIPTION_BRIDGE_LOGIN_AAD: &[u8] =
     b"memeloop-token-center/subscription-bridge-oauth-login/v1";
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_MANAGED_OAUTH_REQUEST_BYTES: usize = MAX_OAUTH_RESPONSE_BYTES + 64 * 1024;
+#[cfg(not(test))]
+const MANAGED_OAUTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const MANAGED_OAUTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
 pub const DEFAULT_CURSOR_LOGIN_URL: &str = "https://cursor.com/loginDeepControl";
 pub const DEFAULT_CURSOR_POLL_URL: &str = "https://api2.cursor.sh/auth/poll";
@@ -80,6 +91,7 @@ struct CursorLoginState {
     account_name: String,
     provider_driver: String,
     provider_config: Value,
+    oauth_driver: String,
     uuid: String,
     verifier: String,
     poll_url: String,
@@ -94,6 +106,8 @@ pub struct ReadyCursorLogin {
     pub account_name: String,
     pub provider_driver: String,
     pub provider_config: Value,
+    pub oauth_driver: String,
+    pub refresh_url: String,
     pub credential: UpstreamCredential,
 }
 
@@ -139,6 +153,208 @@ pub enum SubscriptionBridgePollResult {
         message: Option<String>,
     },
     Ready(Box<ReadySubscriptionBridgeLogin>),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedOAuthNormalizedAccount {
+    pub account_name: String,
+    pub config: Value,
+    pub enabled: bool,
+    pub credential: UpstreamCredential,
+}
+
+#[derive(Serialize)]
+struct ManagedOAuthNormalizeRequest<'a> {
+    api_version: &'static str,
+    source_type: &'a str,
+    payload: &'a Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedOAuthNormalizeResponse {
+    api_version: String,
+    account: ManagedOAuthNormalizedAccount,
+}
+
+#[derive(Serialize)]
+struct ManagedOAuthRefreshRequest<'a> {
+    api_version: &'static str,
+    credential: &'a UpstreamCredential,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedOAuthRefreshResponse {
+    api_version: String,
+    credential: UpstreamCredential,
+}
+
+/// Normalize an opaque CPA managed-OAuth payload with an administrator-owned
+/// catalog contribution. The caller cannot provide either destination URL.
+pub async fn normalize_managed_oauth_document(
+    http: &reqwest::Client,
+    adapter: &ResolvedManagedOAuthAdapter,
+    payload: &Value,
+    allow_test_loopback: bool,
+) -> Result<ManagedOAuthNormalizedAccount, AppError> {
+    match adapter.backend() {
+        ManagedOAuthAdapterBackend::BuiltinCodex => {
+            return managed::codex::normalize(payload);
+        }
+        ManagedOAuthAdapterBackend::BuiltinLegacyGemini => {
+            return managed::legacy_gemini::normalize(payload);
+        }
+        ManagedOAuthAdapterBackend::ReviewedHttp { .. } => {}
+    }
+    let request = ManagedOAuthNormalizeRequest {
+        api_version: MANAGED_OAUTH_ADAPTER_API_VERSION,
+        source_type: adapter.source_type(),
+        payload,
+    };
+    let body = serde_json::to_vec(&request)
+        .map_err(|_| AppError::BadRequest("managed OAuth payload is invalid".into()))?;
+    if body.len() > MAX_MANAGED_OAUTH_REQUEST_BYTES {
+        return Err(AppError::BadRequest(
+            "managed OAuth payload exceeds its size limit".into(),
+        ));
+    }
+    let endpoint = adapter.normalize_url().ok_or(AppError::Internal)?;
+    let response = managed_oauth_adapter_call(http, endpoint, body, allow_test_loopback).await?;
+    let response: ManagedOAuthNormalizeResponse = serde_json::from_slice(&response)
+        .map_err(|_| AppError::Upstream("managed OAuth adapter returned invalid JSON".into()))?;
+    if response.api_version != MANAGED_OAUTH_ADAPTER_API_VERSION
+        || response.account.account_name.trim().is_empty()
+        || response.account.account_name.len() > 200
+        || !matches!(
+            response.account.credential,
+            UpstreamCredential::OAuth { .. }
+        )
+    {
+        return Err(AppError::Upstream(
+            "managed OAuth adapter returned an invalid result".into(),
+        ));
+    }
+    let _ = validate_config(&response.account.config).map_err(|_| {
+        AppError::Upstream("managed OAuth adapter returned an invalid result".into())
+    })?;
+    if let Some(state) = response.account.credential.adapter_state() {
+        crate::provider::validate_adapter_state(state).map_err(|_| {
+            AppError::Upstream("managed OAuth adapter returned an invalid result".into())
+        })?;
+    }
+    Ok(response.account)
+}
+
+pub async fn refresh_managed_oauth_credential(
+    http: &reqwest::Client,
+    adapter: &ResolvedManagedOAuthAdapter,
+    credential: &UpstreamCredential,
+    allow_test_loopback: bool,
+) -> Result<UpstreamCredential, AppError> {
+    if !matches!(credential, UpstreamCredential::OAuth { .. })
+        || !credential.has_oauth_refresh_state()
+    {
+        return Err(AppError::BadRequest(
+            "managed OAuth credential has no refresh state".into(),
+        ));
+    }
+    match adapter.backend() {
+        ManagedOAuthAdapterBackend::BuiltinCodex => {
+            return managed::codex::refresh(http, credential, allow_test_loopback).await;
+        }
+        ManagedOAuthAdapterBackend::BuiltinLegacyGemini => {
+            return managed::legacy_gemini::refresh_unavailable();
+        }
+        ManagedOAuthAdapterBackend::ReviewedHttp { .. } => {}
+    }
+    let request = ManagedOAuthRefreshRequest {
+        api_version: MANAGED_OAUTH_ADAPTER_API_VERSION,
+        credential,
+    };
+    let body = serde_json::to_vec(&request).map_err(|_| AppError::Internal)?;
+    if body.len() > MAX_MANAGED_OAUTH_REQUEST_BYTES {
+        return Err(AppError::BadRequest(
+            "managed OAuth credential exceeds its size limit".into(),
+        ));
+    }
+    let response =
+        managed_oauth_adapter_call(http, adapter.refresh_url(), body, allow_test_loopback).await?;
+    let response: ManagedOAuthRefreshResponse = serde_json::from_slice(&response)
+        .map_err(|_| AppError::Upstream("managed OAuth adapter returned invalid JSON".into()))?;
+    if response.api_version != MANAGED_OAUTH_ADAPTER_API_VERSION
+        || !matches!(response.credential, UpstreamCredential::OAuth { .. })
+    {
+        return Err(AppError::Upstream(
+            "managed OAuth adapter returned an invalid result".into(),
+        ));
+    }
+    response
+        .credential
+        .validate(crate::db::unix_millis())
+        .map_err(|_| {
+            AppError::Upstream("managed OAuth adapter returned an invalid result".into())
+        })?;
+    Ok(response.credential)
+}
+
+/// Resolve a refresh endpoint from the current catalog and compare the stored
+/// snapshot only as consistency evidence. The returned endpoint always comes
+/// from the current server/plugin catalog.
+pub fn resolve_managed_oauth_refresh_adapter(
+    catalog: &ProviderCatalog,
+    driver: &str,
+    stored_refresh_url: &str,
+) -> Result<ResolvedManagedOAuthAdapter, AppError> {
+    let adapter = catalog.managed_oauth_adapter_for_driver(driver)?;
+    if !adapter.can_refresh() {
+        return Err(AppError::BadRequest(
+            "managed OAuth adapter does not support refresh".into(),
+        ));
+    }
+    if adapter.api_version() != MANAGED_OAUTH_ADAPTER_API_VERSION
+        || adapter.refresh_url() != stored_refresh_url
+    {
+        return Err(AppError::Conflict(
+            "managed OAuth adapter lifecycle metadata no longer matches the active catalog".into(),
+        ));
+    }
+    Ok(adapter)
+}
+
+async fn managed_oauth_adapter_call(
+    shared_http: &reqwest::Client,
+    endpoint: &str,
+    body: Vec<u8>,
+    allow_test_loopback: bool,
+) -> Result<Vec<u8>, AppError> {
+    let (url, scope) = managed_oauth_endpoint_scope(endpoint, allow_test_loopback)?;
+    let client = match scope {
+        OutboundScope::Public => {
+            network::client_for_url(shared_http, url.as_str(), scope, allow_test_loopback).await?
+        }
+        OutboundScope::Private => crate::build_http_client().map_err(|_| AppError::Internal)?,
+    };
+    let response = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .timeout(MANAGED_OAUTH_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| AppError::Upstream("managed OAuth adapter request failed".into()))?;
+    if !response.status().is_success() {
+        return Err(AppError::Upstream(
+            "managed OAuth adapter rejected the request".into(),
+        ));
+    }
+    bounded_body(response).await.map_err(|error| match error {
+        AppError::Upstream(_) => {
+            AppError::Upstream("managed OAuth adapter response exceeds its limit".into())
+        }
+        _ => AppError::Internal,
+    })
 }
 
 pub async fn start_subscription_bridge_login(
@@ -345,7 +561,7 @@ async fn subscription_bridge_call(
 }
 
 pub fn start_cursor_login(
-    mut input: StartCursorLogin,
+    input: StartCursorLogin,
     key_material: &[u8],
     now: i64,
 ) -> Result<OAuthLoginStart, AppError> {
@@ -376,21 +592,13 @@ pub fn start_cursor_login(
         .append_pair("mode", "login")
         .append_pair("redirectTarget", "cli");
     let expires_at = now.saturating_add(10 * 60 * 1000);
-    if let Some(config) = input.provider_config.as_object_mut() {
-        config.insert(
-            "oauth".to_owned(),
-            json!({
-                "driver": oauth_driver.clone(),
-                "refresh_url": refresh_url.as_str()
-            }),
-        );
-    }
     let state = CursorLoginState {
         session_id: Uuid::now_v7(),
         tenant_external_id: input.tenant_external_id,
         account_name: input.account_name.trim().to_owned(),
         provider_driver: input.provider_driver,
         provider_config: input.provider_config,
+        oauth_driver: oauth_driver.clone(),
         uuid,
         verifier,
         poll_url: poll_url.to_string(),
@@ -428,12 +636,7 @@ pub async fn poll_cursor_login(
         .query_pairs_mut()
         .append_pair("uuid", &state.uuid)
         .append_pair("verifier", &state.verifier);
-    let scope = if state
-        .provider_config
-        .pointer("/oauth/driver")
-        .and_then(Value::as_str)
-        == Some("provider_adapter")
-    {
+    let scope = if state.oauth_driver == "provider_adapter" {
         // Plugin adapters are installed by the cluster administrator and may
         // intentionally expose their poll endpoint only inside the cluster.
         OutboundScope::Private
@@ -480,12 +683,15 @@ pub async fn poll_cursor_login(
         account_name: state.account_name,
         provider_driver: state.provider_driver,
         provider_config: state.provider_config,
+        oauth_driver: state.oauth_driver,
+        refresh_url: state.refresh_url,
         credential: UpstreamCredential::OAuth {
             access_token: tokens.access_token,
             refresh_token: (!tokens.refresh_token.is_empty()).then_some(tokens.refresh_token),
             expires_at: Some(expires_at),
             header: "authorization".to_owned(),
             prefix: "Bearer ".to_owned(),
+            adapter_state: None,
         },
     })))
 }
@@ -513,7 +719,7 @@ pub async fn refresh_cursor_credential(
         .body("{}")
         .send()
         .await
-        .map_err(|error| AppError::Upstream(format!("Cursor OAuth refresh failed: {error}")))?;
+        .map_err(|_| AppError::Upstream("Cursor OAuth refresh failed".into()))?;
     if !response.status().is_success() {
         return Err(AppError::Upstream(format!(
             "Cursor OAuth refresh returned {}",
@@ -551,6 +757,7 @@ pub async fn refresh_cursor_credential(
         expires_at: Some(expires_at),
         header: "authorization".to_owned(),
         prefix: "Bearer ".to_owned(),
+        adapter_state: credential.adapter_state().cloned(),
     })
 }
 
@@ -563,12 +770,76 @@ pub(crate) fn validate_oauth_endpoint(value: &str, field: &str) -> Result<Url, A
             "OAuth {field} must use HTTPS (private cluster HTTP is allowed)"
         )));
     }
-    if url.username() != "" || url.password().is_some() {
+    if url.username() != "" || url.password().is_some() || url.fragment().is_some() {
         return Err(AppError::BadRequest(format!(
-            "OAuth {field} cannot contain credentials"
+            "OAuth {field} cannot contain credentials or a fragment"
         )));
     }
     Ok(url)
+}
+
+pub(crate) fn validate_managed_oauth_adapter_endpoint(
+    value: &str,
+    field: &str,
+) -> Result<Url, AppError> {
+    validate_managed_oauth_adapter_endpoint_inner(value, field, false)
+}
+
+fn validate_managed_oauth_adapter_endpoint_inner(
+    value: &str,
+    field: &str,
+    allow_test_loopback: bool,
+) -> Result<Url, AppError> {
+    let url = validate_oauth_endpoint(value, field)?;
+    if url.query().is_some() {
+        return Err(AppError::BadRequest(format!(
+            "OAuth {field} cannot contain a query"
+        )));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| AppError::BadRequest(format!("OAuth {field} must include a host")))?;
+    if let Ok(address) = host.parse::<std::net::IpAddr>()
+        && !(allow_test_loopback && address.is_loopback())
+        && !crate::network::is_public_ip(address)
+    {
+        return Err(AppError::BadRequest(format!(
+            "OAuth {field} cannot target a private or reserved IP address"
+        )));
+    }
+    Ok(url)
+}
+
+fn managed_oauth_endpoint_scope(
+    value: &str,
+    allow_test_loopback: bool,
+) -> Result<(Url, OutboundScope), AppError> {
+    let url =
+        validate_managed_oauth_adapter_endpoint_inner(value, "adapter_url", allow_test_loopback)?;
+    let host = url.host_str().ok_or_else(|| {
+        AppError::BadRequest("managed OAuth adapter URL must include a host".into())
+    })?;
+    if host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+    {
+        if !allow_test_loopback {
+            return Err(AppError::BadRequest(
+                "managed OAuth adapter loopback destinations are disabled".into(),
+            ));
+        }
+        return Ok((url, OutboundScope::Private));
+    }
+    let private_cluster =
+        !host.contains('.') || host.ends_with(".svc") || host.ends_with(".svc.cluster.local");
+    Ok((
+        url,
+        if private_cluster {
+            OutboundScope::Private
+        } else {
+            OutboundScope::Public
+        },
+    ))
 }
 
 fn is_private_oauth_host(host: &str) -> bool {
@@ -616,6 +887,10 @@ fn token_expiry_millis(token: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, method, path},
+    };
 
     #[test]
     fn cursor_login_state_is_encrypted_and_contains_pkce_query() {
@@ -691,6 +966,40 @@ mod tests {
         assert!(matches!(error, AppError::Forbidden));
     }
 
+    #[tokio::test]
+    async fn cursor_refresh_transport_errors_never_echo_the_request_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let query_secret = "refresh-query-secret";
+        let endpoint = format!("http://{address}/refresh?token={query_secret}");
+        let credential = UpstreamCredential::OAuth {
+            access_token: "old-access-secret".into(),
+            refresh_token: Some("old-refresh-secret".into()),
+            expires_at: Some(1),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+        };
+        let error = refresh_cursor_credential(
+            &crate::build_http_client().unwrap(),
+            &endpoint,
+            &credential,
+            crate::db::unix_millis(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "configured upstream is unavailable: Cursor OAuth refresh failed"
+        );
+        let rendered = format!("{error:?} {error}");
+        let address = address.to_string();
+        for secret in [query_secret, "old-refresh-secret", address.as_str()] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
     #[test]
     fn subscription_bridge_accepts_only_cluster_services_or_test_loopback() {
         let cluster = json!({"base_url":"http://cpa-bridge.cliproxyapi.svc.cluster.local"});
@@ -700,5 +1009,204 @@ mod tests {
         assert!(validate_subscription_bridge_base_url(&loopback, true).is_ok());
         let public = json!({"base_url":"https://example.com"});
         assert!(validate_subscription_bridge_base_url(&public, false).is_err());
+    }
+
+    fn managed_adapter(server: &MockServer) -> ResolvedManagedOAuthAdapter {
+        ResolvedManagedOAuthAdapter::for_test(
+            "managed-mock",
+            "codex-test",
+            format!("{}/normalize", server.uri()),
+            format!("{}/refresh", server.uri()),
+        )
+    }
+
+    fn assert_managed_error_is_redacted(error: &AppError) {
+        let rendered = format!("{error:?} {error}");
+        for secret in [
+            "source-document-secret",
+            "response-body-secret",
+            "adapter-token-secret",
+            "127.0.0.1",
+            "/normalize",
+        ] {
+            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_normalize_uses_fixed_protocol_and_returns_bounded_typed_result() {
+        let server = MockServer::start().await;
+        let adapter = managed_adapter(&server);
+        Mock::given(method("POST"))
+            .and(path("/normalize"))
+            .and(body_json(json!({
+                "api_version": MANAGED_OAUTH_ADAPTER_API_VERSION,
+                "source_type": "codex-test",
+                "payload": {"secret": "source-document-secret"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "api_version": MANAGED_OAUTH_ADAPTER_API_VERSION,
+                "account": {
+                    "account_name": "Imported Codex",
+                    "config": {"base_url": "https://api.example.test"},
+                    "enabled": true,
+                    "credential": {
+                        "type": "oauth",
+                        "access_token": "adapter-token-secret",
+                        "refresh_token": "refresh-secret",
+                        "expires_at": 4_102_444_800_000_i64,
+                        "adapter_state": {"family": "opaque-state"}
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let normalized = normalize_managed_oauth_document(
+            &crate::build_http_client().unwrap(),
+            &adapter,
+            &json!({"secret": "source-document-secret"}),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(normalized.account_name, "Imported Codex");
+        assert_eq!(
+            normalized.credential.adapter_state().unwrap()["family"],
+            "opaque-state"
+        );
+        assert!(!format!("{:?}", normalized.credential).contains("adapter-token-secret"));
+    }
+
+    #[tokio::test]
+    async fn managed_normalize_never_follows_redirects_or_echoes_failures() {
+        let server = MockServer::start().await;
+        let adapter = managed_adapter(&server);
+        Mock::given(path("/normalize"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/target", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/target"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("response-body-secret"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let error = normalize_managed_oauth_document(
+            &crate::build_http_client().unwrap(),
+            &adapter,
+            &json!({"secret": "source-document-secret"}),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_managed_error_is_redacted(&error);
+    }
+
+    #[tokio::test]
+    async fn managed_normalize_rejects_oversize_timeout_and_invalid_json_without_echoing_data() {
+        let responses = [
+            ResponseTemplate::new(200)
+                .set_body_string("response-body-secret".repeat(MAX_OAUTH_RESPONSE_BYTES / 20 + 2)),
+            ResponseTemplate::new(200)
+                .set_body_string("response-body-secret")
+                .set_delay(std::time::Duration::from_millis(500)),
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"api_version": "wrong", "secret": "response-body-secret"})),
+        ];
+        for response in responses {
+            let server = MockServer::start().await;
+            let adapter = managed_adapter(&server);
+            Mock::given(path("/normalize"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            let error = normalize_managed_oauth_document(
+                &crate::build_http_client().unwrap(),
+                &adapter,
+                &json!({"secret": "source-document-secret"}),
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert_managed_error_is_redacted(&error);
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_refresh_rejects_an_expired_replacement_credential() {
+        let server = MockServer::start().await;
+        let adapter = managed_adapter(&server);
+        Mock::given(method("POST"))
+            .and(path("/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "api_version": MANAGED_OAUTH_ADAPTER_API_VERSION,
+                "credential": {
+                    "type": "oauth",
+                    "access_token": "adapter-token-secret",
+                    "refresh_token": "replacement-refresh-secret",
+                    "expires_at": crate::db::unix_millis() - 1,
+                    "adapter_state": {"family": "response-body-secret"}
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let current: UpstreamCredential = serde_json::from_value(json!({
+            "type": "oauth",
+            "access_token": "current-access-secret",
+            "refresh_token": "current-refresh-secret",
+            "expires_at": crate::db::unix_millis() + 60_000
+        }))
+        .unwrap();
+        let error = refresh_managed_oauth_credential(
+            &crate::build_http_client().unwrap(),
+            &adapter,
+            &current,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_managed_error_is_redacted(&error);
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains("current-refresh-secret"));
+        assert!(!rendered.contains("replacement-refresh-secret"));
+    }
+
+    #[test]
+    fn managed_refresh_resolution_uses_current_catalog_and_fixed_mismatch_errors() {
+        let catalog = ProviderCatalog::builtins();
+        let adapter = resolve_managed_oauth_refresh_adapter(
+            &catalog,
+            "cpa-codex-oauth",
+            managed::codex::TOKEN_ENDPOINT,
+        )
+        .unwrap();
+        assert_eq!(adapter.provider_driver(), "cpa-codex-oauth");
+        assert_eq!(adapter.backend(), &ManagedOAuthAdapterBackend::BuiltinCodex);
+        assert!(adapter.can_refresh());
+
+        let legacy_error = resolve_managed_oauth_refresh_adapter(
+            &catalog,
+            "cpa-gemini-oauth-legacy",
+            managed::legacy_gemini::TOKEN_ENDPOINT,
+        )
+        .unwrap_err();
+        assert_eq!(
+            legacy_error.to_string(),
+            "invalid request: managed OAuth adapter does not support refresh"
+        );
+
+        let stored_secret_url = "https://stored-lifecycle-secret.invalid/token";
+        let error =
+            resolve_managed_oauth_refresh_adapter(&catalog, "cpa-codex-oauth", stored_secret_url)
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "conflict: managed OAuth adapter lifecycle metadata no longer matches the active catalog"
+        );
+        assert!(!format!("{error:?} {error}").contains(stored_secret_url));
     }
 }

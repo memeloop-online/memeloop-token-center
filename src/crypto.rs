@@ -14,9 +14,8 @@ pub struct IssuedCredential {
     pub secret_hash: Vec<u8>,
 }
 
-pub struct ParsedCredential<'a> {
+pub struct ParsedCredential {
     pub key_id: Uuid,
-    pub secret_material: &'a str,
 }
 
 pub fn issue_credential(key_id: Uuid, pepper: &[u8]) -> IssuedCredential {
@@ -45,15 +44,15 @@ fn issue_credential_with_prefix(key_id: Uuid, pepper: &[u8], prefix: &str) -> Is
     }
 }
 
-pub fn parse_credential(value: &str) -> Option<ParsedCredential<'_>> {
+pub fn parse_credential(value: &str) -> Option<ParsedCredential> {
     parse_credential_with_prefix(value, "mtc")
 }
 
-pub fn parse_service_credential(value: &str) -> Option<ParsedCredential<'_>> {
+pub fn parse_service_credential(value: &str) -> Option<ParsedCredential> {
     parse_credential_with_prefix(value, "mts")
 }
 
-fn parse_credential_with_prefix<'a>(value: &'a str, prefix: &str) -> Option<ParsedCredential<'a>> {
+fn parse_credential_with_prefix(value: &str, prefix: &str) -> Option<ParsedCredential> {
     let raw = value.strip_prefix(prefix)?.strip_prefix('_')?;
     let (key_id, secret_material) = raw.split_once('_')?;
     if secret_material.len() < 32 {
@@ -62,13 +61,17 @@ fn parse_credential_with_prefix<'a>(value: &'a str, prefix: &str) -> Option<Pars
 
     Some(ParsedCredential {
         key_id: Uuid::parse_str(key_id).ok()?,
-        secret_material,
     })
 }
 
 pub fn verify_credential(value: &str, pepper: &[u8], expected: &[u8]) -> bool {
-    let actual = keyed_hash(pepper, value.as_bytes());
-    actual.as_slice().ct_eq(expected).into()
+    // Delegate tag verification (including the constant-time comparison and
+    // wrong-length rejection) to RustCrypto's `Mac` implementation.  This
+    // module defines only the Token Center credential format; it does not
+    // implement a cryptographic primitive.
+    let mut mac = HmacSha256::new_from_slice(pepper).expect("HMAC accepts any key length");
+    mac.update(value.as_bytes());
+    mac.verify_slice(expected).is_ok()
 }
 
 pub fn hash_credential(value: &str, pepper: &[u8]) -> (Vec<u8>, String) {
@@ -110,6 +113,16 @@ mod tests {
             &issued.secret,
             b"a pepper that is long enough for this test",
             &issued.secret_hash
+        ));
+        assert!(!verify_credential(
+            "mtc_wrong_material",
+            b"a pepper that is long enough for this test",
+            &issued.secret_hash
+        ));
+        assert!(!verify_credential(
+            &issued.secret,
+            b"a pepper that is long enough for this test",
+            &issued.secret_hash[..31]
         ));
     }
 }

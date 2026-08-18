@@ -15,6 +15,13 @@ export interface RequestDetail extends RequestView {
   request_body: unknown;
   response_body: unknown;
   archive_complete: boolean;
+  provenance?: {
+    source: string;
+    disposition: 'exact' | 'unlinked';
+    unlinked: boolean;
+    external_request_id: string;
+    proof_digest: string;
+  };
 }
 
 export interface RequestEvent {
@@ -41,6 +48,38 @@ export interface StatsBucket {
   cost: string;
 }
 
+export interface UsageAnalysisCost {
+  currency: string;
+  cost: string;
+}
+
+export interface UsageAnalysisMetrics {
+  requests: number;
+  success: number;
+  failed: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
+  cache_write_tokens: number;
+  generation_units: number;
+  avg_duration_ms: number | null;
+  p95_duration_ms: number | null;
+  costs: UsageAnalysisCost[];
+}
+
+export interface UsageAnalysisBucket extends UsageAnalysisMetrics {
+  id: string;
+  label: string;
+}
+
+export interface UsageAnalysisTimeBucket extends UsageAnalysisMetrics {
+  bucket_start: number;
+}
+
+export interface UsageAnalysisHeatmapBucket extends UsageAnalysisMetrics {
+  hour_of_week: number;
+}
+
 export interface SelfStats {
   key_id: string;
   summary: {
@@ -61,6 +100,24 @@ export interface OperatorStats {
   by_model: StatsBucket[];
   by_day: StatsBucket[];
   errors: StatsBucket[];
+}
+
+export interface OperatorUsageAnalysis {
+  from_created_at: number;
+  to_created_at: number;
+  granularity: 'hour' | 'day';
+  time_zone: 'UTC';
+  p95_is_approximate: boolean;
+  p95_method: string;
+  summary: UsageAnalysisMetrics;
+  time_series: UsageAnalysisTimeBucket[];
+  by_model: UsageAnalysisBucket[];
+  by_key: UsageAnalysisBucket[];
+  by_upstream: UsageAnalysisBucket[];
+  by_protocol: UsageAnalysisBucket[];
+  by_status: UsageAnalysisBucket[];
+  errors: UsageAnalysisBucket[];
+  heatmap: UsageAnalysisHeatmapBucket[];
 }
 
 export interface TenantView { external_id: string }
@@ -125,6 +182,28 @@ export interface KeyView {
   fingerprint?: string | null;
 }
 
+export interface KeyLimitSnapshot {
+  key_id: string;
+  captured_at: number;
+  currency: string;
+  available_balance: string;
+  reserved_balance: string;
+  rpm: { limit: number; used: number; remaining: number; reset_at: number };
+  tpm: { limit: number; used: number; remaining: number; reset_at: number };
+  concurrency: { limit: number; active: number; remaining: number };
+  daily_budget: BudgetLimitSnapshot;
+  weekly_budget: BudgetLimitSnapshot;
+  lifetime_budget: BudgetLimitSnapshot;
+}
+
+export interface BudgetLimitSnapshot {
+  limit: string | null;
+  settled: string;
+  reserved: string;
+  remaining: string | null;
+  reset_at: number | null;
+}
+
 export interface ServiceTokenView {
   service_id: string;
   name: string;
@@ -174,10 +253,21 @@ export interface ConversationEdge {
   evidence: unknown;
 }
 
+export interface ConversationRequest extends RequestView {
+  source: 'live' | 'session_archive';
+  provenance: 'native' | 'archive_unlinked';
+  unlinked: boolean;
+  archive_source?: string;
+  external_request_id?: string;
+}
+
 export interface ConversationDetail {
   cluster: ConversationCluster;
-  requests: RequestView[];
+  requests: ConversationRequest[];
   edges: ConversationEdge[];
+  has_more: boolean;
+  next_cursor: { before_created_at: number; before_request_id: string } | null;
+  edges_truncated: boolean;
 }
 
 export interface GenerationJob {
@@ -194,6 +284,15 @@ export interface GenerationJob {
   cost: string;
   error_code: string | null;
   result: unknown | null;
+  assets: GenerationAsset[];
+}
+
+export interface GenerationAsset {
+  asset_id: string;
+  index: number;
+  mime_type: string;
+  size_bytes: number;
+  filename: string;
 }
 
 export interface ProviderType {
@@ -204,9 +303,15 @@ export interface ProviderType {
   config_schema: Record<string, unknown>;
   credential_schema: Record<string, unknown>;
   oauth_adapter?: {
+    api_version: 'oauth-adapter-v1';
+    flow_kind: 'cursor_pkce';
     login_url: string;
     poll_url: string;
     refresh_url: string;
+  };
+  component_adapter?: {
+    api_version: 'buffered-v1';
+    max_response_bytes: number;
   };
   source: string;
 }
@@ -236,6 +341,9 @@ export interface UpstreamAccount {
   credential_generation: number;
   status: string;
   credential_expires_at: number | null;
+  can_refresh: boolean;
+  can_rotate: boolean;
+  can_reauthorize: boolean;
   route_count: number;
   config: Record<string, unknown>;
   created_at: number;

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::Path,
     time::{Duration, Instant},
@@ -67,6 +68,15 @@ fn core_wat_with_post_auth(body: &str) -> String {
     )
 }
 
+fn core_wat_with_body(marker: &str, body: &str) -> String {
+    let source = include_str!("../examples/plugins/policy-rewrite/plugin.wat");
+    let start = format!(";; BEGIN {marker} BODY");
+    let end = format!(";; END {marker} BODY");
+    let (prefix, after_start) = source.split_once(&start).expect("function start marker");
+    let (_, suffix) = after_start.split_once(&end).expect("function end marker");
+    format!("{prefix}{start}\n{body}\n{end}{suffix}")
+}
+
 fn write_policy_package(root: &Path, id: &str, body: &str) {
     let package = root.join(id);
     fs::create_dir(&package).expect("create plugin package");
@@ -75,7 +85,7 @@ fn write_policy_package(root: &Path, id: &str, body: &str) {
         serde_json::to_vec(&json!({
             "id": id,
             "version": "1.0.0",
-            "wit_version": "0.1.0",
+            "wit_version": "0.2.0",
             "wasm": "plugin.wasm",
             "capabilities": [],
             "contributions": {"traffic_policy": true, "providers": []}
@@ -88,6 +98,37 @@ fn write_policy_package(root: &Path, id: &str, body: &str) {
         component_from_core_wat(&core_wat_with_post_auth(body)),
     )
     .expect("write plugin component");
+}
+
+fn write_component_provider_package(root: &Path, id: &str, wat: &str, maximum: usize) {
+    let package = root.join(id);
+    fs::create_dir(&package).expect("create component provider package");
+    fs::write(
+        package.join("plugin.json"),
+        serde_json::to_vec(&json!({
+            "id": id,
+            "version": "1.0.0",
+            "wit_version": "0.2.0",
+            "wasm": "plugin.wasm",
+            "capabilities": [],
+            "contributions": {"providers": [{
+                "id": format!("{id}-provider"),
+                "display_name": "Failure fixture",
+                "protocols": ["openai"],
+                "modalities": ["text"],
+                "config_schema": {"type": "object"},
+                "credential_schema": {"type": "object"},
+                "component_adapter": {
+                    "api_version": "buffered-v1",
+                    "max_response_bytes": maximum
+                }
+            }]}
+        }))
+        .unwrap(),
+    )
+    .expect("write component provider manifest");
+    fs::write(package.join("plugin.wasm"), component_from_core_wat(wat))
+        .expect("write component provider Wasm");
 }
 
 #[test]
@@ -116,6 +157,14 @@ async fn installable_example_contributes_provider_oauth_policy_and_rewrite() {
         .expect("example provider contribution");
     assert_eq!(provider.source, "plugin:example-policy-rewrite@1.0.0");
     assert!(provider.oauth_adapter.is_some());
+    assert_eq!(
+        provider
+            .component_adapter
+            .as_ref()
+            .expect("executable provider capability")
+            .api_version,
+        "buffered-v1"
+    );
     assert_eq!(provider.protocols, ["openai", "anthropic"]);
 
     let mut catalog = ProviderCatalog::builtins();
@@ -154,6 +203,149 @@ async fn installable_example_contributes_provider_oauth_policy_and_rewrite() {
         decision.request_json.unwrap()["messages"][0]["content"],
         "rewritten by plugin"
     );
+
+    let prepared = runtime
+        .prepare_provider_request(
+            "example-oauth-http",
+            context(),
+            &json!({"base_url": "https://api.example.com"}),
+            &json!({
+                "model": "example-rewritten",
+                "messages": [{"role": "user", "content": "canonical"}]
+            }),
+        )
+        .expect("prepare component request")
+        .expect("declared component adapter");
+    assert_eq!(prepared.method, reqwest::Method::POST);
+    assert_eq!(prepared.path, "/vendor/infer");
+    assert_eq!(
+        prepared.headers.get("x-plugin-shape").map(String::as_str),
+        Some("buffered-v1")
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&prepared.body).unwrap(),
+        json!({"prompt": "from-component", "model": "vendor-model"})
+    );
+    assert!(!String::from_utf8_lossy(&prepared.body).contains("account-secret"));
+
+    let normalized = runtime
+        .normalize_provider_response(
+            "example-oauth-http",
+            context(),
+            207,
+            &BTreeMap::from([("content-type".into(), "application/vnd.vendor+json".into())]),
+            br#"{"vendor_answer":"non-openai-shape"}"#,
+        )
+        .expect("normalize component response")
+        .expect("declared component adapter");
+    assert_eq!(normalized.status, 200);
+    assert_eq!(normalized.input_tokens, 7);
+    assert_eq!(normalized.output_tokens, 3);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&normalized.body).unwrap()["choices"][0]["message"]
+            ["content"],
+        "normalized by component"
+    );
+}
+
+#[tokio::test]
+async fn plugin_load_rejects_oauth_adapter_whose_schema_cannot_accept_oauth_results() {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    let package = plugins.join("invalid-oauth-provider");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("plugin.json"),
+        r#"{
+          "id":"invalid-oauth-provider","version":"1.0.0","wit_version":"0.2.0","wasm":null,
+          "capabilities":[],
+          "contributions":{"providers":[{
+            "id":"invalid-oauth","display_name":"Invalid OAuth","protocols":["openai"],
+            "modalities":["text"],"config_schema":{"type":"object"},
+            "credential_schema":{"type":"object","additionalProperties":false,
+              "required":["type","value"],"properties":{"type":{"const":"api_key"},"value":{"type":"string"}}},
+            "oauth_adapter":{
+              "api_version":"oauth-adapter-v1","flow_kind":"cursor_pkce",
+              "login_url":"https://oauth.example.com/login",
+              "poll_url":"https://oauth.example.com/poll",
+              "refresh_url":"https://oauth.example.com/refresh"
+            }
+          }]}
+        }"#,
+    )
+    .unwrap();
+    let error = PluginRuntime::load(
+        Some(plugins.to_str().unwrap()),
+        database(directory.path()).await,
+    )
+    .err()
+    .expect("OAuth adapter schema mismatch must fail at load time");
+    assert!(error.to_string().contains("rejects the OAuth result shape"));
+}
+
+async fn manifest_loads(manifest: serde_json::Value) -> bool {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    let package = plugins.join("package");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("plugin.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    PluginRuntime::load(
+        Some(plugins.to_str().unwrap()),
+        database(directory.path()).await,
+    )
+    .is_ok()
+}
+
+#[tokio::test]
+async fn manifest_schema_and_runtime_share_plugin_and_provider_id_boundaries() {
+    let exact_plugin_id = "p".repeat(64);
+    assert!(
+        manifest_loads(json!({
+            "id": exact_plugin_id,
+            "version": "1.0.0",
+            "wit_version": "0.2.0",
+            "wasm": null,
+            "contributions": {"providers": []}
+        }))
+        .await
+    );
+    for invalid_plugin_id in ["p".repeat(65), "invalid_plugin".to_owned()] {
+        assert!(
+            !manifest_loads(json!({
+                "id": invalid_plugin_id,
+                "version": "1.0.0",
+                "wit_version": "0.2.0",
+                "wasm": null,
+                "contributions": {"providers": []}
+            }))
+            .await
+        );
+    }
+
+    let provider_manifest = |provider_id: String| {
+        json!({
+            "id": "provider-boundary",
+            "version": "1.0.0",
+            "wit_version": "0.2.0",
+            "wasm": null,
+            "contributions": {"providers": [{
+                "id": provider_id,
+                "display_name": "Boundary provider",
+                "protocols": ["openai"],
+                "modalities": ["text"],
+                "config_schema": {"type": "object"},
+                "credential_schema": {"type": "object"}
+            }]}
+        })
+    };
+    assert!(manifest_loads(provider_manifest("v".repeat(64))).await);
+    for invalid_provider_id in ["v".repeat(65), "invalid_provider".to_owned()] {
+        assert!(!manifest_loads(provider_manifest(invalid_provider_id)).await);
+    }
 }
 
 #[tokio::test]
@@ -182,7 +374,7 @@ async fn discovery_rejects_invalid_schema_duplicate_ids_and_incompatible_upgrade
     fs::write(
         package.join("plugin.json"),
         r#"{
-          "id":"one","version":"1.2.3","wit_version":"0.1.9","wasm":null,
+          "id":"one","version":"1.2.3","wit_version":"0.2.9","wasm":null,
           "contributions":{"providers":[{
             "id":"duplicate-provider","display_name":"Duplicate","protocols":["openai"],
             "modalities":["text"],"config_schema":{"type":"object"},
@@ -193,15 +385,15 @@ async fn discovery_rejects_invalid_schema_duplicate_ids_and_incompatible_upgrade
     .unwrap();
     let compatible =
         PluginRuntime::load(plugins.to_str(), database(directory.path()).await.clone())
-            .expect("0.1 patch upgrade remains compatible");
-    assert_eq!(compatible.manifests()[0].wit_version, "0.1.9");
+            .expect("0.2 patch upgrade remains compatible");
+    assert_eq!(compatible.manifests()[0].wit_version, "0.2.9");
 
     let package = plugins.join("two");
     fs::create_dir(&package).unwrap();
     fs::write(
         package.join("plugin.json"),
         r#"{
-          "id":"two","version":"1.2.3","wit_version":"0.1.9","wasm":null,
+          "id":"two","version":"1.2.3","wit_version":"0.2.9","wasm":null,
           "contributions":{"providers":[{
             "id":"duplicate-provider","display_name":"Duplicate","protocols":["openai"],
             "modalities":["text"],"config_schema":{"type":"object"},
@@ -219,7 +411,7 @@ async fn discovery_rejects_invalid_schema_duplicate_ids_and_incompatible_upgrade
     fs::write(
         package.join("plugin.json"),
         r#"{
-          "id":"bad-schema","version":"1.0.0","wit_version":"0.1.0","wasm":null,
+          "id":"bad-schema","version":"1.0.0","wit_version":"0.2.0","wasm":null,
           "contributions":{"providers":[{
             "id":"bad-schema-provider","display_name":"Bad schema","protocols":["openai"],
             "modalities":["text"],"config_schema":{"$ref":"https://untrusted.invalid/schema"},
@@ -301,5 +493,156 @@ async fn epoch_timeout_interrupts_a_guest_even_with_effectively_unlimited_fuel()
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "epoch deadline was not enforced"
+    );
+}
+
+#[tokio::test]
+async fn component_prepare_trap_fuel_and_32_mib_memory_limit_fail_closed() {
+    for (id, body) in [
+        ("prepare-trap", "unreachable"),
+        (
+            "prepare-fuel",
+            "(loop $forever (br $forever))\ni32.const 768",
+        ),
+        (
+            "prepare-memory",
+            r#"
+            i32.const 600
+            memory.grow
+            drop
+            i32.const 40000000
+            i32.load
+            drop
+            i32.const 768
+            "#,
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let plugins = directory.path().join("plugins");
+        fs::create_dir(&plugins).unwrap();
+        write_component_provider_package(&plugins, id, &core_wat_with_body("PREPARE", body), 1024);
+        let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
+            .expect("load component failure fixture");
+        let error = runtime
+            .prepare_provider_request(
+                &format!("{id}-provider"),
+                context(),
+                &json!({}),
+                &json!({"model": "test"}),
+            )
+            .expect_err("component failure must reject the request");
+        assert!(error.to_string().contains(id), "{id}: {error}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn component_prepare_epoch_deadline_fails_closed_with_unlimited_fuel() {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    write_component_provider_package(
+        &plugins,
+        "prepare-timeout",
+        &core_wat_with_body("PREPARE", "(loop $forever (br $forever))\ni32.const 768"),
+        1024,
+    );
+    let mut runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
+        .expect("load component timeout fixture");
+    runtime.set_execution_limits_for_tests(Duration::from_millis(30), u64::MAX);
+    let started = Instant::now();
+    let error = runtime
+        .prepare_provider_request(
+            "prepare-timeout-provider",
+            context(),
+            &json!({}),
+            &json!({"model": "test"}),
+        )
+        .expect_err("epoch timeout must reject component provider prepare");
+    assert!(error.to_string().contains("prepare-timeout"));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn component_streaming_normalize_trap_and_oversize_boundaries_fail_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    let streaming_wat = include_str!("../examples/plugins/policy-rewrite/plugin.wat")
+        .replace("\\22streaming\\22:false}", "\\22streaming\\22:true }");
+    write_component_provider_package(&plugins, "streaming", &streaming_wat, 1024);
+    let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await.clone())
+        .expect("load streaming fixture");
+    assert!(
+        runtime
+            .prepare_provider_request(
+                "streaming-provider",
+                context(),
+                &json!({}),
+                &json!({"model": "test"}),
+            )
+            .expect_err("streaming envelope must be rejected")
+            .to_string()
+            .contains("streaming")
+    );
+
+    fs::remove_dir_all(&plugins).unwrap();
+    fs::create_dir(&plugins).unwrap();
+    write_component_provider_package(
+        &plugins,
+        "normalize-trap",
+        &core_wat_with_body("NORMALIZE", "unreachable"),
+        1024,
+    );
+    let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await.clone())
+        .expect("load normalize trap fixture");
+    assert!(
+        runtime
+            .normalize_provider_response(
+                "normalize-trap-provider",
+                context(),
+                200,
+                &BTreeMap::new(),
+                b"{}",
+            )
+            .expect_err("normalize trap must reject the response")
+            .to_string()
+            .contains("normalize-trap")
+    );
+
+    fs::remove_dir_all(&plugins).unwrap();
+    fs::create_dir(&plugins).unwrap();
+    write_component_provider_package(
+        &plugins,
+        "oversize",
+        include_str!("../examples/plugins/policy-rewrite/plugin.wat"),
+        8,
+    );
+    let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
+        .expect("load oversize fixture");
+    assert!(
+        runtime
+            .normalize_provider_response(
+                "oversize-provider",
+                context(),
+                200,
+                &BTreeMap::new(),
+                b"nine-byte",
+            )
+            .expect_err("oversize upstream response must be rejected")
+            .to_string()
+            .contains("declared limit")
+    );
+    assert!(
+        runtime
+            .normalize_provider_response(
+                "oversize-provider",
+                context(),
+                200,
+                &BTreeMap::new(),
+                b"{}",
+            )
+            .expect_err("oversize normalized body must be rejected")
+            .to_string()
+            .contains("declared limit")
     );
 }

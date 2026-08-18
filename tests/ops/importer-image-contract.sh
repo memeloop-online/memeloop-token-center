@@ -1,0 +1,190 @@
+#!/bin/sh
+set -eu
+
+repository=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+workspace=$(mktemp -d "${TMPDIR:-/tmp}/mtc-importer-contract.XXXXXX")
+image=${IMPORTER_IMAGE:-memeloop-token-center-importer-contract:$$}
+created_image=false
+container_id=
+fixture_volume=
+
+cleanup() {
+  if [ -n "$container_id" ]; then
+    docker container rm "$container_id" >/dev/null 2>&1 || true
+  fi
+  if [ "$created_image" = true ]; then
+    docker image rm "$image" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$fixture_volume" ]; then
+    docker volume rm "$fixture_volume" >/dev/null 2>&1 || true
+  fi
+  rm -rf -- "$workspace"
+}
+trap cleanup EXIT HUP INT TERM
+
+if [ -z "${IMPORTER_IMAGE:-}" ]; then
+  set -- docker build --file "$repository/Dockerfile.importer" --tag "$image"
+  if [ -n "${IMPORTER_RUNTIME_IMAGE:-}" ]; then
+    set -- "$@" --build-arg "RUNTIME_IMAGE=$IMPORTER_RUNTIME_IMAGE"
+  fi
+  "$@" "$repository"
+  created_image=true
+fi
+
+test "$(docker image inspect "$image" --format '{{.Config.User}}')" = "10001:10001"
+test "$(docker image inspect "$image" --format '{{json .Config.Entrypoint}}')" = \
+  '["/usr/local/bin/migrate-cpamp"]'
+
+docker run --rm \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
+  --entrypoint /bin/sh \
+  "$image" -ec '
+    test "$(id -u)" = 10001
+    test "$(id -g)" = 10001
+    test -x /usr/local/bin/migrate-cpamp
+    test -x /usr/local/bin/attach-legacy-cpa-credentials
+    test -x /usr/local/bin/import-cpa-upstreams
+    test ! -w /usr/local/bin/migrate-cpamp
+    test ! -w /usr/local/bin/attach-legacy-cpa-credentials
+    test ! -w /usr/local/bin/import-cpa-upstreams
+    test "$(stat -c %a /usr/local/bin/migrate-cpamp)" = 555
+    test "$(stat -c %a /usr/local/bin/attach-legacy-cpa-credentials)" = 555
+    test "$(stat -c %a /usr/local/bin/import-cpa-upstreams)" = 555
+    command -v psql >/dev/null
+    command -v python3 >/dev/null
+    command -v sqlite3 >/dev/null
+    python3 -c "import yaml; assert yaml.__version__"
+    python3 --version 2>&1 | grep -Eq "^Python 3\\.11\\."
+    psql --version | grep -Eq "^psql \\(PostgreSQL\\) 15\\."
+    test ! -e /tests
+    test ! -e /source
+    test ! -e /work
+  '
+
+docker run --rm \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
+  --entrypoint /usr/local/bin/attach-legacy-cpa-credentials \
+  "$image" --help >"$workspace/legacy-help.txt"
+grep -Fq 'dry-run by default' "$workspace/legacy-help.txt"
+if grep -Eq -- '--credential([ =]|$)' "$workspace/legacy-help.txt"; then
+  echo 'legacy importer must not accept a plaintext credential argument' >&2
+  exit 1
+fi
+
+docker run --rm \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
+  --entrypoint /usr/local/bin/import-cpa-upstreams \
+  "$image" --help >"$workspace/cpa-upstream-help.txt"
+grep -Fq 'dry-run by default' "$workspace/cpa-upstream-help.txt"
+if grep -Eq -- '--(credential|api-key|service-token|bridge-secret)([ =]|$)' \
+  "$workspace/cpa-upstream-help.txt"; then
+  echo 'CPA upstream importer must not accept a plaintext secret argument' >&2
+  exit 1
+fi
+
+cp -R "$repository/tests/fixtures/cpa-upstreams/supported" \
+  "$workspace/cpa-upstream-source"
+# These are synthetic fixtures. The privileged preparation container copies them
+# into a private volume and applies the production ownership/modes before the
+# non-root importer sees them.
+find "$workspace/cpa-upstream-source" -type d -exec chmod 0755 {} +
+find "$workspace/cpa-upstream-source" -type f -exec chmod 0644 {} +
+fixture_volume="mtc-cpa-upstream-fixture-$$"
+docker volume create "$fixture_volume" >/dev/null
+docker run --rm \
+  --user 0:0 \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
+  --cap-add CHOWN \
+  --volume "$workspace/cpa-upstream-source:/fixture:ro" \
+  --volume "$fixture_volume:/source" \
+  --entrypoint /bin/sh \
+  "$image" -ec '
+    cp -R /fixture/. /source/
+    find /source -type d -exec chmod 0700 {} +
+    find /source -type f -exec chmod 0600 {} +
+    chown -R 10001:10001 /source
+  '
+docker run --rm \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
+  --volume "$fixture_volume:/source:ro" \
+  --entrypoint /usr/local/bin/import-cpa-upstreams \
+  "$image" \
+  --config /source/config.yaml \
+  --auth-dir /source/auth \
+  --bridge-base-url https://bridge.example.test \
+  >"$workspace/cpa-upstream-dry-run.json"
+grep -Fq '"mode":"dry-run"' "$workspace/cpa-upstream-dry-run.json"
+grep -Fq '"api_account_count":6' "$workspace/cpa-upstream-dry-run.json"
+grep -Fq '"subscription_account_count":2' "$workspace/cpa-upstream-dry-run.json"
+if grep -Eq 'fixture-only-|Fixture(Copilot|Cursor)Handle' \
+  "$workspace/cpa-upstream-dry-run.json"; then
+  echo 'CPA upstream dry-run leaked fixture credential material' >&2
+  exit 1
+fi
+
+if docker run --rm \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
+  "$image" >"$workspace/default.out" 2>"$workspace/default.err"; then
+  echo 'default CPAMP importer unexpectedly succeeded without required inputs' >&2
+  exit 1
+fi
+grep -Fq 'PGHOST is required' "$workspace/default.err"
+
+container_id=$(docker create --entrypoint /bin/true "$image")
+docker export "$container_id" >"$workspace/rootfs.tar"
+docker cp "$container_id:/usr/local/bin/migrate-cpamp" "$workspace/image-migrate-cpamp"
+docker cp "$container_id:/usr/local/bin/attach-legacy-cpa-credentials" \
+  "$workspace/image-attach-legacy-cpa-credentials"
+docker cp "$container_id:/usr/local/bin/import-cpa-upstreams" \
+  "$workspace/image-import-cpa-upstreams"
+cmp "$repository/ops/migrate-cpamp.sh" "$workspace/image-migrate-cpamp"
+cmp "$repository/ops/legacy-credentials/attach-legacy-cpa-credentials.py" \
+  "$workspace/image-attach-legacy-cpa-credentials"
+cmp "$repository/ops/cpa-upstreams/import-cpa-upstreams.py" \
+  "$workspace/image-import-cpa-upstreams"
+# Stream only regular-file payloads from the image tar. Do not extract the
+# rootfs: absolute compatibility symlinks such as /var/run must never resolve
+# into the host while a packaging test inspects an image.
+if tar -xOf "$workspace/rootfs.tar" 2>/dev/null \
+  | grep -a -E -m1 \
+    'fixture-only-cpa-(linux-codex|claude-code)-key|fixture-service-token' \
+    >"$workspace/forbidden-material.txt"; then
+  echo 'importer image contains test credential or token material' >&2
+  exit 1
+fi
+
+job="$repository/ops/kubernetes/legacy-credential-import-job.yaml"
+grep -Fq 'image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center-importer@sha256:REPLACE_DIGEST' "$job"
+grep -Fq 'command: ["/usr/local/bin/attach-legacy-cpa-credentials"]' "$job"
+grep -Fq 'automountServiceAccountToken: false' "$job"
+grep -Fq 'readOnlyRootFilesystem: true' "$job"
+grep -Fq 'allowPrivilegeEscalation: false' "$job"
+grep -Fq 'fsGroup: 10001' "$job"
+grep -Fq 'runAsUser: 10001' "$job"
+grep -Fq 'name: PGPASSFILE' "$job"
+if grep -Eq '^[[:space:]]*-[[:space:]]*--apply[[:space:]]*$' "$job"; then
+  echo 'checked-in legacy credential Job must remain a dry-run' >&2
+  exit 1
+fi
+if grep -Eq '^[[:space:]]*-[[:space:]]*name:[[:space:]]*PGPASSWORD[[:space:]]*$' "$job"; then
+  echo 'database password must not be exposed through the Job environment' >&2
+  exit 1
+fi
+
+echo 'Importer image and legacy credential Job contract OK'

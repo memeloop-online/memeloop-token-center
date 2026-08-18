@@ -1,6 +1,6 @@
 # Policy rewrite + OAuth provider example
 
-This installable example demonstrates all contribution types in the `0.1`
+This installable example demonstrates all contribution types in the `0.2`
 contract:
 
 - a post-auth traffic policy implemented by `plugin.wasm`;
@@ -8,6 +8,10 @@ contract:
 - a declarative HTTP provider with API-credential and OAuth-credential schemas;
 - an OAuth adapter whose tokens remain in Token Center's encrypted credential
   table.
+- a `buffered-v1` executable provider that prepares the non-OpenAI
+  `/vendor/infer` request and normalizes its bounded response. The component
+  receives no API key or OAuth token; Token Center injects the stable account
+  credential only after `prepare` returns.
 
 For local development, mount `examples/plugins` read-only and set
 `MTC_PLUGIN_DIR` to that mount. The checked-in `plugin.wasm` is generated from

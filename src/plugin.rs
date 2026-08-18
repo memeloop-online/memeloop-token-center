@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component as PathComponent, Path, PathBuf},
     sync::Arc,
@@ -25,11 +25,22 @@ const PLUGIN_FUEL: u64 = 5_000_000;
 const PLUGIN_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 const PLUGIN_TABLE_ELEMENTS: usize = 100_000;
 const PLUGIN_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+const PLUGIN_HTTP_HEADER_COUNT: usize = 64;
+const PLUGIN_HTTP_HEADER_NAME_BYTES: usize = 256;
+const PLUGIN_HTTP_HEADER_VALUE_BYTES: usize = 8 * 1024;
+const PLUGIN_HTTP_HEADER_TOTAL_BYTES: usize = 16 * 1024;
+const PLUGIN_HTTP_HEADERS_JSON_BYTES: usize = 128 * 1024;
 const PLUGIN_MANIFEST_BYTES: u64 = 1024 * 1024;
 const PLUGIN_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_COMPONENT_PROVIDER_BODY: usize = 4 * 1024 * 1024;
+const MAX_PLUGIN_ID_BYTES: usize = 64;
+const MAX_TRAFFIC_REASON_BYTES: usize = 256;
+const MAX_TRAFFIC_MODEL_BYTES: usize = 200;
+const MAX_TRAFFIC_ACCOUNT_ID_BYTES: usize = 64;
+const MAX_TRAFFIC_REQUEST_JSON_BYTES: usize = 16 * 1024 * 1024;
 const PLUGIN_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const PLUGIN_EPOCH_TICK: Duration = Duration::from_millis(10);
-const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.1.0, <0.2.0";
+const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.2.0, <0.3.0";
 
 wasmtime::component::bindgen!({
     world: "plugin",
@@ -73,13 +84,99 @@ struct LoadedPlugin {
     component: Option<Component>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct TrafficDecision {
     pub allow: bool,
-    pub reason: Option<String>,
+    /// The manifest-validated identity of the policy which denied the request.
+    /// Guest-provided reason text is deliberately never retained here.
+    denied_by_plugin_id: Option<String>,
+    /// A host-owned, opaque code suitable for metrics and structured logs.
+    decision_code: Option<&'static str>,
     pub model: Option<String>,
     pub upstream_account_id: Option<String>,
     pub request_json: Option<Value>,
+}
+
+impl TrafficDecision {
+    pub(crate) fn log_denial(&self) {
+        debug_assert!(!self.allow);
+        tracing::warn!(
+            plugin_id = self.denied_by_plugin_id.as_deref().unwrap_or("unknown"),
+            decision_code = self.decision_code.unwrap_or("policy_denied"),
+            "traffic policy plugin denied request"
+        );
+    }
+}
+
+impl std::fmt::Debug for TrafficDecision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TrafficDecision")
+            .field("allow", &self.allow)
+            .field("denied_by_plugin_id", &self.denied_by_plugin_id)
+            .field("decision_code", &self.decision_code)
+            .field("has_model_rewrite", &self.model.is_some())
+            .field(
+                "has_upstream_account_hint",
+                &self.upstream_account_id.is_some(),
+            )
+            .field("has_request_rewrite", &self.request_json.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedProviderRequest {
+    pub method: reqwest::Method,
+    pub path: String,
+    pub headers: BTreeMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormalizedProviderResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: Vec<u8>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub estimated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedProviderEnvelope {
+    method: String,
+    path: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    body_base64: String,
+    streaming: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UpstreamResponseEnvelope<'a> {
+    status: u16,
+    headers: &'a BTreeMap<String, String>,
+    body_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NormalizedProviderEnvelope {
+    status: u16,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    body_base64: String,
+    usage: ComponentProviderUsage,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComponentProviderUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    estimated: bool,
 }
 
 #[derive(Clone, Default)]
@@ -305,29 +402,74 @@ impl PluginRuntime {
                 .call_post_auth(&mut store, &context, &request)
                 .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
                 .map_err(|error| {
-                    AppError::Upstream(format!("plugin {}: {error}", plugin.manifest.id))
+                    plugin_reported_error(&plugin.manifest.id, "traffic-policy", &error)
                 })?;
+            let reason_is_valid = result.reason.as_deref().is_none_or(|reason| {
+                validate_plugin_text(reason, MAX_TRAFFIC_REASON_BYTES, false).is_ok()
+            });
+            let model_is_valid = result.model.as_deref().is_none_or(|model| {
+                validate_plugin_text(model, MAX_TRAFFIC_MODEL_BYTES, false).is_ok()
+            });
+            let account_id_is_valid =
+                result
+                    .upstream_account_id
+                    .as_deref()
+                    .is_none_or(|account_id| {
+                        validate_plugin_text(account_id, MAX_TRAFFIC_ACCOUNT_ID_BYTES, false)
+                            .is_ok()
+                    });
+            let validated_request = result
+                .request_json
+                .as_deref()
+                .map(validate_traffic_request_json)
+                .transpose();
             if !result.allow {
                 return Ok(TrafficDecision {
                     allow: false,
-                    reason: result.reason,
+                    denied_by_plugin_id: Some(plugin.manifest.id.clone()),
+                    decision_code: Some(
+                        if reason_is_valid
+                            && model_is_valid
+                            && account_id_is_valid
+                            && validated_request.is_ok()
+                        {
+                            "policy_denied"
+                        } else {
+                            "policy_denied_invalid_metadata"
+                        },
+                    ),
                     ..decision
                 });
             }
-            if let Some(request) = result.request_json {
-                current = serde_json::from_str(&request).map_err(|_| {
-                    AppError::Upstream(format!(
-                        "plugin {} returned invalid request JSON",
-                        plugin.manifest.id
-                    ))
-                })?;
+            if !reason_is_valid {
+                return Err(invalid_plugin_result(
+                    &plugin.manifest.id,
+                    "traffic policy reason",
+                ));
+            }
+            if !model_is_valid {
+                return Err(invalid_plugin_result(
+                    &plugin.manifest.id,
+                    "traffic policy model",
+                ));
+            }
+            if !account_id_is_valid {
+                return Err(invalid_plugin_result(
+                    &plugin.manifest.id,
+                    "traffic policy upstream account id",
+                ));
+            }
+            if let Some(request) = validated_request.map_err(|_| {
+                invalid_plugin_result(&plugin.manifest.id, "traffic policy request JSON")
+            })? {
+                current = request;
                 decision.request_json = Some(current.clone());
             }
-            if result.model.is_some() {
-                decision.model = result.model;
+            if let Some(model) = result.model {
+                decision.model = Some(model);
             }
-            if result.upstream_account_id.is_some() {
-                decision.upstream_account_id = result.upstream_account_id;
+            if let Some(account_id) = result.upstream_account_id {
+                decision.upstream_account_id = Some(account_id);
             }
         }
         Ok(decision)
@@ -391,9 +533,7 @@ impl PluginRuntime {
             .memeloop_token_center_upstream_provider()
             .call_list_models(&mut store, &config_json)
             .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
-            .map_err(|error| {
-                AppError::Upstream(format!("plugin {}: {error}", plugin.manifest.id))
-            })?;
+            .map_err(|error| plugin_reported_error(&plugin.manifest.id, "list-models", &error))?;
         let models: Value = serde_json::from_str(&models_json).map_err(|_| {
             AppError::Upstream(format!(
                 "plugin {} returned invalid models JSON",
@@ -409,11 +549,424 @@ impl PluginRuntime {
         Ok(Some(models))
     }
 
+    /// Calls an explicitly declared buffered component provider. The caller
+    /// supplies only administrator-owned configuration and canonical request
+    /// JSON; encrypted API/OAuth credentials remain in the core.
+    pub fn prepare_provider_request(
+        &self,
+        provider_id: &str,
+        context: types::RequestContext,
+        config: &Value,
+        request: &Value,
+    ) -> Result<Option<PreparedProviderRequest>, AppError> {
+        let Some((plugin, provider)) = self.component_provider(provider_id)? else {
+            return Ok(None);
+        };
+        let component = plugin.component.as_ref().ok_or_else(|| {
+            AppError::Storage(format!(
+                "plugin {} component provider is unavailable",
+                plugin.manifest.id
+            ))
+        })?;
+        let engine = self.engine.as_ref().ok_or(AppError::Internal)?;
+        let (mut store, bindings) = self.instantiate(plugin, component, engine)?;
+        let config_json = serde_json::to_string(config).map_err(|_| AppError::Internal)?;
+        let request_json = serde_json::to_string(request).map_err(|_| AppError::Internal)?;
+        if config_json.len().saturating_add(request_json.len()) > MAX_COMPONENT_PROVIDER_BODY {
+            return Err(AppError::Upstream(
+                "component provider request exceeds the 4 MiB ABI limit".into(),
+            ));
+        }
+        let result = bindings
+            .memeloop_token_center_upstream_provider()
+            .call_prepare(&mut store, &context, &config_json, &request_json)
+            .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
+            .map_err(|error| plugin_reported_error(&plugin.manifest.id, "prepare", &error))?;
+        if result.len() > encoded_body_limit(MAX_COMPONENT_PROVIDER_BODY) {
+            return Err(AppError::Upstream(format!(
+                "plugin {} prepared request exceeds the 4 MiB ABI limit",
+                plugin.manifest.id
+            )));
+        }
+        let envelope: PreparedProviderEnvelope = serde_json::from_str(&result).map_err(|_| {
+            AppError::Upstream(format!(
+                "plugin {} returned an invalid prepared request",
+                plugin.manifest.id
+            ))
+        })?;
+        if envelope.streaming {
+            return Err(AppError::Upstream(format!(
+                "plugin {} requested unsupported streaming transport",
+                plugin.manifest.id
+            )));
+        }
+        let method = validate_provider_method(&envelope.method)?;
+        validate_provider_path(&envelope.path)?;
+        validate_provider_headers(&envelope.headers, true)?;
+        let body = STANDARD.decode(envelope.body_base64).map_err(|_| {
+            AppError::Upstream(format!(
+                "plugin {} returned invalid request body encoding",
+                plugin.manifest.id
+            ))
+        })?;
+        if body.len() > MAX_COMPONENT_PROVIDER_BODY {
+            return Err(AppError::Upstream(format!(
+                "plugin {} prepared request body exceeds 4 MiB",
+                plugin.manifest.id
+            )));
+        }
+        debug_assert_eq!(
+            provider.component_adapter.as_ref().unwrap().api_version,
+            "buffered-v1"
+        );
+        Ok(Some(PreparedProviderRequest {
+            method,
+            path: envelope.path,
+            headers: envelope.headers,
+            body,
+        }))
+    }
+
+    pub fn normalize_provider_response(
+        &self,
+        provider_id: &str,
+        context: types::RequestContext,
+        upstream_status: u16,
+        upstream_headers: &BTreeMap<String, String>,
+        upstream_body: &[u8],
+    ) -> Result<Option<NormalizedProviderResponse>, AppError> {
+        let Some((plugin, provider)) = self.component_provider(provider_id)? else {
+            return Ok(None);
+        };
+        let adapter = provider
+            .component_adapter
+            .as_ref()
+            .ok_or(AppError::Internal)?;
+        if upstream_body.len() > adapter.max_response_bytes
+            || upstream_body.len() > MAX_COMPONENT_PROVIDER_BODY
+        {
+            return Err(AppError::Upstream(format!(
+                "plugin {} upstream response exceeds its declared limit",
+                plugin.manifest.id
+            )));
+        }
+        validate_provider_headers(upstream_headers, false)?;
+        let response_json = serde_json::to_string(&UpstreamResponseEnvelope {
+            status: upstream_status,
+            headers: upstream_headers,
+            body_base64: STANDARD.encode(upstream_body),
+        })
+        .map_err(|_| AppError::Internal)?;
+        if response_json.len() > encoded_body_limit(adapter.max_response_bytes) {
+            return Err(AppError::Upstream(format!(
+                "plugin {} upstream response exceeds its declared ABI limit",
+                plugin.manifest.id
+            )));
+        }
+        let component = plugin.component.as_ref().ok_or_else(|| {
+            AppError::Storage(format!(
+                "plugin {} component provider is unavailable",
+                plugin.manifest.id
+            ))
+        })?;
+        let engine = self.engine.as_ref().ok_or(AppError::Internal)?;
+        let (mut store, bindings) = self.instantiate(plugin, component, engine)?;
+        let result = bindings
+            .memeloop_token_center_upstream_provider()
+            .call_normalize(&mut store, &context, &response_json)
+            .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
+            .map_err(|error| plugin_reported_error(&plugin.manifest.id, "normalize", &error))?;
+        if result.len() > encoded_body_limit(adapter.max_response_bytes) {
+            return Err(AppError::Upstream(format!(
+                "plugin {} normalized response exceeds its declared limit",
+                plugin.manifest.id
+            )));
+        }
+        let envelope: NormalizedProviderEnvelope = serde_json::from_str(&result).map_err(|_| {
+            AppError::Upstream(format!(
+                "plugin {} returned an invalid normalized response",
+                plugin.manifest.id
+            ))
+        })?;
+        if !(200..=599).contains(&envelope.status) {
+            return Err(AppError::Upstream(format!(
+                "plugin {} returned an invalid downstream status",
+                plugin.manifest.id
+            )));
+        }
+        validate_provider_headers(&envelope.headers, false)?;
+        let body = STANDARD.decode(envelope.body_base64).map_err(|_| {
+            AppError::Upstream(format!(
+                "plugin {} returned invalid normalized body encoding",
+                plugin.manifest.id
+            ))
+        })?;
+        if body.len() > adapter.max_response_bytes || body.len() > MAX_COMPONENT_PROVIDER_BODY {
+            return Err(AppError::Upstream(format!(
+                "plugin {} normalized response body exceeds its declared limit",
+                plugin.manifest.id
+            )));
+        }
+        Ok(Some(NormalizedProviderResponse {
+            status: envelope.status,
+            headers: envelope.headers,
+            body,
+            input_tokens: envelope.usage.input_tokens,
+            output_tokens: envelope.usage.output_tokens,
+            estimated: envelope.usage.estimated,
+        }))
+    }
+
+    fn component_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<(&LoadedPlugin, &ProviderType)>, AppError> {
+        let Some(plugin) = self.plugins.iter().find(|plugin| {
+            plugin
+                .manifest
+                .contributions
+                .providers
+                .iter()
+                .any(|provider| provider.id == provider_id)
+        }) else {
+            return Ok(None);
+        };
+        let provider = plugin
+            .manifest
+            .contributions
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or(AppError::Internal)?;
+        if provider.component_adapter.is_none() {
+            return Ok(None);
+        }
+        if plugin.component.is_none() {
+            return Err(AppError::Storage(format!(
+                "plugin {} declared a component provider without a component",
+                plugin.manifest.id
+            )));
+        }
+        Ok(Some((plugin, provider)))
+    }
+
+    fn instantiate(
+        &self,
+        plugin: &LoadedPlugin,
+        component: &Component,
+        engine: &Engine,
+    ) -> Result<(Store<HostState>, Plugin), AppError> {
+        let http = self.http.as_ref().ok_or(AppError::Internal)?;
+        let runtime = self.runtime.as_ref().ok_or(AppError::Internal)?;
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(PLUGIN_MEMORY_BYTES)
+            .table_elements(PLUGIN_TABLE_ELEMENTS)
+            .instances(8)
+            .tables(2)
+            .memories(2)
+            .build();
+        let mut store = Store::new(
+            engine,
+            HostState {
+                plugin_id: plugin.manifest.id.clone(),
+                capabilities: plugin.manifest.capabilities.clone(),
+                http: http.clone(),
+                runtime: runtime.clone(),
+                kv: self.kv.clone(),
+                limits,
+                deadline: Instant::now() + self.execution_timeout,
+            },
+        );
+        store.limiter(|state| &mut state.limits);
+        store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
+        store
+            .set_fuel(self.fuel)
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let mut linker = Linker::new(engine);
+        Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let bindings = Plugin::instantiate(&mut store, component, &linker)
+            .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
+        Ok((store, bindings))
+    }
+
     #[doc(hidden)]
     pub fn set_execution_limits_for_tests(&mut self, timeout: Duration, fuel: u64) {
         self.execution_timeout = timeout;
         self.fuel = fuel;
     }
+}
+
+fn encoded_body_limit(body_limit: usize) -> usize {
+    body_limit
+        .saturating_mul(4)
+        .div_ceil(3)
+        .saturating_add(64 * 1024)
+}
+
+fn validate_provider_method(value: &str) -> Result<reqwest::Method, AppError> {
+    let method = reqwest::Method::from_bytes(value.as_bytes())
+        .map_err(|_| AppError::Upstream("component provider returned an invalid method".into()))?;
+    if !matches!(
+        method,
+        reqwest::Method::GET
+            | reqwest::Method::POST
+            | reqwest::Method::PUT
+            | reqwest::Method::PATCH
+            | reqwest::Method::DELETE
+    ) {
+        return Err(AppError::Upstream(
+            "component provider method is not allowed".into(),
+        ));
+    }
+    Ok(method)
+}
+
+fn validate_provider_path(value: &str) -> Result<(), AppError> {
+    if value.is_empty()
+        || value.len() > 4_096
+        || !value.starts_with('/')
+        || value.starts_with("//")
+        || value.contains('#')
+        || value.chars().any(char::is_control)
+    {
+        return Err(AppError::Upstream(
+            "component provider returned an unsafe relative path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_headers(
+    headers: &BTreeMap<String, String>,
+    reject_credentials: bool,
+) -> Result<(), AppError> {
+    if headers.len() > 64 {
+        return Err(AppError::Upstream(
+            "component provider returned too many headers".into(),
+        ));
+    }
+    let mut total = 0_usize;
+    for (name, value) in headers {
+        let parsed_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| AppError::Upstream("component provider header name is invalid".into()))?;
+        reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| AppError::Upstream("component provider header value is invalid".into()))?;
+        total = total.saturating_add(name.len()).saturating_add(value.len());
+        let forbidden = matches!(
+            parsed_name.as_str(),
+            "transfer-encoding"
+                | "connection"
+                | "upgrade"
+                | "proxy-authorization"
+                | "proxy-authenticate"
+                | "te"
+                | "trailer"
+                | "set-cookie"
+        ) || (reject_credentials
+            && matches!(
+                parsed_name.as_str(),
+                "authorization" | "cookie" | "x-api-key" | "host" | "content-length"
+            ));
+        if forbidden {
+            return Err(AppError::Upstream(
+                "component provider returned a forbidden header".into(),
+            ));
+        }
+    }
+    if total > 16 * 1024 {
+        return Err(AppError::Upstream(
+            "component provider headers exceed 16 KiB".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plugin_http_method(value: &str) -> Result<reqwest::Method, String> {
+    let method = reqwest::Method::from_bytes(value.as_bytes())
+        .map_err(|_| "plugin HTTP method is invalid".to_owned())?;
+    if !matches!(
+        method,
+        reqwest::Method::GET
+            | reqwest::Method::HEAD
+            | reqwest::Method::POST
+            | reqwest::Method::PUT
+            | reqwest::Method::PATCH
+            | reqwest::Method::DELETE
+    ) {
+        return Err("plugin HTTP method is not allowed".to_owned());
+    }
+    Ok(method)
+}
+
+fn validate_plugin_http_headers(
+    headers_json: &str,
+) -> Result<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>, String> {
+    if headers_json.len() > PLUGIN_HTTP_HEADERS_JSON_BYTES {
+        return Err("plugin HTTP headers JSON exceeds 128 KiB".to_owned());
+    }
+    let headers: BTreeMap<String, String> = serde_json::from_str(headers_json)
+        .map_err(|_| "plugin HTTP headers must be a string map".to_owned())?;
+    if headers.len() > PLUGIN_HTTP_HEADER_COUNT {
+        return Err("plugin HTTP request has too many headers".to_owned());
+    }
+
+    let mut total = 0_usize;
+    let mut normalized_names = BTreeSet::new();
+    let mut validated = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        if name.len() > PLUGIN_HTTP_HEADER_NAME_BYTES {
+            return Err("plugin HTTP header name exceeds 256 bytes".to_owned());
+        }
+        if value.len() > PLUGIN_HTTP_HEADER_VALUE_BYTES {
+            return Err("plugin HTTP header value exceeds 8 KiB".to_owned());
+        }
+        total = total.saturating_add(name.len()).saturating_add(value.len());
+        if total > PLUGIN_HTTP_HEADER_TOTAL_BYTES {
+            return Err("plugin HTTP headers exceed 16 KiB".to_owned());
+        }
+
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| "plugin HTTP header name is invalid".to_owned())?;
+        let normalized = name.as_str();
+        if !normalized_names.insert(normalized.to_owned()) {
+            return Err("plugin HTTP request contains a duplicate header".to_owned());
+        }
+        let forbidden = matches!(
+            normalized,
+            "host"
+                | "content-length"
+                | "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "http2-settings"
+                | "proxy"
+                | "forwarded"
+                | "via"
+                | "max-forwards"
+                | "x-real-ip"
+                | "x-original-url"
+                | "x-rewrite-url"
+                | "x-http-method"
+                | "x-http-method-override"
+                | "x-method-override"
+        ) || normalized.starts_with("proxy-")
+            || normalized.starts_with("x-proxy-")
+            || normalized.starts_with("x-forwarded-");
+        if forbidden {
+            return Err("plugin HTTP request contains a forbidden header".to_owned());
+        }
+
+        let value = reqwest::header::HeaderValue::from_str(&value)
+            .map_err(|_| "plugin HTTP header value is invalid".to_owned())?;
+        validated.push((name, value));
+    }
+    Ok(validated)
 }
 
 fn epoch_deadline_ticks(timeout: Duration) -> u64 {
@@ -456,7 +1009,7 @@ fn plugin_directories(root: &Path) -> Result<Vec<PathBuf>, AppError> {
 }
 
 impl memeloop::token_center::host::Host for HostState {
-    fn log(&mut self, level: String, message: String) {
+    fn log(&mut self, level: String, _message: String) {
         if !self
             .capabilities
             .iter()
@@ -465,10 +1018,26 @@ impl memeloop::token_center::host::Host for HostState {
             return;
         }
         match level.as_str() {
-            "error" => tracing::error!(plugin_id = %self.plugin_id, %message, "plugin"),
-            "warn" => tracing::warn!(plugin_id = %self.plugin_id, %message, "plugin"),
-            "debug" => tracing::debug!(plugin_id = %self.plugin_id, %message, "plugin"),
-            _ => tracing::info!(plugin_id = %self.plugin_id, %message, "plugin"),
+            "error" => tracing::error!(
+                plugin_id = %self.plugin_id,
+                decision_code = "plugin_log_emitted",
+                "plugin emitted a log event"
+            ),
+            "warn" => tracing::warn!(
+                plugin_id = %self.plugin_id,
+                decision_code = "plugin_log_emitted",
+                "plugin emitted a log event"
+            ),
+            "debug" => tracing::debug!(
+                plugin_id = %self.plugin_id,
+                decision_code = "plugin_log_emitted",
+                "plugin emitted a log event"
+            ),
+            _ => tracing::info!(
+                plugin_id = %self.plugin_id,
+                decision_code = "plugin_log_emitted",
+                "plugin emitted a log event"
+            ),
         }
     }
 
@@ -521,8 +1090,12 @@ impl memeloop::token_center::host::Host for HostState {
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
+            || url.fragment().is_some()
         {
-            return Err("plugin HTTP URL must be an HTTP(S) URL without credentials".to_owned());
+            return Err(
+                "plugin HTTP URL must be an HTTP(S) URL without credentials or a fragment"
+                    .to_owned(),
+            );
         }
         let origin = url.origin().ascii_serialization();
         let allowed = self.capabilities.iter().any(|capability| {
@@ -534,10 +1107,11 @@ impl memeloop::token_center::host::Host for HostState {
         if !allowed {
             return Err(format!("plugin HTTP origin is not allowed: {origin}"));
         }
-        let method = reqwest::Method::from_bytes(method.as_bytes())
-            .map_err(|_| "plugin HTTP method is invalid".to_owned())?;
-        let headers: BTreeMap<String, String> = serde_json::from_str(&headers_json)
-            .map_err(|_| "plugin HTTP headers must be a string map".to_owned())?;
+        // Validate the complete request metadata before DNS or network access.
+        // The allowlisted URL remains the request URL so reqwest derives Host
+        // and TLS SNI from its original hostname; plugins cannot override it.
+        let method = validate_plugin_http_method(&method)?;
+        let headers = validate_plugin_http_headers(&headers_json)?;
         // Plugin packages currently have no global-operator approval metadata
         // for private destinations. Until that exists, HTTP capability is
         // deliberately public-only and its DNS result is pinned per call.
@@ -559,10 +1133,6 @@ impl memeloop::token_center::host::Host for HostState {
             .timeout(remaining)
             .body(body);
         for (name, value) in headers {
-            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| "plugin HTTP header name is invalid".to_owned())?;
-            let value = reqwest::header::HeaderValue::from_str(&value)
-                .map_err(|_| "plugin HTTP header value is invalid".to_owned())?;
             request = request.header(name, value);
         }
         let (status, response_headers, response_body) = self.runtime.block_on(async move {
@@ -602,6 +1172,7 @@ impl memeloop::token_center::types::Host for HostState {}
 
 fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
     if manifest.id.is_empty()
+        || manifest.id.len() > MAX_PLUGIN_ID_BYTES
         || !manifest
             .id
             .chars()
@@ -626,6 +1197,18 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
     if manifest.contributions.traffic_policy && manifest.wasm.is_none() {
         return Err(AppError::BadRequest(format!(
             "plugin {} needs a component for its traffic policy",
+            manifest.id
+        )));
+    }
+    if manifest.wasm.is_none()
+        && manifest
+            .contributions
+            .providers
+            .iter()
+            .any(|provider| provider.component_adapter.is_some())
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {} needs a component for its executable provider adapter",
             manifest.id
         )));
     }
@@ -672,6 +1255,7 @@ fn validate_provider_contribution(
     const PROTOCOLS: &[&str] = &["openai", "anthropic", "generation"];
     const MODALITIES: &[&str] = &["text", "embedding", "image", "video", "audio"];
     if provider.id.is_empty()
+        || provider.id.len() > MAX_PLUGIN_ID_BYTES
         || !provider
             .id
             .chars()
@@ -694,7 +1278,47 @@ fn validate_provider_contribution(
     }
     crate::schema::validate_definition(&provider.config_schema)?;
     crate::schema::validate_definition(&provider.credential_schema)?;
+    let supported_credentials = [
+        serde_json::json!({"type": "none"}),
+        serde_json::json!({"type": "api_key", "value": "contract-probe"}),
+        serde_json::json!({
+            "type": "oauth",
+            "access_token": "contract-probe",
+            "refresh_token": "contract-probe",
+            "expires_at": 4_102_444_800_000_i64
+        }),
+        serde_json::json!({
+            "type": "subscription_bridge",
+            "handle": "ContractProbe"
+        }),
+    ];
+    if !supported_credentials.iter().any(|credential| {
+        crate::schema::validate_instance(&provider.credential_schema, credential).is_ok()
+    }) {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} provider {} credential schema accepts no supported core credential shape",
+            provider.id
+        )));
+    }
     if let Some(adapter) = &provider.oauth_adapter {
+        if adapter.api_version != "oauth-adapter-v1"
+            || adapter.flow_kind != crate::provider::OAuthFlowKind::CursorPkce
+        {
+            return Err(AppError::BadRequest(format!(
+                "plugin {plugin_id} provider {} contributes an unsupported OAuth adapter contract",
+                provider.id
+            )));
+        }
+        crate::schema::validate_instance(
+            &provider.credential_schema,
+            &supported_credentials[2],
+        )
+        .map_err(|_| {
+            AppError::BadRequest(format!(
+                "plugin {plugin_id} provider {} OAuth adapter credential schema rejects the OAuth result shape",
+                provider.id
+            ))
+        })?;
         for (field, endpoint) in [
             ("login_url", &adapter.login_url),
             ("poll_url", &adapter.poll_url),
@@ -702,6 +1326,43 @@ fn validate_provider_contribution(
         ] {
             crate::oauth::validate_oauth_endpoint(endpoint, field)?;
         }
+    }
+    if let Some(adapter) = &provider.managed_oauth_adapter {
+        crate::provider::validate_managed_oauth_adapter_contribution(adapter).map_err(|_| {
+            AppError::BadRequest(format!(
+                "plugin {plugin_id} provider {} contributes an invalid managed OAuth adapter",
+                provider.id
+            ))
+        })?;
+        crate::schema::validate_instance(
+            &provider.credential_schema,
+            &serde_json::json!({
+                "type": "oauth",
+                "access_token": "contract-probe",
+                "refresh_token": "contract-probe",
+                "expires_at": 4_102_444_800_000_i64,
+                "adapter_state": {"probe": true}
+            }),
+        )
+        .map_err(|_| {
+            AppError::BadRequest(format!(
+                "plugin {plugin_id} provider {} managed OAuth credential schema rejects the adapter result shape",
+                provider.id
+            ))
+        })?;
+    }
+    if let Some(adapter) = &provider.component_adapter
+        && (adapter.api_version != "buffered-v1"
+            || adapter.max_response_bytes == 0
+            || adapter.max_response_bytes > MAX_COMPONENT_PROVIDER_BODY
+            || provider
+                .protocols
+                .iter()
+                .any(|protocol| !matches!(protocol.as_str(), "openai" | "anthropic")))
+    {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} contributes an unsupported component provider adapter"
+        )));
     }
     Ok(())
 }
@@ -748,13 +1409,55 @@ fn default_wasm_file() -> Option<String> {
     Some("plugin.wasm".to_owned())
 }
 
-fn plugin_failure(plugin_id: &str, error: wasmtime::Error) -> AppError {
-    AppError::Upstream(format!("plugin {plugin_id} failed: {error}"))
+fn validate_plugin_text(value: &str, maximum: usize, allow_empty: bool) -> Result<(), ()> {
+    if value.len() > maximum
+        || (!allow_empty && value.trim().is_empty())
+        || value.chars().any(char::is_control)
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_traffic_request_json(value: &str) -> Result<Value, ()> {
+    if value.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES {
+        return Err(());
+    }
+    serde_json::from_str(value).map_err(|_| ())
+}
+
+fn invalid_plugin_result(plugin_id: &str, field: &str) -> AppError {
+    AppError::Upstream(format!("plugin {plugin_id} returned an invalid {field}"))
+}
+
+fn plugin_reported_error(plugin_id: &str, operation: &str, error: &str) -> AppError {
+    let code = if validate_plugin_text(error, MAX_TRAFFIC_REASON_BYTES, false).is_ok() {
+        "reported_error"
+    } else {
+        "reported_invalid_error"
+    };
+    AppError::Upstream(format!("plugin {plugin_id} {operation} failed ({code})"))
+}
+
+fn plugin_failure(plugin_id: &str, _error: wasmtime::Error) -> AppError {
+    AppError::Upstream(format!("plugin {plugin_id} execution failed"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_text_boundaries_reject_empty_oversize_and_control_characters() {
+        assert!(validate_plugin_text("valid", 5, false).is_ok());
+        assert!(validate_plugin_text("valid!", 5, false).is_err());
+        assert!(validate_plugin_text("", 5, false).is_err());
+        assert!(validate_plugin_text("", 5, true).is_ok());
+        assert!(validate_plugin_text("line\nbreak", 32, false).is_err());
+        assert!(validate_plugin_text("nul\0byte", 32, false).is_err());
+        assert!(validate_plugin_text("你好", 6, false).is_ok());
+        assert!(validate_plugin_text("你好", 5, false).is_err());
+    }
 
     #[test]
     fn rejects_plugin_paths_that_escape_the_package() {
@@ -786,7 +1489,7 @@ mod tests {
         let manifest = PluginManifest {
             id: "test-plugin".to_owned(),
             version: "1.0.0".to_owned(),
-            wit_version: "0.1.0".to_owned(),
+            wit_version: "0.2.0".to_owned(),
             wasm: Some("plugin.wasm".to_owned()),
             capabilities: vec![PluginCapability::Http {
                 allowed_origins: vec!["https://example.com/oauth/token".to_owned()],
@@ -802,7 +1505,7 @@ mod tests {
         let manifest = PluginManifest {
             id: "test-plugin".to_owned(),
             version: "1.0.0".to_owned(),
-            wit_version: "0.1.0".to_owned(),
+            wit_version: "0.2.0".to_owned(),
             wasm: Some("plugin.wasm".to_owned()),
             capabilities: vec![PluginCapability::Http {
                 allowed_origins: vec!["http://metadata.internal".to_owned()],
@@ -814,11 +1517,209 @@ mod tests {
     }
 
     #[test]
+    fn component_provider_request_boundaries_reject_origin_and_secret_header_smuggling() {
+        assert!(validate_provider_path("/vendor/infer?mode=one").is_ok());
+        for path in [
+            "https://metadata.invalid/token",
+            "//metadata.invalid/token",
+            "/safe#fragment",
+            "/safe\nforged",
+        ] {
+            assert!(validate_provider_path(path).is_err(), "{path:?}");
+        }
+        assert!(validate_provider_method("POST").is_ok());
+        assert!(validate_provider_method("CONNECT").is_err());
+        for name in [
+            "authorization",
+            "cookie",
+            "x-api-key",
+            "host",
+            "content-length",
+            "transfer-encoding",
+        ] {
+            assert!(
+                validate_provider_headers(
+                    &BTreeMap::from([(name.to_owned(), "smuggled".to_owned())]),
+                    true,
+                )
+                .is_err(),
+                "{name}"
+            );
+        }
+        assert!(
+            validate_provider_headers(
+                &BTreeMap::from([("x-vendor-version".into(), "2026-08".into())]),
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn plugin_http_methods_are_an_explicit_allowlist() {
+        for method in ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] {
+            assert!(validate_plugin_http_method(method).is_ok(), "{method}");
+        }
+        for method in ["CONNECT", "TRACE", "OPTIONS", "CUSTOM", "get"] {
+            assert!(validate_plugin_http_method(method).is_err(), "{method}");
+        }
+    }
+
+    #[test]
+    fn plugin_http_headers_reject_authority_hop_proxy_and_method_smuggling() {
+        for name in [
+            "Host",
+            "Content-Length",
+            "Connection",
+            "Keep-Alive",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+            "Proxy-Connection",
+            "Proxy-Custom",
+            "Proxy",
+            "X-Proxy-Custom",
+            "TE",
+            "Trailer",
+            "Transfer-Encoding",
+            "Upgrade",
+            "HTTP2-Settings",
+            "Forwarded",
+            "Via",
+            "Max-Forwards",
+            "X-Forwarded-Host",
+            "X-Forwarded-For",
+            "X-Real-IP",
+            "X-Original-URL",
+            "X-Rewrite-URL",
+            "X-HTTP-Method",
+            "X-HTTP-Method-Override",
+            "X-Method-Override",
+        ] {
+            let encoded =
+                serde_json::to_string(&BTreeMap::from([(name.to_owned(), "smuggled".to_owned())]))
+                    .unwrap();
+            assert!(validate_plugin_http_headers(&encoded).is_err(), "{name}");
+        }
+
+        let duplicate = r#"{"X-Vendor-Version":"one","x-vendor-version":"two"}"#;
+        assert!(validate_plugin_http_headers(duplicate).is_err());
+    }
+
+    #[test]
+    fn plugin_http_headers_allow_auth_and_enforce_every_size_boundary() {
+        let authentication = serde_json::to_string(&BTreeMap::from([
+            ("Authorization".to_owned(), "Bearer plugin-token".to_owned()),
+            ("X-Api-Key".to_owned(), "vendor-key".to_owned()),
+        ]))
+        .unwrap();
+        let headers =
+            validate_plugin_http_headers(&authentication).expect("authentication headers");
+        assert_eq!(headers.len(), 2);
+
+        let at_count_limit = (0..PLUGIN_HTTP_HEADER_COUNT)
+            .map(|index| (format!("x-test-{index}"), String::new()))
+            .collect::<BTreeMap<_, _>>();
+        assert!(
+            validate_plugin_http_headers(&serde_json::to_string(&at_count_limit).unwrap()).is_ok()
+        );
+        let over_count_limit = (0..=PLUGIN_HTTP_HEADER_COUNT)
+            .map(|index| (format!("x-test-{index}"), String::new()))
+            .collect::<BTreeMap<_, _>>();
+        assert!(
+            validate_plugin_http_headers(&serde_json::to_string(&over_count_limit).unwrap())
+                .is_err()
+        );
+
+        let at_name_limit =
+            BTreeMap::from([("x".repeat(PLUGIN_HTTP_HEADER_NAME_BYTES), String::new())]);
+        assert!(
+            validate_plugin_http_headers(&serde_json::to_string(&at_name_limit).unwrap()).is_ok()
+        );
+        let over_name_limit =
+            BTreeMap::from([("x".repeat(PLUGIN_HTTP_HEADER_NAME_BYTES + 1), String::new())]);
+        assert!(
+            validate_plugin_http_headers(&serde_json::to_string(&over_name_limit).unwrap())
+                .is_err()
+        );
+
+        let at_value_limit = BTreeMap::from([(
+            "x-test".to_owned(),
+            "a".repeat(PLUGIN_HTTP_HEADER_VALUE_BYTES),
+        )]);
+        assert!(
+            validate_plugin_http_headers(&serde_json::to_string(&at_value_limit).unwrap()).is_ok()
+        );
+        let over_value_limit = BTreeMap::from([(
+            "x-test".to_owned(),
+            "a".repeat(PLUGIN_HTTP_HEADER_VALUE_BYTES + 1),
+        )]);
+        assert!(
+            validate_plugin_http_headers(&serde_json::to_string(&over_value_limit).unwrap())
+                .is_err()
+        );
+
+        let at_total_limit = BTreeMap::from([
+            ("x-a".to_owned(), "a".repeat(8_189)),
+            ("x-b".to_owned(), "b".repeat(8_189)),
+        ]);
+        assert_eq!(
+            at_total_limit
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>(),
+            PLUGIN_HTTP_HEADER_TOTAL_BYTES
+        );
+        assert!(
+            validate_plugin_http_headers(&serde_json::to_string(&at_total_limit).unwrap()).is_ok()
+        );
+        let mut over_total_limit = at_total_limit;
+        over_total_limit
+            .get_mut("x-b")
+            .expect("second header")
+            .push('b');
+        assert!(
+            validate_plugin_http_headers(&serde_json::to_string(&over_total_limit).unwrap())
+                .is_err()
+        );
+
+        assert!(
+            validate_plugin_http_headers(&" ".repeat(PLUGIN_HTTP_HEADERS_JSON_BYTES + 1)).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn malicious_plugin_request_is_rejected_before_dns_access() {
+        let mut state = HostState {
+            plugin_id: "malicious-plugin".to_owned(),
+            capabilities: vec![PluginCapability::Http {
+                allowed_origins: vec!["https://does-not-resolve.invalid".to_owned()],
+            }],
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            runtime: tokio::runtime::Handle::current(),
+            kv: None,
+            limits: StoreLimitsBuilder::new().build(),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let error = memeloop::token_center::host::Host::http_request(
+            &mut state,
+            "POST".to_owned(),
+            "https://does-not-resolve.invalid/token".to_owned(),
+            r#"{"Host":"metadata.internal"}"#.to_owned(),
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.contains("forbidden header"), "{error}");
+    }
+
+    #[test]
     fn manifest_only_oauth_provider_does_not_require_wasm() {
         let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
             "id": "example-oauth",
             "version": "1.0.0",
-            "wit_version": "0.1.0",
+            "wit_version": "0.2.0",
             "wasm": null,
             "contributions": {
                 "providers": [{
@@ -829,6 +1730,8 @@ mod tests {
                     "config_schema": {"type": "object"},
                     "credential_schema": {"type": "object"},
                     "oauth_adapter": {
+                        "api_version": "oauth-adapter-v1",
+                        "flow_kind": "cursor_pkce",
                         "login_url": "http://example-oauth.default.svc/login",
                         "poll_url": "http://example-oauth.default.svc/poll",
                         "refresh_url": "http://example-oauth.default.svc/refresh"
@@ -842,6 +1745,111 @@ mod tests {
         let mut invalid = manifest;
         invalid.contributions.traffic_policy = true;
         assert!(validate_manifest(&invalid).is_err());
+    }
+
+    fn managed_oauth_manifest() -> PluginManifest {
+        serde_json::from_value(serde_json::json!({
+            "id": "managed-oauth",
+            "version": "1.0.0",
+            "wit_version": "0.2.0",
+            "wasm": null,
+            "contributions": {"providers": [{
+                "id": "managed-provider",
+                "display_name": "Managed provider",
+                "protocols": ["openai"],
+                "modalities": ["text"],
+                "config_schema": {"type": "object"},
+                "credential_schema": {"type": "object"},
+                "managed_oauth_adapter": {
+                    "api_version": "cpa-managed-oauth-adapter-v1",
+                    "source_types": ["codex-account", "gemini-account"],
+                    "normalize_url": "http://managed-oauth.default.svc/normalize",
+                    "refresh_url": "http://managed-oauth.default.svc/refresh"
+                }
+            }]}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn managed_oauth_contribution_validates_version_sources_and_ssrf_boundaries() {
+        let valid = managed_oauth_manifest();
+        assert!(validate_manifest(&valid).is_ok());
+
+        let mut invalid_version = valid.clone();
+        invalid_version.contributions.providers[0]
+            .managed_oauth_adapter
+            .as_mut()
+            .unwrap()
+            .api_version = "cpa-managed-oauth-adapter-v2".into();
+        assert!(validate_manifest(&invalid_version).is_err());
+
+        let mut duplicate_source = valid.clone();
+        duplicate_source.contributions.providers[0]
+            .managed_oauth_adapter
+            .as_mut()
+            .unwrap()
+            .source_types = vec!["codex-account".into(), "codex-account".into()];
+        assert!(validate_manifest(&duplicate_source).is_err());
+
+        let mut illegal_source = valid.clone();
+        illegal_source.contributions.providers[0]
+            .managed_oauth_adapter
+            .as_mut()
+            .unwrap()
+            .source_types = vec!["Codex/account".into()];
+        assert!(validate_manifest(&illegal_source).is_err());
+
+        for endpoint in [
+            "ftp://adapter.example/normalize",
+            "http://example.com/normalize",
+            "https://user:password@example.com/normalize",
+            "http://127.0.0.1:3000/normalize",
+            "https://169.254.169.254/latest/meta-data",
+            "https://adapter.example/normalize?target=http://metadata.internal",
+            "https://adapter.example/normalize#fragment",
+        ] {
+            let mut invalid_endpoint = valid.clone();
+            invalid_endpoint.contributions.providers[0]
+                .managed_oauth_adapter
+                .as_mut()
+                .unwrap()
+                .normalize_url = endpoint.into();
+            assert!(
+                validate_manifest(&invalid_endpoint).is_err(),
+                "accepted {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_provider_requires_component_supported_version_and_buffered_protocol() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "component-provider",
+            "version": "1.0.0",
+            "wit_version": "0.2.0",
+            "wasm": null,
+            "contributions": {"providers": [{
+                "id": "component-http",
+                "display_name": "Component HTTP",
+                "protocols": ["openai"],
+                "modalities": ["text"],
+                "config_schema": {"type": "object"},
+                "credential_schema": {"type": "object"},
+                "component_adapter": {
+                    "api_version": "buffered-v1",
+                    "max_response_bytes": 1024
+                }
+            }]}
+        }))
+        .unwrap();
+        assert!(validate_manifest(&manifest).is_err());
+
+        let mut with_component = manifest;
+        with_component.wasm = Some("plugin.wasm".into());
+        assert!(validate_manifest(&with_component).is_ok());
+        with_component.contributions.providers[0].protocols = vec!["generation".into()];
+        assert!(validate_manifest(&with_component).is_err());
     }
 
     #[tokio::test]
@@ -859,7 +1867,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "id": "config-map-provider",
                 "version": "1.0.0",
-                "wit_version": "0.1.0",
+                "wit_version": "0.2.0",
                 "wasm": null,
                 "contributions": {
                     "providers": [{

@@ -73,6 +73,10 @@ The current public/review surfaces are intentionally different:
 The public TLS ingress on port 443 allows only `/v1`, `/self`, `/portal`,
 `/ui-assets` and health/readiness paths. It returns 404 for `/operator` and
 `/internal`; the operator surface remains on the private ingress only.
+Higress/Ingress is also the sole owner of archive/asset download bandwidth,
+request-rate and connection/concurrency limits. Token Center has no separate
+application download limiter; its asset path remains responsible for
+authentication, tenant isolation, exact range semantics and bounded streaming.
 
 ## What the next chart changes
 
@@ -82,19 +86,31 @@ the existing Helm migration hook into `PreSync`; the last observed hook result
 was `Reached expected number of succeeded pods`.
 
 The dogfood database was v12 at audit time. The current working-tree binary
-contains v13-v23. These migrations add columns, indexes and tables; none drops
-or renames an existing application column or table, but that alone does **not**
-make an old binary write-compatible. Starting at v22, every budget reservation,
-settlement and cancellation must transactionally maintain the new rollup state.
-An old pod that writes after v22 is applied will not do so. Therefore an ordinary
-PreSync-migration/rolling-update sequence is a NO-GO for v22/v23. Because this
-review instance is not carrying production traffic and old CPA remains the
-production path, use two separate GitOps stages: Stage A sets Token Center
-gateway/control/worker replicas to zero and waits for termination plus zero
-active requests/jobs; Stage B pins the reviewed SHA/image, enables migration,
-applies v12→v23 and starts only v23 pods. Do not combine these changes into one
-Argo sync. After v22 is applied, do not restore request traffic to the v12 image.
-Do not attempt to roll the database schema backward.
+contains v13-v35. These migrations add columns, indexes and tables, plus bounded
+data repair in v31, the fail-closed one-to-one legacy-key constraint in v33,
+managed OAuth import identity in v34 and fenced archive-staging ownership in
+v35; none drops or renames an existing application column or table. That alone
+does **not** make an old binary write-compatible. Starting at v22, every budget
+reservation, settlement and cancellation must transactionally maintain the new
+rollup state. The v30 generation admission path likewise requires the new
+`preparing` ownership/lease state, and v33 deliberately fails closed if one
+legacy credential maps to multiple stable keys.
+
+A fresh isolated PostgreSQL 17 database has applied v1→v35 successfully, and
+the related focused PostgreSQL gates passed. This validates the empty-database
+migration sequence and the tested runtime invariants; it does not measure locks
+or latency while upgrading the 141k-row dogfood database from v12, and no live
+v35 rollout has occurred. Therefore an ordinary PreSync-migration/rolling-update
+sequence remains a NO-GO. Before authorizing Stage B, reconcile any schema-v33
+uniqueness conflict and retain the production-size migration lock-time plus
+final EXPLAIN/latency evidence. Because this review instance is not carrying
+production traffic and old CPA remains the production path, use two separate
+GitOps stages: Stage A sets Token Center gateway/control/worker replicas to zero
+and waits for termination plus zero active requests/jobs; Stage B pins the
+reviewed SHA/image, enables migration, applies v12→v35 and starts only v35 pods.
+Do not combine these changes into one Argo sync. After v22 is applied, do not
+restore request traffic to the v12 image. Do not attempt to roll the database
+schema backward.
 
 The new probes have these contracts:
 
@@ -118,36 +134,49 @@ the registry digest. A private repository can publish these packages; private
 packages require an image pull credential, while public GHCR container packages
 allow anonymous pulls.
 
-The Forgejo workflow remains a Harbor fallback and builds the same service and
-importer on `master`. Its date/short-SHA tag is a discovery label, not an
-immutability boundary: this Harbor project currently permits tag replacement.
-Discover the tag instead of guessing the UTC date, verify its digest, and deploy
-as `repository:tag@sha256:digest`:
+There is no repository-managed Forgejo/Harbor fallback. GitHub CI and the two
+GHCR packages are the release authority. Select the `sha-<full commit>` images,
+obtain each digest from the successful `publish-ghcr` matrix job, and deploy the
+service and importer as independent `repository:tag@sha256:digest` references:
 
 ```bash
-export MTC_REPO=/home/chenshuangfeng/Github/memeloop-token-center
+: "${MTC_REPO:?Set MTC_REPO to the repository's absolute path}"
+case "$MTC_REPO" in /*) ;; *) echo 'MTC_REPO must be absolute' >&2; exit 1;; esac
 export OPS_HOST=main.admin-test.lindongwu11.coder
 MTC_SHA=$(git -C "$MTC_REPO" rev-parse HEAD)
-MTC_SHORT=$(printf '%s' "$MTC_SHA" | cut -c1-7)
+MTC_SERVICE_IMAGE="ghcr.io/linonetwo/memeloop-token-center:sha-${MTC_SHA}"
+MTC_IMPORTER_IMAGE="ghcr.io/linonetwo/memeloop-token-center-importer:sha-${MTC_SHA}"
 
-MTC_TAG=$(
-  ssh "$OPS_HOST" \
-    'curl --fail --silent "http://harbor-core.harbor.svc.cluster.local/api/v2.0/projects/library/repositories/memeloop-token-center/artifacts?with_tag=true&page_size=100"' \
-  | jq -r --arg suffix "-$MTC_SHORT" \
-      '[.[] | .tags[]?.name | select(endswith($suffix))] | unique | if length == 1 then .[0] else empty end'
-)
-test -n "$MTC_TAG"
+# Authenticate to private GHCR packages without shell tracing, then inspect both.
+docker buildx imagetools inspect "$MTC_SERVICE_IMAGE"
+docker buildx imagetools inspect "$MTC_IMPORTER_IMAGE"
 
-ssh "$OPS_HOST" \
-  "curl --fail --silent 'http://harbor-core.harbor.svc.cluster.local/api/v2.0/projects/library/repositories/memeloop-token-center/artifacts/$MTC_TAG'" \
-  | jq '{digest, push_time, tags: [.tags[]?.name]}'
-ssh "$OPS_HOST" \
-  "curl --fail --silent 'http://harbor-core.harbor.svc.cluster.local/api/v2.0/projects/library/repositories/memeloop-token-center-importer/artifacts/$MTC_TAG'" \
-  | jq '{digest, push_time, tags: [.tags[]?.name]}'
+: "${MTC_SERVICE_DIGEST:?Set from the service publish-ghcr job (sha256:...)}"
+: "${MTC_IMPORTER_DIGEST:?Set from the importer publish-ghcr job (sha256:...)}"
+case "$MTC_SERVICE_DIGEST:$MTC_IMPORTER_DIGEST" in
+  sha256:*:sha256:*) ;;
+  *) echo 'Both image digests must be sha256 values' >&2; exit 1;;
+esac
+MTC_SERVICE_IMAGE_PIN="${MTC_SERVICE_IMAGE}@${MTC_SERVICE_DIGEST}"
+MTC_IMPORTER_IMAGE_PIN="${MTC_IMPORTER_IMAGE}@${MTC_IMPORTER_DIGEST}"
 ```
 
-Both artifacts must exist. Record their digests in the release evidence. A
-mutable date-only tag is never a deployment input.
+For Helm releases, set `image.repository` and the strict `image.digest`
+(`sha256:` plus 64 lowercase hexadecimal characters). A non-empty digest takes
+precedence over `image.tag` for both application Deployments and the migration
+Job, so the rendered workload uses `repository@digest`.
+
+Both artifacts must exist and carry `org.opencontainers.image.revision` equal
+to `MTC_SHA`. Record their separate digests in the release evidence. A moving
+`master` tag is never a deployment input.
+
+If the cluster must pull from Harbor, use only an independently approved and
+verified registry synchronization/import procedure, then prove that each
+destination artifact has the same platform manifest and revision label as its
+GHCR source and pin the Harbor destination digest. This repository currently
+contains no such synchronization procedure, so the mere presence of an old or
+mutable Harbor tag is not release evidence; use GHCR with an image-pull Secret
+until the external procedure and its digest-equivalence evidence are supplied.
 
 ## Gate 2: create an independent pre-upgrade recovery point
 
@@ -161,9 +190,10 @@ storage control plane:
 
 ```bash
 export OPS_HOST=main.admin-test.lindongwu11.coder
-BACKUP_ROOT=/home/chenshuangfeng/Github/memeloop-token-center-backups
+: "${MTC_BACKUP_ROOT:?Set MTC_BACKUP_ROOT to an absolute backup directory}"
+case "$MTC_BACKUP_ROOT" in /*) ;; *) echo 'MTC_BACKUP_ROOT must be absolute' >&2; exit 1;; esac
 BACKUP_ID=$(date -u +%Y%m%dT%H%M%SZ)
-BACKUP_DIR="$BACKUP_ROOT/$BACKUP_ID"
+BACKUP_DIR="$MTC_BACKUP_ROOT/$BACKUP_ID"
 install -d -m 0700 "$BACKUP_DIR/s3"
 
 ssh "$OPS_HOST" '
@@ -338,13 +368,13 @@ the dependency probes succeed.
 
 ## Gate 4: dev canary before the imported dogfood database
 
-The dev app currently follows Token Center `master`, pins an old image and has
-`migration.enabled=false`. The new chart disables startup migrations, so simply
-changing its image would leave the dev database at v10 and is not a valid
+At the 2026-08-13 audit, the dev app followed Token Center `master`, pinned an
+old image and had `migration.enabled=false`; its database was v10. The new chart
+disables startup migrations, so simply changing the image is not a valid
 canary. In one GitOps commit:
 
 - pin the dev chart `targetRevision` to the exact `MTC_SHA`;
-- set its image tag to the immutable `MTC_TAG`;
+- set its image to the immutable `MTC_SERVICE_IMAGE_PIN`;
 - set `migration.enabled=true`;
 - retain one gateway and its separate `memeloop_token_center` database/bucket.
 
@@ -363,12 +393,12 @@ ssh "$OPS_HOST" \
 Then verify `/version`, `/livez`, `/readyz`, UI assets and one disposable
 credential's mocked or non-billable proxy/archive/accounting path through a
 port-forward. The dev database must report the schema version declared by the
-reviewed source revision (v23 in the current working tree). The fresh restricted
-PostgreSQL gate has now applied v1–v23 without a gap and passed the locator,
-budget-concurrency, generation-aggregate, entitlement and observability suites.
-This clears the functional database gate, not the pending 141k-row migration
-lock-time or imported-scale EXPLAIN/latency gate. Stop if readiness fails,
-the migration Job fails, or the reported revision is not exactly `MTC_SHA`.
+reviewed source revision (v35 in the current working tree). The fresh isolated
+PostgreSQL 17 v1→v35 migration and focused PostgreSQL gates have passed. They do
+not clear the pending 141k-row migration lock-time, final imported-scale
+EXPLAIN/latency, current-SHA 15-minute memory, or live rollout gates. Stop if
+those required release artifacts have not been retained, readiness fails, the
+migration Job fails, or the reported revision is not exactly `MTC_SHA`.
 
 ## Incremental CPAMP refresh
 
@@ -403,7 +433,7 @@ ssh "$OPS_HOST" '
 '
 ```
 
-Update the operational Job's image tag to `MTC_TAG` before creating it. Record
+Update the operational Job's image to `MTC_IMPORTER_IMAGE_PIN` before creating it. Record
 the pre/post target request count, importer `staged`, `unmapped` and duplicate
 counts, checkpoint watermark and source file modification time. Re-run once;
 the second run must not increase target request or aggregate counts.
@@ -416,7 +446,7 @@ test "$(ssh "$OPS_HOST" \
   'kubectl -n cliproxyapi get pod -l app.kubernetes.io/name=cpa-manager-plus -o jsonpath="{.items[0].spec.nodeName}"')" = haixia
 
 sed -E \
-  "s#(memeloop-token-center-importer:)[^[:space:]]+#\1${MTC_TAG}#" \
+  "s#^([[:space:]]*image:)[[:space:]].*#\1 ${MTC_IMPORTER_IMAGE_PIN}#" \
   "$MTC_REPO/ops/kubernetes/cpamp-import-job.yaml" \
   | ssh "$OPS_HOST" 'kubectl create -f -'
 
@@ -452,7 +482,7 @@ second-run zero-change evidence is saved, remove both operational objects:
 ssh "$OPS_HOST" \
   'kubectl -n cliproxyapi delete job memeloop-token-center-cpamp-import --wait=true'
 sed -E \
-  "s#(memeloop-token-center-importer:)[^[:space:]]+#\1${MTC_TAG}#" \
+  "s#^([[:space:]]*image:)[[:space:]].*#\1 ${MTC_IMPORTER_IMAGE_PIN}#" \
   "$MTC_REPO/ops/kubernetes/cpamp-import-job.yaml" \
   | ssh "$OPS_HOST" 'kubectl create -f -'
 ssh "$OPS_HOST" \
@@ -482,7 +512,7 @@ Only after Gates 1-4 and the backup checks pass:
    the new image in one GitOps commit.
 2. **Stage B -- migrate and start only the reviewed binary.** In a separate
    commit, pin the exact Token Center source SHA and immutable image, enable the
-   PreSync v12-to-v23 migration, restore the intended replica counts, and set the
+   PreSync v12-to-v35 migration, restore the intended replica counts, and set the
    explicit NetworkPolicy selectors and probe paths. An old Token Center binary
    must never start after v22 has been applied.
 3. Push each stage's commit to the remote actually consumed by Argo CD. This
@@ -496,15 +526,16 @@ Only after Gates 1-4 and the backup checks pass:
 5. Watch the Stage B PreSync migration Job. A failure must prevent Deployment
    rollout and leave the Token Center review roles at zero; old CPA continues
    serving production traffic.
-6. Watch control and worker, then both v23 gateway replicas. The short review
+6. Watch control and worker, then both v35 gateway replicas. The short review
    outage is intentional; do not try to preserve availability by overlapping a
-   pre-v22 Token Center writer with v23.
-7. Confirm the reviewed source's exact schema version (currently v23) and that
+   pre-v22 Token Center writer with v35.
+7. Confirm the reviewed source's exact schema version (currently v35) and that
    request, aggregate, ledger and credential counts did not decrease during
    migration.
 8. Verify the running `/version` revision and pod image digest, not only the
    manifest tag.
-9. Run Playwright dogfooding locally and from the Windows Codex browser proxy.
+9. Run the TypeScript Cucumber.js browser dogfooding suite locally and from the
+   Windows Codex browser proxy. Playwright is only the browser driver inside steps.
    Public testing must include the path allowlist: `/operator` and `/internal`
    on the public origin remain 404, while `/portal`, `/ui-assets`, `/self` authentication
    and model routes work.
@@ -551,10 +582,11 @@ Abort the rollout when any of these occurs:
 Rollback through Git, not `argocd app rollback`: automated self-heal would
 reapply Git. Reverting Stage B returns the review roles to the Stage A
 zero-replica barrier; it does not authorize the old Token Center image to run
-against v23. Push the revert normally:
+against v35. Push the revert normally:
 
 ```bash
-export GITOPS_REPO=/home/chenshuangfeng/Github/k3s-gitops
+: "${GITOPS_REPO:?Set GITOPS_REPO to the GitOps repository's absolute path}"
+case "$GITOPS_REPO" in /*) ;; *) echo 'GITOPS_REPO must be absolute' >&2; exit 1;; esac
 git -C "$GITOPS_REPO" status --short
 git -C "$GITOPS_REPO" revert --no-edit "$DEPLOY_GITOPS_SHA"
 git -C "$GITOPS_REPO" push cluster master
@@ -570,7 +602,7 @@ v12 image is **not** a valid traffic rollback because old writers do not maintai
 budget rollups. Scale Token Center roles back to zero, keep production traffic on
 old CPA, and roll forward a compatible v22+ repair image; alternatively restore
 the validated pre-migration backup into a new database and switch a compatible
-deployment to it. Never restart the old Token Center binary against the v23
+deployment to it. Never restart the old Token Center binary against the v35
 database. Preserve failed pod logs and the release interval for reconciliation.
 
 If a migration or application defect corrupts the database, do not restore in

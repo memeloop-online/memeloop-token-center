@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const MONEY_SCALE: i64 = 1_000_000;
+pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,6 +86,52 @@ pub struct KeyView {
     pub created_at: i64,
     pub policy: KeyPolicy,
     pub available_balance: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct KeyAliasView {
+    pub key_id: Uuid,
+    pub alias: String,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct KeyRateLimitSnapshot {
+    pub limit: u64,
+    pub used: u64,
+    pub remaining: u64,
+    pub reset_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct KeyConcurrencySnapshot {
+    pub limit: u32,
+    pub active: u64,
+    pub remaining: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct KeyBudgetSnapshot {
+    pub limit: Option<String>,
+    pub settled: String,
+    pub reserved: String,
+    pub remaining: Option<String>,
+    pub reset_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct KeyLimitSnapshot {
+    pub key_id: Uuid,
+    pub captured_at: i64,
+    pub currency: String,
+    pub available_balance: String,
+    pub reserved_balance: String,
+    pub rpm: KeyRateLimitSnapshot,
+    pub tpm: KeyRateLimitSnapshot,
+    pub concurrency: KeyConcurrencySnapshot,
+    pub daily_budget: KeyBudgetSnapshot,
+    pub weekly_budget: KeyBudgetSnapshot,
+    pub lifetime_budget: KeyBudgetSnapshot,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -247,6 +294,16 @@ pub struct RequestArchiveRefs {
     pub request_object: String,
     pub response_object: Option<String>,
     pub response_json: Option<serde_json::Value>,
+    pub provenance: Option<RequestProvenanceView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RequestProvenanceView {
+    pub source: String,
+    pub disposition: String,
+    pub unlinked: bool,
+    pub external_request_id: String,
+    pub proof_digest: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -256,6 +313,8 @@ pub struct RequestDetail {
     pub request_body: serde_json::Value,
     pub response_body: serde_json::Value,
     pub archive_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<RequestProvenanceView>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -268,6 +327,12 @@ pub struct ConversationClusterView {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct ConversationCursor {
+    pub before_created_at: i64,
+    pub before_request_id: Uuid,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ConversationEdgeView {
     pub from_request_id: Option<Uuid>,
     pub to_request_id: Uuid,
@@ -277,10 +342,26 @@ pub struct ConversationEdgeView {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct ConversationRequestView {
+    #[serde(flatten)]
+    pub request: RequestView,
+    pub source: String,
+    pub provenance: String,
+    pub unlinked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ConversationClusterDetail {
     pub cluster: ConversationClusterView,
-    pub requests: Vec<RequestView>,
+    pub requests: Vec<ConversationRequestView>,
     pub edges: Vec<ConversationEdgeView>,
+    pub has_more: bool,
+    pub next_cursor: Option<ConversationCursor>,
+    pub edges_truncated: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -317,6 +398,71 @@ pub struct OperatorStats {
     pub by_model: Vec<StatsBucket>,
     pub by_day: Vec<StatsBucket>,
     pub errors: Vec<StatsBucket>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct UsageAnalysisCost {
+    pub currency: String,
+    pub cost: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct UsageAnalysisMetrics {
+    pub requests: i64,
+    pub success: i64,
+    pub failed: i64,
+    /// Uncached input tokens. Cached reads and cache writes are reported separately.
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub generation_units: i64,
+    pub avg_duration_ms: Option<f64>,
+    pub p95_duration_ms: Option<i64>,
+    pub costs: Vec<UsageAnalysisCost>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageAnalysisBucket {
+    pub id: String,
+    pub label: String,
+    #[serde(flatten)]
+    pub metrics: UsageAnalysisMetrics,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageAnalysisTimeBucket {
+    /// Inclusive UTC bucket start as Unix epoch milliseconds.
+    pub bucket_start: i64,
+    #[serde(flatten)]
+    pub metrics: UsageAnalysisMetrics,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageAnalysisHeatmapBucket {
+    /// Monday 00:00 UTC is 0; Sunday 23:00 UTC is 167.
+    pub hour_of_week: i64,
+    #[serde(flatten)]
+    pub metrics: UsageAnalysisMetrics,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageAnalysisResponse {
+    pub from_created_at: i64,
+    pub to_created_at: i64,
+    pub granularity: String,
+    pub time_zone: String,
+    pub p95_is_approximate: bool,
+    pub p95_method: String,
+    pub summary: UsageAnalysisMetrics,
+    pub time_series: Vec<UsageAnalysisTimeBucket>,
+    pub by_model: Vec<UsageAnalysisBucket>,
+    pub by_key: Vec<UsageAnalysisBucket>,
+    pub by_upstream: Vec<UsageAnalysisBucket>,
+    pub by_protocol: Vec<UsageAnalysisBucket>,
+    pub by_status: Vec<UsageAnalysisBucket>,
+    pub errors: Vec<UsageAnalysisBucket>,
+    pub heatmap: Vec<UsageAnalysisHeatmapBucket>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -411,6 +557,39 @@ impl GenerationPrice {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GenerationAssetView {
+    pub asset_id: Uuid,
+    pub index: i64,
+    pub mime_type: String,
+    pub size_bytes: i64,
+    pub filename: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ArchivedGenerationAsset {
+    pub asset_id: Uuid,
+    pub index: i64,
+    pub object_locator: String,
+    pub mime_type: String,
+    pub size_bytes: i64,
+    pub filename: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationStagedAssets {
+    pub attempt_nonce: Uuid,
+    pub billed_units: i64,
+    pub assets: Vec<ArchivedGenerationAsset>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GenerationAssetDownload {
+    pub view: GenerationAssetView,
+    pub object_locator: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct GenerationJobView {
     pub job_id: Uuid,
@@ -426,6 +605,7 @@ pub struct GenerationJobView {
     pub cost: String,
     pub error_code: Option<String>,
     pub result: Option<serde_json::Value>,
+    pub assets: Vec<GenerationAssetView>,
 }
 
 #[derive(Clone, Debug)]
@@ -442,6 +622,8 @@ pub struct GenerationJobWork {
     pub status: String,
     pub request_object: String,
     pub upstream_job_id: Option<String>,
+    pub submission_nonce: Option<Uuid>,
+    pub staged_assets: Option<GenerationStagedAssets>,
     pub estimated_units: i64,
     pub attempt_count: i64,
     pub failure_count: i64,

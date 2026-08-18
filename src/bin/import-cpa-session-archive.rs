@@ -13,6 +13,9 @@ use memeloop_token_center::{
 struct Args {
     #[arg(long, env = "CPA_SESSION_ARCHIVE_INPUT")]
     input: PathBuf,
+    /// Writable, pod-local directory for the bounded sealed import plan.
+    #[arg(long, env = "SESSION_ARCHIVE_PLAN_DIRECTORY", default_value = "/tmp")]
+    plan_directory: PathBuf,
     #[arg(
         long,
         env = "IMPORT_TENANT_EXTERNAL_ID",
@@ -47,6 +50,13 @@ struct Args {
     max_line_bytes: usize,
     #[arg(
         long,
+        env = "SESSION_ARCHIVE_MAX_PLAN_BYTES",
+        default_value_t = 1_073_741_824
+    )]
+    max_plan_bytes: u64,
+    /// Count unmapped records during dry-run. Deliberately incompatible with --apply.
+    #[arg(
+        long,
         env = "SESSION_ARCHIVE_ALLOW_UNMAPPED",
         default_value_t = false,
         action = clap::ArgAction::Set
@@ -60,21 +70,23 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
-    let config = Config::from_env()?;
+    let config = Config::from_session_archive_import_env()?;
     let db = Database::connect_with_max(&config.database_url, 2).await?;
-    db.migrate().await?;
+    db.ensure_session_archive_import_schema().await?;
     let archive = ArchiveStore::from_config(&config).await?;
     let stats = import_session_archive(
         &db,
         &archive,
         &SessionArchiveImportOptions {
             input: &args.input,
+            plan_directory: &args.plan_directory,
             tenant_external_id: &args.tenant_external_id,
             cpamp_source: &args.cpamp_source,
             archive_source: &args.archive_source,
             overlap_ms: args.overlap_ms,
             time_tolerance_ms: args.time_tolerance_ms,
             max_line_bytes: args.max_line_bytes,
+            max_plan_bytes: args.max_plan_bytes,
             allow_unmapped: args.allow_unmapped,
             apply: args.apply,
         },

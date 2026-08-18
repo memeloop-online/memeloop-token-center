@@ -1,10 +1,14 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { ApiError, api } from '../api';
 import { Buckets, DrawerFrame, Metric, RequestTable, Shell } from '../components';
+import { formatCurrency, formatMetricNumber, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import type { ConversationCluster, ConversationDetail, GenerationJob, KeyView, RequestDetail, RequestView, SelfStats } from '../types';
+import { LimitSnapshot } from '../LimitSnapshot';
+import type { ConversationCluster, ConversationDetail, GenerationAsset, GenerationJob, KeyLimitSnapshot, KeyView, RequestDetail, RequestView, SelfStats } from '../types';
 
 const requestPageSize = 50;
+const conversationPageSize = 50;
+const conversationDetailPageSize = 100;
 
 interface RequestFilters {
   from: string;
@@ -70,6 +74,24 @@ function statsPath(filters: RequestFilters) {
   return `/self/v1/stats?${query}`;
 }
 
+function conversationsPath(before?: ConversationCluster) {
+  const query = new URLSearchParams({ limit: String(conversationPageSize) });
+  if (before) {
+    query.set('before_updated_at', String(before.updated_at));
+    query.set('before_cluster_id', before.cluster_id);
+  }
+  return `/self/v1/conversations?${query}`;
+}
+
+function conversationDetailPath(clusterId: string, cursor?: ConversationDetail['next_cursor']) {
+  const query = new URLSearchParams({ limit: String(conversationDetailPageSize) });
+  if (cursor) {
+    query.set('before_created_at', String(cursor.before_created_at));
+    query.set('before_request_id', cursor.before_request_id);
+  }
+  return `/self/v1/conversations/${clusterId}?${query}`;
+}
+
 function selfErrorMessage(reason: unknown, t: (key: string) => string, fallback: string) {
   if (reason instanceof ApiError) {
     if (reason.code === 'unauthorized' || reason.status === 401) return t('self.invalidCredential');
@@ -84,11 +106,18 @@ function selfErrorMessage(reason: unknown, t: (key: string) => string, fallback:
   return reason instanceof Error && !(reason instanceof TypeError) ? reason.message : fallback;
 }
 
+function SelfNumberMetric({ label, value, tone }: { label: string; value: number; tone?: string }) {
+  const { locale } = useI18n();
+  const formatted = formatMetricNumber(value, locale);
+  return <Metric label={label} tone={tone} value={<span title={formatted.title}>{formatted.text}</span>} />;
+}
+
 export function SelfPortal() {
   const { locale, t } = useI18n();
-  const [credential, setCredential] = useState(() => sessionStorage.getItem('mtc-key') ?? '');
+  const [credential, setCredential] = useState('');
   const [stats, setStats] = useState<SelfStats>();
   const [credentialView, setCredentialView] = useState<KeyView>();
+  const [limitSnapshot, setLimitSnapshot] = useState<KeyLimitSnapshot>();
   const [requests, setRequests] = useState<RequestView[]>([]);
   const [requestFilters, setRequestFilters] = useState<RequestFilters>(emptyRequestFilters);
   const [appliedFilters, setAppliedFilters] = useState<RequestFilters>(emptyRequestFilters);
@@ -96,6 +125,8 @@ export function SelfPortal() {
   const [requestLoading, setRequestLoading] = useState(false);
   const [generations, setGenerations] = useState<GenerationJob[]>([]);
   const [conversations, setConversations] = useState<ConversationCluster[]>([]);
+  const [hasOlderConversations, setHasOlderConversations] = useState(false);
+  const [conversationLoading, setConversationLoading] = useState(false);
   const [detail, setDetail] = useState<RequestDetail>();
   const [generationDetail, setGenerationDetail] = useState<GenerationJob>();
   const [conversationDetail, setConversationDetail] = useState<ConversationDetail>();
@@ -105,34 +136,91 @@ export function SelfPortal() {
   async function load() {
     const value = credential.trim();
     if (!value) return;
-    sessionStorage.setItem('mtc-key', value);
     setError(''); setLoading(true);
     try {
       const results = await Promise.allSettled([
-        api<KeyView>('/self/v1/key', value), api<SelfStats>(statsPath(requestFilters), value),
+        api<KeyView>('/self/v1/key', value), api<KeyLimitSnapshot>('/self/v1/key/limits', value), api<SelfStats>(statsPath(requestFilters), value),
         api<RequestView[]>(requestsPath(requestFilters), value),
         api<GenerationJob[]>('/self/v1/generations?limit=100', value),
-        api<ConversationCluster[]>('/self/v1/conversations', value),
+        api<ConversationCluster[]>(conversationsPath(), value),
       ]);
       const failures = results.filter((result) => result.status === 'rejected');
       if (failures.length === results.length) throw failures[0].reason;
-      const [nextCredential, nextStats, nextRequests, nextGenerations, nextConversations] = results;
+      const [nextCredential, nextLimits, nextStats, nextRequests, nextGenerations, nextConversations] = results;
       setCredentialView(nextCredential.status === 'fulfilled' ? nextCredential.value : undefined);
+      setLimitSnapshot(nextLimits.status === 'fulfilled' ? nextLimits.value : undefined);
       setStats(nextStats.status === 'fulfilled' ? nextStats.value : undefined);
       const requestPage = nextRequests.status === 'fulfilled' ? nextRequests.value : [];
       setRequests(requestPage);
       setAppliedFilters(requestFilters);
       setHasOlderRequests(nextRequests.status === 'fulfilled' && requestPage.length === requestPageSize);
       setGenerations(nextGenerations.status === 'fulfilled' ? nextGenerations.value : []);
-      setConversations(nextConversations.status === 'fulfilled' ? nextConversations.value : []);
-      if (failures.length) setError(t('self.partialLoad', { count: failures.length }));
+      const conversationPage = nextConversations.status === 'fulfilled' ? nextConversations.value : [];
+      setConversations(conversationPage);
+      setHasOlderConversations(nextConversations.status === 'fulfilled' && conversationPage.length === conversationPageSize);
+      if (failures.length) setError(t('self.partialLoad', { count: formatNumber(failures.length, locale) }));
     } catch (reason) {
-      setCredentialView(undefined); setStats(undefined); setRequests([]); setGenerations([]); setConversations([]);
+      setCredentialView(undefined); setLimitSnapshot(undefined); setStats(undefined); setRequests([]); setGenerations([]); setConversations([]);
       setDetail(undefined); setGenerationDetail(undefined); setConversationDetail(undefined);
       setHasOlderRequests(false);
+      setHasOlderConversations(false);
       setError(selfErrorMessage(reason, t, t('common.requestFailed')));
     }
     finally { setLoading(false); }
+  }
+
+  async function fetchOlderConversations() {
+    const before = conversations.at(-1);
+    const value = credential.trim();
+    if (!before || !value) return;
+    setConversationLoading(true); setError('');
+    try {
+      const page = await api<ConversationCluster[]>(conversationsPath(before), value);
+      setConversations((current) => {
+        const known = new Set(current.map((conversation) => conversation.cluster_id));
+        return [...current, ...page.filter((conversation) => !known.has(conversation.cluster_id))];
+      });
+      setHasOlderConversations(page.length === conversationPageSize);
+    } catch (reason) {
+      setError(selfErrorMessage(reason, t, t('common.requestFailed')));
+    } finally {
+      setConversationLoading(false);
+    }
+  }
+
+  async function selectConversation(conversation: ConversationCluster) {
+    setConversationLoading(true); setError('');
+    try {
+      setConversationDetail(await api<ConversationDetail>(conversationDetailPath(conversation.cluster_id), credential.trim()));
+    } catch (reason) {
+      setError(selfErrorMessage(reason, t, t('common.requestFailed')));
+    } finally {
+      setConversationLoading(false);
+    }
+  }
+
+  async function fetchOlderConversationDetail() {
+    const current = conversationDetail;
+    if (!current?.next_cursor) return;
+    setConversationLoading(true); setError('');
+    try {
+      const page = await api<ConversationDetail>(conversationDetailPath(current.cluster.cluster_id, current.next_cursor), credential.trim());
+      setConversationDetail((latest) => {
+        if (!latest || latest.cluster.cluster_id !== page.cluster.cluster_id) return latest;
+        const requestIds = new Set(page.requests.map((request) => request.request_id));
+        const edgeKeys = new Set(page.edges.map((edge) => `${edge.from_request_id ?? ''}:${edge.to_request_id}:${edge.relation}`));
+        return {
+          ...page,
+          requests: [...page.requests, ...latest.requests.filter((request) => !requestIds.has(request.request_id))],
+          edges: [...page.edges, ...latest.edges.filter((edge) => !edgeKeys.has(`${edge.from_request_id ?? ''}:${edge.to_request_id}:${edge.relation}`))],
+          edges_truncated: page.edges_truncated || latest.edges_truncated,
+        };
+      });
+    } catch (reason) {
+      setError(selfErrorMessage(reason, t, t('common.requestFailed')));
+    } finally {
+      setConversationLoading(false);
+    }
   }
 
   async function fetchRequestPage(filters: RequestFilters, append = false) {
@@ -187,16 +275,34 @@ export function SelfPortal() {
     catch (reason) { setError(selfErrorMessage(reason, t, t('self.detailFailed'))); }
   }
 
+  async function downloadGenerationAsset(job: GenerationJob, asset: GenerationAsset) {
+    try {
+      const response = await fetch(`/self/v1/generations/${job.job_id}/assets/${asset.asset_id}`, {
+        headers: { Authorization: `Bearer ${credential.trim()}` },
+      });
+      if (!response.ok) throw new ApiError(`HTTP ${response.status}`, response.status);
+      const objectUrl = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = asset.filename;
+      link.click();
+      URL.revokeObjectURL(objectUrl);
+    } catch (reason) {
+      setError(selfErrorMessage(reason, t, t('self.assetDownloadFailed')));
+    }
+  }
+
   useEffect(() => { if (credential) void load(); }, []);
   return <Shell>
-    <header className="hero"><div><span className="eyebrow">{t('self.eyebrow')}</span><h1>{t('self.title')}</h1><p>{t('self.subtitle')}</p></div><form className="credential" onSubmit={(event) => { event.preventDefault(); void load(); }}><input aria-label={t('self.credential')} autoComplete="current-password" type="password" value={credential} onChange={(event) => setCredential(event.target.value)} placeholder={t('self.placeholder')} /><button type="submit" disabled={loading || !credential.trim()}>{loading ? t('common.loading') : t('common.load')}</button></form></header>
+    <header className="hero"><div><span className="eyebrow">{t('self.eyebrow')}</span><h1>{t('self.title')}</h1><p>{t('self.subtitle')}</p></div><form className="credential" onSubmit={(event) => { event.preventDefault(); void load(); }}><input aria-label={t('self.credential')} autoComplete="off" type="password" value={credential} onChange={(event) => setCredential(event.target.value)} placeholder={t('self.placeholder')} /><button type="submit" disabled={loading || !credential.trim()}>{loading ? t('common.loading') : t('common.load')}</button></form></header>
     {error && <div className="notice error" role="alert">{error}</div>}
     {stats && <>
-      <section className="metrics"><Metric label={t('self.balance', { currency: credentialView?.currency ?? '' })} value={credentialView?.available_balance ?? '—'} tone="positive" /><Metric label={t('traffic.total')} value={stats.summary.total_requests.toLocaleString(locale)} /><Metric label={t('traffic.success')} value={stats.summary.successful_requests.toLocaleString(locale)} tone="positive" /><Metric label={t('traffic.failure')} value={stats.summary.failed_requests.toLocaleString(locale)} tone="negative" /><Metric label={t('request.tokens')} value={(stats.summary.input_tokens + stats.summary.output_tokens).toLocaleString(locale)} /><Metric label={t('traffic.cost')} value={stats.summary.total_cost} /></section>
-      {credentialView && <article className="panel key-summary"><div><span className="eyebrow">{t('self.stableCredential')}</span><h2>{credentialView.alias}</h2><code>{credentialView.key_id}</code></div><div className="policy-grid"><span><b>{t('self.credentialGeneration')}</b>{credentialView.credential_generation}</span><span><b>RPM</b>{credentialView.policy.requests_per_minute.toLocaleString(locale)}</span><span><b>TPM</b>{credentialView.policy.tokens_per_minute.toLocaleString(locale)}</span><span><b>{t('self.concurrency')}</b>{credentialView.policy.max_concurrency}</span><span><b>{t('budget.daily')}</b>{credentialView.policy.daily_budget ?? '—'}</span><span><b>{t('budget.weekly')}</b>{credentialView.policy.weekly_budget ?? '—'}</span><span><b>{t('budget.lifetime')}</b>{credentialView.policy.lifetime_budget ?? '—'}</span><span><b>{t('self.allowedModels')}</b>{credentialView.policy.allowed_models.length ? credentialView.policy.allowed_models.join(', ') : t('credentials.noModelsAllowed')}</span></div></article>}
+      <section className="metrics"><Metric label={t('self.balance', { currency: credentialView?.currency ?? '' })} value={credentialView ? <span title={`${credentialView.available_balance} ${credentialView.currency}`}>{formatCurrency(credentialView.available_balance, credentialView.currency, locale)}</span> : '—'} tone="positive" /><SelfNumberMetric label={t('traffic.total')} value={stats.summary.total_requests} /><SelfNumberMetric label={t('traffic.success')} value={stats.summary.successful_requests} tone="positive" /><SelfNumberMetric label={t('traffic.failure')} value={stats.summary.failed_requests} tone="negative" /><SelfNumberMetric label={t('request.tokens')} value={stats.summary.input_tokens + stats.summary.output_tokens} /><Metric label={t('traffic.cost')} value={credentialView ? <span title={`${stats.summary.total_cost} ${credentialView.currency}`}>{formatCurrency(stats.summary.total_cost, credentialView.currency, locale)}</span> : '—'} /></section>
+      {credentialView && <article className="panel key-summary"><div><span className="eyebrow">{t('self.stableCredential')}</span><h2>{credentialView.alias}</h2><code>{credentialView.key_id}</code></div><div className="policy-grid"><span><b>{t('self.credentialGeneration')}</b>{formatNumber(credentialView.credential_generation, locale)}</span><span><b>RPM</b>{formatNumber(credentialView.policy.requests_per_minute, locale)}</span><span><b>TPM</b>{formatNumber(credentialView.policy.tokens_per_minute, locale)}</span><span><b>{t('self.concurrency')}</b>{formatNumber(credentialView.policy.max_concurrency, locale)}</span><span><b>{t('budget.daily')}</b>{credentialView.policy.daily_budget === null ? '—' : formatCurrency(credentialView.policy.daily_budget, credentialView.currency, locale)}</span><span><b>{t('budget.weekly')}</b>{credentialView.policy.weekly_budget === null ? '—' : formatCurrency(credentialView.policy.weekly_budget, credentialView.currency, locale)}</span><span><b>{t('budget.lifetime')}</b>{credentialView.policy.lifetime_budget === null ? '—' : formatCurrency(credentialView.policy.lifetime_budget, credentialView.currency, locale)}</span><span><b>{t('self.allowedModels')}</b>{credentialView.policy.allowed_models.length ? credentialView.policy.allowed_models.join(', ') : t('credentials.noModelsAllowed')}</span></div></article>}
+      {limitSnapshot && <article className="panel"><LimitSnapshot value={limitSnapshot} /></article>}
       <section className="two-column"><article className="panel"><h2>{t('traffic.models')}</h2><Buckets values={stats.by_model} onSelect={(bucket) => filterRequests({ model: bucket.name })} /></article><article className="panel"><h2>{t('traffic.days')}</h2><Buckets values={stats.by_day} onSelect={(bucket) => { if (/^\d{4}-\d{2}-\d{2}$/.test(bucket.name)) filterRequests({ from: `${bucket.name}T00:00`, to: `${bucket.name}T23:59` }); }} /></article></section>
       {stats.errors.length > 0 && <article className="panel"><h2>{t('traffic.errors')}</h2><Buckets values={stats.errors} onSelect={(bucket) => filterRequests({ status: 'error', errorCode: bucket.name })} /></article>}
-      <article className="panel self-history"><div className="panel-title"><div><h2>{t('self.recent')}</h2><p className="muted">{t('self.historyHint')}</p></div><span>{t('self.loadedRequests', { count: requests.length })}</span></div>
+      <article className="panel self-history"><div className="panel-title"><div><h2>{t('self.recent')}</h2><p className="muted">{t('self.historyHint')}</p></div><span>{t('self.loadedRequests', { count: formatNumber(requests.length, locale) })}</span></div>
         <form className="self-request-filters" onSubmit={applyRequestFilters}>
           <label><span>{t('traffic.from')}</span><input type="datetime-local" value={requestFilters.from} onChange={(event) => setRequestFilters((current) => ({ ...current, from: event.target.value }))} /></label>
           <label><span>{t('traffic.to')}</span><input type="datetime-local" value={requestFilters.to} onChange={(event) => setRequestFilters((current) => ({ ...current, to: event.target.value }))} /></label>
@@ -212,24 +318,24 @@ export function SelfPortal() {
           <label><span>{t('traffic.maxCost')}</span><input inputMode="decimal" value={requestFilters.maxCost} onChange={(event) => setRequestFilters((current) => ({ ...current, maxCost: event.target.value }))} /></label>
           <div className="filter-actions"><button type="submit" disabled={requestLoading}>{requestLoading ? t('common.loading') : t('traffic.applyFilters')}</button><button type="button" className="secondary" onClick={clearRequestFilters} disabled={requestLoading}>{t('traffic.clearFilters')}</button></div>
         </form>
-        <RequestTable requests={requests} onSelect={(request) => void select(request)} />
+        <RequestTable requests={requests} currency={credentialView?.currency} onSelect={(request) => void select(request)} />
         {hasOlderRequests && <div className="load-more"><button type="button" className="secondary" disabled={requestLoading} onClick={() => void fetchRequestPage(appliedFilters, true)}>{requestLoading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
       </article>
-      <article className="panel"><div className="panel-title"><h2>{t('self.conversations')}</h2><span>{t('self.conversationHint')}</span></div><div className="conversation-list">{conversations.map((conversation) => <button type="button" className="conversation" key={conversation.cluster_id} onClick={async () => { try { setConversationDetail(await api<ConversationDetail>(`/self/v1/conversations/${conversation.cluster_id}`, credential.trim())); } catch (reason) { setError(selfErrorMessage(reason, t, t('common.requestFailed'))); } }}><span><b>{conversation.explicit_session_id ?? conversation.cluster_id.slice(0, 13)}</b><small>{new Date(conversation.updated_at).toLocaleString(locale)}</small></span><span><strong>{t('request.count', { count: conversation.request_count })}</strong>{conversation.candidate_edge_count > 0 && <em>{t('self.candidateEdges', { count: conversation.candidate_edge_count })}</em>}</span></button>)}{conversations.length === 0 && <div className="empty">{t('self.noConversations')}</div>}</div></article>
-      <GenerationTable jobs={generations} onSelect={setGenerationDetail} />
+      <article className="panel"><div className="panel-title"><h2>{t('self.conversations')}</h2><span>{t('self.conversationHint')}</span></div><div className="conversation-list">{conversations.map((conversation) => <button type="button" className="conversation" key={conversation.cluster_id} disabled={conversationLoading} onClick={() => void selectConversation(conversation)}><span><b>{conversation.explicit_session_id ?? conversation.cluster_id.slice(0, 13)}</b><small>{new Date(conversation.updated_at).toLocaleString(locale)}</small></span><span><strong>{t('request.count', { count: formatNumber(conversation.request_count, locale) })}</strong>{conversation.candidate_edge_count > 0 && <em>{t('self.candidateEdges', { count: formatNumber(conversation.candidate_edge_count, locale) })}</em>}</span></button>)}{conversations.length === 0 && <div className="empty">{t('self.noConversations')}</div>}</div>{hasOlderConversations && <div className="load-more"><button type="button" className="secondary" disabled={conversationLoading} onClick={() => void fetchOlderConversations()}>{conversationLoading ? t('common.loading') : t('self.loadOlderConversations')}</button></div>}</article>
+      <GenerationTable jobs={generations} currency={credentialView?.currency} onSelect={setGenerationDetail} />
     </>}
-    {detail && <RequestDetailDrawer detail={detail} onClose={() => setDetail(undefined)} />}
-    {generationDetail && <GenerationDrawer job={generationDetail} onClose={() => setGenerationDetail(undefined)} />}
-    {conversationDetail && <ConversationDrawer detail={conversationDetail} onClose={() => setConversationDetail(undefined)} />}
+    {detail && <RequestDetailDrawer detail={detail} currency={credentialView?.currency} onClose={() => setDetail(undefined)} />}
+    {generationDetail && <GenerationDrawer job={generationDetail} currency={credentialView?.currency} onDownload={(asset) => void downloadGenerationAsset(generationDetail, asset)} onClose={() => setGenerationDetail(undefined)} />}
+    {conversationDetail && <ConversationDrawer detail={conversationDetail} currency={credentialView?.currency} loading={conversationLoading} onLoadOlder={() => void fetchOlderConversationDetail()} onSelect={(request) => void select(request)} onClose={() => setConversationDetail(undefined)} />}
   </Shell>;
 }
 
-function GenerationTable({ jobs, onSelect }: { jobs: GenerationJob[]; onSelect: (job: GenerationJob) => void }) {
+function GenerationTable({ jobs, currency, onSelect }: { jobs: GenerationJob[]; currency?: string; onSelect: (job: GenerationJob) => void }) {
   const { locale, t } = useI18n();
-  return <article className="panel"><div className="panel-title"><h2>{t('self.generations')}</h2><span>{t('self.generationDrivers')}</span></div><div className="table-scroll"><table><thead><tr><th>{t('request.time')}</th><th>{t('request.model')}</th><th>{t('self.integration')}</th><th>{t('request.status')}</th><th>{t('self.units')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.job_id}><td>{new Date(job.created_at).toLocaleString(locale)}</td><td><button type="button" className="table-link" onClick={() => onSelect(job)} aria-label={t('self.openGeneration', { model: job.model })}><code>{job.model}</code></button></td><td>{job.driver}</td><td><span className={`status ${job.status === 'succeeded' ? 'ok' : job.status === 'failed' || job.status === 'cancelled' ? 'bad' : 'pending'}`}>{t(`generationStatus.${job.status}`)}</span></td><td>{job.billed_units ?? `≤ ${job.estimated_units}`}</td><td>{job.cost}</td><td>{job.error_code ?? '—'}</td></tr>)}</tbody></table>{jobs.length === 0 && <div className="empty">{t('self.noGenerations')}</div>}</div></article>;
+  return <article className="panel"><div className="panel-title"><h2>{t('self.generations')}</h2><span>{t('self.generationDrivers')}</span></div><div className="table-scroll"><table><thead><tr><th>{t('request.time')}</th><th>{t('request.model')}</th><th>{t('self.integration')}</th><th>{t('request.status')}</th><th>{t('self.units')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.job_id}><td>{new Date(job.created_at).toLocaleString(locale)}</td><td><button type="button" className="table-link" onClick={() => onSelect(job)} aria-label={t('self.openGeneration', { model: job.model })}><code>{job.model}</code></button></td><td>{job.driver}</td><td><span className={`status ${job.status === 'succeeded' ? 'ok' : job.status === 'failed' || job.status === 'cancelled' ? 'bad' : 'pending'}`}>{t(`generationStatus.${job.status}`)}</span></td><td>{job.billed_units === null ? `≤ ${formatNumber(job.estimated_units, locale)}` : formatNumber(job.billed_units, locale)}</td><td>{currency ? formatCurrency(job.cost, currency, locale) : '—'}</td><td>{job.error_code ?? '—'}</td></tr>)}</tbody></table>{jobs.length === 0 && <div className="empty">{t('self.noGenerations')}</div>}</div></article>;
 }
 
-function RequestDetailDrawer({ detail, onClose }: { detail: RequestDetail; onClose: () => void }) {
+function RequestDetailDrawer({ detail, currency, onClose }: { detail: RequestDetail; currency?: string; onClose: () => void }) {
   const { locale, t } = useI18n();
   const successful = detail.status_code !== null && detail.status_code < 400;
   return <DrawerFrame title={detail.model} eyebrow={t('request.detail')} onClose={onClose}>
@@ -238,22 +344,23 @@ function RequestDetailDrawer({ detail, onClose }: { detail: RequestDetail; onClo
       <span><b>{t('request.time')}</b>{new Date(detail.created_at).toLocaleString(locale)}</span>
       <span><b>{t('request.status')}</b><i className={`status ${successful ? 'ok' : detail.status_code ? 'bad' : 'pending'}`}>{detail.status_code ?? t('common.running')}</i></span>
       <span><b>{t('request.protocol')}</b>{detail.protocol}</span>
-      <span><b>{t('request.duration')}</b>{detail.duration_ms === null ? '—' : `${detail.duration_ms.toLocaleString(locale)} ms`}</span>
-      <span><b>{t('request.tokens')}</b>{(detail.input_tokens + detail.output_tokens).toLocaleString(locale)} <small>{detail.input_tokens.toLocaleString(locale)} + {detail.output_tokens.toLocaleString(locale)}</small></span>
-      <span><b>{t('request.cost')}</b>{detail.cost}</span>
+      <span><b>{t('request.duration')}</b>{formatMilliseconds(detail.duration_ms, locale)}</span>
+      <span><b>{t('request.tokens')}</b>{formatNumber(detail.input_tokens + detail.output_tokens, locale)} <small>{formatNumber(detail.input_tokens, locale)} + {formatNumber(detail.output_tokens, locale)}</small></span>
+      <span><b>{t('request.cost')}</b>{currency ? formatCurrency(detail.cost, currency, locale) : '—'}</span>
       <span><b>{t('request.error')}</b>{detail.error_code ?? '—'}</span>
       <span><b>{t('self.archive')}</b>{detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
+      {detail.provenance && <span><b>{t('request.provenance')}</b>{detail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {detail.provenance.source}</span>}
     </div>
     <h3>{t('request.request')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre><h3>{t('request.response')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>
   </DrawerFrame>;
 }
 
-function GenerationDrawer({ job, onClose }: { job: GenerationJob; onClose: () => void }) {
-  const { t } = useI18n();
-  return <DrawerFrame title={job.model} eyebrow={t('self.generationDetail')} onClose={onClose}><p className="muted break-anywhere">{job.job_id} · {job.driver} · {t(`generationStatus.${job.status}`)}</p><h3>{t('self.billing')}</h3><pre>{JSON.stringify({ estimated_units: job.estimated_units, billed_units: job.billed_units, cost: job.cost }, null, 2)}</pre><h3>{t('self.resultArchive')}</h3><pre>{JSON.stringify(job.result, null, 2)}</pre>{job.error_code && <><h3>{t('request.error')}</h3><pre>{job.error_code}</pre></>}</DrawerFrame>;
+function GenerationDrawer({ job, currency, onDownload, onClose }: { job: GenerationJob; currency?: string; onDownload: (asset: GenerationAsset) => void; onClose: () => void }) {
+  const { locale, t } = useI18n();
+  return <DrawerFrame title={job.model} eyebrow={t('self.generationDetail')} onClose={onClose}><p className="muted break-anywhere">{job.job_id} · {job.driver} · {t(`generationStatus.${job.status}`)}</p><h3>{t('self.billing')}</h3><pre>{JSON.stringify({ estimated_units: formatNumber(job.estimated_units, locale), billed_units: job.billed_units === null ? null : formatNumber(job.billed_units, locale), cost: currency ? formatCurrency(job.cost, currency, locale) : '—' }, null, 2)}</pre><h3>{t('self.resultArchive')}</h3>{job.assets.length > 0 ? <div className="account-list">{job.assets.map((asset) => <div className="account" key={asset.asset_id}><div className="account-main"><b>{asset.filename}</b><span>{asset.mime_type} · {formatNumber(asset.size_bytes, locale)} {t('self.bytes')}</span></div><button type="button" className="secondary" onClick={() => onDownload(asset)}>{t('self.downloadAsset')}</button></div>)}</div> : <div className="empty">{t('self.noAssets')}</div>}<pre>{JSON.stringify(job.result, null, 2)}</pre>{job.error_code && <><h3>{t('request.error')}</h3><pre>{job.error_code}</pre></>}</DrawerFrame>;
 }
 
-function ConversationDrawer({ detail, onClose }: { detail: ConversationDetail; onClose: () => void }) {
-  const { t } = useI18n();
-  return <DrawerFrame title={detail.cluster.explicit_session_id ?? t('self.inferred')} eyebrow={t('self.logicalConversation')} onClose={onClose}><p className="muted break-anywhere">{detail.cluster.cluster_id}</p><h3>{t('self.sequence')}</h3><RequestTable requests={detail.requests} /><h3>{t('self.edges')}</h3><div className="edge-list">{detail.edges.map((edge) => <div className="edge" key={`${edge.to_request_id}-${edge.relation}`}><span className={`status ${edge.relation === 'candidate' ? 'pending' : 'ok'}`}>{t(`conversationRelation.${edge.relation}`)}</span><code>{edge.from_request_id?.slice(0, 8) ?? t('self.root')} → {edge.to_request_id.slice(0, 8)}</code><b>{Math.round(edge.confidence * 100)}%</b></div>)}{detail.edges.length === 0 && <div className="empty">{t('self.singleObservation')}</div>}</div></DrawerFrame>;
+function ConversationDrawer({ detail, currency, loading, onLoadOlder, onSelect, onClose }: { detail: ConversationDetail; currency?: string; loading: boolean; onLoadOlder: () => void; onSelect: (request: RequestView) => void; onClose: () => void }) {
+  const { locale, t } = useI18n();
+  return <DrawerFrame title={detail.cluster.explicit_session_id ?? t('self.inferred')} eyebrow={t('self.logicalConversation')} onClose={onClose}><p className="muted break-anywhere">{detail.cluster.cluster_id}</p><h3>{t('self.sequence')}</h3>{detail.has_more && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('self.loadEarlierConversation')}</button></div>}<RequestTable requests={detail.requests} currency={currency} onSelect={onSelect} /><h3>{t('self.edges')}</h3>{detail.edges_truncated && <div className="notice warning">{t('self.edgesTruncated')}</div>}<div className="edge-list">{detail.edges.map((edge) => <div className="edge" key={`${edge.from_request_id ?? 'root'}-${edge.to_request_id}-${edge.relation}`}><span className={`status ${edge.relation === 'candidate' ? 'pending' : 'ok'}`}>{t(`conversationRelation.${edge.relation}`)}</span><code>{edge.from_request_id?.slice(0, 8) ?? t('self.root')} → {edge.to_request_id.slice(0, 8)}</code><b>{formatPercent(edge.confidence, locale)}</b></div>)}{detail.edges.length === 0 && <div className="empty">{t('self.singleObservation')}</div>}</div></DrawerFrame>;
 }

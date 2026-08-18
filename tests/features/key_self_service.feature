@@ -16,6 +16,14 @@ Feature: Stable key identity and read-only self-service statistics
     And the request detail contains the archived prompt and response
     And the downstream key cannot create another key
 
+  Scenario: Alias rename preserves stable identity and exposes the key's own limits
+    Given a token center backed by SQLite and memory object storage
+    When the service creates a key for principal "alias-user" allowing model "gpt-test"
+    And the service renames the key alias to "renamed credential"
+    Then the renamed alias retains the stable key identity
+    When the client views its own limit snapshot
+    Then the own limit snapshot belongs to the stable key
+
   Scenario: A global operator credential sees imported-style history across tenants
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI upstream returns a successful completion
@@ -46,6 +54,7 @@ Feature: Stable key identity and read-only self-service statistics
     When the service creates an exhausted key allowing model "paid-model"
     And the client calls model "paid-model"
     Then the response status is 429
+    And the rejection reason is "balance_exhausted" and is not retryable
 
   Scenario: Subscription grant reversal is durable and idempotent
     Given a token center backed by SQLite and memory object storage
@@ -82,6 +91,7 @@ Feature: Stable key identity and read-only self-service statistics
     When the service creates a key with RPM 1 allowing model "gpt-test"
     And the client calls model "gpt-test" twice
     Then the response status is 429
+    And the rejection reason is "rpm_exhausted" and is retryable with Retry-After
 
   Scenario: Cached tokens and service tiers are charged from one immutable snapshot
     Given a token center backed by SQLite and memory object storage
@@ -145,14 +155,37 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 202
     And the rejected generation fails once and refunds its entire reservation
 
-  Scenario: A retried Seedance submission keeps one upstream idempotency identity
+  Scenario: A Seedance success without a video asset is sanitized and refunded
     Given a token center backed by SQLite and memory object storage
-    And the mock Seedance upstream transiently fails once and then completes
+    And the mock Seedance upstream reports success without a video asset
     When the service creates a metered Seedance route and key
     And the client creates a five second Seedance generation
     Then the response status is 202
-    And the generation eventually succeeds with an archived video costing 0.5
-    And both Seedance submission attempts use the same upstream idempotency key
+    And the assetless Seedance success fails safely and refunds its entire reservation
+
+  Scenario: A malicious upstream generation job id is bounded and never exposed
+    Given a token center backed by SQLite and memory object storage
+    And the mock Seedance upstream returns a malicious job id
+    When the service creates a metered Seedance route and key
+    And the client creates a five second Seedance generation
+    Then the response status is 202
+    And the malicious Seedance job id is neither stored nor exposed
+
+  Scenario: An ambiguous non-idempotent Seedance submission fails closed without a duplicate
+    Given a token center backed by SQLite and memory object storage
+    And the mock Seedance upstream returns an ambiguous server error after one submission
+    When the service creates a metered Seedance route and key
+    And the client creates a five second Seedance generation
+    Then the response status is 202
+    And the ambiguous Seedance submission fails closed without a second upstream POST
+
+  Scenario: Seedance provider usage cannot exceed the admitted reservation
+    Given a token center backed by SQLite and memory object storage
+    And the mock Seedance upstream reports sixty seconds for a five second reservation
+    When the service creates a metered Seedance route and key
+    And the client creates a five second Seedance generation
+    Then the response status is 202
+    And the over-contract Seedance usage charges the reservation ceiling without an asset
 
   Scenario: ComfyUI generation is permissioned, metered and archived
     Given a token center backed by SQLite and memory object storage
@@ -162,6 +195,38 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 202
     And the ComfyUI generation eventually succeeds with an archived image costing 0.2
 
+  Scenario: A durable generation manifest survives a worker crash before terminal settlement
+    Given a token center backed by SQLite and memory object storage
+    When the service creates a metered ComfyUI route and key
+    And the generation worker is stopped before it can submit upstream
+    And the client creates a ComfyUI image generation
+    And a durable ComfyUI manifest is persisted before terminal settlement
+    Then the restarted worker settles the durable manifest without contacting ComfyUI
+
+  Scenario: A ComfyUI success without generated assets is sanitized and refunded
+    Given a token center backed by SQLite and memory object storage
+    And the mock ComfyUI upstream reports success without generated assets
+    When the service creates a metered ComfyUI route and key
+    And the client creates a ComfyUI image generation
+    Then the response status is 202
+    And the assetless ComfyUI success fails safely and refunds its entire reservation
+
+  Scenario: An oversized ComfyUI asset manifest is rejected before any download
+    Given a token center backed by SQLite and memory object storage
+    And the mock ComfyUI upstream returns seventeen generated assets
+    When the service creates a metered ComfyUI route and key
+    And the client creates a ComfyUI image generation
+    Then the response status is 202
+    And the oversized ComfyUI manifest fails before downloads and refunds its reservation
+
+  Scenario: ComfyUI video generation uses the video endpoint, job billing and job-scoped durable archive
+    Given a token center backed by SQLite and memory object storage
+    And the mock ComfyUI upstream completes an MP4 video workflow
+    When the service creates a metered ComfyUI video route and key
+    And the client creates a ComfyUI video generation
+    Then the response status is 202
+    And the ComfyUI video is available through self service with exact archived content and cost 0.2
+
   Scenario: OpenAI-compatible image generation is forwarded and metered
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI Images upstream returns a generated icon
@@ -170,6 +235,54 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 200
     And the OpenAI image response is archived and costs 0.3
 
+  Scenario: OpenAI-compatible image generation is atomic without an idempotency key
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images upstream returns a generated icon without requiring idempotency
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image without an idempotency key
+    Then the response status is 200
+    And the non-idempotent OpenAI image is atomically archived and costs 0.3
+
+  Scenario: URL-backed OpenAI image results are durably archived
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images upstream returns an exact-origin signed URL
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
+    Then the response status is 200
+    And the signed URL image is stored in CAS without exposing its secret URL
+
+  Scenario: Ten OpenAI image results share one aggregate archive budget
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images upstream returns ten assets over the aggregate budget
+    When the service creates a metered OpenAI Images route and key
+    And the client creates ten OpenAI-compatible images in one request
+    Then the response status is 502
+    And the ten image request is refunded and leaves no staged assets
+
+  Scenario: Empty URL-backed OpenAI image results are rejected without billing
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images upstream returns an empty signed URL asset
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
+    Then the response status is 502
+    And the empty URL image is rejected unbilled without exposing the signed URL
+
+  Scenario: Oversized OpenAI image responses are rejected without billing
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images upstream exceeds the response limit by one byte
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
+    Then the response status is 502
+    And the oversized image is unbilled and has no partial response archive
+
+  Scenario: OpenAI image provider errors never expose or archive the upstream body
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI Images upstream rejects with a sensitive error body
+    When the service creates a metered OpenAI Images route and key
+    And the client creates an OpenAI-compatible image
+    Then the response status is 502
+    And the upstream image rejection is sanitized archived as a gap and replayed safely
+
   Scenario: Codex Responses image tools are exposed as the OpenAI Images API
     Given a token center backed by SQLite and memory object storage
     And the mock Codex Responses upstream returns a generated icon
@@ -177,6 +290,14 @@ Feature: Stable key identity and read-only self-service statistics
     And the client creates a Codex-backed OpenAI-compatible image
     Then the response status is 200
     And the Codex-backed image response is archived and costs 0.4
+
+  Scenario: Invalid Codex Responses image payloads never expose or archive provider details
+    Given a token center backed by SQLite and memory object storage
+    And the mock Codex Responses upstream returns a sensitive invalid image payload
+    When the service creates a metered Codex Responses image route and key
+    And the client creates a Codex-backed OpenAI-compatible image
+    Then the response status is 502
+    And the invalid Codex image payload is sanitized and never archived
 
   Scenario: Copilot subscription OAuth uses an opaque bridge handle
     Given a token center backed by SQLite and memory object storage

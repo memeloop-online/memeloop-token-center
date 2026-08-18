@@ -25,6 +25,7 @@ RUN mkdir -p /usr/local/cargo \
     && printf '[source.crates-io]\nreplace-with = "build-mirror"\n[source.build-mirror]\nregistry = "%s"\n' "${CARGO_REGISTRY}" \
       > /usr/local/cargo/config.toml
 WORKDIR /build
+COPY .cargo/config.toml /build/.cargo/config.toml
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src tests \
     && printf 'pub fn dependency_cache_marker() {}\n' > src/lib.rs \

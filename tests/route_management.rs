@@ -112,6 +112,8 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
                     prefix: "Bearer ".into(),
                 },
                 oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
             },
             pepper,
         )

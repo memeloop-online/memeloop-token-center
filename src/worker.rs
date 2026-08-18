@@ -1,20 +1,52 @@
 use std::time::Duration;
 
+use tokio::{sync::watch, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{AppState, generation};
+use crate::{
+    AppState, api, archive_reaper::ArchiveReaper, archive_staging::ArchiveStagingLeaseOwner,
+    generation,
+};
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const GENERATION_INTERVAL: Duration = Duration::from_millis(500);
+const OAUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const OAUTH_REFRESH_AHEAD_MILLIS: i64 = 5 * 60 * 1_000;
 
 pub async fn run(state: AppState) {
+    let (shutdown_sender, shutdown) = watch::channel(false);
+    run_until_shutdown(state, shutdown).await;
+    drop(shutdown_sender);
+}
+
+/// Runs the worker roles with a shutdown signal that can be shared by the
+/// server supervisor. The archive reaper is its own Tokio task, so a slow
+/// generation provider never delays cleanup claims.
+pub async fn run_until_shutdown(state: AppState, mut shutdown: watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
     let worker_id = format!("worker-{}", Uuid::now_v7());
+    let reaper_owner = ArchiveStagingLeaseOwner::new(format!("archive-reaper-{}", Uuid::now_v7()))
+        .expect("reaper owner is canonical safe ASCII");
+    let reaper = ArchiveReaper::new(state.db.clone(), state.archive.clone(), reaper_owner);
+    let reaper_shutdown = shutdown.clone();
+    let mut reaper_task = AbortTaskOnDrop::new(tokio::spawn(async move {
+        reaper.run(reaper_shutdown).await;
+    }));
     let mut maintenance = tokio::time::interval(MAINTENANCE_INTERVAL);
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut generations = tokio::time::interval(GENERATION_INTERVAL);
     generations.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut oauth_refresh = tokio::time::interval(OAUTH_REFRESH_INTERVAL);
+    oauth_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
             _ = maintenance.tick() => {
                 if let Err(error) = state.db.maintain_partitions().await {
                     tracing::error!(%error, "worker failed to maintain PostgreSQL partitions");
@@ -57,10 +89,80 @@ pub async fn run(state: AppState) {
                 }
             }
             _ = generations.tick() => {
+                match state.db.expire_preparing_generation_jobs(100).await {
+                    Ok(expired) if expired > 0 => {
+                        tracing::warn!(expired, "worker refunded expired generation archive preparations");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "worker failed to expire generation archive preparations");
+                    }
+                }
                 if let Err(error) = generation::process_one(&state, &worker_id).await {
                     tracing::error!(%error, "worker failed to claim or update a generation job");
                 }
             }
+            _ = oauth_refresh.tick() => {
+                let refresh_before = crate::db::unix_millis()
+                    .saturating_add(OAUTH_REFRESH_AHEAD_MILLIS);
+                match state.db.list_managed_oauth_refresh_candidates(refresh_before, 20).await {
+                    Ok(accounts) => {
+                        for (account_id, generation) in accounts {
+                            let idempotency_key = format!(
+                                "oauth-worker-{}-generation-{}",
+                                account_id,
+                                generation
+                            );
+                            if let Err(error) = api::refresh_managed_upstream_oauth(
+                                &state,
+                                account_id,
+                                &idempotency_key,
+                            )
+                            .await
+                            {
+                                tracing::warn!(%error, %account_id, "worker failed to refresh managed OAuth credential");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "worker failed to list expiring managed OAuth credentials");
+                    }
+                }
+            }
+        }
+    }
+
+    if reaper_task.join().await.is_err() {
+        tracing::error!(
+            error_code = "reaper_task_failed",
+            "archive staging reaper task failed"
+        );
+    }
+}
+
+struct AbortTaskOnDrop {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl AbortTaskOnDrop {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(&mut self) -> Result<(), tokio::task::JoinError> {
+        self.handle
+            .take()
+            .expect("reaper task is joined once")
+            .await
+    }
+}
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
         }
     }
 }

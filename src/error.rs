@@ -1,5 +1,48 @@
-use axum::{Json, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    http::{HeaderValue, StatusCode, header},
+    response::IntoResponse,
+};
 use serde_json::json;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LimitReason {
+    BalanceExhausted,
+    DailyBudgetExhausted,
+    WeeklyBudgetExhausted,
+    LifetimeBudgetExhausted,
+    RpmExhausted,
+    TpmExhausted,
+    ConcurrencyExhausted,
+}
+
+impl LimitReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BalanceExhausted => "balance_exhausted",
+            Self::DailyBudgetExhausted => "daily_budget_exhausted",
+            Self::WeeklyBudgetExhausted => "weekly_budget_exhausted",
+            Self::LifetimeBudgetExhausted => "lifetime_budget_exhausted",
+            Self::RpmExhausted => "rpm_exhausted",
+            Self::TpmExhausted => "tpm_exhausted",
+            Self::ConcurrencyExhausted => "concurrency_exhausted",
+        }
+    }
+
+    const fn is_quota(self) -> bool {
+        matches!(
+            self,
+            Self::BalanceExhausted
+                | Self::DailyBudgetExhausted
+                | Self::WeeklyBudgetExhausted
+                | Self::LifetimeBudgetExhausted
+        )
+    }
+
+    const fn retryable(self) -> bool {
+        !matches!(self, Self::BalanceExhausted | Self::LifetimeBudgetExhausted)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -13,6 +56,11 @@ pub enum AppError {
     QuotaExceeded,
     #[error("rate limit exceeded")]
     RateLimited,
+    #[error("usage limit exceeded: {reason:?}")]
+    LimitExceeded {
+        reason: LimitReason,
+        retry_after_seconds: Option<u64>,
+    },
     #[error("resource not found")]
     NotFound,
     #[error("conflict: {0}")]
@@ -47,6 +95,15 @@ impl IntoResponse for AppError {
                 "rate_limit_exceeded",
                 self.to_string(),
             ),
+            Self::LimitExceeded { reason, .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                if reason.is_quota() {
+                    "insufficient_quota"
+                } else {
+                    "rate_limit_exceeded"
+                },
+                self.to_string(),
+            ),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found", self.to_string()),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict", self.to_string()),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request", self.to_string()),
@@ -61,11 +118,32 @@ impl IntoResponse for AppError {
                 "internal error".to_owned(),
             ),
         };
-        (
-            status,
-            Json(json!({"error": {"code": code, "message": message}})),
-        )
-            .into_response()
+        let mut response = match &self {
+            Self::LimitExceeded { reason, .. } => (
+                status,
+                Json(json!({"error": {
+                    "code": code,
+                    "message": message,
+                    "reason": reason.as_str(),
+                    "retryable": reason.retryable(),
+                }})),
+            )
+                .into_response(),
+            _ => (
+                status,
+                Json(json!({"error": {"code": code, "message": message}})),
+            )
+                .into_response(),
+        };
+        if let Self::LimitExceeded {
+            retry_after_seconds: Some(seconds),
+            ..
+        } = self
+            && let Ok(value) = HeaderValue::from_str(&seconds.max(1).to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 
@@ -91,5 +169,48 @@ impl From<reqwest::Error> for AppError {
             "upstream HTTP operation failed"
         );
         Self::Upstream(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn retryable_limit_response_has_fixed_reason_and_retry_after() {
+        let response = AppError::LimitExceeded {
+            reason: LimitReason::RpmExhausted,
+            retry_after_seconds: Some(17),
+        }
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "17");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(body["error"]["reason"], "rpm_exhausted");
+        assert_eq!(body["error"]["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn permanent_limit_response_has_no_retry_after() {
+        let response = AppError::LimitExceeded {
+            reason: LimitReason::LifetimeBudgetExhausted,
+            retry_after_seconds: None,
+        }
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "insufficient_quota");
+        assert_eq!(body["error"]["reason"], "lifetime_budget_exhausted");
+        assert_eq!(body["error"]["retryable"], false);
     }
 }

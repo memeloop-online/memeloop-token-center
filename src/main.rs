@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use clap::{Parser, Subcommand};
 use memeloop_token_center::{
@@ -7,9 +7,13 @@ use memeloop_token_center::{
     db::Database,
     worker,
 };
-use tokio::net::TcpListener;
-use tracing::info;
+use tokio::{net::TcpListener, sync::watch};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+#[global_allocator]
+#[cfg(not(target_env = "msvc"))]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[derive(Debug, Parser)]
 #[command(name = "memeloop-token-center")]
@@ -55,17 +59,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Command::Serve { role } => {
             let state = AppState::initialize(config.clone()).await?;
-            let worker_task = role
-                .runs_worker()
-                .then(|| tokio::spawn(worker::run(state.clone())));
             let address: SocketAddr = config.listen.parse()?;
             let listener = TcpListener::bind(address).await?;
+            let (worker_shutdown, mut worker_task) = if role.runs_worker() {
+                let (sender, receiver) = watch::channel(false);
+                let task = tokio::spawn(worker::run_until_shutdown(state.clone(), receiver));
+                (Some(sender), Some(task))
+            } else {
+                (None, None)
+            };
             info!(%address, ?role, "token center listening");
             let result = axum::serve(listener, api::router_for_role(state, role))
                 .with_graceful_shutdown(shutdown_signal())
                 .await;
-            if let Some(task) = worker_task {
-                task.abort();
+            if let Some(sender) = worker_shutdown {
+                let _ = sender.send(true);
+            }
+            if let Some(task) = worker_task.as_mut() {
+                match tokio::time::timeout(Duration::from_secs(30), &mut *task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => error!(
+                        error_code = "worker_task_failed",
+                        "background worker stopped unexpectedly"
+                    ),
+                    Err(_) => {
+                        warn!(
+                            error_code = "worker_shutdown_timeout",
+                            "background worker did not stop before the shutdown deadline"
+                        );
+                        task.abort();
+                        let _ = task.await;
+                    }
+                }
             }
             result?;
         }

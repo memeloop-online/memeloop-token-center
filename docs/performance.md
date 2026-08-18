@@ -4,7 +4,7 @@ The repository contains two dependency-light, machine-readable acceptance tools 
 
 ## Memory, streaming and large assets
 
-Build the same optimized binary that will be deployed, then run the 15-minute acceptance profile:
+Build an optimized binary from the exact release commit, then run the 15-minute acceptance profile:
 
 ```bash
 cargo build --release --bin memeloop-token-center
@@ -18,9 +18,13 @@ The acceptance profile performs all of the following:
 
 - measures idle RSS/PSS for the split control, gateway and worker roles;
 - receives 12 concurrent 16 MiB upstream streams while sampling gateway RSS;
-- closes downstream connections early and requires the requests to become `upstream_stream` failures;
-- sends 65 MiB from the upstream and proves the gateway stops at its 64 MiB cap;
-- streams and archives a 500 MiB Seedance asset while sampling gateway and worker separately;
+- closes downstream connections early and requires the requests to become
+  `downstream_disconnected` failures;
+- sends 65 MiB from the upstream, proves the gateway delivers between 63 and
+  64 MiB before enforcing its 64 MiB cap, and requires an
+  `upstream_response_too_large` failure record;
+- streams and archives a 500 MiB Seedance asset, requires a newly archived
+  object of exactly 500 MiB, and samples gateway and worker separately;
 - runs a 15-minute, rate-controlled soak, waits for cooldown, and gates retained RSS and RSS slope.
 
 For quick local feedback, the short profile uses a 100 MiB asset and a 30-second soak. It covers the same paths, but its RSS slope is informational because such a short regression is statistically noisy:
@@ -29,19 +33,40 @@ For quick local feedback, the short profile uses a 100 MiB asset and a 30-second
 ops/benchmark-memory.sh --profile short --binary target/debug/memeloop-token-center
 ```
 
-Default release thresholds are deliberately well below the historical 1 GiB CPA process:
+Default release thresholds are deliberately well below the historical 1 GiB CPA process and leave explicit headroom under the chart's 256 MiB gateway limit:
 
 | Measurement | Gate |
 |---|---:|
-| Gateway idle RSS | at most 256 MiB |
-| Concurrent-stream gateway RSS increase | at most 192 MiB |
+| Gateway idle RSS | at most 96 MiB |
+| Concurrent-stream gateway RSS increase | at most 128 MiB |
 | 100–500 MiB asset gateway RSS increase | at most 96 MiB |
 | 100–500 MiB asset worker RSS increase | at most 192 MiB |
-| Gateway RSS retained after cooldown | at most 96 MiB over idle |
+| Gateway RSS retained after cooldown | at most 64 MiB over idle |
 | 15-minute gateway RSS slope | at most 2 MiB/minute |
+| Peak gateway RSS with a 256 MiB deployment limit | at most 224 MiB (32 MiB headroom) |
 | Peak gateway RSS / user-observed 1 GiB CPA process | at most 25% |
 
 Every threshold has a command-line override so a stricter deployment budget can be recorded explicitly. Do not raise a threshold merely to turn a regression green; attach a heap/profile investigation and explain the new budget.
+
+The non-PR-blocking `memory-acceptance` GitHub Actions workflow accepts only an
+exact 40-hex commit SHA (or defaults to the workflow event SHA). It validates
+the resolved checkout, builds it in release mode with Rust 1.95.0 and embedded
+build metadata, and runs the complete acceptance profile. Its failure-safe
+artifact contains checkout, toolchain and build metadata, build/harness logs,
+and the JSON report after a completed or caught-failure harness run. The artifact is retained for 30
+days even when checkout, setup, build, functional or resource gates fail. The
+report records the resolved Git commit and binary digest; use those fields—not
+a mutable branch name—as release evidence. The harness rejects any report
+labelled `acceptance` unless it includes a 500 MiB asset, a soak of at least 900
+seconds, at least 12 concurrent streams, and at least 16 MiB per stream.
+
+The workflow deliberately writes evidence under the runner's temporary
+directory, outside the checkout. This keeps `git_dirty=false` meaningful and
+prevents benchmark logs or reports from becoming accidental source changes.
+Harness prerequisite and functional failures still write a machine-readable
+failure report when the output location is writable.
+
+The 224 MiB check measures the gateway process's Linux RSS/high-water mark and reserves 32 MiB for allocator, runtime and other container charges. It is a conservative release proxy, not a measurement of Kubernetes cgroup `memory.current` or `memory.peak`. Before production cutover, confirm the same workload in the 256 MiB Pod and retain cgroup peak plus `memory.events`; any OOM event fails the deployment gate regardless of this harness result.
 
 The output has `schema_version`, raw measurements, thresholds as individual checks and one top-level `passed` value. Exit codes are stable:
 
@@ -50,7 +75,7 @@ The output has `schema_version`, raw measurements, thresholds as individual chec
 - `3`: a prerequisite or startup condition was missing;
 - `4`: a functional test failed.
 
-The asset test uses filesystem object storage so the worker's RSS result is not confused by the intentionally in-memory test archive. Production S3 should additionally be tested for multipart retry and latency, but the bounded-memory property is exercised here.
+The asset test uses filesystem object storage so the worker's RSS result is not confused by the intentionally in-memory test archive. Production S3 should additionally be tested for multipart retry and latency, but the bounded-memory property is exercised here. The GitHub-hosted binary digest is not assumed to equal the GHCR image's binary digest: compare the report with the extracted release image binary, and retain the separate in-Pod cgroup acceptance evidence before cutover.
 
 ## PostgreSQL large-history query plans
 
@@ -69,11 +94,40 @@ Keep the URI in `MTC_BENCH_DATABASE_URL` or a mode-`0600` file passed with `--da
 The URL is never written to the report. The script forces `default_transaction_read_only=on`, applies a statement timeout, selects high-cardinality tenant/key samples, and runs `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, TIMING OFF)` for:
 
 - global, tenant and credential newest-first cursor pages;
+- operator-shaped tenant statistics using daily rollups plus exact UTC boundary
+  facts, including model/protocol/status/error/upstream/route/alias/principal
+  dimensions;
 - credential daily aggregates;
 - tenant error troubleshooting when an error sample exists;
 - tenant request-event cursor replay when events exist.
 
-It records execution/planning time, returned rows, buffer hits/reads, index names and the complete plan tree. On a sufficiently large dataset, sequential scans of `request_records` or `request_events` fail the run. The default latency budget is 250 ms per query, but release evidence should also include cold-cache results if the deployment SLO depends on them.
+It records execution/planning time, returned rows, buffer hits/reads, index names and the complete plan tree. On a sufficiently large dataset, sequential scans of `request_records`, `request_events`, or `request_stats_facts` fail the run. It also verifies that every terminal request has a compact fact and that all request-history leaf partitions are attached with valid indexes. The default latency budget is 250 ms per query, but release evidence should also include cold-cache results if the deployment SLO depends on them.
+
+Schema v24 backfills terminal request facts and UTC daily rollups. If a legacy
+load, repair, or retention operation bypassed normal dual writes, reconcile an
+explicit range before benchmarking. The command is dry-run by default:
+
+On PostgreSQL, the same migration installs the parent partitioned
+`request_records_recent_idx` and `request_events_global_cursor_idx` indexes, so
+fresh Helm deployments have global history and SSE cursor paths without a
+manual operator step. Running
+`ops/backfill-postgres-history-partitions.sh --indexes-only` remains the
+low-lock repair path for databases that were created by an older build.
+
+```bash
+PGHOST=… PGUSER=… PGDATABASE=… \
+  ops/reconcile-postgres-request-stats.sh \
+  --from 2026-07-01 --before 2026-08-01 --max-days 31
+
+PGHOST=… PGUSER=… PGDATABASE=… \
+  ops/reconcile-postgres-request-stats.sh \
+  --from 2026-07-01 --before 2026-08-01 --max-days 31 --apply
+```
+
+Statistics pruning is a separate, explicit operation. It refuses to delete facts
+or rollups while raw rows still exist in the target interval and requires both
+`--apply` and `--confirm-prune`; raw-history archival and deletion use their own
+reviewed retention procedure.
 
 Before treating results as comparable, run `ANALYZE`, use the same PostgreSQL settings and resource limits, and state whether the cache was warm. A report from a smaller dataset exits `2`: it can catch SQL breakage, but it is not ARC-05 large-volume evidence. The benchmark performs no inserts, schema changes or maintenance and is safe to point at a read replica.
 

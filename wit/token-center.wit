@@ -1,4 +1,4 @@
-package memeloop:token-center@0.1.0;
+package memeloop:token-center@0.2.0;
 
 interface types {
   record request-context {
@@ -43,6 +43,19 @@ interface upstream-provider {
   use types.{request-context, metering};
   list-models: func(config-json: string) -> result<string, string>;
   quote: func(context: request-context, request-json: string) -> result<metering, string>;
+
+  /// Convert one canonical, credential-free request into a bounded upstream
+  /// request. The JSON result is the buffered-v1 envelope documented by the
+  /// host. It contains method, relative path, non-secret headers, base64 body,
+  /// and a streaming=false assertion. The host validates every field and adds
+  /// the stable upstream account credential only after this call returns.
+  prepare: func(context: request-context, config-json: string, request-json: string) -> result<string, string>;
+
+  /// Convert one bounded, credential-free upstream response envelope into the
+  /// public protocol response and token usage. This ABI is deliberately
+  /// buffered-only; a route requesting streaming is rejected by the host
+  /// before the component is invoked.
+  normalize: func(context: request-context, response-json: string) -> result<string, string>;
 }
 
 world plugin {
@@ -50,4 +63,3 @@ world plugin {
   export traffic-policy;
   export upstream-provider;
 }
-

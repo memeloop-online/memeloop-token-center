@@ -1,0 +1,179 @@
+# Review and replace every REPLACE_* reference before creating this one-shot Job.
+# The checked-in form is intentionally a dry-run. Add the final `--apply` argument
+# only after the exact-count preflight and PostgreSQL snapshot are approved.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: memeloop-token-center-session-archive-import
+  namespace: memeloop-token-center-dev
+  labels:
+    app.kubernetes.io/name: memeloop-token-center-session-archive-import
+    app.kubernetes.io/component: migration
+  annotations:
+    memeloop-token-center/import-mode: dry-run
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 86400
+  ttlSecondsAfterFinished: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: memeloop-token-center-session-archive-import
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: importer
+          # Pin the reviewed service image: it contains import-cpa-session-archive.
+          image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center@sha256:REPLACE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/import-cpa-session-archive"]
+          args:
+            - --input
+            - /source/archive.jsonl
+            - --plan-directory
+            - /plan
+            - --max-plan-bytes
+            - "1073741824"
+            - --tenant-external-id
+            - cpa-dogfood-import
+            - --cpamp-source
+            - cpamp-usage-events-v1
+            - --archive-source
+            - cpa-session-archive-v1
+            # Add only after dry-run approval:
+            # - --apply
+          env:
+            - name: MTC_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_SESSION_ARCHIVE_IMPORT_SECRET
+                  key: database-url
+            - name: MTC_ARCHIVE_BACKEND
+              value: s3
+            - name: MTC_S3_BUCKET
+              value: memeloop-token-center-dogfood
+            - name: MTC_S3_REGION
+              value: us-east-1
+            - name: MTC_S3_ENDPOINT
+              value: http://minio.memeloop-token-center-dev.svc.cluster.local:9000
+            - name: MTC_S3_ALLOW_HTTP
+              value: "true"
+            - name: MTC_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_SESSION_ARCHIVE_IMPORT_SECRET
+                  key: s3-access-key
+            - name: MTC_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_SESSION_ARCHIVE_IMPORT_SECRET
+                  key: s3-secret-key
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 1300Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+              ephemeral-storage: 1536Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: source
+              mountPath: /source
+              readOnly: true
+            - name: plan
+              mountPath: /plan
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: source
+          persistentVolumeClaim:
+            claimName: REPLACE_READ_ONLY_SESSION_ARCHIVE_PVC
+            readOnly: true
+        - name: plan
+          emptyDir:
+            # 1 GiB sealed-plan cap plus SQLite metadata/journal headroom.
+            sizeLimit: 1200Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+---
+# This one-shot workload is not selected by the long-running chart policies, so
+# it carries its own default-deny policy. Keep the selectors aligned with the Job.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: memeloop-token-center-session-archive-import-default-deny
+  namespace: memeloop-token-center-dev
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: memeloop-token-center-session-archive-import
+      app.kubernetes.io/component: migration
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Adjust the PostgreSQL and object-store pod selectors together with the reviewed
+# endpoint values. Never replace them with an unrestricted all-addresses rule.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: memeloop-token-center-session-archive-import-egress
+  namespace: memeloop-token-center-dev
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: memeloop-token-center-session-archive-import
+      app.kubernetes.io/component: migration
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: memeloop-token-center-dev
+          podSelector:
+            matchLabels:
+              cnpg.io/cluster: memeloop-token-center-pg
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: memeloop-token-center-dev
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000

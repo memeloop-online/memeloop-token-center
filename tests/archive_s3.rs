@@ -5,8 +5,10 @@ use bytes::Bytes;
 use memeloop_token_center::{
     archive::ArchiveStore,
     config::{ArchiveBackend, Config},
+    error::AppError,
 };
 use serde_json::Value;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 fn s3_config() -> Option<Config> {
@@ -59,6 +61,18 @@ async fn minio_put_get_list_missing_and_read_limit() {
         .await
         .expect("put tenant object");
     assert_eq!(store.get(&location).await.expect("get tenant object"), body);
+    let ranged = store
+        .open_stream(&location, Some(8..19))
+        .await
+        .expect("open ranged MinIO object");
+    assert_eq!(ranged.object_size, body.len() as u64);
+    assert_eq!(ranged.range, 8..19);
+    let mut stream = ranged.stream;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk.expect("read ranged MinIO chunk"));
+    }
+    assert_eq!(bytes, b"integration");
 
     let missing = format!("tenants/test-tenant/objects/missing-{unique}.bin");
     assert!(
@@ -93,6 +107,39 @@ async fn minio_put_get_list_missing_and_read_limit() {
 }
 
 #[tokio::test]
+async fn minio_list_only_credentials_fail_the_read_write_readiness_canary() {
+    let Some(mut config) = s3_config() else {
+        return;
+    };
+    let (Ok(access_key), Ok(secret_key)) = (
+        env::var("MTC_TEST_S3_LIST_ONLY_ACCESS_KEY"),
+        env::var("MTC_TEST_S3_LIST_ONLY_SECRET_KEY"),
+    ) else {
+        eprintln!("list-only MinIO credentials are unset; skipping IAM readiness assertion");
+        return;
+    };
+    config.s3_access_key = Some(access_key);
+    config.s3_secret_key = Some(secret_key);
+    let store = ArchiveStore::from_config(&config)
+        .await
+        .expect("construct list-only MinIO archive store");
+
+    let error = store
+        .readiness_check()
+        .await
+        .expect_err("ListBucket without PutObject/GetObject/DeleteObject must not be ready");
+    assert_eq!(
+        error.to_string(),
+        "storage error: archive readiness canary failed"
+    );
+    let cached = store
+        .readiness_check()
+        .await
+        .expect_err("a failed canary remains not-ready during its short retry TTL");
+    assert_eq!(cached.to_string(), error.to_string());
+}
+
+#[tokio::test]
 async fn minio_multipart_writer_publishes_only_the_content_address() {
     let Some(config) = s3_config() else {
         return;
@@ -122,6 +169,92 @@ async fn minio_multipart_writer_publishes_only_the_content_address() {
         .delete(&location)
         .await
         .expect("remove multipart test object");
+}
+
+#[tokio::test]
+async fn minio_delete_prefix_is_segment_exact_and_rejects_unsafe_input() {
+    let Some(config) = s3_config() else {
+        return;
+    };
+    let store = ArchiveStore::from_config(&config)
+        .await
+        .expect("construct MinIO archive store");
+    let base = format!("staging/archive-delete-prefix/{}", Uuid::now_v7());
+    let exact = format!("{base}/exact-object");
+    let target = format!("{base}/x/object");
+    let lexical_neighbour = format!("{base}/x2/object");
+    store
+        .put(&exact, Bytes::from_static(b"exact"))
+        .await
+        .expect("put exact-prefix object");
+    store
+        .put(&target, Bytes::from_static(b"x"))
+        .await
+        .expect("put target descendant");
+    store
+        .put(&lexical_neighbour, Bytes::from_static(b"x2"))
+        .await
+        .expect("put lexical neighbour");
+
+    store
+        .delete_prefix(&exact)
+        .await
+        .expect("delete exact-prefix object");
+    assert!(store.get(&exact).await.is_err());
+    store
+        .delete_prefix(&format!("{base}/x"))
+        .await
+        .expect("delete exact segment prefix");
+    assert!(store.get(&target).await.is_err());
+    assert_eq!(
+        store
+            .get(&lexical_neighbour)
+            .await
+            .expect("x2 must survive deleting x"),
+        Bytes::from_static(b"x2")
+    );
+
+    for unsafe_prefix in [
+        "",
+        "/",
+        ".",
+        "..",
+        "staging/./x",
+        "staging/../x",
+        "staging//x",
+        "staging/x/",
+        "staging\\x",
+    ] {
+        assert!(matches!(
+            store.delete_prefix(unsafe_prefix).await,
+            Err(AppError::BadRequest(_))
+        ));
+    }
+    store
+        .delete_prefix(&base)
+        .await
+        .expect("clean MinIO prefix fixtures");
+}
+
+#[tokio::test]
+async fn minio_explicit_multipart_abort_never_publishes_the_object() {
+    let Some(config) = s3_config() else {
+        return;
+    };
+    let store = ArchiveStore::from_config(&config)
+        .await
+        .expect("construct MinIO archive store");
+    let staging = format!("staging/archive-abort/{}/response.bin", Uuid::now_v7());
+    let mut writer = store.start_writer(&staging).await.expect("start multipart");
+    writer
+        .write(Bytes::from(vec![0x5a; 6 * 1024 * 1024]))
+        .await
+        .expect("write enough bytes to start a multipart part");
+    writer.abort().await.expect("abort multipart");
+    assert!(
+        store.get(&staging).await.is_err(),
+        "aborted multipart must not publish an object"
+    );
 }
 
 #[tokio::test]

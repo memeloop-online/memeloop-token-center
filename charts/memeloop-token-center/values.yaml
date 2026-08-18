@@ -1,6 +1,10 @@
 image:
-  repository: ghcr.io/memeloop/memeloop-token-center
+  repository: ghcr.io/linonetwo/memeloop-token-center
   tag: "0.1.0"
+  # When non-empty, digest takes precedence over tag and all workloads render
+  # repository@digest. Keep tag populated as the explicit fallback for local
+  # development and registries that do not provide a reviewed digest.
+  digest: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -113,9 +117,15 @@ config:
   keyPepperSecret:
     name: memeloop-token-center-secrets
     key: key-pepper
+  # The referenced value must be generated from at least 32 random bytes and
+  # encoded without Unicode whitespace/Cc controls; the application validates it.
   serviceTokenSecret:
     name: memeloop-token-center-secrets
     key: service-token
+  # The Kubernetes chart supports only externally managed S3-compatible
+  # storage. The runtime filesystem/memory backends are intentionally limited
+  # to local and test harnesses; mounting them into this hardened Pod would
+  # create a single-replica, non-durable archive.
   archiveBackend: s3
   s3:
     bucket: memeloop-token-center
@@ -142,14 +152,26 @@ plugins:
   existingClaim: ""
 
 ingress:
-  enabled: false
-  className: ""
-  annotations: {}
   gateway:
-    host: api.token-center.example.com
+    enabled: false
+    className: ""
+    annotations: {}
+    sourceRanges: []
+    host: ""
     tlsSecretName: ""
   control:
-    host: control.token-center.example.com
+    # Keep the control plane cluster-internal by default. Enabling this
+    # endpoint is an explicit, independent operator decision and must use a
+    # private ingress class with its own access controls.
+    enabled: false
+    className: ""
+    annotations: {}
+    # When enabled, the chart renders the nginx-compatible source-range
+    # annotation supported by both Higress and ingress-nginx. Each entry must
+    # be a valid IPv4 CIDR with a /1 through /32 prefix; /0 and IPv6 ranges are
+    # rejected. The control ingress also requires at least one range and TLS.
+    sourceRanges: []
+    host: ""
     tlsSecretName: ""
 
 podAnnotations: {}
@@ -162,6 +184,10 @@ topologySpreadConstraints: []
 # Axum's graceful shutdown to drain them during a rollout.
 terminationGracePeriodSeconds: 660
 revisionHistoryLimit: 5
+# Use Recreate for the one-time transition from releases that predate atomic
+# request admission. RollingUpdate is safe again once every running replica
+# implements the current admission contract.
+deploymentStrategy: RollingUpdate
 
 # Startup and liveness prove the process is responsive. Readiness additionally
 # checks PostgreSQL and archive bucket access before receiving traffic.

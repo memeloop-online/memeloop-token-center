@@ -1,5 +1,6 @@
 /target/
-/.cargo/
+/.cargo/*
+!/.cargo/config.toml
 /.env
 /web/node_modules/
 /web/dist/
@@ -13,3 +14,5 @@ web/test-results/
 web/playwright-report/
 /tests/load/results/*-latest.json
 /tests/load/results/local-*.json
+__pycache__/
+*.py[cod]

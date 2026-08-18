@@ -1,7 +1,6 @@
 apiVersion: v2
 name: memeloop-token-center
-description: PostgreSQL-first AI gateway, archive and quota center
+description: Open-source high-performance relay and usage analytics for AI text, image, and video workloads
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
-

@@ -37,11 +37,50 @@ export async function api<T>(
   return body as T;
 }
 
+/**
+ * Data-bearing SSE messages emitted by Token Center.
+ *
+ * Contract: every message has a non-empty `id` field. For request events this is
+ * the request-event UUID and must equal `data.event_id`; callers use it together
+ * with the JSON `event_at` value as the durable resume cursor.
+ */
+export interface SseMessage<T> {
+  id: string;
+  event: string;
+  data: T;
+}
+
+function normalizeSseLineEndings(value: string): string {
+  const trailingCarriageReturn = value.endsWith('\r');
+  const complete = trailingCarriageReturn ? value.slice(0, -1) : value;
+  return complete.replaceAll('\r\n', '\n').replaceAll('\r', '\n')
+    + (trailingCarriageReturn ? '\r' : '');
+}
+
+function parseSseMessage<T>(message: string): SseMessage<T> | undefined {
+  let id: string | undefined;
+  let event = 'message';
+  const data: string[] = [];
+  for (const line of message.split('\n')) {
+    if (!line || line.startsWith(':')) continue;
+    const separator = line.indexOf(':');
+    const field = separator < 0 ? line : line.slice(0, separator);
+    const rawValue = separator < 0 ? '' : line.slice(separator + 1);
+    const value = rawValue.startsWith(' ') ? rawValue.slice(1) : rawValue;
+    if (field === 'data') data.push(value);
+    else if (field === 'event') event = value || 'message';
+    else if (field === 'id' && !value.includes('\0')) id = value;
+  }
+  if (data.length === 0) return undefined;
+  if (!id) throw new Error('SSE data event is missing its required id field');
+  return { id, event, data: JSON.parse(data.join('\n')) as T };
+}
+
 export async function streamSse<T>(
   path: string,
   credential: string,
   signal: AbortSignal,
-  onEvent: (event: T) => void,
+  onEvent: (message: SseMessage<T>) => void,
 ): Promise<void> {
   const response = await fetch(path, {
     headers: { Authorization: `Bearer ${credential}` },
@@ -52,21 +91,21 @@ export async function streamSse<T>(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffered = '';
-  while (!signal.aborted) {
-    const { done, value } = await reader.read();
-    if (done) return;
-    buffered += decoder.decode(value, { stream: true }).replaceAll('\r\n', '\n');
-    let boundary = buffered.indexOf('\n\n');
-    while (boundary >= 0) {
-      const message = buffered.slice(0, boundary);
-      buffered = buffered.slice(boundary + 2);
-      const data = message
-        .split('\n')
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trimStart())
-        .join('\n');
-      if (data) onEvent(JSON.parse(data) as T);
-      boundary = buffered.indexOf('\n\n');
+  try {
+    while (!signal.aborted) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      buffered = normalizeSseLineEndings(buffered + decoder.decode(value, { stream: true }));
+      let boundary = buffered.indexOf('\n\n');
+      while (boundary >= 0) {
+        const parsed = parseSseMessage<T>(buffered.slice(0, boundary));
+        buffered = buffered.slice(boundary + 2);
+        if (parsed) onEvent(parsed);
+        boundary = buffered.indexOf('\n\n');
+      }
     }
+  } finally {
+    try { await reader.cancel(); } catch { /* Abort and remote close can already release the reader. */ }
+    reader.releaseLock();
   }
 }

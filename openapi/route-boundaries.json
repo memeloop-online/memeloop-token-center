@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "minimum_openapi_paths": 71,
+  "minimum_openapi_operations": 81,
+  "rules": [
+    {
+      "name": "shared-health-probes",
+      "source_role": "common",
+      "runtime_roles": ["gateway", "control", "worker", "all"],
+      "exposure": "public-operational",
+      "authentication": "none",
+      "in_openapi": true,
+      "exact_paths": ["/healthz", "/livez", "/readyz"]
+    },
+    {
+      "name": "shared-ui-assets",
+      "source_role": "common",
+      "runtime_roles": ["gateway", "control", "worker", "all"],
+      "exposure": "static-support",
+      "authentication": "none",
+      "in_openapi": false,
+      "exact_paths": ["/ui-assets/{*path}"]
+    },
+    {
+      "name": "control-observability",
+      "source_role": "control",
+      "runtime_roles": ["control", "all"],
+      "exposure": "private-only",
+      "authentication": "service credential with metrics:read",
+      "in_openapi": true,
+      "exact_paths": ["/metrics", "/version"]
+    },
+    {
+      "name": "control-operator-shell",
+      "source_role": "control",
+      "runtime_roles": ["control", "all"],
+      "exposure": "private-only",
+      "authentication": "shell is static; API calls require a service credential",
+      "in_openapi": false,
+      "exact_paths": ["/operator"]
+    },
+    {
+      "name": "control-api",
+      "source_role": "control",
+      "runtime_roles": ["control", "all"],
+      "exposure": "private-only",
+      "authentication": "service credential and operation scope",
+      "in_openapi": true,
+      "path_prefixes": ["/internal/v1/"]
+    },
+    {
+      "name": "self-service-portal",
+      "source_role": "gateway",
+      "runtime_roles": ["gateway", "all"],
+      "exposure": "public-client",
+      "authentication": "none for shell; subsequent API calls require a client credential",
+      "in_openapi": true,
+      "exact_paths": ["/portal"]
+    },
+    {
+      "name": "self-service-api",
+      "source_role": "gateway",
+      "runtime_roles": ["gateway", "all"],
+      "exposure": "public-client",
+      "authentication": "client credential bound to stable key_id",
+      "in_openapi": true,
+      "path_prefixes": ["/self/v1/"]
+    },
+    {
+      "name": "compatible-model-api",
+      "source_role": "gateway",
+      "runtime_roles": ["gateway", "all"],
+      "exposure": "public-client",
+      "authentication": "client credential bound to stable key_id",
+      "in_openapi": true,
+      "path_prefixes": ["/v1/"]
+    }
+  ]
+}

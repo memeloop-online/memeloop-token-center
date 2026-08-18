@@ -1,0 +1,2 @@
+[env]
+JEMALLOC_SYS_WITH_MALLOC_CONF = { value = "abort_conf:true,background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0", force = true }

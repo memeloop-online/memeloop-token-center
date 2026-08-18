@@ -37,6 +37,7 @@ from typing import Any
 
 MIB = 1024 * 1024
 RESPONSE_LIMIT_BYTES = 64 * MIB
+MP4_PREFIX = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2"
 
 
 class HarnessFailure(RuntimeError):
@@ -50,7 +51,28 @@ class PrerequisiteFailure(RuntimeError):
 class MockState:
     def __init__(self) -> None:
         self.assets: dict[str, int] = {}
+        self.active_streams = 0
+        self.peak_streams = 0
         self.lock = threading.Lock()
+
+    def begin_stream(self) -> None:
+        with self.lock:
+            self.active_streams += 1
+            self.peak_streams = max(self.peak_streams, self.active_streams)
+
+    def end_stream(self) -> None:
+        with self.lock:
+            self.active_streams -= 1
+
+    def reset_stream_peak(self) -> None:
+        with self.lock:
+            if self.active_streams:
+                raise HarnessFailure("cannot reset mock concurrency while a stream is active")
+            self.peak_streams = 0
+
+    def observed_stream_peak(self) -> int:
+        with self.lock:
+            return self.peak_streams
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -76,24 +98,41 @@ class MockHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _stream_bytes(self, total: int, chunk_size: int, delay_ms: float) -> None:
-        self.send_response(200)
-        self.send_header("content-type", "application/octet-stream")
-        self.send_header("content-length", str(total))
-        self.end_headers()
-        block = b"x" * min(chunk_size, total)
-        remaining = total
+    def _stream_bytes(
+        self,
+        total: int,
+        chunk_size: int,
+        delay_ms: float,
+        content_type: str = "application/octet-stream",
+        prefix: bytes = b"",
+    ) -> None:
+        if len(prefix) > total:
+            raise ValueError("stream prefix exceeds the configured response size")
+        self.state.begin_stream()
         try:
-            while remaining:
-                take = min(len(block), remaining)
-                self.wfile.write(block[:take])
-                self.wfile.flush()
-                remaining -= take
-                if delay_ms:
-                    time.sleep(delay_ms / 1000.0)
-        except (BrokenPipeError, ConnectionResetError):
-            # Disconnect and response-cap tests intentionally close early.
-            return
+            self.send_response(200)
+            self.send_header("content-type", content_type)
+            self.send_header("content-length", str(total))
+            self.end_headers()
+            remaining = total
+            try:
+                if prefix:
+                    self.wfile.write(prefix)
+                    self.wfile.flush()
+                    remaining -= len(prefix)
+                block = b"x" * min(chunk_size, remaining)
+                while remaining:
+                    take = min(len(block), remaining)
+                    self.wfile.write(block[:take])
+                    self.wfile.flush()
+                    remaining -= take
+                    if delay_ms:
+                        time.sleep(delay_ms / 1000.0)
+            except (BrokenPipeError, ConnectionResetError):
+                # Disconnect and response-cap tests intentionally close early.
+                return
+        finally:
+            self.state.end_stream()
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         try:
@@ -171,7 +210,13 @@ class MockHandler(BaseHTTPRequestHandler):
                 return
             # A small delay ensures the sampler observes the transfer without
             # making the 500 MiB acceptance profile unnecessarily slow.
-            self._stream_bytes(asset_bytes, 256 * 1024, 0.25)
+            self._stream_bytes(
+                asset_bytes,
+                256 * 1024,
+                0.25,
+                content_type="video/mp4",
+                prefix=MP4_PREFIX,
+            )
             return
         self._send_json(404, {"error": "mock route not found"})
 
@@ -220,6 +265,8 @@ class Sampler:
         self.interval = interval
         self.samples: list[dict[str, Any]] = []
         self.stop_event = threading.Event()
+        self.first_sample = threading.Event()
+        self.failure: HarnessFailure | None = None
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
@@ -230,20 +277,49 @@ class Sampler:
                 for name, pid in self.pids.items():
                     sample[name] = process_memory(pid)
                 self.samples.append(sample)
-            except HarnessFailure:
+                self.first_sample.set()
+            except HarnessFailure as error:
+                self.failure = error
+                self.first_sample.set()
                 return
             self.stop_event.wait(self.interval)
 
     def __enter__(self) -> "Sampler":
         self.thread.start()
+        if not self.first_sample.wait(timeout=2):
+            self.stop_event.set()
+            self.thread.join(timeout=2)
+            raise HarnessFailure("memory sampler did not produce its first sample")
+        if self.failure is not None:
+            raise self.failure
         return self
 
-    def __exit__(self, *_args: object) -> None:
+    def __exit__(self, exception_type: object, *_args: object) -> None:
         self.stop_event.set()
         self.thread.join(timeout=2)
+        if exception_type is None and self.failure is not None:
+            raise self.failure
 
-    def max_rss(self, name: str) -> float:
-        return max((sample[name]["rss_mib"] for sample in self.samples), default=0.0)
+    def max_current_rss(self, name: str) -> float:
+        return max(
+            (sample[name]["rss_mib"] for sample in self.samples),
+            default=0.0,
+        )
+
+    def lifetime_high_water_evidence(self, name: str) -> dict[str, float]:
+        if not self.samples:
+            return {
+                "start_rss_mib": 0.0,
+                "end_rss_mib": 0.0,
+                "growth_mib": 0.0,
+            }
+        start = self.samples[0][name]["high_water_mib"]
+        end = self.samples[-1][name]["high_water_mib"]
+        return {
+            "start_rss_mib": round(start, 3),
+            "end_rss_mib": round(end, 3),
+            "growth_mib": round(max(0.0, end - start), 3),
+        }
 
 
 def memory_summary(pid: int, duration: float = 1.0) -> dict[str, float]:
@@ -254,11 +330,13 @@ def memory_summary(pid: int, duration: float = 1.0) -> dict[str, float]:
         time.sleep(0.1)
     rss = [sample["rss_mib"] for sample in samples]
     pss = [sample["pss_mib"] for sample in samples if sample["pss_mib"] > 0]
+    high_water = [sample["high_water_mib"] for sample in samples]
     return {
         "rss_mib_median": round(statistics.median(rss), 3),
         "rss_mib_p95": round(percentile(rss, 0.95), 3),
         "rss_mib_max": round(max(rss), 3),
         "pss_mib_median": round(statistics.median(pss), 3) if pss else 0.0,
+        "lifetime_high_water_rss_mib": round(max(high_water), 3),
     }
 
 
@@ -580,13 +658,22 @@ def oversize_chat(gateway_url: str, key: str, byte_count: int) -> tuple[int, int
     return status, received, error_name
 
 
-def wait_for_stream_errors(gateway_url: str, key: str, minimum: int, timeout: float = 20) -> int:
+def wait_for_request_errors(
+    gateway_url: str,
+    key: str,
+    error_code: str,
+    minimum: int,
+    timeout: float = 20,
+) -> int:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         values = api_json(
             gateway_url,
             "GET",
-            "/self/v1/requests?status=error&error_code=upstream_stream&limit=100",
+            "/self/v1/requests?"
+            + urllib.parse.urlencode(
+                {"status": "error", "error_code": error_code, "limit": 100}
+            ),
             key,
         )
         if isinstance(values, list) and len(values) >= minimum:
@@ -599,6 +686,14 @@ def archive_bytes(root: pathlib.Path) -> int:
     return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
 
 
+def archive_inventory(root: pathlib.Path) -> dict[str, int]:
+    return {
+        path.relative_to(root).as_posix(): path.stat().st_size
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
 def run_asset(
     gateway_url: str,
     key: str,
@@ -607,6 +702,7 @@ def run_asset(
     archive_root: pathlib.Path,
 ) -> dict[str, Any]:
     archive_before = archive_bytes(archive_root)
+    inventory_before = archive_inventory(archive_root)
     job = api_json(
         gateway_url,
         "POST",
@@ -637,6 +733,12 @@ def run_asset(
         raise HarnessFailure("large asset generation did not finish before timeout")
     expected_bytes = asset_mib * MIB
     archive_after = archive_bytes(archive_root)
+    inventory_after = archive_inventory(archive_root)
+    new_asset_objects = sorted(
+        path
+        for path, size in inventory_after.items()
+        if size == expected_bytes and inventory_before.get(path) != size
+    )
     return {
         "job_id": job_id,
         "status": final["status"],
@@ -646,9 +748,12 @@ def run_asset(
         "archive_bytes_before": archive_before,
         "archive_bytes_after": archive_after,
         "archive_growth_bytes": archive_after - archive_before,
+        "exact_size_asset_objects": new_asset_objects,
         "duration_seconds": round(time.monotonic() - started, 3),
-        "gateway_peak_rss_mib": round(sampler.max_rss("gateway"), 3),
-        "worker_peak_rss_mib": round(sampler.max_rss("worker"), 3),
+        "gateway_peak_rss_mib": round(sampler.max_current_rss("gateway"), 3),
+        "worker_peak_rss_mib": round(sampler.max_current_rss("worker"), 3),
+        "gateway_lifetime_high_water": sampler.lifetime_high_water_evidence("gateway"),
+        "worker_lifetime_high_water": sampler.lifetime_high_water_evidence("worker"),
         "sample_count": len(sampler.samples),
     }
 
@@ -698,12 +803,15 @@ def run_soak(
         "configured_seconds": seconds,
         "duration_seconds": round(elapsed, 3),
         "target_rps": target_rps,
+        "concurrency": concurrency,
         "successes": successes,
         "failures": failures,
         "achieved_rps": round(successes / elapsed, 3) if elapsed else 0.0,
         "latency_ms_p50": round(percentile(latencies_ms, 0.50), 3),
         "latency_ms_p95": round(percentile(latencies_ms, 0.95), 3),
-        "gateway_peak_rss_mib": round(sampler.max_rss("gateway"), 3),
+        "latency_ms_p99": round(percentile(latencies_ms, 0.99), 3),
+        "gateway_peak_rss_mib": round(sampler.max_current_rss("gateway"), 3),
+        "gateway_lifetime_high_water": sampler.lifetime_high_water_evidence("gateway"),
         "gateway_rss_slope_mib_per_minute": round(
             rss_slope_mib_per_minute(sampler.samples, "gateway"), 3
         ),
@@ -741,6 +849,50 @@ def file_sha256(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def write_json_report(output: pathlib.Path, report: dict[str, Any]) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+
+
+def failure_report(
+    args: argparse.Namespace,
+    exit_code: int,
+    error_kind: str,
+    error: BaseException,
+) -> dict[str, Any]:
+    repository = pathlib.Path(__file__).resolve().parents[2]
+    binary = (args.binary or repository / "target/release/memeloop-token-center").resolve()
+    report: dict[str, Any] = {
+        "schema_version": 2,
+        "benchmark": "memeloop-token-center-memory",
+        "profile": args.profile,
+        "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "git_revision": git_revision(repository),
+        "git_dirty": git_dirty(repository),
+        "binary": str(binary),
+        "passed": False,
+        "exit_code": exit_code,
+        "error_kind": error_kind,
+        "error": str(error)[:4000],
+    }
+    if binary.is_file():
+        with contextlib.suppress(OSError):
+            report["binary_sha256"] = file_sha256(binary)
+            report["binary_mtime"] = dt.datetime.fromtimestamp(
+                binary.stat().st_mtime, tz=dt.timezone.utc
+            ).isoformat()
+    return report
+
+
+def write_failure_report(args: argparse.Namespace, report: dict[str, Any]) -> None:
+    repository = pathlib.Path(__file__).resolve().parents[2]
+    output = (
+        args.output or repository / "tests/load/results/memory-latest.json"
+    ).resolve()
+    with contextlib.suppress(OSError):
+        write_json_report(output, report)
+
+
 def total_memory_mib() -> float | None:
     with contextlib.suppress(OSError, ValueError):
         with open("/proc/meminfo", encoding="utf-8") as source:
@@ -772,12 +924,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int)
     parser.add_argument("--stream-mib", type=int)
     parser.add_argument("--target-rps", type=float, default=20.0)
-    parser.add_argument("--idle-max-mib", type=float, default=256.0)
-    parser.add_argument("--stream-delta-max-mib", type=float, default=192.0)
+    parser.add_argument("--idle-max-mib", type=float, default=96.0)
+    parser.add_argument("--stream-delta-max-mib", type=float, default=128.0)
     parser.add_argument("--asset-gateway-delta-max-mib", type=float, default=96.0)
     parser.add_argument("--asset-worker-delta-max-mib", type=float, default=192.0)
-    parser.add_argument("--retained-delta-max-mib", type=float, default=96.0)
+    parser.add_argument("--retained-delta-max-mib", type=float, default=64.0)
     parser.add_argument("--soak-slope-max-mib-per-minute", type=float, default=2.0)
+    parser.add_argument("--gateway-limit-mib", type=float, default=256.0)
+    parser.add_argument("--gateway-headroom-mib", type=float, default=32.0)
     parser.add_argument("--comparison-rss-mib", type=float, default=1024.0)
     parser.add_argument("--comparison-max-ratio", type=float, default=0.25)
     return parser.parse_args()
@@ -818,9 +972,50 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         raise PrerequisiteFailure("asset-mib must be in the MM-05 acceptance range 100..500")
     if values["soak_seconds"] < 1:
         raise PrerequisiteFailure("soak-seconds must be positive")
+    if values["stream_mib"] < 1:
+        raise PrerequisiteFailure("stream-mib must be positive")
+    if args.profile == "acceptance" and (
+        values["asset_mib"] != 500
+        or values["soak_seconds"] < 900
+        or values["concurrency"] < 12
+        or values["stream_mib"] < 16
+    ):
+        raise PrerequisiteFailure(
+            "acceptance profile requires a 500 MiB asset, at least a 900 second soak, "
+            "at least 12 concurrent streams, and at least 16 MiB per stream"
+        )
+    numeric_limits = {
+        "target-rps": args.target_rps,
+        "idle-max-mib": args.idle_max_mib,
+        "stream-delta-max-mib": args.stream_delta_max_mib,
+        "asset-gateway-delta-max-mib": args.asset_gateway_delta_max_mib,
+        "asset-worker-delta-max-mib": args.asset_worker_delta_max_mib,
+        "retained-delta-max-mib": args.retained_delta_max_mib,
+        "soak-slope-max-mib-per-minute": args.soak_slope_max_mib_per_minute,
+        "gateway-limit-mib": args.gateway_limit_mib,
+        "gateway-headroom-mib": args.gateway_headroom_mib,
+        "comparison-rss-mib": args.comparison_rss_mib,
+        "comparison-max-ratio": args.comparison_max_ratio,
+    }
+    invalid_limits = [
+        name for name, value in numeric_limits.items() if not math.isfinite(value) or value <= 0
+    ]
+    if invalid_limits:
+        raise PrerequisiteFailure(
+            "numeric limits must be finite and positive: " + ", ".join(invalid_limits)
+        )
     if args.comparison_rss_mib <= 0 or not 0 < args.comparison_max_ratio <= 1:
         raise PrerequisiteFailure(
             "comparison-rss-mib must be positive and comparison-max-ratio must be in (0, 1]"
+        )
+    gateway_budget_mib = args.gateway_limit_mib - args.gateway_headroom_mib
+    if args.gateway_limit_mib <= 0 or not 0 < args.gateway_headroom_mib < args.gateway_limit_mib:
+        raise PrerequisiteFailure(
+            "gateway-limit-mib must be positive and gateway-headroom-mib must be in (0, limit)"
+        )
+    if args.idle_max_mib >= gateway_budget_mib:
+        raise PrerequisiteFailure(
+            "idle-max-mib must leave room below the gateway limit/headroom budget"
         )
     binary = (args.binary or repository / "target/release/memeloop-token-center").resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -829,6 +1024,10 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         )
     if not pathlib.Path("/proc/self/status").exists():
         raise PrerequisiteFailure("RSS acceptance requires Linux /proc")
+    binary_sha256 = file_sha256(binary)
+    binary_mtime = dt.datetime.fromtimestamp(
+        binary.stat().st_mtime, tz=dt.timezone.utc
+    ).isoformat()
 
     output = args.output or repository / "tests/load/results/memory-latest.json"
     output = output.resolve()
@@ -844,7 +1043,22 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         archive_root = temporary / "archive"
         archive_root.mkdir()
         database = temporary / "benchmark.db"
-        environment = os.environ.copy() | {
+        environment = {
+            name: os.environ[name]
+            for name in (
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "NO_COLOR",
+                "PATH",
+                "RUST_BACKTRACE",
+                "SSL_CERT_DIR",
+                "SSL_CERT_FILE",
+                "TMPDIR",
+                "TZ",
+            )
+            if name in os.environ
+        } | {
             "MTC_DATABASE_URL": f"sqlite://{database}?mode=rwc",
             "MTC_DATABASE_MAX_CONNECTIONS": "2",
             "MTC_KEY_PEPPER": "memory-benchmark-pepper-has-at-least-32-bytes",
@@ -888,59 +1102,91 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             stream_bytes = values["stream_mib"] * MIB
             stream_started = time.monotonic()
             stream_pids = {"gateway": processes["gateway"].pid}
+            state.reset_stream_peak()
+            stream_start_barrier = threading.Barrier(values["concurrency"])
+
+            def run_concurrent_stream(_index: int) -> int:
+                stream_start_barrier.wait(timeout=10)
+                return stream_chat(urls["gateway"], key, stream_bytes, delay_ms=5.0)
+
             with Sampler(stream_pids) as stream_sampler:
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=values["concurrency"]
                 ) as pool:
                     stream_results = list(
-                        pool.map(
-                            lambda _index: stream_chat(
-                                urls["gateway"], key, stream_bytes, delay_ms=0.25
-                            ),
-                            range(values["concurrency"]),
-                        )
+                        pool.map(run_concurrent_stream, range(values["concurrency"]))
                     )
-            stream_peak = stream_sampler.max_rss("gateway")
+            stream_peak = stream_sampler.max_current_rss("gateway")
             stream = {
                 "concurrency": values["concurrency"],
                 "bytes_per_response": stream_bytes,
                 "bytes_received": sum(stream_results),
+                "observed_peak_concurrency": state.observed_stream_peak(),
                 "duration_seconds": round(time.monotonic() - stream_started, 3),
                 "gateway_peak_rss_mib": round(stream_peak, 3),
                 "gateway_delta_rss_mib": round(stream_peak - idle_gateway, 3),
+                "gateway_lifetime_high_water": stream_sampler.lifetime_high_water_evidence(
+                    "gateway"
+                ),
                 "sample_count": len(stream_sampler.samples),
             }
 
             disconnect_attempts = max(2, min(4, values["concurrency"]))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=disconnect_attempts) as pool:
-                disconnected = list(
-                    pool.map(
-                        lambda _index: disconnect_chat(urls["gateway"], key, 16 * MIB),
-                        range(disconnect_attempts),
+            with Sampler({"gateway": processes["gateway"].pid}) as disconnect_sampler:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=disconnect_attempts
+                ) as pool:
+                    disconnected = list(
+                        pool.map(
+                            lambda _index: disconnect_chat(urls["gateway"], key, 16 * MIB),
+                            range(disconnect_attempts),
+                        )
                     )
+                disconnect_errors = wait_for_request_errors(
+                    urls["gateway"],
+                    key,
+                    "downstream_disconnected",
+                    disconnect_attempts,
+                    timeout=20,
                 )
-            disconnect_errors = wait_for_stream_errors(
-                urls["gateway"], key, disconnect_attempts, timeout=20
-            )
             disconnect = {
                 "attempts": disconnect_attempts,
                 "client_bytes_before_close": sum(disconnected),
-                "recorded_upstream_stream_errors": disconnect_errors,
+                "recorded_downstream_disconnected_errors": disconnect_errors,
+                "gateway_peak_rss_mib": round(
+                    disconnect_sampler.max_current_rss("gateway"), 3
+                ),
+                "gateway_lifetime_high_water": disconnect_sampler.lifetime_high_water_evidence(
+                    "gateway"
+                ),
+                "sample_count": len(disconnect_sampler.samples),
             }
 
-            oversize_status, oversize_received, oversize_error = oversize_chat(
-                urls["gateway"], key, RESPONSE_LIMIT_BYTES + MIB
-            )
-            total_stream_errors = wait_for_stream_errors(
-                urls["gateway"], key, disconnect_attempts + 1, timeout=20
-            )
+            with Sampler({"gateway": processes["gateway"].pid}) as response_limit_sampler:
+                oversize_status, oversize_received, oversize_error = oversize_chat(
+                    urls["gateway"], key, RESPONSE_LIMIT_BYTES + MIB
+                )
+                response_limit_errors = wait_for_request_errors(
+                    urls["gateway"],
+                    key,
+                    "upstream_response_too_large",
+                    1,
+                    timeout=20,
+                )
             response_limit = {
                 "upstream_bytes": RESPONSE_LIMIT_BYTES + MIB,
                 "configured_limit_bytes": RESPONSE_LIMIT_BYTES,
                 "http_status_before_stream_abort": oversize_status,
                 "client_bytes_received": oversize_received,
                 "client_error": oversize_error,
-                "recorded_upstream_stream_errors": total_stream_errors,
+                "recorded_upstream_response_too_large_errors": response_limit_errors,
+                "gateway_peak_rss_mib": round(
+                    response_limit_sampler.max_current_rss("gateway"), 3
+                ),
+                "gateway_lifetime_high_water": response_limit_sampler.lifetime_high_water_evidence(
+                    "gateway"
+                ),
+                "sample_count": len(response_limit_sampler.samples),
             }
 
             asset = run_asset(
@@ -986,6 +1232,27 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     idle_gateway <= args.idle_max_mib,
                 ),
                 check(
+                    "concurrent streams reached EOF",
+                    stream["bytes_received"],
+                    "==",
+                    values["concurrency"] * stream_bytes,
+                    stream["bytes_received"] == values["concurrency"] * stream_bytes,
+                ),
+                check(
+                    "mock observed configured stream concurrency",
+                    stream["observed_peak_concurrency"],
+                    ">=",
+                    values["concurrency"],
+                    stream["observed_peak_concurrency"] >= values["concurrency"],
+                ),
+                check(
+                    "concurrent stream memory samples",
+                    stream["sample_count"],
+                    ">=",
+                    2,
+                    stream["sample_count"] >= 2,
+                ),
+                check(
                     "concurrent stream RSS delta",
                     stream["gateway_delta_rss_mib"],
                     "<=",
@@ -993,19 +1260,20 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     stream["gateway_delta_rss_mib"] <= args.stream_delta_max_mib,
                 ),
                 check(
-                    "disconnects recorded as stream errors",
+                    "disconnects recorded as downstream disconnects",
                     disconnect_errors,
                     ">=",
                     disconnect_attempts,
                     disconnect_errors >= disconnect_attempts,
                 ),
                 check(
-                    "64 MiB response cap stopped the upstream body",
+                    "64 MiB response cap stopped and classified the upstream body",
                     oversize_received,
-                    "<=",
-                    RESPONSE_LIMIT_BYTES,
-                    oversize_received <= RESPONSE_LIMIT_BYTES
-                    and total_stream_errors >= disconnect_attempts + 1,
+                    "between",
+                    [RESPONSE_LIMIT_BYTES - MIB, RESPONSE_LIMIT_BYTES],
+                    oversize_status == 200
+                    and RESPONSE_LIMIT_BYTES - MIB <= oversize_received <= RESPONSE_LIMIT_BYTES
+                    and response_limit_errors >= 1,
                 ),
                 check(
                     "large asset job succeeded",
@@ -1016,10 +1284,17 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 ),
                 check(
                     "large asset fully archived",
-                    asset["archive_growth_bytes"],
+                    len(asset["exact_size_asset_objects"]),
                     ">=",
-                    asset["expected_asset_bytes"],
-                    asset["archive_growth_bytes"] >= asset["expected_asset_bytes"],
+                    1,
+                    len(asset["exact_size_asset_objects"]) >= 1,
+                ),
+                check(
+                    "large asset memory samples",
+                    asset["sample_count"],
+                    ">=",
+                    2,
+                    asset["sample_count"] >= 2,
                 ),
                 check(
                     "large asset gateway RSS delta",
@@ -1043,6 +1318,13 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     soak["failures"] == 0,
                 ),
                 check(
+                    "soak memory samples",
+                    soak["sample_count"],
+                    ">=",
+                    2,
+                    soak["sample_count"] >= 2,
+                ),
+                check(
                     "post-soak retained RSS delta",
                     soak["retained_delta_from_idle_mib"],
                     "<=",
@@ -1064,15 +1346,14 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     )
                 )
 
-            observed_gateway_peak = max(
-                stream["gateway_peak_rss_mib"],
-                asset["gateway_peak_rss_mib"],
-                soak["gateway_peak_rss_mib"],
-            )
+            observed_gateway_peak = process_memory(processes["gateway"].pid)[
+                "high_water_mib"
+            ]
             comparison = {
                 "reference": "user-observed CPA process",
                 "reference_rss_mib": args.comparison_rss_mib,
                 "gateway_peak_rss_mib": observed_gateway_peak,
+                "measurement": "process lifetime VmHWM",
                 "gateway_to_reference_ratio": round(
                     observed_gateway_peak / args.comparison_rss_mib, 4
                 ),
@@ -1086,9 +1367,40 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     comparison["gateway_to_reference_ratio"] <= args.comparison_max_ratio,
                 )
             )
+            roles_alive = {
+                role: process.poll() is None for role, process in processes.items()
+            }
+            checks.append(
+                check(
+                    "control, gateway, and worker remained alive",
+                    roles_alive,
+                    "==",
+                    {"control": True, "gateway": True, "worker": True},
+                    all(roles_alive.values()),
+                )
+            )
+            binary_sha256_after = file_sha256(binary)
+            checks.append(
+                check(
+                    "release binary unchanged during the run",
+                    binary_sha256_after,
+                    "==",
+                    binary_sha256,
+                    binary_sha256_after == binary_sha256,
+                )
+            )
+            checks.append(
+                check(
+                    "gateway process RSS budget under the 256 MiB deployment limit",
+                    observed_gateway_peak,
+                    "<=",
+                    gateway_budget_mib,
+                    observed_gateway_peak <= gateway_budget_mib,
+                )
+            )
 
             report = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "benchmark": "memeloop-token-center-memory",
                 "profile": args.profile,
                 "started_at": started_at.isoformat(),
@@ -1096,10 +1408,9 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 "git_revision": git_revision(repository),
                 "git_dirty": git_dirty(repository),
                 "binary": str(binary),
-                "binary_sha256": file_sha256(binary),
-                "binary_mtime": dt.datetime.fromtimestamp(
-                    binary.stat().st_mtime, tz=dt.timezone.utc
-                ).isoformat(),
+                "binary_sha256": binary_sha256,
+                "binary_sha256_after": binary_sha256_after,
+                "binary_mtime": binary_mtime,
                 "system": {
                     "kernel": platform.release(),
                     "architecture": platform.machine(),
@@ -1110,6 +1421,16 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 },
                 "runtime_topology": "control/gateway/worker split; SQLite; filesystem archive",
                 "configuration": values | {"target_rps": args.target_rps},
+                "resource_budget": {
+                    "gateway_limit_mib": args.gateway_limit_mib,
+                    "required_gateway_headroom_mib": args.gateway_headroom_mib,
+                    "maximum_observed_gateway_rss_mib": gateway_budget_mib,
+                    "measured_quantity": "gateway process RSS",
+                    "observed_gateway_lifetime_high_water_rss_mib": round(
+                        observed_gateway_peak, 3
+                    ),
+                    "reserved_for": "container and cgroup-charged overhead outside process RSS",
+                },
                 "idle": idle,
                 "stream": stream,
                 "disconnect": disconnect,
@@ -1121,7 +1442,7 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 "passed": all(item["passed"] for item in checks),
             }
             report["exit_code"] = 0 if report["passed"] else 2
-            output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+            write_json_report(output, report)
             return int(report["exit_code"]), report
         finally:
             for process in processes.values():
@@ -1138,20 +1459,19 @@ def main() -> int:
         print(json.dumps({"passed": report["passed"], "checks": report["checks"]}, indent=2))
         return code
     except PrerequisiteFailure as error:
-        print(
-            json.dumps(
-                {"passed": False, "exit_code": 3, "error_kind": "prerequisite", "error": str(error)}
-            ),
-            file=sys.stderr,
-        )
+        report = failure_report(args, 3, "prerequisite", error)
+        write_failure_report(args, report)
+        print(json.dumps(report), file=sys.stderr)
         return 3
     except (HarnessFailure, OSError, subprocess.SubprocessError) as error:
-        print(
-            json.dumps(
-                {"passed": False, "exit_code": 4, "error_kind": "functional", "error": str(error)}
-            ),
-            file=sys.stderr,
-        )
+        report = failure_report(args, 4, "functional", error)
+        write_failure_report(args, report)
+        print(json.dumps(report), file=sys.stderr)
+        return 4
+    except Exception as error:  # Keep an artifact for harness defects as well.
+        report = failure_report(args, 4, "harness", error)
+        write_failure_report(args, report)
+        print(json.dumps(report), file=sys.stderr)
         return 4
 
 

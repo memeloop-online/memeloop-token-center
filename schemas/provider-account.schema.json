@@ -36,6 +36,26 @@
     "credential": {
       "oneOf": [
         {
+          "title": "No credential",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "none" }
+          }
+        },
+        {
+          "title": "Subscription bridge",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "handle"],
+          "properties": {
+            "type": { "const": "subscription_bridge" },
+            "handle": { "type": "string", "pattern": "^[A-Za-z0-9]{1,80}$", "writeOnly": true },
+            "secret": { "type": "string", "minLength": 1, "writeOnly": true }
+          }
+        },
+        {
           "title": "API key",
           "type": "object",
           "additionalProperties": false,
@@ -61,7 +81,11 @@
               "description": "Unix milliseconds"
             },
             "header": { "type": "string", "default": "authorization" },
-            "prefix": { "type": "string", "default": "Bearer " }
+            "prefix": { "type": "string", "default": "Bearer " },
+            "adapter_state": {
+              "description": "Opaque encrypted state for a server-installed managed OAuth adapter.",
+              "writeOnly": true
+            }
           }
         }
       ]

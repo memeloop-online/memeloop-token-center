@@ -2,15 +2,21 @@
 ARG RUNTIME_IMAGE=debian:bookworm-slim
 
 FROM ${RUNTIME_IMAGE}
+USER root
 ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian
 ENV DEBIAN_FRONTEND=noninteractive
 RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
       -o Dpkg::Options::="--force-confnew" \
-      ca-certificates postgresql-client sqlite3 \
+      ca-certificates postgresql-client python3 python3-yaml sqlite3 \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --create-home importer
-COPY --chmod=0555 ops/migrate-cpamp.sh /usr/local/bin/migrate-cpamp
+    && (getent passwd 10001 >/dev/null || useradd --system --uid 10001 --create-home importer)
+COPY ops/migrate-cpamp.sh /usr/local/bin/migrate-cpamp
+COPY ops/legacy-credentials/attach-legacy-cpa-credentials.py /usr/local/bin/attach-legacy-cpa-credentials
+COPY ops/cpa-upstreams/import-cpa-upstreams.py /usr/local/bin/import-cpa-upstreams
+RUN chmod 0555 /usr/local/bin/migrate-cpamp \
+    /usr/local/bin/attach-legacy-cpa-credentials \
+    /usr/local/bin/import-cpa-upstreams
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/migrate-cpamp"]

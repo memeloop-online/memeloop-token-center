@@ -1,4 +1,66 @@
 use super::*;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
+
+async fn unauthenticated_declared_oversized_status(service_url: &str, path: &str) -> StatusCode {
+    let url = url::Url::parse(service_url).expect("parse test service URL");
+    let host = url.host_str().expect("test service host");
+    let port = url.port_or_known_default().expect("test service port");
+    let authority = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(&authority)
+        .await
+        .expect("connect oversized authentication probe");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        5 * 1024 * 1024
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write oversized authentication probe headers");
+    stream
+        .flush()
+        .await
+        .expect("flush oversized authentication probe headers");
+
+    // Do not send the declared body. A prompt response proves authentication
+    // runs before either body parsing or the body-size guard. It also avoids a
+    // client-side BrokenPipe race when the server correctly rejects the request
+    // while a high-level HTTP client is still uploading several MiB.
+    const MAX_STATUS_LINE_BYTES: usize = 1024;
+    let response_line = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut response_line = Vec::with_capacity(MAX_STATUS_LINE_BYTES);
+        let mut chunk = [0_u8; 128];
+        loop {
+            assert!(
+                response_line.len() < MAX_STATUS_LINE_BYTES,
+                "authentication response status line exceeded {MAX_STATUS_LINE_BYTES} bytes"
+            );
+            let read_limit = chunk.len().min(MAX_STATUS_LINE_BYTES - response_line.len());
+            let received = stream
+                .read(&mut chunk[..read_limit])
+                .await
+                .expect("read oversized authentication response");
+            assert!(received > 0, "server closed before an HTTP status line");
+            response_line.extend_from_slice(&chunk[..received]);
+            if let Some(line_end) = response_line.windows(2).position(|bytes| bytes == b"\r\n") {
+                response_line.truncate(line_end);
+                return response_line;
+            }
+        }
+    })
+    .await
+    .expect("unauthenticated response arrived before the declared body");
+    std::str::from_utf8(&response_line)
+        .expect("authentication response head is ASCII")
+        .split_ascii_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .and_then(|value| StatusCode::from_u16(value).ok())
+        .expect("parse authentication response status")
+}
 
 async fn issue_service_token(world: &TokenCenterWorld, name: &str, scopes: &[&str]) -> String {
     let response = world
@@ -571,15 +633,9 @@ async fn authentication_precedes_body_parsing(world: &mut TokenCenterWorld) {
             .await
             .expect("malformed unauthenticated request");
         assert_eq!(malformed.status(), StatusCode::UNAUTHORIZED, "path={path}");
-        let oversized = world
-            .client
-            .post(format!("{}{path}", world.service_url))
-            .header("content-type", "application/json")
-            .body(vec![b'x'; 5 * 1024 * 1024])
-            .send()
-            .await
-            .expect("oversized unauthenticated request");
-        assert_eq!(oversized.status(), StatusCode::UNAUTHORIZED, "path={path}");
+        let oversized_status =
+            unauthenticated_declared_oversized_status(&world.service_url, path).await;
+        assert_eq!(oversized_status, StatusCode::UNAUTHORIZED, "path={path}");
     }
 }
 

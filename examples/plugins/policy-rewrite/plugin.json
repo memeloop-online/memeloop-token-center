@@ -1,7 +1,7 @@
 {
   "id": "example-policy-rewrite",
   "version": "1.0.0",
-  "wit_version": "0.1.0",
+  "wit_version": "0.2.0",
   "wasm": "plugin.wasm",
   "capabilities": [],
   "contributions": {
@@ -58,9 +58,15 @@
           ]
         },
         "oauth_adapter": {
+          "api_version": "oauth-adapter-v1",
+          "flow_kind": "cursor_pkce",
           "login_url": "https://oauth.example.com/device/login",
           "poll_url": "https://oauth.example.com/device/poll",
           "refresh_url": "https://oauth.example.com/token/refresh"
+        },
+        "component_adapter": {
+          "api_version": "buffered-v1",
+          "max_response_bytes": 1048576
         }
       }
     ]

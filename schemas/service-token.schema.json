@@ -27,6 +27,7 @@
           "providers:write",
           "plugins:read",
           "oauth:write",
+          "imports:cpa:write",
           "routes:write",
           "routes:read",
           "prices:write",

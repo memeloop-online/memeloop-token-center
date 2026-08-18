@@ -1,29 +1,270 @@
-use std::path::Path;
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use sqlx::{
+    Connection, Row,
+    sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqliteSynchronous},
+};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
+use uuid::Uuid;
 
 use crate::{
     archive::ArchiveStore,
     conversation::ConversationHints,
-    db::{Database, SessionArchiveCommitInput, SessionArchiveMatchInput, SessionArchiveTarget},
+    db::{
+        Database, SessionArchiveCommitInput, SessionArchiveCorrelation, SessionArchiveMatchInput,
+        SessionArchiveTarget, SessionArchiveUnlinkedCommitInput, SessionArchiveUnlinkedMetadata,
+        SessionArchiveUnlinkedTarget,
+    },
     error::AppError,
+    model::{AuthenticatedKey, KeyPolicy},
 };
+
+const IMPORT_PLAN_VERSION: i64 = 3;
+const MAX_PLAN_RECORD_BYTES: usize = 512 * 1024;
+const PLAN_SIZE_CHECK_INTERVAL: u64 = 32;
 
 #[derive(Clone, Debug)]
 pub struct SessionArchiveImportOptions<'a> {
     pub input: &'a Path,
+    pub plan_directory: &'a Path,
     pub tenant_external_id: &'a str,
     pub cpamp_source: &'a str,
     pub archive_source: &'a str,
     pub overlap_ms: i64,
     pub time_tolerance_ms: i64,
     pub max_line_bytes: usize,
+    pub max_plan_bytes: u64,
     pub allow_unmapped: bool,
     pub apply: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportPlanHeader {
+    version: i64,
+    tenant_external_id: String,
+    cpamp_source: String,
+    archive_source: String,
+    source_size_bytes: u64,
+    source_blake3: String,
+    record_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportPlanKey {
+    key_id: Uuid,
+    tenant_id: Uuid,
+    principal_id: Uuid,
+    account_id: Uuid,
+    alias: String,
+    currency: String,
+    credential_generation: i64,
+    policy: KeyPolicy,
+}
+
+impl From<&AuthenticatedKey> for ImportPlanKey {
+    fn from(key: &AuthenticatedKey) -> Self {
+        Self {
+            key_id: key.key_id,
+            tenant_id: key.tenant_id,
+            principal_id: key.principal_id,
+            account_id: key.account_id,
+            alias: key.alias.clone(),
+            currency: key.currency.clone(),
+            credential_generation: key.credential_generation,
+            policy: key.policy.clone(),
+        }
+    }
+}
+
+impl From<ImportPlanKey> for AuthenticatedKey {
+    fn from(key: ImportPlanKey) -> Self {
+        Self {
+            key_id: key.key_id,
+            tenant_id: key.tenant_id,
+            principal_id: key.principal_id,
+            account_id: key.account_id,
+            alias: key.alias,
+            currency: key.currency,
+            credential_generation: key.credential_generation,
+            policy: key.policy,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportPlanTarget {
+    tenant_id: Uuid,
+    target_request_id: Uuid,
+    request_created_at: i64,
+    key: ImportPlanKey,
+    external_event_hash: String,
+    source_created_at: i64,
+    source_model: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportPlanUnlinkedTarget {
+    tenant_id: Uuid,
+    archive_request_id: Uuid,
+    key: ImportPlanKey,
+    identity_proof_kind: String,
+    identity_proof_digest: String,
+    correlation_proof_digest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
+enum ImportPlanCorrelation {
+    Exact {
+        target: ImportPlanTarget,
+        identity_proof_kind: String,
+        identity_proof_digest: String,
+        correlation_proof_digest: String,
+    },
+    Unlinked {
+        target: ImportPlanUnlinkedTarget,
+    },
+}
+
+impl From<&SessionArchiveCorrelation> for ImportPlanCorrelation {
+    fn from(correlation: &SessionArchiveCorrelation) -> Self {
+        match correlation {
+            SessionArchiveCorrelation::Exact {
+                target,
+                identity_proof_kind,
+                identity_proof_digest,
+                correlation_proof_digest,
+            } => Self::Exact {
+                target: ImportPlanTarget::from(target),
+                identity_proof_kind: identity_proof_kind.clone(),
+                identity_proof_digest: identity_proof_digest.clone(),
+                correlation_proof_digest: correlation_proof_digest.clone(),
+            },
+            SessionArchiveCorrelation::Unlinked(target) => Self::Unlinked {
+                target: ImportPlanUnlinkedTarget {
+                    tenant_id: target.tenant_id,
+                    archive_request_id: target.archive_request_id,
+                    key: ImportPlanKey::from(&target.key),
+                    identity_proof_kind: target.identity_proof_kind.clone(),
+                    identity_proof_digest: target.identity_proof_digest.clone(),
+                    correlation_proof_digest: target.correlation_proof_digest.clone(),
+                },
+            },
+        }
+    }
+}
+
+impl From<&SessionArchiveTarget> for ImportPlanTarget {
+    fn from(target: &SessionArchiveTarget) -> Self {
+        Self {
+            tenant_id: target.tenant_id,
+            target_request_id: target.target_request_id,
+            request_created_at: target.request_created_at,
+            key: ImportPlanKey::from(&target.key),
+            external_event_hash: target.external_event_hash.clone(),
+            source_created_at: target.source_created_at,
+            source_model: target.source_model.clone(),
+        }
+    }
+}
+
+impl From<ImportPlanTarget> for SessionArchiveTarget {
+    fn from(target: ImportPlanTarget) -> Self {
+        Self {
+            tenant_id: target.tenant_id,
+            target_request_id: target.target_request_id,
+            request_created_at: target.request_created_at,
+            key: target.key.into(),
+            external_event_hash: target.external_event_hash,
+            source_created_at: target.source_created_at,
+            source_model: target.source_model,
+            replay: false,
+        }
+    }
+}
+
+impl From<ImportPlanUnlinkedTarget> for SessionArchiveUnlinkedTarget {
+    fn from(target: ImportPlanUnlinkedTarget) -> Self {
+        Self {
+            tenant_id: target.tenant_id,
+            archive_request_id: target.archive_request_id,
+            key: target.key.into(),
+            identity_proof_kind: target.identity_proof_kind,
+            identity_proof_digest: target.identity_proof_digest,
+            correlation_proof_digest: target.correlation_proof_digest,
+            replay: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportPlanRecord {
+    version: i64,
+    external_request_id: String,
+    correlation: ImportPlanCorrelation,
+    record_digest: String,
+    request_digest: Option<String>,
+    response_digest: Option<String>,
+    request_object: Option<String>,
+    response_object: Option<String>,
+    request_is_structured: bool,
+    conversation_hints: ConversationHints,
+    client_name: Option<String>,
+    source_started_at: i64,
+    source_completed_at: Option<i64>,
+    source_checkpoint_ms: i64,
+    protocol: String,
+    model: String,
+    status_code: Option<i64>,
+    duration_ms: Option<i64>,
+    input_tokens: i64,
+    output_tokens: i64,
+    error_code: Option<String>,
+}
+
+struct PlanPathGuard {
+    path: PathBuf,
+}
+
+impl Drop for PlanPathGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = self.path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(sidecar));
+        }
+    }
+}
+
+struct SealedImportPlan {
+    path: PlanPathGuard,
+    identity: InputIdentity,
+    size: u64,
+    digest: blake3::Hash,
+    record_count: u64,
+}
+
+struct ValidatedImportPlan {
+    connection: SqliteConnection,
+    record_count: u64,
+    _path: PlanPathGuard,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -35,6 +276,12 @@ pub struct SessionArchiveImportStats {
     pub unmapped: u64,
     pub replayed: u64,
     pub imported: u64,
+    pub input_device: u64,
+    pub input_inode: u64,
+    pub input_size_bytes: u64,
+    pub input_mtime_seconds: i64,
+    pub input_mtime_nanoseconds: i64,
+    pub input_blake3: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -58,6 +305,11 @@ struct ArchiveRecord {
     outcome: String,
     #[serde(default)]
     status_code: i64,
+    // Older importer releases ignored this top-level display hint when deriving
+    // the canonical record digest. Read it for archive-only metadata, but keep
+    // the digest stable so an unchanged historical record remains replayable.
+    #[serde(default, skip_serializing)]
+    request_path: String,
     #[serde(default)]
     metadata: serde_json::Map<String, Value>,
     #[serde(default)]
@@ -66,6 +318,138 @@ struct ArchiveRecord {
     request: Value,
     #[serde(default)]
     response: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InputIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+}
+
+impl InputIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(not(unix))]
+            device: 0,
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(not(unix))]
+            inode: 0,
+            size: metadata.len(),
+            #[cfg(unix)]
+            mtime_seconds: metadata.mtime(),
+            #[cfg(not(unix))]
+            mtime_seconds: metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|value| i64::try_from(value.as_secs()).ok())
+                .unwrap_or_default(),
+            #[cfg(unix)]
+            mtime_nanoseconds: metadata.mtime_nsec(),
+            #[cfg(not(unix))]
+            mtime_nanoseconds: metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| i64::from(value.subsec_nanos()))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+struct SealedInput {
+    identity: InputIdentity,
+    digest: blake3::Hash,
+}
+
+struct ReadOnlyInput {
+    path: PathBuf,
+    identity: InputIdentity,
+    reader: BufReader<tokio::fs::File>,
+}
+
+impl ReadOnlyInput {
+    async fn open(path: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let file = tokio::fs::OpenOptions::new().read(true).open(path).await?;
+        let descriptor_metadata = file.metadata().await?;
+        if !descriptor_metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "archive input must be a regular file",
+            )
+            .into());
+        }
+        let identity = InputIdentity::from_metadata(&descriptor_metadata);
+        let path_identity = InputIdentity::from_metadata(&tokio::fs::metadata(path).await?);
+        if identity != path_identity {
+            return Err(input_changed_error().into());
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            identity,
+            reader: BufReader::new(file),
+        })
+    }
+
+    async fn rewind(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.verify_identity().await?;
+        self.reader.seek(io::SeekFrom::Start(0)).await?;
+        Ok(())
+    }
+
+    async fn seal(
+        &self,
+        digest: blake3::Hash,
+    ) -> Result<SealedInput, Box<dyn std::error::Error + Send + Sync>> {
+        self.verify_identity().await?;
+        Ok(SealedInput {
+            identity: self.identity.clone(),
+            digest,
+        })
+    }
+
+    async fn verify_seal(
+        &self,
+        seal: &SealedInput,
+        digest: blake3::Hash,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.verify_identity().await?;
+        if self.identity != seal.identity || digest != seal.digest {
+            return Err(input_changed_error().into());
+        }
+        Ok(())
+    }
+
+    async fn verify_identity(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let descriptor = InputIdentity::from_metadata(&self.reader.get_ref().metadata().await?);
+        let path = InputIdentity::from_metadata(&tokio::fs::metadata(&self.path).await?);
+        if descriptor != self.identity || path != self.identity {
+            return Err(input_changed_error().into());
+        }
+        Ok(())
+    }
+}
+
+fn input_changed_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "archive input changed after preflight; no apply is permitted",
+    )
+}
+
+fn record_input_seal(stats: &mut SessionArchiveImportStats, seal: &SealedInput) {
+    stats.input_device = seal.identity.device;
+    stats.input_inode = seal.identity.inode;
+    stats.input_size_bytes = seal.identity.size;
+    stats.input_mtime_seconds = seal.identity.mtime_seconds;
+    stats.input_mtime_nanoseconds = seal.identity.mtime_nanoseconds;
+    stats.input_blake3 = seal.digest.to_hex().to_string();
 }
 
 pub async fn import_session_archive(
@@ -79,6 +463,32 @@ pub async fn import_session_archive(
     if options.max_line_bytes < 1024 || options.max_line_bytes > 256 * 1024 * 1024 {
         return Err("max line bytes must be between 1 KiB and 256 MiB".into());
     }
+    if options.max_plan_bytes < 1024 * 1024 || options.max_plan_bytes > 16 * 1024 * 1024 * 1024 {
+        return Err("max plan bytes must be between 1 MiB and 16 GiB".into());
+    }
+    if options.apply && options.allow_unmapped {
+        return Err("allow-unmapped is diagnostic-only and cannot be combined with apply".into());
+    }
+    if options.apply {
+        validate_plan_directory(options.plan_directory).await?;
+    }
+    let import_lock = db
+        .acquire_session_archive_import_lock(options.tenant_external_id, options.archive_source)
+        .await?;
+    let result = import_session_archive_locked(db, archive, options).await;
+    let release = import_lock.release().await;
+    match (result, release) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(stats), Ok(())) => Ok(stats),
+    }
+}
+
+async fn import_session_archive_locked(
+    db: &Database,
+    archive: &ArchiveStore,
+    options: &SessionArchiveImportOptions<'_>,
+) -> Result<SessionArchiveImportStats, Box<dyn std::error::Error + Send + Sync>> {
     let lower_bound = db
         .session_archive_lower_bound(
             options.tenant_external_id,
@@ -90,32 +500,10 @@ pub async fn import_session_archive(
     // Pass one never writes. A missing/ambiguous CPAMP identity or a protected
     // request/response locator therefore stops the entire batch before any target
     // object or relational row can be changed.
-    let mut stats = SessionArchiveImportStats::default();
-    let mut reader = open_reader(options.input).await?;
-    while let Some(line) = read_bounded_line(&mut reader, options.max_line_bytes).await? {
-        let Some((record, digest)) = parse_record(&line)? else {
-            continue;
-        };
-        stats.scanned += 1;
-        let started_at = record.started_at.timestamp_millis();
-        if started_at < lower_bound {
-            stats.before_overlap += 1;
-            continue;
-        }
-        stats.eligible += 1;
-        match match_record(db, options, &record, &digest).await {
-            Ok(target) => {
-                preflight_gap_compatibility(db, options, &record, &target).await?;
-                stats.mapped += 1;
-                stats.replayed += u64::from(target.replay);
-            }
-            Err(AppError::BadRequest(_)) if options.allow_unmapped => stats.unmapped += 1,
-            Err(AppError::BadRequest(_)) => {
-                stats.unmapped += 1;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
+    let mut input = ReadOnlyInput::open(options.input).await?;
+    let (mut stats, first_digest) = preflight_pass(db, options, lower_bound, &mut input).await?;
+    let seal = input.seal(first_digest).await?;
+    record_input_seal(&mut stats, &seal);
     if stats.unmapped > 0 && !options.allow_unmapped {
         return Err(format!(
             "archive import stopped before writes: {} of {} eligible records were unmapped, ambiguous, or inconsistent",
@@ -127,29 +515,96 @@ pub async fn import_session_archive(
         return Ok(stats);
     }
 
-    let mut reader = open_reader(options.input).await?;
-    while let Some(line) = read_bounded_line(&mut reader, options.max_line_bytes).await? {
+    // Re-read and re-match the complete source while writing only content-addressed
+    // objects and a local bounded plan. No target database write is permitted until
+    // the source reaches EOF with its original seal and the plan itself is sealed,
+    // reopened read-only and completely validated.
+    input.rewind().await?;
+    let (second_stats, sealed_plan) =
+        build_import_plan(db, archive, options, lower_bound, &mut input, &seal).await?;
+    if second_stats.unmapped > 0 {
+        return Err(format!(
+            "archive import stopped before writes: {} of {} eligible records were unmapped, ambiguous, or inconsistent",
+            second_stats.unmapped, second_stats.eligible
+        )
+        .into());
+    }
+    stats = second_stats;
+    record_input_seal(&mut stats, &seal);
+    let mut plan = open_validated_plan(
+        sealed_plan.ok_or("archive import plan was not created")?,
+        options,
+        &seal,
+    )
+    .await?;
+    stats.imported = apply_validated_plan(db, archive, options, &mut plan).await?;
+    // The explicit read transaction is the immutable SQLite snapshot used by
+    // apply. It never contains writes and is discarded after the final row.
+    sqlx::query("ROLLBACK")
+        .execute(&mut plan.connection)
+        .await?;
+    plan.connection.close().await?;
+    Ok(stats)
+}
+
+async fn validate_plan_directory(
+    directory: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let metadata = tokio::fs::symlink_metadata(directory).await?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("session archive plan directory must be a real directory".into());
+    }
+    Ok(())
+}
+
+async fn build_import_plan(
+    db: &Database,
+    archive: &ArchiveStore,
+    options: &SessionArchiveImportOptions<'_>,
+    lower_bound: i64,
+    input: &mut ReadOnlyInput,
+    source_seal: &SealedInput,
+) -> Result<
+    (SessionArchiveImportStats, Option<SealedImportPlan>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let (guard, mut connection) = create_import_plan(options.plan_directory).await?;
+    create_import_plan_schema(&mut connection).await?;
+    let mut transaction = connection.begin().await?;
+    let mut stats = SessionArchiveImportStats::default();
+    let mut source_hasher = blake3::Hasher::new();
+    let mut record_count = 0_u64;
+    let mut serialized_bytes = 0_u64;
+
+    while let Some(line) = read_bounded_line(&mut input.reader, options.max_line_bytes).await? {
+        source_hasher.update(&line);
         let Some((record, record_digest)) = parse_record(&line)? else {
             continue;
         };
-        if record.started_at.timestamp_millis() < lower_bound {
+        stats.scanned += 1;
+        if !archive_record_inside_overlap(&record, lower_bound) {
+            stats.before_overlap += 1;
             continue;
         }
-        let target = match match_record(db, options, &record, &record_digest).await {
-            Ok(target) => target,
-            Err(AppError::BadRequest(_)) if options.allow_unmapped => continue,
+        stats.eligible += 1;
+        let correlation = match match_record(db, options, &record, &record_digest).await {
+            Ok(correlation) => correlation,
+            Err(AppError::BadRequest(_)) => {
+                stats.unmapped += 1;
+                continue;
+            }
             Err(error) => return Err(error.into()),
         };
-        if target.replay {
-            continue;
-        }
+        preflight_gap_compatibility(db, options, &record, &correlation).await?;
+        stats.mapped += 1;
+        stats.replayed += u64::from(correlation.replay());
 
         let request = payload_bytes(&record.request)?;
         let response = payload_bytes(&record.response)?;
         let request_digest = request.as_ref().map(|body| digest(body));
         let response_digest = response.as_ref().map(|body| digest(body));
-        // CAS writes precede the transaction. A crash can leave only unreferenced,
-        // content-addressed objects; replay writes the same names and is harmless.
+        // These are the only durable writes allowed before both seals validate.
+        // Content addressing makes an orphan harmless if planning later fails.
         let request_object = match request.as_ref() {
             Some(body) => Some(archive.put_content(Bytes::copy_from_slice(body)).await?),
             None => None,
@@ -158,29 +613,572 @@ pub async fn import_session_archive(
             Some(body) => Some(archive.put_content(Bytes::copy_from_slice(body)).await?),
             None => None,
         };
-        let hints = conversation_hints(&record);
-        let client = first_facet(&record, "client").or_else(|| metadata_string(&record, "client"));
-        let request_json = structured_request(&record.request);
-        let imported = db
-            .commit_session_archive_request(SessionArchiveCommitInput {
-                tenant_external_id: options.tenant_external_id,
-                archive_source: options.archive_source,
-                external_request_id: &record.request_id,
-                target: &target,
-                record_digest: &record_digest,
-                request_digest: request_digest.as_deref(),
-                response_digest: response_digest.as_deref(),
-                request_object: request_object.as_deref(),
-                response_object: response_object.as_deref(),
-                request_json,
-                conversation_hints: &hints,
-                client_name: client,
-                source_started_at: record.started_at.timestamp_millis(),
-            })
-            .await?;
-        stats.imported += u64::from(imported);
+        let source_started_at = record.started_at.timestamp_millis();
+        let completed_at = record.completed_at.timestamp_millis();
+        let source_completed_at = Some(completed_at);
+        let duration_ms = Some(completed_at - source_started_at);
+        let (input_tokens, output_tokens) = archive_usage(&record);
+        let plan_record = ImportPlanRecord {
+            version: IMPORT_PLAN_VERSION,
+            external_request_id: record.request_id.clone(),
+            correlation: ImportPlanCorrelation::from(&correlation),
+            record_digest,
+            request_digest,
+            response_digest,
+            request_object,
+            response_object,
+            request_is_structured: structured_request(&record.request).is_some(),
+            conversation_hints: conversation_hints(&record),
+            client_name: first_facet(&record, "client")
+                .or_else(|| metadata_string(&record, "client"))
+                .map(str::to_owned),
+            source_started_at,
+            source_completed_at,
+            source_checkpoint_ms: completed_at,
+            protocol: archive_protocol(&record),
+            model: nonempty(&record.requested_model)
+                .or_else(|| nonempty(&record.model))
+                .unwrap_or("unknown")
+                .to_owned(),
+            status_code: (record.status_code > 0).then_some(record.status_code),
+            duration_ms,
+            input_tokens,
+            output_tokens,
+            error_code: archive_error_code(&record),
+        };
+        validate_plan_record(&plan_record)?;
+        let encoded = serde_json::to_vec(&plan_record)?;
+        if encoded.len() > MAX_PLAN_RECORD_BYTES {
+            return Err("session archive import plan record exceeds 512 KiB".into());
+        }
+        serialized_bytes = serialized_bytes.saturating_add(encoded.len() as u64);
+        if serialized_bytes > options.max_plan_bytes {
+            return Err("session archive import plan exceeds its configured size limit".into());
+        }
+        record_count += 1;
+        sqlx::query(
+            "INSERT INTO import_plan_records (sequence, source_started_at, source_checkpoint_ms, external_request_id, record_json) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(i64::try_from(record_count)?)
+        .bind(plan_record.source_started_at)
+        .bind(plan_record.source_checkpoint_ms)
+        .bind(&plan_record.external_request_id)
+        .bind(encoded)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("session archive import plan is not unique: {error}"),
+            )
+        })?;
+        if record_count.is_multiple_of(PLAN_SIZE_CHECK_INTERVAL)
+            && plan_database_bytes(&mut transaction).await? > options.max_plan_bytes
+        {
+            return Err("session archive import plan exceeds its configured size limit".into());
+        }
     }
-    Ok(stats)
+
+    input
+        .verify_seal(source_seal, source_hasher.finalize())
+        .await?;
+    if stats.unmapped > 0 {
+        transaction.rollback().await?;
+        connection.close().await?;
+        return Ok((stats, None));
+    }
+    let header = ImportPlanHeader {
+        version: IMPORT_PLAN_VERSION,
+        tenant_external_id: options.tenant_external_id.to_owned(),
+        cpamp_source: options.cpamp_source.to_owned(),
+        archive_source: options.archive_source.to_owned(),
+        source_size_bytes: source_seal.identity.size,
+        source_blake3: source_seal.digest.to_hex().to_string(),
+        record_count,
+    };
+    sqlx::query("INSERT INTO import_plan_metadata (singleton, header_json) VALUES (1, $1)")
+        .bind(serde_json::to_vec(&header)?)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    connection.close().await?;
+    let sealed = seal_import_plan(guard, record_count, options.max_plan_bytes).await?;
+    Ok((stats, Some(sealed)))
+}
+
+async fn create_import_plan(
+    directory: &Path,
+) -> Result<(PlanPathGuard, SqliteConnection), Box<dyn std::error::Error + Send + Sync>> {
+    validate_plan_directory(directory).await?;
+    let mut created = None;
+    for _ in 0..8 {
+        let path = directory.join(format!(
+            ".mtc-session-archive-plan-{}.sqlite",
+            Uuid::now_v7()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
+            Ok(file) => {
+                drop(file);
+                created = Some(PlanPathGuard { path });
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let guard = created.ok_or("could not allocate a unique session archive plan")?;
+    let connect_options = SqliteConnectOptions::new()
+        .filename(&guard.path)
+        .create_if_missing(false)
+        .journal_mode(SqliteJournalMode::Delete)
+        .synchronous(SqliteSynchronous::Full)
+        .foreign_keys(true);
+    let connection = SqliteConnection::connect_with(&connect_options).await?;
+    Ok((guard, connection))
+}
+
+async fn create_import_plan_schema(
+    connection: &mut SqliteConnection,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query(
+        "CREATE TABLE import_plan_metadata (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), header_json BLOB NOT NULL); CREATE TABLE import_plan_records (sequence INTEGER PRIMARY KEY CHECK(sequence > 0), source_started_at INTEGER NOT NULL CHECK(source_started_at >= 0), source_checkpoint_ms INTEGER NOT NULL CHECK(source_checkpoint_ms >= source_started_at), external_request_id TEXT NOT NULL UNIQUE, record_json BLOB NOT NULL); CREATE INDEX import_plan_apply_order ON import_plan_records(source_checkpoint_ms, external_request_id, sequence)",
+    )
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
+async fn plan_database_bytes(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<u64, sqlx::Error> {
+    let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+        .fetch_one(&mut **transaction)
+        .await?;
+    Ok((page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64))
+}
+
+async fn seal_import_plan(
+    guard: PlanPathGuard,
+    record_count: u64,
+    maximum: u64,
+) -> Result<SealedImportPlan, Box<dyn std::error::Error + Send + Sync>> {
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&guard.path)
+        .await?;
+    file.sync_all().await?;
+    drop(file);
+    #[cfg(unix)]
+    tokio::fs::set_permissions(&guard.path, std::fs::Permissions::from_mode(0o400)).await?;
+    #[cfg(not(unix))]
+    {
+        let mut permissions = tokio::fs::metadata(&guard.path).await?.permissions();
+        permissions.set_readonly(true);
+        tokio::fs::set_permissions(&guard.path, permissions).await?;
+    }
+    let (identity, size, digest) = hash_plan_file(&guard.path).await?;
+    if size > maximum {
+        return Err("session archive import plan exceeds its configured size limit".into());
+    }
+    Ok(SealedImportPlan {
+        path: guard,
+        identity,
+        size,
+        digest,
+        record_count,
+    })
+}
+
+async fn hash_plan_file(
+    path: &Path,
+) -> Result<(InputIdentity, u64, blake3::Hash), Box<dyn std::error::Error + Send + Sync>> {
+    let mut file = tokio::fs::OpenOptions::new().read(true).open(path).await?;
+    let identity = InputIdentity::from_metadata(&file.metadata().await?);
+    let path_identity = InputIdentity::from_metadata(&tokio::fs::metadata(path).await?);
+    if identity != path_identity || !file.metadata().await?.is_file() {
+        return Err(plan_changed_error().into());
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        size = size.saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+    }
+    let final_identity = InputIdentity::from_metadata(&file.metadata().await?);
+    let final_path_identity = InputIdentity::from_metadata(&tokio::fs::metadata(path).await?);
+    if identity != final_identity || identity != final_path_identity || size != identity.size {
+        return Err(plan_changed_error().into());
+    }
+    Ok((identity, size, hasher.finalize()))
+}
+
+fn plan_changed_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "session archive import plan changed after it was sealed; no database apply is permitted",
+    )
+}
+
+async fn verify_plan_file(
+    plan: &SealedImportPlan,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(unix)]
+    {
+        let mode = tokio::fs::metadata(&plan.path.path)
+            .await?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != 0o400 {
+            return Err(plan_changed_error().into());
+        }
+    }
+    let (identity, size, digest) = hash_plan_file(&plan.path.path).await?;
+    if identity != plan.identity || size != plan.size || digest != plan.digest {
+        return Err(plan_changed_error().into());
+    }
+    Ok(())
+}
+
+async fn open_validated_plan(
+    plan: SealedImportPlan,
+    options: &SessionArchiveImportOptions<'_>,
+    source_seal: &SealedInput,
+) -> Result<ValidatedImportPlan, Box<dyn std::error::Error + Send + Sync>> {
+    verify_plan_file(&plan).await?;
+    let connect_options = SqliteConnectOptions::new()
+        .filename(&plan.path.path)
+        .read_only(true);
+    let mut connection = SqliteConnection::connect_with(&connect_options).await?;
+    sqlx::query("PRAGMA query_only = ON")
+        .execute(&mut connection)
+        .await?;
+    // Keep one read transaction from the complete validation scan through the
+    // final apply read. SQLite's rollback-journal shared lock prevents another
+    // SQLite writer from changing later rows after earlier rows have committed.
+    // Apply therefore reads the exact snapshot that was parsed and hashed.
+    sqlx::query("BEGIN").execute(&mut connection).await?;
+    validate_plan_contents(&mut connection, options, source_seal, plan.record_count).await?;
+    // Hash again after SQLite parsed every row. This closes path replacement or
+    // in-place mutation races before the first target database transaction.
+    verify_plan_file(&plan).await?;
+    #[cfg(unix)]
+    tokio::fs::remove_file(&plan.path.path).await?;
+    Ok(ValidatedImportPlan {
+        connection,
+        record_count: plan.record_count,
+        _path: plan.path,
+    })
+}
+
+async fn validate_plan_contents(
+    connection: &mut SqliteConnection,
+    options: &SessionArchiveImportOptions<'_>,
+    source_seal: &SealedInput,
+    expected_records: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let header_bytes: Vec<u8> =
+        sqlx::query_scalar("SELECT header_json FROM import_plan_metadata WHERE singleton = 1")
+            .fetch_one(&mut *connection)
+            .await?;
+    let header: ImportPlanHeader = serde_json::from_slice(&header_bytes)?;
+    if header.version != IMPORT_PLAN_VERSION
+        || header.tenant_external_id != options.tenant_external_id
+        || header.cpamp_source != options.cpamp_source
+        || header.archive_source != options.archive_source
+        || header.source_size_bytes != source_seal.identity.size
+        || header.source_blake3 != source_seal.digest.to_hex().as_str()
+        || header.record_count != expected_records
+    {
+        return Err(plan_changed_error().into());
+    }
+
+    let mut count = 0_u64;
+    let mut rows = sqlx::query(
+        "SELECT sequence, source_started_at, source_checkpoint_ms, external_request_id, record_json FROM import_plan_records ORDER BY sequence ASC",
+    )
+    .fetch(&mut *connection);
+    while let Some(row) = rows.try_next().await? {
+        count += 1;
+        let sequence: i64 = row.try_get("sequence")?;
+        if sequence != i64::try_from(count)? {
+            return Err(plan_changed_error().into());
+        }
+        let bytes: Vec<u8> = row.try_get("record_json")?;
+        if bytes.len() > MAX_PLAN_RECORD_BYTES {
+            return Err(plan_changed_error().into());
+        }
+        let record: ImportPlanRecord = serde_json::from_slice(&bytes)?;
+        validate_plan_record(&record)?;
+        if row.try_get::<i64, _>("source_started_at")? != record.source_started_at
+            || row.try_get::<i64, _>("source_checkpoint_ms")? != record.source_checkpoint_ms
+            || row.try_get::<String, _>("external_request_id")? != record.external_request_id
+        {
+            return Err(plan_changed_error().into());
+        }
+    }
+    if count != expected_records {
+        return Err(plan_changed_error().into());
+    }
+    Ok(())
+}
+
+fn validate_plan_record(record: &ImportPlanRecord) -> Result<(), io::Error> {
+    let correlation_valid = match &record.correlation {
+        ImportPlanCorrelation::Exact {
+            target,
+            identity_proof_kind,
+            identity_proof_digest,
+            correlation_proof_digest,
+        } => {
+            target.tenant_id == target.key.tenant_id
+                && !target.target_request_id.is_nil()
+                && is_digest_hex(&target.external_event_hash)
+                && valid_plan_text(&target.source_model, 512)
+                && valid_plan_text(identity_proof_kind, 200)
+                && is_digest_hex(identity_proof_digest)
+                && is_digest_hex(correlation_proof_digest)
+        }
+        ImportPlanCorrelation::Unlinked { target } => {
+            target.tenant_id == target.key.tenant_id
+                && !target.archive_request_id.is_nil()
+                && valid_plan_text(&target.identity_proof_kind, 200)
+                && is_digest_hex(&target.identity_proof_digest)
+                && is_digest_hex(&target.correlation_proof_digest)
+        }
+    };
+    let timing_valid = match (record.source_completed_at, record.duration_ms) {
+        (Some(completed), Some(duration)) => completed
+            .checked_sub(record.source_started_at)
+            .is_some_and(|expected| {
+                expected >= 0 && duration == expected && record.source_checkpoint_ms == completed
+            }),
+        (None, None) => record.source_checkpoint_ms == record.source_started_at,
+        _ => false,
+    };
+    if record.version != IMPORT_PLAN_VERSION
+        || record.external_request_id.is_empty()
+        || record.external_request_id.len() > 512
+        || record.external_request_id.chars().any(char::is_control)
+        || !correlation_valid
+        || !is_digest_hex(&record.record_digest)
+        || record
+            .request_digest
+            .as_deref()
+            .is_some_and(|value| !is_digest_hex(value))
+        || record
+            .response_digest
+            .as_deref()
+            .is_some_and(|value| !is_digest_hex(value))
+        || !plan_object_matches(
+            record.request_object.as_deref(),
+            record.request_digest.as_deref(),
+        )
+        || !plan_object_matches(
+            record.response_object.as_deref(),
+            record.response_digest.as_deref(),
+        )
+        || (record.request_is_structured && record.request_object.is_none())
+        || !timing_valid
+        || !valid_plan_text(&record.protocol, 512)
+        || !valid_plan_text(&record.model, 512)
+        || record.status_code.is_some_and(|status| status <= 0)
+        || record.input_tokens < 0
+        || record.output_tokens < 0
+        || record
+            .error_code
+            .as_deref()
+            .is_some_and(|value| !valid_plan_text(value, 200))
+    {
+        return Err(plan_changed_error());
+    }
+    Ok(())
+}
+
+fn valid_plan_text(value: &str, maximum: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+}
+
+fn plan_object_matches(location: Option<&str>, digest: Option<&str>) -> bool {
+    match (location, digest) {
+        (None, None) => true,
+        (Some(location), Some(digest)) if is_digest_hex(digest) => {
+            location == content_location(digest)
+        }
+        _ => false,
+    }
+}
+
+fn is_digest_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn apply_validated_plan(
+    db: &Database,
+    archive: &ArchiveStore,
+    options: &SessionArchiveImportOptions<'_>,
+    plan: &mut ValidatedImportPlan,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let mut imported = 0_u64;
+    let mut seen = 0_u64;
+    let mut rows = sqlx::query(
+        "SELECT sequence, source_started_at, source_checkpoint_ms, external_request_id, record_json FROM import_plan_records ORDER BY source_checkpoint_ms ASC, external_request_id ASC, sequence ASC",
+    )
+    .fetch(&mut plan.connection);
+    while let Some(row) = rows.try_next().await? {
+        seen += 1;
+        let encoded: Vec<u8> = row.try_get("record_json")?;
+        let record: ImportPlanRecord = serde_json::from_slice(&encoded)?;
+        validate_plan_record(&record)?;
+        if row.try_get::<i64, _>("source_started_at")? != record.source_started_at
+            || row.try_get::<i64, _>("source_checkpoint_ms")? != record.source_checkpoint_ms
+            || row.try_get::<String, _>("external_request_id")? != record.external_request_id
+        {
+            return Err(plan_changed_error().into());
+        }
+        let request_json = load_structured_plan_request(archive, options, &record).await?;
+        let committed = match &record.correlation {
+            ImportPlanCorrelation::Exact {
+                target,
+                identity_proof_kind,
+                identity_proof_digest,
+                correlation_proof_digest,
+            } => {
+                let target: SessionArchiveTarget = target.clone().into();
+                db.commit_session_archive_request(SessionArchiveCommitInput {
+                    tenant_external_id: options.tenant_external_id,
+                    archive_source: options.archive_source,
+                    external_request_id: &record.external_request_id,
+                    target: &target,
+                    record_digest: &record.record_digest,
+                    request_digest: record.request_digest.as_deref(),
+                    response_digest: record.response_digest.as_deref(),
+                    request_object: record.request_object.as_deref(),
+                    response_object: record.response_object.as_deref(),
+                    request_json: request_json.as_ref(),
+                    conversation_hints: &record.conversation_hints,
+                    client_name: record.client_name.as_deref(),
+                    source_started_at: record.source_started_at,
+                    source_completed_at: record.source_completed_at,
+                    identity_proof_kind,
+                    identity_proof_digest,
+                    correlation_proof_digest,
+                })
+                .await?
+            }
+            ImportPlanCorrelation::Unlinked { target } => {
+                let target: SessionArchiveUnlinkedTarget = target.clone().into();
+                db.commit_session_archive_unlinked_request(SessionArchiveUnlinkedCommitInput {
+                    tenant_external_id: options.tenant_external_id,
+                    archive_source: options.archive_source,
+                    external_request_id: &record.external_request_id,
+                    target: &target,
+                    record_digest: &record.record_digest,
+                    request_digest: record.request_digest.as_deref(),
+                    response_digest: record.response_digest.as_deref(),
+                    request_object: record.request_object.as_deref(),
+                    response_object: record.response_object.as_deref(),
+                    request_json: request_json.as_ref(),
+                    conversation_hints: &record.conversation_hints,
+                    client_name: record.client_name.as_deref(),
+                    source_started_at: record.source_started_at,
+                    metadata: SessionArchiveUnlinkedMetadata {
+                        source_completed_at: record.source_completed_at,
+                        protocol: &record.protocol,
+                        model: &record.model,
+                        status_code: record.status_code,
+                        duration_ms: record.duration_ms,
+                        input_tokens: record.input_tokens,
+                        output_tokens: record.output_tokens,
+                        error_code: record.error_code.as_deref(),
+                    },
+                })
+                .await?
+            }
+        };
+        imported += u64::from(committed);
+    }
+    if seen != plan.record_count {
+        return Err(plan_changed_error().into());
+    }
+    Ok(imported)
+}
+
+async fn load_structured_plan_request(
+    archive: &ArchiveStore,
+    options: &SessionArchiveImportOptions<'_>,
+    record: &ImportPlanRecord,
+) -> Result<Option<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    if !record.request_is_structured {
+        return Ok(None);
+    }
+    let location = record
+        .request_object
+        .as_deref()
+        .ok_or_else(plan_changed_error)?;
+    let expected_digest = record
+        .request_digest
+        .as_deref()
+        .ok_or_else(plan_changed_error)?;
+    let body = archive
+        .get_bounded(location, options.max_line_bytes)
+        .await?;
+    if digest(&body) != expected_digest {
+        return Err("planned request CAS object failed its content digest".into());
+    }
+    let value: Value = serde_json::from_slice(&body)?;
+    if !matches!(value, Value::Array(_) | Value::Object(_)) {
+        return Err(plan_changed_error().into());
+    }
+    Ok(Some(value))
+}
+
+async fn preflight_pass(
+    db: &Database,
+    options: &SessionArchiveImportOptions<'_>,
+    lower_bound: i64,
+    input: &mut ReadOnlyInput,
+) -> Result<(SessionArchiveImportStats, blake3::Hash), Box<dyn std::error::Error + Send + Sync>> {
+    let mut stats = SessionArchiveImportStats::default();
+    let mut hasher = blake3::Hasher::new();
+    while let Some(line) = read_bounded_line(&mut input.reader, options.max_line_bytes).await? {
+        hasher.update(&line);
+        let Some((record, digest)) = parse_record(&line)? else {
+            continue;
+        };
+        stats.scanned += 1;
+        if !archive_record_inside_overlap(&record, lower_bound) {
+            stats.before_overlap += 1;
+            continue;
+        }
+        stats.eligible += 1;
+        match match_record(db, options, &record, &digest).await {
+            Ok(correlation) => {
+                preflight_gap_compatibility(db, options, &record, &correlation).await?;
+                stats.mapped += 1;
+                stats.replayed += u64::from(correlation.replay());
+            }
+            Err(AppError::BadRequest(_)) if options.allow_unmapped => stats.unmapped += 1,
+            Err(AppError::BadRequest(_)) => {
+                stats.unmapped += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok((stats, hasher.finalize()))
 }
 
 async fn match_record(
@@ -188,8 +1186,9 @@ async fn match_record(
     options: &SessionArchiveImportOptions<'_>,
     record: &ArchiveRecord,
     record_digest: &str,
-) -> Result<SessionArchiveTarget, AppError> {
-    db.match_session_archive_request(SessionArchiveMatchInput {
+) -> Result<SessionArchiveCorrelation, AppError> {
+    let source_key_hash = archived_credential_hash(record)?;
+    db.correlate_session_archive_request(SessionArchiveMatchInput {
         tenant_external_id: options.tenant_external_id,
         cpamp_source: options.cpamp_source,
         archive_source: options.archive_source,
@@ -197,8 +1196,9 @@ async fn match_record(
         started_at: record.started_at.timestamp_millis(),
         requested_model: nonempty(&record.requested_model),
         resolved_model: nonempty(&record.model),
-        credential_hash: nonempty(&record.credential_hash),
-        legacy_key_id: nonempty(&record.key_id),
+        source_key_hash,
+        input_tokens: None,
+        output_tokens: None,
         record_digest,
         time_tolerance_ms: options.time_tolerance_ms,
     })
@@ -209,8 +1209,11 @@ async fn preflight_gap_compatibility(
     db: &Database,
     options: &SessionArchiveImportOptions<'_>,
     record: &ArchiveRecord,
-    target: &SessionArchiveTarget,
+    correlation: &SessionArchiveCorrelation,
 ) -> Result<(), AppError> {
+    let SessionArchiveCorrelation::Exact { target, .. } = correlation else {
+        return Ok(());
+    };
     if target.replay {
         return Ok(());
     }
@@ -253,7 +1256,7 @@ fn parse_record(
         return Ok(None);
     }
     let record: ArchiveRecord = serde_json::from_slice(line)?;
-    if record.schema_version != 2 {
+    if !matches!(record.schema_version, 1 | 2) {
         return Err(format!(
             "unsupported cpa-session-archive schema {}",
             record.schema_version
@@ -265,11 +1268,37 @@ fn parse_record(
         || record.request_id.chars().any(char::is_control)
         || record.session_id.len() > 1024
         || record.session_id.chars().any(char::is_control)
+        || record.completed_at < record.started_at
     {
-        return Err("archive record contains an invalid request or session id".into());
+        return Err("archive record contains an invalid identity or time range".into());
     }
     let canonical = serde_json::to_vec(&record)?;
     Ok(Some((record, digest(&canonical))))
+}
+
+fn archive_record_inside_overlap(record: &ArchiveRecord, lower_bound: i64) -> bool {
+    let started_at = record.started_at.timestamp_millis();
+    let completed_at = record.completed_at.timestamp_millis();
+    // This exactly mirrors the source delta cursor: long-running or late-completed
+    // records remain eligible when either endpoint is inside the overlap window.
+    started_at >= lower_bound || completed_at >= lower_bound
+}
+
+fn archived_credential_hash(record: &ArchiveRecord) -> Result<&str, AppError> {
+    let value = match record.schema_version {
+        1 => nonempty(&record.key_id),
+        2 => nonempty(&record.credential_hash).or_else(|| nonempty(&record.key_id)),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        AppError::BadRequest("archive request has no verified credential hash".into())
+    })?;
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::BadRequest(
+            "archive request has no verified credential hash".into(),
+        ));
+    }
+    Ok(value)
 }
 
 fn payload_bytes(value: &Value) -> Result<Option<Vec<u8>>, serde_json::Error> {
@@ -321,6 +1350,60 @@ fn metadata_string<'a>(record: &'a ArchiveRecord, name: &str) -> Option<&'a str>
         .and_then(nonempty)
 }
 
+fn archive_protocol(record: &ArchiveRecord) -> String {
+    nonempty(&record.request_path)
+        .or_else(|| first_facet(record, "request.path"))
+        .or_else(|| metadata_string(record, "request_path"))
+        .or_else(|| first_facet(record, "client"))
+        .unwrap_or("session-archive")
+        .to_owned()
+}
+
+fn archive_usage(record: &ArchiveRecord) -> (i64, i64) {
+    let usage = record
+        .response
+        .pointer("/response/usage")
+        .or_else(|| record.response.pointer("/usage"));
+    let Some(usage) = usage else {
+        return (0, 0);
+    };
+    let Some(input_tokens) = usage.get("input_tokens").and_then(Value::as_i64) else {
+        return (0, 0);
+    };
+    let Some(output_tokens) = usage.get("output_tokens").and_then(Value::as_i64) else {
+        return (0, 0);
+    };
+    if input_tokens < 0 || output_tokens < 0 {
+        (0, 0)
+    } else {
+        (input_tokens, output_tokens)
+    }
+}
+
+fn archive_error_code(record: &ArchiveRecord) -> Option<String> {
+    let outcome = record.outcome.trim();
+    let successful =
+        outcome.eq_ignore_ascii_case("success") || outcome.eq_ignore_ascii_case("succeeded");
+    if successful && record.status_code < 400 {
+        return None;
+    }
+    if !outcome.is_empty() && !successful {
+        let normalized: String = outcome
+            .chars()
+            .take(200)
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '-') {
+                    character.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        return nonempty(&normalized).map(str::to_owned);
+    }
+    (record.status_code >= 400).then(|| format!("http_{}", record.status_code))
+}
+
 fn nonempty(value: &str) -> Option<&str> {
     let value = value.trim();
     (!value.is_empty()).then_some(value)
@@ -340,13 +1423,6 @@ fn validate_name(value: &str, label: &str) -> Result<(), String> {
         return Err(format!("{label} contains unsupported characters"));
     }
     Ok(())
-}
-
-async fn open_reader(
-    path: &Path,
-) -> Result<BufReader<tokio::fs::File>, Box<dyn std::error::Error + Send + Sync>> {
-    let file = tokio::fs::OpenOptions::new().read(true).open(path).await?;
-    Ok(BufReader::new(file))
 }
 
 async fn read_bounded_line(
@@ -376,6 +1452,8 @@ async fn read_bounded_line(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -395,5 +1473,344 @@ mod tests {
     fn invalid_sources_are_rejected() {
         assert!(validate_name("archive-v2", "source").is_ok());
         assert!(validate_name("../archive", "source").is_err());
+    }
+
+    #[test]
+    fn archive_schema_uses_only_its_verified_identity_field() {
+        let v1: ArchiveRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "session_id": "s",
+            "request_id": "r",
+            "started_at": "2026-08-12T00:00:00Z",
+            "completed_at": "2026-08-12T00:00:01Z",
+            "key_id": "a".repeat(64),
+            "credential_hash": "b".repeat(64)
+        }))
+        .expect("schema-v1 fixture");
+        assert_eq!(archived_credential_hash(&v1).unwrap(), "a".repeat(64));
+
+        let v2: ArchiveRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "session_id": "s",
+            "request_id": "r",
+            "started_at": "2026-08-12T00:00:00Z",
+            "completed_at": "2026-08-12T00:00:01Z",
+            "key_id": "a".repeat(64),
+            "credential_hash": "b".repeat(64)
+        }))
+        .expect("schema-v2 fixture");
+        assert_eq!(archived_credential_hash(&v2).unwrap(), "b".repeat(64));
+
+        let v2_legacy_fallback: ArchiveRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "session_id": "s",
+            "request_id": "r",
+            "started_at": "2026-08-12T00:00:00Z",
+            "completed_at": "2026-08-12T00:00:01Z",
+            "key_id": "c".repeat(64)
+        }))
+        .expect("schema-v2 legacy fallback fixture");
+        assert_eq!(
+            archived_credential_hash(&v2_legacy_fallback).unwrap(),
+            "c".repeat(64)
+        );
+
+        let v2_invalid_explicit: ArchiveRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "session_id": "s",
+            "request_id": "r",
+            "started_at": "2026-08-12T00:00:00Z",
+            "completed_at": "2026-08-12T00:00:01Z",
+            "key_id": "c".repeat(64),
+            "credential_hash": "invalid-explicit-value"
+        }))
+        .expect("schema-v2 invalid explicit fixture");
+        assert!(archived_credential_hash(&v2_invalid_explicit).is_err());
+
+        let invalid_v1: ArchiveRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "session_id": "s",
+            "request_id": "r",
+            "started_at": "2026-08-12T00:00:00Z",
+            "completed_at": "2026-08-12T00:00:01Z",
+            "key_id": "human-label",
+            "credential_hash": "b".repeat(64)
+        }))
+        .expect("invalid schema-v1 fixture");
+        assert!(archived_credential_hash(&invalid_v1).is_err());
+    }
+
+    #[test]
+    fn request_path_enriches_metadata_without_changing_legacy_record_digest() {
+        let without_path = serde_json::json!({
+            "schema_version": 2,
+            "session_id": "s",
+            "request_id": "r",
+            "started_at": "2026-08-12T00:00:00Z",
+            "completed_at": "2026-08-12T00:00:01Z",
+            "credential_hash": "a".repeat(64),
+            "requested_model": "gpt-fixture"
+        });
+        let mut with_path = without_path.clone();
+        with_path["request_path"] = Value::String("/v1/responses".into());
+        let (without_record, without_digest) =
+            parse_record(format!("{}\n", serde_json::to_string(&without_path).unwrap()).as_bytes())
+                .unwrap()
+                .unwrap();
+        let (with_record, with_digest) =
+            parse_record(format!("{}\n", serde_json::to_string(&with_path).unwrap()).as_bytes())
+                .unwrap()
+                .unwrap();
+        assert_eq!(without_digest, with_digest);
+        assert_eq!(archive_protocol(&without_record), "session-archive");
+        assert_eq!(archive_protocol(&with_record), "/v1/responses");
+    }
+
+    #[tokio::test]
+    async fn sealed_input_rejects_in_place_changes() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary input");
+        file.write_all(b"first sealed content\n")
+            .expect("write input");
+        file.flush().expect("flush input");
+
+        let mut input = ReadOnlyInput::open(file.path()).await.expect("open input");
+        let line = read_bounded_line(&mut input.reader, 1024)
+            .await
+            .expect("read input")
+            .expect("one line");
+        let seal = input.seal(blake3::hash(&line)).await.expect("seal input");
+
+        std::fs::write(file.path(), b"changed input bytes\n").expect("mutate input");
+        let error = input
+            .rewind()
+            .await
+            .expect_err("changed input must not be reused");
+        assert!(error.to_string().contains("changed after preflight"));
+        assert_eq!(seal.digest, blake3::hash(b"first sealed content\n"));
+    }
+
+    #[tokio::test]
+    async fn sealed_input_rejects_path_replacement_and_digest_mismatch() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("archive.jsonl");
+        std::fs::write(&path, b"sealed\n").expect("write input");
+        let mut input = ReadOnlyInput::open(&path).await.expect("open input");
+        let line = read_bounded_line(&mut input.reader, 1024)
+            .await
+            .expect("read input")
+            .expect("one line");
+        let seal = input.seal(blake3::hash(&line)).await.expect("seal input");
+
+        input
+            .verify_seal(&seal, blake3::hash(b"different\n"))
+            .await
+            .expect_err("whole-file digest mismatch must fail");
+
+        let replacement = directory.path().join("replacement.jsonl");
+        std::fs::write(&replacement, b"sealed\n").expect("write replacement");
+        std::fs::rename(&replacement, &path).expect("replace input path");
+        let error = input
+            .verify_identity()
+            .await
+            .expect_err("path replacement must fail");
+        assert!(error.to_string().contains("changed after preflight"));
+    }
+
+    #[tokio::test]
+    async fn sealed_input_rejects_changes_during_the_planning_scan() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary input");
+        file.write_all(b"first\nsecond\n").expect("write input");
+        file.flush().expect("flush input");
+
+        let mut input = ReadOnlyInput::open(file.path()).await.expect("open input");
+        let mut preflight_hasher = blake3::Hasher::new();
+        while let Some(line) = read_bounded_line(&mut input.reader, 1024)
+            .await
+            .expect("preflight read")
+        {
+            preflight_hasher.update(&line);
+        }
+        let seal = input
+            .seal(preflight_hasher.finalize())
+            .await
+            .expect("seal input");
+        input.rewind().await.expect("start planning scan");
+
+        let mut apply_hasher = blake3::Hasher::new();
+        let first = read_bounded_line(&mut input.reader, 1024)
+            .await
+            .expect("first planning read")
+            .expect("first planning line");
+        apply_hasher.update(&first);
+        file.write_all(b"changed-during-apply\n")
+            .expect("append during planning");
+        file.flush().expect("flush mutation");
+        while let Some(line) = read_bounded_line(&mut input.reader, 1024)
+            .await
+            .expect("remaining planning read")
+        {
+            apply_hasher.update(&line);
+        }
+        let error = input
+            .verify_seal(&seal, apply_hasher.finalize())
+            .await
+            .expect_err("mid-planning mutation must fail final verification");
+        assert!(error.to_string().contains("changed after preflight"));
+    }
+
+    async fn empty_sealed_test_plan(directory: &Path) -> SealedImportPlan {
+        let (guard, mut connection) = create_import_plan(directory)
+            .await
+            .expect("create test plan");
+        create_import_plan_schema(&mut connection)
+            .await
+            .expect("create test plan schema");
+        connection.close().await.expect("close test plan");
+        seal_import_plan(guard, 0, 16 * 1024 * 1024)
+            .await
+            .expect("seal test plan")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sealed_plan_rejects_permission_content_and_path_tampering() {
+        let directory = tempfile::tempdir().expect("test plan directory");
+
+        let permission_plan = empty_sealed_test_plan(directory.path()).await;
+        tokio::fs::set_permissions(
+            &permission_plan.path.path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .expect("make plan writable");
+        verify_plan_file(&permission_plan)
+            .await
+            .expect_err("a writable plan must fail closed");
+
+        let content_plan = empty_sealed_test_plan(directory.path()).await;
+        tokio::fs::set_permissions(
+            &content_plan.path.path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .expect("make content plan writable");
+        let mut content = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&content_plan.path.path)
+            .expect("open plan for tamper");
+        content.write_all(b"tamper").expect("tamper plan content");
+        content.flush().expect("flush plan tamper");
+        drop(content);
+        tokio::fs::set_permissions(
+            &content_plan.path.path,
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .await
+        .expect("restore read-only mode");
+        verify_plan_file(&content_plan)
+            .await
+            .expect_err("content-tampered plan must fail closed");
+
+        let path_plan = empty_sealed_test_plan(directory.path()).await;
+        let replacement_bytes = std::fs::read(&path_plan.path.path).expect("read sealed plan");
+        let displaced = directory.path().join("displaced-plan.sqlite");
+        std::fs::rename(&path_plan.path.path, &displaced).expect("displace sealed plan");
+        std::fs::write(&path_plan.path.path, replacement_bytes).expect("replace plan path");
+        std::fs::set_permissions(&path_plan.path.path, std::fs::Permissions::from_mode(0o400))
+            .expect("make replacement read-only");
+        verify_plan_file(&path_plan)
+            .await
+            .expect_err("path-replaced plan must fail closed");
+        std::fs::remove_file(displaced).expect("remove displaced plan");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validated_plan_is_unlinked_before_database_apply() {
+        let directory = tempfile::tempdir().expect("test plan directory");
+        let mut source = tempfile::NamedTempFile::new().expect("test source");
+        source.write_all(b"sealed source\n").expect("write source");
+        source.flush().expect("flush source");
+        let mut input = ReadOnlyInput::open(source.path())
+            .await
+            .expect("open source");
+        let line = read_bounded_line(&mut input.reader, 1024)
+            .await
+            .expect("read source")
+            .expect("source line");
+        let source_seal = input.seal(blake3::hash(&line)).await.expect("seal source");
+        let options = SessionArchiveImportOptions {
+            input: source.path(),
+            plan_directory: directory.path(),
+            tenant_external_id: "archive-fixture",
+            cpamp_source: "cpamp-usage-events-v1",
+            archive_source: "unlink-test",
+            overlap_ms: 0,
+            time_tolerance_ms: 0,
+            max_line_bytes: 1024,
+            max_plan_bytes: 16 * 1024 * 1024,
+            allow_unmapped: false,
+            apply: true,
+        };
+        let (guard, mut connection) = create_import_plan(directory.path())
+            .await
+            .expect("create valid plan");
+        create_import_plan_schema(&mut connection)
+            .await
+            .expect("create valid plan schema");
+        let header = ImportPlanHeader {
+            version: IMPORT_PLAN_VERSION,
+            tenant_external_id: options.tenant_external_id.to_owned(),
+            cpamp_source: options.cpamp_source.to_owned(),
+            archive_source: options.archive_source.to_owned(),
+            source_size_bytes: source_seal.identity.size,
+            source_blake3: source_seal.digest.to_hex().to_string(),
+            record_count: 0,
+        };
+        sqlx::query("INSERT INTO import_plan_metadata (singleton, header_json) VALUES (1, $1)")
+            .bind(serde_json::to_vec(&header).expect("encode header"))
+            .execute(&mut connection)
+            .await
+            .expect("insert valid plan header");
+        connection.close().await.expect("close valid plan");
+        let writer_options = SqliteConnectOptions::new()
+            .filename(&guard.path)
+            .create_if_missing(false)
+            .journal_mode(SqliteJournalMode::Delete);
+        let mut preopened_writer = SqliteConnection::connect_with(&writer_options)
+            .await
+            .expect("preopen a competing SQLite writer");
+        sqlx::query("PRAGMA busy_timeout = 50")
+            .execute(&mut preopened_writer)
+            .await
+            .expect("bound competing writer wait");
+        let sealed = seal_import_plan(guard, 0, options.max_plan_bytes)
+            .await
+            .expect("seal valid plan");
+        let path = sealed.path.path.clone();
+        let validated = open_validated_plan(sealed, &options, &source_seal)
+            .await
+            .expect("open validated plan");
+        assert!(
+            !path.exists(),
+            "validated plan path must be unlinked before apply"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sqlx::query("UPDATE import_plan_metadata SET header_json = X'00' WHERE singleton = 1")
+                .execute(&mut preopened_writer),
+        )
+        .await
+        .expect("competing writer must not wait indefinitely")
+        .expect_err("validated read snapshot must reject a preopened SQLite writer");
+        preopened_writer
+            .close()
+            .await
+            .expect("close competing writer");
+        validated
+            .connection
+            .close()
+            .await
+            .expect("close validated plan");
     }
 }

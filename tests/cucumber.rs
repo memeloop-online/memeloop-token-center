@@ -8,17 +8,27 @@ use std::{
 
 use cucumber::{World, given, then, when};
 use futures_util::StreamExt;
-use memeloop_token_center::{AppState, api, config::Config, worker};
+use memeloop_token_center::{
+    AppState, api,
+    archive_staging::{
+        ArchiveStagingIntentDigest, ArchiveStagingKey, ArchiveStagingLeaseOwner,
+        ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingState, BeginArchiveStagingInput,
+        BeginArchiveStagingResult,
+    },
+    config::Config,
+    model::{ArchivedGenerationAsset, GenerationStagedAssets},
+    worker,
+};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{AnyPool, PgPool, Row};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{body_partial_json, header, header_exists, method, path},
+    matchers::{body_partial_json, header, header_exists, method, path, query_param},
 };
 
 #[path = "steps/security_acceptance.rs"]
@@ -28,6 +38,7 @@ mod security_acceptance;
 struct TokenCenterWorld {
     client: Client,
     service_url: String,
+    state: Option<AppState>,
     mock: Option<MockServer>,
     temp_dir: Option<TempDir>,
     server_task: Option<JoinHandle<()>>,
@@ -46,6 +57,9 @@ struct TokenCenterWorld {
     old_service_token: String,
     stable_service_id: Option<Uuid>,
     generation_job_id: Option<Uuid>,
+    synchronous_request_id: Option<Uuid>,
+    image_route_id: Option<Uuid>,
+    image_route_updated_at: i64,
     subscription_session_token: String,
     matrix_global_service_token: String,
     matrix_scoped_service_token: String,
@@ -60,6 +74,7 @@ struct TokenCenterWorld {
     import_source: String,
     import_sqlite_path: Option<PathBuf>,
     status: Option<StatusCode>,
+    response_retry_after: Option<String>,
     response: Value,
 }
 
@@ -68,6 +83,7 @@ impl Default for TokenCenterWorld {
         Self {
             client: Client::new(),
             service_url: String::new(),
+            state: None,
             mock: None,
             temp_dir: None,
             server_task: None,
@@ -86,6 +102,9 @@ impl Default for TokenCenterWorld {
             old_service_token: String::new(),
             stable_service_id: None,
             generation_job_id: None,
+            synchronous_request_id: None,
+            image_route_id: None,
+            image_route_updated_at: 0,
             subscription_session_token: String::new(),
             matrix_global_service_token: String::new(),
             matrix_scoped_service_token: String::new(),
@@ -100,6 +119,7 @@ impl Default for TokenCenterWorld {
             import_source: String::new(),
             import_sqlite_path: None,
             status: None,
+            response_retry_after: None,
             response: Value::Null,
         }
     }
@@ -140,6 +160,7 @@ async fn start_test_service(world: &mut TokenCenterWorld) {
     let state = AppState::initialize(config)
         .await
         .expect("initialize test service");
+    let test_state = state.clone();
     let worker_task = tokio::spawn(worker::run(state.clone()));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -152,6 +173,7 @@ async fn start_test_service(world: &mut TokenCenterWorld) {
     });
 
     world.service_url = format!("http://{address}");
+    world.state = Some(test_state);
     world.mock = Some(mock);
     world.temp_dir = Some(temp_dir);
     world.server_task = Some(server_task);
@@ -176,7 +198,11 @@ async fn mock_seedance_generation(world: &mut TokenCenterWorld) {
             "id": "cgt-test",
             "status": "succeeded",
             "duration": "5",
-            "content": {"video_url": format!("{mock_url}/assets/video.mp4")},
+            "content": {
+                "video_url": format!("{mock_url}/assets/video.mp4?token=seedance-sensitive-token"),
+                "internal_path": "/provider/private/video.mp4"
+            },
+            "provider_token": "seedance-sensitive-envelope-token",
             "usage": {"completion_tokens": 1234, "total_tokens": 1234}
         })))
         .mount(world.mock.as_ref().expect("mock server"))
@@ -192,41 +218,54 @@ async fn mock_seedance_generation(world: &mut TokenCenterWorld) {
         .await;
 }
 
-#[given("the mock Seedance upstream transiently fails once and then completes")]
-async fn mock_seedance_retry(world: &mut TokenCenterWorld) {
+#[given("the mock Seedance upstream returns an ambiguous server error after one submission")]
+async fn mock_seedance_ambiguous_submission(world: &mut TokenCenterWorld) {
     let server = world.mock.as_ref().expect("mock server");
     Mock::given(method("POST"))
         .and(path("/api/v3/contents/generations/tasks"))
         .and(header("authorization", "Bearer seedance-secret"))
         .and(header_exists("idempotency-key"))
-        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "temporary"})))
-        .with_priority(1)
-        .up_to_n_times(1)
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": "provider may have accepted this request",
+            "token": "ambiguous-submission-sensitive-token"
+        })))
         .expect(1)
         .mount(server)
         .await;
+}
+
+#[given("the mock Seedance upstream reports sixty seconds for a five second reservation")]
+async fn mock_seedance_usage_exceeds_contract(world: &mut TokenCenterWorld) {
+    let server = world.mock.as_ref().expect("mock server");
     Mock::given(method("POST"))
         .and(path("/api/v3/contents/generations/tasks"))
         .and(header("authorization", "Bearer seedance-secret"))
         .and(header_exists("idempotency-key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "cgt-retry"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "cgt-over-contract"})))
         .expect(1)
         .mount(server)
         .await;
     let mock_url = server.uri();
     Mock::given(method("GET"))
-        .and(path("/api/v3/contents/generations/tasks/cgt-retry"))
+        .and(path("/api/v3/contents/generations/tasks/cgt-over-contract"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "cgt-retry",
+            "id": "cgt-over-contract",
             "status": "succeeded",
-            "duration": "5",
-            "content": {"video_url": format!("{mock_url}/assets/retry-video.mp4")}
+            "duration": "60",
+            "content": {
+                "video_url": format!("{mock_url}/assets/must-not-download.mp4?token=must-not-leak")
+            }
         })))
         .mount(server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/assets/retry-video.mp4"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"mock-retry-video"))
+        .and(path("/assets/must-not-download.mp4"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "video/mp4")
+                .set_body_bytes(b"must-not-be-archived"),
+        )
+        .expect(0)
         .mount(server)
         .await;
 }
@@ -237,8 +276,49 @@ async fn mock_seedance_rejection(world: &mut TokenCenterWorld) {
         .and(path("/api/v3/contents/generations/tasks"))
         .and(header("authorization", "Bearer seedance-secret"))
         .and(header_exists("idempotency-key"))
-        .respond_with(ResponseTemplate::new(400).set_body_string("request rejected"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "rejected: provider-sensitive-token"},
+            "internal_url": "https://provider.invalid/private?token=must-not-persist"
+        })))
         .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock Seedance upstream reports success without a video asset")]
+async fn mock_seedance_success_without_asset(world: &mut TokenCenterWorld) {
+    let server = world.mock.as_ref().expect("mock server");
+    Mock::given(method("POST"))
+        .and(path("/api/v3/contents/generations/tasks"))
+        .and(header("authorization", "Bearer seedance-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "cgt-missing-asset"})))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/contents/generations/tasks/cgt-missing-asset"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cgt-missing-asset",
+            "status": "succeeded",
+            "duration": "5",
+            "content": {
+                "internal_path": "/provider/private/missing.mp4",
+                "token": "missing-seedance-sensitive-token"
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+#[given("the mock Seedance upstream returns a malicious job id")]
+async fn mock_seedance_malicious_job_id(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/api/v3/contents/generations/tasks"))
+        .and(header("authorization", "Bearer seedance-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "../private?token=invalid-upstream-id-secret"
+        })))
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
 }
@@ -308,6 +388,9 @@ async fn create_seedance_route_and_key(world: &mut TokenCenterWorld) {
         .expect("create Seedance key");
     assert_eq!(response.status(), StatusCode::CREATED);
     let key: Value = response.json().await.expect("Seedance key JSON");
+    world.stable_key_id = key["key_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok());
     world.current_key = key["key"].as_str().expect("Seedance key").to_owned();
 }
 
@@ -353,11 +436,26 @@ async fn generation_succeeds(world: &mut TokenCenterWorld) {
         if value["status"] == "succeeded" {
             assert_eq!(value["billed_units"], 5);
             assert_eq!(value["cost"], "0.5");
-            assert!(
-                value["result"]["archive_objects"][0]
-                    .as_str()
-                    .is_some_and(|location| location.starts_with("objects/blake3/"))
+            assert_eq!(value["assets"].as_array().map(Vec::len), Some(1));
+            assert_eq!(value["result"]["assets"], value["assets"]);
+            assert_eq!(
+                value["result"]["provider"],
+                json!({"status": "succeeded", "duration": 5})
             );
+            assert!(!value.to_string().contains("objects/blake3/"));
+            assert!(!value.to_string().contains("seedance-sensitive"));
+            assert!(!value.to_string().contains("provider/private"));
+            let stored = world
+                .state
+                .as_ref()
+                .expect("test state")
+                .db
+                .generation_job(world.stable_key_id.expect("Seedance key id"), job_id)
+                .await
+                .expect("stored successful Seedance generation");
+            let stored_result = stored.result.expect("safe Seedance result").to_string();
+            assert!(!stored_result.contains("seedance-sensitive"));
+            assert!(!stored_result.contains("provider/private"));
             assert_generation_stats(world, "seedance-public", "0.5").await;
             world.response = value;
             return;
@@ -367,8 +465,40 @@ async fn generation_succeeds(world: &mut TokenCenterWorld) {
     panic!("generation did not complete: {}", world.response);
 }
 
-#[then("both Seedance submission attempts use the same upstream idempotency key")]
-async fn seedance_retries_are_idempotent(world: &mut TokenCenterWorld) {
+#[then("the ambiguous Seedance submission fails closed without a second upstream POST")]
+async fn seedance_ambiguous_submission_fails_closed(world: &mut TokenCenterWorld) {
+    let job_id = world.generation_job_id.expect("generation job id");
+    for _ in 0..40 {
+        let value = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("ambiguous generation status")
+            .json::<Value>()
+            .await
+            .expect("ambiguous generation status JSON");
+        if value["status"] == "failed" {
+            assert_eq!(value["error_code"], "submission_outcome_unknown");
+            assert_eq!(value["billed_units"], 0);
+            assert_eq!(value["cost"], "0");
+            assert_eq!(value["result"], Value::Null);
+            assert_eq!(value["assets"], json!([]));
+            assert!(
+                !value
+                    .to_string()
+                    .contains("ambiguous-submission-sensitive-token")
+            );
+            world.response = value;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(world.response["error_code"], "submission_outcome_unknown");
     let requests = world
         .mock
         .as_ref()
@@ -376,31 +506,70 @@ async fn seedance_retries_are_idempotent(world: &mut TokenCenterWorld) {
         .received_requests()
         .await
         .expect("request recording enabled");
-    let keys = requests
+    let posts = requests
         .iter()
         .filter(|request| {
             request.method.as_str() == "POST"
                 && request.url.path() == "/api/v3/contents/generations/tasks"
         })
-        .map(|request| {
-            request
-                .headers
-                .get("idempotency-key")
-                .expect("upstream idempotency header")
-                .to_str()
-                .expect("ASCII idempotency header")
-                .to_owned()
-        })
         .collect::<Vec<_>>();
-    assert_eq!(keys.len(), 2);
-    assert_eq!(keys[0], keys[1]);
+    assert_eq!(posts.len(), 1);
+    let idempotency_key = posts[0]
+        .headers
+        .get("idempotency-key")
+        .expect("upstream idempotency header")
+        .to_str()
+        .expect("ASCII idempotency header");
     assert_eq!(
-        keys[0],
+        idempotency_key,
         world
             .generation_job_id
             .expect("generation job id")
             .to_string()
     );
+}
+
+#[then("the over-contract Seedance usage charges the reservation ceiling without an asset")]
+async fn seedance_usage_exceeds_contract_is_bounded(world: &mut TokenCenterWorld) {
+    let job_id = world.generation_job_id.expect("generation job id");
+    for _ in 0..30 {
+        let value = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("over-contract generation status")
+            .json::<Value>()
+            .await
+            .expect("over-contract generation status JSON");
+        if value["status"] == "failed" {
+            assert_eq!(value["error_code"], "upstream_usage_exceeds_contract");
+            assert_eq!(value["billed_units"], 5);
+            assert_eq!(value["cost"], "0.5");
+            assert_eq!(value["assets"], json!([]));
+            assert_eq!(value["result"], Value::Null);
+            assert!(!value.to_string().contains("must-not-leak"));
+            let key = world
+                .client
+                .get(format!("{}/self/v1/key", world.service_url))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("key after over-contract generation")
+                .json::<Value>()
+                .await
+                .expect("key after over-contract generation JSON");
+            assert_eq!(key["available_balance"], "9.5");
+            world.response = value;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("over-contract generation did not fail: {}", world.response);
 }
 
 #[then("the rejected generation fails once and refunds its entire reservation")]
@@ -424,6 +593,18 @@ async fn rejected_generation_is_refunded(world: &mut TokenCenterWorld) {
             assert_eq!(value["billed_units"], 0);
             assert_eq!(value["cost"], "0");
             assert_eq!(value["error_code"], "generation_rejected");
+            assert_eq!(value["result"], Value::Null);
+            assert!(!value.to_string().contains("provider-sensitive-token"));
+            assert!(!value.to_string().contains("provider.invalid"));
+            let stored = world
+                .state
+                .as_ref()
+                .expect("test state")
+                .db
+                .generation_job(world.stable_key_id.expect("Seedance key id"), job_id)
+                .await
+                .expect("stored rejected generation");
+            assert_eq!(stored.result, None);
             let key = world
                 .client
                 .get(format!("{}/self/v1/key", world.service_url))
@@ -443,6 +624,77 @@ async fn rejected_generation_is_refunded(world: &mut TokenCenterWorld) {
     panic!("rejected generation did not fail: {}", world.response);
 }
 
+#[then("the assetless Seedance success fails safely and refunds its entire reservation")]
+async fn assetless_seedance_success_is_refunded(world: &mut TokenCenterWorld) {
+    assert_generation_failure_is_sanitized_and_refunded(
+        world,
+        "seedance_missing_asset",
+        &["missing-seedance-sensitive-token", "provider/private"],
+    )
+    .await;
+}
+
+#[then("the malicious Seedance job id is neither stored nor exposed")]
+async fn malicious_seedance_job_id_is_rejected(world: &mut TokenCenterWorld) {
+    let job_id = world.generation_job_id.expect("generation job id");
+    for _ in 0..40 {
+        let value = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("malicious id generation status")
+            .json::<Value>()
+            .await
+            .expect("malicious id generation JSON");
+        if value["status"] == "failed" {
+            assert_eq!(value["error_code"], "submission_outcome_unknown");
+            assert_eq!(value["upstream_job_id"], Value::Null);
+            assert_eq!(value["billed_units"], 0);
+            assert_eq!(value["cost"], "0");
+            assert_eq!(value["assets"], json!([]));
+            assert_eq!(value["result"], Value::Null);
+            assert!(!value.to_string().contains("invalid-upstream-id-secret"));
+            assert!(!value.to_string().contains("../private"));
+            let stored = world
+                .state
+                .as_ref()
+                .expect("test state")
+                .db
+                .generation_job(world.stable_key_id.expect("Seedance key id"), job_id)
+                .await
+                .expect("stored malicious id generation");
+            assert_eq!(stored.upstream_job_id, None);
+            assert!(!format!("{stored:?}").contains("invalid-upstream-id-secret"));
+            let posts = world
+                .mock
+                .as_ref()
+                .expect("mock server")
+                .received_requests()
+                .await
+                .expect("request recording enabled")
+                .into_iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST"
+                        && request.url.path() == "/api/v3/contents/generations/tasks"
+                })
+                .count();
+            assert_eq!(posts, 1);
+            world.response = value;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!(
+        "malicious upstream job id was not rejected: {}",
+        world.response
+    );
+}
+
 #[given("the mock ComfyUI upstream completes an image workflow")]
 async fn mock_comfyui_generation(world: &mut TokenCenterWorld) {
     Mock::given(method("POST"))
@@ -456,6 +708,8 @@ async fn mock_comfyui_generation(world: &mut TokenCenterWorld) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "comfy-test": {
                 "status": {"status_str": "success", "completed": true},
+                "provider_token": "successful-comfy-sensitive-token",
+                "internal_path": "/provider/private/comfy-success.png",
                 "outputs": {
                     "9": {"images": [{"filename": "result.png", "subfolder": "", "type": "output"}]}
                 }
@@ -474,24 +728,114 @@ async fn mock_comfyui_generation(world: &mut TokenCenterWorld) {
         .await;
 }
 
+#[given("the mock ComfyUI upstream reports success without generated assets")]
+async fn mock_comfyui_success_without_assets(world: &mut TokenCenterWorld) {
+    let server = world.mock.as_ref().expect("mock server");
+    Mock::given(method("POST"))
+        .and(path("/prompt"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"prompt_id": "comfy-no-assets"})),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/history/comfy-no-assets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "comfy-no-assets": {
+                "status": {"status_str": "success", "completed": true},
+                "outputs": {
+                    "9": {
+                        "text": ["provider-sensitive-comfy-token"],
+                        "internal_path": "/provider/private/comfy-output.png"
+                    }
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+#[given("the mock ComfyUI upstream returns seventeen generated assets")]
+async fn mock_comfyui_oversized_manifest(world: &mut TokenCenterWorld) {
+    let server = world.mock.as_ref().expect("mock server");
+    Mock::given(method("POST"))
+        .and(path("/prompt"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"prompt_id": "comfy-too-many"})),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+    let images = (0..17)
+        .map(|index| {
+            json!({
+                "filename": format!("result-{index}.png"),
+                "subfolder": "",
+                "type": "output"
+            })
+        })
+        .collect::<Vec<_>>();
+    Mock::given(method("GET"))
+        .and(path("/history/comfy-too-many"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "comfy-too-many": {
+                "status": {"status_str": "success", "completed": true},
+                "outputs": {"9": {"images": images}}
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/view"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(b"must-not-download-oversized-manifest"),
+        )
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
 #[when("the service creates a metered ComfyUI route and key")]
 async fn create_comfyui_route_and_key(world: &mut TokenCenterWorld) {
+    create_metered_comfyui_route_and_key(
+        world,
+        "comfy-public",
+        "workflow-v1",
+        json!({
+            "3": {"class_type": "KSampler", "inputs": {"seed": {"$mtc_param": "seed"}}},
+            "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "MTC"}}
+        }),
+        "image-user",
+        "image",
+    )
+    .await;
+}
+
+async fn create_metered_comfyui_route_and_key(
+    world: &mut TokenCenterWorld,
+    public_model: &str,
+    workflow_id: &str,
+    workflow_template: Value,
+    principal: &str,
+    alias: &str,
+) {
     let mock_url = world.mock.as_ref().expect("mock server").uri();
     let response = world
         .client
         .post(format!("{}/internal/v1/upstreams", world.service_url))
         .bearer_auth("test-service-token")
         .json(&json!({
-            "name": "comfyui",
+            "name": public_model,
             "driver": "comfyui",
             "config": {
                 "base_url": mock_url,
                 "api_prefix": "",
-                "workflow_id": "workflow-v1",
-                "workflow_template": {
-                    "3": {"class_type": "KSampler", "inputs": {"seed": {"$mtc_param": "seed"}}},
-                    "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "MTC"}}
-                }
+                "workflow_id": workflow_id,
+                "workflow_template": workflow_template
             },
             "credential": {"type": "none"}
         }))
@@ -505,9 +849,9 @@ async fn create_comfyui_route_and_key(world: &mut TokenCenterWorld) {
         .post(format!("{}/internal/v1/model-routes", world.service_url))
         .bearer_auth("test-service-token")
         .json(&json!({
-            "public_model": "comfy-public",
+            "public_model": public_model,
             "upstream_account_id": account["id"],
-            "upstream_model": "workflow-v1",
+            "upstream_model": workflow_id,
             "protocol": "generation"
         }))
         .send()
@@ -517,8 +861,8 @@ async fn create_comfyui_route_and_key(world: &mut TokenCenterWorld) {
     let response = world
         .client
         .post(format!(
-            "{}/internal/v1/generation-prices/USD/comfy-public",
-            world.service_url
+            "{}/internal/v1/generation-prices/USD/{public_model}",
+            world.service_url,
         ))
         .bearer_auth("test-service-token")
         .json(&json!({"billing_unit": "job", "price_per_unit": "0.2"}))
@@ -531,17 +875,20 @@ async fn create_comfyui_route_and_key(world: &mut TokenCenterWorld) {
         .post(format!("{}/internal/v1/keys", world.service_url))
         .bearer_auth("test-service-token")
         .json(&json!({
-            "principal_external_id": "image-user",
-            "alias": "image",
+            "principal_external_id": principal,
+            "alias": alias,
             "currency": "USD",
             "initial_balance": "10",
-            "policy": {"allowed_models": ["comfy-public"]}
+            "policy": {"allowed_models": [public_model]}
         }))
         .send()
         .await
         .expect("create ComfyUI key");
     assert_eq!(response.status(), StatusCode::CREATED);
     let key: Value = response.json().await.expect("ComfyUI key JSON");
+    world.stable_key_id = key["key_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok());
     world.current_key = key["key"].as_str().expect("ComfyUI key").to_owned();
 }
 
@@ -567,6 +914,176 @@ async fn create_comfyui_generation(world: &mut TokenCenterWorld) {
         .and_then(|value| Uuid::parse_str(value).ok());
 }
 
+#[when("the generation worker is stopped before it can submit upstream")]
+async fn stop_generation_worker(world: &mut TokenCenterWorld) {
+    let worker = world.worker_task.take().expect("generation worker task");
+    worker.abort();
+    let _ = worker.await;
+}
+
+#[when("a durable ComfyUI manifest is persisted before terminal settlement")]
+async fn persist_comfyui_manifest_before_terminal_settlement(world: &mut TokenCenterWorld) {
+    let state = world.state.as_ref().expect("test state");
+    let job_id = world.generation_job_id.expect("ComfyUI generation job id");
+    let submitting_worker = "manifest-submitting-worker";
+    let claimed = state
+        .db
+        .claim_generation_job(submitting_worker)
+        .await
+        .expect("claim queued manifest job")
+        .expect("queued manifest job");
+    assert_eq!(claimed.job_id, job_id);
+    let submission_nonce = Uuid::now_v7();
+    state
+        .db
+        .mark_generation_submitting(job_id, submitting_worker, submission_nonce)
+        .await
+        .expect("mark manifest job submitting");
+    state
+        .db
+        .mark_generation_submitted(
+            job_id,
+            submitting_worker,
+            submission_nonce,
+            "manifest-recovery-upstream-job",
+        )
+        .await
+        .expect("mark manifest job submitted");
+
+    tokio::time::sleep(std::time::Duration::from_millis(2_050)).await;
+    let settlement_worker = "manifest-settlement-worker";
+    let running = state
+        .db
+        .claim_generation_job(settlement_worker)
+        .await
+        .expect("claim running manifest job")
+        .expect("running manifest job");
+    assert_eq!(running.job_id, job_id);
+    let attempt_nonce = Uuid::now_v7();
+    let staging_lease = match state
+        .db
+        .begin_archive_staging_attempt(BeginArchiveStagingInput {
+            key: ArchiveStagingKey::new(
+                ArchiveStagingOwner::GenerationJob(job_id),
+                ArchiveStagingPurpose::Assets,
+                attempt_nonce,
+            )
+            .expect("valid generation staging key"),
+            intent_digest: ArchiveStagingIntentDigest::new("b".repeat(64))
+                .expect("fixed non-secret typed test intent"),
+            lease_token: Uuid::now_v7(),
+            lease_owner: ArchiveStagingLeaseOwner::new("manifest-settlement-worker")
+                .expect("safe test lease owner"),
+        })
+        .await
+        .expect("begin durable generation staging intent")
+    {
+        BeginArchiveStagingResult::Created(lease) => lease,
+        other => panic!("unexpected generation staging begin result: {other:?}"),
+    };
+    let object_locator = format!("{}/asset-0", staging_lease.key.canonical_prefix());
+    let body = bytes::Bytes::from_static(b"durable-manifest-image");
+    state
+        .archive
+        .put(&object_locator, body.clone())
+        .await
+        .expect("persist durable manifest object");
+    let manifest = GenerationStagedAssets {
+        attempt_nonce,
+        billed_units: 1,
+        assets: vec![ArchivedGenerationAsset {
+            asset_id: Uuid::now_v7(),
+            index: 0,
+            object_locator,
+            mime_type: "image/png".to_owned(),
+            size_bytes: i64::try_from(body.len()).expect("manifest body size"),
+            filename: "recovered.png".to_owned(),
+        }],
+    };
+    assert!(
+        state
+            .db
+            .save_generation_staged_assets_staged(
+                job_id,
+                settlement_worker,
+                &manifest,
+                &staging_lease,
+            )
+            .await
+            .expect("persist exact generation manifest and binding")
+    );
+    state
+        .db
+        .reschedule_generation_job(job_id, settlement_worker, 0, None)
+        .await
+        .expect("simulate crash before terminal settlement");
+}
+
+#[then("the restarted worker settles the durable manifest without contacting ComfyUI")]
+async fn restarted_worker_recovers_comfyui_manifest(world: &mut TokenCenterWorld) {
+    let state = world.state.clone().expect("test state");
+    world.worker_task = Some(tokio::spawn(worker::run(state)));
+    let job_id = world.generation_job_id.expect("ComfyUI generation job id");
+    for _ in 0..30 {
+        let detail = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("recovered generation status")
+            .json::<Value>()
+            .await
+            .expect("recovered generation status JSON");
+        if detail["status"] == "succeeded" {
+            assert_eq!(detail["cost"], "0.2");
+            assert_eq!(detail["billed_units"], 1);
+            assert_eq!(detail["assets"].as_array().map(Vec::len), Some(1));
+            let asset_id = detail["assets"][0]["asset_id"]
+                .as_str()
+                .expect("recovered asset id");
+            let downloaded = world
+                .client
+                .get(format!(
+                    "{}/self/v1/generations/{job_id}/assets/{asset_id}",
+                    world.service_url
+                ))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("download recovered manifest asset");
+            assert_eq!(downloaded.status(), StatusCode::OK);
+            assert_eq!(
+                downloaded.bytes().await.expect("recovered manifest bytes"),
+                bytes::Bytes::from_static(b"durable-manifest-image")
+            );
+            let upstream_requests = world
+                .mock
+                .as_ref()
+                .expect("mock server")
+                .received_requests()
+                .await
+                .expect("request recording enabled")
+                .into_iter()
+                .filter(|request| {
+                    matches!(
+                        request.url.path(),
+                        "/prompt" | "/history/manifest-recovery-upstream-job" | "/view"
+                    )
+                })
+                .count();
+            assert_eq!(upstream_requests, 0);
+            world.response = detail;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("durable manifest was not recovered: {}", world.response);
+}
+
 #[then("the ComfyUI generation eventually succeeds with an archived image costing 0.2")]
 async fn comfyui_generation_succeeds(world: &mut TokenCenterWorld) {
     let job_id = world.generation_job_id.expect("ComfyUI generation job id");
@@ -587,10 +1104,45 @@ async fn comfyui_generation_succeeds(world: &mut TokenCenterWorld) {
         if value["status"] == "succeeded" {
             assert_eq!(value["billed_units"], 1);
             assert_eq!(value["cost"], "0.2");
+            assert_eq!(value["assets"].as_array().map(Vec::len), Some(1));
+            assert_eq!(value["assets"][0]["mime_type"], "image/png");
+            assert_eq!(value["assets"][0]["filename"], "result.png");
+            assert_eq!(value["result"]["assets"], value["assets"]);
+            assert!(!value.to_string().contains("objects/blake3/"));
             assert!(
-                value["result"]["archive_objects"][0]
-                    .as_str()
-                    .is_some_and(|location| location.starts_with("objects/blake3/"))
+                !value
+                    .to_string()
+                    .contains("successful-comfy-sensitive-token")
+            );
+            assert!(!value.to_string().contains("provider/private"));
+            let stored = world
+                .state
+                .as_ref()
+                .expect("test state")
+                .db
+                .generation_job(world.stable_key_id.expect("ComfyUI key id"), job_id)
+                .await
+                .expect("stored successful ComfyUI generation");
+            let stored_result = stored.result.expect("safe ComfyUI result").to_string();
+            assert!(!stored_result.contains("successful-comfy-sensitive-token"));
+            assert!(!stored_result.contains("provider/private"));
+            let asset_id = value["assets"][0]["asset_id"]
+                .as_str()
+                .expect("ComfyUI image asset id");
+            let downloaded = world
+                .client
+                .get(format!(
+                    "{}/self/v1/generations/{job_id}/assets/{asset_id}",
+                    world.service_url
+                ))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("download ComfyUI PNG");
+            assert_eq!(downloaded.status(), StatusCode::OK);
+            assert_eq!(
+                downloaded.bytes().await.expect("downloaded PNG bytes"),
+                bytes::Bytes::from_static(b"mock-png-content")
             );
             assert_generation_stats(world, "comfy-public", "0.2").await;
             world.response = value;
@@ -601,8 +1153,462 @@ async fn comfyui_generation_succeeds(world: &mut TokenCenterWorld) {
     panic!("ComfyUI generation did not complete: {}", world.response);
 }
 
+#[then("the assetless ComfyUI success fails safely and refunds its entire reservation")]
+async fn assetless_comfyui_success_is_refunded(world: &mut TokenCenterWorld) {
+    assert_generation_failure_is_sanitized_and_refunded(
+        world,
+        "comfyui_missing_assets",
+        &["provider-sensitive-comfy-token", "provider/private"],
+    )
+    .await;
+}
+
+#[then("the oversized ComfyUI manifest fails before downloads and refunds its reservation")]
+async fn oversized_comfyui_manifest_is_refunded(world: &mut TokenCenterWorld) {
+    assert_generation_failure_is_sanitized_and_refunded(world, "comfyui_asset_limit_exceeded", &[])
+        .await;
+}
+
+async fn assert_generation_failure_is_sanitized_and_refunded(
+    world: &mut TokenCenterWorld,
+    expected_error_code: &str,
+    forbidden: &[&str],
+) {
+    let job_id = world.generation_job_id.expect("generation job id");
+    for _ in 0..30 {
+        let value = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("assetless generation status")
+            .json::<Value>()
+            .await
+            .expect("assetless generation status JSON");
+        if value["status"] == "failed" {
+            assert_eq!(value["billed_units"], 0);
+            assert_eq!(value["cost"], "0");
+            assert_eq!(value["error_code"], expected_error_code);
+            assert_eq!(value["result"], Value::Null);
+            assert_eq!(value["assets"], json!([]));
+            let serialized = value.to_string();
+            for secret in forbidden {
+                assert!(!serialized.contains(secret));
+            }
+            let stored = world
+                .state
+                .as_ref()
+                .expect("test state")
+                .db
+                .generation_job(world.stable_key_id.expect("generation key id"), job_id)
+                .await
+                .expect("stored assetless generation");
+            assert_eq!(stored.result, None);
+            let key = world
+                .client
+                .get(format!("{}/self/v1/key", world.service_url))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("key after assetless generation")
+                .json::<Value>()
+                .await
+                .expect("key after assetless generation JSON");
+            assert_eq!(key["available_balance"], "10");
+            world.response = value;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!("assetless generation did not fail: {}", world.response);
+}
+
+#[given("the mock ComfyUI upstream completes an MP4 video workflow")]
+async fn mock_comfyui_video_generation(world: &mut TokenCenterWorld) {
+    let server = world.mock.as_ref().expect("mock server");
+    Mock::given(method("POST"))
+        .and(path("/prompt"))
+        .and(header_exists("idempotency-key"))
+        .and(body_partial_json(json!({
+            "prompt": {
+                "12": {
+                    "class_type": "VHS_VideoCombine",
+                    "inputs": {"frame_rate": 24}
+                }
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"prompt_id": "comfy-video"})))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/history/comfy-video"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "comfy-video": {
+                "status": {"status_str": "success", "completed": true},
+                "outputs": {
+                    "12": {
+                        "videos": [{
+                            "filename": "result.mp4",
+                            "subfolder": "videos",
+                            "type": "output"
+                        }]
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/view"))
+        .and(query_param("filename", "result.mp4"))
+        .and(query_param("subfolder", "videos"))
+        .and(query_param("type", "output"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "video/mp4")
+                .set_body_bytes(b"mock-comfy-video-content"),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[when("the service creates a metered ComfyUI video route and key")]
+async fn create_comfyui_video_route_and_key(world: &mut TokenCenterWorld) {
+    create_metered_comfyui_route_and_key(
+        world,
+        "comfy-video-public",
+        "video-workflow-v1",
+        json!({
+            "12": {
+                "class_type": "VHS_VideoCombine",
+                "inputs": {"frame_rate": {"$mtc_param": "frame_rate"}}
+            }
+        }),
+        "video-user",
+        "video",
+    )
+    .await;
+}
+
+#[when("the client creates a ComfyUI video generation")]
+async fn create_comfyui_video_generation(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/v1/videos/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .json(&json!({
+            "model": "comfy-video-public",
+            "input": {
+                "parameters": {"frame_rate": 24}
+            }
+        }))
+        .send()
+        .await
+        .expect("create ComfyUI video generation");
+    world.status = Some(response.status());
+    world.response = response
+        .json()
+        .await
+        .expect("ComfyUI video generation JSON");
+    world.generation_job_id = world.response["job_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok());
+}
+
+#[then(
+    "the ComfyUI video is available through self service with exact archived content and cost 0.2"
+)]
+async fn comfyui_video_generation_succeeds(world: &mut TokenCenterWorld) {
+    let job_id = world
+        .generation_job_id
+        .expect("ComfyUI video generation job id");
+    for _ in 0..30 {
+        let detail = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("ComfyUI video self-service detail");
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: Value = detail
+            .json()
+            .await
+            .expect("ComfyUI video self-service detail JSON");
+        if detail["status"] == "succeeded" {
+            assert_eq!(detail["billed_units"], 1);
+            assert_eq!(detail["cost"], "0.2");
+            assert_eq!(detail["result"]["provider"]["status"], "success");
+            let asset = &detail["assets"][0];
+            assert_eq!(asset["index"], 0);
+            assert_eq!(asset["mime_type"], "video/mp4");
+            assert_eq!(
+                asset["size_bytes"],
+                u64::try_from(b"mock-comfy-video-content".len()).unwrap()
+            );
+            assert_eq!(asset["filename"], "result.mp4");
+            assert_eq!(detail["result"]["assets"][0], *asset);
+            assert!(
+                !detail.to_string().contains("objects/blake3/"),
+                "self-service metadata must not expose an internal archive locator"
+            );
+            let asset_id = asset["asset_id"]
+                .as_str()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .expect("ComfyUI video asset id");
+
+            let downloaded = world
+                .client
+                .get(format!(
+                    "{}/self/v1/generations/{job_id}/assets/{asset_id}",
+                    world.service_url
+                ))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("download ComfyUI video asset");
+            assert_eq!(downloaded.status(), StatusCode::OK);
+            assert_eq!(
+                downloaded
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("video/mp4")
+            );
+            assert_eq!(
+                downloaded
+                    .bytes()
+                    .await
+                    .expect("downloaded ComfyUI video bytes"),
+                bytes::Bytes::from_static(b"mock-comfy-video-content")
+            );
+
+            let ranged = world
+                .client
+                .get(format!(
+                    "{}/self/v1/generations/{job_id}/assets/{asset_id}",
+                    world.service_url
+                ))
+                .bearer_auth(&world.current_key)
+                .header(reqwest::header::RANGE, "bytes=5-9")
+                .send()
+                .await
+                .expect("range download ComfyUI video asset");
+            assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                ranged
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bytes 5-9/24")
+            );
+            assert_eq!(
+                ranged.bytes().await.expect("ranged ComfyUI video bytes"),
+                bytes::Bytes::from_static(b"comfy")
+            );
+            for invalid in ["bytes=99-", "bytes=0-1,3-4"] {
+                let response = world
+                    .client
+                    .get(format!(
+                        "{}/self/v1/generations/{job_id}/assets/{asset_id}",
+                        world.service_url
+                    ))
+                    .bearer_auth(&world.current_key)
+                    .header(reqwest::header::RANGE, invalid)
+                    .send()
+                    .await
+                    .expect("invalid ComfyUI video range");
+                assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(reqwest::header::CONTENT_RANGE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("bytes */24")
+                );
+            }
+            let non_utf8_range = world
+                .client
+                .get(format!(
+                    "{}/self/v1/generations/{job_id}/assets/{asset_id}",
+                    world.service_url
+                ))
+                .bearer_auth(&world.current_key)
+                .header(
+                    reqwest::header::RANGE,
+                    reqwest::header::HeaderValue::from_bytes(b"bytes=\xff")
+                        .expect("opaque non-UTF-8 Range header"),
+                )
+                .send()
+                .await
+                .expect("non-UTF-8 ComfyUI video range");
+            assert_eq!(non_utf8_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+            assert_eq!(
+                non_utf8_range
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bytes */24")
+            );
+
+            let other_key = world
+                .client
+                .post(format!("{}/internal/v1/keys", world.service_url))
+                .bearer_auth("test-service-token")
+                .json(&json!({
+                    "principal_external_id": "other-asset-user",
+                    "alias": "other-asset-user"
+                }))
+                .send()
+                .await
+                .expect("create unrelated asset key");
+            assert_eq!(other_key.status(), StatusCode::CREATED);
+            let other_key: Value = other_key.json().await.expect("unrelated key JSON");
+            let wrong_owner = world
+                .client
+                .get(format!(
+                    "{}/self/v1/generations/{job_id}/assets/{asset_id}",
+                    world.service_url
+                ))
+                .bearer_auth(other_key["key"].as_str().expect("unrelated key"))
+                .send()
+                .await
+                .expect("cross-key asset request");
+            assert_eq!(wrong_owner.status(), StatusCode::NOT_FOUND);
+
+            let operator = world
+                .client
+                .get(format!(
+                    "{}/internal/v1/generations/{job_id}/assets/{asset_id}?tenant_external_id=default",
+                    world.service_url
+                ))
+                .bearer_auth("test-service-token")
+                .send()
+                .await
+                .expect("operator asset request");
+            assert_eq!(operator.status(), StatusCode::OK);
+            assert_eq!(
+                operator.bytes().await.expect("operator asset bytes"),
+                bytes::Bytes::from_static(b"mock-comfy-video-content")
+            );
+            let wrong_tenant = world
+                .client
+                .get(format!(
+                    "{}/internal/v1/generations/{job_id}/assets/{asset_id}?tenant_external_id=other-tenant",
+                    world.service_url
+                ))
+                .bearer_auth("test-service-token")
+                .send()
+                .await
+                .expect("cross-tenant operator asset request");
+            assert_eq!(wrong_tenant.status(), StatusCode::NOT_FOUND);
+
+            let state = world.state.clone().expect("test application state");
+            let key = state
+                .db
+                .authenticate_key(&world.current_key, state.config.key_pepper.as_bytes())
+                .await
+                .expect("authenticate ComfyUI video key");
+            let stored = state
+                .db
+                .generation_asset_for_key(key.key_id, job_id, asset_id)
+                .await
+                .expect("stored ComfyUI video asset");
+            let expected_prefix = format!("staging/generation/{job_id}/assets/");
+            assert!(stored.object_locator.starts_with(&expected_prefix));
+            let suffix = stored
+                .object_locator
+                .strip_prefix(&expected_prefix)
+                .expect("job-scoped generation object");
+            let (attempt_nonce, asset_name) = suffix
+                .split_once('/')
+                .expect("attempt-scoped generation object");
+            Uuid::parse_str(attempt_nonce).expect("opaque generation attempt nonce");
+            assert_eq!(asset_name, "asset-0");
+            assert_eq!(stored.view.mime_type, "video/mp4");
+            assert_eq!(stored.view.filename, "result.mp4");
+            assert_eq!(
+                state
+                    .archive
+                    .get(&stored.object_locator)
+                    .await
+                    .expect("archived ComfyUI video bytes"),
+                bytes::Bytes::from_static(b"mock-comfy-video-content")
+            );
+
+            let list = world
+                .client
+                .get(format!("{}/self/v1/generations", world.service_url))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("ComfyUI video self-service list");
+            assert_eq!(list.status(), StatusCode::OK);
+            let list: Value = list
+                .json()
+                .await
+                .expect("ComfyUI video self-service list JSON");
+            assert_eq!(list.as_array().map(Vec::len), Some(1));
+            assert_eq!(list[0]["job_id"], job_id.to_string());
+            assert_eq!(list[0]["assets"][0], *asset);
+            assert!(!list.to_string().contains("objects/blake3/"));
+
+            let key = world
+                .client
+                .get(format!("{}/self/v1/key", world.service_url))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("key after ComfyUI video generation");
+            assert_eq!(key.status(), StatusCode::OK);
+            let key: Value = key
+                .json()
+                .await
+                .expect("key after ComfyUI video generation JSON");
+            assert_eq!(key["available_balance"], "9.8");
+            assert_generation_stats(world, "comfy-video-public", "0.2").await;
+            world.response = detail;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!(
+        "ComfyUI video generation did not complete: {}",
+        world.response
+    );
+}
+
 #[given("the mock OpenAI Images upstream returns a generated icon")]
 async fn mock_openai_image_generation(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .and(body_partial_json(json!({
+            "model": "gpt-image-upstream",
+            "prompt": "a compact token loop icon"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "data": [{"b64_json": "bW9jay1wbmc="}]
+        })))
+        .expect(2)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock OpenAI Images upstream returns a generated icon without requiring idempotency")]
+async fn mock_non_idempotent_openai_image_generation(world: &mut TokenCenterWorld) {
     Mock::given(method("POST"))
         .and(path("/v1/images/generations"))
         .and(header("authorization", "Bearer image-secret"))
@@ -614,6 +1620,144 @@ async fn mock_openai_image_generation(world: &mut TokenCenterWorld) {
             "created": 1,
             "data": [{"b64_json": "bW9jay1wbmc="}]
         })))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock OpenAI Images upstream returns an exact-origin signed URL")]
+async fn mock_openai_image_url_generation(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "id": "provider-secret-response-id",
+            "debug_url": "https://provider.invalid/debug?token=must-not-leak",
+            "data": [{
+                "url": format!("{mock_url}/generated/SECRET_TOKEN.png?token=must-not-leak"),
+                "provider_trace": "must-not-leak"
+            }],
+            "usage": {"total_tokens": 7, "provider_debug": "must-not-leak"}
+        })))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/SECRET_TOKEN.png"))
+        .and(query_param("token", "must-not-leak"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(b"exact-url-png"),
+        )
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock OpenAI Images upstream returns an empty signed URL asset")]
+async fn mock_empty_openai_image_url_generation(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "data": [{"url": format!("{mock_url}/generated/empty.png?token=must-not-leak")}]
+        })))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/generated/empty.png"))
+        .and(query_param("token", "must-not-leak"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(Vec::<u8>::new()),
+        )
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock OpenAI Images upstream returns ten assets over the aggregate budget")]
+async fn mock_openai_image_aggregate_limit(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let data = (0..10)
+        .map(|index| json!({"url": format!("{mock_url}/generated/aggregate-{index}.png")}))
+        .collect::<Vec<_>>();
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .and(body_partial_json(json!({"n": 10})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 1,
+            "data": data
+        })))
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    for index in 0..9 {
+        Mock::given(method("GET"))
+            .and(path(format!("/generated/aggregate-{index}.png")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes([u8::try_from(index).expect("small index")]),
+            )
+            .expect(1)
+            .mount(world.mock.as_ref().expect("mock server"))
+            .await;
+    }
+    // This final object fits an empty 512 MiB budget exactly, but cannot fit
+    // the same request budget after the first nine assets. The body is never
+    // read because Content-Length is checked before streaming.
+    Mock::given(method("GET"))
+        .and(path("/generated/aggregate-9.png"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .insert_header("content-length", "536870912"),
+        )
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock OpenAI Images upstream exceeds the response limit by one byte")]
+async fn mock_oversized_openai_image_generation(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_bytes(vec![b'x'; 16 * 1024 * 1024 + 1]),
+        )
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock OpenAI Images upstream rejects with a sensitive error body")]
+async fn mock_sensitive_openai_image_rejection(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/images/generations"))
+        .and(header("authorization", "Bearer image-secret"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "message": "provider detail must-not-leak",
+                "signed_url": "https://images.example.invalid/result.png?token=must-not-leak"
+            }
+        })))
+        .expect(1)
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
 }
@@ -650,6 +1794,11 @@ async fn create_openai_image_route_and_key(world: &mut TokenCenterWorld) {
         .await
         .expect("create Images route");
     assert_eq!(response.status(), StatusCode::CREATED);
+    let route: Value = response.json().await.expect("Images route JSON");
+    world.image_route_id = route["id"].as_str().and_then(|id| Uuid::parse_str(id).ok());
+    world.image_route_updated_at = route["updated_at"]
+        .as_i64()
+        .expect("Images route updated_at");
     let response = world
         .client
         .post(format!(
@@ -670,7 +1819,7 @@ async fn create_openai_image_route_and_key(world: &mut TokenCenterWorld) {
             "principal_external_id": "image-api-user",
             "alias": "image-api",
             "currency": "USD",
-            "initial_balance": "10",
+            "initial_balance": "0.3",
             "policy": {"allowed_models": ["gpt-image-public"]}
         }))
         .send()
@@ -682,10 +1831,38 @@ async fn create_openai_image_route_and_key(world: &mut TokenCenterWorld) {
     world.stable_key_id = key["key_id"]
         .as_str()
         .and_then(|id| Uuid::parse_str(id).ok());
+    world.stable_account_id = key["account_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok());
 }
 
 #[when("the client creates an OpenAI-compatible image")]
 async fn create_openai_compatible_image(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/v1/images/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .header("idempotency-key", "openai-image-stable-1")
+        .json(&json!({
+            "model": "gpt-image-public",
+            "prompt": "a compact token loop icon",
+            "n": 1,
+            "size": "1024x1024"
+        }))
+        .send()
+        .await
+        .expect("create OpenAI-compatible image");
+    world.status = Some(response.status());
+    world.synchronous_request_id = response
+        .headers()
+        .get("x-mtc-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok());
+    world.response = response.json().await.expect("Images response JSON");
+}
+
+#[when("the client creates an OpenAI-compatible image without an idempotency key")]
+async fn create_non_idempotent_openai_compatible_image(world: &mut TokenCenterWorld) {
     let response = world
         .client
         .post(format!("{}/v1/images/generations", world.service_url))
@@ -698,14 +1875,142 @@ async fn create_openai_compatible_image(world: &mut TokenCenterWorld) {
         }))
         .send()
         .await
-        .expect("create OpenAI-compatible image");
+        .expect("create non-idempotent OpenAI-compatible image");
     world.status = Some(response.status());
-    world.response = response.json().await.expect("Images response JSON");
+    world.synchronous_request_id = response
+        .headers()
+        .get("x-mtc-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok());
+    world.response = response
+        .json()
+        .await
+        .expect("non-idempotent Images response JSON");
+}
+
+#[when("the client creates ten OpenAI-compatible images in one request")]
+async fn create_ten_openai_compatible_images(world: &mut TokenCenterWorld) {
+    let grant = world
+        .client
+        .post(format!(
+            "{}/internal/v1/accounts/{}/grants",
+            world.service_url,
+            world.stable_account_id.expect("Images account id")
+        ))
+        .bearer_auth("test-service-token")
+        .header("idempotency-key", "image-aggregate-budget-credit")
+        .json(&json!({"amount": "2.7", "source": "aggregate-budget-test"}))
+        .send()
+        .await
+        .expect("grant aggregate image test credit");
+    assert_eq!(grant.status(), StatusCode::CREATED);
+    let response = world
+        .client
+        .post(format!("{}/v1/images/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .header("idempotency-key", "openai-image-aggregate-budget")
+        .json(&json!({
+            "model": "gpt-image-public",
+            "prompt": "ten bounded icons",
+            "n": 10,
+            "size": "1024x1024"
+        }))
+        .send()
+        .await
+        .expect("create ten OpenAI-compatible images");
+    world.status = Some(response.status());
+    world.synchronous_request_id = response
+        .headers()
+        .get("x-mtc-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok());
+    world.response = response
+        .json()
+        .await
+        .expect("aggregate Images response JSON");
+}
+
+async fn replay_openai_compatible_image(world: &TokenCenterWorld) -> reqwest::Response {
+    world
+        .client
+        .post(format!("{}/v1/images/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .header("idempotency-key", "openai-image-stable-1")
+        .json(&json!({
+            "model": "gpt-image-public",
+            "prompt": "a compact token loop icon",
+            "n": 1,
+            "size": "1024x1024"
+        }))
+        .send()
+        .await
+        .expect("replay OpenAI-compatible image")
 }
 
 #[then("the OpenAI image response is archived and costs 0.3")]
 async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
     assert_eq!(world.response["data"][0]["b64_json"], "bW9jay1wbmc=");
+    let replay = replay_openai_compatible_image(world).await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let expected_request_id = world
+        .synchronous_request_id
+        .expect("synchronous image request id")
+        .to_string();
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-mtc-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_request_id.as_str())
+    );
+    assert_eq!(
+        replay.json::<Value>().await.expect("replayed image JSON"),
+        world.response
+    );
+    let mismatch = world
+        .client
+        .post(format!("{}/v1/images/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .header("idempotency-key", "openai-image-stable-1")
+        .json(&json!({
+            "model": "gpt-image-public",
+            "prompt": "a different image must not reuse the claim",
+            "n": 1,
+            "size": "1024x1024"
+        }))
+        .send()
+        .await
+        .expect("mismatched OpenAI image replay");
+    assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+    let key: Value = world
+        .client
+        .get(format!("{}/self/v1/key", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("image key after exact replay")
+        .json()
+        .await
+        .expect("image key JSON after exact replay");
+    assert_eq!(key["available_balance"], "0");
+    let upstream_requests = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("received image upstream requests")
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/images/generations")
+        .collect::<Vec<_>>();
+    assert_eq!(upstream_requests.len(), 1);
+    let upstream_idempotency = upstream_requests[0]
+        .headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .expect("derived upstream image idempotency header");
+    assert!(upstream_idempotency.starts_with("mtc-img-"));
+    assert_ne!(upstream_idempotency, "openai-image-stable-1");
     for _ in 0..30 {
         let stats: Value = world
             .client
@@ -730,11 +2035,597 @@ async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
                 .await
                 .expect("image request history JSON");
             assert_eq!(requests[0]["protocol"], "openai-image");
+            let other = world
+                .client
+                .post(format!("{}/internal/v1/keys", world.service_url))
+                .bearer_auth("test-service-token")
+                .json(&json!({
+                    "principal_external_id": "image-api-second-identity",
+                    "alias": "image-api-second-identity",
+                    "currency": "USD",
+                    "initial_balance": "0.3",
+                    "policy": {"allowed_models": ["gpt-image-public"]}
+                }))
+                .send()
+                .await
+                .expect("create second image identity")
+                .json::<Value>()
+                .await
+                .expect("second image identity JSON");
+            let second = world
+                .client
+                .post(format!("{}/v1/images/generations", world.service_url))
+                .bearer_auth(other["key"].as_str().expect("second image identity secret"))
+                .header("idempotency-key", "openai-image-stable-1")
+                .json(&json!({
+                    "model": "gpt-image-public",
+                    "prompt": "a compact token loop icon",
+                    "n": 1,
+                    "size": "1024x1024"
+                }))
+                .send()
+                .await
+                .expect("same image idempotency key under another identity");
+            assert_eq!(second.status(), StatusCode::OK);
+            let upstream_idempotencies = world
+                .mock
+                .as_ref()
+                .expect("mock server")
+                .received_requests()
+                .await
+                .expect("cross-identity upstream image requests")
+                .into_iter()
+                .filter(|request| request.url.path() == "/v1/images/generations")
+                .map(|request| {
+                    request
+                        .headers
+                        .get("idempotency-key")
+                        .and_then(|value| value.to_str().ok())
+                        .expect("derived cross-identity idempotency header")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(upstream_idempotencies.len(), 2);
+            assert_ne!(upstream_idempotencies[0], upstream_idempotencies[1]);
+            assert!(
+                upstream_idempotencies
+                    .iter()
+                    .all(|value| value.starts_with("mtc-img-") && value != "openai-image-stable-1")
+            );
+            let route_id = world.image_route_id.expect("OpenAI image route id");
+            let disabled = world
+                .client
+                .patch(format!(
+                    "{}/internal/v1/model-routes/{route_id}",
+                    world.service_url
+                ))
+                .bearer_auth("test-service-token")
+                .json(&json!({
+                    "tenant_external_id": "default",
+                    "enabled": false,
+                    "expected_updated_at": world.image_route_updated_at
+                }))
+                .send()
+                .await
+                .expect("disable OpenAI image route after completion");
+            assert_eq!(disabled.status(), StatusCode::OK);
+            let route_independent_replay = replay_openai_compatible_image(world).await;
+            assert_eq!(route_independent_replay.status(), StatusCode::OK);
+            assert_eq!(
+                route_independent_replay
+                    .json::<Value>()
+                    .await
+                    .expect("route-independent image replay"),
+                world.response
+            );
+            let key_id = world.stable_key_id.expect("OpenAI image key id");
+            let suspended = world
+                .client
+                .patch(format!(
+                    "{}/internal/v1/keys/{key_id}/status",
+                    world.service_url
+                ))
+                .bearer_auth("test-service-token")
+                .json(&json!({"status": "suspended"}))
+                .send()
+                .await
+                .expect("suspend OpenAI image key after completion");
+            assert_eq!(suspended.status(), StatusCode::OK);
+            let rejected_replay = replay_openai_compatible_image(world).await;
+            assert_eq!(rejected_replay.status(), StatusCode::UNAUTHORIZED);
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("OpenAI image request was not metered");
+}
+
+#[then("the non-idempotent OpenAI image is atomically archived and costs 0.3")]
+async fn non_idempotent_openai_image_is_atomic(world: &mut TokenCenterWorld) {
+    assert_eq!(world.response["data"][0]["b64_json"], "bW9jay1wbmc=");
+    let request_id = world
+        .synchronous_request_id
+        .expect("non-idempotent synchronous image request id");
+    let detail = world
+        .client
+        .get(format!(
+            "{}/self/v1/requests/{request_id}",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("non-idempotent image detail")
+        .json::<Value>()
+        .await
+        .expect("non-idempotent image detail JSON");
+    assert_eq!(detail["status_code"], 200);
+    assert_eq!(detail["cost"], "0.3");
+    assert_eq!(detail["archive_complete"], true);
+    let key = world
+        .client
+        .get(format!("{}/self/v1/key", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("non-idempotent image key")
+        .json::<Value>()
+        .await
+        .expect("non-idempotent image key JSON");
+    assert_eq!(key["available_balance"], "0");
+    let upstream_requests = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("non-idempotent upstream image requests")
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/images/generations")
+        .collect::<Vec<_>>();
+    assert_eq!(upstream_requests.len(), 1);
+    assert!(!upstream_requests[0].headers.contains_key("idempotency-key"));
+}
+
+#[then("the signed URL image is stored in CAS without exposing its secret URL")]
+async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
+    assert!(!world.response.to_string().contains("must-not-leak"));
+    assert!(!world.response.to_string().contains("SECRET_TOKEN"));
+    let public_url = world.response["data"][0]["url"]
+        .as_str()
+        .expect("normalized MTC asset URL");
+    assert!(public_url.starts_with("/self/v1/requests/"));
+    assert!(!public_url.contains("must-not-leak"));
+    let request_id = world
+        .synchronous_request_id
+        .expect("synchronous image request id");
+    let replay = replay_openai_compatible_image(world).await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let expected_request_id = request_id.to_string();
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-mtc-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_request_id.as_str())
+    );
+    assert_eq!(
+        replay
+            .json::<Value>()
+            .await
+            .expect("replayed URL image JSON"),
+        world.response
+    );
+    let state = world.state.clone().expect("test application state");
+    let assets = state
+        .db
+        .synchronous_generation_assets(request_id)
+        .await
+        .expect("synchronous image assets");
+    assert_eq!(assets.len(), 1);
+    let result_prefix = format!("staging/synchronous/{request_id}/result/");
+    let result_suffix = assets[0]
+        .object_locator
+        .strip_prefix(&result_prefix)
+        .expect("canonical synchronous result prefix");
+    let (result_attempt, result_name) = result_suffix
+        .split_once('/')
+        .expect("attempt-scoped synchronous result");
+    let result_attempt = Uuid::parse_str(result_attempt).expect("result attempt UUID");
+    assert_eq!(result_name, "asset-0");
+    assert_eq!(
+        state
+            .db
+            .archive_staging_attempt(result_attempt)
+            .await
+            .expect("read synchronous result staging attempt")
+            .expect("synchronous result staging attempt")
+            .state,
+        ArchiveStagingState::Bound
+    );
+    assert_eq!(assets[0].view.mime_type, "image/png");
+    assert_eq!(assets[0].view.filename, "asset-0.png");
+    assert_eq!(
+        public_url,
+        format!(
+            "/self/v1/requests/{request_id}/assets/{}",
+            assets[0].view.asset_id
+        )
+    );
+    assert_eq!(
+        state
+            .archive
+            .get(&assets[0].object_locator)
+            .await
+            .expect("read URL-backed image CAS"),
+        bytes::Bytes::from_static(b"exact-url-png")
+    );
+    let response_refs = state
+        .db
+        .request_archive_refs(
+            world.stable_key_id.expect("stable image key id"),
+            request_id,
+        )
+        .await
+        .expect("URL-backed image archive references");
+    let stored_response = state
+        .archive
+        .get(
+            response_refs
+                .response_object
+                .as_deref()
+                .expect("stored normalized image response"),
+        )
+        .await
+        .expect("read normalized image response CAS");
+    assert!(!String::from_utf8_lossy(&stored_response).contains("must-not-leak"));
+    let detail = world
+        .client
+        .get(format!(
+            "{}/self/v1/requests/{request_id}",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("URL-backed image request detail");
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail: Value = detail.json().await.expect("URL-backed image detail JSON");
+    let rendered = detail["response_body"].to_string();
+    assert!(!rendered.contains("must-not-leak"));
+    assert!(!rendered.contains("objects/blake3/"));
+    assert_eq!(
+        detail["response_body"]["data"][0]["archived_asset"]["asset_id"],
+        assets[0].view.asset_id.to_string()
+    );
+    let asset_url = format!(
+        "{}/self/v1/requests/{request_id}/assets/{}",
+        world.service_url, assets[0].view.asset_id
+    );
+    let download = world
+        .client
+        .get(&asset_url)
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("download synchronous image asset");
+    assert_eq!(download.status(), StatusCode::OK);
+    assert_eq!(download.headers()["content-length"], "13");
+    assert_eq!(
+        download.bytes().await.expect("synchronous image bytes"),
+        bytes::Bytes::from_static(b"exact-url-png")
+    );
+    let range = world
+        .client
+        .get(&asset_url)
+        .bearer_auth(&world.current_key)
+        .header("range", "bytes=6-8")
+        .send()
+        .await
+        .expect("range synchronous image asset");
+    assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(range.headers()["content-range"], "bytes 6-8/13");
+    assert_eq!(
+        range.bytes().await.expect("synchronous image range"),
+        bytes::Bytes::from_static(b"url")
+    );
+    let invalid_range = world
+        .client
+        .get(&asset_url)
+        .bearer_auth(&world.current_key)
+        .header("range", "bytes=99-")
+        .send()
+        .await
+        .expect("invalid synchronous image range");
+    assert_eq!(invalid_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    let other = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "principal_external_id": "other-image-api-user",
+            "alias": "other-image-api",
+            "currency": "USD",
+            "initial_balance": "0",
+            "policy": {"allowed_models": ["gpt-image-public"]}
+        }))
+        .send()
+        .await
+        .expect("create other image key")
+        .json::<Value>()
+        .await
+        .expect("other image key JSON");
+    let hidden = world
+        .client
+        .get(&asset_url)
+        .bearer_auth(other["key"].as_str().expect("other image secret"))
+        .send()
+        .await
+        .expect("cross-key synchronous image download");
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+    let operator = world
+        .client
+        .get(format!(
+            "{}/internal/v1/requests/{request_id}/assets/{}?tenant_external_id=default",
+            world.service_url, assets[0].view.asset_id
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("operator synchronous image download");
+    assert_eq!(operator.status(), StatusCode::OK);
+    assert_eq!(
+        operator.bytes().await.expect("operator image bytes"),
+        bytes::Bytes::from_static(b"exact-url-png")
+    );
+    let hidden_tenant = world
+        .client
+        .get(format!(
+            "{}/internal/v1/requests/{request_id}/assets/{}?tenant_external_id=other-tenant",
+            world.service_url, assets[0].view.asset_id
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("cross-tenant synchronous image download");
+    assert_eq!(hidden_tenant.status(), StatusCode::NOT_FOUND);
+    let stats: Value = world
+        .client
+        .get(format!("{}/self/v1/stats", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("URL-backed image stats")
+        .json()
+        .await
+        .expect("URL-backed image stats JSON");
+    assert_eq!(stats["summary"]["total_requests"], 1);
+    assert_eq!(stats["summary"]["total_cost"], "0.3");
+}
+
+#[then("the empty URL image is rejected unbilled without exposing the signed URL")]
+async fn empty_openai_url_image_is_rejected(world: &mut TokenCenterWorld) {
+    assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
+    assert_eq!(world.response["error"]["code"], "upstream_error");
+    assert!(!world.response.to_string().contains("must-not-leak"));
+    let request_id = world
+        .synchronous_request_id
+        .expect("empty URL image request id");
+    let replay = replay_openai_compatible_image(world).await;
+    assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        replay
+            .json::<Value>()
+            .await
+            .expect("empty URL image replay JSON"),
+        world.response
+    );
+    let detail = world
+        .client
+        .get(format!(
+            "{}/self/v1/requests/{request_id}",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("empty URL image detail")
+        .json::<Value>()
+        .await
+        .expect("empty URL image detail JSON");
+    assert_eq!(detail["status_code"], 502);
+    assert_eq!(detail["error_code"], "upstream_image_asset");
+    assert_eq!(detail["cost"], "0");
+    assert!(detail["response_body"].is_null());
+    assert_eq!(detail["archive_complete"], false);
+    assert!(!detail.to_string().contains("must-not-leak"));
+    let state = world.state.clone().expect("test application state");
+    assert!(
+        state
+            .db
+            .synchronous_generation_assets(request_id)
+            .await
+            .expect("empty URL image assets")
+            .is_empty()
+    );
+}
+
+#[then("the ten image request is refunded and leaves no staged assets")]
+async fn aggregate_openai_images_are_refunded_and_cleaned(world: &mut TokenCenterWorld) {
+    assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
+    assert_eq!(world.response["error"]["code"], "upstream_error");
+    let request_id = world
+        .synchronous_request_id
+        .expect("aggregate image request id");
+    let state = world.state.clone().expect("test application state");
+    assert!(
+        state
+            .db
+            .synchronous_generation_assets(request_id)
+            .await
+            .expect("aggregate image DB assets")
+            .is_empty()
+    );
+    let inspection = AnyPool::connect(&state.config.database_url)
+        .await
+        .expect("connect synchronous staging inspection pool");
+    let attempt = sqlx::query(
+        "SELECT attempt_id, state FROM archive_staging_attempts WHERE owner_kind = 'synchronous_request' AND owner_id = $1 AND purpose = 'result' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .expect("failed synchronous result staging attempt");
+    assert_eq!(
+        attempt.get::<String, _>("state"),
+        "cleanup_pending",
+        "only the durable reaper state may authorize deletion"
+    );
+    let attempt_id: String = attempt.get("attempt_id");
+    let result_prefix = format!("staging/synchronous/{request_id}/result/{attempt_id}");
+    for index in 0..9 {
+        assert!(
+            state
+                .archive
+                .get(&format!("{result_prefix}/asset-{index}"))
+                .await
+                .is_ok(),
+            "partial asset {index} stays durable until the reaper cleans cleanup_pending"
+        );
+    }
+    let detail = world
+        .client
+        .get(format!(
+            "{}/self/v1/requests/{request_id}",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("aggregate image request detail")
+        .json::<Value>()
+        .await
+        .expect("aggregate image detail JSON");
+    assert_eq!(detail["status_code"], 502);
+    assert_eq!(detail["error_code"], "upstream_image_asset");
+    assert_eq!(detail["cost"], "0");
+    let key = world
+        .client
+        .get(format!("{}/self/v1/key", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("key after aggregate image failure")
+        .json::<Value>()
+        .await
+        .expect("key after aggregate image failure JSON");
+    assert_eq!(key["available_balance"], "3");
+    let downloads = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("aggregate image upstream requests")
+        .into_iter()
+        .filter(|request| request.url.path().starts_with("/generated/aggregate-"))
+        .count();
+    assert_eq!(downloads, 10);
+}
+
+#[then("the oversized image is unbilled and has no partial response archive")]
+async fn oversized_openai_image_is_unbilled(world: &mut TokenCenterWorld) {
+    let request_id = world
+        .synchronous_request_id
+        .expect("oversized synchronous image request id");
+    let replay = replay_openai_compatible_image(world).await;
+    assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
+    let expected_request_id = request_id.to_string();
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-mtc-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_request_id.as_str())
+    );
+    let detail = world
+        .client
+        .get(format!(
+            "{}/self/v1/requests/{request_id}",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("oversized image detail");
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail: Value = detail.json().await.expect("oversized image detail JSON");
+    assert_eq!(detail["status_code"], 502);
+    assert_eq!(detail["cost"], "0");
+    assert_eq!(detail["error_code"], "upstream_image_too_large");
+    assert!(detail["response_body"].is_null());
+    assert_eq!(detail["archive_complete"], false);
+    let key: Value = world
+        .client
+        .get(format!("{}/self/v1/key", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("key after oversized image")
+        .json()
+        .await
+        .expect("key after oversized image JSON");
+    assert_eq!(key["available_balance"], "0.3");
+}
+
+#[then("the upstream image rejection is sanitized archived as a gap and replayed safely")]
+async fn sensitive_openai_image_rejection_is_sanitized(world: &mut TokenCenterWorld) {
+    assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
+    let rendered = world.response.to_string();
+    assert!(!rendered.contains("must-not-leak"));
+    assert_eq!(world.response["error"]["code"], "upstream_error");
+    let request_id = world
+        .synchronous_request_id
+        .expect("rejected synchronous image request id");
+    let replay = replay_openai_compatible_image(world).await;
+    assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        replay
+            .json::<Value>()
+            .await
+            .expect("sanitized rejection replay"),
+        world.response
+    );
+    let state = world.state.clone().expect("test application state");
+    let refs = state
+        .db
+        .request_archive_refs(
+            world.stable_key_id.expect("rejected image key id"),
+            request_id,
+        )
+        .await
+        .expect("rejected image archive references");
+    let expected_gap = format!("gap://{request_id}/response");
+    assert_eq!(refs.response_object.as_deref(), Some(expected_gap.as_str()));
+    let detail = world
+        .client
+        .get(format!(
+            "{}/self/v1/requests/{request_id}",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("rejected image detail")
+        .json::<Value>()
+        .await
+        .expect("rejected image detail JSON");
+    assert_eq!(detail["status_code"], 502);
+    assert_eq!(detail["error_code"], "upstream_http_400");
+    assert_eq!(detail["cost"], "0");
+    assert!(detail["response_body"].is_null());
+    assert_eq!(detail["archive_complete"], false);
+    assert!(!detail.to_string().contains("must-not-leak"));
 }
 
 #[given("the mock Codex Responses upstream returns a generated icon")]
@@ -757,6 +2648,25 @@ async fn mock_codex_responses_image_generation(world: &mut TokenCenterWorld) {
             }],
             "usage": {"input_tokens": 12, "output_tokens": 34, "total_tokens": 46}
         })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock Codex Responses upstream returns a sensitive invalid image payload")]
+async fn mock_sensitive_invalid_codex_image(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(header("authorization", "Bearer codex-image-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_invalid_image_test",
+            "output": [{
+                "type": "image_generation_call",
+                "id": "ig_invalid",
+                "result": "",
+                "debug_url": "https://images.example.invalid/result.png?token=must-not-leak"
+            }]
+        })))
+        .expect(1)
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
 }
@@ -826,6 +2736,9 @@ async fn create_codex_responses_image_route_and_key(world: &mut TokenCenterWorld
     assert_eq!(response.status(), StatusCode::CREATED);
     let key: Value = response.json().await.expect("Codex Images key JSON");
     world.current_key = key["key"].as_str().expect("Codex Images key").to_owned();
+    world.stable_key_id = key["key_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok());
 }
 
 #[when("the client creates a Codex-backed OpenAI-compatible image")]
@@ -834,6 +2747,7 @@ async fn create_codex_backed_openai_image(world: &mut TokenCenterWorld) {
         .client
         .post(format!("{}/v1/images/generations", world.service_url))
         .bearer_auth(&world.current_key)
+        .header("idempotency-key", "codex-image-stable-1")
         .json(&json!({
             "model": "codex-image-public",
             "prompt": "a compact token loop icon",
@@ -846,6 +2760,11 @@ async fn create_codex_backed_openai_image(world: &mut TokenCenterWorld) {
         .await
         .expect("create Codex-backed OpenAI-compatible image");
     world.status = Some(response.status());
+    world.synchronous_request_id = response
+        .headers()
+        .get("x-mtc-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok());
     world.response = response.json().await.expect("Codex Images response JSON");
 }
 
@@ -868,6 +2787,70 @@ async fn codex_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
     assert_eq!(stats["summary"]["total_requests"], 1);
     assert_eq!(stats["summary"]["successful_requests"], 1);
     assert_eq!(stats["summary"]["total_cost"], "0.4");
+}
+
+#[then("the invalid Codex image payload is sanitized and never archived")]
+async fn invalid_codex_image_is_sanitized(world: &mut TokenCenterWorld) {
+    assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
+    assert_eq!(world.response["error"]["code"], "upstream_error");
+    assert!(!world.response.to_string().contains("must-not-leak"));
+    let request_id = world
+        .synchronous_request_id
+        .expect("invalid Codex image request id");
+    let replay = world
+        .client
+        .post(format!("{}/v1/images/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .header("idempotency-key", "codex-image-stable-1")
+        .json(&json!({
+            "model": "codex-image-public",
+            "prompt": "a compact token loop icon",
+            "n": 1,
+            "size": "1024x1024",
+            "quality": "medium",
+            "output_format": "png"
+        }))
+        .send()
+        .await
+        .expect("replay invalid Codex image");
+    assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        replay
+            .json::<Value>()
+            .await
+            .expect("invalid Codex image replay JSON"),
+        world.response
+    );
+    let detail = world
+        .client
+        .get(format!(
+            "{}/self/v1/requests/{request_id}",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("invalid Codex image detail")
+        .json::<Value>()
+        .await
+        .expect("invalid Codex image detail JSON");
+    assert_eq!(detail["status_code"], 502);
+    assert_eq!(detail["error_code"], "upstream_image_invalid_payload");
+    assert_eq!(detail["cost"], "0");
+    assert!(detail["response_body"].is_null());
+    assert_eq!(detail["archive_complete"], false);
+    assert!(!detail.to_string().contains("must-not-leak"));
+    let state = world.state.clone().expect("test application state");
+    let refs = state
+        .db
+        .request_archive_refs(
+            world.stable_key_id.expect("invalid Codex image key id"),
+            request_id,
+        )
+        .await
+        .expect("invalid Codex image archive references");
+    let expected_gap = format!("gap://{request_id}/response");
+    assert_eq!(refs.response_object.as_deref(), Some(expected_gap.as_str()));
 }
 
 async fn assert_generation_stats(world: &TokenCenterWorld, model: &str, cost: &str) {
@@ -932,10 +2915,11 @@ async fn assert_generation_stats(world: &TokenCenterWorld, model: &str, cost: &s
         assert_eq!(detail["archive_complete"], true);
         assert!(detail["request_body"].is_object());
         assert!(
-            detail["response_body"]["archive_objects"]
+            detail["response_body"]["assets"]
                 .as_array()
-                .is_some_and(|objects| !objects.is_empty())
+                .is_some_and(|assets| !assets.is_empty())
         );
+        assert!(!detail.to_string().contains("objects/blake3/"));
     }
 
     let response = world
@@ -2074,6 +4058,10 @@ async fn poll_cursor_oauth(world: &mut TokenCenterWorld) {
     let value: Value = response.json().await.expect("Cursor account JSON");
     assert_eq!(value["auth_kind"], "oauth");
     assert!(value.get("credential").is_none());
+    assert!(value["config"].get("oauth").is_none());
+    assert_eq!(value["can_refresh"], true);
+    assert!(!value.to_string().contains("cursor-access-1"));
+    assert!(!value.to_string().contains("cursor-refresh-1"));
     world.cursor_account_id = Some(
         Uuid::from_str(value["id"].as_str().expect("Cursor account id"))
             .expect("Cursor account UUID"),
@@ -2127,6 +4115,9 @@ async fn refresh_cursor_oauth(world: &mut TokenCenterWorld) {
     assert_eq!(response.status(), StatusCode::OK);
     let value: Value = response.json().await.expect("refreshed Cursor account");
     assert_eq!(value["id"], account_id.to_string());
+    assert!(value.get("credential").is_none());
+    assert!(!value.to_string().contains("cursor-access-2"));
+    assert!(!value.to_string().contains("cursor-refresh-1"));
     world.cursor_generation = value["credential_generation"]
         .as_i64()
         .expect("refreshed generation");
@@ -2196,6 +4187,73 @@ async fn create_key(world: &mut TokenCenterWorld, principal: String, model: Stri
         Uuid::from_str(world.response["account_id"].as_str().expect("account id"))
             .expect("UUID account id"),
     );
+}
+
+#[when(expr = "the service renames the key alias to {string}")]
+async fn rename_key_alias(world: &mut TokenCenterWorld, alias: String) {
+    let key_id = world.stable_key_id.expect("stable key id");
+    let response = world
+        .client
+        .patch(format!(
+            "{}/internal/v1/keys/{key_id}/alias",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"alias": alias}))
+        .send()
+        .await
+        .expect("rename key alias");
+    world.status = Some(response.status());
+    world.response = response.json().await.expect("renamed key alias JSON");
+}
+
+#[then("the renamed alias retains the stable key identity")]
+async fn renamed_alias_retains_identity(world: &mut TokenCenterWorld) {
+    let key_id = world.stable_key_id.expect("stable key id");
+    assert_eq!(world.status, Some(StatusCode::OK));
+    assert_eq!(world.response["key_id"], key_id.to_string());
+    assert_eq!(world.response["alias"], "renamed credential");
+    let response = world
+        .client
+        .get(format!("{}/self/v1/key", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("read renamed key with unchanged credential");
+    assert_eq!(response.status(), StatusCode::OK);
+    let key: Value = response.json().await.expect("renamed key JSON");
+    assert_eq!(key["key_id"], key_id.to_string());
+    assert_eq!(key["alias"], "renamed credential");
+    assert_eq!(key["credential_generation"], 1);
+}
+
+#[when("the client views its own limit snapshot")]
+async fn view_own_limit_snapshot(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .get(format!("{}/self/v1/key/limits", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("read own key limit snapshot");
+    world.status = Some(response.status());
+    world.response = response.json().await.expect("own key limit snapshot JSON");
+}
+
+#[then("the own limit snapshot belongs to the stable key")]
+async fn own_limit_snapshot_is_stably_bound(world: &mut TokenCenterWorld) {
+    assert_eq!(world.status, Some(StatusCode::OK));
+    assert_eq!(
+        world.response["key_id"],
+        world.stable_key_id.expect("stable key id").to_string()
+    );
+    assert_eq!(world.response["currency"], "USD");
+    assert_eq!(world.response["rpm"]["used"], 0);
+    assert_eq!(world.response["tpm"]["used"], 0);
+    assert_eq!(world.response["concurrency"]["active"], 0);
+    assert_eq!(world.response["daily_budget"]["settled"], "0");
+    assert_eq!(world.response["weekly_budget"]["settled"], "0");
+    assert_eq!(world.response["lifetime_budget"]["settled"], "0");
 }
 
 #[when("the service creates and uses a credential with an explicit policy and budget")]
@@ -2618,6 +4676,11 @@ async fn call_model(world: &mut TokenCenterWorld, model: String) {
         .await
         .expect("model request");
     world.status = Some(response.status());
+    world.response_retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     world.response = response.json().await.unwrap_or(Value::Null);
 }
 
@@ -2668,6 +4731,10 @@ async fn send_full_context_session(world: &mut TokenCenterWorld, model: String) 
         .await
         .expect("first full-context request");
     assert_eq!(first.status(), StatusCode::OK);
+    let _ = first
+        .bytes()
+        .await
+        .expect("first full-context response body");
     let second = world
         .client
         .post(format!("{}/v1/chat/completions", world.service_url))
@@ -2685,6 +4752,10 @@ async fn send_full_context_session(world: &mut TokenCenterWorld, model: String) 
         .await
         .expect("second full-context request");
     world.status = Some(second.status());
+    let _ = second
+        .bytes()
+        .await
+        .expect("second full-context response body");
 }
 
 #[when(expr = "the client sends a parent-linked compacted turn for model {string}")]
@@ -2708,6 +4779,7 @@ async fn send_parent_linked_compaction(world: &mut TokenCenterWorld, model: Stri
         .await
         .expect("explicit parent request");
     assert_eq!(first.status(), StatusCode::OK);
+    let _ = first.bytes().await.expect("explicit parent response body");
 
     let second = world
         .client
@@ -2726,6 +4798,7 @@ async fn send_parent_linked_compaction(world: &mut TokenCenterWorld, model: Stri
         .await
         .expect("compacted child request");
     world.status = Some(second.status());
+    let _ = second.bytes().await.expect("compacted child response body");
 }
 
 #[then(expr = "the response status is {int}")]
@@ -2734,6 +4807,24 @@ async fn response_status(world: &mut TokenCenterWorld, expected: u16) {
         world.status,
         Some(StatusCode::from_u16(expected).expect("valid HTTP status"))
     );
+}
+
+#[then(expr = "the rejection reason is {string} and is not retryable")]
+async fn rejection_is_permanent(world: &mut TokenCenterWorld, reason: String) {
+    assert_eq!(world.response["error"]["reason"], reason);
+    assert_eq!(world.response["error"]["retryable"], false);
+    assert!(world.response_retry_after.is_none());
+}
+
+#[then(expr = "the rejection reason is {string} and is retryable with Retry-After")]
+async fn rejection_is_retryable(world: &mut TokenCenterWorld, reason: String) {
+    assert_eq!(world.response["error"]["reason"], reason);
+    assert_eq!(world.response["error"]["retryable"], true);
+    let retry_after = world
+        .response_retry_after
+        .as_deref()
+        .expect("Retry-After header");
+    assert!(retry_after.parse::<u64>().is_ok_and(|seconds| seconds >= 1));
 }
 
 #[then("the operator realtime stream contains started and finished events")]
@@ -2793,6 +4884,7 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         .await
         .expect("operator requests JSON");
     let request_id = requests[0]["request_id"].as_str().expect("request id");
+    let request_uuid = Uuid::parse_str(request_id).expect("request UUID");
     let detail = world
         .client
         .get(format!(
@@ -2811,6 +4903,36 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         detail["response_body"]["choices"][0]["message"]["content"],
         "hello"
     );
+    let state = world.state.as_ref().expect("test application state");
+    let refs = state
+        .db
+        .request_archive_refs(world.stable_key_id.expect("key id"), request_uuid)
+        .await
+        .expect("proxy archive references");
+    let request_prefix = format!("staging/proxy/{request_id}/request/");
+    let response_prefix = format!("staging/proxy/{request_id}/response/");
+    assert!(refs.request_object.starts_with(&request_prefix));
+    assert!(refs.request_object.ends_with("/body"));
+    let response_object = refs.response_object.expect("response object");
+    assert!(response_object.starts_with(&response_prefix));
+    assert!(response_object.ends_with("/body"));
+    for locator in [&refs.request_object, &response_object] {
+        let attempt_id = locator
+            .strip_suffix("/body")
+            .and_then(|prefix| prefix.rsplit('/').next())
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("canonical proxy attempt UUID");
+        assert_eq!(
+            state
+                .db
+                .archive_staging_attempt(attempt_id)
+                .await
+                .expect("staging attempt query")
+                .expect("staging attempt")
+                .state,
+            ArchiveStagingState::Bound
+        );
+    }
 }
 
 #[when("the bootstrap service creates a tenant scoped service token")]
@@ -3230,7 +5352,7 @@ fn postgres_command_environment(database_url: &str) -> Vec<(String, String)> {
     ]
 }
 
-fn run_cpamp_importer(world: &TokenCenterWorld) {
+fn cpamp_importer_output(world: &TokenCenterWorld) -> std::process::Output {
     let sqlite_path = world
         .import_sqlite_path
         .as_ref()
@@ -3244,7 +5366,11 @@ fn run_cpamp_importer(world: &TokenCenterWorld) {
         .env("CPAMP_IMPORT_SOURCE", &world.import_source)
         .env("CPAMP_OVERLAP_MS", "86400000")
         .env("CPAMP_RESET_IMPORT", "false");
-    let output = command.output().expect("execute CPAMP importer");
+    command.output().expect("execute CPAMP importer")
+}
+
+fn run_cpamp_importer(world: &TokenCenterWorld) {
+    let output = cpamp_importer_output(world);
     assert!(
         output.status.success(),
         "CPAMP importer failed: {}",
@@ -3278,6 +5404,21 @@ async fn prepare_cpamp_import_fixture(world: &mut TokenCenterWorld) {
         .maintain_partitions()
         .await
         .expect("maintain CPAMP importer acceptance partitions");
+
+    // Model prices are global rather than tenant-scoped. Keep this reserved
+    // fixture model isolated across local retries of the same PostgreSQL gate.
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("connect for CPAMP fixture price cleanup");
+    sqlx::query("DELETE FROM model_price_tiers WHERE model = 'fixture-model'")
+        .execute(&pool)
+        .await
+        .expect("clear prior CPAMP fixture price tiers");
+    sqlx::query("DELETE FROM model_prices WHERE model = 'fixture-model'")
+        .execute(&pool)
+        .await
+        .expect("clear prior CPAMP fixture base price");
+    pool.close().await;
 
     let unique = Uuid::now_v7().simple().to_string();
     let temp_dir = tempfile::tempdir().expect("CPAMP importer temporary directory");
@@ -3360,6 +5501,19 @@ async fn assert_cpamp_import_state(
         aggregate_row.get::<i64, _>("cost_micros"),
         expected_cost_micros
     );
+    let compact_stats = sqlx::query(
+        "SELECT (SELECT COUNT(*) FROM request_stats_facts WHERE tenant_id = $1) AS facts, COALESCE((SELECT SUM(requests) FROM request_daily_aggregates WHERE tenant_id = $2), 0)::BIGINT AS aggregate_requests",
+    )
+    .bind(&tenant_id)
+    .bind(&tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("compact request statistics");
+    assert_eq!(compact_stats.get::<i64, _>("facts"), expected_requests);
+    assert_eq!(
+        compact_stats.get::<i64, _>("aggregate_requests"),
+        expected_requests
+    );
 
     let checkpoint = sqlx::query(
         "SELECT watermark_ms, watermark_hash, imported_events FROM cpamp_import_checkpoints WHERE source = $1",
@@ -3402,12 +5556,83 @@ async fn assert_cpamp_import_state(
     assert_eq!(price.get::<i64, _>("input_micros_per_million"), 2_000_000);
     assert_eq!(price.get::<i64, _>("output_micros_per_million"), 4_000_000);
     assert_eq!(price.get::<String, _>("source"), "cpamp:fixture");
+    let tier = sqlx::query(
+        "SELECT input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million, source FROM model_price_tiers WHERE model = 'fixture-model' AND currency = 'USD' AND service_tier = 'default'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("imported fixture default price tier");
+    assert_eq!(tier.get::<i64, _>("input_micros_per_million"), 2_000_000);
+    assert_eq!(
+        tier.get::<i64, _>("cached_input_micros_per_million"),
+        2_000_000
+    );
+    assert_eq!(
+        tier.get::<i64, _>("cache_write_micros_per_million"),
+        2_000_000
+    );
+    assert_eq!(tier.get::<i64, _>("output_micros_per_million"), 4_000_000);
+    assert_eq!(tier.get::<String, _>("source"), "cpamp:fixture");
     pool.close().await;
 }
 
 #[then("the imported requests aggregates and checkpoint contain exactly the initial events")]
 async fn initial_cpamp_import_is_exact(world: &mut TokenCenterWorld) {
     assert_cpamp_import_state(world, 2, 28, 8, 88, 300_000_000, "fixture-event-initial-b").await;
+
+    let pool = PgPool::connect(&world.import_database_url)
+        .await
+        .expect("connect for legacy CPAMP marker reconciliation");
+    let initial_gaps: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_records r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = $1 AND r.request_object LIKE 'gap://%' AND r.response_object LIKE 'gap://%'",
+    )
+    .bind(&world.import_tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("new CPAMP rows use archive gaps");
+    assert_eq!(initial_gaps, 2);
+    sqlx::query(
+        "UPDATE request_records r SET response_object = CASE WHEN r.error_code = 'http_502' THEN 'inline-json:' || jsonb_build_object('source','cpamp','error','fixture upstream failure')::text ELSE 'inline-json:{\"source\":\"protected-real-body\"}' END FROM tenants t WHERE t.id = r.tenant_id AND t.external_id = $1",
+    )
+    .bind(&world.import_tenant)
+    .execute(&pool)
+    .await
+    .expect("install legacy and protected response markers");
+    pool.close().await;
+    run_cpamp_importer(world);
+    let pool = PgPool::connect(&world.import_database_url)
+        .await
+        .expect("verify legacy CPAMP marker reconciliation");
+    let reconciled = sqlx::query(
+        "SELECT COUNT(*) FILTER (WHERE r.error_code = 'http_502' AND r.response_object = 'gap://cpamp/fixture-event-initial-b/response') AS normalized, COUNT(*) FILTER (WHERE r.error_code IS NULL AND r.response_object = 'inline-json:{\"source\":\"protected-real-body\"}') AS protected FROM request_records r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = $1",
+    )
+    .bind(&world.import_tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("reconciled response markers");
+    assert_eq!(reconciled.get::<i64, _>("normalized"), 1);
+    assert_eq!(reconciled.get::<i64, _>("protected"), 1);
+    sqlx::query(
+        "UPDATE request_records r SET response_object = 'cas://fixture/archive-response' FROM tenants t WHERE t.id = r.tenant_id AND t.external_id = $1 AND r.error_code = 'http_502'",
+    )
+    .bind(&world.import_tenant)
+    .execute(&pool)
+    .await
+    .expect("emulate archive replacement");
+    pool.close().await;
+    run_cpamp_importer(world);
+    let pool = PgPool::connect(&world.import_database_url)
+        .await
+        .expect("verify archived response remains protected");
+    let archived: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_records r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = $1 AND r.response_object = 'cas://fixture/archive-response'",
+    )
+    .bind(&world.import_tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("archived response locator");
+    assert_eq!(archived, 1);
+    pool.close().await;
 }
 
 #[when("a late overlap event and a newer event are appended and the importer runs twice")]
@@ -3435,6 +5660,167 @@ async fn late_cpamp_import_is_exact(world: &mut TokenCenterWorld) {
         "fixture-event-new-watermark",
     )
     .await;
+    let sqlite_path = world
+        .import_sqlite_path
+        .as_ref()
+        .expect("CPAMP SQLite fixture path");
+    let status = Command::new("sqlite3")
+        .arg(sqlite_path)
+        .arg("UPDATE model_prices SET prompt_per_1m = 3.0, completion_per_1m = 5.0, updated_at_ms = 500000000 WHERE model = 'fixture-model';")
+        .status()
+        .expect("update CPAMP source price");
+    assert!(status.success());
+    run_cpamp_importer(world);
+    run_cpamp_importer(world);
+
+    let pool = PgPool::connect(&world.import_database_url)
+        .await
+        .expect("connect for CPAMP price settlement");
+    let key_row = sqlx::query(
+        "SELECT k.id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.credential_generation, k.policy_json FROM key_records k JOIN tenants t ON t.id = k.tenant_id WHERE t.external_id = $1",
+    )
+    .bind(&world.import_tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("imported CPAMP key");
+    let key = memeloop_token_center::model::AuthenticatedKey {
+        key_id: Uuid::parse_str(key_row.get("id")).expect("key UUID"),
+        tenant_id: Uuid::parse_str(key_row.get("tenant_id")).expect("tenant UUID"),
+        principal_id: Uuid::parse_str(key_row.get("principal_id")).expect("principal UUID"),
+        account_id: Uuid::parse_str(key_row.get("account_id")).expect("account UUID"),
+        alias: key_row.get("alias"),
+        currency: key_row.get("currency"),
+        credential_generation: key_row.get("credential_generation"),
+        policy: serde_json::from_str(&key_row.get::<String, _>("policy_json")).expect("key policy"),
+    };
+    sqlx::query("UPDATE credit_accounts SET available_micros = 1000000000 WHERE id = $1")
+        .bind(key.account_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("fund CPAMP acceptance account");
+    let tier = sqlx::query(
+        "SELECT input_micros_per_million, output_micros_per_million, source FROM model_price_tiers WHERE model = 'fixture-model' AND currency = 'USD' AND service_tier = 'default'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("updated CPAMP tier");
+    assert_eq!(tier.get::<i64, _>("input_micros_per_million"), 3_000_000);
+    assert_eq!(tier.get::<i64, _>("output_micros_per_million"), 5_000_000);
+    assert_eq!(tier.get::<String, _>("source"), "cpamp:fixture");
+    pool.close().await;
+    let database = memeloop_token_center::db::Database::connect(&world.import_database_url)
+        .await
+        .expect("connect settlement database");
+    let price = database
+        .model_price("fixture-model", "USD")
+        .await
+        .expect("updated CPAMP model price");
+    let reservation = database
+        .reserve_usage(&key, &price, 10, 10)
+        .await
+        .expect("reserve with updated CPAMP tier");
+    let charged = database
+        .settle_usage(&reservation, 1, 1)
+        .await
+        .expect("settle with updated CPAMP tier");
+    assert_eq!(charged, 8);
+    assert_eq!(database.settle_usage(&reservation, 1, 1).await.unwrap(), 8);
+
+    let pool = PgPool::connect(&world.import_database_url)
+        .await
+        .expect("connect for manual price precedence");
+    sqlx::query("UPDATE model_prices SET input_micros_per_million = 9000000, output_micros_per_million = 11000000, source = 'manual' WHERE model = 'fixture-model' AND currency = 'USD'")
+        .execute(&pool)
+        .await
+        .expect("install manual base price override");
+    sqlx::query("UPDATE model_price_tiers SET input_micros_per_million = 9000000, cached_input_micros_per_million = 9000000, cache_write_micros_per_million = 9000000, output_micros_per_million = 11000000, source = 'manual' WHERE model = 'fixture-model' AND currency = 'USD' AND service_tier = 'default'")
+        .execute(&pool)
+        .await
+        .expect("install manual tier price override");
+    pool.close().await;
+    let status = Command::new("sqlite3")
+        .arg(sqlite_path)
+        .arg("UPDATE model_prices SET prompt_per_1m = 4.0, completion_per_1m = 6.0, updated_at_ms = 600000000 WHERE model = 'fixture-model';")
+        .status()
+        .expect("update CPAMP source beneath manual override");
+    assert!(status.success());
+    run_cpamp_importer(world);
+    let pool = PgPool::connect(&world.import_database_url)
+        .await
+        .expect("verify manual price precedence");
+    let preserved = sqlx::query(
+        "SELECT b.input_micros_per_million AS base_input, b.output_micros_per_million AS base_output, b.source AS base_source, t.input_micros_per_million AS tier_input, t.output_micros_per_million AS tier_output, t.source AS tier_source FROM model_prices b JOIN model_price_tiers t ON t.model = b.model AND t.currency = b.currency AND t.service_tier = 'default' WHERE b.model = 'fixture-model' AND b.currency = 'USD'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("preserved manual prices");
+    assert_eq!(preserved.get::<i64, _>("base_input"), 9_000_000);
+    assert_eq!(preserved.get::<i64, _>("base_output"), 11_000_000);
+    assert_eq!(preserved.get::<String, _>("base_source"), "manual");
+    assert_eq!(preserved.get::<i64, _>("tier_input"), 9_000_000);
+    assert_eq!(preserved.get::<i64, _>("tier_output"), 11_000_000);
+    assert_eq!(preserved.get::<String, _>("tier_source"), "manual");
+    pool.close().await;
+
+    let status = Command::new("sqlite3")
+        .arg(sqlite_path)
+        .arg("INSERT INTO usage_events SELECT * FROM usage_events WHERE event_hash = 'fixture-event-new-watermark' LIMIT 1;")
+        .status()
+        .expect("append exact duplicate CPAMP event");
+    assert!(status.success());
+    run_cpamp_importer(world);
+    let status = Command::new("sqlite3")
+        .arg(sqlite_path)
+        .arg("INSERT INTO usage_events SELECT event_hash, request_id, timestamp_ms, provider, model, endpoint, api_key_hash, 999, output_tokens, latency_ms, failed, fail_status_code, fail_summary FROM usage_events WHERE event_hash = 'fixture-event-new-watermark' LIMIT 1;")
+        .status()
+        .expect("append conflicting duplicate CPAMP event");
+    assert!(status.success());
+    let conflict = cpamp_importer_output(world);
+    assert!(!conflict.status.success());
+    assert!(
+        String::from_utf8_lossy(&conflict.stderr)
+            .contains("event hashes map to conflicting source rows")
+    );
+    let status = Command::new("sqlite3")
+        .arg(sqlite_path)
+        .arg("DELETE FROM usage_events WHERE event_hash = 'fixture-event-new-watermark' AND input_tokens = 999; DELETE FROM usage_events WHERE rowid NOT IN (SELECT min(rowid) FROM usage_events GROUP BY event_hash);")
+        .status()
+        .expect("remove duplicate CPAMP fixtures");
+    assert!(status.success());
+    let status = Command::new("sqlite3")
+        .arg(sqlite_path)
+        .arg("INSERT INTO usage_events VALUES ('fixture-invalid-hash', 'invalid-hash-request', 450000000, 'openai', 'fixture-model', '/v1/responses', 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz', 1, 1, 1, 0, NULL, NULL);")
+        .status()
+        .expect("append invalid CPAMP key hash");
+    assert!(status.success());
+    let invalid = cpamp_importer_output(world);
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("no supported key identity"));
+    let status = Command::new("sqlite3")
+        .arg(sqlite_path)
+        .arg("DELETE FROM usage_events WHERE event_hash = 'fixture-invalid-hash'; UPDATE usage_events SET input_tokens = input_tokens + 1 WHERE event_hash = 'fixture-event-new-watermark';")
+        .status()
+        .expect("mutate an already imported CPAMP event");
+    assert!(status.success());
+    let drift = cpamp_importer_output(world);
+    assert!(!drift.status.success());
+    let pool = PgPool::connect(&world.import_database_url)
+        .await
+        .expect("verify CPAMP conflict failures leave no target writes");
+    let stable = sqlx::query(
+        "SELECT (SELECT COUNT(*) FROM request_records r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = $1) AS requests, (SELECT COUNT(*) FROM import_request_links l JOIN tenants t ON t.id = l.tenant_id WHERE t.external_id = $2 AND l.source_digest <> '') AS digested_links, (SELECT imported_events FROM cpamp_import_checkpoints WHERE tenant_external_id = $3 AND source = $4) AS imported_events",
+    )
+    .bind(&world.import_tenant)
+    .bind(&world.import_tenant)
+    .bind(&world.import_tenant)
+    .bind(&world.import_source)
+    .fetch_one(&pool)
+    .await
+    .expect("stable CPAMP target after rejected inputs");
+    assert_eq!(stable.get::<i64, _>("requests"), 4);
+    assert_eq!(stable.get::<i64, _>("digested_links"), 4);
+    assert_eq!(stable.get::<i64, _>("imported_events"), 4);
+    pool.close().await;
 }
 
 #[given("the mock buffered Responses upstream returns parent and child responses")]
@@ -3469,6 +5855,28 @@ async fn mock_buffered_responses_parent_and_child(world: &mut TokenCenterWorld) 
 
 #[given("the mock streaming Responses upstream returns parent and child events")]
 async fn mock_streaming_responses_parent_and_child(world: &mut TokenCenterWorld) {
+    let mut parent_stream = String::with_capacity(2 * 1024 * 1024 + 128 * 1024);
+    parent_stream.push_str(concat!(
+        "event: response.created\r\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-streaming-parent\",\"object\":\"response\"}}\r\n",
+        "\r\n"
+    ));
+    let delta = "x".repeat(4 * 1024);
+    for _ in 0..520 {
+        parent_stream.push_str("event: response.output_text.delta\n");
+        parent_stream.push_str("data: {\"type\":\"response.output_text.delta\",\"delta\":\"");
+        parent_stream.push_str(&delta);
+        parent_stream.push_str("\"}\n\n");
+    }
+    parent_stream.push_str(concat!(
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n",
+        "data: [DONE]\n\n"
+    ));
+    assert!(
+        parent_stream.len() > 2 * 1024 * 1024,
+        "the streaming fixture must exceed the legacy usage-tail capture"
+    );
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
         .and(body_partial_json(
@@ -3477,9 +5885,7 @@ async fn mock_streaming_responses_parent_and_child(world: &mut TokenCenterWorld)
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(include_str!(
-                    "fixtures/protocols/responses-streaming-parent.sse"
-                )),
+                .set_body_string(parent_stream),
         )
         .expect(1)
         .mount(world.mock.as_ref().expect("mock server"))
@@ -3497,6 +5903,69 @@ async fn mock_streaming_responses_parent_and_child(world: &mut TokenCenterWorld)
                 .set_body_string(concat!(
                     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-streaming-child\"}}\n\n",
                     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-streaming-child\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+                    "data: [DONE]\n\n"
+                )),
+        )
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock failed streaming Responses upstream returns parent and child events")]
+async fn mock_failed_streaming_responses_parent_and_child(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_partial_json(
+            json!({"input": "failed streaming parent", "stream": true}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-failed-parent\"}}\n\n",
+                    "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed-parent\"}}\n\n",
+                    "data: [DONE]\n\n"
+                )),
+        )
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_partial_json(json!({
+            "input": "failed streaming child",
+            "previous_response_id": "resp-failed-parent",
+            "stream": true
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-after-failure\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-after-failure\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+                )),
+        )
+        .expect(1)
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock streaming Responses upstream exceeds the admitted usage")]
+async fn mock_streaming_responses_invalid_usage(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_partial_json(json!({
+            "input": "invalid usage stream",
+            "stream": true,
+            "max_output_tokens": 2
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-invalid-usage\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delivered output\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-invalid-usage\",\"usage\":{\"input_tokens\":1,\"output_tokens\":999}}}\n\n",
                     "data: [DONE]\n\n"
                 )),
         )
@@ -3565,6 +6034,47 @@ async fn send_streaming_responses_parent_and_child(world: &mut TokenCenterWorld,
     );
 }
 
+#[when(expr = "the Responses client sends a failed streaming parent and child for model {string}")]
+async fn send_failed_streaming_responses_parent_and_child(
+    world: &mut TokenCenterWorld,
+    model: String,
+) {
+    assert_eq!(
+        send_responses_turn(world, &model, "failed streaming parent", None, true).await,
+        StatusCode::OK
+    );
+    world.status = Some(
+        send_responses_turn(
+            world,
+            &model,
+            "failed streaming child",
+            Some("resp-failed-parent"),
+            true,
+        )
+        .await,
+    );
+}
+
+#[when(expr = "the Responses client consumes the invalid usage stream for model {string}")]
+async fn consume_streaming_responses_invalid_usage(world: &mut TokenCenterWorld, model: String) {
+    let response = world
+        .client
+        .post(format!("{}/v1/responses", world.service_url))
+        .bearer_auth(&world.current_key)
+        .json(&json!({
+            "model": model,
+            "input": "invalid usage stream",
+            "stream": true,
+            "max_output_tokens": 2
+        }))
+        .send()
+        .await
+        .expect("invalid usage Responses request");
+    world.status = Some(response.status());
+    let body = response.text().await.expect("invalid usage Responses body");
+    assert!(body.contains("delivered output"), "{body}");
+}
+
 async fn own_conversation_detail(world: &TokenCenterWorld) -> Value {
     let clusters = world
         .client
@@ -3609,6 +6119,108 @@ async fn responses_requests_have_direct_parent_edge(world: &mut TokenCenterWorld
     assert_eq!(edge["evidence"]["explicit_parent"], true, "{detail}");
     assert_eq!(edge["from_request_id"], detail["requests"][0]["request_id"]);
     assert_eq!(edge["to_request_id"], detail["requests"][1]["request_id"]);
+}
+
+#[then("the failed Responses id does not form a continuation edge")]
+async fn failed_responses_id_is_not_a_parent(world: &mut TokenCenterWorld) {
+    let clusters = world
+        .client
+        .get(format!("{}/self/v1/conversations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("conversation clusters")
+        .json::<Value>()
+        .await
+        .expect("conversation clusters JSON");
+    let clusters = clusters.as_array().expect("conversation cluster array");
+    assert_eq!(clusters.len(), 2, "{clusters:?}");
+    assert!(
+        clusters.iter().all(|cluster| cluster["request_count"] == 1),
+        "{clusters:?}"
+    );
+    let requests = world
+        .client
+        .get(format!("{}/self/v1/requests", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("failed Responses request history")
+        .json::<Value>()
+        .await
+        .expect("failed Responses request history JSON");
+    let failed = requests
+        .as_array()
+        .expect("request history array")
+        .iter()
+        .find(|request| request["error_code"] == "upstream_failed_response")
+        .expect("HTTP 200 response.failed terminal record");
+    assert_eq!(failed["status_code"], 502, "{failed}");
+    assert_ne!(failed["cost"], "0", "delivered failed streams are billed");
+    assert_eq!(failed["output_tokens"], 4096, "{failed}");
+
+    let stats = world
+        .client
+        .get(format!("{}/self/v1/stats", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("failed Responses statistics")
+        .json::<Value>()
+        .await
+        .expect("failed Responses statistics JSON");
+    assert_eq!(stats["summary"]["failed_requests"], 1, "{stats}");
+    assert!(
+        stats["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|bucket| {
+                bucket["name"] == "upstream_failed_response" && bucket["requests"] == 1
+            })),
+        "{stats}"
+    );
+}
+
+#[then("the delivered invalid stream is a fully billed failure without response lineage")]
+async fn invalid_stream_is_billed_failure(world: &mut TokenCenterWorld) {
+    assert_eq!(world.status, Some(StatusCode::OK));
+    let requests = world
+        .client
+        .get(format!("{}/self/v1/requests", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("invalid stream request history")
+        .json::<Value>()
+        .await
+        .expect("invalid stream request history JSON");
+    assert_eq!(requests.as_array().map(Vec::len), Some(1), "{requests}");
+    assert_eq!(requests[0]["status_code"], 502, "{requests}");
+    assert_eq!(
+        requests[0]["error_code"], "upstream_invalid_usage",
+        "{requests}"
+    );
+    assert_eq!(requests[0]["output_tokens"], 2, "{requests}");
+    assert_ne!(requests[0]["cost"], "0", "{requests}");
+
+    let detail = own_conversation_detail(world).await;
+    assert_eq!(detail["cluster"]["request_count"], 1, "{detail}");
+    assert_eq!(
+        detail["edges"].as_array().map(Vec::len),
+        Some(0),
+        "{detail}"
+    );
+    let stats = world
+        .client
+        .get(format!("{}/self/v1/stats", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("invalid stream stats")
+        .json::<Value>()
+        .await
+        .expect("invalid stream stats JSON");
+    assert_eq!(stats["summary"]["failed_requests"], 1, "{stats}");
+    assert_eq!(stats["summary"]["output_tokens"], 2, "{stats}");
 }
 
 #[when(

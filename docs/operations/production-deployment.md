@@ -48,18 +48,23 @@ same migration set before the new application image is started. A successful
 schema migration does not prove application readiness; verify the new binary
 against the migrated schema separately.
 
-Schema v22 introduces transactionally maintained budget state. Binaries older
-than v22 do not dual-write it. A pre-upgrade hook followed by an ordinary rolling
-update would therefore allow old pods to accept reservations/settlements after
-the migration and corrupt the new invariant. The review instance uses a two-stage
+Schema v22 introduces transactionally maintained budget state, and schema v30
+introduces the worker-indexed two-phase asynchronous-generation preparation
+contract. Binaries older than these write barriers do not dual-write the new
+state. In particular, mixing the pre-v30 archive-before-admission writer with a
+v30 admission-before-archive writer can strand a reservation during an
+idempotency race. A pre-upgrade hook followed by an ordinary rolling update
+would therefore allow old pods to corrupt the new invariants. The review instance uses a two-stage
 GitOps quiesce while production traffic remains on old CPA:
 
 1. Stage A sets Token Center gateway, control and worker replicas to zero. Wait
    for every old pod to terminate and verify there are no active requests/jobs.
 2. Stage B pins the reviewed source SHA and immutable image, enables the bounded
-   migration hook, applies v12→v23, and starts only the new v23 pods.
+   migration hook, applies v12→v30, and starts only the new v30 pods.
 
-Do not combine the replica-zero and new-image changes into one sync: the write
+For the first v30 deployment, every application role must use the Helm
+`Recreate` strategy (or the equivalent explicit scale-to-zero barrier); no old
+gateway may overlap a new gateway. Do not combine the replica-zero and new-image changes into one sync: the write
 barrier must be observed before migration. After v22 is applied, the old binary
 must never be restored to traffic. Application rollback means rolling forward a
 compatible v22+ repair image while the barrier remains, or restoring a validated
@@ -77,6 +82,17 @@ backfill procedure to drain that exact day before relying on the next retry. A
 regression test exists for this fail-soft path, but it had not yet been executed
 against PostgreSQL at the time of this documentation snapshot.
 
+Schema v24 creates compact terminal-request facts and UTC daily aggregates and
+backfills them transactionally. Before enabling statistics traffic after a
+legacy import, compare terminal request counts with `request_stats_facts`, run
+`ops/reconcile-postgres-request-stats.sh` for any repaired/imported interval,
+`ANALYZE` the fact and aggregate tables, and retain the resulting count and
+EXPLAIN reports. The reconciliation command is dry-run by default and takes a
+transaction advisory lock when `--apply` is supplied. Pruning compact statistics
+is never implicit; it additionally requires `--confirm-prune` and fails closed
+unless raw history has already been archived and removed by the separate
+retention procedure.
+
 ## Health probes
 
 The chart configures distinct startup, readiness and liveness paths. The current
@@ -89,6 +105,15 @@ server implements all three operational endpoints:
   writing on every probe. Concurrent probes are coalesced and briefly cached.
 - `/healthz`: deprecated compatibility alias for `/livez`; new deployments use
   the distinct defaults above.
+
+The public gateway ingress routes only the compatibility `/healthz` probe; it
+does not route `/readyz` or `/livez`. The control ingress is disabled by default.
+Enabling it requires a TLS secret, a Higress/ingress-nginx-compatible class and
+one or more explicit `ingress.control.sourceRanges` office/VPN/NAT CIDRs;
+every `/0` form is rejected. The chart renders the supported source
+range and forced HTTPS annotations, which Higress also implements, and user
+annotations cannot disable them. Do not expose a custom control route without
+an equivalent source allowlist, VPN or SSO boundary.
 
 ## Network policy
 
@@ -165,11 +190,10 @@ networkPolicy:
         ports: [{ protocol: TCP, port: 8317 }]
 ```
 
-At audit time the live dogfood release still rendered the old allow-all
-`egress: [{}]` and ingress without a source selector because its GitOps values
-only set `networkPolicy.enabled=true`. The fail-closed chart and the exact values
-above have passed strict Helm render/schema checks, but they are **not** live
-deployment evidence. Apply them through reviewed GitOps and verify connectivity
+The reviewed GitOps desired values now contain the explicit selectors, exact
+CIDRs and ports above, and they pass the chart's strict render/schema contract.
+Desired Git state is not live deployment evidence: confirm the Argo CD revision,
+inspect the rendered NetworkPolicy, and verify allowed plus denied connectivity
 before treating the public instance as conformant.
 
 NetworkPolicy cannot select a DNS hostname. Provider hosts must either use the
@@ -189,6 +213,26 @@ mesh. Keep `config.s3.allowHttp=false` in production. Enable bucket versioning,
 retention or object lock according to the data-retention policy, server-side
 encryption and cross-failure-domain replication. Archive credentials should be
 limited to the one bucket and required object operations.
+
+Production S3/MinIO buckets **must** configure an
+`AbortIncompleteMultipartUpload` lifecycle rule; one day after initiation is the
+recommended limit. This rule aborts multipart sessions left by a process or node
+crash. It is not an object-expiration rule. Never configure an ordinary TTL for
+objects under `staging/`: successfully bound request, response, result, and asset
+locators intentionally remain in that namespace for their full retention life.
+The fenced archive reaper removes only unreferenced typed attempt segments.
+
+Archive download rate limiting belongs at Higress. Do not add an application
+download limiter to compensate for a missing gateway policy; validate the
+Higress route policy and its client-facing rejection behavior before cutover.
+
+The Helm schema accepts only `config.archiveBackend=s3`. Although the binary's
+filesystem and memory implementations remain useful for isolated tests, the
+hardened chart has a read-only root filesystem, multiple independently scaled
+roles and no local archive volume contract. It therefore rejects those backends
+instead of rendering a deployment that appears valid but loses or strands
+archive objects. Supply S3 credentials through the referenced external Secret;
+the chart never renders credential values.
 
 See [backup and restore](backup-and-restore.md) and
 [secret management](secret-management.md) for the operational gates.

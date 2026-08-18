@@ -56,6 +56,235 @@ fn account(value: Value) -> UpstreamAccountView {
 }
 
 #[tokio::test]
+async fn oauth_refresh_lease_is_account_generation_scoped_and_stale_safe() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("oauth-refresh-lease.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "oauth-lease-tenant".into(),
+                name: "managed-oauth".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url": "https://api.example.test"}),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "access-v1".into(),
+                    refresh_token: Some("refresh-v1".into()),
+                    expires_at: Some(memeloop_token_center::db::unix_millis() + 60_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: None,
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("cursor".into()),
+                oauth_refresh_url: Some("https://oauth.example.test/refresh".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert!(account.can_refresh);
+    assert!(account.config.get("oauth").is_none());
+
+    assert!(
+        state
+            .db
+            .begin_upstream_oauth_refresh(account.id, "refresh-lease-a", pepper)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let concurrent = state
+        .db
+        .begin_upstream_oauth_refresh(account.id, "refresh-lease-b", pepper)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        concurrent,
+        memeloop_token_center::error::AppError::Conflict(_)
+    ));
+
+    let manually_rotated = state
+        .db
+        .rotate_upstream_credential(
+            account.id,
+            UpstreamCredential::OAuth {
+                access_token: "access-manual".into(),
+                refresh_token: Some("refresh-manual".into()),
+                expires_at: Some(memeloop_token_center::db::unix_millis() + 120_000),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: None,
+            },
+            "manual-during-refresh",
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(manually_rotated.credential_generation, 2);
+    let stale = state
+        .db
+        .finish_upstream_oauth_refresh(
+            account.id,
+            UpstreamCredential::OAuth {
+                access_token: "stale-access".into(),
+                refresh_token: Some("stale-refresh".into()),
+                expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: None,
+            },
+            "refresh-lease-a",
+            pepper,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        memeloop_token_center::error::AppError::Conflict(_)
+    ));
+    state
+        .db
+        .abort_upstream_oauth_refresh(account.id, "refresh-lease-a")
+        .await
+        .unwrap();
+
+    assert!(
+        state
+            .db
+            .begin_upstream_oauth_refresh(account.id, "refresh-lease-b", pepper)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let refreshed = state
+        .db
+        .finish_upstream_oauth_refresh(
+            account.id,
+            UpstreamCredential::OAuth {
+                access_token: "access-v3".into(),
+                refresh_token: Some("refresh-v3".into()),
+                expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: None,
+            },
+            "refresh-lease-b",
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshed.credential_generation, 3);
+    assert_eq!(refreshed.id, account.id);
+}
+
+#[tokio::test]
+async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remote_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("oauth-finalize-fault.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "oauth-fault-tenant".into(),
+                name: "managed-oauth-fault".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url": "https://api.example.test"}),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "access-before-fault".into(),
+                    refresh_token: Some("refresh-before-fault".into()),
+                    expires_at: Some(memeloop_token_center::db::unix_millis() + 60_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: None,
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("cursor".into()),
+                oauth_refresh_url: Some("https://oauth.example.test/refresh".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let idempotency_key = "refresh-finalize-fault";
+    assert!(
+        state
+            .db
+            .begin_upstream_oauth_refresh(account.id, idempotency_key, pepper)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    sqlx::any::install_default_drivers();
+    let fault_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER inject_oauth_finalize_failure BEFORE UPDATE OF credential_generation ON upstream_accounts WHEN NEW.id = '{}' BEGIN SELECT RAISE(ABORT, 'injected OAuth finalize failure'); END",
+        account.id
+    ))
+    .execute(&fault_pool)
+    .await
+    .unwrap();
+    let refreshed_credential = UpstreamCredential::OAuth {
+        access_token: "access-after-remote-success".into(),
+        refresh_token: Some("refresh-after-remote-success".into()),
+        expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+        header: "authorization".into(),
+        prefix: "Bearer ".into(),
+        adapter_state: None,
+    };
+    let failed = state
+        .db
+        .finish_upstream_oauth_refresh(account.id, refreshed_credential, idempotency_key, pepper)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        failed,
+        memeloop_token_center::error::AppError::Internal
+    ));
+    sqlx::query("DROP TRIGGER inject_oauth_finalize_failure")
+        .execute(&fault_pool)
+        .await
+        .unwrap();
+
+    // Retrying the same key finalizes the durable encrypted pending result.
+    // No authorization-server call or plaintext token is needed here.
+    let recovered = state
+        .db
+        .begin_upstream_oauth_refresh(account.id, idempotency_key, pepper)
+        .await
+        .unwrap()
+        .expect("pending OAuth result finalized");
+    assert_eq!(recovered.id, account.id);
+    assert_eq!(recovered.credential_generation, 2);
+    let replay = state
+        .db
+        .begin_upstream_oauth_refresh(account.id, idempotency_key, pepper)
+        .await
+        .unwrap()
+        .expect("committed result replayed exactly");
+    assert_eq!(replay.id, recovered.id);
+    assert_eq!(
+        replay.credential_generation,
+        recovered.credential_generation
+    );
+}
+
+#[tokio::test]
 async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -92,6 +321,8 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
                     prefix: "Bearer ".into(),
                 },
                 oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
             },
             pepper,
         )
@@ -109,6 +340,8 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
                 config: json!({"base_url": mock.uri()}),
                 credential: UpstreamCredential::None,
                 oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
             },
             pepper,
         )
@@ -290,6 +523,77 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
+    let (status, _) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{}/credential", upstream.id),
+        &service_a.token,
+        Some("invalid-api-to-oauth"),
+        Some(json!({"credential": {
+            "type": "oauth", "access_token": ""
+        }})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let unchanged = state
+        .db
+        .list_upstream_accounts("tenant-upstream-a")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|account| account.id == upstream.id)
+        .unwrap();
+    assert_eq!(unchanged.auth_kind, "api_key");
+    assert_eq!(unchanged.credential_generation, 2);
+    assert_eq!(unchanged.route_count, 1);
+
+    let (status, oauth) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{}/credential", upstream.id),
+        &service_a.token,
+        Some("upstream-api-to-oauth"),
+        Some(json!({"credential": {
+            "type": "oauth",
+            "access_token": "oauth-access-secret",
+            "refresh_token": "oauth-refresh-secret",
+            "expires_at": memeloop_token_center::db::unix_millis() + 3_600_000
+        }})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let oauth = account(oauth);
+    assert_eq!(oauth.id, upstream.id);
+    assert_eq!(oauth.auth_kind, "oauth");
+    assert_eq!(oauth.connection_method, "oauth");
+    assert_eq!(oauth.credential_generation, 3);
+    assert_eq!(oauth.route_count, 1);
+    assert!(oauth.can_rotate);
+    assert!(
+        !oauth.can_refresh,
+        "manual OAuth has no managed refresh lifecycle"
+    );
+
+    let (status, rotated) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{}/credential", upstream.id),
+        &service_a.token,
+        Some("upstream-oauth-to-api"),
+        Some(json!({"credential": {
+            "type": "api_key", "value": "final-api-secret"
+        }})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rotated = account(rotated);
+    assert_eq!(rotated.id, upstream.id);
+    assert_eq!(rotated.auth_kind, "api_key");
+    assert_eq!(rotated.credential_generation, 4);
+    assert_eq!(rotated.route_count, 1);
+    assert!(rotated.can_rotate);
+    assert!(!rotated.can_refresh);
+
     let (status, disabled) = json_request(
         &state,
         "PATCH",
@@ -380,6 +684,8 @@ async fn global_operator_update_still_requires_the_resource_tenant_and_supported
                 config: json!({"base_url": mock.uri()}),
                 credential: UpstreamCredential::None,
                 oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("cursor".into()),
+                oauth_refresh_url: Some("https://api2.cursor.sh/auth/exchange_user_api_key".into()),
             },
             state.config.key_pepper.as_bytes(),
         )

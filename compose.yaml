@@ -43,7 +43,8 @@ services:
     environment:
       MTC_DATABASE_URL: postgres://token_center:token_center@postgres:5432/memeloop_token_center
       MTC_KEY_PEPPER: local-development-pepper-change-before-production
-      MTC_SERVICE_TOKEN: local-development-service-token
+      # Fixed local-only fixture; production must inject a generated Secret.
+      MTC_SERVICE_TOKEN: local-development-bootstrap-token
       MTC_ARCHIVE_BACKEND: s3
       MTC_S3_BUCKET: memeloop-token-center
       MTC_S3_ENDPOINT: http://minio:9000

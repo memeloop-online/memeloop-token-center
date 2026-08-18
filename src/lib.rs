@@ -1,10 +1,13 @@
 pub mod api;
 pub mod archive;
+pub mod archive_reaper;
+pub mod archive_staging;
 pub mod config;
 pub mod conversation;
 pub mod crypto;
 pub mod db;
 pub mod error;
+mod gateway_body;
 pub mod generation;
 pub mod metrics;
 pub mod model;
@@ -13,6 +16,8 @@ pub mod oauth;
 pub mod plugin;
 pub mod pricing;
 pub mod provider;
+mod proxy_lifecycle;
+mod request_event_stream;
 pub mod schema;
 pub mod session_archive_import;
 pub mod worker;
@@ -30,7 +35,7 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // The image path has its own 2-request concurrency and 16 MiB body bounds, so
 // matching the read timeout to the overall deadline does not make it unbounded.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
-const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(21 * 60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -41,6 +46,7 @@ pub struct AppState {
     pub providers: ProviderCatalog,
     pub plugins: PluginRuntime,
     pub metrics: metrics::Metrics,
+    pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
 }
 
 impl AppState {
@@ -62,6 +68,7 @@ impl AppState {
             providers,
             plugins,
             metrics: metrics::Metrics::default(),
+            request_event_streams: request_event_stream::RequestEventStreamLimiter::default(),
             http: build_http_client()?,
         })
     }

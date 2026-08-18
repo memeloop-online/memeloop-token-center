@@ -10,7 +10,12 @@ metadata:
     {{- include "memeloop-token-center.labels" $ | nindent 4 }}
     app.kubernetes.io/component: {{ $role }}
 spec:
+  {{- if or (eq $role "control") (eq $role "all") }}
+  # Roles containing the control plane are never directly node/public exposed.
+  type: ClusterIP
+  {{- else }}
   type: {{ $roleConfig.service.type }}
+  {{- end }}
   selector:
     app.kubernetes.io/name: {{ include "memeloop-token-center.name" $ }}
     app.kubernetes.io/instance: {{ $.Release.Name }}

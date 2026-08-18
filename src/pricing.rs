@@ -6,12 +6,13 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{db::Database, error::AppError, model::ModelPriceView};
-
-const MODELS_DEV_URL: &str = "https://models.dev/catalog.json";
-const LITELLM_URL: &str =
-    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
-const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
+use crate::{
+    config::Config,
+    db::Database,
+    error::AppError,
+    model::ModelPriceView,
+    network::{self, OutboundScope},
+};
 const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -67,22 +68,29 @@ pub struct ModelPriceSyncResult {
     pub prices: Vec<ModelPriceView>,
 }
 
+pub fn model_price_sources(config: &Config) -> [(&'static str, &str); 3] {
+    [
+        ("models.dev", config.pricing_models_dev_url.as_str()),
+        ("litellm", config.pricing_litellm_url.as_str()),
+        ("openrouter", config.pricing_openrouter_url.as_str()),
+    ]
+}
+
 pub async fn sync_model_prices(
     db: &Database,
     http: &reqwest::Client,
     models: Vec<String>,
     currency: &str,
+    source_specs: &[(&'static str, &str)],
+    allow_test_loopback: bool,
 ) -> Result<ModelPriceSyncResult, AppError> {
     sync_model_prices_with_sources(
         db,
         http,
         models,
         currency,
-        &[
-            ("models.dev", MODELS_DEV_URL),
-            ("litellm", LITELLM_URL),
-            ("openrouter", OPENROUTER_URL),
-        ],
+        source_specs,
+        allow_test_loopback,
     )
     .await
 }
@@ -93,6 +101,7 @@ async fn sync_model_prices_with_sources(
     mut models: Vec<String>,
     currency: &str,
     source_specs: &[(&'static str, &str)],
+    allow_test_loopback: bool,
 ) -> Result<ModelPriceSyncResult, AppError> {
     models = normalized_models(models);
     if models.is_empty() {
@@ -111,7 +120,7 @@ async fn sync_model_prices_with_sources(
     let mut successful_sources = Vec::new();
     let mut failed_sources = Vec::new();
     for &(source, url) in source_specs {
-        match fetch_source(http, source, url).await {
+        match fetch_source(http, source, url, allow_test_loopback).await {
             Ok((prices, skipped)) => {
                 source_results.push(SyncSourceResult {
                     source: source.to_owned(),
@@ -255,9 +264,12 @@ async fn fetch_source(
     http: &reqwest::Client,
     source: &'static str,
     url: &str,
+    allow_test_loopback: bool,
 ) -> Result<(Vec<RemotePrice>, usize), AppError> {
     let task = async {
-        let response = http.get(url).send().await?;
+        let outbound =
+            network::client_for_url(http, url, OutboundScope::Public, allow_test_loopback).await?;
+        let response = outbound.get(url).send().await?;
         if !response.status().is_success() {
             return Err(AppError::Upstream(format!(
                 "{source} returned HTTP {}",
@@ -663,6 +675,7 @@ mod tests {
             ],
             "usd",
             &sources,
+            true,
         )
         .await
         .expect("offline price synchronization");
@@ -780,6 +793,7 @@ mod tests {
             vec!["openai/gpt-manual".into(), "openai/gpt-priority".into()],
             "USD",
             &sources,
+            true,
         )
         .await
         .expect("partial-source synchronization");
@@ -835,6 +849,7 @@ mod tests {
             vec!["openai/gpt-manual".into()],
             "USD",
             &sources,
+            true,
         )
         .await
         .expect_err("all unavailable sources must fail closed");

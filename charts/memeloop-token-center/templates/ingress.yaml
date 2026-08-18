@@ -1,8 +1,16 @@
-{{- if .Values.ingress.enabled }}
 {{- range $role := list "gateway" "control" }}
 {{- $roleConfig := index $.Values.roles $role }}
 {{- $ingressConfig := index $.Values.ingress $role }}
-{{- if and $roleConfig.enabled $roleConfig.service.enabled $ingressConfig.host }}
+{{- if $ingressConfig.enabled }}
+{{- if not (and $roleConfig.enabled $roleConfig.service.enabled) }}
+{{- fail (printf "ingress.%s.enabled requires roles.%s and its Service to be enabled" $role $role) }}
+{{- end }}
+{{- $annotations := deepCopy $ingressConfig.annotations }}
+{{- if eq $role "control" }}
+{{- $_ := set $annotations "nginx.ingress.kubernetes.io/whitelist-source-range" (join "," $ingressConfig.sourceRanges) }}
+{{- $_ := set $annotations "nginx.ingress.kubernetes.io/ssl-redirect" "true" }}
+{{- $_ := set $annotations "nginx.ingress.kubernetes.io/force-ssl-redirect" "true" }}
+{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -11,12 +19,12 @@ metadata:
   labels:
     {{- include "memeloop-token-center.labels" $ | nindent 4 }}
     app.kubernetes.io/component: {{ $role }}
-  {{- with $.Values.ingress.annotations }}
+  {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  {{- with $.Values.ingress.className }}
+  {{- with $ingressConfig.className }}
   ingressClassName: {{ . }}
   {{- end }}
   {{- with $ingressConfig.tlsSecretName }}
@@ -28,13 +36,28 @@ spec:
     - host: {{ $ingressConfig.host | quote }}
       http:
         paths:
-          - path: /
+          {{- if eq $role "gateway" }}
+          {{- range $path := list "/v1" "/self" "/portal" "/ui-assets" "/healthz" }}
+          - path: {{ $path }}
             pathType: Prefix
             backend:
               service:
                 name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
                 port:
                   name: http
-{{- end }}
+          {{- end }}
+          {{- else }}
+          # The operator SPA calls /internal/v1 with a service credential.
+          # This allowlist belongs only on a private, source-restricted ingress.
+          {{- range $path := list "/operator" "/ui-assets" "/internal/v1" }}
+          - path: {{ $path }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "memeloop-token-center.roleName" (dict "root" $ "role" $role) }}
+                port:
+                  name: http
+          {{- end }}
+          {{- end }}
 {{- end }}
 {{- end }}

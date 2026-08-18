@@ -23,14 +23,14 @@ escape from its declared capabilities.
 
 | Area | Current control |
 | --- | --- |
-| Authentication | Control and gateway protected routes authenticate before body extraction. Service scopes and tenant scope are checked separately; a private upstream destination additionally requires a global service credential. |
+| Authentication | Control and gateway protected routes authenticate before body extraction. Service scopes and tenant scope are checked separately; a private upstream destination additionally requires a global service credential. The global bootstrap token must be generated from at least 32 random bytes; startup rejects encoded values shorter than 32 bytes or containing Unicode whitespace/`Cc` control characters anywhere. This prevents invisible-character ambiguity and validates a minimum format, not entropy. |
 | Credential storage | Downstream and service credentials are stored as keyed hashes. Upstream OAuth/API credentials and replayable rotation responses are encrypted. Rotation advances a generation under a stable key/account identity so history does not move. Secret values are not written to normal tracing fields. |
 | SQL injection | Runtime values are bound parameters. The migration-time dynamic column identifier is selected only from a fixed in-code two-item allowlist. |
 | Command injection | Production code does not invoke an operating-system shell or child process. The `Command` references in `main.rs` are CLI enum variants, not process execution. |
 | Path traversal | Archive object locations use a restricted internal alphabet and object-store parsing. Plugin component paths reject absolute/parent components, are canonicalized, and must remain below the canonical package root; package symlinks are rejected. |
 | Browser boundary | Responses set a restrictive CSP, deny framing and object embedding, and constrain scripts/connects to the same origin. Bearer credentials are sent only in authorization headers. |
 | Resource bounds | Request bodies, upstream bodies, archive reads, image concurrency, gateway concurrency, plugin memory/table/instance counts, plugin HTTP bodies, and plugin execution time are bounded. Redirect following is disabled. |
-| Plugin isolation | Wasmtime components receive only declared host capabilities. HTTP allowlists are exact HTTPS origins, and plugin HTTP remains public-only until private-destination approval metadata exists. |
+| Plugin isolation | Wasmtime components receive only declared host capabilities. Plugin/provider IDs are restricted to 1–64 lowercase ASCII letters, digits or hyphens. Traffic-policy reasons and `host.log` guest messages are never retained, reflected to clients or recorded verbatim; plugin logs contain only the validated plugin ID and host-owned fixed decision/event codes. HTTP allowlists are exact HTTPS origins, and plugin HTTP remains public-only until private-destination approval metadata exists. |
 | Dependency surface | SQLx and `rust_decimal` default features are disabled to avoid unused MySQL/RSA and `rkyv` dependency paths. A freshly fetched 1,216-entry RustSec database reported zero known vulnerabilities on the review date. Registry yanked-status queries returned HTTP 403 in this environment, so that separate signal was not verified. |
 
 ## Outbound network boundary
@@ -51,6 +51,15 @@ operation:
 6. Disable inherited environment proxies and redirects so another resolver
    cannot bypass the pin.
 
+Plugin `host.http-request` additionally validates method and the complete header
+map before DNS access. It accepts only `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and
+`DELETE`; rejects authority/content-length, RFC hop-by-hop, proxy/forwarding and
+method-override headers; and bounds the JSON encoding, header count, decoded
+total and individual name/value lengths. Normal `Authorization` and vendor API
+key headers remain available for the exact allowlisted origin. Because a plugin
+cannot supply `Host`, the original URL hostname used by the pinned client is
+also the HTTP Host and TLS SNI/certificate identity.
+
 The policy is applied at the actual request, not only when configuration is
 saved. It covers normal model forwarding, OAuth polling and refresh URLs,
 generation submission/polling, approved generation result origins and asset
@@ -68,36 +77,14 @@ application clients. If an enterprise proxy is needed, add an explicit trusted
 proxy configuration with its own destination policy and tests; do not restore
 ambient proxy inheritance.
 
-## Open findings and deployment requirements
+## Browser and deployment requirements
 
-### P2: readiness probes can be reached through a catch-all ingress
-
-`/readyz` already has application-level amplification bounds: database and
-archive checks run in parallel with an independent two-second timeout, their
-result is cached for five seconds, and a non-blocking singleflight lock prevents
-concurrent probes from building a waiter queue or starting duplicate checks.
-The response exposes only coarse ready/failed state.
-
-The default Ingress nevertheless forwards the path anonymously. An Internet
-caller can still trigger at most one database query and one S3 check per process
-per five-second cache window, compete with the real load-balancer probe, and
-observe dependency availability/timing. This is bounded operational traffic and
-coarse information disclosure, not a direct privilege-boundary bypass, so it is
-P2 rather than P1. Production ingress or edge policy should expose `/readyz`
-only to the cluster/load-balancer health checker. The same restriction should
-cover `/livez` and the deprecated `/healthz` where practical. `/metrics`
-requires a `metrics:read` service credential and is not served by the
-gateway-only role.
-
-### P2: operator bearer token is browser-readable
-
-The operator UI keeps its service credential in `sessionStorage`. The CSP
-reduces the XSS attack surface, but any same-origin script compromise can read a
-long-lived token. Moving the token to React/process memory is the recommended
-near-term P2 fix: reload or browser restart requires another login/paste, and a
-token is no longer recoverable from browser storage after the page is gone.
-Memory-only storage does not stop active same-origin XSS, which can inspect
-runtime state or intercept authenticated requests.
+The operator and self-service UIs keep bearer credentials only in React/process
+memory. Reloading or closing the page requires another paste, and a token is not
+recoverable from browser storage after the page is gone. The CSP reduces the
+XSS attack surface, but memory-only storage does not stop an active same-origin
+script compromise from inspecting runtime state or intercepting authenticated
+requests.
 
 An `HttpOnly; Secure; SameSite=Strict` cookie would provide the stronger browser
 boundary, but the service currently has no server-side operator session. That
@@ -105,14 +92,17 @@ design requires short session expiry, rotation/revocation, origin and CSRF
 controls, and must not translate the current long-lived bootstrap bearer
 directly into a persistent cookie.
 
-### P1 deployment condition: an unrestricted public control plane
+### Control-plane ingress boundary
 
 Regardless of token storage, exposing the control hostname to arbitrary
 Internet clients while operators use a long-lived global service credential is
-a P1 deployment blocker. Keep it behind SSO, VPN or a strict source allowlist;
-the tenant gateway can remain the public product endpoint. With that perimeter
-in place, the `sessionStorage` and readiness findings above remain P2 hardening
-items rather than release blockers.
+a P1 deployment blocker. The Helm chart therefore keeps the control ingress off
+by default and, when enabled, requires TLS, a Higress/ingress-nginx-compatible
+class and at least one explicit source CIDR; every `/0` form is rejected.
+It renders the controller-supported source-range and forced HTTPS annotations
+itself, overriding conflicting user annotations. Custom GitOps routes outside
+the chart must provide an equivalent SSO, VPN or source-allowlist boundary; the
+tenant gateway can remain the public product endpoint.
 
 ### Operational requirements
 
