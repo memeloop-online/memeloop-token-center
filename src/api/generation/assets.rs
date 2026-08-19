@@ -223,10 +223,7 @@ pub(in crate::api) async fn cancel_self_generation(
 ) -> Result<impl IntoResponse, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
     Ok(Json(
-        state
-            .db
-            .cancel_queued_generation_job(key.key_id, job_id)
-            .await?,
+        state.db.cancel_generation_job(key.key_id, job_id).await?,
     ))
 }
 

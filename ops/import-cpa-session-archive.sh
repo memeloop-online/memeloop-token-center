@@ -7,7 +7,7 @@ set -eu
 : "${SESSION_ARCHIVE_IMPORT_SOURCE:=cpa-session-archive-v2}"
 : "${SESSION_ARCHIVE_OVERLAP_MS:=86400000}"
 : "${SESSION_ARCHIVE_TIME_TOLERANCE_MS:=300000}"
-: "${SESSION_ARCHIVE_MAX_LINE_BYTES:=134217728}"
+: "${SESSION_ARCHIVE_MAX_LINE_BYTES:=16777216}"
 : "${SESSION_ARCHIVE_PLAN_DIRECTORY:=/tmp}"
 : "${SESSION_ARCHIVE_MAX_PLAN_BYTES:=1073741824}"
 : "${SESSION_ARCHIVE_ALLOW_UNMAPPED:=false}"
@@ -23,6 +23,10 @@ case "$SESSION_ARCHIVE_ALLOW_UNMAPPED" in true|false) ;; *) echo "SESSION_ARCHIV
 for value in "$SESSION_ARCHIVE_OVERLAP_MS" "$SESSION_ARCHIVE_TIME_TOLERANCE_MS" "$SESSION_ARCHIVE_MAX_LINE_BYTES" "$SESSION_ARCHIVE_MAX_PLAN_BYTES"; do
   case "$value" in *[!0-9]*|'') echo "archive import numeric settings must be unsigned integers" >&2; exit 2;; esac
 done
+[ "$SESSION_ARCHIVE_MAX_LINE_BYTES" -le 16777216 ] || {
+  echo "SESSION_ARCHIVE_MAX_LINE_BYTES must not exceed the 16 MiB importer hard limit" >&2
+  exit 2
+}
 [ -d "$SESSION_ARCHIVE_PLAN_DIRECTORY" ] && [ -w "$SESSION_ARCHIVE_PLAN_DIRECTORY" ] || {
   echo "SESSION_ARCHIVE_PLAN_DIRECTORY must be a writable directory" >&2
   exit 2

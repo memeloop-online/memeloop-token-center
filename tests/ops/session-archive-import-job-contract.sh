@@ -55,8 +55,11 @@ if grep -Eq '(mts_|mtc_|postgres://[^R]|password:[[:space:]]*[^R])' "$job"; then
 fi
 
 binary="$repository/src/bin/import-cpa-session-archive.rs"
+wrapper="$repository/ops/import-cpa-session-archive.sh"
 grep -Fq 'Config::from_session_archive_import_env()' "$binary"
 grep -Fq 'ensure_session_archive_import_schema()' "$binary"
+grep -Fq 'SESSION_ARCHIVE_MAX_LINE_BYTES:=16777216' "$wrapper"
+grep -Fq 'SESSION_ARCHIVE_MAX_LINE_BYTES must not exceed the 16 MiB importer hard limit' "$wrapper"
 if grep -Fq '.migrate()' "$binary"; then
   echo "session archive binary must not run target database migrations" >&2
   exit 1

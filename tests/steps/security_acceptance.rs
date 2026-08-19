@@ -247,6 +247,23 @@ async fn downstream_status_lifecycle_is_terminal(world: &mut TokenCenterWorld) {
     "service credential status management requires a global operator and enforces terminal revocation"
 )]
 async fn service_status_lifecycle_and_global_only(world: &mut TokenCenterWorld) {
+    for scopes in [
+        json!(["*"]),
+        json!(["keys:*"]),
+        json!(["future:admin"]),
+        json!(["keys:read", "keys:read"]),
+    ] {
+        let rejected = world
+            .client
+            .post(format!("{}/internal/v1/service-tokens", world.service_url))
+            .bearer_auth("test-service-token")
+            .json(&json!({"name": "invalid-scope", "scopes": scopes}))
+            .send()
+            .await
+            .expect("reject non-exact managed service credential scope");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
+
     let target_response = world
         .client
         .post(format!("{}/internal/v1/service-tokens", world.service_url))
@@ -619,6 +636,80 @@ async fn oauth_start_enforces_network_boundary(world: &mut TokenCenterWorld) {
     let started: Value = response.json().await.expect("global OAuth start JSON");
     assert!(started["login_url"].as_str().is_some());
     assert!(started["session_token"].as_str().is_some());
+}
+
+#[then("provider configuration and credential schemas are authoritative on every write")]
+async fn provider_schemas_are_authoritative(world: &mut TokenCenterWorld) {
+    let token = issue_service_token(world, "schema-provider-writer", &["providers:write"]).await;
+    let base_url = world.mock.as_ref().expect("mock upstream").uri();
+
+    for config in [
+        json!({"base_url": base_url, "undeclared": true}),
+        json!({"base_url": "not a URI"}),
+    ] {
+        let response = world
+            .client
+            .post(format!("{}/internal/v1/upstreams", world.service_url))
+            .bearer_auth(&token)
+            .json(&json!({
+                "tenant_external_id": "schema-authority-tenant",
+                "name": "rejected-provider",
+                "driver": "http-json",
+                "config": config,
+                "credential": {"type": "none"}
+            }))
+            .send()
+            .await
+            .expect("invalid provider configuration response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let created = world
+        .client
+        .post(format!("{}/internal/v1/upstreams", world.service_url))
+        .bearer_auth(&token)
+        .json(&json!({
+            "tenant_external_id": "schema-authority-tenant",
+            "name": "schema-provider",
+            "driver": "http-json",
+            "config": {"base_url": base_url, "network_scope": "private"},
+            "credential": {"type": "none"}
+        }))
+        .send()
+        .await
+        .expect("valid provider configuration response");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let account_id = created
+        .json::<Value>()
+        .await
+        .expect("created provider JSON")["id"]
+        .as_str()
+        .expect("created provider id")
+        .to_owned();
+
+    let secret = "schema-contract-secret-must-not-echo";
+    let rejected = world
+        .client
+        .put(format!(
+            "{}/internal/v1/upstreams/{account_id}/credential",
+            world.service_url
+        ))
+        .bearer_auth(&token)
+        .header("idempotency-key", "schema-authority-invalid-rotation")
+        .json(&json!({"credential": {
+            "type": "api_key", "value": secret, "undeclared": true
+        }}))
+        .send()
+        .await
+        .expect("invalid provider credential response");
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !rejected
+            .text()
+            .await
+            .expect("schema error body")
+            .contains(secret)
+    );
 }
 
 #[then("malformed and oversized unauthenticated bodies are rejected as unauthorized")]

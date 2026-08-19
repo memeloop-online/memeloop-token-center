@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::json;
+use std::time::Duration;
 
 use crate::{
     AppState, crypto,
@@ -13,13 +14,84 @@ use crate::{
     model::{AuthenticatedKey, AuthenticatedService},
 };
 
+const CONTROL_BODY_READ_DEADLINE: Duration = Duration::from_secs(60);
+const CONTROL_BODY_PERMIT_WAIT: Duration = Duration::from_secs(1);
+const CONTROL_BODY_READ_CONCURRENCY: usize = 4;
+static CONTROL_BODY_READ_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(CONTROL_BODY_READ_CONCURRENCY);
+
 pub(super) async fn authenticate_control_before_body(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
     let _ = authenticated_service(request.headers(), &state).await?;
+    if matches!(
+        *request.method(),
+        axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::PATCH
+    ) {
+        let _permit = match tokio::time::timeout(
+            CONTROL_BODY_PERMIT_WAIT,
+            CONTROL_BODY_READ_PERMITS.acquire(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(AppError::Internal),
+            Err(_) => {
+                return Ok(control_body_rejection(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "control_body_capacity_exhausted",
+                    "control request body capacity is exhausted",
+                ));
+            }
+        };
+        let maximum = match request.uri().path() {
+            "/internal/v1/imports/cpa/managed-oauth" => super::MAX_MANAGED_OAUTH_IMPORT_REQUEST,
+            "/internal/v1/imports/cpa/subscription-accounts" => super::MAX_CPA_IMPORT_BODY,
+            _ => super::MAX_DEFAULT_REQUEST_BODY,
+        };
+        request = match crate::gateway_body::admit_request_body(
+            request,
+            CONTROL_BODY_READ_DEADLINE,
+            maximum,
+        )
+        .await
+        {
+            Ok(request) => request,
+            Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
+                return Ok(control_body_rejection(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request_body_timeout",
+                    "request body was not received before the deadline",
+                ));
+            }
+            Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected) => {
+                return Ok(control_body_rejection(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_body_too_large",
+                    "request body exceeds the supported limit",
+                ));
+            }
+        };
+        // Keep the permit through parsing and handler execution. Releasing it
+        // immediately after buffering would still allow many maximum-sized
+        // JSON values to be parsed and retained concurrently.
+        return Ok(next.run(request).await);
+    }
     Ok(next.run(request).await)
+}
+
+fn control_body_rejection(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> Response {
+    (
+        status,
+        Json(json!({"error": {"code": code, "message": message}})),
+    )
+        .into_response()
 }
 
 pub(super) async fn authenticate_gateway_before_body(
@@ -138,13 +210,7 @@ pub(super) async fn authenticate_downstream(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<AuthenticatedKey, AppError> {
-    let provided = bearer(headers)
-        .or_else(|| {
-            headers
-                .get("x-api-key")
-                .and_then(|value| value.to_str().ok())
-        })
-        .ok_or(AppError::Unauthorized)?;
+    let provided = downstream_credential(headers).ok_or(AppError::Unauthorized)?;
     state
         .db
         .authenticate_key(provided, state.config.key_pepper.as_bytes())
@@ -152,9 +218,84 @@ pub(super) async fn authenticate_downstream(
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+    single_header(headers, header::AUTHORIZATION)?.strip_prefix("Bearer ")
+}
+
+fn downstream_credential(headers: &HeaderMap) -> Option<&str> {
+    // Never let a second credential source rescue an ambiguous or malformed
+    // Authorization header. Different proxies disagree about whether the
+    // first or last duplicate wins, so accepting either would make the
+    // authenticated identity depend on which hop inspected the request.
+    if headers.contains_key(header::AUTHORIZATION) {
+        bearer(headers)
+    } else {
+        single_header(headers, "x-api-key")
+    }
+}
+
+fn single_header(headers: &HeaderMap, name: impl axum::http::header::AsHeaderName) -> Option<&str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::HeaderValue;
+
+    use super::*;
+
+    #[test]
+    fn duplicate_authorization_headers_fail_closed() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer first"),
+        );
+        headers.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer second"),
+        );
+
+        assert_eq!(bearer(&headers), None);
+        assert_eq!(downstream_credential(&headers), None);
+    }
+
+    #[test]
+    fn malformed_authorization_does_not_fall_back_to_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic ignored"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("must-not-be-used"));
+
+        assert_eq!(downstream_credential(&headers), None);
+    }
+
+    #[test]
+    fn duplicate_api_key_headers_fail_closed() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-api-key", HeaderValue::from_static("first"));
+        headers.append("x-api-key", HeaderValue::from_static("second"));
+
+        assert_eq!(downstream_credential(&headers), None);
+    }
+
+    #[test]
+    fn either_single_supported_credential_is_accepted() {
+        let mut bearer_headers = HeaderMap::new();
+        bearer_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer bearer-token"),
+        );
+        assert_eq!(downstream_credential(&bearer_headers), Some("bearer-token"));
+
+        let mut api_key_headers = HeaderMap::new();
+        api_key_headers.insert("x-api-key", HeaderValue::from_static("api-key"));
+        assert_eq!(downstream_credential(&api_key_headers), Some("api-key"));
+    }
 }

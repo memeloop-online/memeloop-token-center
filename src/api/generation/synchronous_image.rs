@@ -720,15 +720,32 @@ async fn finish_responses_tool_image(
         return fail_image_request(context, "upstream_image_invalid_payload").await;
     }
     let usage = response.get("usage").and_then(sanitize_image_usage);
-    let mut transformed = json!({
-        "created": unix_millis() / 1_000,
-        "data": images.into_iter().map(|image| json!({"b64_json": image})).collect::<Vec<_>>()
-    });
-    if let Some(usage) = usage {
-        transformed["usage"] = usage;
+    #[derive(serde::Serialize)]
+    struct ImageData<'a> {
+        b64_json: &'a str,
     }
+
+    #[derive(serde::Serialize)]
+    struct ImageResponse<'a> {
+        created: i64,
+        data: Vec<ImageData<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<Value>,
+    }
+
+    let transformed = ImageResponse {
+        created: unix_millis() / 1_000,
+        data: images
+            .into_iter()
+            .map(|image| ImageData { b64_json: image })
+            .collect(),
+        usage,
+    };
     let response_bytes =
         Bytes::from(serde_json::to_vec(&transformed).expect("image response is JSON serializable"));
+    if response_bytes.len() > MAX_IMAGE_RESPONSE {
+        return fail_image_request(context, "upstream_image_response_too_large").await;
+    }
     let mut result_lease = crate::generation::begin_generation_staging_attempt(
         state,
         crate::archive_staging::ArchiveStagingOwner::SynchronousRequest(request_id),
@@ -775,7 +792,7 @@ async fn finish_responses_tool_image(
         .map_err(|_| AppError::Internal)
 }
 
-fn collect_image_results(value: &Value, images: &mut Vec<String>) {
+fn collect_image_results<'a>(value: &'a Value, images: &mut Vec<&'a str>) {
     match value {
         Value::Array(values) => {
             for value in values {
@@ -789,7 +806,7 @@ fn collect_image_results(value: &Value, images: &mut Vec<String>) {
                 .is_some_and(|value| value == "image_generation_call")
                 && let Some(result) = object.get("result").and_then(Value::as_str)
             {
-                images.push(result.to_owned());
+                images.push(result);
             }
             for value in object.values() {
                 collect_image_results(value, images);
@@ -799,9 +816,29 @@ fn collect_image_results(value: &Value, images: &mut Vec<String>) {
     }
 }
 
-pub(in crate::api) fn has_one_valid_bounded_image(images: &[String]) -> bool {
-    images.len() == 1
-        && STANDARD
-            .decode(images.first().map(String::as_str).unwrap_or_default())
-            .is_ok_and(|decoded| !decoded.is_empty() && decoded.len() <= MAX_IMAGE_RESPONSE)
+pub(in crate::api) fn has_one_valid_bounded_image<T: AsRef<str>>(images: &[T]) -> bool {
+    let Some(image) = images.first().filter(|_| images.len() == 1) else {
+        return false;
+    };
+    let encoded = image.as_ref().as_bytes();
+    if encoded.is_empty() || !encoded.len().is_multiple_of(4) {
+        return false;
+    }
+
+    let mut decoded_len = 0_usize;
+    let mut decoded_quantum = [0_u8; 3];
+    let quantum_count = encoded.len() / 4;
+    for (index, quantum) in encoded.chunks_exact(4).enumerate() {
+        if index + 1 != quantum_count && quantum.contains(&b'=') {
+            return false;
+        }
+        let Ok(written) = STANDARD.decode_slice(quantum, &mut decoded_quantum) else {
+            return false;
+        };
+        decoded_len = decoded_len.saturating_add(written);
+        if decoded_len > MAX_IMAGE_RESPONSE {
+            return false;
+        }
+    }
+    decoded_len != 0
 }

@@ -1,7 +1,7 @@
 use memeloop_token_center::{
     db::{
         CreateGenerationJobInput, CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput,
-        CreateUpstreamAccountInput, Database, FinishGenerationJobInput,
+        CreateUpstreamAccountInput, Database, FinishGenerationJobInput, StatsFilter, unix_millis,
     },
     error::{AppError, LimitReason},
     model::{ArchivedGenerationAsset, GenerationStagedAssets, KeyPolicy},
@@ -575,15 +575,26 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
         1
     );
 
-    let stats = database.stats(key.key_id).await.unwrap();
+    let range = StatsFilter {
+        from_created_at: Some(unix_millis().saturating_sub(60_000)),
+        to_created_at: Some(unix_millis().saturating_add(1)),
+        ..Default::default()
+    };
+    let stats = database
+        .stats_filtered(key.key_id, range.clone())
+        .await
+        .unwrap();
     assert_eq!(stats.summary.total_requests, 1);
     assert_eq!(stats.summary.successful_requests, 1);
-    assert_eq!(stats.summary.total_cost, "0.25");
+    assert_eq!(stats.summary.total_cost.as_deref(), Some("0.25"));
     assert_eq!(stats.by_model[0].name, "video-test");
-    let operator_stats = database.operator_stats(&tenant).await.unwrap();
+    let operator_stats = database
+        .operator_stats_filtered(&tenant, range)
+        .await
+        .unwrap();
     assert_eq!(operator_stats.summary.total_requests, 1);
     assert_eq!(operator_stats.summary.successful_requests, 1);
-    assert_eq!(operator_stats.summary.total_cost, "0.25");
+    assert_eq!(operator_stats.summary.total_cost.as_deref(), Some("0.25"));
     assert_eq!(operator_stats.by_model[0].name, "video-test");
     let requests = database.list_all_requests(&tenant, 10).await.unwrap();
     assert_eq!(requests[0].protocol, "generation");

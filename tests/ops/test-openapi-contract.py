@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import copy
 import pathlib
+import tempfile
 import unittest
 
 
@@ -43,6 +44,17 @@ fn gateway_router(state: AppState) -> Router<AppState> {{
 
 
 class RouteExtractorTests(unittest.TestCase):
+    def test_source_directory_is_combined_in_stable_relative_path_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            (root / "nested").mkdir()
+            (root / "z.rs").write_text("fn z() {}\n", encoding="utf-8")
+            (root / "nested" / "a.rs").write_text("fn a() {}\n", encoding="utf-8")
+
+            source = CONTRACT.read_rust_source(root)
+
+        self.assertLess(source.index("nested/a.rs"), source.index("z.rs"))
+
     def test_comments_are_ignored_and_control_guard_is_classified(self) -> None:
         routes = CONTRACT.source_routes(source_with())
         self.assertNotIn("/ghost", {route["path"] for route in routes})
@@ -121,6 +133,24 @@ class ProductContractTests(unittest.TestCase):
         with self.assertRaisesRegex(CONTRACT.ContractFailure, "idempotency contract"):
             CONTRACT.validate_product_contracts(document)
 
+    def test_cloud_subscription_policy_rollback_regression_fails_closed(self) -> None:
+        document = copy.deepcopy(self.document)
+        document["paths"][
+            "/internal/v1/integrations/memeloop-cloud/subscription"
+        ]["put"]["x-idempotency-contract"]["policy-update"] = "unversioned"
+        with self.assertRaisesRegex(
+            CONTRACT.ContractFailure, "Cloud ordered idempotency contract"
+        ):
+            CONTRACT.validate_product_contracts(document)
+
+    def test_cloud_subscription_hmac_regression_fails_closed(self) -> None:
+        document = copy.deepcopy(self.document)
+        document["paths"][
+            "/internal/v1/integrations/memeloop-cloud/subscription"
+        ]["put"]["security"] = [{"serviceBearer": []}]
+        with self.assertRaisesRegex(CONTRACT.ContractFailure, "lost HMAC security"):
+            CONTRACT.validate_product_contracts(document)
+
     def test_usage_analysis_contract_is_currency_safe_and_canonical(self) -> None:
         operation = self.document["paths"]["/internal/v1/usage-analysis"]["get"]
         self.assertEqual("requests:read", operation["x-required-scope"])
@@ -174,6 +204,71 @@ class ProductContractTests(unittest.TestCase):
         ]
         hour = heatmap["allOf"][0]["properties"]["hour_of_week"]
         self.assertEqual((0, 167), (hour["minimum"], hour["maximum"]))
+
+    def test_oauth_reauthorization_reuses_the_unified_upstream_resource(self) -> None:
+        cases = [
+            ("cursor", "StartCursorOAuthRequest"),
+            ("provider-adapter", "StartProviderAdapterOAuthRequest"),
+            ("subscription-bridge", "StartSubscriptionBridgeRequest"),
+        ]
+        for path_segment, request_schema in cases:
+            start = self.document["paths"][
+                f"/internal/v1/oauth/{path_segment}/start"
+            ]["post"]
+            poll = self.document["paths"][
+                f"/internal/v1/oauth/{path_segment}/poll"
+            ]["post"]
+            self.assertEqual("oauth:write", start["x-required-scope"])
+            self.assertEqual("oauth:write", poll["x-required-scope"])
+            target = self.document["components"]["schemas"][request_schema][
+                "properties"
+            ]["upstream_account_id"]
+            self.assertEqual(("string", "uuid"), (target["type"], target["format"]))
+            self.assertEqual(
+                "#/components/schemas/UpstreamProvider",
+                poll["responses"]["200"]["content"]["application/json"][
+                    "schema"
+                ]["$ref"],
+            )
+
+    def test_session_archive_quarantine_is_persistent_global_operator_only(self) -> None:
+        base = "/internal/v1/imports/session-archive/quarantine"
+        operations = [
+            (self.document["paths"][base]["get"], "imports:session_archive:quarantine:read"),
+            (
+                self.document["paths"][f"{base}/{{quarantine_id}}"]["get"],
+                "imports:session_archive:quarantine:read",
+            ),
+            (
+                self.document["paths"][f"{base}/{{quarantine_id}}/resolutions"]["post"],
+                "imports:session_archive:quarantine:resolve",
+            ),
+        ]
+        for operation, scope in operations:
+            self.assertEqual([{"serviceBearer": []}], operation["security"])
+            self.assertEqual(scope, operation["x-required-scope"])
+            self.assertIs(operation["x-global-service-only"], True)
+            self.assertIs(operation["x-persistent-service-only"], True)
+
+        scopes = self.document["components"]["schemas"]["ServiceScope"]["enum"]
+        self.assertIn("imports:session_archive:quarantine:read", scopes)
+        self.assertIn("imports:session_archive:quarantine:resolve", scopes)
+        request = self.document["components"]["schemas"][
+            "ResolveSessionArchiveQuarantineRequest"
+        ]
+        self.assertTrue(
+            {"expected_record_digest", "evidence_digest"}.issubset(request["required"])
+        )
+        record_properties = self.document["components"]["schemas"][
+            "SessionArchiveQuarantineRecord"
+        ]["properties"]
+        for secret_internal_field in (
+            "identity_claim_digest",
+            "proof_digest",
+            "request_object",
+            "response_object",
+        ):
+            self.assertNotIn(secret_internal_field, record_properties)
 
 
 if __name__ == "__main__":

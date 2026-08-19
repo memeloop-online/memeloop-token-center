@@ -31,6 +31,8 @@ use wiremock::{
     matchers::{body_partial_json, header, header_exists, method, path, query_param},
 };
 
+#[path = "steps/cloud_entitlements.rs"]
+mod cloud_entitlements;
 #[path = "steps/security_acceptance.rs"]
 mod security_acceptance;
 
@@ -215,6 +217,34 @@ async fn mock_seedance_generation(world: &mut TokenCenterWorld) {
                 .set_body_bytes(b"mock-video-content"),
         )
         .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock Seedance upstream keeps a generation running until cancellation")]
+async fn mock_cancellable_seedance_generation(world: &mut TokenCenterWorld) {
+    let server = world.mock.as_ref().expect("mock server");
+    Mock::given(method("POST"))
+        .and(path("/api/v3/contents/generations/tasks"))
+        .and(header("authorization", "Bearer seedance-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "cgt-cancellable"})))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/contents/generations/tasks/cgt-cancellable"))
+        .and(header("authorization", "Bearer seedance-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cgt-cancellable",
+            "status": "running"
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v3/contents/generations/tasks/cgt-cancellable"))
+        .and(header("authorization", "Bearer seedance-secret"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(server)
         .await;
 }
 
@@ -728,6 +758,68 @@ async fn mock_comfyui_generation(world: &mut TokenCenterWorld) {
         .await;
 }
 
+#[given("the mock ComfyUI upstream keeps a generation running until cancellation")]
+async fn mock_cancellable_comfyui_generation(world: &mut TokenCenterWorld) {
+    let server = world.mock.as_ref().expect("mock server");
+    Mock::given(method("POST"))
+        .and(path("/prompt"))
+        .and(header_exists("idempotency-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"prompt_id": "comfy-cancellable"})),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/history/comfy-cancellable"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/queue"))
+        .and(body_partial_json(json!({"delete": ["comfy-cancellable"]})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"deleted": 1})))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[given("the mock ComfyUI upstream returns two images for a three image request")]
+async fn mock_comfyui_megapixel_generation(world: &mut TokenCenterWorld) {
+    let server = world.mock.as_ref().expect("mock server");
+    Mock::given(method("POST"))
+        .and(path("/prompt"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"prompt_id": "comfy-megapixel"})),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/history/comfy-megapixel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "comfy-megapixel": {
+                "status": {"status_str": "success", "completed": true},
+                "outputs": {"9": {"images": [
+                    {"filename": "mp-0.png", "subfolder": "", "type": "output"},
+                    {"filename": "mp-1.png", "subfolder": "", "type": "output"}
+                ]}}
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/view"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(b"mock-megapixel-png"),
+        )
+        .expect(2)
+        .mount(server)
+        .await;
+}
+
 #[given("the mock ComfyUI upstream reports success without generated assets")]
 async fn mock_comfyui_success_without_assets(world: &mut TokenCenterWorld) {
     let server = world.mock.as_ref().expect("mock server");
@@ -892,6 +984,155 @@ async fn create_metered_comfyui_route_and_key(
     world.current_key = key["key"].as_str().expect("ComfyUI key").to_owned();
 }
 
+#[when("the service creates a megapixel-priced ComfyUI route and key")]
+async fn create_megapixel_comfyui_route_and_key(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let upstream = world
+        .client
+        .post(format!("{}/internal/v1/upstreams", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "name": "comfy-megapixel",
+            "driver": "comfyui",
+            "config": {
+                "base_url": mock_url,
+                "api_prefix": "",
+                "workflow_id": "workflow-megapixel-v1",
+                "workflow_template": {"1": {"inputs": {
+                    "width": {"$mtc_param": "width"},
+                    "height": {"$mtc_param": "height"},
+                    "batch_size": {"$mtc_param": "batch_size"}
+                }}}
+            },
+            "credential": {"type": "none"}
+        }))
+        .send()
+        .await
+        .expect("create megapixel ComfyUI upstream");
+    assert_eq!(upstream.status(), StatusCode::CREATED);
+    let upstream = upstream
+        .json::<Value>()
+        .await
+        .expect("megapixel upstream JSON");
+    let route = world
+        .client
+        .post(format!("{}/internal/v1/model-routes", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "public_model": "comfy-megapixel-public",
+            "upstream_account_id": upstream["id"],
+            "upstream_model": "workflow-megapixel-v1",
+            "protocol": "generation"
+        }))
+        .send()
+        .await
+        .expect("create megapixel route");
+    assert_eq!(route.status(), StatusCode::CREATED);
+    let price = world
+        .client
+        .post(format!(
+            "{}/internal/v1/generation-prices/USD/comfy-megapixel-public",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"billing_unit": "megapixel", "price_per_unit": "1"}))
+        .send()
+        .await
+        .expect("create megapixel price");
+    assert_eq!(price.status(), StatusCode::OK);
+    let key = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "principal_external_id": "megapixel-user",
+            "alias": "megapixel-user",
+            "currency": "USD",
+            "initial_balance": "10",
+            "policy": {
+                "allowed_models": ["comfy-megapixel-public"],
+                "tokens_per_minute": 10000000
+            }
+        }))
+        .send()
+        .await
+        .expect("create megapixel key");
+    assert_eq!(key.status(), StatusCode::CREATED);
+    let key = key.json::<Value>().await.expect("megapixel key JSON");
+    world.current_key = key["key"].as_str().expect("megapixel key").to_owned();
+}
+
+#[when("the client creates a three-output ComfyUI megapixel generation")]
+async fn create_comfyui_megapixel_generation(world: &mut TokenCenterWorld) {
+    let response = world
+        .client
+        .post(format!("{}/v1/images/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .header("idempotency-key", "comfy-megapixel-three")
+        .json(&json!({
+            "model": "comfy-megapixel-public",
+            "input": {"parameters": {"width": 1024, "height": 512, "batch_size": 3}}
+        }))
+        .send()
+        .await
+        .expect("create megapixel generation");
+    world.status = Some(response.status());
+    world.response = response.json().await.expect("megapixel generation JSON");
+    world.generation_job_id = world.response["job_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok());
+    assert_eq!(
+        world.status,
+        Some(StatusCode::ACCEPTED),
+        "{}",
+        world.response
+    );
+}
+
+#[then("the ComfyUI generation bills exactly 1.048576 megapixels and refunds the unused output")]
+async fn comfyui_megapixel_bills_actual_outputs(world: &mut TokenCenterWorld) {
+    let job_id = world.generation_job_id.expect("megapixel job id");
+    let mut detail = Value::Null;
+    for _ in 0..120 {
+        let response = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("poll megapixel generation");
+        assert_eq!(response.status(), StatusCode::OK);
+        detail = response
+            .json::<Value>()
+            .await
+            .expect("megapixel detail JSON");
+        if detail["status"] == "succeeded" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(detail["status"], "succeeded", "{detail}");
+    assert_eq!(detail["billing_unit"], "megapixel");
+    assert_eq!(detail["estimated_units"], 1_572_864);
+    assert_eq!(detail["billed_units"], 1_048_576);
+    assert_eq!(detail["cost"], "1.048576");
+    assert_eq!(detail["assets"].as_array().map(Vec::len), Some(2));
+
+    let key = world
+        .client
+        .get(format!("{}/self/v1/key", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("read megapixel balance");
+    assert_eq!(key.status(), StatusCode::OK);
+    let key = key.json::<Value>().await.expect("megapixel key view JSON");
+    assert_eq!(key["available_balance"], "8.951424");
+}
+
 #[when("the client creates a ComfyUI image generation")]
 async fn create_comfyui_generation(world: &mut TokenCenterWorld) {
     let response = world
@@ -912,6 +1153,369 @@ async fn create_comfyui_generation(world: &mut TokenCenterWorld) {
     world.generation_job_id = world.response["job_id"]
         .as_str()
         .and_then(|value| Uuid::parse_str(value).ok());
+}
+
+#[then("cancelling the running ComfyUI generation is idempotent and refunds exactly once")]
+async fn running_comfyui_cancellation_is_safe(world: &mut TokenCenterWorld) {
+    let job_id = world.generation_job_id.expect("ComfyUI generation job id");
+    let detail_url = format!("{}/self/v1/generations/{job_id}", world.service_url);
+    for _ in 0..100 {
+        let detail = world
+            .client
+            .get(&detail_url)
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("poll running generation");
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail = detail
+            .json::<Value>()
+            .await
+            .expect("running generation JSON");
+        if detail["status"] == "running" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let cancellation = world
+        .client
+        .delete(&detail_url)
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("request running generation cancellation");
+    assert_eq!(cancellation.status(), StatusCode::OK);
+    let cancellation = cancellation
+        .json::<Value>()
+        .await
+        .expect("cancelling generation JSON");
+    assert_eq!(cancellation["status"], "cancelling", "{cancellation}");
+
+    let mut terminal = Value::Null;
+    for _ in 0..100 {
+        let detail = world
+            .client
+            .get(&detail_url)
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("poll cancelled generation");
+        assert_eq!(detail.status(), StatusCode::OK);
+        terminal = detail
+            .json::<Value>()
+            .await
+            .expect("cancelled generation JSON");
+        if terminal["status"] == "cancelled" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(terminal["status"], "cancelled", "{terminal}");
+    assert_eq!(terminal["cost"], "0");
+    assert_eq!(terminal["error_code"], "cancelled_by_user");
+
+    let replay = world
+        .client
+        .delete(&detail_url)
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("replay generation cancellation");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay = replay
+        .json::<Value>()
+        .await
+        .expect("replayed cancellation JSON");
+    assert_eq!(replay["status"], "cancelled");
+
+    let key = world
+        .client
+        .get(format!("{}/self/v1/key", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("read key after cancellation");
+    assert_eq!(key.status(), StatusCode::OK);
+    let key = key
+        .json::<Value>()
+        .await
+        .expect("key JSON after cancellation");
+    assert_eq!(key["available_balance"], "10");
+    let limits = world
+        .client
+        .get(format!("{}/self/v1/key/limits", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("read limits after cancellation");
+    assert_eq!(limits.status(), StatusCode::OK);
+    let limits = limits
+        .json::<Value>()
+        .await
+        .expect("limits JSON after cancellation");
+    assert_eq!(limits["concurrency"]["active"], 0);
+}
+
+#[then("cancelling the running Seedance generation is idempotent and refunds exactly once")]
+async fn running_seedance_cancellation_is_safe(world: &mut TokenCenterWorld) {
+    running_comfyui_cancellation_is_safe(world).await;
+}
+
+async fn create_generation_admission_key(
+    world: &TokenCenterWorld,
+    principal: &str,
+    allowed_model: &str,
+    initial_balance: &str,
+    requests_per_minute: u32,
+    tokens_per_minute: u64,
+    max_concurrency: u32,
+) -> String {
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "principal_external_id": principal,
+            "alias": principal,
+            "currency": "USD",
+            "initial_balance": initial_balance,
+            "policy": {
+                "allowed_models": [allowed_model],
+                "requests_per_minute": requests_per_minute,
+                "tokens_per_minute": tokens_per_minute,
+                "max_concurrency": max_concurrency
+            }
+        }))
+        .send()
+        .await
+        .expect("create generation admission key");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    response
+        .json::<Value>()
+        .await
+        .expect("generation admission key JSON")["key"]
+        .as_str()
+        .expect("issued generation admission key")
+        .to_owned()
+}
+
+async fn call_async_generation_admission(
+    world: &TokenCenterWorld,
+    key: &str,
+    endpoint: &str,
+    model: &str,
+    input: &Value,
+) -> (StatusCode, Value) {
+    let response = world
+        .client
+        .post(format!("{}{endpoint}", world.service_url))
+        .bearer_auth(key)
+        .header("idempotency-key", Uuid::now_v7().to_string())
+        .json(&json!({"model": model, "input": input}))
+        .send()
+        .await
+        .expect("call asynchronous generation admission");
+    let status = response.status();
+    let body = response
+        .json::<Value>()
+        .await
+        .expect("generation admission response JSON");
+    (status, body)
+}
+
+async fn assert_generation_admission_matrix(
+    world: &mut TokenCenterWorld,
+    driver: &str,
+    model: &str,
+    billing_unit: &str,
+    input: Value,
+) {
+    if let Some(worker) = world.worker_task.take() {
+        worker.abort();
+    }
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let endpoint = if driver == "comfyui" {
+        "/v1/images/generations"
+    } else {
+        "/v1/videos/generations"
+    };
+    let config = if driver == "comfyui" {
+        json!({
+            "base_url": mock_url,
+            "api_prefix": "",
+            "workflow_id": "admission-workflow",
+            "workflow_template": {
+                "1": {"inputs": {
+                    "width": {"$mtc_param": "width"},
+                    "height": {"$mtc_param": "height"},
+                    "batch_size": {"$mtc_param": "batch_size"}
+                }}
+            }
+        })
+    } else {
+        json!({"base_url": mock_url})
+    };
+    let upstream = world
+        .client
+        .post(format!("{}/internal/v1/upstreams", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "name": format!("{model}-upstream"),
+            "driver": driver,
+            "config": config,
+            "credential": {"type": "none"}
+        }))
+        .send()
+        .await
+        .expect("create admission upstream");
+    assert_eq!(upstream.status(), StatusCode::CREATED);
+    let upstream = upstream
+        .json::<Value>()
+        .await
+        .expect("admission upstream JSON");
+    let route = world
+        .client
+        .post(format!("{}/internal/v1/model-routes", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "public_model": model,
+            "upstream_account_id": upstream["id"],
+            "upstream_model": if driver == "comfyui" { "admission-workflow" } else { "seedance-admission" },
+            "protocol": "generation"
+        }))
+        .send()
+        .await
+        .expect("create admission route");
+    assert_eq!(route.status(), StatusCode::CREATED);
+    let price = world
+        .client
+        .post(format!(
+            "{}/internal/v1/generation-prices/USD/{model}",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"billing_unit": billing_unit, "price_per_unit": "0.1"}))
+        .send()
+        .await
+        .expect("create admission price");
+    assert_eq!(price.status(), StatusCode::OK);
+
+    let forbidden = create_generation_admission_key(
+        world,
+        &format!("{model}-forbidden"),
+        "another-model",
+        "10",
+        60,
+        10_000_000,
+        8,
+    )
+    .await;
+    let (status, body) =
+        call_async_generation_admission(world, &forbidden, endpoint, model, &input).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "forbidden");
+
+    let quota = create_generation_admission_key(
+        world,
+        &format!("{model}-quota"),
+        model,
+        "0",
+        60,
+        10_000_000,
+        8,
+    )
+    .await;
+    let (status, body) =
+        call_async_generation_admission(world, &quota, endpoint, model, &input).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], "insufficient_quota");
+    assert_eq!(body["error"]["reason"], "balance_exhausted");
+
+    let rpm = create_generation_admission_key(
+        world,
+        &format!("{model}-rpm"),
+        model,
+        "10",
+        1,
+        10_000_000,
+        8,
+    )
+    .await;
+    let (first_status, first_body) =
+        call_async_generation_admission(world, &rpm, endpoint, model, &input).await;
+    assert_eq!(first_status, StatusCode::ACCEPTED, "{first_body}");
+    let (mut status, mut body) =
+        call_async_generation_admission(world, &rpm, endpoint, model, &input).await;
+    if status == StatusCode::ACCEPTED {
+        (status, body) =
+            call_async_generation_admission(world, &rpm, endpoint, model, &input).await;
+    }
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["reason"], "rpm_exhausted");
+
+    let tpm =
+        create_generation_admission_key(world, &format!("{model}-tpm"), model, "10", 60, 1, 8)
+            .await;
+    let (status, body) =
+        call_async_generation_admission(world, &tpm, endpoint, model, &input).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["reason"], "tpm_exhausted");
+
+    let concurrency = create_generation_admission_key(
+        world,
+        &format!("{model}-concurrency"),
+        model,
+        "10",
+        60,
+        10_000_000,
+        1,
+    )
+    .await;
+    let (first_status, first_body) =
+        call_async_generation_admission(world, &concurrency, endpoint, model, &input).await;
+    assert_eq!(first_status, StatusCode::ACCEPTED, "{first_body}");
+    let (status, body) =
+        call_async_generation_admission(world, &concurrency, endpoint, model, &input).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["reason"], "concurrency_exhausted");
+
+    let received = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("mock request journal");
+    assert!(received.is_empty(), "admission must precede upstream work");
+}
+
+#[then(
+    "the asynchronous ComfyUI image endpoint rejects permission quota RPM TPM and concurrency violations"
+)]
+async fn comfyui_image_admission_matrix(world: &mut TokenCenterWorld) {
+    assert_generation_admission_matrix(
+        world,
+        "comfyui",
+        "comfy-admission-image",
+        "megapixel",
+        json!({"parameters": {"width": 512, "height": 512, "batch_size": 1}}),
+    )
+    .await;
+}
+
+#[then(
+    "the asynchronous Seedance video endpoint rejects permission quota RPM TPM and concurrency violations"
+)]
+async fn seedance_video_admission_matrix(world: &mut TokenCenterWorld) {
+    assert_generation_admission_matrix(
+        world,
+        "volcengine-seedance",
+        "seedance-admission-video",
+        "second",
+        json!({"duration": 5, "content": [{"text": "mock video"}]}),
+    )
+    .await;
 }
 
 #[when("the generation worker is stopped before it can submit upstream")]
@@ -4146,6 +4750,104 @@ async fn refreshed_cursor_account_is_stable(world: &mut TokenCenterWorld) {
             .and_then(|value| value.to_str().ok())
             == Some("Bearer cursor-access-2")
     }));
+}
+
+#[when("the service starts reauthorization for the Cursor OAuth account")]
+async fn start_cursor_oauth_reauthorization(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let account_id = world.cursor_account_id.expect("Cursor account id");
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/oauth/cursor/start",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "account_name": "cursor-oauth",
+            "provider_driver": "http-json",
+            "provider_config": {"base_url": mock_url},
+            "upstream_account_id": account_id,
+            "endpoints": {
+                "login_url": format!("{mock_url}/cursor/loginDeepControl"),
+                "poll_url": format!("{mock_url}/cursor/auth/poll"),
+                "refresh_url": format!("{mock_url}/cursor/auth/exchange_user_api_key")
+            }
+        }))
+        .send()
+        .await
+        .expect("start Cursor OAuth reauthorization");
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = response
+        .json()
+        .await
+        .expect("Cursor OAuth reauthorization start JSON");
+    world.cursor_session_token = value["session_token"]
+        .as_str()
+        .expect("Cursor reauthorization session token")
+        .to_owned();
+    assert!(
+        !world
+            .cursor_session_token
+            .contains(account_id.to_string().as_str())
+    );
+}
+
+#[when("the service polls the completed Cursor OAuth reauthorization")]
+async fn poll_cursor_oauth_reauthorization(world: &mut TokenCenterWorld) {
+    let poll = || {
+        world
+            .client
+            .post(format!(
+                "{}/internal/v1/oauth/cursor/poll",
+                world.service_url
+            ))
+            .bearer_auth("test-service-token")
+            .json(&json!({"session_token": world.cursor_session_token}))
+            .send()
+    };
+    let response = poll().await.expect("poll Cursor OAuth reauthorization");
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = response
+        .json()
+        .await
+        .expect("reauthorized Cursor account JSON");
+    assert_eq!(
+        value["id"],
+        world
+            .cursor_account_id
+            .expect("Cursor account id")
+            .to_string()
+    );
+    assert_eq!(value["credential_generation"], 3);
+    assert_eq!(value["route_count"], 1);
+    assert_eq!(value["can_reauthorize"], true);
+    assert!(value.get("credential").is_none());
+    world.cursor_generation = 3;
+
+    let replay = poll()
+        .await
+        .expect("replay Cursor OAuth reauthorization poll");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay: Value = replay.json().await.expect("reauthorization replay JSON");
+    assert_eq!(replay["credential_generation"], 3);
+}
+
+#[then("the reauthorized Cursor account keeps its id and route and uses generation 3")]
+async fn reauthorized_cursor_account_is_stable(world: &mut TokenCenterWorld) {
+    assert!(world.cursor_account_id.is_some());
+    assert_eq!(world.cursor_generation, 3);
+    let state = world.state.as_ref().expect("state");
+    let routes = state
+        .db
+        .list_model_routes(Some("default"))
+        .await
+        .expect("routes");
+    let cursor_routes = routes
+        .iter()
+        .filter(|route| route.upstream_account_id == world.cursor_account_id.unwrap())
+        .count();
+    assert_eq!(cursor_routes, 1);
 }
 
 #[when(expr = "the service creates a key for principal {string} allowing model {string}")]

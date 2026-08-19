@@ -195,6 +195,41 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "durable archive staging attempts",
         sql: include_str!("../../../migrations/common/0035_archive_staging_attempts.sql"),
     },
+    Migration {
+        version: 36,
+        name: "operator-only session archive quarantine",
+        sql: include_str!("../../../migrations/common/0036_session_archive_quarantine.sql"),
+    },
+    Migration {
+        version: 37,
+        name: "MemeLoop Cloud subscription event audit",
+        sql: include_str!("../../../migrations/common/0037_memeloop_cloud_subscription_events.sql"),
+    },
+    Migration {
+        version: 38,
+        name: "credential and billing keyset pagination",
+        sql: include_str!("../../../migrations/common/0038_credential_billing_pagination.sql"),
+    },
+    Migration {
+        version: 39,
+        name: "observability currency snapshots and selective filters",
+        sql: include_str!("../../../migrations/common/0039_observability_currency_and_filters.sql"),
+    },
+    Migration {
+        version: 40,
+        name: "generation cancellation claim index",
+        sql: include_str!("../../../migrations/common/0040_generation_cancellation.sql"),
+    },
+    Migration {
+        version: 41,
+        name: "tenant-scoped plugin configurations",
+        sql: include_str!("../../../migrations/common/0041_plugin_configurations.sql"),
+    },
+    Migration {
+        version: 42,
+        name: "bounded control list pagination indexes",
+        sql: include_str!("../../../migrations/common/0042_control_list_pagination.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -375,6 +410,41 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 35,
         name: "durable archive staging attempts",
         sql: include_str!("../../../migrations/common/0035_archive_staging_attempts.sql"),
+    },
+    Migration {
+        version: 36,
+        name: "operator-only session archive quarantine",
+        sql: include_str!("../../../migrations/common/0036_session_archive_quarantine.sql"),
+    },
+    Migration {
+        version: 37,
+        name: "MemeLoop Cloud subscription event audit",
+        sql: include_str!("../../../migrations/common/0037_memeloop_cloud_subscription_events.sql"),
+    },
+    Migration {
+        version: 38,
+        name: "credential and billing keyset pagination",
+        sql: include_str!("../../../migrations/common/0038_credential_billing_pagination.sql"),
+    },
+    Migration {
+        version: 39,
+        name: "observability currency snapshots and selective filters",
+        sql: include_str!("../../../migrations/common/0039_observability_currency_and_filters.sql"),
+    },
+    Migration {
+        version: 40,
+        name: "generation cancellation claim index",
+        sql: include_str!("../../../migrations/common/0040_generation_cancellation.sql"),
+    },
+    Migration {
+        version: 41,
+        name: "tenant-scoped plugin configurations",
+        sql: include_str!("../../../migrations/common/0041_plugin_configurations.sql"),
+    },
+    Migration {
+        version: 42,
+        name: "bounded control list pagination indexes",
+        sql: include_str!("../../../migrations/common/0042_control_list_pagination.sql"),
     },
 ];
 

@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   summary: Multi-protocol AI gateway, credential, quota, and archive API
   description: |
-    Contract for the API surface implemented by `src/api.rs`.
+    Contract for the API surface implemented under `src/api/`.
 
     The production Helm deployment separates the **control** and **gateway** roles.
     `/internal/v1/*` is served only by the control role. `/self/v1/*` and `/v1/*`
@@ -43,6 +43,8 @@ tags:
     description: Exact, versioned subscription credit reconciliation for memeloop web.
   - name: Operator traffic
     description: Tenant/global traffic statistics, request detail, and live events.
+  - name: Session archive quarantine
+    description: Global persistent-operator review and immutable resolution of uncorrelated archive records.
   - name: Self service
     description: Credential-scoped, read-only usage and logical-conversation views.
   - name: OpenAI compatible
@@ -161,7 +163,12 @@ paths:
       description: |
         A tenant-scoped service credential is always restricted to its bound tenant.
         A global credential may omit `tenant_external_id` to inspect all tenants.
-        The implementation currently returns at most 500 records and has no cursor.
+        Records are ordered by `(created_at, key_id)` descending. Use the final row's
+        `created_at` and `key_id` as the paired, exclusive `before_created_at` and
+        `before_id` cursor. The response never contains a credential secret, so a caller
+        that lost a create response can reconcile the stable `key_id`, `account_id`,
+        fingerprint, generation, policy and balance, then rotate if secret recovery is
+        required.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:read
       parameters:
@@ -169,6 +176,9 @@ paths:
         - name: principal_external_id
           in: query
           schema: { type: string, maxLength: 200 }
+        - $ref: '#/components/parameters/CredentialListLimit500'
+        - $ref: '#/components/parameters/BeforeCreatedAt'
+        - $ref: '#/components/parameters/BeforeId'
       responses:
         '200':
           description: Stable identities; never contains credential secrets.
@@ -176,7 +186,9 @@ paths:
             application/json:
               schema:
                 type: array
+                maxItems: 500
                 items: { $ref: '#/components/schemas/ManagedClientCredential' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
     post:
@@ -386,6 +398,10 @@ paths:
       description: Global service credentials only. Secrets are never returned.
       security: [{ serviceBearer: [] }]
       x-required-scope: service_tokens:read
+      parameters:
+        - $ref: '#/components/parameters/ControlListLimit100'
+        - $ref: '#/components/parameters/BeforeCreatedAt'
+        - $ref: '#/components/parameters/BeforeId'
       responses:
         '200':
           description: Service credential metadata.
@@ -393,6 +409,7 @@ paths:
             application/json:
               schema:
                 type: array
+                maxItems: 100
                 items: { $ref: '#/components/schemas/ServiceCredential' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -498,6 +515,9 @@ paths:
       summary: List visible tenant external IDs
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ControlListLimit100'
+        - $ref: '#/components/parameters/AfterExternalId'
       responses:
         '200':
           description: A scoped credential sees only its own tenant.
@@ -505,6 +525,7 @@ paths:
             application/json:
               schema:
                 type: array
+                maxItems: 100
                 items:
                   type: object
                   required: [external_id]
@@ -530,6 +551,59 @@ paths:
                 items: { $ref: '#/components/schemas/PluginManifest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/plugins/{plugin_id}/configuration:
+    parameters:
+      - name: plugin_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+    get:
+      tags: [System]
+      operationId: getPluginConfiguration
+      summary: Read the effective plugin configuration and selected-scope version
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:read
+      parameters:
+        - name: tenant_external_id
+          in: query
+          required: false
+          description: Omit for the global layer. A tenant-scoped service credential is always bound to its own tenant.
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        '200':
+          description: Tenant override, inherited global value, or manifest default. `scope_version` is always the selected write scope and is zero when that scope has no row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PluginConfiguration' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [System]
+      operationId: putPluginConfiguration
+      summary: Validate and atomically replace one global or tenant plugin configuration
+      description: The value is validated against the currently loaded plugin schema. Optimistic `expected_version` and the scoped Idempotency-Key prevent lost or duplicate updates.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PutPluginConfigurationRequest' }
+      responses:
+        '200':
+          description: Persisted configuration for the selected scope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PluginConfiguration' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /internal/v1/schemas:
     get:
@@ -558,7 +632,11 @@ paths:
       description: API credentials, OAuth, subscription bridges, and no-auth connections are authentication methods of the same upstream account resource.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:read
-      parameters: [{ $ref: '#/components/parameters/TenantFilter' }]
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ControlListLimit100'
+        - $ref: '#/components/parameters/BeforeCreatedAt'
+        - $ref: '#/components/parameters/BeforeId'
       responses:
         '200':
           description: Upstream account metadata without secrets.
@@ -566,6 +644,7 @@ paths:
             application/json:
               schema:
                 type: array
+                maxItems: 100
                 items: { $ref: '#/components/schemas/UpstreamProvider' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -793,6 +872,11 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/OAuthPollRequest' }
       responses:
+        '200':
+          description: Existing stable upstream reauthorized; routes and history remain attached.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
         '201':
           description: Authorization completed and stable upstream created.
           content:
@@ -843,6 +927,11 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/OAuthPollRequest' }
       responses:
+        '200':
+          description: Existing stable upstream reauthorized; routes and history remain attached.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
         '201':
           description: Authorization completed and stable upstream created.
           content:
@@ -894,6 +983,11 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/OAuthPollRequest' }
       responses:
+        '200':
+          description: Existing stable upstream reauthorized; routes and history remain attached.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
         '201':
           description: Authorization completed and stable upstream created.
           content:
@@ -991,6 +1085,110 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
+  /internal/v1/imports/session-archive/quarantine:
+    get:
+      tags: [Session archive quarantine]
+      operationId: listSessionArchiveQuarantine
+      summary: List quarantined session archive records for one tenant
+      description: |
+        Requires a global persistent service credential. The bootstrap secret,
+        tenant-scoped service credentials, and downstream client credentials are
+        rejected. Records are ordered by `(source_started_at, id)` descending;
+        continue with the final row's paired cursor values.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: imports:session_archive:quarantine:read
+      x-global-service-only: true
+      x-persistent-service-only: true
+      parameters:
+        - $ref: '#/components/parameters/RequiredTenant'
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, resolved, dismissed]
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, format: int64, minimum: 1, maximum: 100, default: 100 }
+        - name: before_started_at
+          in: query
+          required: false
+          description: Exclusive source-start timestamp cursor; must be paired with `before_id`.
+          schema: { type: integer, format: int64 }
+        - $ref: '#/components/parameters/BeforeId'
+      responses:
+        '200':
+          description: Bounded tenant quarantine page without credential material or identity-claim proofs.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                items: { $ref: '#/components/schemas/SessionArchiveQuarantineRecord' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/imports/session-archive/quarantine/{quarantine_id}:
+    get:
+      tags: [Session archive quarantine]
+      operationId: getSessionArchiveQuarantineRecord
+      summary: Get one tenant-bound quarantine record
+      description: Requires a global persistent service credential; cross-tenant IDs are returned as not found.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: imports:session_archive:quarantine:read
+      x-global-service-only: true
+      x-persistent-service-only: true
+      parameters:
+        - $ref: '#/components/parameters/QuarantineId'
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Quarantine metadata safe for operator review.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionArchiveQuarantineRecord' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/imports/session-archive/quarantine/{quarantine_id}/resolutions:
+    post:
+      tags: [Session archive quarantine]
+      operationId: resolveSessionArchiveQuarantineRecord
+      summary: Permanently associate or dismiss one quarantined archive record
+      description: |
+        Requires a global persistent service credential so the immutable audit
+        record always contains a stable service principal. `expected_record_digest`
+        provides optimistic concurrency; `evidence_digest` is a SHA-256 digest of
+        independently retained operator evidence. An exact Idempotency-Key replay
+        returns the original resolution, while changed proof or action returns 409.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: imports:session_archive:quarantine:resolve
+      x-global-service-only: true
+      x-persistent-service-only: true
+      parameters:
+        - $ref: '#/components/parameters/QuarantineId'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResolveSessionArchiveQuarantineRequest' }
+      responses:
+        '200':
+          description: Newly committed or exactly replayed immutable resolution.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionArchiveQuarantineResolution' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /internal/v1/model-routes:
     get:
       tags: [Routes and pricing]
@@ -998,7 +1196,11 @@ paths:
       summary: List model routes visible to the caller
       security: [{ serviceBearer: [] }]
       x-required-scope: routes:read
-      parameters: [{ $ref: '#/components/parameters/TenantFilter' }]
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ControlListLimit100'
+        - $ref: '#/components/parameters/BeforeCreatedAt'
+        - $ref: '#/components/parameters/BeforeId'
       responses:
         '200':
           description: Routes ordered by public model and priority.
@@ -1006,6 +1208,7 @@ paths:
             application/json:
               schema:
                 type: array
+                maxItems: 100
                 items: { $ref: '#/components/schemas/ModelRoute' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1337,12 +1540,18 @@ paths:
       tags: [Credits]
       operationId: listAccountLedger
       summary: List recent account ledger entries
-      description: Returns at most 500 entries; cursor pagination is not yet implemented.
+      description: |
+        Entries are ordered by `(created_at, entry_id)` descending. Use the final row's
+        `created_at` and `entry_id` as the paired, exclusive `before_created_at` and
+        `before_id` cursor. Every page remains bound to the path account and a
+        tenant-scoped service credential may inspect only an account in its own tenant.
       security: [{ serviceBearer: [] }]
       x-required-scope: credits:read
       parameters:
         - $ref: '#/components/parameters/AccountId'
         - $ref: '#/components/parameters/Limit500'
+        - $ref: '#/components/parameters/BeforeCreatedAt'
+        - $ref: '#/components/parameters/BeforeId'
       responses:
         '200':
           description: Ledger entries newest first.
@@ -1350,7 +1559,9 @@ paths:
             application/json:
               schema:
                 type: array
+                maxItems: 500
                 items: { $ref: '#/components/schemas/LedgerEntry' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1415,6 +1626,73 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/EntitlementResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/integrations/memeloop-cloud/subscription:
+    put:
+      tags: [Entitlements]
+      operationId: syncMemeLoopCloudSubscription
+      summary: Apply one signed MemeLoop Cloud registration or subscription snapshot
+      description: |
+        Provisions one stable principal, credit account, and downstream credential, then
+        applies the exact subscription quota and credential policy. Credential rotation
+        never changes the stable key/account IDs or their history. Active snapshots cover
+        registration, renewal, upgrade, downgrade, and explicit reactivation; cancelled
+        snapshots withdraw only the unconsumed entitlement remainder.
+
+        `version` is monotonically increasing for the stable external subscription. Older
+        out-of-order events return 409 and cannot roll quota or policy back. The replay
+        namespace is the tenant plus `Idempotency-Key`; reuse with a different canonical
+        snapshot returns 409. Signature input is the ASCII timestamp, one `.` byte, and
+        the exact request body. The signature is `v1=` plus unpadded URL-safe base64 of
+        HMAC-SHA-256. Timestamps outside a five-minute window fail closed.
+      x-signature-contract:
+        algorithm: HMAC-SHA-256
+        encoding: base64url-no-padding
+        envelope: ascii-timestamp-dot-exact-body
+        tolerance-seconds: 300
+        disabled-without-secret: true
+      x-idempotency-contract:
+        namespace: tenant-and-event-id-digest
+        payload: canonical-full-snapshot
+        different-payload-status: 409
+        stale-version-status: 409
+        quota-version-source: durable-subscription-entitlement
+        policy-update: compare-and-set-on-current-entitlement-version
+        stable-history-owner: key-id-and-account-id
+        raw-event-id-persisted: false
+      security: [{ memeloopCloudHmac: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+        - name: X-MTC-Webhook-Timestamp
+          in: header
+          required: true
+          schema: { type: string, pattern: '^[0-9]+$' }
+          description: Unix epoch seconds used in the signed envelope.
+        - name: X-MTC-Webhook-Signature
+          in: header
+          required: true
+          schema: { type: string, pattern: '^v1=[A-Za-z0-9_-]{43}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MemeLoopCloudSubscriptionSnapshot' }
+      responses:
+        '200':
+          description: Cancellation applied or replayed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemeLoopCloudSubscriptionResult' }
+        '201':
+          description: Registration or active subscription snapshot applied or replayed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemeLoopCloudSubscriptionResult' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1927,14 +2205,13 @@ paths:
     delete:
       tags: [Self service]
       operationId: cancelOwnGenerationJob
-      summary: Cancel one owned generation job before upstream submission
+      summary: Cancel one owned generation job
       description: |
-        Only a queued job without an active worker lease can be cancelled. Cancellation
-        atomically settles its reservation at zero, refunds the reserved balance, and
-        returns the job with status `cancelled` and error code `cancelled_by_user`.
-        Repeating cancellation of that cancelled job is idempotent. A running, completed,
-        failed, or actively leased job returns 400 because provider-specific upstream
-        cancellation is not implemented.
+        A queued job without an active worker lease is cancelled and refunded atomically.
+        A running Seedance or ComfyUI job is fenced from its polling worker and returned as
+        `cancelling`; its reservation remains held until a worker confirms the provider-specific
+        upstream cancellation, then it becomes `cancelled` and is refunded. Repeating either
+        request is idempotent. Submitting, already-finalizing, succeeded, or failed jobs return 400.
       security: [{ clientBearer: [] }]
       parameters:
         - name: job_id
@@ -1943,7 +2220,7 @@ paths:
           schema: { type: string, format: uuid }
       responses:
         '200':
-          description: Cancelled job, or the same job from an idempotent cancellation replay.
+          description: Cancelled/cancelling job, or the same job from an idempotent replay.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/GenerationJob' }
@@ -2294,6 +2571,11 @@ components:
       scheme: bearer
       bearerFormat: mtc_… or migrated CPA credential
       description: Current native generation or an active migrated CPA credential attached to one stable client identity.
+    memeloopCloudHmac:
+      type: apiKey
+      in: header
+      name: X-MTC-Webhook-Signature
+      description: RustCrypto HMAC-SHA-256 signature over `timestamp + "." + exact_body`; requires the timestamp header documented on the operation.
 
   headers:
     RequestId:
@@ -2380,12 +2662,23 @@ components:
       in: query
       required: false
       description: Creation timestamp from the last row of the prior page. Use together with `before_id` as an exclusive descending keyset cursor.
-      schema: { type: integer, format: int64 }
+      schema: { type: integer, format: int64, minimum: 0 }
+    AfterExternalId:
+      name: after_external_id
+      in: query
+      required: false
+      description: Exclusive ascending tenant cursor from the final row of the prior page.
+      schema: { type: string, minLength: 1, maxLength: 200 }
     BeforeId:
       name: before_id
       in: query
       required: false
-      description: Request or generation UUID from the last row of the prior page. Use together with `before_created_at`.
+      description: Stable row UUID from the last row of the prior page. Use together with `before_created_at`; the concrete response documents whether this is a key, ledger-entry, request, or generation ID.
+      schema: { type: string, format: uuid }
+    QuarantineId:
+      name: quarantine_id
+      in: path
+      required: true
       schema: { type: string, format: uuid }
     KeyFilter:
       name: key_id
@@ -2495,11 +2788,23 @@ components:
       in: query
       required: false
       schema: { type: integer, format: int64, minimum: 1, maximum: 100, default: 50 }
+    ControlListLimit100:
+      name: limit
+      in: query
+      required: false
+      description: Bounded control-resource page size.
+      schema: { type: integer, format: int64, minimum: 1, maximum: 100, default: 100 }
     Limit500:
       name: limit
       in: query
       required: false
       schema: { type: integer, format: int64, minimum: 1, maximum: 500, default: 50 }
+    CredentialListLimit500:
+      name: limit
+      in: query
+      required: false
+      description: Page size for credential reconciliation. Defaults to the legacy maximum so existing operator clients retain their pre-pagination view.
+      schema: { type: integer, format: int64, minimum: 1, maximum: 500, default: 500 }
 
   responses:
     InvalidRequest:
@@ -2800,7 +3105,7 @@ components:
     ManagedClientCredential:
       type: object
       additionalProperties: false
-      required: [key_id, account_id, tenant_external_id, principal_external_id, alias, currency, status, credential_generation, created_at, updated_at, policy, available_balance, reserved_balance]
+      required: [key_id, account_id, tenant_external_id, principal_external_id, alias, currency, status, credential_generation, fingerprint, created_at, updated_at, policy, available_balance, reserved_balance]
       properties:
         key_id: { type: string, format: uuid }
         account_id: { type: string, format: uuid }
@@ -2902,8 +3207,11 @@ components:
         - providers:read
         - providers:write
         - plugins:read
+        - plugins:write
         - oauth:write
         - imports:cpa:write
+        - imports:session_archive:quarantine:read
+        - imports:session_archive:quarantine:resolve
         - routes:read
         - routes:write
         - prices:read
@@ -3131,6 +3439,7 @@ components:
         account_name: { type: string, minLength: 1 }
         provider_driver: { type: string, default: http-json }
         provider_config: { type: object, additionalProperties: true }
+        upstream_account_id: { type: string, format: uuid, description: Existing stable upstream identity to reauthorize. Its tenant, name, driver, and configuration must match this request. }
         endpoints:
           type: [object, 'null']
           additionalProperties: false
@@ -3149,6 +3458,7 @@ components:
         account_name: { type: string, minLength: 1 }
         provider_driver: { type: string, minLength: 1 }
         provider_config: { type: object, additionalProperties: true }
+        upstream_account_id: { type: string, format: uuid, description: Existing stable upstream identity to reauthorize. Its tenant, name, driver, and configuration must match this request. }
     StartSubscriptionBridgeRequest:
       type: object
       additionalProperties: false
@@ -3158,6 +3468,7 @@ components:
         account_name: { type: string, minLength: 1 }
         provider: { type: string, enum: [copilot, cursor] }
         base_url: { type: string, format: uri }
+        upstream_account_id: { type: string, format: uuid, description: Existing stable upstream identity to reauthorize. Its tenant, name, provider, and bridge URL must match this request. }
         bridge_secret: { type: [string, 'null'], writeOnly: true }
     OAuthLoginStart:
       type: object
@@ -3260,6 +3571,68 @@ components:
       properties:
         disposition: { type: string, enum: [created, replayed] }
         account: { $ref: '#/components/schemas/UpstreamProvider' }
+    SessionArchiveQuarantineRecord:
+      type: object
+      additionalProperties: false
+      required: [id, tenant_external_id, source, external_request_id, record_digest, reason_code, source_started_at, source_completed_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, error_code, state]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        source: { type: string, minLength: 1, maxLength: 256 }
+        external_request_id: { type: string, minLength: 1, maxLength: 512 }
+        record_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        reason_code: { type: string, enum: [missing_credential_hash, unproven_identity] }
+        source_started_at: { type: integer, format: int64 }
+        source_completed_at: { type: [integer, 'null'], format: int64 }
+        protocol: { type: string, minLength: 1, maxLength: 64 }
+        model: { type: string, minLength: 1, maxLength: 512 }
+        status_code: { type: [integer, 'null'], format: int64, minimum: 100, maximum: 599 }
+        duration_ms: { type: [integer, 'null'], format: int64, minimum: 0 }
+        input_tokens: { type: integer, format: int64, minimum: 0 }
+        output_tokens: { type: integer, format: int64, minimum: 0 }
+        error_code: { type: [string, 'null'], maxLength: 256 }
+        state: { type: string, enum: [pending, resolved, dismissed] }
+    ResolveSessionArchiveQuarantineRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, action, expected_record_digest, evidence_digest]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
+        action:
+          type: string
+          enum: [associate, dismiss]
+          description: Associate requires `key_id`; dismiss requires it to be absent or null.
+        key_id: { type: [string, 'null'], format: uuid }
+        expected_record_digest:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Optimistic-concurrency digest copied from the reviewed quarantine record.
+        evidence_digest:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 digest of independently retained operator evidence; raw evidence is never accepted.
+        note: { type: [string, 'null'], maxLength: 2000, pattern: '^[^\x00-\x1F\x7F]*$' }
+      allOf:
+        - if:
+            properties: { action: { const: associate } }
+          then:
+            required: [key_id]
+            properties: { key_id: { type: string, format: uuid } }
+        - if:
+            properties: { action: { const: dismiss } }
+          then:
+            properties: { key_id: { type: 'null' } }
+    SessionArchiveQuarantineResolution:
+      type: object
+      additionalProperties: false
+      required: [id, quarantine_id, action, key_id, evidence_digest, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        quarantine_id: { type: string, format: uuid }
+        action: { type: string, enum: [associate, dismiss] }
+        key_id: { type: [string, 'null'], format: uuid }
+        evidence_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        created_at: { type: integer, format: int64 }
     PluginManifest:
       type: object
       required: [id, version, wit_version, capabilities, contributions]
@@ -3273,12 +3646,42 @@ components:
           items: { type: object, additionalProperties: true }
         contributions:
           type: object
-          required: [traffic_policy, providers]
+          required: [traffic_policy, request_rewrite, configuration, providers]
           properties:
             traffic_policy: { type: boolean }
+            request_rewrite: { type: boolean }
+            configuration:
+              oneOf:
+                - type: 'null'
+                - type: object
+                  additionalProperties: false
+                  required: [schema, default]
+                  properties:
+                    schema: { type: object, additionalProperties: true }
+                    default: {}
             providers:
               type: array
               items: { $ref: '#/components/schemas/ProviderType' }
+    PluginConfiguration:
+      type: object
+      additionalProperties: false
+      required: [plugin_id, tenant_external_id, value, source, scope_version, updated_at, schema_digest]
+      properties:
+        plugin_id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+        tenant_external_id: { type: [string, 'null'] }
+        value: {}
+        source: { type: string, enum: [default, global, tenant] }
+        scope_version: { type: integer, format: int64, minimum: 0 }
+        updated_at: { type: [integer, 'null'], format: int64 }
+        schema_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+    PutPluginConfigurationRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version, value]
+      properties:
+        tenant_external_id: { type: [string, 'null'], minLength: 1, maxLength: 200 }
+        expected_version: { type: integer, format: int64, minimum: 0 }
+        value: {}
     CreateModelRouteRequest:
       type: object
       additionalProperties: false
@@ -3584,6 +3987,55 @@ components:
               type: [string, 'null']
               format: uuid
               description: Old stable subscription identity, populated only by replace.
+    MemeLoopCloudSubscriptionSnapshot:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, principal_external_id, external_subscription_id, currency, version, status, policy]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
+        principal_external_id: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
+        external_subscription_id: { $ref: '#/components/schemas/EntitlementIdentity' }
+        external_cycle_id:
+          oneOf:
+            - $ref: '#/components/schemas/EntitlementIdentity'
+            - type: 'null'
+          description: Required for active snapshots; optional stale-cycle guard for cancellation.
+        period_start: { type: [integer, 'null'], format: int64, minimum: 0, description: Required only for active snapshots. }
+        period_end: { type: [integer, 'null'], format: int64, minimum: 1, description: Required only for active snapshots and must exceed period_start. }
+        currency: { $ref: '#/components/schemas/Currency' }
+        desired:
+          oneOf:
+            - $ref: '#/components/schemas/NonNegativeMoney'
+            - type: 'null'
+          description: Exact current-cycle funded amount; required only for active snapshots.
+        version: { type: integer, format: int64, minimum: 1 }
+        status: { type: string, enum: [active, cancelled] }
+        policy: { $ref: '#/components/schemas/CredentialPolicy' }
+        proration:
+          description: Optional active-plan evidence; canonical serialized size, including the event digest, is limited to 4 KiB.
+    ProvisionedCloudCredential:
+      type: object
+      additionalProperties: false
+      required: [key_id, account_id, alias, currency, credential_generation, fingerprint, key]
+      properties:
+        key_id: { type: string, format: uuid, description: Stable across credential rotation and subscription changes. }
+        account_id: { type: string, format: uuid, description: Stable credit/history owner. }
+        alias: { type: string }
+        currency: { $ref: '#/components/schemas/Currency' }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+        fingerprint: { type: string }
+        key:
+          type: [string, 'null']
+          writeOnly: true
+          description: Encrypted replayable one-time secret during the 24-hour provisioning window; null after expiry or rotation.
+    MemeLoopCloudSubscriptionResult:
+      type: object
+      additionalProperties: false
+      required: [credential, entitlement, policy]
+      properties:
+        credential: { $ref: '#/components/schemas/ProvisionedCloudCredential' }
+        entitlement: { $ref: '#/components/schemas/EntitlementResult' }
+        policy: { $ref: '#/components/schemas/CredentialPolicy' }
     RequestSummary:
       type: object
       required: [request_id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost, error_code]
@@ -3623,23 +4075,39 @@ components:
         proof_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
     StatisticsSummary:
       type: object
-      required: [total_requests, successful_requests, failed_requests, input_tokens, output_tokens, total_cost]
+      required: [total_requests, successful_requests, failed_requests, input_tokens, output_tokens, total_cost, costs]
       properties:
         total_requests: { type: integer, format: int64 }
         successful_requests: { type: integer, format: int64 }
         failed_requests: { type: integer, format: int64 }
         input_tokens: { type: integer, format: int64 }
         output_tokens: { type: integer, format: int64 }
-        total_cost: { $ref: '#/components/schemas/Money' }
+        total_cost:
+          description: Single-currency compatibility value; null when the projection spans currencies.
+          oneOf:
+            - $ref: '#/components/schemas/Money'
+            - type: 'null'
+        costs:
+          type: array
+          description: Stable ascending currency order; unlike currencies are never added.
+          items: { $ref: '#/components/schemas/UsageAnalysisCost' }
     StatisticsBucket:
       type: object
-      required: [name, requests, input_tokens, output_tokens, cost]
+      required: [name, requests, input_tokens, output_tokens, cost, costs]
       properties:
         name: { type: string }
         requests: { type: integer, format: int64 }
         input_tokens: { type: integer, format: int64 }
         output_tokens: { type: integer, format: int64 }
-        cost: { $ref: '#/components/schemas/Money' }
+        cost:
+          description: Single-currency compatibility value; null when the bucket spans currencies.
+          oneOf:
+            - $ref: '#/components/schemas/Money'
+            - type: 'null'
+        costs:
+          type: array
+          description: Stable ascending currency order; unlike currencies are never added.
+          items: { $ref: '#/components/schemas/UsageAnalysisCost' }
     Statistics:
       type: object
       required: [summary, by_model, by_day, errors]
@@ -3724,7 +4192,7 @@ components:
     UsageAnalysis:
       type: object
       additionalProperties: false
-      required: [from_created_at, to_created_at, granularity, time_zone, p95_is_approximate, p95_method, summary, time_series, by_model, by_key, by_upstream, by_protocol, by_status, errors, heatmap]
+      required: [from_created_at, to_created_at, granularity, time_zone, p95_is_approximate, p95_method, upstream_grouping, summary, time_series, by_model, by_key, by_upstream, by_protocol, by_status, errors, heatmap]
       properties:
         from_created_at: { type: integer, format: int64, minimum: 0 }
         to_created_at: { type: integer, format: int64, minimum: 0 }
@@ -3732,6 +4200,13 @@ components:
         time_zone: { type: string, const: UTC }
         p95_is_approximate: { type: boolean, const: true }
         p95_method: { type: string, const: fixed_histogram_upper_bound_capped_60000ms }
+        upstream_grouping:
+          type: string
+          const: stable_account
+          description: >-
+            Usage is grouped by the stable upstream account across API credential
+            and OAuth rotations. Historical requests are never relabelled as the
+            account's current credential generation.
         summary: { $ref: '#/components/schemas/UsageAnalysisMetrics' }
         time_series:
           type: array
@@ -3755,8 +4230,10 @@ components:
           maxItems: 100
           description: >-
             `id` is a stable upstream UUID or the `unassigned` sentinel, both
-            accepted by this operation's `upstream_account_id` filter. Clients
-            localize the sentinel label.
+            accepted by this operation's `upstream_account_id` filter. The UUID
+            is the stable account identity across credential rotations; a
+            credential generation is intentionally not inferred for historical
+            requests. Clients localize the sentinel label.
           items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
         by_protocol:
           type: array
@@ -3790,7 +4267,7 @@ components:
           items: { $ref: '#/components/schemas/UsageAnalysisHeatmapBucket' }
     GenerationJob:
       type: object
-      required: [job_id, created_at, updated_at, completed_at, model, driver, status, upstream_job_id, estimated_units, billed_units, cost, error_code, result, assets]
+      required: [job_id, created_at, updated_at, completed_at, model, driver, billing_unit, status, upstream_job_id, estimated_units, billed_units, cost, error_code, result, assets]
       properties:
         job_id: { type: string, format: uuid }
         created_at: { type: integer, format: int64 }
@@ -3798,7 +4275,8 @@ components:
         completed_at: { type: [integer, 'null'], format: int64 }
         model: { type: string }
         driver: { type: string }
-        status: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
+        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        status: { type: string, enum: [queued, running, cancelling, succeeded, failed, cancelled] }
         upstream_job_id: { type: [string, 'null'] }
         estimated_units: { type: integer, format: int64 }
         billed_units: { type: [integer, 'null'], format: int64 }

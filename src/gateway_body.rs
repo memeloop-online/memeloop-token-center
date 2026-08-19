@@ -3,6 +3,7 @@ use std::time::Duration;
 use axum::{
     body::{Body, to_bytes},
     extract::Request,
+    http::header,
 };
 
 pub(crate) const GATEWAY_BODY_READ_DEADLINE: Duration = Duration::from_secs(60);
@@ -24,6 +25,23 @@ pub(crate) async fn admit_gateway_request_body(
     } else {
         MAX_DEFAULT_BODY
     };
+    admit_request_body(request, deadline, maximum).await
+}
+
+pub(crate) async fn admit_request_body(
+    request: Request,
+    deadline: Duration,
+    maximum: usize,
+) -> Result<Request, GatewayBodyAdmissionError> {
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > u64::try_from(maximum).unwrap_or(u64::MAX))
+    {
+        return Err(GatewayBodyAdmissionError::Rejected);
+    }
     let (parts, body) = request.into_parts();
     let bytes = tokio::time::timeout(deadline, to_bytes(body, maximum))
         .await
@@ -85,5 +103,33 @@ mod tests {
                 "{path} over limit"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_control_plane_limit_uses_the_same_bounded_reader() {
+        let exact = Request::post("/internal/v1/imports/example")
+            .body(Body::from(vec![b'x'; 257]))
+            .unwrap();
+        assert!(
+            admit_request_body(exact, Duration::from_secs(1), 257)
+                .await
+                .is_ok()
+        );
+        let over = Request::post("/internal/v1/imports/example")
+            .body(Body::from(vec![b'x'; 258]))
+            .unwrap();
+        assert!(matches!(
+            admit_request_body(over, Duration::from_secs(1), 257).await,
+            Err(GatewayBodyAdmissionError::Rejected)
+        ));
+
+        let declared_over = Request::post("/internal/v1/imports/example")
+            .header(header::CONTENT_LENGTH, "258")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            admit_request_body(declared_over, Duration::from_secs(1), 257).await,
+            Err(GatewayBodyAdmissionError::Rejected)
+        ));
     }
 }

@@ -85,29 +85,31 @@ sets `MTC_RUN_MIGRATIONS_ON_START=false` in all Deployments. Argo CD translates
 the existing Helm migration hook into `PreSync`; the last observed hook result
 was `Reached expected number of succeeded pods`.
 
-The dogfood database was v12 at audit time. The current working-tree binary
-contains v13-v35. These migrations add columns, indexes and tables, plus bounded
+The dogfood database was v12 at the original audit time. The current working-tree binary
+contains v13-v42. These migrations add columns, indexes and tables, plus bounded
 data repair in v31, the fail-closed one-to-one legacy-key constraint in v33,
 managed OAuth import identity in v34 and fenced archive-staging ownership in
-v35; none drops or renames an existing application column or table. That alone
+v35. Versions v36-v42 add quarantine, Cloud entitlement audit, bounded
+pagination, currency-safe observability, cancellation and plugin configuration;
+none drops or renames an existing application column or table. That alone
 does **not** make an old binary write-compatible. Starting at v22, every budget
 reservation, settlement and cancellation must transactionally maintain the new
 rollup state. The v30 generation admission path likewise requires the new
 `preparing` ownership/lease state, and v33 deliberately fails closed if one
 legacy credential maps to multiple stable keys.
 
-A fresh isolated PostgreSQL 17 database has applied v1→v35 successfully, and
+A fresh isolated PostgreSQL 16 and a PostgreSQL 17 database have applied v1→v42 successfully, and
 the related focused PostgreSQL gates passed. This validates the empty-database
 migration sequence and the tested runtime invariants; it does not measure locks
-or latency while upgrading the 141k-row dogfood database from v12, and no live
-v35 rollout has occurred. Therefore an ordinary PreSync-migration/rolling-update
+or latency while upgrading the imported dogfood snapshot from its deployed schema, and no live
+v42 rollout has occurred. Therefore an ordinary PreSync-migration/rolling-update
 sequence remains a NO-GO. Before authorizing Stage B, reconcile any schema-v33
 uniqueness conflict and retain the production-size migration lock-time plus
 final EXPLAIN/latency evidence. Because this review instance is not carrying
 production traffic and old CPA remains the production path, use two separate
 GitOps stages: Stage A sets Token Center gateway/control/worker replicas to zero
 and waits for termination plus zero active requests/jobs; Stage B pins the
-reviewed SHA/image, enables migration, applies v12→v35 and starts only v35 pods.
+reviewed SHA/image, enables migration, applies the pending versions through v42 and starts only v42 pods.
 Do not combine these changes into one Argo sync. After v22 is applied, do not
 restore request traffic to the v12 image. Do not attempt to roll the database
 schema backward.
@@ -393,9 +395,9 @@ ssh "$OPS_HOST" \
 Then verify `/version`, `/livez`, `/readyz`, UI assets and one disposable
 credential's mocked or non-billable proxy/archive/accounting path through a
 port-forward. The dev database must report the schema version declared by the
-reviewed source revision (v35 in the current working tree). The fresh isolated
-PostgreSQL 17 v1→v35 migration and focused PostgreSQL gates have passed. They do
-not clear the pending 141k-row migration lock-time, final imported-scale
+reviewed source revision (v42 in the current working tree). The fresh isolated
+PostgreSQL 16/17 v1→v42 migration and focused PostgreSQL gates have passed. They do
+not clear the pending production-snapshot migration lock-time or final imported-scale
 EXPLAIN/latency, current-SHA 15-minute memory, or live rollout gates. Stop if
 those required release artifacts have not been retained, readiness fails, the
 migration Job fails, or the reported revision is not exactly `MTC_SHA`.
@@ -512,7 +514,7 @@ Only after Gates 1-4 and the backup checks pass:
    the new image in one GitOps commit.
 2. **Stage B -- migrate and start only the reviewed binary.** In a separate
    commit, pin the exact Token Center source SHA and immutable image, enable the
-   PreSync v12-to-v35 migration, restore the intended replica counts, and set the
+   PreSync migration through v42, restore the intended replica counts, and set the
    explicit NetworkPolicy selectors and probe paths. An old Token Center binary
    must never start after v22 has been applied.
 3. Push each stage's commit to the remote actually consumed by Argo CD. This
@@ -526,10 +528,10 @@ Only after Gates 1-4 and the backup checks pass:
 5. Watch the Stage B PreSync migration Job. A failure must prevent Deployment
    rollout and leave the Token Center review roles at zero; old CPA continues
    serving production traffic.
-6. Watch control and worker, then both v35 gateway replicas. The short review
+6. Watch control and worker, then both v42 gateway replicas. The short review
    outage is intentional; do not try to preserve availability by overlapping a
-   pre-v22 Token Center writer with v35.
-7. Confirm the reviewed source's exact schema version (currently v35) and that
+   pre-v22 Token Center writer with v42.
+7. Confirm the reviewed source's exact schema version (currently v42) and that
    request, aggregate, ledger and credential counts did not decrease during
    migration.
 8. Verify the running `/version` revision and pod image digest, not only the
@@ -582,7 +584,7 @@ Abort the rollout when any of these occurs:
 Rollback through Git, not `argocd app rollback`: automated self-heal would
 reapply Git. Reverting Stage B returns the review roles to the Stage A
 zero-replica barrier; it does not authorize the old Token Center image to run
-against v35. Push the revert normally:
+against v42. Push the revert normally:
 
 ```bash
 : "${GITOPS_REPO:?Set GITOPS_REPO to the GitOps repository's absolute path}"
@@ -602,7 +604,7 @@ v12 image is **not** a valid traffic rollback because old writers do not maintai
 budget rollups. Scale Token Center roles back to zero, keep production traffic on
 old CPA, and roll forward a compatible v22+ repair image; alternatively restore
 the validated pre-migration backup into a new database and switch a compatible
-deployment to it. Never restart the old Token Center binary against the v35
+deployment to it. Never restart the old Token Center binary against the v42
 database. Preserve failed pod logs and the release interval for reconciliation.
 
 If a migration or application defect corrupts the database, do not restore in

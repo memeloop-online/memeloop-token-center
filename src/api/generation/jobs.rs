@@ -75,9 +75,15 @@ pub(in crate::api) async fn create_generation(
         .await?;
     let estimated_units =
         estimated_generation_units(&route.driver, &generation_price.billing_unit, &body.input)?;
-    let reservation_price = generation_price
+    let mut reservation_price = generation_price
         .reservation_price()
         .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
+    if generation_price.billing_unit == "megapixel" {
+        // A megapixel price is stored in micros per 1,000,000 pixels. Pixel
+        // counts are the internal reservation unit so fractional megapixels
+        // settle exactly instead of rounding every image up to a whole MP.
+        reservation_price.output_micros_per_million = generation_price.micros_per_unit;
+    }
     let job_id = Uuid::now_v7();
     let archived = serde_json::to_vec(&json!({
         "model": body.model,
@@ -210,11 +216,12 @@ fn estimated_generation_units(
             Ok(units)
         }
         ("comfyui", "job") => Ok(1),
+        ("comfyui", "megapixel") => crate::generation::comfyui_requested_pixels(input),
         ("volcengine-seedance", _) => Err(AppError::BadRequest(
             "Seedance generation price must use second billing".into(),
         )),
         ("comfyui", _) => Err(AppError::BadRequest(
-            "ComfyUI generation price must use job billing".into(),
+            "ComfyUI generation price must use job or megapixel billing".into(),
         )),
         _ => Err(AppError::BadRequest("unsupported generation driver".into())),
     }

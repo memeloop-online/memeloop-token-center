@@ -305,7 +305,7 @@ async fn sqlite_request_stats_rollups_use_exact_utc_boundaries_and_filters() {
     {
         let request_id = Uuid::now_v7().to_string();
         sqlx::query(
-                "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, $4, 'boundary-model', $5, $6, $7, $8, $9, $10, 1, 2, $11)",
+                "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, currency, cost_micros) VALUES ($1, $2, $3, $4, 'boundary-model', $5, $6, $7, $8, $9, $10, 1, 2, 'USD', $11)",
             )
             .bind(request_id)
             .bind(&tenant_id)
@@ -322,7 +322,7 @@ async fn sqlite_request_stats_rollups_use_exact_utc_boundaries_and_filters() {
             .await
             .unwrap();
         sqlx::query(
-                "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, requests, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, 'boundary-model', $4, $5, $6, $7, $8, 1, 1, 2, $9)",
+                "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, currency, requests, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, 'boundary-model', $4, $5, $6, $7, $8, 'USD', 1, 1, 2, $9)",
             )
             .bind(&tenant_id)
             .bind(issued.key_id.to_string())
@@ -353,7 +353,7 @@ async fn sqlite_request_stats_rollups_use_exact_utc_boundaries_and_filters() {
     assert_eq!(stats.summary.failed_requests, 1);
     assert_eq!(stats.summary.input_tokens, 3);
     assert_eq!(stats.summary.output_tokens, 6);
-    assert_eq!(stats.summary.total_cost, "0.0006");
+    assert_eq!(stats.summary.total_cost.as_deref(), Some("0.0006"));
     assert_eq!(stats.by_day.len(), 3);
     assert!(stats.by_day.iter().all(|bucket| bucket.requests == 1));
 
@@ -388,7 +388,64 @@ async fn sqlite_request_stats_rollups_use_exact_utc_boundaries_and_filters() {
         .await
         .unwrap();
     assert_eq!(fact_filtered.summary.total_requests, 1);
-    assert_eq!(fact_filtered.summary.total_cost, "0.0003");
+    assert_eq!(fact_filtered.summary.total_cost.as_deref(), Some("0.0003"));
+
+    let cny = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "stats-boundary-tenant".to_owned(),
+                principal_external_id: "Boundary-CNY-Principal".to_owned(),
+                alias: "Boundary-CNY-Credential".to_owned(),
+                currency: "CNY".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            b"request stats boundary test pepper is sufficiently long",
+        )
+        .await
+        .unwrap();
+    let cny_request_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, currency, cost_micros) VALUES ($1, $2, $3, $4, 'boundary-model', 'openai', 'success', '', '', '', 15, 4, 5, 'CNY', 400)",
+    )
+    .bind(cny_request_id)
+    .bind(&tenant_id)
+    .bind(cny.key_id.to_string())
+    .bind(11 * DAY + 600)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, currency, requests, input_tokens, output_tokens, cost_micros) VALUES ($1, $2, $3, 'boundary-model', 'openai', 'success', '', '', '', 'CNY', 1, 4, 5, 400)",
+    )
+    .bind(&tenant_id)
+    .bind(cny.key_id.to_string())
+    .bind(11)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+
+    let mixed = database
+        .operator_stats_filtered(
+            "stats-boundary-tenant",
+            StatsFilter {
+                from_created_at: Some(10 * DAY + 100),
+                to_created_at: Some(12 * DAY + 200),
+                ..StatsFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(mixed.summary.total_requests, 4);
+    assert_eq!(mixed.summary.total_cost, None);
+    assert_eq!(mixed.summary.costs.len(), 2);
+    assert_eq!(mixed.summary.costs[0].currency, "CNY");
+    assert_eq!(mixed.summary.costs[0].cost, "0.0004");
+    assert_eq!(mixed.summary.costs[1].currency, "USD");
+    assert_eq!(mixed.summary.costs[1].cost, "0.0006");
+    assert_eq!(mixed.by_model[0].cost, None);
+    assert_eq!(mixed.by_model[0].costs.len(), 2);
 }
 
 async fn create_locator_migration_fixture(database: &Database) {

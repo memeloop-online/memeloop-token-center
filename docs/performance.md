@@ -18,6 +18,12 @@ The acceptance profile performs all of the following:
 
 - measures idle RSS/PSS for the split control, gateway and worker roles;
 - receives 12 concurrent 16 MiB upstream streams while sampling gateway RSS;
+- seeds 100,000 tenants, upstreams, routes and managed service credentials,
+  then requires 16 concurrent control-list reads to remain at 100 rows and
+  below 1 MiB per response while sampling control RSS;
+- runs two concurrent Responses-tool image generations whose decoded images
+  are 11 MiB each, enforces the 16 MiB final JSON response cap, and samples
+  gateway RSS;
 - closes downstream connections early and requires the requests to become
   `downstream_disconnected` failures;
 - sends 65 MiB from the upstream, proves the gateway delivers between 63 and
@@ -39,6 +45,8 @@ Default release thresholds are deliberately well below the historical 1 GiB CPA 
 |---|---:|
 | Gateway idle RSS | at most 96 MiB |
 | Concurrent-stream gateway RSS increase | at most 128 MiB |
+| 100k-row concurrent control-list RSS increase | at most 64 MiB |
+| Two concurrent 11 MiB synchronous-image RSS increase | at most 128 MiB |
 | 100–500 MiB asset gateway RSS increase | at most 96 MiB |
 | 100–500 MiB asset worker RSS increase | at most 192 MiB |
 | Gateway RSS retained after cooldown | at most 64 MiB over idle |
@@ -100,8 +108,9 @@ The URL is never written to the report. The script forces `default_transaction_r
 - credential daily aggregates;
 - tenant error troubleshooting when an error sample exists;
 - tenant request-event cursor replay when events exist.
+- usage-analysis model, error and route drill-downs when samples exist.
 
-It records execution/planning time, returned rows, buffer hits/reads, index names and the complete plan tree. On a sufficiently large dataset, sequential scans of `request_records`, `request_events`, or `request_stats_facts` fail the run. It also verifies that every terminal request has a compact fact and that all request-history leaf partitions are attached with valid indexes. The default latency budget is 250 ms per query, but release evidence should also include cold-cache results if the deployment SLO depends on them.
+It records execution/planning time, returned rows, buffer hits/reads, index names and the complete plan tree. On a sufficiently large dataset, sequential scans over more than 10,000 history rows fail the run; the sole exception is an explicitly time-bounded incomplete-day fact branch, which remains subject to the 250 ms latency gate. It also verifies request and generation fact coverage, non-empty historical currencies, required observability indexes, and request-history partition indexes. The CI migration-smoke job creates a disposable 100,000-row fixture with `tests/load/seed_postgres_observability.sql`, enforces the same plan gate, and retains its JSON report. Imported-snapshot and cold-cache evidence are still required when the deployment SLO depends on production cardinality or storage latency.
 
 Schema v24 backfills terminal request facts and UTC daily rollups. If a legacy
 load, repair, or retention operation bypassed normal dual writes, reconcile an
@@ -124,8 +133,8 @@ PGHOST=… PGUSER=… PGDATABASE=… \
   --from 2026-07-01 --before 2026-08-01 --max-days 31 --apply
 ```
 
-Statistics pruning is a separate, explicit operation. It refuses to delete facts
-or rollups while raw rows still exist in the target interval and requires both
+Statistics pruning is a separate, explicit operation. It refuses to delete request
+or generation facts and rollups while either raw source still exists in the target interval and requires both
 `--apply` and `--confirm-prune`; raw-history archival and deletion use their own
 reviewed retention procedure.
 

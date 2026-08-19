@@ -173,18 +173,32 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
         "request": {"input":"must not be written"},
         "response": {"output":"must not be written"}
     });
-    let mixed = jsonl(&[good.clone(), missing_legacy_hash, invalid_legacy_hash]);
+    let mixed = jsonl(&[good.clone(), missing_legacy_hash]);
     let mixed_options = options(&mixed, true);
     let error = import_session_archive(&db, &archive, &mixed_options)
         .await
         .expect_err("unmapped batch must fail before writes");
-    assert!(error.to_string().contains("stopped before writes"));
+    assert!(
+        error.to_string().contains("stopped before writes"),
+        "unexpected import error: {error}"
+    );
     let refs = db
         .request_archive_refs_for_tenant("archive-fixture", request_id)
         .await
         .expect("target references");
     assert!(refs.request_object.starts_with("gap://"));
     assert!(refs.response_object.unwrap().starts_with("gap://"));
+
+    let malformed = jsonl(&[good.clone(), invalid_legacy_hash]);
+    let malformed_error = import_session_archive(&db, &archive, &options(&malformed, true))
+        .await
+        .expect_err("malformed credential evidence must remain fatal");
+    assert!(
+        malformed_error
+            .to_string()
+            .contains("credential hash is malformed"),
+        "unexpected malformed-evidence error: {malformed_error}"
+    );
 
     let mut unsafe_override = options(&mixed, true);
     unsafe_override.allow_unmapped = true;
@@ -1300,6 +1314,10 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
         max_line_bytes: 1024 * 1024,
         max_plan_bytes: 16 * 1024 * 1024,
         allow_unmapped: false,
+        quarantine_unknown_identities: false,
+        quarantine_tenant_binding_kind: None,
+        quarantine_tenant_binding_proof: None,
+        quarantine_approved_by_service_id: None,
         apply: true,
     };
     let late_applied = import_session_archive(&db, &archive, &late_options)
@@ -1335,6 +1353,10 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
         max_line_bytes: 1024 * 1024,
         max_plan_bytes: 16 * 1024 * 1024,
         allow_unmapped: false,
+        quarantine_unknown_identities: false,
+        quarantine_tenant_binding_kind: None,
+        quarantine_tenant_binding_proof: None,
+        quarantine_approved_by_service_id: None,
         apply: true,
     };
     sqlx::query(
@@ -1547,6 +1569,10 @@ fn options(input: &NamedTempFile, apply: bool) -> SessionArchiveImportOptions<'_
         max_line_bytes: 1024 * 1024,
         max_plan_bytes: 16 * 1024 * 1024,
         allow_unmapped: false,
+        quarantine_unknown_identities: false,
+        quarantine_tenant_binding_kind: None,
+        quarantine_tenant_binding_proof: None,
+        quarantine_approved_by_service_id: None,
         apply,
     }
 }

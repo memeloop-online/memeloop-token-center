@@ -84,6 +84,36 @@ pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     left.ct_eq(right).into()
 }
 
+/// Signs an HTTP webhook payload using the documented MemeLoop Cloud v1
+/// envelope.  RustCrypto performs both HMAC construction and verification;
+/// this function only defines the wire-format framing.
+pub fn sign_webhook_payload(secret: &[u8], timestamp: &str, payload: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(payload);
+    format!("v1={}", URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+pub fn verify_webhook_payload(
+    secret: &[u8],
+    timestamp: &str,
+    payload: &[u8],
+    signature: &str,
+) -> bool {
+    let Some(encoded) = signature.strip_prefix("v1=") else {
+        return false;
+    };
+    let Ok(tag) = URL_SAFE_NO_PAD.decode(encoded) else {
+        return false;
+    };
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(payload);
+    mac.verify_slice(&tag).is_ok()
+}
+
 fn keyed_hash(pepper: &[u8], value: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(pepper).expect("HMAC accepts any key length");
     mac.update(value);
@@ -123,6 +153,36 @@ mod tests {
             &issued.secret,
             b"a pepper that is long enough for this test",
             &issued.secret_hash[..31]
+        ));
+    }
+
+    #[test]
+    fn webhook_signature_is_framed_and_verified_by_rustcrypto() {
+        let secret = b"webhook secret long enough for a real integration";
+        let signature = sign_webhook_payload(secret, "1700000000", br#"{"event":"updated"}"#);
+        assert!(verify_webhook_payload(
+            secret,
+            "1700000000",
+            br#"{"event":"updated"}"#,
+            &signature,
+        ));
+        assert!(!verify_webhook_payload(
+            secret,
+            "1700000001",
+            br#"{"event":"updated"}"#,
+            &signature,
+        ));
+        assert!(!verify_webhook_payload(
+            secret,
+            "1700000000",
+            br#"{"event":"cancelled"}"#,
+            &signature,
+        ));
+        assert!(!verify_webhook_payload(
+            secret,
+            "1700000000",
+            br#"{"event":"updated"}"#,
+            "v1=not-base64!",
         ));
     }
 }

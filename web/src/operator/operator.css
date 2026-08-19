@@ -526,6 +526,35 @@
   white-space: normal;
 }
 
+.usage-dimension-contract {
+  color: #71858d;
+  font-size: 11px;
+  margin: 0 0 10px;
+}
+
+.usage-trend-title {
+  align-items: flex-end;
+  gap: 16px;
+}
+
+.usage-trend-controls {
+  align-items: flex-end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  justify-content: flex-end;
+}
+
+.usage-trend-controls label {
+  color: #81949c;
+  font-size: 10px;
+  min-width: 130px;
+}
+
+.usage-trend-controls select {
+  margin-top: 5px;
+}
+
 .usage-trend-chart svg {
   display: block;
   min-width: 620px;

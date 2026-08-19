@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use regex::Regex;
 use serde_json::Value;
@@ -7,9 +7,54 @@ use crate::error::AppError;
 
 const MAX_SCHEMA_BYTES: usize = 256 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 32;
+const MAX_SCHEMA_NODES: usize = 4_096;
+const MAX_SCHEMA_CHOICES: usize = 64;
+const MAX_SCHEMA_PROPERTIES: usize = 512;
 const MAX_PATTERN_BYTES: usize = 1_024;
+const MAX_INSTANCE_BYTES: usize = 1024 * 1024;
+
+/// A compiled, reusable schema from the declarative subset supported by both
+/// the service and the CSP-safe browser renderer.
+#[derive(Clone)]
+pub struct CompiledSchema(jsonschema::Validator);
+
+impl CompiledSchema {
+    pub fn validate(&self, instance: &Value) -> Result<(), AppError> {
+        let encoded = serde_json::to_vec(instance).map_err(|_| AppError::Internal)?;
+        if encoded.len() > MAX_INSTANCE_BYTES {
+            return Err(AppError::BadRequest(
+                "JSON Schema instance exceeds the 1 MiB limit".into(),
+            ));
+        }
+        self.0.validate(instance).map_err(|error| {
+            // Never render `error` itself: some validator errors contain the
+            // rejected instance, which may be an API key or OAuth token.
+            let path = error.instance_path().to_string();
+            let path = if path.is_empty() { "/" } else { path.as_str() };
+            AppError::BadRequest(format!(
+                "JSON Schema validation failed at {path}: value is not allowed"
+            ))
+        })
+    }
+}
+
+pub fn compile(schema: &Value) -> Result<CompiledSchema, AppError> {
+    inspect_definition(schema)?;
+    let validator = jsonschema::draft202012::options()
+        .should_validate_formats(true)
+        // The linear-time `regex` engine is also the dialect accepted by the
+        // browser validator. Do not enable fancy-regex/backtracking here.
+        .with_pattern_options(jsonschema::PatternOptions::regex())
+        .build(schema)
+        .map_err(|_| AppError::BadRequest("invalid JSON Schema definition".into()))?;
+    Ok(CompiledSchema(validator))
+}
 
 pub fn validate_definition(schema: &Value) -> Result<(), AppError> {
+    compile(schema).map(|_| ())
+}
+
+fn inspect_definition(schema: &Value) -> Result<(), AppError> {
     if serde_json::to_vec(schema)
         .map_err(|_| AppError::Internal)?
         .len()
@@ -19,18 +64,19 @@ pub fn validate_definition(schema: &Value) -> Result<(), AppError> {
             "JSON Schema exceeds the 256 KiB limit".into(),
         ));
     }
-    inspect_schema(schema, 0)
+    let mut nodes = 0;
+    inspect_schema(schema, 0, &mut nodes)
 }
 
 pub fn validate_instance(schema: &Value, instance: &Value) -> Result<(), AppError> {
-    validate_definition(schema)?;
-    validate(schema, instance, "$", 0)
+    compile(schema)?.validate(instance)
 }
 
-fn inspect_schema(schema: &Value, depth: usize) -> Result<(), AppError> {
-    if depth > MAX_SCHEMA_DEPTH {
+fn inspect_schema(schema: &Value, depth: usize, nodes: &mut usize) -> Result<(), AppError> {
+    *nodes = nodes.saturating_add(1);
+    if depth > MAX_SCHEMA_DEPTH || *nodes > MAX_SCHEMA_NODES {
         return Err(AppError::BadRequest(
-            "JSON Schema exceeds the maximum nesting depth".into(),
+            "JSON Schema exceeds the structural complexity limit".into(),
         ));
     }
     let Some(object) = schema.as_object() else {
@@ -43,6 +89,9 @@ fn inspect_schema(schema: &Value, depth: usize) -> Result<(), AppError> {
     };
     const SUPPORTED: &[&str] = &[
         "$schema",
+        "$id",
+        "$ref",
+        "$defs",
         "title",
         "description",
         "default",
@@ -57,9 +106,15 @@ fn inspect_schema(schema: &Value, depth: usize) -> Result<(), AppError> {
         "anyOf",
         "allOf",
         "not",
+        "if",
+        "then",
+        "else",
         "required",
         "properties",
+        "propertyNames",
         "additionalProperties",
+        "minProperties",
+        "maxProperties",
         "items",
         "minItems",
         "maxItems",
@@ -70,14 +125,40 @@ fn inspect_schema(schema: &Value, depth: usize) -> Result<(), AppError> {
         "format",
         "minimum",
         "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
     ];
     if let Some(keyword) = object.keys().find(|key| !SUPPORTED.contains(&key.as_str())) {
         return Err(AppError::BadRequest(format!(
             "unsupported JSON Schema keyword: {keyword}"
         )));
     }
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str)
+        && !reference.starts_with("#/")
+    {
+        return Err(AppError::BadRequest(
+            "JSON Schema references must be local JSON pointers".into(),
+        ));
+    }
+    if let Some(dialect) = object.get("$schema").and_then(Value::as_str)
+        && dialect != "https://json-schema.org/draft/2020-12/schema"
+    {
+        return Err(AppError::BadRequest(
+            "only JSON Schema draft 2020-12 is supported".into(),
+        ));
+    }
+    if let Some(format) = object.get("format").and_then(Value::as_str)
+        && !matches!(format, "uri" | "uri-reference" | "uuid")
+    {
+        return Err(AppError::BadRequest(format!(
+            "unsupported JSON Schema format: {format}"
+        )));
+    }
     if let Some(pattern) = object.get("pattern").and_then(Value::as_str)
-        && (pattern.len() > MAX_PATTERN_BYTES || Regex::new(pattern).is_err())
+        && (pattern.len() > MAX_PATTERN_BYTES
+            || Regex::new(pattern).is_err()
+            || !browser_safe_pattern(pattern))
     {
         return Err(AppError::BadRequest(
             "JSON Schema contains an invalid or oversized pattern".into(),
@@ -88,220 +169,62 @@ fn inspect_schema(schema: &Value, depth: usize) -> Result<(), AppError> {
             let children = children.as_array().ok_or_else(|| {
                 AppError::BadRequest(format!("JSON Schema {keyword} must be an array"))
             })?;
-            if children.is_empty() || children.len() > 64 {
+            if children.is_empty() || children.len() > MAX_SCHEMA_CHOICES {
                 return Err(AppError::BadRequest(format!(
-                    "JSON Schema {keyword} must contain 1 to 64 choices"
+                    "JSON Schema {keyword} must contain 1 to {MAX_SCHEMA_CHOICES} choices"
                 )));
             }
             for child in children {
-                inspect_schema(child, depth + 1)?;
+                inspect_schema(child, depth + 1, nodes)?;
             }
         }
     }
-    if let Some(child) = object.get("not") {
-        inspect_schema(child, depth + 1)?;
-    }
-    if let Some(properties) = object.get("properties") {
-        let properties = properties.as_object().ok_or_else(|| {
-            AppError::BadRequest("JSON Schema properties must be an object".into())
-        })?;
-        if properties.len() > 512 {
-            return Err(AppError::BadRequest(
-                "JSON Schema contains too many properties".into(),
-            ));
+    for keyword in ["not", "if", "then", "else", "propertyNames"] {
+        if let Some(child) = object.get(keyword) {
+            inspect_schema(child, depth + 1, nodes)?;
         }
-        for child in properties.values() {
-            inspect_schema(child, depth + 1)?;
+    }
+    for keyword in ["properties", "$defs"] {
+        if let Some(children) = object.get(keyword) {
+            let children = children.as_object().ok_or_else(|| {
+                AppError::BadRequest(format!("JSON Schema {keyword} must be an object"))
+            })?;
+            if children.len() > MAX_SCHEMA_PROPERTIES {
+                return Err(AppError::BadRequest(format!(
+                    "JSON Schema {keyword} contains too many entries"
+                )));
+            }
+            for child in children.values() {
+                inspect_schema(child, depth + 1, nodes)?;
+            }
         }
     }
     for keyword in ["additionalProperties", "items"] {
-        if let Some(child) = object.get(keyword).filter(|child| !child.is_boolean()) {
-            inspect_schema(child, depth + 1)?;
+        if let Some(child) = object.get(keyword) {
+            inspect_schema(child, depth + 1, nodes)?;
         }
     }
     Ok(())
 }
 
-fn validate(schema: &Value, instance: &Value, path: &str, depth: usize) -> Result<(), AppError> {
-    if depth > MAX_SCHEMA_DEPTH {
-        return schema_error(path, "value exceeds maximum nesting depth");
-    }
-    if let Some(allowed) = schema.as_bool() {
-        return if allowed {
-            Ok(())
-        } else {
-            schema_error(path, "value is not allowed")
-        };
-    }
-    let object = schema.as_object().ok_or(AppError::Internal)?;
-    if let Some(expected) = object.get("const")
-        && instance != expected
-    {
-        return schema_error(path, "value does not match the required constant");
-    }
-    if let Some(values) = object.get("enum").and_then(Value::as_array)
-        && !values.contains(instance)
-    {
-        return schema_error(path, "value is not in the allowed set");
-    }
-    if let Some(children) = object.get("allOf").and_then(Value::as_array) {
-        for child in children {
-            validate(child, instance, path, depth + 1)?;
-        }
-    }
-    if let Some(children) = object.get("anyOf").and_then(Value::as_array)
-        && !children
-            .iter()
-            .any(|child| validate(child, instance, path, depth + 1).is_ok())
-    {
-        return schema_error(path, "value does not match any allowed schema");
-    }
-    if let Some(children) = object.get("oneOf").and_then(Value::as_array) {
-        let matches = children
-            .iter()
-            .filter(|child| validate(child, instance, path, depth + 1).is_ok())
-            .count();
-        if matches != 1 {
-            return schema_error(path, "value must match exactly one allowed schema");
-        }
-    }
-    if object
-        .get("not")
-        .is_some_and(|child| validate(child, instance, path, depth + 1).is_ok())
-    {
-        return schema_error(path, "value matches a forbidden schema");
-    }
-    if let Some(expected) = object.get("type") {
-        let matches = match expected {
-            Value::String(expected) => matches_type(expected, instance),
-            Value::Array(expected) => expected
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|expected| matches_type(expected, instance)),
-            _ => false,
-        };
-        if !matches {
-            return schema_error(path, "value has the wrong type");
-        }
-    }
-    if let Some(value) = instance.as_object() {
-        let properties = object.get("properties").and_then(Value::as_object);
-        if let Some(required) = object.get("required").and_then(Value::as_array) {
-            for field in required.iter().filter_map(Value::as_str) {
-                if !value.contains_key(field) {
-                    return schema_error(path, &format!("required property {field} is missing"));
-                }
-            }
-        }
-        for (field, child) in value {
-            if let Some(child_schema) = properties.and_then(|properties| properties.get(field)) {
-                validate(child_schema, child, &format!("{path}.{field}"), depth + 1)?;
-            } else if object.get("additionalProperties") == Some(&Value::Bool(false)) {
-                return schema_error(path, &format!("property {field} is not allowed"));
-            } else if let Some(additional) = object
-                .get("additionalProperties")
-                .filter(|additional| additional.is_object())
-            {
-                validate(additional, child, &format!("{path}.{field}"), depth + 1)?;
-            }
-        }
-    }
-    if let Some(values) = instance.as_array() {
-        if object
-            .get("minItems")
-            .and_then(Value::as_u64)
-            .is_some_and(|minimum| values.len() < minimum as usize)
-        {
-            return schema_error(path, "array has too few items");
-        }
-        if object
-            .get("maxItems")
-            .and_then(Value::as_u64)
-            .is_some_and(|maximum| values.len() > maximum as usize)
-        {
-            return schema_error(path, "array has too many items");
-        }
-        if object.get("uniqueItems") == Some(&Value::Bool(true)) {
-            let mut unique = HashSet::new();
-            if values.iter().any(|value| !unique.insert(value.to_string())) {
-                return schema_error(path, "array items must be unique");
-            }
-        }
-        if let Some(items) = object.get("items") {
-            for (index, value) in values.iter().enumerate() {
-                validate(items, value, &format!("{path}[{index}]"), depth + 1)?;
-            }
-        }
-    }
-    if let Some(value) = instance.as_str() {
-        let length = value.chars().count();
-        if object
-            .get("minLength")
-            .and_then(Value::as_u64)
-            .is_some_and(|minimum| length < minimum as usize)
-        {
-            return schema_error(path, "string is too short");
-        }
-        if object
-            .get("maxLength")
-            .and_then(Value::as_u64)
-            .is_some_and(|maximum| length > maximum as usize)
-        {
-            return schema_error(path, "string is too long");
-        }
-        if let Some(pattern) = object.get("pattern").and_then(Value::as_str)
-            && !Regex::new(pattern)
-                .map_err(|_| AppError::Internal)?
-                .is_match(value)
-        {
-            return schema_error(path, "string does not match the required pattern");
-        }
-        if object.get("format").and_then(Value::as_str) == Some("uri")
-            && url::Url::parse(value).is_err()
-        {
-            return schema_error(path, "string is not a valid URI");
-        }
-    }
-    if let Some(value) = instance.as_f64() {
-        if object
-            .get("minimum")
-            .and_then(Value::as_f64)
-            .is_some_and(|minimum| value < minimum)
-        {
-            return schema_error(path, "number is below the minimum");
-        }
-        if object
-            .get("maximum")
-            .and_then(Value::as_f64)
-            .is_some_and(|maximum| value > maximum)
-        {
-            return schema_error(path, "number is above the maximum");
-        }
-    }
-    Ok(())
-}
-
-fn matches_type(expected: &str, value: &Value) -> bool {
-    match expected {
-        "null" => value.is_null(),
-        "boolean" => value.is_boolean(),
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "number" => value.is_number(),
-        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-        "string" => value.is_string(),
-        _ => false,
-    }
-}
-
-fn schema_error<T>(path: &str, message: &str) -> Result<T, AppError> {
-    Err(AppError::BadRequest(format!(
-        "JSON Schema validation failed at {path}: {message}"
-    )))
+fn browser_safe_pattern(pattern: &str) -> bool {
+    // JavaScript's native RegExp is the only CSP-compatible browser engine
+    // available without shipping another runtime. Keep its accepted dialect
+    // to a conservative, non-backtracking-heavy subset of Rust `regex`.
+    static NESTED_REPETITION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\([^)]*(?:[+*]|\{\d)[^)]*\)(?:[+*]|\{\d)")
+            .expect("static nested-repetition expression")
+    });
+    static REPEATED_ALTERNATION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\([^)]*\|[^)]*\)(?:[+*]|\{\d)")
+            .expect("static repeated-alternation expression")
+    });
+    !NESTED_REPETITION.is_match(pattern) && !REPEATED_ALTERNATION.is_match(pattern)
 }
 
 #[cfg(test)]
 mod tests {
+    use serde::Deserialize;
     use serde_json::json;
 
     use super::*;
@@ -322,7 +245,71 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_schema_keywords_instead_of_silently_ignoring_them() {
-        assert!(validate_definition(&json!({"type": "object", "$ref": "https://bad"})).is_err());
+    fn validates_property_names_conditionals_and_numeric_constraints() {
+        let schema = json!({
+            "type": "object",
+            "propertyNames": {"pattern": "^[a-z]+$"},
+            "additionalProperties": {
+                "type": "number", "exclusiveMinimum": 0, "multipleOf": 0.5
+            }
+        });
+        assert!(validate_instance(&schema, &json!({"model": 1.5})).is_ok());
+        assert!(validate_instance(&schema, &json!({"Bad": 1.5})).is_err());
+        assert!(validate_instance(&schema, &json!({"model": 1.25})).is_err());
+    }
+
+    #[test]
+    fn required_follows_json_schema_and_does_not_treat_empty_as_missing() {
+        let schema = json!({"type": "object", "required": ["name"], "properties": {
+            "name": {"type": "string"}
+        }});
+        assert!(validate_instance(&schema, &json!({"name": ""})).is_ok());
+        assert!(validate_instance(&schema, &json!({})).is_err());
+    }
+
+    #[test]
+    fn rejects_remote_references_and_unknown_or_unsafe_keywords() {
+        assert!(validate_definition(&json!({"$ref": "https://untrusted.invalid/schema"})).is_err());
+        assert!(validate_definition(&json!({"type": "object", "patternProperties": {}})).is_err());
+        assert!(validate_definition(&json!({"type": "string", "pattern": "(?=unsafe)"})).is_err());
+    }
+
+    #[test]
+    fn validation_errors_do_not_echo_secret_instances() {
+        let error = validate_instance(&json!({"type": "integer"}), &json!("secret-token"))
+            .expect_err("invalid value");
+        assert!(!error.to_string().contains("secret-token"));
+    }
+
+    #[derive(Deserialize)]
+    struct ParityFixture {
+        name: String,
+        schema: Value,
+        cases: Vec<ParityCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct ParityCase {
+        valid: bool,
+        value: Value,
+    }
+
+    #[test]
+    fn service_matches_the_shared_browser_validation_contract() {
+        let fixtures: Vec<ParityFixture> =
+            serde_json::from_str(include_str!("../tests/fixtures/schema-parity.json"))
+                .expect("schema parity fixtures");
+        for fixture in fixtures {
+            let validator = compile(&fixture.schema)
+                .unwrap_or_else(|error| panic!("{} schema: {error}", fixture.name));
+            for (index, case) in fixture.cases.into_iter().enumerate() {
+                assert_eq!(
+                    validator.validate(&case.value).is_ok(),
+                    case.valid,
+                    "{} case {index}",
+                    fixture.name
+                );
+            }
+        }
     }
 }

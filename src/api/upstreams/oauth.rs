@@ -4,6 +4,53 @@ use super::accounts::{
     validate_upstream_destination,
 };
 
+async fn reauthorization_target(
+    state: &AppState,
+    account_id: Option<Uuid>,
+    tenant_external_id: &str,
+    account_name: &str,
+    provider_driver: &str,
+    provider_config: &Value,
+    oauth_driver: &str,
+) -> Result<Option<OAuthReauthorizationTarget>, AppError> {
+    let Some(account_id) = account_id else {
+        return Ok(None);
+    };
+    let account = state
+        .db
+        .upstream_account_for_reauthorization(account_id, tenant_external_id)
+        .await?;
+    if !account.can_reauthorize {
+        return Err(AppError::BadRequest(
+            "upstream account does not support interactive reauthorization".into(),
+        ));
+    }
+    let existing_oauth_driver = if account.connection_method == "subscription_bridge" {
+        "subscription_bridge"
+    } else if state
+        .providers
+        .get(&account.driver)
+        .is_some_and(|provider| provider.oauth_adapter.is_some())
+    {
+        "provider_adapter"
+    } else {
+        "cursor"
+    };
+    if account.name != account_name.trim()
+        || account.driver != provider_driver
+        || account.config != *provider_config
+        || existing_oauth_driver != oauth_driver
+    {
+        return Err(AppError::Conflict(
+            "reauthorization must use the existing upstream name, driver, configuration, and OAuth lifecycle".into(),
+        ));
+    }
+    Ok(Some(OAuthReauthorizationTarget {
+        account_id,
+        expected_updated_at: account.updated_at,
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct StartCursorOAuthRequest {
@@ -15,6 +62,8 @@ pub(in crate::api) struct StartCursorOAuthRequest {
     provider_config: Value,
     #[serde(default)]
     endpoints: Option<CursorOAuthEndpoints>,
+    #[serde(default)]
+    upstream_account_id: Option<Uuid>,
 }
 
 pub(in crate::api) async fn start_cursor_oauth(
@@ -31,6 +80,16 @@ pub(in crate::api) async fn start_cursor_oauth(
         )));
     }
     validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
+    let reauthorize = reauthorization_target(
+        &state,
+        body.upstream_account_id,
+        &body.tenant_external_id,
+        &body.account_name,
+        &body.provider_driver,
+        &body.provider_config,
+        "cursor",
+    )
+    .await?;
     validate_upstream_destination(
         &body.provider_driver,
         &body.provider_config,
@@ -52,6 +111,7 @@ pub(in crate::api) async fn start_cursor_oauth(
             provider_config: body.provider_config,
             endpoints,
             oauth_driver: "cursor".to_owned(),
+            reauthorize,
         },
         state.config.key_pepper.as_bytes(),
         unix_millis(),
@@ -59,12 +119,15 @@ pub(in crate::api) async fn start_cursor_oauth(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::api) struct StartProviderAdapterOAuthRequest {
     #[serde(default = "default_tenant")]
     tenant_external_id: String,
     account_name: String,
     provider_driver: String,
     provider_config: Value,
+    #[serde(default)]
+    upstream_account_id: Option<Uuid>,
 }
 
 pub(in crate::api) async fn start_provider_adapter_oauth(
@@ -92,6 +155,16 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
         )));
     }
     validate_provider_config_schema(&state, &body.provider_driver, &body.provider_config)?;
+    let reauthorize = reauthorization_target(
+        &state,
+        body.upstream_account_id,
+        &body.tenant_external_id,
+        &body.account_name,
+        &body.provider_driver,
+        &body.provider_config,
+        "provider_adapter",
+    )
+    .await?;
     validate_upstream_destination(
         &body.provider_driver,
         &body.provider_config,
@@ -111,6 +184,7 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
                 refresh_url: adapter.refresh_url.clone(),
             },
             oauth_driver: "provider_adapter".to_owned(),
+            reauthorize,
         },
         state.config.key_pepper.as_bytes(),
         unix_millis(),
@@ -118,6 +192,7 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::api) struct PollCursorOAuthRequest {
     session_token: String,
 }
@@ -164,28 +239,57 @@ pub(in crate::api) async fn poll_cursor_oauth(
                 &state,
             )
             .await?;
-            let account = state
-                .db
-                .create_upstream_account(
-                    CreateUpstreamAccountInput {
-                        tenant_external_id: ready.tenant_external_id,
-                        name: ready.account_name,
-                        driver: ready.provider_driver,
-                        config: ready.provider_config,
-                        credential: ready.credential,
-                        oauth_session_id: Some(ready.session_id),
-                        oauth_driver: Some(ready.oauth_driver),
-                        oauth_refresh_url: Some(ready.refresh_url),
-                    },
-                    state.config.key_pepper.as_bytes(),
-                )
-                .await?;
-            Ok((StatusCode::CREATED, Json(account)).into_response())
+            let reauthorizing = ready.reauthorize.is_some();
+            let account = match ready.reauthorize {
+                Some(target) => {
+                    state
+                        .db
+                        .reauthorize_upstream_account(
+                            target.account_id,
+                            ReauthorizeUpstreamAccountInput {
+                                tenant_external_id: ready.tenant_external_id,
+                                expected_updated_at: target.expected_updated_at,
+                                driver: ready.provider_driver,
+                                oauth_session_id: ready.session_id,
+                                oauth_driver: ready.oauth_driver,
+                                oauth_refresh_url: Some(ready.refresh_url),
+                                credential: ready.credential,
+                            },
+                            state.config.key_pepper.as_bytes(),
+                        )
+                        .await?
+                }
+                None => {
+                    state
+                        .db
+                        .create_upstream_account(
+                            CreateUpstreamAccountInput {
+                                tenant_external_id: ready.tenant_external_id,
+                                name: ready.account_name,
+                                driver: ready.provider_driver,
+                                config: ready.provider_config,
+                                credential: ready.credential,
+                                oauth_session_id: Some(ready.session_id),
+                                oauth_driver: Some(ready.oauth_driver),
+                                oauth_refresh_url: Some(ready.refresh_url),
+                            },
+                            state.config.key_pepper.as_bytes(),
+                        )
+                        .await?
+                }
+            };
+            let status = if reauthorizing {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            Ok((status, Json(account)).into_response())
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::api) struct StartSubscriptionBridgeOAuthRequest {
     #[serde(default = "default_tenant")]
     tenant_external_id: String,
@@ -193,6 +297,8 @@ pub(in crate::api) struct StartSubscriptionBridgeOAuthRequest {
     provider: String,
     base_url: String,
     bridge_secret: Option<String>,
+    #[serde(default)]
+    upstream_account_id: Option<Uuid>,
 }
 
 pub(in crate::api) async fn start_subscription_bridge_oauth(
@@ -205,19 +311,31 @@ pub(in crate::api) async fn start_subscription_bridge_oauth(
     // Subscription bridges are deliberately in-cluster. Only a global operator may
     // authorize a new private-network destination for a tenant.
     require_global_service(&service)?;
+    let provider_config = json!({
+        "base_url": body.base_url,
+        "provider": body.provider,
+        "network_scope": "private"
+    });
+    let reauthorize = reauthorization_target(
+        &state,
+        body.upstream_account_id,
+        &body.tenant_external_id,
+        &body.account_name,
+        "cpa-subscription-bridge",
+        &provider_config,
+        "subscription_bridge",
+    )
+    .await?;
     Ok(Json(
         start_subscription_bridge_login(
             &state.http,
             StartSubscriptionBridgeLogin {
                 tenant_external_id: body.tenant_external_id,
                 account_name: body.account_name,
-                provider_config: json!({
-                    "base_url": body.base_url,
-                    "provider": body.provider,
-                    "network_scope": "private"
-                }),
+                provider_config,
                 bridge_secret: body.bridge_secret,
                 allow_loopback: state.config.allow_oauth_loopback,
+                reauthorize,
             },
             state.config.key_pepper.as_bytes(),
             unix_millis(),
@@ -269,23 +387,51 @@ pub(in crate::api) async fn poll_subscription_bridge_oauth(
                 &state,
             )
             .await?;
-            let account = state
-                .db
-                .create_upstream_account(
-                    CreateUpstreamAccountInput {
-                        tenant_external_id: ready.tenant_external_id,
-                        name: ready.account_name,
-                        driver: "cpa-subscription-bridge".to_owned(),
-                        config: ready.provider_config,
-                        credential: ready.credential,
-                        oauth_session_id: Some(ready.session_id),
-                        oauth_driver: None,
-                        oauth_refresh_url: None,
-                    },
-                    state.config.key_pepper.as_bytes(),
-                )
-                .await?;
-            Ok((StatusCode::CREATED, Json(account)).into_response())
+            let reauthorizing = ready.reauthorize.is_some();
+            let account = match ready.reauthorize {
+                Some(target) => {
+                    state
+                        .db
+                        .reauthorize_upstream_account(
+                            target.account_id,
+                            ReauthorizeUpstreamAccountInput {
+                                tenant_external_id: ready.tenant_external_id,
+                                expected_updated_at: target.expected_updated_at,
+                                driver: "cpa-subscription-bridge".to_owned(),
+                                oauth_session_id: ready.session_id,
+                                oauth_driver: "subscription_bridge".to_owned(),
+                                oauth_refresh_url: None,
+                                credential: ready.credential,
+                            },
+                            state.config.key_pepper.as_bytes(),
+                        )
+                        .await?
+                }
+                None => {
+                    state
+                        .db
+                        .create_upstream_account(
+                            CreateUpstreamAccountInput {
+                                tenant_external_id: ready.tenant_external_id,
+                                name: ready.account_name,
+                                driver: "cpa-subscription-bridge".to_owned(),
+                                config: ready.provider_config,
+                                credential: ready.credential,
+                                oauth_session_id: Some(ready.session_id),
+                                oauth_driver: Some("subscription_bridge".to_owned()),
+                                oauth_refresh_url: None,
+                            },
+                            state.config.key_pepper.as_bytes(),
+                        )
+                        .await?
+                }
+            };
+            let status = if reauthorizing {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            Ok((status, Json(account)).into_response())
         }
     }
 }

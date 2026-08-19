@@ -10,6 +10,11 @@ const CPAMP_IMPORT_LOCK_SEED: i64 = 734_627_102_948_313;
 
 const SESSION_ARCHIVE_IMPORT_LOCK_SEED: i64 = 734_627_102_948_314;
 
+pub(super) const ARCHIVE_IDENTITY_UNPROVEN: &str =
+    "archive request has no proven stable key/principal identity";
+pub(super) const ARCHIVE_IDENTITY_AMBIGUOUS: &str =
+    "archive credential hash maps to multiple stable identities";
+
 #[derive(Clone, Debug)]
 pub struct SessionArchiveMatchInput<'a> {
     pub tenant_external_id: &'a str,
@@ -584,12 +589,12 @@ impl Database {
         }
     }
 
-    async fn resolve_session_archive_identity(
+    pub(super) async fn resolve_session_archive_identity_optional(
         &self,
         tenant_external_id: &str,
         cpamp_source: &str,
         source_key_hash: &str,
-    ) -> Result<(AuthenticatedKey, String), AppError> {
+    ) -> Result<Option<(AuthenticatedKey, String)>, AppError> {
         let rows = sqlx::query(
             "SELECT k.id AS key_id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.credential_generation, k.policy_json, 'legacy-source-hash-v1' AS proof_kind FROM legacy_key_credentials c JOIN key_records k ON k.id = c.key_id JOIN tenants t ON t.id = k.tenant_id WHERE t.external_id = $1 AND LOWER(c.source_hash) = LOWER($2) UNION ALL SELECT DISTINCT k.id AS key_id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.credential_generation, k.policy_json, 'cpamp-source-key-hash-v1' AS proof_kind FROM import_request_links l JOIN tenants t ON t.id = l.tenant_id JOIN request_record_locators q ON q.id = l.target_request_id AND q.tenant_id = l.tenant_id JOIN request_records r ON r.id = q.id AND r.created_at = q.created_at AND r.tenant_id = q.tenant_id JOIN key_records k ON k.id = r.key_id AND k.tenant_id = l.tenant_id WHERE t.external_id = $1 AND l.source = $3 AND LOWER(l.source_key_hash) = LOWER($2)",
         )
@@ -607,19 +612,27 @@ impl Database {
                     || current.tenant_id != candidate.tenant_id
                     || current.principal_id != candidate.principal_id
             }) {
-                return Err(AppError::BadRequest(
-                    "archive credential hash maps to multiple stable identities".into(),
-                ));
+                return Err(AppError::BadRequest(ARCHIVE_IDENTITY_AMBIGUOUS.into()));
             }
             proof_kinds.insert(row.try_get::<String, _>("proof_kind")?);
             selected = Some(candidate);
         }
-        let key = selected.ok_or_else(|| {
-            AppError::BadRequest(
-                "archive request has no proven stable key/principal identity".into(),
-            )
-        })?;
-        Ok((key, proof_kinds.into_iter().collect::<Vec<_>>().join("+")))
+        Ok(selected.map(|key| (key, proof_kinds.into_iter().collect::<Vec<_>>().join("+"))))
+    }
+
+    async fn resolve_session_archive_identity(
+        &self,
+        tenant_external_id: &str,
+        cpamp_source: &str,
+        source_key_hash: &str,
+    ) -> Result<(AuthenticatedKey, String), AppError> {
+        self.resolve_session_archive_identity_optional(
+            tenant_external_id,
+            cpamp_source,
+            source_key_hash,
+        )
+        .await?
+        .ok_or_else(|| AppError::BadRequest(ARCHIVE_IDENTITY_UNPROVEN.into()))
     }
 
     pub async fn acquire_session_archive_import_lock(
@@ -718,7 +731,7 @@ impl Database {
         // columns. A forged or drifted schema_migrations table therefore remains
         // fail-closed before source planning or CAS writes.
         sqlx::query(
-            "SELECT l.source_digest, r.record_digest, c.watermark_ms, q.created_at, x.proof_digest, u.archive_request_id FROM import_request_links l CROSS JOIN session_archive_import_records r CROSS JOIN session_archive_import_checkpoints c CROSS JOIN request_record_locators q CROSS JOIN session_archive_correlations x CROSS JOIN session_archive_unlinked_requests u WHERE 1 = 0",
+            "SELECT l.source_digest, r.record_digest, c.watermark_ms, q.created_at, x.proof_digest, u.archive_request_id, z.tenant_binding_proof, y.proof_digest, b.sequence, s.evidence_digest FROM import_request_links l CROSS JOIN session_archive_import_records r CROSS JOIN session_archive_import_checkpoints c CROSS JOIN request_record_locators q CROSS JOIN session_archive_correlations x CROSS JOIN session_archive_unlinked_requests u CROSS JOIN session_archive_quarantine_batches z CROSS JOIN session_archive_quarantine_records y CROSS JOIN session_archive_quarantine_batch_records b CROSS JOIN session_archive_quarantine_resolutions s WHERE 1 = 0",
         )
         .fetch_all(&self.pool)
         .await
@@ -751,7 +764,7 @@ impl Database {
     }
 }
 
-fn archive_authenticated_key(row: &AnyRow) -> Result<AuthenticatedKey, AppError> {
+pub(super) fn archive_authenticated_key(row: &AnyRow) -> Result<AuthenticatedKey, AppError> {
     let policy_json: String = row.try_get("policy_json")?;
     Ok(AuthenticatedKey {
         key_id: parse_uuid(row.try_get("key_id")?)?,
@@ -781,7 +794,7 @@ fn ensure_archive_target_identity(
     }
 }
 
-fn archive_proof_digest(domain: &str, fields: &[&str]) -> String {
+pub(super) fn archive_proof_digest(domain: &str, fields: &[&str]) -> String {
     let mut digest = Sha256::new();
     digest.update(domain.as_bytes());
     for field in fields {
@@ -791,7 +804,7 @@ fn archive_proof_digest(domain: &str, fields: &[&str]) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn deterministic_archive_request_id(
+pub(super) fn deterministic_archive_request_id(
     tenant_external_id: &str,
     source: &str,
     external_request_id: &str,
@@ -816,7 +829,7 @@ fn deterministic_archive_request_id(
     Uuid::from_bytes(bytes)
 }
 
-fn normalize_archive_source_key_hash(value: &str) -> Option<String> {
+pub(super) fn normalize_archive_source_key_hash(value: &str) -> Option<String> {
     let value = value.strip_prefix("sha256:").unwrap_or(value);
     is_sha256_hex(value).then(|| value.to_ascii_lowercase())
 }

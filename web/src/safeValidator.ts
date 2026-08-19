@@ -36,13 +36,30 @@ function matchesType(type: string, value: unknown) {
 }
 
 function validFormat(format: string, value: string) {
-  if (format === 'uri' || format === 'uri-reference') {
+  const validUriCharacters = /^[\x21-\x7e]*$/u.test(value) && !/%(?![0-9a-f]{2})/iu.test(value);
+  if (format === 'uri') {
+    if (!validUriCharacters) return false;
     try { return Boolean(new URL(value)); } catch { return false; }
   }
-  if (format === 'uuid') return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  if (format === 'uri-reference') {
+    if (!validUriCharacters) return false;
+    try { new URL(value, 'https://schema.invalid/'); return true; } catch { return false; }
+  }
+  if (format === 'uuid') return /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
   if (format === 'email') return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
   if (format === 'date-time') return !Number.isNaN(Date.parse(value));
   return true;
+}
+
+function canonicalKey(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalKey).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalKey(item)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'undefined';
 }
 
 function validPattern(pattern: string, value: string) {
@@ -66,7 +83,7 @@ function validate(schema: Schema, value: unknown, root: Schema, path: Array<stri
   if (typeof schema.$ref === 'string') {
     const referenced = resolve(root, schema.$ref);
     if (!referenced) { addError(errors, '$ref', 'contains an unsupported schema reference', path, `${schemaPath}/$ref`); return false; }
-    return validate(referenced, value, root, path, schema.$ref, errors, depth + 1);
+    validate(referenced, value, root, path, schema.$ref, errors, depth + 1);
   }
   if (value === undefined) return true;
 
@@ -89,8 +106,9 @@ function validate(schema: Schema, value: unknown, root: Schema, path: Array<stri
   }
 
   if (typeof value === 'string') {
-    if (schema.minLength !== undefined && value.length < schema.minLength) addError(errors, 'minLength', `must contain at least ${schema.minLength} characters`, path, `${schemaPath}/minLength`, { limit: schema.minLength });
-    if (schema.maxLength !== undefined && value.length > schema.maxLength) addError(errors, 'maxLength', `must contain at most ${schema.maxLength} characters`, path, `${schemaPath}/maxLength`, { limit: schema.maxLength });
+    const length = [...value].length;
+    if (schema.minLength !== undefined && length < schema.minLength) addError(errors, 'minLength', `must contain at least ${schema.minLength} characters`, path, `${schemaPath}/minLength`, { limit: schema.minLength });
+    if (schema.maxLength !== undefined && length > schema.maxLength) addError(errors, 'maxLength', `must contain at most ${schema.maxLength} characters`, path, `${schemaPath}/maxLength`, { limit: schema.maxLength });
     if (schema.pattern) {
       if (!validPattern(schema.pattern, value)) addError(errors, 'pattern', 'has an invalid or unsafe format constraint', path, `${schemaPath}/pattern`);
     }
@@ -106,12 +124,16 @@ function validate(schema: Schema, value: unknown, root: Schema, path: Array<stri
   if (Array.isArray(value)) {
     if (schema.minItems !== undefined && value.length < schema.minItems) addError(errors, 'minItems', `must contain at least ${schema.minItems} items`, path, `${schemaPath}/minItems`, { limit: schema.minItems });
     if (schema.maxItems !== undefined && value.length > schema.maxItems) addError(errors, 'maxItems', `must contain at most ${schema.maxItems} items`, path, `${schemaPath}/maxItems`, { limit: schema.maxItems });
-    if (schema.uniqueItems && new Set(value.map((item) => JSON.stringify(item))).size !== value.length) addError(errors, 'uniqueItems', 'must not contain duplicate items', path, `${schemaPath}/uniqueItems`);
+    if (schema.uniqueItems && new Set(value.map(canonicalKey)).size !== value.length) addError(errors, 'uniqueItems', 'must not contain duplicate items', path, `${schemaPath}/uniqueItems`);
     if (schema.items && !Array.isArray(schema.items)) value.forEach((item, index) => validate(schema.items as Schema, item, root, [...path, index], `${schemaPath}/items`, errors, depth + 1));
   }
   if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
     const object = value as Record<string, unknown>;
-    for (const required of schema.required ?? []) if (object[required] === undefined || object[required] === '') addError(errors, 'required', 'is required', [...path, required], `${schemaPath}/required`, { missingProperty: required });
+    const entries = Object.entries(object);
+    if (schema.minProperties !== undefined && entries.length < schema.minProperties) addError(errors, 'minProperties', `must contain at least ${schema.minProperties} properties`, path, `${schemaPath}/minProperties`, { limit: schema.minProperties });
+    if (schema.maxProperties !== undefined && entries.length > schema.maxProperties) addError(errors, 'maxProperties', `must contain at most ${schema.maxProperties} properties`, path, `${schemaPath}/maxProperties`, { limit: schema.maxProperties });
+    for (const required of schema.required ?? []) if (!(required in object)) addError(errors, 'required', 'is required', [...path, required], `${schemaPath}/required`, { missingProperty: required });
+    if (schema.propertyNames !== undefined) for (const key of Object.keys(object)) validate(schema.propertyNames as Schema, key, root, [...path, key], `${schemaPath}/propertyNames`, errors, depth + 1);
     for (const [key, child] of Object.entries(schema.properties ?? {})) if (object[key] !== undefined) validate(child as Schema, object[key], root, [...path, key], `${schemaPath}/properties/${key}`, errors, depth + 1);
     if (schema.additionalProperties === false) {
       for (const key of Object.keys(object)) if (!(key in (schema.properties ?? {}))) addError(errors, 'additionalProperties', 'is not an allowed field', [...path, key], `${schemaPath}/additionalProperties`);

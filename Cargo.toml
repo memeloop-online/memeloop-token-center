@@ -13,9 +13,18 @@ path = "src/lib.rs"
 name = "memeloop-token-center"
 path = "src/main.rs"
 
+[[bin]]
+name = "install-plugin-oci"
+path = "src/bin/install-plugin-oci.rs"
+required-features = ["plugin-distribution"]
+
 [[test]]
 name = "cucumber"
 harness = false
+
+[features]
+default = []
+plugin-distribution = ["dep:oci-client", "dep:rustix", "dep:sigstore"]
 
 [dependencies]
 async-trait = "0.1"
@@ -30,15 +39,19 @@ futures-util = "0.3"
 getrandom = "0.3"
 hmac = "0.12"
 http = "1"
+jsonschema = { version = "0.49.9", default-features = false }
 mime_guess = "2"
 object_store = { version = "0.14.1", features = ["aws"] }
+oci-client = { version = "0.17", optional = true, default-features = false, features = ["rustls-tls"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 regex = "1"
 rust_decimal = { version = "1", default-features = false, features = ["serde-with-str", "std"] }
+rustix = { version = "1", optional = true, features = ["fs"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sigstore = { version = "0.14", optional = true, default-features = false, features = ["cosign", "rustls-tls"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "any", "postgres", "sqlite"] }
 subtle = "2"
 thiserror = "2"

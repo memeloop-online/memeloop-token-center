@@ -1,15 +1,42 @@
 use super::super::*;
 
 impl Database {
+    pub async fn require_account_exists(&self, account_id: Uuid) -> Result<(), AppError> {
+        let exists = sqlx::query("SELECT id FROM credit_accounts WHERE id = $1")
+            .bind(account_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+        exists.then_some(()).ok_or(AppError::NotFound)
+    }
+
     pub async fn list_account_ledger(
         &self,
         account_id: Uuid,
         limit: i64,
     ) -> Result<Vec<LedgerEntryView>, AppError> {
+        self.list_account_ledger_page(account_id, limit, None).await
+    }
+
+    /// Lists ledger entries using an exclusive descending
+    /// `(created_at, entry_id)` cursor. Account ownership is checked by the
+    /// HTTP boundary before this method is called; the account predicate is
+    /// retained in every page query so entries cannot cross accounts.
+    pub async fn list_account_ledger_page(
+        &self,
+        account_id: Uuid,
+        limit: i64,
+        before: Option<(i64, Uuid)>,
+    ) -> Result<Vec<LedgerEntryView>, AppError> {
+        let (before_created_at, before_id) = before
+            .map(|(created_at, id)| (created_at, id.to_string()))
+            .unwrap_or_else(|| (i64::MAX, "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned()));
         let rows = sqlx::query(
-            "SELECT id, kind, amount_micros, currency, source, idempotency_key, created_at FROM ledger_entries WHERE account_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
+            "SELECT id, kind, amount_micros, currency, source, idempotency_key, created_at FROM ledger_entries WHERE account_id = $1 AND (created_at < $2 OR (created_at = $2 AND id < $3)) ORDER BY created_at DESC, id DESC LIMIT $4",
         )
         .bind(account_id.to_string())
+        .bind(before_created_at)
+        .bind(before_id)
         .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
         .await?;

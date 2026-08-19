@@ -39,6 +39,11 @@ reviewed_digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   --show-only templates/migration-job.yaml \
   --set imagePullSecrets[0].name=registry-credentials \
   >"$workspace/migration-pull-secret.yaml"
+"$helm_binary" template token-center-cloud-webhook "$chart" \
+  --namespace token-center \
+  --set config.memeloopCloudWebhookSecret.name=memeloop-cloud-integration \
+  --set config.memeloopCloudWebhookSecret.key=webhook-secret \
+  >"$workspace/cloud-webhook.yaml"
 "$helm_binary" template token-center-gateway-ingress "$chart" \
   --namespace token-center \
   --show-only templates/ingress.yaml \
@@ -103,6 +108,12 @@ grep -A2 -F 'imagePullSecrets:' "$workspace/migration-pull-secret.yaml" \
   | grep -Fq -- '- name: registry-credentials'
 test "$(grep -c 'name: MTC_ARCHIVE_BACKEND' "$workspace/default.yaml")" -eq 3
 test "$(grep -A1 'name: MTC_ARCHIVE_BACKEND' "$workspace/default.yaml" | grep -c 'value: "s3"')" -eq 3
+test "$(grep -c 'name: MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET' "$workspace/default.yaml" || true)" -eq 0
+test "$(grep -c 'name: MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET' "$workspace/cloud-webhook.yaml")" -eq 1
+grep -A4 -F 'name: MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET' "$workspace/cloud-webhook.yaml" \
+  | grep -Fq 'name: memeloop-cloud-integration'
+grep -A4 -F 'name: MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET' "$workspace/cloud-webhook.yaml" \
+  | grep -Fq 'key: webhook-secret'
 test "$(grep -c '^kind: Ingress$' "$workspace/default.yaml" || true)" -eq 0
 test "$(grep -c '^kind: Ingress$' "$workspace/gateway-ingress.yaml")" -eq 1
 test "$(grep -c '^kind: Ingress$' "$workspace/control-ingress.yaml")" -eq 1

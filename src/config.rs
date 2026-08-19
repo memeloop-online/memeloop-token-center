@@ -31,7 +31,7 @@ impl RuntimeRole {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     pub listen: String,
     pub database_url: String,
@@ -39,6 +39,9 @@ pub struct Config {
     pub run_migrations_on_start: bool,
     pub key_pepper: String,
     pub service_token: String,
+    /// Shared HMAC secret for the MemeLoop Cloud subscription webhook.  The
+    /// endpoint fails closed when this integration is not configured.
+    pub memeloop_cloud_webhook_secret: Option<String>,
     pub archive_backend: ArchiveBackend,
     pub archive_path: Option<String>,
     pub s3_bucket: Option<String>,
@@ -58,6 +61,65 @@ pub struct Config {
     pub allow_oauth_loopback: bool,
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("listen", &self.listen)
+            .field("database_url", &"[redacted]")
+            .field("database_max_connections", &self.database_max_connections)
+            .field("run_migrations_on_start", &self.run_migrations_on_start)
+            .field("key_pepper", &"[redacted]")
+            .field("service_token", &"[redacted]")
+            .field(
+                "memeloop_cloud_webhook_secret",
+                &self
+                    .memeloop_cloud_webhook_secret
+                    .as_ref()
+                    .map(|_| "[redacted]"),
+            )
+            .field("archive_backend", &self.archive_backend)
+            .field("archive_path", &self.archive_path)
+            .field("s3_bucket", &self.s3_bucket)
+            .field(
+                "s3_endpoint",
+                &self.s3_endpoint.as_ref().map(|_| "[configured]"),
+            )
+            .field("s3_region", &self.s3_region)
+            .field(
+                "s3_access_key",
+                &self.s3_access_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "s3_secret_key",
+                &self.s3_secret_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("s3_allow_http", &self.s3_allow_http)
+            .field(
+                "upstream_openai_url",
+                &self.upstream_openai_url.as_ref().map(|_| "[configured]"),
+            )
+            .field(
+                "upstream_openai_key",
+                &self.upstream_openai_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "upstream_anthropic_url",
+                &self.upstream_anthropic_url.as_ref().map(|_| "[configured]"),
+            )
+            .field(
+                "upstream_anthropic_key",
+                &self.upstream_anthropic_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("pricing_models_dev_url", &"[configured public HTTPS URL]")
+            .field("pricing_litellm_url", &"[configured public HTTPS URL]")
+            .field("pricing_openrouter_url", &"[configured public HTTPS URL]")
+            .field("plugin_dir", &self.plugin_dir)
+            .field("allow_oauth_loopback", &self.allow_oauth_loopback)
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchiveBackend {
@@ -68,12 +130,7 @@ pub enum ArchiveBackend {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let archive_backend = match env_string("MTC_ARCHIVE_BACKEND", "s3").as_str() {
-            "s3" => ArchiveBackend::S3,
-            "filesystem" => ArchiveBackend::Filesystem,
-            "memory" => ArchiveBackend::Memory,
-            value => return Err(ConfigError::InvalidArchiveBackend(value.to_owned())),
-        };
+        let archive_backend = production_archive_backend(&env_string("MTC_ARCHIVE_BACKEND", "s3"))?;
 
         let key_pepper = required("MTC_KEY_PEPPER")?;
         if key_pepper.len() < 32 {
@@ -82,6 +139,9 @@ impl Config {
 
         let service_token = required("MTC_SERVICE_TOKEN")?;
         validate_bootstrap_service_token(&service_token)?;
+
+        let memeloop_cloud_webhook_secret =
+            optional_secret("MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET", 32)?;
 
         let allow_oauth_loopback = env_bool("MTC_ALLOW_OAUTH_LOOPBACK", false);
         let pricing_models_dev_url = pricing_source_url(
@@ -110,6 +170,7 @@ impl Config {
             run_migrations_on_start: env_bool("MTC_RUN_MIGRATIONS_ON_START", true),
             key_pepper,
             service_token,
+            memeloop_cloud_webhook_secret,
             archive_backend,
             archive_path: env::var("MTC_ARCHIVE_PATH").ok(),
             s3_bucket: env::var("MTC_S3_BUCKET").ok(),
@@ -136,12 +197,7 @@ impl Config {
     /// credentials, plugin settings or pricing-source overrides. The importer
     /// needs only the target database and archive object store.
     pub fn from_session_archive_import_env() -> Result<Self, ConfigError> {
-        let archive_backend = match env_string("MTC_ARCHIVE_BACKEND", "s3").as_str() {
-            "s3" => ArchiveBackend::S3,
-            "filesystem" => ArchiveBackend::Filesystem,
-            "memory" => ArchiveBackend::Memory,
-            value => return Err(ConfigError::InvalidArchiveBackend(value.to_owned())),
-        };
+        let archive_backend = production_archive_backend(&env_string("MTC_ARCHIVE_BACKEND", "s3"))?;
         Ok(Self {
             listen: "127.0.0.1:0".to_owned(),
             database_url: required("MTC_DATABASE_URL")?,
@@ -149,6 +205,7 @@ impl Config {
             run_migrations_on_start: false,
             key_pepper: "unused-by-session-archive-importer".to_owned(),
             service_token: "unused-by-session-archive-importer".to_owned(),
+            memeloop_cloud_webhook_secret: None,
             archive_backend,
             archive_path: env::var("MTC_ARCHIVE_PATH").ok(),
             s3_bucket: env::var("MTC_S3_BUCKET").ok(),
@@ -177,6 +234,9 @@ impl Config {
             run_migrations_on_start: true,
             key_pepper: "test-pepper-must-have-at-least-32-bytes".to_owned(),
             service_token: "test-service-token".to_owned(),
+            memeloop_cloud_webhook_secret: Some(
+                "test-memeloop-cloud-webhook-secret-long-enough".to_owned(),
+            ),
             archive_backend: ArchiveBackend::Memory,
             archive_path: None,
             s3_bucket: None,
@@ -195,6 +255,17 @@ impl Config {
             plugin_dir: None,
             allow_oauth_loopback: true,
         }
+    }
+}
+
+fn production_archive_backend(value: &str) -> Result<ArchiveBackend, ConfigError> {
+    match value {
+        "s3" => Ok(ArchiveBackend::S3),
+        "filesystem" => Ok(ArchiveBackend::Filesystem),
+        // The in-memory object store has no capacity or retention bound. Keep
+        // it reachable only through Config::for_test, never through a serving
+        // process or one-shot importer environment.
+        other => Err(ConfigError::InvalidArchiveBackend(other.to_owned())),
     }
 }
 
@@ -241,6 +312,25 @@ fn required(name: &'static str) -> Result<String, ConfigError> {
     env::var(name).map_err(|_| ConfigError::Missing(name))
 }
 
+fn optional_secret(
+    name: &'static str,
+    minimum_bytes: usize,
+) -> Result<Option<String>, ConfigError> {
+    let Ok(value) = env::var(name) else {
+        return Ok(None);
+    };
+    if value.len() < minimum_bytes {
+        return Err(ConfigError::SecretTooShort(name, minimum_bytes));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(ConfigError::InvalidSecretCharacters(name));
+    }
+    Ok(Some(value))
+}
+
 fn env_string(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_owned())
 }
@@ -271,6 +361,10 @@ pub enum ConfigError {
     ServiceTokenTooShort,
     #[error("MTC_SERVICE_TOKEN must not contain any whitespace or control characters")]
     InvalidServiceTokenCharacters,
+    #[error("{0} must contain at least {1} bytes")]
+    SecretTooShort(&'static str, usize),
+    #[error("{0} must not contain whitespace or control characters")]
+    InvalidSecretCharacters(&'static str),
     #[error("unsupported archive backend: {0}")]
     InvalidArchiveBackend(String),
     #[error("{0} must be an unsigned integer, received {1}")]
@@ -282,6 +376,43 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_never_contains_runtime_credentials_or_credential_bearing_urls() {
+        let secrets = [
+            "postgres-password-secret",
+            "pepper-secret-material",
+            "bootstrap-service-secret",
+            "cloud-webhook-secret",
+            "s3-access-secret",
+            "s3-secret-secret",
+            "openai-upstream-secret",
+            "anthropic-upstream-secret",
+            "url-query-secret",
+        ];
+        let mut config = Config::for_test(
+            "postgres://operator:postgres-password-secret@db.internal/token-center".to_owned(),
+        );
+        config.key_pepper = "pepper-secret-material".to_owned();
+        config.service_token = "bootstrap-service-secret".to_owned();
+        config.memeloop_cloud_webhook_secret = Some("cloud-webhook-secret".to_owned());
+        config.s3_access_key = Some("s3-access-secret".to_owned());
+        config.s3_secret_key = Some("s3-secret-secret".to_owned());
+        config.s3_endpoint = Some("https://s3.example.test?signature=url-query-secret".to_owned());
+        config.upstream_openai_url =
+            Some("https://api.example.test/v1?token=url-query-secret".to_owned());
+        config.upstream_openai_key = Some("openai-upstream-secret".to_owned());
+        config.upstream_anthropic_url =
+            Some("https://anthropic.example.test?token=url-query-secret".to_owned());
+        config.upstream_anthropic_key = Some("anthropic-upstream-secret".to_owned());
+
+        let debug = format!("{config:?}");
+        for secret in secrets {
+            assert!(!debug.contains(secret), "debug output leaked {secret}");
+        }
+        assert!(debug.contains("database_max_connections"));
+        assert!(debug.contains("[redacted]"));
+    }
 
     #[test]
     fn bootstrap_service_token_requires_at_least_32_bytes() {
@@ -341,6 +472,26 @@ mod tests {
         );
         assert!(
             pricing_source_url("SOURCE", "http://10.0.0.1:1234/catalog".to_owned(), true,).is_err()
+        );
+    }
+
+    #[test]
+    fn production_configuration_rejects_the_unbounded_memory_archive() {
+        assert_eq!(
+            production_archive_backend("s3").unwrap(),
+            ArchiveBackend::S3
+        );
+        assert_eq!(
+            production_archive_backend("filesystem").unwrap(),
+            ArchiveBackend::Filesystem
+        );
+        assert!(matches!(
+            production_archive_backend("memory"),
+            Err(ConfigError::InvalidArchiveBackend(value)) if value == "memory"
+        ));
+        assert_eq!(
+            Config::for_test("sqlite::memory:".to_owned()).archive_backend,
+            ArchiveBackend::Memory
         );
     }
 }

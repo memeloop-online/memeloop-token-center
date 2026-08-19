@@ -16,6 +16,17 @@ from typing import Any
 
 
 SAFE_ID = re.compile(r"^[0-9A-Fa-f-]{36}$")
+LARGE_HISTORY_RELATIONS = (
+    "request_records",
+    "request_events",
+    "request_stats_facts",
+    "request_daily_aggregates",
+    "generation_jobs",
+    "generation_stats_facts",
+    "generation_daily_aggregates",
+    "usage_analysis_hourly",
+    "usage_analysis_daily",
+)
 
 
 class PrerequisiteFailure(RuntimeError):
@@ -63,7 +74,13 @@ def plan_nodes(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return nodes
 
 
-def explain(database_url: str, name: str, query: str, timeout_ms: int) -> dict[str, Any]:
+def explain(
+    database_url: str,
+    name: str,
+    query: str,
+    timeout_ms: int,
+    max_sequential_scan_rows: int,
+) -> dict[str, Any]:
     raw = run_psql(
         database_url,
         f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, TIMING OFF) {query};",
@@ -74,21 +91,23 @@ def explain(database_url: str, name: str, query: str, timeout_ms: int) -> dict[s
     indexes = sorted(
         {str(node["Index Name"]) for node in nodes if node.get("Index Name") is not None}
     )
+    sequential_scans = []
+    for node in nodes:
+        relation = str(node.get("Relation Name", ""))
+        if node.get("Node Type") != "Seq Scan" or not relation.startswith(
+            LARGE_HISTORY_RELATIONS
+        ):
+            continue
+        loops = max(1, int(node.get("Actual Loops", 1)))
+        scanned_rows = (
+            int(node.get("Actual Rows", 0))
+            + int(node.get("Rows Removed by Filter", 0))
+        ) * loops
+        sequential_scans.append({"relation": relation, "scanned_rows": scanned_rows})
     sequential_large_relations = sorted(
-        {
-            str(node.get("Relation Name"))
-            for node in nodes
-            if node.get("Node Type") == "Seq Scan"
-            and str(node.get("Relation Name", "")).startswith(
-                (
-                    "request_records",
-                    "request_events",
-                    "request_stats_facts",
-                    "usage_analysis_hourly",
-                    "usage_analysis_daily",
-                )
-            )
-        }
+        scan["relation"]
+        for scan in sequential_scans
+        if scan["scanned_rows"] > max_sequential_scan_rows
     )
     return {
         "name": name,
@@ -97,7 +116,15 @@ def explain(database_url: str, name: str, query: str, timeout_ms: int) -> dict[s
         "returned_rows": document["Plan"].get("Actual Rows", 0),
         "root_node": document["Plan"].get("Node Type"),
         "indexes": indexes,
+        "relations": sorted(
+            {
+                str(node["Relation Name"])
+                for node in nodes
+                if node.get("Relation Name") is not None
+            }
+        ),
         "sequential_large_relations": sequential_large_relations,
+        "sequential_scans": sequential_scans,
         "shared_hit_blocks": sum(int(node.get("Shared Hit Blocks", 0)) for node in nodes),
         "shared_read_blocks": sum(int(node.get("Shared Read Blocks", 0)) for node in nodes),
         "plan": document["Plan"],
@@ -115,6 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-execution-ms", type=float, default=250.0)
     parser.add_argument("--statement-timeout-ms", type=int, default=30000)
     parser.add_argument("--min-request-rows", type=int, default=100000)
+    parser.add_argument("--max-sequential-scan-rows", type=int, default=10000)
     parser.add_argument("--allow-sequential-scan", action="store_true")
     return parser.parse_args()
 
@@ -167,10 +195,64 @@ def main() -> int:
     ).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
-        request_rows = int(scalar(database_url, "SELECT count(*) FROM request_records;", args.statement_timeout_ms))
-        event_rows = int(scalar(database_url, "SELECT count(*) FROM request_events;", args.statement_timeout_ms))
-        fact_rows = int(scalar(database_url, "SELECT count(*) FROM request_stats_facts;", args.statement_timeout_ms))
-        terminal_request_rows = int(scalar(database_url, "SELECT count(*) FROM request_records WHERE completed_at IS NOT NULL AND status_code IS NOT NULL;", args.statement_timeout_ms))
+        request_rows = int(
+            scalar(
+                database_url,
+                "SELECT count(*) FROM request_records;",
+                args.statement_timeout_ms,
+            )
+        )
+        event_rows = int(
+            scalar(
+                database_url,
+                "SELECT count(*) FROM request_events;",
+                args.statement_timeout_ms,
+            )
+        )
+        fact_rows = int(
+            scalar(
+                database_url,
+                "SELECT count(*) FROM request_stats_facts;",
+                args.statement_timeout_ms,
+            )
+        )
+        generation_fact_rows = int(
+            scalar(
+                database_url,
+                "SELECT count(*) FROM generation_stats_facts;",
+                args.statement_timeout_ms,
+            )
+        )
+        terminal_request_rows = int(
+            scalar(
+                database_url,
+                "SELECT count(*) FROM request_records "
+                "WHERE completed_at IS NOT NULL AND status_code IS NOT NULL;",
+                args.statement_timeout_ms,
+            )
+        )
+        terminal_generation_rows = int(
+            scalar(
+                database_url,
+                "SELECT count(*) FROM generation_jobs "
+                "WHERE status IN ('succeeded', 'failed', 'cancelled');",
+                args.statement_timeout_ms,
+            )
+        )
+        blank_currency_rows = int(
+            scalar(
+                database_url,
+                "SELECT SUM(rows) FROM ("
+                "SELECT count(*) AS rows FROM request_records WHERE currency = '' UNION ALL "
+                "SELECT count(*) FROM request_stats_facts WHERE currency = '' UNION ALL "
+                "SELECT count(*) FROM request_daily_aggregates WHERE currency = '' UNION ALL "
+                "SELECT count(*) FROM generation_stats_facts WHERE currency = '' UNION ALL "
+                "SELECT count(*) FROM generation_daily_aggregates WHERE currency = '' UNION ALL "
+                "SELECT count(*) FROM usage_analysis_hourly WHERE currency = '' UNION ALL "
+                "SELECT count(*) FROM usage_analysis_daily WHERE currency = '') currency_gaps;",
+                args.statement_timeout_ms,
+            )
+        )
         valid_required_cursor_indexes = int(
             scalar(
                 database_url,
@@ -198,6 +280,23 @@ def main() -> int:
                 args.statement_timeout_ms,
             )
         )
+        valid_required_observability_indexes = int(
+            scalar(
+                database_url,
+                "SELECT count(*) FROM pg_index WHERE indexrelid IN ("
+                "to_regclass('public.request_stats_facts_tenant_created_idx'), "
+                "to_regclass('public.generation_stats_facts_tenant_created_idx'), "
+                "to_regclass('public.request_daily_aggregates_tenant_day_idx'), "
+                "to_regclass('public.generation_daily_aggregates_tenant_day_idx'), "
+                "to_regclass('public.usage_analysis_hourly_tenant_time_idx'), "
+                "to_regclass('public.usage_analysis_daily_tenant_time_idx'), "
+                "to_regclass('public.usage_analysis_daily_tenant_model_time_idx'), "
+                "to_regclass('public.usage_analysis_daily_tenant_error_time_idx'), "
+                "to_regclass('public.usage_analysis_daily_tenant_route_time_idx')) "
+                "AND indisvalid AND indisready;",
+                args.statement_timeout_ms,
+            )
+        )
         key_id = scalar(
             database_url,
             "SELECT key_id FROM request_records GROUP BY key_id ORDER BY count(*) DESC LIMIT 1;",
@@ -221,6 +320,26 @@ def main() -> int:
         error_code = literal(
             database_url,
             "SELECT error_code FROM request_records WHERE error_code IS NOT NULL GROUP BY error_code ORDER BY count(*) DESC LIMIT 1",
+            args.statement_timeout_ms,
+        )
+        analysis_model = literal(
+            database_url,
+            "SELECT model FROM usage_analysis_daily "
+            f"WHERE tenant_id = '{tenant_id}' GROUP BY model ORDER BY count(*) DESC LIMIT 1",
+            args.statement_timeout_ms,
+        )
+        analysis_error = literal(
+            database_url,
+            "SELECT error_code FROM usage_analysis_daily "
+            f"WHERE tenant_id = '{tenant_id}' AND error_code <> '' "
+            "GROUP BY error_code ORDER BY count(*) DESC LIMIT 1",
+            args.statement_timeout_ms,
+        )
+        analysis_route = literal(
+            database_url,
+            "SELECT model_route_id FROM usage_analysis_daily "
+            f"WHERE tenant_id = '{tenant_id}' AND model_route_id <> '' "
+            "GROUP BY model_route_id ORDER BY count(*) DESC LIMIT 1",
             args.statement_timeout_ms,
         )
         stats_day_bounds = scalar(
@@ -347,6 +466,22 @@ def main() -> int:
                     "ORDER BY created_at DESC, id DESC LIMIT 100",
                 )
             )
+        for name, column, value in (
+            ("tenant_usage_model_drilldown", "model", analysis_model),
+            ("tenant_usage_error_drilldown", "error_code", analysis_error),
+            ("tenant_usage_route_drilldown", "model_route_id", analysis_route),
+        ):
+            if value is not None:
+                queries.append(
+                    (
+                        name,
+                        "SELECT currency, SUM(requests), SUM(cost_micros) "
+                        "FROM usage_analysis_daily "
+                        f"WHERE tenant_id = '{tenant_id}' AND {column} = {value} "
+                        f"AND day_bucket >= {usage_from_day} AND day_bucket <= {usage_max_day} "
+                        "GROUP BY currency",
+                    )
+                )
         if event_tenant_id:
             queries.append(
                 (
@@ -357,7 +492,13 @@ def main() -> int:
             )
 
         results = [
-            explain(database_url, name, query, args.statement_timeout_ms)
+            explain(
+                database_url,
+                name,
+                query,
+                args.statement_timeout_ms,
+                args.max_sequential_scan_rows,
+            )
             for name, query in queries
         ]
         checks: list[dict[str, Any]] = [
@@ -376,6 +517,20 @@ def main() -> int:
                 "passed": fact_rows == terminal_request_rows,
             },
             {
+                "name": "terminal generation fact coverage",
+                "actual": generation_fact_rows,
+                "operator": "==",
+                "expected": terminal_generation_rows,
+                "passed": generation_fact_rows == terminal_generation_rows,
+            },
+            {
+                "name": "historical billing currency is complete",
+                "actual": blank_currency_rows,
+                "operator": "==",
+                "expected": 0,
+                "passed": blank_currency_rows == 0,
+            },
+            {
                 "name": "required global cursor parent indexes are ready",
                 "actual": valid_required_cursor_indexes,
                 "operator": "==",
@@ -389,6 +544,13 @@ def main() -> int:
                 "expected": 0,
                 "passed": unattached_required_cursor_leaves == 0,
             },
+            {
+                "name": "required observability indexes are ready",
+                "actual": valid_required_observability_indexes,
+                "operator": "==",
+                "expected": 9,
+                "passed": valid_required_observability_indexes == 9,
+            },
         ]
         for result in results:
             checks.append(
@@ -401,17 +563,23 @@ def main() -> int:
                 }
             )
             if not args.allow_sequential_scan and request_rows >= args.min_request_rows:
+                bounded_edge_fact_scan = (
+                    result["name"] == "tenant_filtered_stats"
+                    and set(result["sequential_large_relations"])
+                    <= {"request_stats_facts", "generation_stats_facts"}
+                )
                 checks.append(
                     {
                         "name": f"{result['name']} avoids sequential history scan",
                         "actual": result["sequential_large_relations"],
                         "operator": "==",
-                        "expected": [],
-                        "passed": not result["sequential_large_relations"],
+                        "expected": "[] except bounded incomplete-day fact branches",
+                        "passed": not result["sequential_large_relations"]
+                        or bounded_edge_fact_scan,
                     }
                 )
         report = {
-            "schema_version": 2,
+            "schema_version": 3,
             "benchmark": "memeloop-token-center-postgres-explain",
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "postgres_version": scalar(database_url, "SHOW server_version;", args.statement_timeout_ms),
@@ -419,11 +587,15 @@ def main() -> int:
                 "request_rows": request_rows,
                 "terminal_request_rows": terminal_request_rows,
                 "request_fact_rows": fact_rows,
+                "terminal_generation_rows": terminal_generation_rows,
+                "generation_fact_rows": generation_fact_rows,
+                "blank_currency_rows": blank_currency_rows,
                 "event_rows": event_rows,
             },
             "thresholds": {
                 "max_execution_ms": args.max_execution_ms,
                 "min_request_rows": args.min_request_rows,
+                "max_sequential_scan_rows": args.max_sequential_scan_rows,
                 "allow_sequential_scan": args.allow_sequential_scan,
             },
             "results": results,

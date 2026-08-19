@@ -124,6 +124,12 @@ export function SelfPortal() {
   const [hasOlderRequests, setHasOlderRequests] = useState(false);
   const [requestLoading, setRequestLoading] = useState(false);
   const [generations, setGenerations] = useState<GenerationJob[]>([]);
+  const [generationKind, setGenerationKind] = useState<'image' | 'video'>('image');
+  const [generationModel, setGenerationModel] = useState('');
+  const [generationPrompt, setGenerationPrompt] = useState('');
+  const [generationDuration, setGenerationDuration] = useState('5');
+  const [generationSubmitting, setGenerationSubmitting] = useState(false);
+  const [generationMessage, setGenerationMessage] = useState('');
   const [conversations, setConversations] = useState<ConversationCluster[]>([]);
   const [hasOlderConversations, setHasOlderConversations] = useState(false);
   const [conversationLoading, setConversationLoading] = useState(false);
@@ -292,7 +298,72 @@ export function SelfPortal() {
     }
   }
 
+  async function createGeneration(event: FormEvent) {
+    event.preventDefault();
+    const value = credential.trim();
+    const selectedModel = generationModel.trim();
+    const prompt = generationPrompt.trim();
+    if (!value || !selectedModel || !prompt) return;
+    setGenerationSubmitting(true); setGenerationMessage(''); setError('');
+    try {
+      const path = generationKind === 'video' ? '/v1/videos/generations' : '/v1/images/generations';
+      const input = generationKind === 'video'
+        ? { duration: Number(generationDuration), content: [{ type: 'text', text: prompt }] }
+        : { parameters: { prompt } };
+      const job = await api<GenerationJob>(path, value, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({ model: selectedModel, input }),
+      });
+      setGenerations((current) => [job, ...current.filter((candidate) => candidate.job_id !== job.job_id)]);
+      setGenerationMessage(t('self.generationSubmitted'));
+    } catch (reason) {
+      setError(selfErrorMessage(reason, t, t('self.generationCreateFailed')));
+    } finally {
+      setGenerationSubmitting(false);
+    }
+  }
+
+  async function refreshGenerations() {
+    const value = credential.trim();
+    if (!value) return;
+    try {
+      const next = await api<GenerationJob[]>('/self/v1/generations?limit=100', value);
+      setGenerations(next);
+      setGenerationDetail((current) => current ? next.find((job) => job.job_id === current.job_id) ?? current : undefined);
+      if (!next.some((job) => job.status === 'queued' || job.status === 'running' || job.status === 'cancelling')) await load();
+    } catch (reason) {
+      setError(selfErrorMessage(reason, t, t('common.requestFailed')));
+    }
+  }
+
+  async function cancelGeneration(job: GenerationJob) {
+    setError(''); setGenerationMessage('');
+    try {
+      const cancelled = await api<GenerationJob>(`/self/v1/generations/${job.job_id}`, credential.trim(), { method: 'DELETE' });
+      setGenerations((current) => current.map((candidate) => candidate.job_id === cancelled.job_id ? cancelled : candidate));
+      setGenerationDetail((current) => current?.job_id === cancelled.job_id ? cancelled : current);
+      setGenerationMessage(t(cancelled.status === 'cancelling' ? 'self.generationCancellationRequested' : 'self.generationCancelled'));
+      await load();
+    } catch (reason) {
+      setError(reason instanceof ApiError && reason.status === 400
+        ? t('self.generationCancelFailed')
+        : selfErrorMessage(reason, t, t('self.generationCancelFailed')));
+    }
+  }
+
+  const hasPendingGenerations = generations.some((job) => job.status === 'queued' || job.status === 'running' || job.status === 'cancelling');
   useEffect(() => { if (credential) void load(); }, []);
+  useEffect(() => {
+    if (!credential.trim() || !hasPendingGenerations) return;
+    let cancelled = false;
+    let timer = window.setTimeout(poll, 1_000);
+    async function poll() {
+      await refreshGenerations();
+      if (!cancelled) timer = window.setTimeout(poll, 1_000);
+    }
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [credential, hasPendingGenerations]);
   return <Shell>
     <header className="hero"><div><span className="eyebrow">{t('self.eyebrow')}</span><h1>{t('self.title')}</h1><p>{t('self.subtitle')}</p></div><form className="credential" onSubmit={(event) => { event.preventDefault(); void load(); }}><input aria-label={t('self.credential')} autoComplete="off" type="password" value={credential} onChange={(event) => setCredential(event.target.value)} placeholder={t('self.placeholder')} /><button type="submit" disabled={loading || !credential.trim()}>{loading ? t('common.loading') : t('common.load')}</button></form></header>
     {error && <div className="notice error" role="alert">{error}</div>}
@@ -322,17 +393,27 @@ export function SelfPortal() {
         {hasOlderRequests && <div className="load-more"><button type="button" className="secondary" disabled={requestLoading} onClick={() => void fetchRequestPage(appliedFilters, true)}>{requestLoading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
       </article>
       <article className="panel"><div className="panel-title"><h2>{t('self.conversations')}</h2><span>{t('self.conversationHint')}</span></div><div className="conversation-list">{conversations.map((conversation) => <button type="button" className="conversation" key={conversation.cluster_id} disabled={conversationLoading} onClick={() => void selectConversation(conversation)}><span><b>{conversation.explicit_session_id ?? conversation.cluster_id.slice(0, 13)}</b><small>{new Date(conversation.updated_at).toLocaleString(locale)}</small></span><span><strong>{t('request.count', { count: formatNumber(conversation.request_count, locale) })}</strong>{conversation.candidate_edge_count > 0 && <em>{t('self.candidateEdges', { count: formatNumber(conversation.candidate_edge_count, locale) })}</em>}</span></button>)}{conversations.length === 0 && <div className="empty">{t('self.noConversations')}</div>}</div>{hasOlderConversations && <div className="load-more"><button type="button" className="secondary" disabled={conversationLoading} onClick={() => void fetchOlderConversations()}>{conversationLoading ? t('common.loading') : t('self.loadOlderConversations')}</button></div>}</article>
-      <GenerationTable jobs={generations} currency={credentialView?.currency} onSelect={setGenerationDetail} />
+      <article className="panel form-panel generation-create"><div className="panel-title"><div><h2>{t('self.createGeneration')}</h2><p className="muted">{t('self.generationDrivers')}</p></div><button type="button" className="secondary" disabled={loading} onClick={() => void refreshGenerations()}>{t('self.refreshGenerations')}</button></div>
+        {generationMessage && <div className="notice success" role="status">{generationMessage}</div>}
+        <form onSubmit={createGeneration}>
+          <label>{t('self.generationKind')}<select value={generationKind} onChange={(event) => setGenerationKind(event.target.value as 'image' | 'video')}><option value="image">{t('self.image')}</option><option value="video">{t('self.video')}</option></select></label>
+          <label>{t('self.generationModel')}<input list="self-generation-models" value={generationModel} onChange={(event) => setGenerationModel(event.target.value)} /><datalist id="self-generation-models">{credentialView?.policy.allowed_models.map((allowedModel) => <option value={allowedModel} key={allowedModel} />)}</datalist></label>
+          <label>{t('self.generationPrompt')}<textarea value={generationPrompt} onChange={(event) => setGenerationPrompt(event.target.value)} /></label>
+          {generationKind === 'video' && <label>{t('self.generationDuration')}<input type="number" min="1" max="60" step="1" value={generationDuration} onChange={(event) => setGenerationDuration(event.target.value)} /></label>}
+          <button type="submit" disabled={generationSubmitting || !generationModel.trim() || !generationPrompt.trim()}>{generationSubmitting ? t('common.loading') : t('self.submitGeneration')}</button>
+        </form>
+      </article>
+      <GenerationTable jobs={generations} currency={credentialView?.currency} onSelect={setGenerationDetail} onCancel={(job) => void cancelGeneration(job)} />
     </>}
     {detail && <RequestDetailDrawer detail={detail} currency={credentialView?.currency} onClose={() => setDetail(undefined)} />}
-    {generationDetail && <GenerationDrawer job={generationDetail} currency={credentialView?.currency} onDownload={(asset) => void downloadGenerationAsset(generationDetail, asset)} onClose={() => setGenerationDetail(undefined)} />}
+    {generationDetail && <GenerationDrawer job={generationDetail} currency={credentialView?.currency} onDownload={(asset) => void downloadGenerationAsset(generationDetail, asset)} onCancel={() => void cancelGeneration(generationDetail)} onClose={() => setGenerationDetail(undefined)} />}
     {conversationDetail && <ConversationDrawer detail={conversationDetail} currency={credentialView?.currency} loading={conversationLoading} onLoadOlder={() => void fetchOlderConversationDetail()} onSelect={(request) => void select(request)} onClose={() => setConversationDetail(undefined)} />}
   </Shell>;
 }
 
-function GenerationTable({ jobs, currency, onSelect }: { jobs: GenerationJob[]; currency?: string; onSelect: (job: GenerationJob) => void }) {
+function GenerationTable({ jobs, currency, onSelect, onCancel }: { jobs: GenerationJob[]; currency?: string; onSelect: (job: GenerationJob) => void; onCancel: (job: GenerationJob) => void }) {
   const { locale, t } = useI18n();
-  return <article className="panel"><div className="panel-title"><h2>{t('self.generations')}</h2><span>{t('self.generationDrivers')}</span></div><div className="table-scroll"><table><thead><tr><th>{t('request.time')}</th><th>{t('request.model')}</th><th>{t('self.integration')}</th><th>{t('request.status')}</th><th>{t('self.units')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.job_id}><td>{new Date(job.created_at).toLocaleString(locale)}</td><td><button type="button" className="table-link" onClick={() => onSelect(job)} aria-label={t('self.openGeneration', { model: job.model })}><code>{job.model}</code></button></td><td>{job.driver}</td><td><span className={`status ${job.status === 'succeeded' ? 'ok' : job.status === 'failed' || job.status === 'cancelled' ? 'bad' : 'pending'}`}>{t(`generationStatus.${job.status}`)}</span></td><td>{job.billed_units === null ? `≤ ${formatNumber(job.estimated_units, locale)}` : formatNumber(job.billed_units, locale)}</td><td>{currency ? formatCurrency(job.cost, currency, locale) : '—'}</td><td>{job.error_code ?? '—'}</td></tr>)}</tbody></table>{jobs.length === 0 && <div className="empty">{t('self.noGenerations')}</div>}</div></article>;
+  return <article className="panel"><div className="panel-title"><h2>{t('self.generations')}</h2><span>{t('self.generationDrivers')}</span></div><div className="table-scroll"><table><thead><tr><th>{t('request.time')}</th><th>{t('request.model')}</th><th>{t('self.integration')}</th><th>{t('request.status')}</th><th>{t('self.units')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.job_id}><td>{new Date(job.created_at).toLocaleString(locale)}</td><td><button type="button" className="table-link" onClick={() => onSelect(job)} aria-label={t('self.openGeneration', { model: job.model })}><code>{job.model}</code></button></td><td>{job.driver}</td><td><span className={`status ${job.status === 'succeeded' ? 'ok' : job.status === 'failed' || job.status === 'cancelled' ? 'bad' : 'pending'}`}>{t(`generationStatus.${job.status}`)}</span></td><td>{job.billed_units === null ? `≤ ${formatNumber(job.estimated_units, locale)}` : formatNumber(job.billed_units, locale)}</td><td>{currency ? formatCurrency(job.cost, currency, locale) : '—'}</td><td>{job.error_code ?? '—'}</td><td>{(job.status === 'queued' || job.status === 'running') && <button type="button" className="secondary" onClick={() => onCancel(job)}>{t('self.cancelGeneration')}</button>}</td></tr>)}</tbody></table>{jobs.length === 0 && <div className="empty">{t('self.noGenerations')}</div>}</div></article>;
 }
 
 function RequestDetailDrawer({ detail, currency, onClose }: { detail: RequestDetail; currency?: string; onClose: () => void }) {
@@ -355,9 +436,9 @@ function RequestDetailDrawer({ detail, currency, onClose }: { detail: RequestDet
   </DrawerFrame>;
 }
 
-function GenerationDrawer({ job, currency, onDownload, onClose }: { job: GenerationJob; currency?: string; onDownload: (asset: GenerationAsset) => void; onClose: () => void }) {
+function GenerationDrawer({ job, currency, onDownload, onCancel, onClose }: { job: GenerationJob; currency?: string; onDownload: (asset: GenerationAsset) => void; onCancel: () => void; onClose: () => void }) {
   const { locale, t } = useI18n();
-  return <DrawerFrame title={job.model} eyebrow={t('self.generationDetail')} onClose={onClose}><p className="muted break-anywhere">{job.job_id} · {job.driver} · {t(`generationStatus.${job.status}`)}</p><h3>{t('self.billing')}</h3><pre>{JSON.stringify({ estimated_units: formatNumber(job.estimated_units, locale), billed_units: job.billed_units === null ? null : formatNumber(job.billed_units, locale), cost: currency ? formatCurrency(job.cost, currency, locale) : '—' }, null, 2)}</pre><h3>{t('self.resultArchive')}</h3>{job.assets.length > 0 ? <div className="account-list">{job.assets.map((asset) => <div className="account" key={asset.asset_id}><div className="account-main"><b>{asset.filename}</b><span>{asset.mime_type} · {formatNumber(asset.size_bytes, locale)} {t('self.bytes')}</span></div><button type="button" className="secondary" onClick={() => onDownload(asset)}>{t('self.downloadAsset')}</button></div>)}</div> : <div className="empty">{t('self.noAssets')}</div>}<pre>{JSON.stringify(job.result, null, 2)}</pre>{job.error_code && <><h3>{t('request.error')}</h3><pre>{job.error_code}</pre></>}</DrawerFrame>;
+  return <DrawerFrame title={job.model} eyebrow={t('self.generationDetail')} onClose={onClose}><p className="muted break-anywhere">{job.job_id} · {job.driver} · {t(`generationStatus.${job.status}`)}</p>{(job.status === 'queued' || job.status === 'running') && <button type="button" className="danger" onClick={onCancel}>{t('self.cancelGeneration')}</button>}<h3>{t('self.billing')}</h3><pre>{JSON.stringify({ estimated_units: formatNumber(job.estimated_units, locale), billed_units: job.billed_units === null ? null : formatNumber(job.billed_units, locale), cost: currency ? formatCurrency(job.cost, currency, locale) : '—' }, null, 2)}</pre><h3>{t('self.resultArchive')}</h3>{job.assets.length > 0 ? <div className="account-list">{job.assets.map((asset) => <div className="account" key={asset.asset_id}><div className="account-main"><b>{asset.filename}</b><span>{asset.mime_type} · {formatNumber(asset.size_bytes, locale)} {t('self.bytes')}</span></div><button type="button" className="secondary" onClick={() => onDownload(asset)}>{t('self.downloadAsset')}</button></div>)}</div> : <div className="empty">{t('self.noAssets')}</div>}<pre>{JSON.stringify(job.result, null, 2)}</pre>{job.error_code && <><h3>{t('request.error')}</h3><pre>{job.error_code}</pre></>}</DrawerFrame>;
 }
 
 function ConversationDrawer({ detail, currency, loading, onLoadOlder, onSelect, onClose }: { detail: ConversationDetail; currency?: string; loading: boolean; onLoadOlder: () => void; onSelect: (request: RequestView) => void; onClose: () => void }) {

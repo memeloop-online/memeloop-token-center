@@ -18,6 +18,11 @@ The default Secret references contain:
 Upstream credentials and issued review credentials are separate operational
 secrets and must have an owner, purpose and expiry.
 
+The optional MemeLoop Cloud integration uses a separate
+`memeloop-cloud-webhook-secret` HMAC key. Do not reuse the bootstrap service
+token or key pepper. Leaving its Secret reference name empty keeps the signed
+subscription endpoint fail-closed.
+
 The application enforces the `service-token` format at startup: its encoded
 value must be at least 32 bytes and must not contain Unicode whitespace or
 Unicode General Category `Cc` control characters anywhere. Rejecting them
@@ -53,6 +58,7 @@ database, archive and bootstrap credentials at the same time.
 | PostgreSQL password/URL | Create the new database credential, update the managed Secret, roll pods, verify all connections use it, then revoke the old credential. |
 | S3 access key | Grant a second least-privilege key, roll and verify archive reads/writes, then revoke the first key. |
 | Bootstrap service token | Issue a replacement service credential, update trusted callers and the Secret, then revoke the old generation. |
+| MemeLoop Cloud webhook HMAC | The runtime accepts one generation, so use a controlled integration window: pause deliveries, update the managed Secret and roll control pods, switch the sender, then replay queued events with their original idempotency keys and fresh timestamps. |
 | Key pepper | **Do not rotate in place.** Existing downstream and migrated CPA credentials depend on it. First implement versioned peppers or dual-read/single-write migration, inventory every credential generation, and only then retire the old pepper. |
 | TLS private key | Let cert-manager or the approved controller rotate it; verify consumers reload it and old keys are retired. |
 
@@ -76,6 +82,9 @@ config:
   serviceTokenSecret:
     name: memeloop-token-center-service-canary
     key: service-token
+  memeloopCloudWebhookSecret:
+    name: memeloop-token-center-cloud-canary
+    key: memeloop-cloud-webhook-secret
   s3:
     credentialsSecret:
       name: memeloop-token-center-archive-canary

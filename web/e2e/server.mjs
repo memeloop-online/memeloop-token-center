@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,20 +12,121 @@ const listenHost = baseURL.hostname;
 const listenPort = baseURL.port || '80';
 const mockPort = Number(process.env.MTC_E2E_MOCK_PORT ?? 41740);
 const testDirectory = mkdtempSync(join(tmpdir(), 'memeloop-token-center-e2e-'));
+const pluginRoot = join(testDirectory, 'plugins');
+const configurablePlugin = join(pluginRoot, 'browser-configuration');
+mkdirSync(configurablePlugin, { recursive: true });
+writeFileSync(join(configurablePlugin, 'plugin.json'), JSON.stringify({
+  id: 'browser-configuration',
+  version: '1.0.0',
+  wit_version: '0.2.0',
+  wasm: null,
+  capabilities: [],
+  contributions: {
+    configuration: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['mode'],
+        properties: { mode: { type: 'string', title: 'Mode', enum: ['default', 'configured'] } },
+      },
+      default: { mode: 'default' },
+    },
+    providers: [],
+  },
+}));
 let application;
 let stopping = false;
 let stopPromise;
+let comfySequence = 0;
+let blockerActive = false;
 
 const upstream = createServer((request, response) => {
   const chunks = [];
   request.on('data', (chunk) => chunks.push(chunk));
   request.on('end', () => {
-    if (request.method === 'GET' && request.url === '/v1/models') {
+    const requestUrl = new URL(request.url ?? '/', `http://127.0.0.1:${mockPort}`);
+    if (request.method === 'GET' && requestUrl.pathname === '/v1/models') {
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ data: [{ id: 'mock-provider-model' }] }));
       return;
     }
-    if (request.method !== 'POST' || request.url !== '/v1/chat/completions') {
+    if (request.method === 'GET' && requestUrl.pathname === '/__e2e/blocker-active') {
+      response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      response.end(JSON.stringify({ active: blockerActive }));
+      return;
+    }
+    if (request.method === 'POST' && requestUrl.pathname === '/api/v3/contents/generations/tasks') {
+      let body;
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+      catch { body = undefined; }
+      if (request.headers.authorization !== 'Bearer browser-seedance-secret-not-real'
+        || body?.model !== 'seedance-browser-v1'
+        || body?.duration !== 5
+        || body?.content?.[0]?.text !== '一只狐狸跑过草地') {
+        response.writeHead(400, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: { message: 'invalid browser Seedance request' } }));
+        return;
+      }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ id: 'browser-seedance-video' }));
+      return;
+    }
+    if (request.method === 'GET' && requestUrl.pathname === '/api/v3/contents/generations/tasks/browser-seedance-video') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        id: 'browser-seedance-video',
+        status: 'succeeded',
+        duration: '5',
+        content: { video_url: `http://127.0.0.1:${mockPort}/assets/browser-video.mp4?provider_secret=never-persist` },
+      }));
+      return;
+    }
+    if (request.method === 'GET' && requestUrl.pathname === '/assets/browser-video.mp4') {
+      response.writeHead(200, { 'content-type': 'video/mp4' });
+      response.end(Buffer.from('browser-video-asset'));
+      return;
+    }
+    if (request.method === 'POST' && requestUrl.pathname === '/prompt') {
+      let body;
+      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+      catch { body = undefined; }
+      const prompt = body?.prompt?.['9']?.inputs?.filename_prefix;
+      if (typeof prompt !== 'string' || !prompt) {
+        response.writeHead(400, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: { message: 'invalid browser ComfyUI workflow' } }));
+        return;
+      }
+      if (prompt === 'browser-worker-blocker') {
+        blockerActive = true;
+        setTimeout(() => {
+          blockerActive = false;
+          response.writeHead(400, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ error: { message: 'deterministic worker blocker released' } }));
+        }, 5_000);
+        return;
+      }
+      comfySequence += 1;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ prompt_id: `browser-comfy-${comfySequence}` }));
+      return;
+    }
+    if (request.method === 'GET' && requestUrl.pathname.startsWith('/history/browser-comfy-')) {
+      const promptId = requestUrl.pathname.slice('/history/'.length);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        [promptId]: {
+          status: { status_str: 'success', completed: true },
+          outputs: { '9': { images: [{ filename: 'browser-result.png', subfolder: '', type: 'output' }] } },
+        },
+      }));
+      return;
+    }
+    if (request.method === 'GET' && requestUrl.pathname === '/view') {
+      response.writeHead(200, { 'content-type': 'image/png' });
+      response.end(Buffer.from('browser-png-asset'));
+      return;
+    }
+    if (request.method !== 'POST' || requestUrl.pathname !== '/v1/chat/completions') {
       response.writeHead(404, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ error: { message: 'mock route not found' } }));
       return;
@@ -107,9 +208,12 @@ upstream.on('error', (error) => {
 
 upstream.listen(mockPort, '127.0.0.1', () => {
   process.send?.({ type: 'mock-listening' });
+  const prebuiltBinary = process.env.MTC_E2E_BINARY;
   application = spawn(
-    'cargo',
-    ['run', '--quiet', '--manifest-path', join(repositoryRoot, 'Cargo.toml'), '--bin', 'memeloop-token-center', '--', 'serve', '--role', 'all'],
+    prebuiltBinary || 'cargo',
+    prebuiltBinary
+      ? ['serve', '--role', 'all']
+      : ['run', '--quiet', '--manifest-path', join(repositoryRoot, 'Cargo.toml'), '--bin', 'memeloop-token-center', '--', 'serve', '--role', 'all'],
     {
       cwd: repositoryRoot,
       env: {
@@ -119,7 +223,9 @@ upstream.listen(mockPort, '127.0.0.1', () => {
         MTC_DATABASE_MAX_CONNECTIONS: '2',
         MTC_KEY_PEPPER: 'browser-e2e-pepper-is-not-a-real-secret-value',
         MTC_SERVICE_TOKEN: process.env.MTC_E2E_SERVICE_TOKEN ?? 'browser-e2e-bootstrap-not-a-real-token',
-        MTC_ARCHIVE_BACKEND: 'memory',
+        MTC_ARCHIVE_BACKEND: 'filesystem',
+        MTC_ARCHIVE_PATH: join(testDirectory, 'archive'),
+        MTC_PLUGIN_DIR: pluginRoot,
         MTC_WEB_ROOT: join(webRoot, 'dist'),
         MTC_ALLOW_OAUTH_LOOPBACK: 'true',
         RUST_LOG: process.env.RUST_LOG ?? 'warn',

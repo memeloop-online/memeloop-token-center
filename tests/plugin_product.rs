@@ -23,6 +23,26 @@ async fn database(directory: &Path) -> Database {
     .expect("connect SQLite")
 }
 
+#[tokio::test]
+async fn plugin_load_errors_do_not_disclose_paths_or_untrusted_manifest_text() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = "must-not-leak-plugin-path-or-content";
+    let root = directory.path().join(marker);
+    let package = root.join("invalid-plugin");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(package.join("plugin.json"), format!("{{invalid-{marker}")).unwrap();
+
+    let error = match PluginRuntime::load(
+        Some(root.to_str().expect("temporary path is UTF-8")),
+        database(directory.path()).await,
+    ) {
+        Ok(_) => panic!("invalid manifest must fail closed"),
+        Err(error) => error.to_string(),
+    };
+    assert!(!error.contains(marker), "untrusted data leaked: {error}");
+    assert!(!error.contains(&root.to_string_lossy().to_string()));
+}
+
 fn context() -> RequestContext {
     RequestContext {
         tenant_id: "tenant-1".to_owned(),
@@ -100,6 +120,29 @@ fn write_policy_package(root: &Path, id: &str, body: &str) {
     .expect("write plugin component");
 }
 
+fn write_rewrite_package(root: &Path, id: &str) {
+    let package = root.join(id);
+    fs::create_dir(&package).expect("create rewrite plugin package");
+    fs::write(
+        package.join("plugin.json"),
+        serde_json::to_vec(&json!({
+            "id": id,
+            "version": "1.0.0",
+            "wit_version": "0.2.0",
+            "wasm": "plugin.wasm",
+            "capabilities": [],
+            "contributions": {"request_rewrite": true, "providers": []}
+        }))
+        .unwrap(),
+    )
+    .expect("write rewrite plugin manifest");
+    fs::write(
+        package.join("plugin.wasm"),
+        include_bytes!("../examples/plugins/policy-rewrite/plugin.wasm"),
+    )
+    .expect("write rewrite plugin component");
+}
+
 fn write_component_provider_package(root: &Path, id: &str, wat: &str, maximum: usize) {
     let package = root.join(id);
     fs::create_dir(&package).expect("create component provider package");
@@ -150,6 +193,7 @@ async fn installable_example_contributes_provider_oauth_policy_and_rewrite() {
     let manifests = runtime.manifests();
     assert_eq!(manifests.len(), 1);
     assert!(manifests[0].contributions.traffic_policy);
+    assert!(manifests[0].contributions.request_rewrite);
     let provider = runtime
         .provider_types()
         .into_iter()
@@ -246,6 +290,35 @@ async fn installable_example_contributes_provider_oauth_policy_and_rewrite() {
             ["content"],
         "normalized by component"
     );
+}
+
+#[tokio::test]
+async fn rewrite_is_an_independent_auditable_contribution() {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    fs::create_dir(&plugins).unwrap();
+    write_rewrite_package(&plugins, "rewrite-only");
+    let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
+        .expect("load rewrite-only package");
+
+    let manifest = &runtime.manifests()[0];
+    assert!(!manifest.contributions.traffic_policy);
+    assert!(manifest.contributions.request_rewrite);
+    let decision = runtime
+        .apply_traffic(context(), &json!({"model": "original", "messages": []}))
+        .expect("execute rewrite-only contribution");
+    assert!(decision.allow);
+    assert_eq!(decision.model.as_deref(), Some("example-rewritten"));
+    assert!(decision.request_json.is_some());
+
+    let invalid = json!({
+        "id": "rewrite-without-component",
+        "version": "1.0.0",
+        "wit_version": "0.2.0",
+        "wasm": null,
+        "contributions": {"request_rewrite": true, "providers": []}
+    });
+    assert!(!manifest_loads(invalid).await);
 }
 
 #[tokio::test]

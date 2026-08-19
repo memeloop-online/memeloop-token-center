@@ -43,8 +43,13 @@ async fn archive_value(state: &AppState, location: &str) -> (Value, bool) {
         .await
     {
         Ok(bytes) => decode_archive_value(&bytes),
-        Err(error) => {
-            tracing::warn!(%location, %error, "archived request object is unavailable");
+        Err(_) => {
+            // Imported locators and object-store errors can contain provider
+            // paths, signed query values, or storage identity metadata.
+            tracing::warn!(
+                error_code = "archive_object_unavailable",
+                "archived request object is unavailable"
+            );
             (Value::Null, false)
         }
     }

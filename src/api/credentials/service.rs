@@ -32,10 +32,28 @@ pub(in crate::api) async fn create_service_token(
 pub(in crate::api) async fn list_service_tokens(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ServiceTokenListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "service_tokens:read").await?;
     require_global_service(&service)?;
-    Ok(Json(state.db.list_service_tokens().await?))
+    Ok(Json(
+        state
+            .db
+            .list_service_tokens_page(query.before_created_at, query.before_id, query.limit)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub(in crate::api) struct ServiceTokenListQuery {
+    before_created_at: Option<i64>,
+    before_id: Option<Uuid>,
+    #[serde(default = "default_service_token_list_limit")]
+    limit: i64,
+}
+
+fn default_service_token_list_limit() -> i64 {
+    100
 }
 
 pub(in crate::api) async fn rotate_service_token(

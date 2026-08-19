@@ -63,10 +63,21 @@ pub(in crate::api) async fn create_key(
     Ok((StatusCode::CREATED, Json(issued)))
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::api) struct KeysQuery {
     tenant_external_id: Option<String>,
     principal_external_id: Option<String>,
+    #[serde(default = "default_key_list_limit")]
+    limit: i64,
+    before_created_at: Option<i64>,
+    before_id: Option<Uuid>,
+}
+
+fn default_key_list_limit() -> i64 {
+    // Preserve the pre-pagination response size for existing operator clients;
+    // new callers should request smaller pages and continue with the cursor.
+    500
 }
 
 pub(in crate::api) async fn list_keys(
@@ -86,12 +97,41 @@ pub(in crate::api) async fn list_keys(
             "principal_external_id must contain at most 200 non-control characters".into(),
         ));
     }
+    let before = list_cursor(
+        query.limit,
+        query.before_created_at,
+        query.before_id,
+        "credential",
+    )?;
     Ok(Json(
         state
             .db
-            .list_managed_keys(tenant.as_deref(), principal)
+            .list_managed_keys_page(tenant.as_deref(), principal, query.limit, before)
             .await?,
     ))
+}
+
+fn list_cursor(
+    limit: i64,
+    before_created_at: Option<i64>,
+    before_id: Option<Uuid>,
+    resource: &str,
+) -> Result<Option<(i64, Uuid)>, AppError> {
+    if !(1..=500).contains(&limit) {
+        return Err(AppError::BadRequest(
+            "limit must be between 1 and 500".into(),
+        ));
+    }
+    match (before_created_at, before_id) {
+        (None, None) => Ok(None),
+        (Some(created_at), Some(id)) if created_at >= 0 => Ok(Some((created_at, id))),
+        (Some(_), Some(_)) => Err(AppError::BadRequest(
+            "before_created_at cannot be negative".into(),
+        )),
+        _ => Err(AppError::BadRequest(format!(
+            "before_created_at and before_id must be supplied together for {resource} pagination"
+        ))),
+    }
 }
 
 pub(in crate::api) async fn rotate_key(

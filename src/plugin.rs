@@ -10,6 +10,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config as WasmtimeConfig, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
@@ -40,6 +41,9 @@ const MAX_TRAFFIC_ACCOUNT_ID_BYTES: usize = 64;
 const MAX_TRAFFIC_REQUEST_JSON_BYTES: usize = 16 * 1024 * 1024;
 const PLUGIN_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const PLUGIN_EPOCH_TICK: Duration = Duration::from_millis(10);
+const PLUGIN_CONFIGURATION_CACHE_TTL: Duration = Duration::from_secs(5);
+const PLUGIN_CONFIGURATION_CACHE_ENTRIES: usize = 64;
+const PLUGIN_CONFIGURATION_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.2.0, <0.3.0";
 
 wasmtime::component::bindgen!({
@@ -66,8 +70,61 @@ pub struct PluginManifest {
 pub struct PluginContributions {
     #[serde(default)]
     pub traffic_policy: bool,
+    /// Runs the same post-auth component hook but explicitly declares that the
+    /// package contributes request/model/route rewriting. Keeping this
+    /// separate in the manifest lets operators audit installed capabilities;
+    /// the versioned WIT hook remains combined so policy and rewrite can share
+    /// one bounded execution without exposing credentials.
+    #[serde(default)]
+    pub request_rewrite: bool,
+    #[serde(default)]
+    pub configuration: Option<PluginConfigurationContribution>,
     #[serde(default)]
     pub providers: Vec<ProviderType>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginConfigurationContribution {
+    pub schema: Value,
+    #[serde(default = "empty_json_object")]
+    pub default: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredPluginConfiguration {
+    pub plugin_id: String,
+    pub tenant_id: Option<Uuid>,
+    pub value: Value,
+    pub schema_digest: String,
+    pub version: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PutPluginConfigurationInput {
+    pub plugin_id: String,
+    pub tenant_id: Option<Uuid>,
+    pub value: Value,
+    pub schema_digest: String,
+    pub expected_version: i64,
+    pub idempotency_key: String,
+    pub request_hash: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PluginConfigurationView {
+    pub plugin_id: String,
+    pub tenant_external_id: Option<String>,
+    pub value: Value,
+    pub source: String,
+    pub scope_version: i64,
+    pub updated_at: Option<i64>,
+    pub schema_digest: String,
+}
+
+fn empty_json_object() -> Value {
+    serde_json::json!({})
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -82,6 +139,14 @@ pub enum PluginCapability {
 struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
+    configuration_validator: Option<crate::schema::CompiledSchema>,
+}
+
+#[derive(Clone)]
+struct CachedPluginConfigurations {
+    loaded_at: Instant,
+    values: BTreeMap<String, Value>,
+    estimated_bytes: usize,
 }
 
 #[derive(Clone, Default)]
@@ -187,6 +252,7 @@ pub struct PluginRuntime {
     kv: Option<PluginKv>,
     plugins: Arc<Vec<LoadedPlugin>>,
     providers: Arc<Vec<ProviderType>>,
+    configuration_cache: Arc<tokio::sync::RwLock<BTreeMap<Uuid, CachedPluginConfigurations>>>,
     execution_timeout: Duration,
     fuel: u64,
 }
@@ -213,10 +279,9 @@ impl PluginRuntime {
         };
         let root = Path::new(root);
         if !root.is_dir() {
-            return Err(AppError::BadRequest(format!(
-                "plugin directory does not exist: {}",
-                root.display()
-            )));
+            return Err(AppError::BadRequest(
+                "plugin directory does not exist".into(),
+            ));
         }
 
         let mut engine_config = WasmtimeConfig::new();
@@ -224,7 +289,7 @@ impl PluginRuntime {
         engine_config.consume_fuel(true);
         engine_config.epoch_interruption(true);
         let engine = Engine::new(&engine_config)
-            .map_err(|error| AppError::Storage(format!("initialize plugin runtime: {error}")))?;
+            .map_err(|_| plugin_runtime_failure("engine_initialization"))?;
         let epoch_engine = engine.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(PLUGIN_EPOCH_TICK);
@@ -238,40 +303,15 @@ impl PluginRuntime {
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|error| AppError::Storage(format!("initialize plugin HTTP: {error}")))?;
-        let canonical_root = fs::canonicalize(root)
-            .map_err(|error| AppError::Storage(format!("resolve plugin directory: {error}")))?;
+            .map_err(|_| plugin_runtime_failure("http_initialization"))?;
+        let canonical_root =
+            fs::canonicalize(root).map_err(|_| plugin_runtime_failure("directory_resolution"))?;
         let directories = plugin_directories(&canonical_root)?;
 
         let mut plugins = Vec::new();
         let mut providers = Vec::new();
         for directory in directories {
-            let manifest_path = directory.join("plugin.json");
-            if !manifest_path.is_file() {
-                return Err(AppError::BadRequest(format!(
-                    "plugin package has no plugin.json: {}",
-                    directory.display()
-                )));
-            }
-            require_file_size(&manifest_path, PLUGIN_MANIFEST_BYTES, "plugin manifest")?;
-            let manifest: PluginManifest = serde_json::from_slice(
-                &fs::read(&manifest_path).map_err(|error| AppError::Storage(error.to_string()))?,
-            )
-            .map_err(|error| {
-                AppError::BadRequest(format!("{}: {error}", manifest_path.display()))
-            })?;
-            let mut manifest_schema: Value =
-                serde_json::from_str(include_str!("../schemas/plugin-manifest.schema.json"))
-                    .map_err(|_| AppError::Internal)?;
-            manifest_schema
-                .as_object_mut()
-                .ok_or(AppError::Internal)?
-                .remove("$id");
-            crate::schema::validate_instance(
-                &manifest_schema,
-                &serde_json::to_value(&manifest).map_err(|_| AppError::Internal)?,
-            )?;
-            validate_manifest(&manifest)?;
+            let manifest = validate_plugin_package(&directory)?;
             if plugins
                 .iter()
                 .any(|loaded: &LoadedPlugin| loaded.manifest.id == manifest.id)
@@ -284,7 +324,6 @@ impl PluginRuntime {
             for provider in &manifest.contributions.providers {
                 let mut provider = provider.clone();
                 provider.source = format!("plugin:{}@{}", manifest.id, manifest.version);
-                validate_provider_contribution(&manifest.id, &provider)?;
                 if providers
                     .iter()
                     .any(|existing: &ProviderType| existing.id == provider.id)
@@ -302,14 +341,21 @@ impl PluginRuntime {
                 .map(|wasm| {
                     let wasm_path = safe_child(&directory, wasm)?;
                     require_file_size(&wasm_path, PLUGIN_COMPONENT_BYTES, "plugin component")?;
-                    Component::from_file(&engine, &wasm_path).map_err(|error| {
-                        AppError::BadRequest(format!("compile {}: {error}", wasm_path.display()))
+                    Component::from_file(&engine, &wasm_path).map_err(|_| {
+                        AppError::BadRequest("plugin component cannot be compiled".into())
                     })
                 })
+                .transpose()?;
+            let configuration_validator = manifest
+                .contributions
+                .configuration
+                .as_ref()
+                .map(|configuration| crate::schema::compile(&configuration.schema))
                 .transpose()?;
             plugins.push(LoadedPlugin {
                 manifest,
                 component,
+                configuration_validator,
             });
         }
 
@@ -320,6 +366,7 @@ impl PluginRuntime {
             kv: Some(PluginKv { database }),
             plugins: Arc::new(plugins),
             providers: Arc::new(providers),
+            configuration_cache: Arc::default(),
             execution_timeout: PLUGIN_EXECUTION_TIMEOUT,
             fuel: PLUGIN_FUEL,
         })
@@ -336,10 +383,178 @@ impl PluginRuntime {
             .collect()
     }
 
+    pub fn configuration_contribution(
+        &self,
+        plugin_id: &str,
+    ) -> Option<PluginConfigurationContribution> {
+        self.plugins
+            .iter()
+            .find(|plugin| plugin.manifest.id == plugin_id)
+            .and_then(|plugin| plugin.manifest.contributions.configuration.clone())
+    }
+
+    pub async fn resolved_traffic_configurations(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<BTreeMap<String, Value>, AppError> {
+        let configurable: Vec<_> = self
+            .plugins
+            .iter()
+            .filter(|plugin| {
+                (plugin.manifest.contributions.traffic_policy
+                    || plugin.manifest.contributions.request_rewrite)
+                    && plugin.manifest.contributions.configuration.is_some()
+            })
+            .collect();
+        if configurable.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        if let Some(cached) = self.configuration_cache.read().await.get(&tenant_id)
+            && cached.loaded_at.elapsed() < PLUGIN_CONFIGURATION_CACHE_TTL
+        {
+            return Ok(cached.values.clone());
+        }
+        let database = &self.kv.as_ref().ok_or(AppError::Internal)?.database;
+        let layers = database.plugin_configuration_layers(tenant_id).await?;
+        let mut resolved = BTreeMap::new();
+        for plugin in configurable {
+            let contribution = plugin
+                .manifest
+                .contributions
+                .configuration
+                .as_ref()
+                .expect("filtered configurable plugin");
+            let stored = layers
+                .iter()
+                .find(|layer| {
+                    layer.plugin_id == plugin.manifest.id && layer.tenant_id == Some(tenant_id)
+                })
+                .or_else(|| {
+                    layers.iter().find(|layer| {
+                        layer.plugin_id == plugin.manifest.id && layer.tenant_id.is_none()
+                    })
+                });
+            let value = stored
+                .map(|configuration| configuration.value.clone())
+                .unwrap_or_else(|| contribution.default.clone());
+            plugin
+                .configuration_validator
+                .as_ref()
+                .ok_or(AppError::Internal)?
+                .validate(&value)?;
+            resolved.insert(plugin.manifest.id.clone(), value);
+        }
+        self.cache_resolved_configurations(tenant_id, resolved.clone())
+            .await;
+        Ok(resolved)
+    }
+
+    async fn cache_resolved_configurations(
+        &self,
+        tenant_id: Uuid,
+        values: BTreeMap<String, Value>,
+    ) {
+        let estimated_bytes = values.iter().fold(0usize, |total, (plugin_id, value)| {
+            total
+                .saturating_add(plugin_id.len())
+                .saturating_add(estimated_json_bytes(value))
+        });
+        if estimated_bytes > PLUGIN_CONFIGURATION_CACHE_BYTES {
+            return;
+        }
+        let now = Instant::now();
+        let mut cache = self.configuration_cache.write().await;
+        cache.retain(|_, entry| {
+            now.duration_since(entry.loaded_at) <= PLUGIN_CONFIGURATION_CACHE_TTL
+        });
+        cache.remove(&tenant_id);
+        loop {
+            let current_bytes = cache.values().fold(0usize, |total, entry| {
+                total.saturating_add(entry.estimated_bytes)
+            });
+            if cache.len() < PLUGIN_CONFIGURATION_CACHE_ENTRIES
+                && current_bytes.saturating_add(estimated_bytes) <= PLUGIN_CONFIGURATION_CACHE_BYTES
+            {
+                break;
+            }
+            let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.loaded_at)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            tenant_id,
+            CachedPluginConfigurations {
+                loaded_at: now,
+                values,
+                estimated_bytes,
+            },
+        );
+    }
+
+    pub async fn invalidate_configuration_cache(&self, tenant_id: Option<Uuid>) {
+        let mut cache = self.configuration_cache.write().await;
+        if let Some(tenant_id) = tenant_id {
+            cache.remove(&tenant_id);
+        } else {
+            // A global write may affect every tenant without an override.
+            cache.clear();
+        }
+    }
+
+    pub async fn validate_stored_configurations(&self) -> Result<(), AppError> {
+        if self.plugins.is_empty() {
+            return Ok(());
+        }
+        let database = &self.kv.as_ref().ok_or(AppError::Internal)?.database;
+        database
+            .visit_plugin_configurations(|stored| {
+                let Some(plugin) = self
+                    .plugins
+                    .iter()
+                    .find(|plugin| plugin.manifest.id == stored.plugin_id)
+                else {
+                    // A disabled plugin may leave configuration behind so that a
+                    // later re-enable is non-destructive. It has no execution path.
+                    return Ok(());
+                };
+                let _configuration = plugin
+                    .manifest
+                    .contributions
+                    .configuration
+                    .as_ref()
+                    .ok_or_else(|| {
+                        AppError::BadRequest(format!(
+                            "plugin {} has stored configuration but no configuration schema",
+                            stored.plugin_id
+                        ))
+                    })?;
+                plugin
+                    .configuration_validator
+                    .as_ref()
+                    .ok_or(AppError::Internal)?
+                    .validate(&stored.value)
+            })
+            .await
+    }
+
     pub fn apply_traffic(
         &self,
         context: types::RequestContext,
         request_json: &Value,
+    ) -> Result<TrafficDecision, AppError> {
+        self.apply_traffic_with_config(context, request_json, &BTreeMap::new())
+    }
+
+    pub fn apply_traffic_with_config(
+        &self,
+        context: types::RequestContext,
+        request_json: &Value,
+        configurations: &BTreeMap<String, Value>,
     ) -> Result<TrafficDecision, AppError> {
         let Some(engine) = &self.engine else {
             return Ok(TrafficDecision {
@@ -354,11 +569,10 @@ impl PluginRuntime {
             allow: true,
             ..TrafficDecision::default()
         };
-        for plugin in self
-            .plugins
-            .iter()
-            .filter(|plugin| plugin.manifest.contributions.traffic_policy)
-        {
+        for plugin in self.plugins.iter().filter(|plugin| {
+            plugin.manifest.contributions.traffic_policy
+                || plugin.manifest.contributions.request_rewrite
+        }) {
             let component = plugin.component.as_ref().ok_or_else(|| {
                 AppError::Storage(format!(
                     "plugin {} contributes a traffic policy without a component",
@@ -390,16 +604,31 @@ impl PluginRuntime {
             store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
             store
                 .set_fuel(self.fuel)
-                .map_err(|error| AppError::Storage(error.to_string()))?;
+                .map_err(|_| plugin_runtime_failure("fuel_configuration"))?;
             let mut linker = Linker::new(engine);
             Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-                .map_err(|error| AppError::Storage(error.to_string()))?;
+                .map_err(|_| plugin_runtime_failure("linker_configuration"))?;
             let bindings = Plugin::instantiate(&mut store, component, &linker)
                 .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
             let request = serde_json::to_string(&current).map_err(|_| AppError::Internal)?;
+            let mut plugin_context = context.clone();
+            let configuration = configurations
+                .get(&plugin.manifest.id)
+                .cloned()
+                .or_else(|| {
+                    plugin
+                        .manifest
+                        .contributions
+                        .configuration
+                        .as_ref()
+                        .map(|contribution| contribution.default.clone())
+                })
+                .unwrap_or_else(empty_json_object);
+            plugin_context.config_json =
+                serde_json::to_string(&configuration).map_err(|_| AppError::Internal)?;
             let result = bindings
                 .memeloop_token_center_traffic_policy()
-                .call_post_auth(&mut store, &context, &request)
+                .call_post_auth(&mut store, &plugin_context, &request)
                 .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
                 .map_err(|error| {
                     plugin_reported_error(&plugin.manifest.id, "traffic-policy", &error)
@@ -522,10 +751,10 @@ impl PluginRuntime {
         store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
         store
             .set_fuel(self.fuel)
-            .map_err(|error| AppError::Storage(error.to_string()))?;
+            .map_err(|_| plugin_runtime_failure("fuel_configuration"))?;
         let mut linker = Linker::new(engine);
         Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-            .map_err(|error| AppError::Storage(error.to_string()))?;
+            .map_err(|_| plugin_runtime_failure("linker_configuration"))?;
         let bindings = Plugin::instantiate(&mut store, component, &linker)
             .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
         let config_json = serde_json::to_string(config).map_err(|_| AppError::Internal)?;
@@ -781,10 +1010,10 @@ impl PluginRuntime {
         store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
         store
             .set_fuel(self.fuel)
-            .map_err(|error| AppError::Storage(error.to_string()))?;
+            .map_err(|_| plugin_runtime_failure("fuel_configuration"))?;
         let mut linker = Linker::new(engine);
         Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-            .map_err(|error| AppError::Storage(error.to_string()))?;
+            .map_err(|_| plugin_runtime_failure("linker_configuration"))?;
         let bindings = Plugin::instantiate(&mut store, component, &linker)
             .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
         Ok((store, bindings))
@@ -981,9 +1210,9 @@ fn plugin_directories(root: &Path) -> Result<Vec<PathBuf>, AppError> {
         return Ok(vec![root.to_path_buf()]);
     }
     let entries = fs::read_dir(root)
-        .map_err(|error| AppError::Storage(error.to_string()))?
+        .map_err(|_| plugin_runtime_failure("directory_read"))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| AppError::Storage(error.to_string()))?;
+        .map_err(|_| plugin_runtime_failure("directory_entry_read"))?;
     let mut directories = Vec::new();
     for entry in entries {
         if entry.file_name().to_string_lossy().starts_with('.') {
@@ -991,17 +1220,17 @@ fn plugin_directories(root: &Path) -> Result<Vec<PathBuf>, AppError> {
         }
         let file_type = entry
             .file_type()
-            .map_err(|error| AppError::Storage(error.to_string()))?;
+            .map_err(|_| plugin_runtime_failure("directory_entry_type"))?;
         if file_type.is_symlink() {
-            return Err(AppError::BadRequest(format!(
-                "plugin package directory cannot be a symlink: {}",
-                entry.path().display()
-            )));
+            return Err(AppError::BadRequest(
+                "plugin package directory cannot be a symlink".into(),
+            ));
         }
         if file_type.is_dir() {
-            directories.push(fs::canonicalize(entry.path()).map_err(|error| {
-                AppError::Storage(format!("resolve plugin package directory: {error}"))
-            })?);
+            directories.push(
+                fs::canonicalize(entry.path())
+                    .map_err(|_| plugin_runtime_failure("package_directory_resolution"))?,
+            );
         }
     }
     directories.sort();
@@ -1055,7 +1284,7 @@ impl memeloop::token_center::host::Host for HostState {
             .ok_or_else(|| "plugin KV runtime is unavailable".to_owned())?;
         self.runtime
             .block_on(kv.database.plugin_kv_get(&self.plugin_id, &key))
-            .map_err(|error| error.to_string())
+            .map_err(|_| "plugin KV get failed".to_owned())
     }
 
     fn kv_put(&mut self, key: String, value: Vec<u8>) -> Result<(), String> {
@@ -1072,7 +1301,7 @@ impl memeloop::token_center::host::Host for HostState {
             .ok_or_else(|| "plugin KV runtime is unavailable".to_owned())?;
         self.runtime
             .block_on(kv.database.plugin_kv_put(&self.plugin_id, &key, &value))
-            .map_err(|error| error.to_string())
+            .map_err(|_| "plugin KV put failed".to_owned())
     }
 
     fn http_request(
@@ -1136,7 +1365,10 @@ impl memeloop::token_center::host::Host for HostState {
             request = request.header(name, value);
         }
         let (status, response_headers, response_body) = self.runtime.block_on(async move {
-            let response = request.send().await.map_err(|error| error.to_string())?;
+            let response = request
+                .send()
+                .await
+                .map_err(|_| "plugin HTTP request failed".to_owned())?;
             let status = response.status().as_u16();
             let response_headers = response
                 .headers()
@@ -1151,7 +1383,7 @@ impl memeloop::token_center::host::Host for HostState {
             let mut response_body = Vec::new();
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|error| error.to_string())?;
+                let chunk = chunk.map_err(|_| "plugin HTTP response read failed".to_owned())?;
                 if response_body.len().saturating_add(chunk.len()) > PLUGIN_HTTP_BODY_BYTES {
                     return Err("plugin HTTP response exceeds 16 MiB".to_owned());
                 }
@@ -1164,11 +1396,47 @@ impl memeloop::token_center::host::Host for HostState {
             "headers": response_headers,
             "body_base64": STANDARD.encode(response_body)
         }))
-        .map_err(|error| error.to_string())
+        .map_err(|_| "plugin HTTP response encoding failed".to_owned())
     }
 }
 
 impl memeloop::token_center::types::Host for HostState {}
+
+/// Validates one unpacked plugin package with the same authoritative rules the
+/// runtime uses at startup. Distribution installers call this before making a
+/// staged package visible.
+pub fn validate_plugin_package(directory: &Path) -> Result<PluginManifest, AppError> {
+    let manifest_path = directory.join("plugin.json");
+    if !manifest_path.is_file() {
+        return Err(AppError::BadRequest(
+            "plugin package has no plugin.json".into(),
+        ));
+    }
+    require_file_size(&manifest_path, PLUGIN_MANIFEST_BYTES, "plugin manifest")?;
+    let manifest_bytes =
+        fs::read(&manifest_path).map_err(|_| plugin_runtime_failure("manifest_read"))?;
+    let manifest_value: Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| AppError::BadRequest("plugin manifest is invalid JSON".into()))?;
+    let manifest_schema: Value =
+        serde_json::from_str(include_str!("../schemas/plugin-manifest.schema.json"))
+            .map_err(|_| AppError::Internal)?;
+    // Validate the source document before Serde applies defaults. The checked-in
+    // schema is authoritative for required and unknown fields.
+    crate::schema::validate_instance(&manifest_schema, &manifest_value)?;
+    let manifest: PluginManifest = serde_json::from_value(manifest_value)
+        .map_err(|_| AppError::BadRequest("plugin manifest shape is invalid".into()))?;
+    validate_manifest(&manifest)?;
+    for provider in &manifest.contributions.providers {
+        let mut provider = provider.clone();
+        provider.source = format!("plugin:{}@{}", manifest.id, manifest.version);
+        validate_provider_contribution(&manifest.id, &provider)?;
+    }
+    if let Some(wasm) = manifest.wasm.as_deref() {
+        let wasm_path = safe_child(directory, wasm)?;
+        require_file_size(&wasm_path, PLUGIN_COMPONENT_BYTES, "plugin component")?;
+    }
+    Ok(manifest)
+}
 
 fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
     if manifest.id.is_empty()
@@ -1194,9 +1462,11 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
             manifest.id
         )));
     }
-    if manifest.contributions.traffic_policy && manifest.wasm.is_none() {
+    if (manifest.contributions.traffic_policy || manifest.contributions.request_rewrite)
+        && manifest.wasm.is_none()
+    {
         return Err(AppError::BadRequest(format!(
-            "plugin {} needs a component for its traffic policy",
+            "plugin {} needs a component for its traffic or request-rewrite contribution",
             manifest.id
         )));
     }
@@ -1211,6 +1481,22 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
             "plugin {} needs a component for its executable provider adapter",
             manifest.id
         )));
+    }
+    if let Some(configuration) = &manifest.contributions.configuration {
+        if configuration.schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} configuration schema must have an object root",
+                manifest.id
+            )));
+        }
+        crate::schema::validate_definition(&configuration.schema)?;
+        if schema_contains_write_only(&configuration.schema) {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} configuration schema cannot contain writeOnly fields; credentials belong to provider credential_schema",
+                manifest.id
+            )));
+        }
+        crate::schema::validate_instance(&configuration.schema, &configuration.default)?;
     }
     for capability in &manifest.capabilities {
         if let PluginCapability::Http { allowed_origins } = capability {
@@ -1246,6 +1532,80 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
         validate_provider_contribution(&manifest.id, provider)?;
     }
     Ok(())
+}
+
+pub fn plugin_configuration_schema_digest(schema: &Value) -> Result<String, AppError> {
+    let canonical = canonical_json(schema);
+    let bytes = serde_json::to_vec(&canonical).map_err(|_| AppError::Internal)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+pub fn plugin_configuration_request_hash(
+    plugin_id: &str,
+    scope: &str,
+    expected_version: i64,
+    schema_digest: &str,
+    value: &Value,
+) -> Result<String, AppError> {
+    let payload = serde_json::json!({
+        "plugin_id": plugin_id,
+        "scope": scope,
+        "expected_version": expected_version,
+        "schema_digest": schema_digest,
+        "value": canonical_json(value)
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|_| AppError::Internal)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
+        Value::Object(values) => {
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), canonical_json(value)))
+                    .collect(),
+            )
+        }
+        value => value.clone(),
+    }
+}
+
+fn estimated_json_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(number) => number.to_string().len(),
+        // Every input byte can expand to at most one six-byte JSON escape
+        // (for example `\u0000`), so this remains a conservative budget.
+        Value::String(value) => value.len().saturating_mul(6).saturating_add(2),
+        Value::Array(values) => values.iter().fold(2usize, |total, value| {
+            total
+                .saturating_add(1)
+                .saturating_add(estimated_json_bytes(value))
+        }),
+        Value::Object(values) => values.iter().fold(2usize, |total, (key, value)| {
+            total
+                .saturating_add(key.len().saturating_mul(6))
+                .saturating_add(4)
+                .saturating_add(estimated_json_bytes(value))
+        }),
+    }
+}
+
+fn schema_contains_write_only(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(schema_contains_write_only),
+        Value::Object(values) => {
+            values.get("writeOnly").and_then(Value::as_bool) == Some(true)
+                || values.values().any(schema_contains_write_only)
+        }
+        _ => false,
+    }
 }
 
 fn validate_provider_contribution(
@@ -1381,10 +1741,10 @@ fn safe_child(root: &Path, child: &str) -> Result<PathBuf, AppError> {
             "plugin wasm path must stay inside its package".into(),
         ));
     }
-    let canonical_root = fs::canonicalize(root)
-        .map_err(|error| AppError::Storage(format!("resolve plugin package: {error}")))?;
+    let canonical_root =
+        fs::canonicalize(root).map_err(|_| plugin_runtime_failure("package_resolution"))?;
     let canonical_child = fs::canonicalize(root.join(child))
-        .map_err(|error| AppError::Storage(format!("resolve plugin component: {error}")))?;
+        .map_err(|_| plugin_runtime_failure("component_resolution"))?;
     if !canonical_child.starts_with(&canonical_root) {
         return Err(AppError::BadRequest(
             "plugin wasm path must stay inside its package".into(),
@@ -1395,7 +1755,7 @@ fn safe_child(root: &Path, child: &str) -> Result<PathBuf, AppError> {
 
 fn require_file_size(path: &Path, maximum: u64, kind: &str) -> Result<(), AppError> {
     let length = fs::metadata(path)
-        .map_err(|error| AppError::Storage(format!("inspect {}: {error}", path.display())))?
+        .map_err(|_| plugin_runtime_failure("file_metadata"))?
         .len();
     if length > maximum {
         return Err(AppError::BadRequest(format!(
@@ -1430,6 +1790,13 @@ fn invalid_plugin_result(plugin_id: &str, field: &str) -> AppError {
     AppError::Upstream(format!("plugin {plugin_id} returned an invalid {field}"))
 }
 
+fn plugin_runtime_failure(code: &'static str) -> AppError {
+    // The fixed low-cardinality code is safe for logs and metrics. Never retain
+    // the underlying fs/Wasmtime/HTTP error: those strings may include mount
+    // paths, URLs, configuration fragments, or guest-controlled custom text.
+    AppError::Storage(format!("plugin_runtime_{code}"))
+}
+
 fn plugin_reported_error(plugin_id: &str, operation: &str, error: &str) -> AppError {
     let code = if validate_plugin_text(error, MAX_TRAFFIC_REASON_BYTES, false).is_ok() {
         "reported_error"
@@ -1446,6 +1813,97 @@ fn plugin_failure(plugin_id: &str, _error: wasmtime::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn configurable_manifest(schema: Value, default: Value) -> PluginManifest {
+        PluginManifest {
+            id: "configured-plugin".to_owned(),
+            version: "1.0.0".to_owned(),
+            wit_version: "0.2.0".to_owned(),
+            wasm: Some("plugin.wasm".to_owned()),
+            capabilities: Vec::new(),
+            contributions: PluginContributions {
+                traffic_policy: true,
+                configuration: Some(PluginConfigurationContribution { schema, default }),
+                ..PluginContributions::default()
+            },
+        }
+    }
+
+    #[test]
+    fn plugin_configuration_requires_non_secret_object_schema_and_valid_default() {
+        assert!(
+            validate_manifest(&configurable_manifest(
+                serde_json::json!({"type": "object"}),
+                serde_json::json!({}),
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_manifest(&configurable_manifest(
+                serde_json::json!({"type": "string"}),
+                serde_json::json!("value"),
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_manifest(&configurable_manifest(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"token": {"type": "string", "writeOnly": true}}
+                }),
+                serde_json::json!({}),
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_manifest(&configurable_manifest(
+                serde_json::json!({
+                    "type": "object",
+                    "required": ["mode"],
+                    "properties": {"mode": {"type": "string"}}
+                }),
+                serde_json::json!({}),
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn plugin_configuration_hashes_are_canonical_across_object_key_order() {
+        let first = serde_json::json!({"nested": {"z": 1, "a": 2}, "mode": "safe"});
+        let second: Value =
+            serde_json::from_str(r#"{"mode":"safe","nested":{"a":2,"z":1}}"#).unwrap();
+        assert_eq!(
+            plugin_configuration_schema_digest(&first).unwrap(),
+            plugin_configuration_schema_digest(&second).unwrap()
+        );
+        assert_eq!(
+            plugin_configuration_request_hash("plugin", "global", 3, "digest", &first).unwrap(),
+            plugin_configuration_request_hash("plugin", "global", 3, "digest", &second).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_configuration_cache_has_entry_and_byte_bounds() {
+        let runtime = PluginRuntime::default();
+        for index in 0..(PLUGIN_CONFIGURATION_CACHE_ENTRIES + 10) {
+            runtime
+                .cache_resolved_configurations(
+                    Uuid::from_u128(index as u128 + 1),
+                    BTreeMap::from([("plugin".to_owned(), Value::String("x".repeat(512 * 1024)))]),
+                )
+                .await;
+        }
+        let cache = runtime.configuration_cache.read().await;
+        assert!(cache.len() <= PLUGIN_CONFIGURATION_CACHE_ENTRIES);
+        assert!(
+            cache
+                .values()
+                .map(|entry| entry.estimated_bytes)
+                .sum::<usize>()
+                <= PLUGIN_CONFIGURATION_CACHE_BYTES
+        );
+    }
 
     #[test]
     fn plugin_text_boundaries_reject_empty_oversize_and_control_characters() {

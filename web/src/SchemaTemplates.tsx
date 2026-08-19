@@ -19,6 +19,8 @@ function validationMessage(error: RJSFValidationError, t: (key: string, variable
     multipleOf: 'schemaError.multipleOf',
     minItems: 'schemaError.minimum',
     maxItems: 'schemaError.maximum',
+    minProperties: 'schemaError.minimum',
+    maxProperties: 'schemaError.maximum',
     uniqueItems: 'schemaError.unique',
     format: 'schemaError.format',
     pattern: 'schemaError.pattern',

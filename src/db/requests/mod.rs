@@ -3,6 +3,7 @@ mod lifecycle;
 mod queries;
 mod session_archive;
 mod session_archive_commit;
+mod session_archive_quarantine;
 mod settlement;
 mod stats;
 
@@ -29,6 +30,12 @@ pub use session_archive::{
 };
 pub use session_archive_commit::{
     SessionArchiveCommitInput, SessionArchiveUnlinkedCommitInput, SessionArchiveUnlinkedMetadata,
+};
+pub use session_archive_quarantine::{
+    SessionArchiveImportMatch, SessionArchiveImportMatchInput, SessionArchiveQuarantineBatchInput,
+    SessionArchiveQuarantineCommitInput, SessionArchiveQuarantineFilter,
+    SessionArchiveQuarantineRecordView, SessionArchiveQuarantineResolutionInput,
+    SessionArchiveQuarantineResolutionView, SessionArchiveQuarantineTarget,
 };
 pub use settlement::normalize_proxy_usage;
 pub(crate) use settlement::{

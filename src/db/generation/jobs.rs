@@ -75,7 +75,7 @@ impl Database {
     ) -> Result<Option<GenerationJobView>, AppError> {
         validate_generation_job_idempotency(idempotency)?;
         let row = sqlx::query(
-            "SELECT id, created_at, updated_at, completed_at, public_model, driver, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json, request_hash, lease_expires_at FROM generation_jobs WHERE key_id = $1 AND client_idempotency_key = $2",
+            "SELECT id, created_at, updated_at, completed_at, public_model, driver, billing_unit_snapshot, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json, request_hash, lease_expires_at FROM generation_jobs WHERE key_id = $1 AND client_idempotency_key = $2",
         )
         .bind(key_id.to_string())
         .bind(&idempotency.key)
@@ -163,7 +163,7 @@ impl Database {
             }
 
             if let Some(row) = sqlx::query(
-                "SELECT id, created_at, updated_at, completed_at, public_model, driver, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json, request_hash, lease_expires_at FROM generation_jobs WHERE key_id = $1 AND client_idempotency_key = $2",
+                "SELECT id, created_at, updated_at, completed_at, public_model, driver, billing_unit_snapshot, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json, request_hash, lease_expires_at FROM generation_jobs WHERE key_id = $1 AND client_idempotency_key = $2",
             )
             .bind(input.key.key_id.to_string())
             .bind(&idempotency.key)
@@ -289,6 +289,7 @@ impl Database {
             completed_at: None,
             model: input.public_model,
             driver: input.driver,
+            billing_unit: input.billing_unit,
             status: "preparing".to_owned(),
             upstream_job_id: None,
             estimated_units: input.estimated_units,
@@ -642,7 +643,7 @@ impl Database {
         .bind(&input.driver)
         .bind(input.request_object)
         .bind(input.estimated_units)
-        .bind(input.billing_unit)
+        .bind(&input.billing_unit)
         .bind(input.micros_per_unit)
         .bind(idempotency.map(|value| value.key.as_str()))
         .bind(idempotency.map(|value| value.request_hash.as_str()))
@@ -653,7 +654,7 @@ impl Database {
         .await?;
         if inserted.rows_affected() == 0 {
             let row = sqlx::query(
-                "SELECT id, created_at, updated_at, completed_at, public_model, driver, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json, request_hash, reservation_id FROM generation_jobs WHERE key_id = $1 AND client_idempotency_key = $2",
+                "SELECT id, created_at, updated_at, completed_at, public_model, driver, billing_unit_snapshot, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json, request_hash, reservation_id FROM generation_jobs WHERE key_id = $1 AND client_idempotency_key = $2",
             )
             .bind(input.key.key_id.to_string())
             .bind(idempotency.map(|value| value.key.as_str()))
@@ -708,6 +709,7 @@ impl Database {
             completed_at: None,
             model: input.public_model,
             driver: input.driver,
+            billing_unit: input.billing_unit,
             status: "queued".to_owned(),
             upstream_job_id: None,
             estimated_units: input.estimated_units,
@@ -725,7 +727,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<GenerationJobView>, AppError> {
         let rows = sqlx::query(
-            "SELECT id, created_at, updated_at, completed_at, public_model, driver, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json FROM generation_jobs WHERE key_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
+            "SELECT id, created_at, updated_at, completed_at, public_model, driver, billing_unit_snapshot, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json FROM generation_jobs WHERE key_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
         )
         .bind(key_id.to_string())
         .bind(limit.clamp(1, 200))
@@ -740,7 +742,7 @@ impl Database {
         job_id: Uuid,
     ) -> Result<GenerationJobView, AppError> {
         let row = sqlx::query(
-            "SELECT id, created_at, updated_at, completed_at, public_model, driver, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json FROM generation_jobs WHERE id = $1 AND key_id = $2",
+            "SELECT id, created_at, updated_at, completed_at, public_model, driver, billing_unit_snapshot, status, upstream_job_id, estimated_units, billed_units, cost_micros, error_code, result_json FROM generation_jobs WHERE id = $1 AND key_id = $2",
         )
         .bind(job_id.to_string())
         .bind(key_id.to_string())
@@ -802,9 +804,10 @@ impl Database {
         generation_asset_download(row)
     }
 
-    /// Atomically cancels and refunds a generation job that has not been submitted upstream.
-    /// Running jobs deliberately require a driver-specific upstream cancellation flow.
-    pub async fn cancel_queued_generation_job(
+    /// Atomically cancels a queued job, or fences a running job for the
+    /// driver-specific cancellation worker. A running reservation is not
+    /// refunded until that worker proves the upstream cancellation succeeded.
+    pub async fn cancel_generation_job(
         &self,
         key_id: Uuid,
         job_id: Uuid,
@@ -813,10 +816,10 @@ impl Database {
         let mut transaction = self.pool.begin().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT j.status, j.lease_owner, j.lease_expires_at, j.created_at, j.tenant_id, j.public_model, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 AND j.key_id = $2 FOR UPDATE"
+                "SELECT j.status, j.lease_owner, j.lease_expires_at, j.staged_assets_json, j.created_at, j.tenant_id, j.public_model, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 AND j.key_id = $2 FOR UPDATE"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT j.status, j.lease_owner, j.lease_expires_at, j.created_at, j.tenant_id, j.public_model, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 AND j.key_id = $2"
+                "SELECT j.status, j.lease_owner, j.lease_expires_at, j.staged_assets_json, j.created_at, j.tenant_id, j.public_model, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 AND j.key_id = $2"
             }
         };
         let row = sqlx::query(select)
@@ -831,9 +834,37 @@ impl Database {
             transaction.commit().await?;
             return self.generation_job(key_id, job_id).await;
         }
+        if status == "cancelling" {
+            transaction.commit().await?;
+            return self.generation_job(key_id, job_id).await;
+        }
+        if status == "running" {
+            let staged_assets: Option<String> = row.try_get("staged_assets_json")?;
+            if staged_assets.is_some() {
+                return Err(AppError::BadRequest(
+                    "generation result is already being finalized".into(),
+                ));
+            }
+            let requested = sqlx::query(
+                "UPDATE generation_jobs SET status = 'cancelling', next_attempt_at = $1, lease_owner = NULL, lease_expires_at = NULL, error_code = NULL, updated_at = $2 WHERE id = $3 AND key_id = $4 AND status = 'running' AND staged_assets_json IS NULL",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(job_id.to_string())
+            .bind(key_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+            if requested.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "generation state changed while cancellation was requested".into(),
+                ));
+            }
+            transaction.commit().await?;
+            return self.generation_job(key_id, job_id).await;
+        }
         if status != "queued" {
             return Err(AppError::BadRequest(
-                "only a queued generation job can be cancelled".into(),
+                "generation job cannot be cancelled in its current state".into(),
             ));
         }
         let lease_owner: Option<String> = row.try_get("lease_owner")?;
@@ -987,10 +1018,10 @@ impl Database {
         let mut transaction = self.pool.begin().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running', 'submitting') AND next_attempt_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at < $2) ORDER BY next_attempt_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1"
+                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running', 'submitting', 'cancelling') AND next_attempt_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at < $2) ORDER BY next_attempt_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running', 'submitting') AND next_attempt_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at < $2) ORDER BY next_attempt_at, created_at, id LIMIT 1"
+                "SELECT id FROM generation_jobs WHERE status IN ('queued', 'running', 'submitting', 'cancelling') AND next_attempt_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at < $2) ORDER BY next_attempt_at, created_at, id LIMIT 1"
             }
         };
         let candidate = sqlx::query(select)
@@ -1004,7 +1035,7 @@ impl Database {
         };
         let job_id: String = candidate.try_get("id")?;
         let claimed = sqlx::query(
-            "UPDATE generation_jobs SET lease_owner = $1, lease_expires_at = $2, attempt_count = attempt_count + 1, updated_at = $3 WHERE id = $4 AND status IN ('queued', 'running', 'submitting') AND (lease_expires_at IS NULL OR lease_expires_at < $5)",
+            "UPDATE generation_jobs SET lease_owner = $1, lease_expires_at = $2, attempt_count = attempt_count + 1, updated_at = $3 WHERE id = $4 AND status IN ('queued', 'running', 'submitting', 'cancelling') AND (lease_expires_at IS NULL OR lease_expires_at < $5)",
         )
         .bind(worker_id)
         .bind(now.saturating_add(60_000))
@@ -1018,13 +1049,14 @@ impl Database {
             return Ok(None);
         }
         let row = sqlx::query(
-            "SELECT j.id, j.created_at, j.tenant_id, j.key_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.submission_nonce, j.staged_assets_json, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, j.micros_per_unit_snapshot FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
+            "SELECT j.id, j.created_at, j.tenant_id, j.key_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.submission_nonce, j.staged_assets_json, j.billing_unit_snapshot, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, j.micros_per_unit_snapshot FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
         )
         .bind(&job_id)
         .fetch_one(&mut *transaction)
         .await?;
         transaction.commit().await?;
         let micros_per_unit: i64 = row.try_get("micros_per_unit_snapshot")?;
+        let billing_unit: String = row.try_get("billing_unit_snapshot")?;
         let key_id = parse_uuid(row.try_get("key_id")?)?;
         let submission_nonce = row
             .try_get::<Option<String>, _>("submission_nonce")?
@@ -1046,9 +1078,13 @@ impl Database {
                 key_id,
                 reserved_micros: row.try_get("reserved_micros")?,
                 input_micros_per_million: 0,
-                output_micros_per_million: micros_per_unit
-                    .checked_mul(1_000_000)
-                    .ok_or(AppError::Internal)?,
+                output_micros_per_million: if billing_unit == "megapixel" {
+                    micros_per_unit
+                } else {
+                    micros_per_unit
+                        .checked_mul(1_000_000)
+                        .ok_or(AppError::Internal)?
+                },
                 price_tiers: Vec::new(),
                 rate_window_start: row.try_get("rate_window_start")?,
                 reserved_tokens: row.try_get("reserved_tokens")?,
@@ -1061,6 +1097,7 @@ impl Database {
             upstream_job_id: row.try_get("upstream_job_id")?,
             submission_nonce,
             staged_assets,
+            billing_unit,
             estimated_units: row.try_get("estimated_units")?,
             attempt_count: row.try_get("attempt_count")?,
             failure_count: row.try_get("failure_count")?,
@@ -1231,7 +1268,7 @@ impl Database {
         let now = unix_millis();
         generation_update_claimed(
             sqlx::query(
-                "UPDATE generation_jobs SET lease_expires_at = $1, updated_at = $2 WHERE id = $3 AND lease_owner = $4 AND status IN ('queued', 'running', 'submitting')",
+                "UPDATE generation_jobs SET lease_expires_at = $1, updated_at = $2 WHERE id = $3 AND lease_owner = $4 AND status IN ('queued', 'running', 'submitting', 'cancelling')",
             )
             .bind(now.saturating_add(60_000))
             .bind(now)
@@ -1304,10 +1341,10 @@ impl Database {
         let mut transaction = self.pool.begin().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT j.status, j.lease_owner, j.tenant_id, j.key_id, j.driver, j.created_at, j.estimated_units, j.billed_units, j.cost_micros, j.result_json, j.error_code, j.staged_assets_json, j.reservation_id, j.micros_per_unit_snapshot, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 FOR UPDATE"
+                "SELECT j.status, j.lease_owner, j.tenant_id, j.key_id, j.driver, j.created_at, j.estimated_units, j.billed_units, j.cost_micros, j.result_json, j.error_code, j.staged_assets_json, j.reservation_id, j.billing_unit_snapshot, j.micros_per_unit_snapshot, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 FOR UPDATE"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT j.status, j.lease_owner, j.tenant_id, j.key_id, j.driver, j.created_at, j.estimated_units, j.billed_units, j.cost_micros, j.result_json, j.error_code, j.staged_assets_json, j.reservation_id, j.micros_per_unit_snapshot, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1"
+                "SELECT j.status, j.lease_owner, j.tenant_id, j.key_id, j.driver, j.created_at, j.estimated_units, j.billed_units, j.cost_micros, j.result_json, j.error_code, j.staged_assets_json, j.reservation_id, j.billing_unit_snapshot, j.micros_per_unit_snapshot, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1"
             }
         };
         let job = sqlx::query(select)
@@ -1344,15 +1381,20 @@ impl Database {
 
         let key_id = parse_uuid(job.try_get("key_id")?)?;
         let micros_per_unit: i64 = job.try_get("micros_per_unit_snapshot")?;
+        let billing_unit: String = job.try_get("billing_unit_snapshot")?;
         let reservation = UsageReservation {
             id: parse_uuid(job.try_get("reservation_id")?)?,
             account_id: parse_uuid(job.try_get("account_id")?)?,
             key_id,
             reserved_micros: job.try_get("reserved_micros")?,
             input_micros_per_million: 0,
-            output_micros_per_million: micros_per_unit
-                .checked_mul(1_000_000)
-                .ok_or(AppError::Internal)?,
+            output_micros_per_million: if billing_unit == "megapixel" {
+                micros_per_unit
+            } else {
+                micros_per_unit
+                    .checked_mul(1_000_000)
+                    .ok_or(AppError::Internal)?
+            },
             price_tiers: Vec::new(),
             rate_window_start: job.try_get("rate_window_start")?,
             reserved_tokens: job.try_get("reserved_tokens")?,
@@ -1408,7 +1450,10 @@ impl Database {
             transaction.commit().await?;
             return Ok(existing_cost_micros);
         }
-        if !matches!(current_status.as_str(), "queued" | "running" | "submitting") {
+        if !matches!(
+            current_status.as_str(),
+            "queued" | "running" | "submitting" | "cancelling"
+        ) {
             return Err(AppError::Internal);
         }
         let lease_owner: Option<String> = job.try_get("lease_owner")?;
@@ -1431,7 +1476,7 @@ impl Database {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|_| AppError::Internal)?;
-        let updated = sqlx::query("UPDATE generation_jobs SET status = $1, billed_units = $2, cost_micros = $3, result_json = $4, error_code = $5, completed_at = $6, updated_at = $7, lease_owner = NULL, lease_expires_at = NULL, staged_assets_json = CASE WHEN $1 = 'succeeded' THEN staged_assets_json ELSE NULL END WHERE id = $8 AND lease_owner = $9 AND status IN ('queued', 'running', 'submitting') AND ((staged_assets_json IS NULL AND $10 IS NULL) OR staged_assets_json = $10)")
+        let updated = sqlx::query("UPDATE generation_jobs SET status = $1, billed_units = $2, cost_micros = $3, result_json = $4, error_code = $5, completed_at = $6, updated_at = $7, lease_owner = NULL, lease_expires_at = NULL, staged_assets_json = CASE WHEN $1 = 'succeeded' THEN staged_assets_json ELSE NULL END WHERE id = $8 AND lease_owner = $9 AND status IN ('queued', 'running', 'submitting', 'cancelling') AND ((staged_assets_json IS NULL AND $10 IS NULL) OR staged_assets_json = $10)")
             .bind(input.status)
             .bind(input.billed_units)
             .bind(cost_micros)
@@ -1493,7 +1538,7 @@ impl Database {
         .await?
         {
             sqlx::query(
-                "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', 'generation', public_model, CASE WHEN status = 'succeeded' THEN 200 ELSE 502 END, $3 - created_at, 0, 0, cost_micros, error_code FROM generation_jobs WHERE id = $4",
+                "INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'finished', 'generation', public_model, CASE WHEN status = 'succeeded' THEN 200 WHEN status = 'cancelled' THEN 499 ELSE 502 END, $3 - created_at, 0, 0, cost_micros, error_code FROM generation_jobs WHERE id = $4",
             )
             .bind(&event_id)
             .bind(now)
@@ -1665,7 +1710,7 @@ async fn aggregate_terminal_generation_job(
     }
 
     let fact = sqlx::query(
-        "INSERT INTO generation_stats_facts (job_id, tenant_id, key_id, created_at, model, status_class, error_code, upstream_account_id, duration_ms, cost_micros, billed_units) SELECT id, tenant_id, key_id, created_at, public_model, CASE WHEN status = 'succeeded' THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), CASE WHEN completed_at IS NULL OR completed_at < created_at THEN 0 ELSE completed_at - created_at END, cost_micros, COALESCE(billed_units, 0) FROM generation_jobs WHERE id = $1 AND status IN ('succeeded', 'failed', 'cancelled') ON CONFLICT (job_id) DO NOTHING",
+        "INSERT INTO generation_stats_facts (job_id, tenant_id, key_id, created_at, model, status_class, error_code, upstream_account_id, duration_ms, cost_micros, billed_units, currency) SELECT j.id, j.tenant_id, j.key_id, j.created_at, j.public_model, CASE WHEN j.status = 'succeeded' THEN 'success' ELSE 'failure' END, COALESCE(j.error_code, ''), COALESCE(j.upstream_account_id, ''), CASE WHEN j.completed_at IS NULL OR j.completed_at < j.created_at THEN 0 ELSE j.completed_at - j.created_at END, j.cost_micros, COALESCE(j.billed_units, 0), k.currency FROM generation_jobs j JOIN key_records k ON k.id = j.key_id AND k.tenant_id = j.tenant_id WHERE j.id = $1 AND j.status IN ('succeeded', 'failed', 'cancelled') ON CONFLICT (job_id) DO NOTHING",
     )
     .bind(job_id)
     .execute(&mut **transaction)
@@ -1675,7 +1720,7 @@ async fn aggregate_terminal_generation_job(
     }
 
     let aggregated = sqlx::query(
-        "INSERT INTO generation_daily_aggregates (tenant_id, key_id, day_bucket, model, status_class, error_code, upstream_account_id, requests, billed_units, cost_micros) SELECT tenant_id, key_id, created_at / 86400000, public_model, CASE WHEN status = 'succeeded' THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), 1, COALESCE(billed_units, 0), cost_micros FROM generation_jobs WHERE id = $1 AND status IN ('succeeded', 'failed', 'cancelled') ON CONFLICT (tenant_id, key_id, day_bucket, model, status_class, error_code, upstream_account_id) DO UPDATE SET requests = generation_daily_aggregates.requests + excluded.requests, billed_units = generation_daily_aggregates.billed_units + excluded.billed_units, cost_micros = generation_daily_aggregates.cost_micros + excluded.cost_micros",
+        "INSERT INTO generation_daily_aggregates (tenant_id, key_id, day_bucket, model, status_class, error_code, upstream_account_id, requests, billed_units, cost_micros, currency) SELECT f.tenant_id, f.key_id, f.created_at / 86400000, f.model, f.status_class, f.error_code, f.upstream_account_id, 1, f.billed_units, f.cost_micros, f.currency FROM generation_stats_facts f WHERE f.job_id = $1 ON CONFLICT (tenant_id, key_id, day_bucket, model, status_class, error_code, upstream_account_id, currency) DO UPDATE SET requests = generation_daily_aggregates.requests + excluded.requests, billed_units = generation_daily_aggregates.billed_units + excluded.billed_units, cost_micros = generation_daily_aggregates.cost_micros + excluded.cost_micros",
     )
     .bind(job_id)
     .execute(&mut **transaction)
@@ -1694,7 +1739,7 @@ async fn aggregate_terminal_generation_job(
                duration_bucket_9, duration_bucket_10, duration_bucket_11, cost_micros)
            SELECT g.tenant_id, g.key_id, g.created_at / 3600000, 'generation', g.model,
                   'generation', g.status_class, g.error_code, g.upstream_account_id, '',
-                  'default', k.currency, 1, 0, 0, 0, 0, g.billed_units, 1, g.duration_ms,
+                  'default', g.currency, 1, 0, 0, 0, 0, g.billed_units, 1, g.duration_ms,
                   CASE WHEN g.duration_ms <= 10 THEN 1 ELSE 0 END,
                   CASE WHEN g.duration_ms > 10 AND g.duration_ms <= 50 THEN 1 ELSE 0 END,
                   CASE WHEN g.duration_ms > 50 AND g.duration_ms <= 100 THEN 1 ELSE 0 END,
@@ -1708,7 +1753,7 @@ async fn aggregate_terminal_generation_job(
                   CASE WHEN g.duration_ms > 30000 AND g.duration_ms <= 60000 THEN 1 ELSE 0 END,
                   CASE WHEN g.duration_ms > 60000 THEN 1 ELSE 0 END,
                   g.cost_micros
-             FROM generation_stats_facts g JOIN key_records k ON k.id = g.key_id
+             FROM generation_stats_facts g
             WHERE g.job_id = $1
            ON CONFLICT (tenant_id, key_id, hour_bucket, source_kind, model, protocol,
                         status_class, error_code, upstream_account_id, model_route_id,
@@ -1745,7 +1790,7 @@ async fn aggregate_terminal_generation_job(
                duration_bucket_9, duration_bucket_10, duration_bucket_11, cost_micros)
            SELECT g.tenant_id, g.key_id, g.created_at / 86400000, 'generation', g.model,
                   'generation', g.status_class, g.error_code, g.upstream_account_id, '',
-                  'default', k.currency, 1, 0, 0, 0, 0, g.billed_units, 1, g.duration_ms,
+                  'default', g.currency, 1, 0, 0, 0, 0, g.billed_units, 1, g.duration_ms,
                   CASE WHEN g.duration_ms <= 10 THEN 1 ELSE 0 END,
                   CASE WHEN g.duration_ms > 10 AND g.duration_ms <= 50 THEN 1 ELSE 0 END,
                   CASE WHEN g.duration_ms > 50 AND g.duration_ms <= 100 THEN 1 ELSE 0 END,
@@ -1759,7 +1804,7 @@ async fn aggregate_terminal_generation_job(
                   CASE WHEN g.duration_ms > 30000 AND g.duration_ms <= 60000 THEN 1 ELSE 0 END,
                   CASE WHEN g.duration_ms > 60000 THEN 1 ELSE 0 END,
                   g.cost_micros
-             FROM generation_stats_facts g JOIN key_records k ON k.id = g.key_id
+             FROM generation_stats_facts g
             WHERE g.job_id = $1
            ON CONFLICT (tenant_id, key_id, day_bucket, source_kind, model, protocol,
                         status_class, error_code, upstream_account_id, model_route_id,
@@ -1920,6 +1965,7 @@ fn generation_job_view(row: AnyRow) -> Result<GenerationJobView, AppError> {
         completed_at: row.try_get("completed_at")?,
         model: row.try_get("public_model")?,
         driver: row.try_get("driver")?,
+        billing_unit: row.try_get("billing_unit_snapshot")?,
         status: row.try_get("status")?,
         upstream_job_id: row.try_get("upstream_job_id")?,
         estimated_units: row.try_get("estimated_units")?,

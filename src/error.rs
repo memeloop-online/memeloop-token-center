@@ -149,15 +149,27 @@ impl IntoResponse for AppError {
 
 impl From<sqlx::Error> for AppError {
     fn from(error: sqlx::Error) -> Self {
-        tracing::error!(%error, "database operation failed");
+        // Driver messages can echo bound values (including identifiers or
+        // encrypted credential envelopes). Keep a stable diagnostic class,
+        // never the driver-provided message, in application logs.
+        tracing::error!(
+            error_kind = sqlx_error_kind(&error),
+            "database operation failed"
+        );
         Self::Internal
     }
 }
 
 impl From<object_store::Error> for AppError {
-    fn from(error: object_store::Error) -> Self {
-        tracing::error!(%error, "object storage operation failed");
-        Self::Storage(error.to_string())
+    fn from(_error: object_store::Error) -> Self {
+        // S3 errors may include the endpoint, access-key identifier, object
+        // locator, or a signed URL. None of those belong in logs or in an
+        // AppError that a higher layer could later log with Display.
+        tracing::error!(
+            error_kind = "object_store",
+            "object storage operation failed"
+        );
+        Self::Storage("object storage operation failed".to_owned())
     }
 }
 
@@ -168,7 +180,32 @@ impl From<reqwest::Error> for AppError {
             is_connect = error.is_connect(),
             "upstream HTTP operation failed"
         );
-        Self::Upstream(error.to_string())
+        // reqwest's Display includes the request URL, which may carry a
+        // provider-supplied signature or token in its query string.
+        Self::Upstream("HTTP operation failed".to_owned())
+    }
+}
+
+fn sqlx_error_kind(error: &sqlx::Error) -> &'static str {
+    match error {
+        sqlx::Error::Configuration(_) => "configuration",
+        sqlx::Error::Database(_) => "database",
+        sqlx::Error::Io(_) => "io",
+        sqlx::Error::Tls(_) => "tls",
+        sqlx::Error::Protocol(_) => "protocol",
+        sqlx::Error::RowNotFound => "row_not_found",
+        sqlx::Error::TypeNotFound { .. } => "type_not_found",
+        sqlx::Error::ColumnIndexOutOfBounds { .. } => "column_index",
+        sqlx::Error::ColumnNotFound(_) => "column_not_found",
+        sqlx::Error::ColumnDecode { .. } => "column_decode",
+        sqlx::Error::Encode(_) => "encode",
+        sqlx::Error::Decode(_) => "decode",
+        sqlx::Error::AnyDriverError(_) => "driver",
+        sqlx::Error::PoolTimedOut => "pool_timeout",
+        sqlx::Error::PoolClosed => "pool_closed",
+        sqlx::Error::WorkerCrashed => "worker_crashed",
+        sqlx::Error::Migrate(_) => "migration",
+        _ => "unknown",
     }
 }
 
@@ -212,5 +249,30 @@ mod tests {
         assert_eq!(body["error"]["code"], "insufficient_quota");
         assert_eq!(body["error"]["reason"], "lifetime_budget_exhausted");
         assert_eq!(body["error"]["retryable"], false);
+    }
+
+    #[test]
+    fn dependency_errors_do_not_retain_secret_bearing_driver_messages() {
+        let object_error = object_store::Error::Generic {
+            store: "signed-url?token=object-secret",
+            source: Box::new(std::io::Error::other("access-key-secret")),
+        };
+        let rendered = AppError::from(object_error).to_string();
+        assert_eq!(rendered, "storage error: object storage operation failed");
+        assert!(!rendered.contains("object-secret"));
+        assert!(!rendered.contains("access-key-secret"));
+
+        let request_error = reqwest::Client::builder()
+            .build()
+            .unwrap()
+            .get("http://[::1?token=request-secret")
+            .build()
+            .expect_err("invalid secret-bearing URL");
+        let rendered = AppError::from(request_error).to_string();
+        assert_eq!(
+            rendered,
+            "configured upstream is unavailable: HTTP operation failed"
+        );
+        assert!(!rendered.contains("request-secret"));
     }
 }

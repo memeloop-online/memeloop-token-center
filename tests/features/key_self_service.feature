@@ -129,6 +129,11 @@ Feature: Stable key identity and read-only self-service statistics
     And the client calls model "cursor-public"
     Then the response status is 200
     And the refreshed Cursor account keeps its id and uses generation 2
+    When the service starts reauthorization for the Cursor OAuth account
+    And the service polls the completed Cursor OAuth reauthorization
+    And the client calls model "cursor-public"
+    Then the response status is 200
+    And the reauthorized Cursor account keeps its id and route and uses generation 3
 
   Scenario: Scoped service credentials rotate without crossing tenant boundaries
     Given a token center backed by SQLite and memory object storage
@@ -146,6 +151,13 @@ Feature: Stable key identity and read-only self-service statistics
     And the client creates a five second Seedance generation
     Then the response status is 202
     And the generation eventually succeeds with an archived video costing 0.5
+
+  Scenario: A running Seedance job is cancelled upstream and refunded exactly once
+    Given a token center backed by SQLite and memory object storage
+    And the mock Seedance upstream keeps a generation running until cancellation
+    When the service creates a metered Seedance route and key
+    And the client creates a five second Seedance generation
+    Then cancelling the running Seedance generation is idempotent and refunds exactly once
 
   Scenario: A permanently rejected Seedance generation is refunded without retries
     Given a token center backed by SQLite and memory object storage
@@ -194,6 +206,28 @@ Feature: Stable key identity and read-only self-service statistics
     And the client creates a ComfyUI image generation
     Then the response status is 202
     And the ComfyUI generation eventually succeeds with an archived image costing 0.2
+
+  Scenario: A running ComfyUI job is fenced, cancelled upstream and refunded exactly once
+    Given a token center backed by SQLite and memory object storage
+    And the mock ComfyUI upstream keeps a generation running until cancellation
+    When the service creates a metered ComfyUI route and key
+    And the client creates a ComfyUI image generation
+    Then cancelling the running ComfyUI generation is idempotent and refunds exactly once
+
+  Scenario: ComfyUI megapixel billing settles actual output pixels and refunds unused reservation
+    Given a token center backed by SQLite and memory object storage
+    And the mock ComfyUI upstream returns two images for a three image request
+    When the service creates a megapixel-priced ComfyUI route and key
+    And the client creates a three-output ComfyUI megapixel generation
+    Then the ComfyUI generation bills exactly 1.048576 megapixels and refunds the unused output
+
+  Scenario: ComfyUI image admission enforces every credential limit before upstream work
+    Given a token center backed by SQLite and memory object storage
+    Then the asynchronous ComfyUI image endpoint rejects permission quota RPM TPM and concurrency violations
+
+  Scenario: Seedance video admission enforces every credential limit before upstream work
+    Given a token center backed by SQLite and memory object storage
+    Then the asynchronous Seedance video endpoint rejects permission quota RPM TPM and concurrency violations
 
   Scenario: A durable generation manifest survives a worker crash before terminal settlement
     Given a token center backed by SQLite and memory object storage

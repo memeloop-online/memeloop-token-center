@@ -177,13 +177,28 @@ impl AuthenticatedService {
     }
 
     pub fn allows(&self, required: &str) -> bool {
-        self.scopes.iter().any(|scope| {
-            scope == "*"
-                || scope == required
-                || scope
-                    .strip_suffix(":*")
-                    .is_some_and(|prefix| required.starts_with(&format!("{prefix}:")))
-        })
+        self.scopes
+            .iter()
+            .any(|scope| scope == required || (self.service_id.is_none() && scope.as_str() == "*"))
+    }
+}
+
+#[cfg(test)]
+mod authenticated_service_tests {
+    use super::AuthenticatedService;
+
+    #[test]
+    fn only_bootstrap_identity_can_use_the_global_scope() {
+        assert!(AuthenticatedService::bootstrap().allows("keys:write"));
+
+        let managed = AuthenticatedService {
+            service_id: Some(uuid::Uuid::now_v7()),
+            scopes: vec!["*".to_owned(), "keys:*".to_owned(), "keys:read".to_owned()],
+            tenant_external_id: None,
+        };
+        assert!(managed.allows("keys:read"));
+        assert!(!managed.allows("keys:write"));
+        assert!(!managed.allows("prices:read"));
     }
 }
 
@@ -371,7 +386,9 @@ pub struct StatsSummary {
     pub failed_requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
-    pub total_cost: String,
+    /// Single-currency compatibility value. `None` means the projection spans currencies.
+    pub total_cost: Option<String>,
+    pub costs: Vec<UsageAnalysisCost>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -380,7 +397,9 @@ pub struct StatsBucket {
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
-    pub cost: String,
+    /// Single-currency compatibility value. `None` means the bucket spans currencies.
+    pub cost: Option<String>,
+    pub costs: Vec<UsageAnalysisCost>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -454,6 +473,9 @@ pub struct UsageAnalysisResponse {
     pub time_zone: String,
     pub p95_is_approximate: bool,
     pub p95_method: String,
+    /// `stable_account`: upstream usage stays attached to one provider account across API/OAuth
+    /// credential rotations. Historical requests are never relabelled as the current generation.
+    pub upstream_grouping: String,
     pub summary: UsageAnalysisMetrics,
     pub time_series: Vec<UsageAnalysisTimeBucket>,
     pub by_model: Vec<UsageAnalysisBucket>,
@@ -598,6 +620,7 @@ pub struct GenerationJobView {
     pub completed_at: Option<i64>,
     pub model: String,
     pub driver: String,
+    pub billing_unit: String,
     pub status: String,
     pub upstream_job_id: Option<String>,
     pub estimated_units: i64,
@@ -624,6 +647,7 @@ pub struct GenerationJobWork {
     pub upstream_job_id: Option<String>,
     pub submission_nonce: Option<Uuid>,
     pub staged_assets: Option<GenerationStagedAssets>,
+    pub billing_unit: String,
     pub estimated_units: i64,
     pub attempt_count: i64,
     pub failure_count: i64,

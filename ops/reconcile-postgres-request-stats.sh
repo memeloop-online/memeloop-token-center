@@ -17,10 +17,14 @@ Options:
   --confirm-prune         Required with --apply --prune-before.
   --help                  Show this help.
 
-The prune mode refuses to run while request_records still contains a row before
-the cutoff. Archive retention must be verified separately before pruning facts.
+The prune mode refuses to run while request_records or generation_jobs still
+contains a row before the cutoff. Archive retention must be verified separately
+before pruning facts and their hourly/daily projections.
 USAGE
 }
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+reconcile_day_sql=$script_dir/postgres/reconcile-observability-day.sql
 
 ACTION=dry-run
 FROM_DATE=
@@ -105,9 +109,17 @@ WITH boundary AS (
 )
 SELECT :'cutoff' AS prune_before_utc,
        (SELECT count(*) FROM request_records, boundary WHERE created_at < boundary.millis) AS retained_raw_rows,
+       (SELECT count(*) FROM generation_jobs, boundary WHERE created_at < boundary.millis) AS retained_generation_rows,
        (SELECT count(*) FROM request_stats_facts, boundary WHERE created_at < boundary.millis) AS fact_rows,
+       (SELECT count(*) FROM generation_stats_facts, boundary WHERE created_at < boundary.millis) AS generation_fact_rows,
        (SELECT COALESCE(sum(requests), 0) FROM request_daily_aggregates
-         WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint) AS aggregate_requests;
+         WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint) AS aggregate_requests,
+       (SELECT COALESCE(sum(requests), 0) FROM generation_daily_aggregates
+         WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint) AS generation_aggregate_requests,
+       (SELECT COALESCE(sum(requests), 0) FROM usage_analysis_hourly
+         WHERE hour_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint * 24) AS analysis_hourly_requests,
+       (SELECT COALESCE(sum(requests), 0) FROM usage_analysis_daily
+         WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint) AS analysis_daily_requests;
 SQL
   if [ "$ACTION" != apply ]; then
     echo "DRY RUN: no request statistics were pruned."
@@ -116,7 +128,8 @@ SQL
   psql_target -v cutoff="$PRUNE_BEFORE" <<'SQL'
 BEGIN;
 SELECT pg_advisory_xact_lock(hashtextextended('memeloop-token-center:request-stats', 734627102948314));
-LOCK TABLE request_records IN SHARE MODE;
+SET LOCAL lock_timeout = '5s';
+LOCK TABLE request_records, generation_jobs IN SHARE MODE;
 CREATE TEMP TABLE mtc_request_stats_prune_guard (
   invalid boolean NOT NULL CHECK (invalid = false)
 ) ON COMMIT DROP;
@@ -125,10 +138,21 @@ SELECT true
  WHERE EXISTS (
    SELECT 1 FROM request_records
     WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
+   UNION ALL
+   SELECT 1 FROM generation_jobs
+    WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
  );
+DELETE FROM usage_analysis_daily
+ WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
+DELETE FROM usage_analysis_hourly
+ WHERE hour_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint * 24;
 DELETE FROM request_daily_aggregates
  WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
+DELETE FROM generation_daily_aggregates
+ WHERE day_bucket < (:'cutoff'::date - DATE '1970-01-01')::bigint;
 DELETE FROM request_stats_facts
+ WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint;
+DELETE FROM generation_stats_facts
  WHERE created_at < (extract(epoch FROM (:'cutoff'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint;
 COMMIT;
 SQL
@@ -143,12 +167,19 @@ else
 fi
 
 days=$(psql_target -At -v from_date="$FROM_DATE" -v before_date="$BEFORE_DATE" <<SQL
-SELECT to_char(to_timestamp(created_at / 1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD')
-  FROM request_records
- WHERE $from_predicate
-       created_at < (extract(epoch FROM (:'before_date'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
-   AND completed_at IS NOT NULL AND status_code IS NOT NULL
- GROUP BY 1
+SELECT day
+  FROM (
+    SELECT to_char(to_timestamp(created_at / 1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day
+      FROM request_records
+     WHERE $from_predicate
+           created_at < (extract(epoch FROM (:'before_date'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
+       AND completed_at IS NOT NULL AND status_code IS NOT NULL
+    UNION
+    SELECT to_char(to_timestamp(created_at / 1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day
+      FROM generation_stats_facts
+     WHERE $from_predicate
+           created_at < (extract(epoch FROM (:'before_date'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
+  ) completed_days
  ORDER BY 1
  LIMIT $MAX_DAYS;
 SQL
@@ -171,52 +202,20 @@ SELECT (SELECT count(*) FROM request_records, bounds
            AND completed_at IS NOT NULL AND status_code IS NOT NULL) AS terminal_raw_rows,
        (SELECT count(*) FROM request_stats_facts, bounds
          WHERE created_at >= start_ms AND created_at < end_ms) AS fact_rows,
+       (SELECT count(*) FROM generation_stats_facts, bounds
+         WHERE created_at >= start_ms AND created_at < end_ms) AS generation_fact_rows,
        (SELECT COALESCE(sum(requests), 0) FROM request_daily_aggregates
-         WHERE day_bucket = (:'day'::date - DATE '1970-01-01')::bigint) AS aggregate_requests;
+         WHERE day_bucket = (:'day'::date - DATE '1970-01-01')::bigint) AS aggregate_requests,
+       (SELECT COALESCE(sum(requests), 0) FROM generation_daily_aggregates
+         WHERE day_bucket = (:'day'::date - DATE '1970-01-01')::bigint) AS generation_aggregate_requests,
+       (SELECT COALESCE(sum(requests), 0) FROM usage_analysis_hourly
+         WHERE hour_bucket >= (:'day'::date - DATE '1970-01-01')::bigint * 24
+           AND hour_bucket < ((:'day'::date - DATE '1970-01-01')::bigint + 1) * 24) AS analysis_hourly_requests,
+       (SELECT COALESCE(sum(requests), 0) FROM usage_analysis_daily
+         WHERE day_bucket = (:'day'::date - DATE '1970-01-01')::bigint) AS analysis_daily_requests;
 SQL
   if [ "$ACTION" != apply ]; then continue; fi
-  psql_target -v day="$day" <<'SQL'
-BEGIN;
-SELECT pg_advisory_xact_lock(hashtextextended('memeloop-token-center:request-stats', 734627102948314));
-INSERT INTO request_stats_facts
-  (request_id, tenant_id, key_id, created_at, model, protocol, status_class,
-   error_code, upstream_account_id, model_route_id, duration_ms,
-   input_tokens, output_tokens, cost_micros)
-SELECT id, tenant_id, key_id, created_at, model, protocol,
-       CASE WHEN status_code BETWEEN 200 AND 399 THEN 'success' ELSE 'failure' END,
-       COALESCE(error_code, ''), COALESCE(upstream_account_id, ''),
-       COALESCE(model_route_id, ''), COALESCE(duration_ms, 0),
-       input_tokens, output_tokens, cost_micros
-  FROM request_records
- WHERE created_at >= (extract(epoch FROM (:'day'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
-   AND created_at < (extract(epoch FROM ((:'day'::date + 1)::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
-   AND completed_at IS NOT NULL AND status_code IS NOT NULL
-ON CONFLICT (request_id) DO UPDATE SET
-  tenant_id = excluded.tenant_id, key_id = excluded.key_id,
-  created_at = excluded.created_at, model = excluded.model, protocol = excluded.protocol,
-  status_class = excluded.status_class, error_code = excluded.error_code,
-  upstream_account_id = excluded.upstream_account_id,
-  model_route_id = excluded.model_route_id, duration_ms = excluded.duration_ms,
-  input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,
-  cost_micros = excluded.cost_micros;
-DELETE FROM request_daily_aggregates
- WHERE day_bucket = (:'day'::date - DATE '1970-01-01')::bigint;
-INSERT INTO request_daily_aggregates
-  (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code,
-   upstream_account_id, model_route_id, requests, input_tokens,
-   output_tokens, cost_micros)
-SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class,
-       error_code, upstream_account_id, model_route_id, COUNT(*),
-       SUM(input_tokens), SUM(output_tokens), SUM(cost_micros)
-  FROM request_stats_facts
- WHERE created_at >= (extract(epoch FROM (:'day'::date::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
-   AND created_at < (extract(epoch FROM ((:'day'::date + 1)::timestamp AT TIME ZONE 'UTC')) * 1000)::bigint
- GROUP BY tenant_id, key_id, created_at / 86400000, model, protocol,
-          status_class, error_code, upstream_account_id, model_route_id;
-COMMIT;
-ANALYZE request_stats_facts;
-ANALYZE request_daily_aggregates;
-SQL
+  psql_target -v day="$day" -f "$reconcile_day_sql"
 done
 
 if [ "$ACTION" = dry-run ]; then

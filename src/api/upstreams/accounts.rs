@@ -197,15 +197,33 @@ fn validate_provider_config(driver: &str, config: &Value) -> Result<(), AppError
 pub(in crate::api) async fn list_upstreams(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ManagementTenantQuery>,
+    Query(query): Query<UpstreamListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id)?;
-    let values = match tenant {
-        Some(tenant) => state.db.list_upstream_accounts(&tenant).await?,
-        None => state.db.list_all_upstream_accounts().await?,
-    };
+    let values = state
+        .db
+        .list_upstream_accounts_page(
+            tenant.as_deref(),
+            query.before_created_at,
+            query.before_id,
+            query.limit,
+        )
+        .await?;
     Ok(Json(values))
+}
+
+#[derive(Debug, Deserialize)]
+pub(in crate::api) struct UpstreamListQuery {
+    tenant_external_id: Option<String>,
+    before_created_at: Option<i64>,
+    before_id: Option<Uuid>,
+    #[serde(default = "default_upstream_list_limit")]
+    limit: i64,
+}
+
+fn default_upstream_list_limit() -> i64 {
+    100
 }
 
 #[derive(Debug, Deserialize)]

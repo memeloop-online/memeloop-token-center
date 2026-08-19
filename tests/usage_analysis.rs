@@ -211,8 +211,9 @@ async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
             sqlx::query(
                 r#"INSERT INTO generation_stats_facts (
                        job_id, tenant_id, key_id, created_at, model, status_class,
-                       error_code, upstream_account_id, duration_ms, cost_micros, billed_units
-                   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 20, $9, $10)"#,
+                       error_code, upstream_account_id, duration_ms, cost_micros, billed_units,
+                       currency
+                   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 20, $9, $10, $11)"#,
             )
             .bind(Uuid::now_v7().to_string())
             .bind(&tenant_id)
@@ -224,6 +225,7 @@ async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
             .bind(&upstream_account_id)
             .bind(activity.cost_micros)
             .bind(units)
+            .bind(activity.currency)
             .execute(pool)
             .await
             .unwrap();
@@ -279,8 +281,9 @@ async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
 }
 
 fn assert_multibucket_metrics(body: &Value) {
-    assert_eq!(body["summary"]["requests"], 6, "{body}");
-    assert_eq!(body["summary"]["success"], 3, "{body}");
+    assert_eq!(body["upstream_grouping"], "stable_account", "{body}");
+    assert_eq!(body["summary"]["requests"], 7, "{body}");
+    assert_eq!(body["summary"]["success"], 4, "{body}");
     assert_eq!(body["summary"]["failed"], 3, "{body}");
     assert_eq!(body["summary"]["input_tokens"], 90, "{body}");
     assert_eq!(body["summary"]["generation_units"], 12, "{body}");
@@ -295,7 +298,7 @@ fn assert_multibucket_metrics(body: &Value) {
             .iter()
             .map(|bucket| bucket["requests"].as_i64().unwrap())
             .sum::<i64>(),
-        6,
+        7,
         "{body}"
     );
     assert_eq!(
@@ -305,7 +308,7 @@ fn assert_multibucket_metrics(body: &Value) {
             .iter()
             .map(|bucket| bucket["requests"].as_i64().unwrap())
             .sum::<i64>(),
-        6,
+        7,
         "{body}"
     );
     assert!(
@@ -346,6 +349,37 @@ async fn assert_multibucket_usage_analysis(database_url: String, tenant: String)
     let day_start = now.div_euclid(86_400_000) * 86_400_000 - 2 * 86_400_000;
     let from = day_start + 6 * 3_600_000 + 15 * 60_000;
     let to = day_start + 2 * 86_400_000 + 18 * 3_600_000 + 45 * 60_000;
+    seed_usage_activity(
+        &pool,
+        SeedUsageActivity {
+            key: &usd,
+            currency: "USD",
+            model: "multi-before-upstream-rotation",
+            created_at: from + 60_000,
+            status_class: "success",
+            error_code: "",
+            upstream_account_id: Some(upstream.id),
+            cost_micros: 0,
+            kind: SeedUsageKind::Request { input_tokens: 0 },
+        },
+    )
+    .await;
+    let rotated = state
+        .db
+        .rotate_upstream_credential(
+            upstream.id,
+            UpstreamCredential::ApiKey {
+                value: "usage-analysis-rotated-not-a-secret".to_owned(),
+                header: "authorization".to_owned(),
+                prefix: "Bearer ".to_owned(),
+            },
+            "usage-analysis-stable-account-rotation",
+            PEPPER,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotated.id, upstream.id);
+    assert_eq!(rotated.credential_generation, 2);
     let activities = [
         SeedUsageActivity {
             key: &usd,
@@ -508,8 +542,9 @@ async fn assert_multibucket_usage_analysis(database_url: String, tenant: String)
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{assigned}");
-    assert_eq!(assigned["summary"]["requests"], 1, "{assigned}");
+    assert_eq!(assigned["summary"]["requests"], 2, "{assigned}");
     assert_eq!(assigned["summary"]["generation_units"], 4, "{assigned}");
+    assert_eq!(assigned["by_upstream"].as_array().unwrap().len(), 1);
     assert_eq!(assigned["by_upstream"][0]["id"], upstream.id.to_string());
 
     let (status, generation_only) = get_json(
@@ -668,6 +703,7 @@ async fn sqlite_usage_analysis_keeps_currency_cache_scope_and_prefix_filters_exa
     assert_eq!(body["granularity"], "hour");
     assert_eq!(body["time_zone"], "UTC");
     assert_eq!(body["p95_is_approximate"], true);
+    assert_eq!(body["upstream_grouping"], "stable_account");
     assert_eq!(body["summary"]["requests"], 2);
     assert_eq!(body["summary"]["success"], 1);
     assert_eq!(body["summary"]["failed"], 1);

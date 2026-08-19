@@ -122,6 +122,11 @@ config:
   serviceTokenSecret:
     name: memeloop-token-center-secrets
     key: service-token
+  # Optional HMAC secret used by the signed MemeLoop Cloud subscription bridge.
+  # Keep `name` empty to leave the integration endpoint fail-closed.
+  memeloopCloudWebhookSecret:
+    name: ""
+    key: memeloop-cloud-webhook-secret
   # The Kubernetes chart supports only externally managed S3-compatible
   # storage. The runtime filesystem/memory backends are intentionally limited
   # to local and test harnesses; mounting them into this hardened Pod would

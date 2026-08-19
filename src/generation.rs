@@ -181,7 +181,22 @@ pub async fn process_one(state: &AppState, worker_id: &str) -> Result<bool, AppE
     if let Err(error) = outcome {
         let next_failure = job.failure_count.saturating_add(1);
         tracing::warn!(job_id = %job.job_id, attempt = job.attempt_count, failure = next_failure, %error, "generation job attempt failed");
-        if next_failure >= MAX_FAILURES {
+        if job.status == "cancelling" {
+            // Never refund an upstream-submitted task merely because its
+            // cancellation endpoint is unavailable. Keep the fenced job and
+            // reservation retryable until the provider confirms cancellation.
+            let exponent = u32::try_from(next_failure.clamp(0, 6)).unwrap_or(6);
+            let delay = 1_000_i64.saturating_mul(2_i64.saturating_pow(exponent));
+            state
+                .db
+                .reschedule_generation_job(
+                    job.job_id,
+                    worker_id,
+                    delay.min(60_000),
+                    Some("upstream_cancel_retry"),
+                )
+                .await?;
+        } else if next_failure >= MAX_FAILURES {
             terminal_failure(state, worker_id, &job, "retry_exhausted").await?;
         } else {
             let exponent = u32::try_from(next_failure.clamp(0, 6)).unwrap_or(6);
@@ -229,12 +244,101 @@ pub fn generation_request_hash(model: &str, input: &Value) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+pub(crate) fn comfyui_requested_pixels(input: &Value) -> Result<i64, AppError> {
+    let (pixels_per_output, outputs) = comfyui_pixel_contract(input)?;
+    pixels_per_output
+        .checked_mul(outputs)
+        .ok_or_else(|| AppError::BadRequest("ComfyUI pixel count is too large".into()))
+}
+
+fn comfyui_pixel_contract(input: &Value) -> Result<(i64, i64), AppError> {
+    let parameters = input
+        .get("parameters")
+        .and_then(Value::as_object)
+        .ok_or_else(|| AppError::BadRequest("ComfyUI parameters are required".into()))?;
+    let dimension = |name: &str| -> Result<i64, AppError> {
+        let value = parameters
+            .get(name)
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "ComfyUI megapixel billing requires an integer {name} parameter"
+                ))
+            })?;
+        if !(1..=32_768).contains(&value) {
+            return Err(AppError::BadRequest(format!(
+                "ComfyUI {name} must be between 1 and 32768"
+            )));
+        }
+        Ok(value)
+    };
+    let width = dimension("width")?;
+    let height = dimension("height")?;
+    let outputs = ["batch_size", "n", "images"]
+        .into_iter()
+        .find_map(|name| parameters.get(name))
+        .map(|value| {
+            value.as_i64().ok_or_else(|| {
+                AppError::BadRequest(
+                    "ComfyUI output count must be an integer for megapixel billing".into(),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or(1);
+    if !(1..=MAX_COMFY_ASSETS as i64).contains(&outputs) {
+        return Err(AppError::BadRequest(
+            "ComfyUI output count must be between 1 and 16".into(),
+        ));
+    }
+    let pixels_per_output = width
+        .checked_mul(height)
+        .ok_or_else(|| AppError::BadRequest("ComfyUI pixel count is too large".into()))?;
+    Ok((pixels_per_output, outputs))
+}
+
+async fn comfyui_billed_pixels(
+    state: &AppState,
+    job: &GenerationJobWork,
+    actual_outputs: usize,
+) -> Result<Option<i64>, AppError> {
+    if job.billing_unit == "job" {
+        return Ok(Some(1));
+    }
+    if job.billing_unit != "megapixel" {
+        return Err(AppError::Storage(
+            "ComfyUI job has an unsupported billing snapshot".into(),
+        ));
+    }
+    let archived = state
+        .archive
+        .get_bounded(&job.request_object, MAX_CONTROL_BODY)
+        .await?;
+    let outer: Value = serde_json::from_slice(&archived)
+        .map_err(|_| AppError::Storage("generation request archive is invalid".into()))?;
+    let input = outer
+        .get("input")
+        .ok_or_else(|| AppError::Storage("generation input archive is invalid".into()))?;
+    let (pixels_per_output, reserved_outputs) = comfyui_pixel_contract(input)
+        .map_err(|_| AppError::Storage("generation pixel contract is invalid".into()))?;
+    let actual_outputs = i64::try_from(actual_outputs).map_err(|_| AppError::Internal)?;
+    if actual_outputs > reserved_outputs {
+        return Ok(None);
+    }
+    pixels_per_output
+        .checked_mul(actual_outputs)
+        .map(Some)
+        .ok_or(AppError::Internal)
+}
+
 async fn process_claimed(
     state: &AppState,
     worker_id: &str,
     job: &GenerationJobWork,
 ) -> Result<(), AppError> {
-    if unix_millis().saturating_sub(job.created_at) > MAX_JOB_AGE_MILLIS {
+    if job.status != "cancelling"
+        && unix_millis().saturating_sub(job.created_at) > MAX_JOB_AGE_MILLIS
+    {
         return terminal_failure(state, worker_id, job, "generation_timeout").await;
     }
     if job.status == "submitting"
@@ -270,10 +374,120 @@ async fn process_claimed(
             "generation route driver changed while job was queued".into(),
         ));
     }
+    if job.status == "cancelling" {
+        let upstream_job_id = job.upstream_job_id.as_deref().ok_or(AppError::Internal)?;
+        return cancel_upstream_generation(state, worker_id, job, &route, upstream_job_id).await;
+    }
     match job.upstream_job_id.as_deref() {
         None => submit(state, worker_id, job, &route).await,
         Some(upstream_job_id) => poll(state, worker_id, job, &route, upstream_job_id).await,
     }
+}
+
+async fn cancel_upstream_generation(
+    state: &AppState,
+    worker_id: &str,
+    job: &GenerationJobWork,
+    route: &ResolvedUpstream,
+    upstream_job_id: &str,
+) -> Result<(), AppError> {
+    let upstream_job_id = validated_upstream_job_id(upstream_job_id)?;
+    let outbound_http = route_http(state, route, &route.base_url).await?;
+    let (request, requires_delete_proof) = match route.driver.as_str() {
+        "volcengine-seedance" => {
+            let url = generation_url(
+                &route.base_url,
+                &[
+                    "api",
+                    "v3",
+                    "contents",
+                    "generations",
+                    "tasks",
+                    upstream_job_id,
+                ],
+            )?;
+            (outbound_http.delete(url), false)
+        }
+        "comfyui" => {
+            let prefix = comfy_prefix(route)?;
+            if prefix == "/api" {
+                let url =
+                    generation_url(&route.base_url, &["api", "job", upstream_job_id, "cancel"])?;
+                (outbound_http.post(url), false)
+            } else {
+                let url = generation_url(&route.base_url, &["queue"])?;
+                // The classic ComfyUI API supports deleting one prompt from
+                // its queue without the unsafe instance-wide /interrupt call.
+                (
+                    outbound_http
+                        .post(url)
+                        .json(&serde_json::json!({"delete": [upstream_job_id]})),
+                    true,
+                )
+            }
+        }
+        _ => return Err(AppError::Upstream("unsupported generation driver".into())),
+    };
+    let upstream_started = std::time::Instant::now();
+    let response_result = route.credential.apply(request, unix_millis())?.send().await;
+    state.metrics.observe_upstream(
+        &route.driver,
+        "generation_cancel",
+        response_result.as_ref().ok().map(reqwest::Response::status),
+        upstream_started.elapsed(),
+    );
+    let response = response_result
+        .map_err(|error| sanitized_http_error(&error, "generation cancellation request"))?;
+    let status = response.status();
+    if !status.is_success() {
+        drain_bounded_control_response(response).await?;
+        return Err(AppError::Upstream(format!(
+            "generation cancellation returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+    if requires_delete_proof {
+        let body = bounded_json(response).await?;
+        if !comfyui_delete_confirmed(&body, upstream_job_id) {
+            return Err(AppError::Upstream(
+                "ComfyUI did not confirm the prompt deletion".into(),
+            ));
+        }
+    } else {
+        drain_bounded_control_response(response).await?;
+    }
+    // Only an explicit success proves cancellation. Treating a first 404 as
+    // success could refund a task that actually completed and was later
+    // purged by the provider, so absence remains retryable and keeps credit
+    // reserved for operator reconciliation.
+    terminal_cancelled(state, worker_id, job).await
+}
+
+fn comfyui_delete_confirmed(body: &Value, upstream_job_id: &str) -> bool {
+    body.get("deleted").is_some_and(|value| match value {
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_u64().is_some_and(|value| value > 0),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value.as_str().is_some_and(|value| value == upstream_job_id)),
+        _ => false,
+    })
+}
+
+async fn drain_bounded_control_response(response: Response) -> Result<(), AppError> {
+    let mut received = 0_usize;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|error| sanitized_http_error(&error, "generation cancellation response"))?;
+        received = received.saturating_add(chunk.len());
+        if received > MAX_CONTROL_BODY {
+            return Err(AppError::Upstream(
+                "generation cancellation response exceeds 4 MiB".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn submit(
@@ -649,6 +863,19 @@ async fn poll_comfy(
     if assets.len() > MAX_COMFY_ASSETS {
         return terminal_failure(state, worker_id, job, "comfyui_asset_limit_exceeded").await;
     }
+    let billed_units = match comfyui_billed_pixels(state, job, assets.len()).await? {
+        Some(units) if units > 0 && units <= job.estimated_units => units,
+        _ => {
+            return terminal_failure_billed(
+                state,
+                worker_id,
+                job,
+                "upstream_usage_exceeds_contract",
+                job.estimated_units,
+            )
+            .await;
+        }
+    };
     let attempt_nonce = uuid::Uuid::now_v7();
     let mut staging_lease = begin_generation_staging_attempt(
         state,
@@ -707,7 +934,7 @@ async fn poll_comfy(
         job,
         GenerationStagedAssets {
             attempt_nonce,
-            billed_units: 1,
+            billed_units,
             assets: archived_assets,
         },
         &staging_lease,
@@ -1001,6 +1228,26 @@ async fn terminal_failure(
     terminal_failure_billed(state, worker_id, job, error_code, 0).await
 }
 
+async fn terminal_cancelled(
+    state: &AppState,
+    worker_id: &str,
+    job: &GenerationJobWork,
+) -> Result<(), AppError> {
+    state
+        .db
+        .finish_generation_job(FinishGenerationJobInput {
+            job_id: job.job_id,
+            worker_id,
+            status: "cancelled",
+            billed_units: 0,
+            error_code: Some("cancelled_by_user"),
+            assets: &[],
+            staged_assets: None,
+        })
+        .await
+        .map(|_| ())
+}
+
 async fn terminal_failure_billed(
     state: &AppState,
     worker_id: &str,
@@ -1283,6 +1530,46 @@ mod tests {
             generation_request_hash("image-test", &json!({"prompt": "cat"})),
             generation_request_hash("image-test", &json!({"prompt": "dog"})),
         );
+    }
+
+    #[test]
+    fn comfyui_megapixel_contract_reserves_exact_pixels_and_bounds_outputs() {
+        assert_eq!(
+            comfyui_requested_pixels(&json!({
+                "parameters": {"width": 1024, "height": 768, "batch_size": 3}
+            }))
+            .unwrap(),
+            2_359_296
+        );
+        assert_eq!(
+            comfyui_requested_pixels(&json!({
+                "parameters": {"width": 512, "height": 512}
+            }))
+            .unwrap(),
+            262_144
+        );
+        for invalid in [
+            json!({"parameters": {"height": 512}}),
+            json!({"parameters": {"width": 512, "height": 0}}),
+            json!({"parameters": {"width": 512, "height": 512, "n": 17}}),
+            json!({"parameters": {"width": 512.5, "height": 512}}),
+        ] {
+            assert!(comfyui_requested_pixels(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn classic_comfyui_cancellation_requires_explicit_prompt_deletion_proof() {
+        assert!(comfyui_delete_confirmed(
+            &json!({"deleted": ["prompt-1"]}),
+            "prompt-1"
+        ));
+        assert!(comfyui_delete_confirmed(&json!({"deleted": 1}), "prompt-1"));
+        assert!(!comfyui_delete_confirmed(&json!({}), "prompt-1"));
+        assert!(!comfyui_delete_confirmed(
+            &json!({"deleted": ["another-prompt"]}),
+            "prompt-1"
+        ));
     }
 
     #[test]

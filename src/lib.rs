@@ -14,6 +14,8 @@ pub mod model;
 pub mod network;
 pub mod oauth;
 pub mod plugin;
+#[cfg(feature = "plugin-distribution")]
+pub mod plugin_distribution;
 pub mod pricing;
 pub mod provider;
 mod proxy_lifecycle;
@@ -58,6 +60,7 @@ impl AppState {
         }
         let archive = ArchiveStore::from_config(&config).await?;
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())?;
+        plugins.validate_stored_configurations().await?;
         let mut providers = ProviderCatalog::builtins();
         providers.extend(plugins.provider_types())?;
 

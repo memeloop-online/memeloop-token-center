@@ -65,6 +65,26 @@
       "additionalProperties": false,
       "properties": {
         "traffic_policy": { "type": "boolean", "default": false },
+        "request_rewrite": {
+          "type": "boolean",
+          "default": false,
+          "description": "Contributes bounded post-auth model, route, or canonical request rewriting through the WIT traffic-policy hook."
+        },
+        "configuration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema"],
+          "properties": {
+            "schema": {
+              "type": "object",
+              "description": "CSP-safe JSON Schema rendered by the operator and validated by the service. writeOnly fields are forbidden; credentials use provider credential_schema."
+            },
+            "default": {
+              "default": {},
+              "description": "Validated global fallback when no persisted global or tenant override exists."
+            }
+          }
+        },
         "providers": {
           "type": "array",
           "items": {

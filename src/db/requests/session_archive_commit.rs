@@ -543,7 +543,7 @@ fn replacement_for_gap(
     ))
 }
 
-fn session_archive_checkpoint_ms(
+pub(super) fn session_archive_checkpoint_ms(
     source_started_at: i64,
     source_completed_at: Option<i64>,
 ) -> Result<i64, AppError> {
@@ -559,7 +559,7 @@ fn session_archive_checkpoint_ms(
     Ok(source_completed_at.unwrap_or(source_started_at))
 }
 
-async fn advance_session_archive_checkpoint(
+pub(super) async fn advance_session_archive_checkpoint(
     tx: &mut Transaction<'_, Any>,
     tenant_id: Uuid,
     archive_source: &str,

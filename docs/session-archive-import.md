@@ -127,7 +127,12 @@ Required runtime access is:
 - a pod-local writable plan directory. The reference Job mounts `/plan` as a
   `1200Mi` `emptyDir` (leaving metadata/journal headroom above the 1 GiB plan
   cap) and sets `SESSION_ARCHIVE_MAX_PLAN_BYTES=1073741824`; do not put the plan
-  on the source PVC or a volume shared with another pod;
+  on the source PVC or a volume shared with another pod. The binary has
+  non-overridable compile-time ceilings of 16 MiB per JSONL record and 1 GiB per
+  plan. `SESSION_ARCHIVE_MAX_LINE_BYTES` and
+  `SESSION_ARCHIVE_MAX_PLAN_BYTES` may lower those limits but cannot raise them;
+  oversized settings are rejected before database or object-store connections
+  are opened;
 - the target PostgreSQL connection;
 - write/list access to the target archive S3 bucket;
 - only the target database and archive-store credentials, supplied by Secret

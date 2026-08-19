@@ -294,6 +294,93 @@ async fn candidates_are_visible_but_do_not_merge_and_empty_context_never_links()
 }
 
 #[tokio::test]
+async fn explicit_compaction_with_retained_content_links_but_weak_similarity_does_not_merge() {
+    let fixture = Fixture::new("compaction-overlap").await;
+    let first_request = fixture.start_request("memory://full-context").await;
+    let first_cluster = fixture
+        .state
+        .db
+        .record_conversation_observation(
+            &fixture.key,
+            first_request,
+            &json!({"input": [
+                {"role": "system", "content": "shared client bootstrap"},
+                {"role": "user", "content": "retain this exact turn"},
+                {"role": "assistant", "content": "long answer"}
+            ]}),
+            &ConversationHints::default(),
+            Some("MetadataPoorClient"),
+        )
+        .await
+        .expect("record full context");
+
+    let compacted_request = fixture.start_request("memory://compacted-context").await;
+    let compacted_cluster = fixture
+        .state
+        .db
+        .record_conversation_observation(
+            &fixture.key,
+            compacted_request,
+            &json!({"input": [
+                {"role": "system", "content": "replacement summary"},
+                {"role": "user", "content": "retain this exact turn"},
+                {"role": "user", "content": "continue after compaction"}
+            ]}),
+            &ConversationHints {
+                compaction: true,
+                ..ConversationHints::default()
+            },
+            Some("MetadataPoorClient"),
+        )
+        .await
+        .expect("record compacted context");
+    assert_eq!(compacted_cluster, first_cluster);
+
+    let detail = fixture
+        .state
+        .db
+        .conversation_cluster_detail(
+            fixture.key.key_id,
+            first_cluster,
+            memeloop_token_center::db::ConversationDetailFilter {
+                limit: 10,
+                before_created_at: None,
+                before_request_id: None,
+            },
+        )
+        .await
+        .expect("compacted conversation detail");
+    assert_eq!(detail.requests.len(), 2);
+    assert_eq!(detail.edges.len(), 1);
+    assert_eq!(detail.edges[0].relation, "compacts");
+    assert_eq!(detail.edges[0].evidence["compaction_overlap"], true);
+
+    let weak_request = fixture.start_request("memory://weak-compaction").await;
+    let weak_cluster = fixture
+        .state
+        .db
+        .record_conversation_observation(
+            &fixture.key,
+            weak_request,
+            &json!({"input": [
+                {"role": "system", "content": "shared client bootstrap"},
+                {"role": "user", "content": "an unrelated task"}
+            ]}),
+            &ConversationHints {
+                compaction: true,
+                ..ConversationHints::default()
+            },
+            Some("MetadataPoorClient"),
+        )
+        .await
+        .expect("record weak compaction candidate");
+    assert_ne!(
+        weak_cluster, first_cluster,
+        "a system prompt alone is not ancestry"
+    );
+}
+
+#[tokio::test]
 async fn self_conversations_never_infer_or_expose_metadata_across_stable_keys() {
     let directory = tempfile::tempdir().expect("temporary database directory");
     let database_url = format!(

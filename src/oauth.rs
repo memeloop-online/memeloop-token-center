@@ -73,6 +73,13 @@ pub struct StartCursorLogin {
     pub provider_config: Value,
     pub endpoints: CursorOAuthEndpoints,
     pub oauth_driver: String,
+    pub reauthorize: Option<OAuthReauthorizationTarget>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OAuthReauthorizationTarget {
+    pub account_id: Uuid,
+    pub expected_updated_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -97,6 +104,8 @@ struct CursorLoginState {
     poll_url: String,
     refresh_url: String,
     expires_at: i64,
+    #[serde(default)]
+    reauthorize: Option<OAuthReauthorizationTarget>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +118,7 @@ pub struct ReadyCursorLogin {
     pub oauth_driver: String,
     pub refresh_url: String,
     pub credential: UpstreamCredential,
+    pub reauthorize: Option<OAuthReauthorizationTarget>,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +134,7 @@ pub struct StartSubscriptionBridgeLogin {
     pub provider_config: Value,
     pub bridge_secret: Option<String>,
     pub allow_loopback: bool,
+    pub reauthorize: Option<OAuthReauthorizationTarget>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,6 +146,8 @@ struct SubscriptionBridgeLoginState {
     bridge_secret: Option<String>,
     bridge_state: String,
     expires_at: i64,
+    #[serde(default)]
+    reauthorize: Option<OAuthReauthorizationTarget>,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +157,7 @@ pub struct ReadySubscriptionBridgeLogin {
     pub account_name: String,
     pub provider_config: Value,
     pub credential: UpstreamCredential,
+    pub reauthorize: Option<OAuthReauthorizationTarget>,
 }
 
 #[derive(Clone, Debug)]
@@ -400,6 +414,7 @@ pub async fn start_subscription_bridge_login(
         bridge_secret: input.bridge_secret,
         bridge_state,
         expires_at,
+        reauthorize: input.reauthorize,
     };
     Ok(OAuthLoginStart {
         driver: format!("subscription-bridge:{provider}"),
@@ -473,6 +488,7 @@ pub async fn poll_subscription_bridge_login(
                     account_name: state.account_name,
                     provider_config: state.provider_config,
                     credential,
+                    reauthorize: state.reauthorize,
                 },
             )))
         }
@@ -544,10 +560,7 @@ async fn subscription_bridge_call(
         Some(secret) => request.bearer_auth(secret),
         None => request,
     };
-    let response = request
-        .send()
-        .await
-        .map_err(|error| AppError::Upstream(format!("subscription bridge failed: {error}")))?;
+    let response = request.send().await.map_err(AppError::from)?;
     let status = response.status();
     let body = bounded_body(response).await?;
     if !status.is_success() {
@@ -604,6 +617,7 @@ pub fn start_cursor_login(
         poll_url: poll_url.to_string(),
         refresh_url: refresh_url.to_string(),
         expires_at,
+        reauthorize: input.reauthorize,
     };
     let session_token = seal_private_json(&state, key_material, CURSOR_LOGIN_AAD)?;
     Ok(OAuthLoginStart {
@@ -649,7 +663,7 @@ pub async fn poll_cursor_login(
         .get(poll_url)
         .send()
         .await
-        .map_err(|error| AppError::Upstream(format!("Cursor OAuth poll failed: {error}")))?;
+        .map_err(AppError::from)?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(CursorPollResult::Pending {
             retry_after_seconds: 1,
@@ -693,6 +707,7 @@ pub async fn poll_cursor_login(
             prefix: "Bearer ".to_owned(),
             adapter_state: None,
         },
+        reauthorize: state.reauthorize,
     })))
 }
 
@@ -868,7 +883,7 @@ async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> 
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| AppError::Upstream(error.to_string()))?;
+        let chunk = chunk.map_err(AppError::from)?;
         if body.len().saturating_add(chunk.len()) > MAX_OAUTH_RESPONSE_BYTES {
             return Err(AppError::Upstream("OAuth response is too large".into()));
         }
@@ -894,6 +909,7 @@ mod tests {
 
     #[test]
     fn cursor_login_state_is_encrypted_and_contains_pkce_query() {
+        let stable_account_id = Uuid::now_v7();
         let started = start_cursor_login(
             StartCursorLogin {
                 tenant_external_id: "default".to_owned(),
@@ -902,6 +918,10 @@ mod tests {
                 provider_config: json!({"base_url": "https://provider.example"}),
                 endpoints: CursorOAuthEndpoints::default(),
                 oauth_driver: "cursor".to_owned(),
+                reauthorize: Some(OAuthReauthorizationTarget {
+                    account_id: stable_account_id,
+                    expected_updated_at: 999,
+                }),
             },
             b"test material with at least 32 bytes",
             1_000,
@@ -910,6 +930,11 @@ mod tests {
         assert!(started.login_url.contains("challenge="));
         assert!(started.login_url.contains("uuid="));
         assert!(!started.session_token.contains("cursor-one"));
+        assert!(
+            !started
+                .session_token
+                .contains(stable_account_id.to_string().as_str())
+        );
         assert_eq!(started.expires_at, 601_000);
     }
 
@@ -927,6 +952,7 @@ mod tests {
                     refresh_url: "http://oauth-adapter.default.svc/refresh".to_owned(),
                 },
                 oauth_driver: "provider_adapter".to_owned(),
+                reauthorize: None,
             },
             b"test material with at least 32 bytes",
             1_000,
@@ -947,6 +973,7 @@ mod tests {
                 provider_config: json!({"base_url": "https://provider.example"}),
                 endpoints: CursorOAuthEndpoints::default(),
                 oauth_driver: "cursor".to_owned(),
+                reauthorize: None,
             },
             key_material,
             1_000,

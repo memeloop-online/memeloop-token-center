@@ -45,7 +45,8 @@ export interface StatsBucket {
   requests: number;
   input_tokens: number;
   output_tokens: number;
-  cost: string;
+  cost: string | null;
+  costs: UsageAnalysisCost[];
 }
 
 export interface UsageAnalysisCost {
@@ -88,7 +89,8 @@ export interface SelfStats {
     failed_requests: number;
     input_tokens: number;
     output_tokens: number;
-    total_cost: string;
+    total_cost: string | null;
+    costs: UsageAnalysisCost[];
   };
   by_model: StatsBucket[];
   by_day: StatsBucket[];
@@ -109,6 +111,7 @@ export interface OperatorUsageAnalysis {
   time_zone: 'UTC';
   p95_is_approximate: boolean;
   p95_method: string;
+  upstream_grouping: 'stable_account';
   summary: UsageAnalysisMetrics;
   time_series: UsageAnalysisTimeBucket[];
   by_model: UsageAnalysisBucket[];
@@ -277,7 +280,8 @@ export interface GenerationJob {
   completed_at: number | null;
   model: string;
   driver: string;
-  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  billing_unit: 'job' | 'second' | 'image' | 'megapixel';
+  status: 'queued' | 'running' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled';
   upstream_job_id: string | null;
   estimated_units: number;
   billed_units: number | null;
@@ -326,8 +330,23 @@ export interface PluginManifest {
   >;
   contributions: {
     traffic_policy?: boolean;
+    request_rewrite?: boolean;
+    configuration?: {
+      schema: Record<string, unknown>;
+      default: unknown;
+    } | null;
     providers?: ProviderType[];
   };
+}
+
+export interface PluginConfiguration {
+  plugin_id: string;
+  tenant_external_id: string | null;
+  value: unknown;
+  source: 'default' | 'global' | 'tenant';
+  scope_version: number;
+  updated_at: number | null;
+  schema_digest: string;
 }
 
 export interface UpstreamAccount {

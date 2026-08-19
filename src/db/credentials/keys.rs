@@ -13,17 +13,153 @@ pub struct CreateKeyInput {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ProvisionedCloudCredential {
+    pub key_id: Uuid,
+    pub account_id: Uuid,
+    pub alias: String,
+    pub currency: String,
+    pub credential_generation: i64,
+    pub fingerprint: String,
+    /// Present only while the encrypted one-time provisioning response is
+    /// retained. Stable IDs remain replayable after the secret expires.
+    pub key: Option<String>,
+}
+
+pub struct CloudCredentialEntitlementBinding {
+    pub tenant_external_id: String,
+    pub principal_external_id: String,
+    pub provider: String,
+    pub external_subscription_id: String,
+    pub currency: String,
+    pub provisioning_idempotency_key: String,
+}
+
 impl Database {
+    pub async fn cloud_credential_for_entitlement(
+        &self,
+        binding: CloudCredentialEntitlementBinding,
+        pepper: &[u8],
+    ) -> Result<ProvisionedCloudCredential, AppError> {
+        let entitlement_exists = sqlx::query(
+            "SELECT e.id FROM subscription_entitlements e JOIN tenants t ON t.id = e.tenant_id WHERE t.external_id = $1 AND e.provider = $2 AND e.external_subscription_id = $3",
+        )
+        .bind(&binding.tenant_external_id)
+        .bind(&binding.provider)
+        .bind(&binding.external_subscription_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some();
+        if !entitlement_exists {
+            return Err(AppError::NotFound);
+        }
+        let row = sqlx::query(
+            "SELECT k.id, k.account_id, k.alias, k.currency, k.credential_generation, k.issued_key_ciphertext, p.external_id AS principal_external_id, COALESCE((SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1), (SELECT lc.fingerprint FROM legacy_key_credentials lc WHERE lc.key_id = k.id AND lc.generation = k.credential_generation AND lc.revoked_at IS NULL ORDER BY lc.id LIMIT 1)) AS fingerprint FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN subscription_entitlements e ON e.tenant_id = t.id AND e.account_id = k.account_id WHERE t.external_id = $1 AND p.external_id = $2 AND e.provider = $3 AND e.external_subscription_id = $4 AND k.provisioning_idempotency_key = $5",
+        )
+        .bind(&binding.tenant_external_id)
+        .bind(&binding.principal_external_id)
+        .bind(&binding.provider)
+        .bind(&binding.external_subscription_id)
+        .bind(&binding.provisioning_idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::Forbidden)?;
+        provisioned_cloud_credential_from_row(
+            row,
+            &binding.principal_external_id,
+            Some(&binding.currency),
+            pepper,
+        )
+    }
+
+    /// Idempotently provisions the one stable downstream credential used by a
+    /// MemeLoop Cloud principal. The deterministic idempotency key is scoped by
+    /// tenant. Replays after secret-retention expiry return stable public
+    /// metadata without resurrecting or rotating credential material.
+    pub async fn provision_cloud_credential(
+        &self,
+        tenant_external_id: &str,
+        principal_external_id: &str,
+        currency: &str,
+        provisioning_idempotency_key: &str,
+        pepper: &[u8],
+    ) -> Result<ProvisionedCloudCredential, AppError> {
+        let existing = sqlx::query(
+            "SELECT k.id, k.account_id, k.alias, k.currency, k.credential_generation, k.issued_key_ciphertext, p.external_id AS principal_external_id, COALESCE((SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1), (SELECT lc.fingerprint FROM legacy_key_credentials lc WHERE lc.key_id = k.id AND lc.generation = k.credential_generation AND lc.revoked_at IS NULL ORDER BY lc.id LIMIT 1)) AS fingerprint FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id WHERE t.external_id = $1 AND k.provisioning_idempotency_key = $2",
+        )
+        .bind(tenant_external_id)
+        .bind(provisioning_idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = existing {
+            return provisioned_cloud_credential_from_row(
+                row,
+                principal_external_id,
+                Some(currency),
+                pepper,
+            );
+        }
+
+        let issued = self
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: tenant_external_id.to_owned(),
+                    principal_external_id: principal_external_id.to_owned(),
+                    alias: "MemeLoop Cloud".to_owned(),
+                    currency: currency.to_owned(),
+                    // The signed subscription snapshot is applied only after
+                    // the entitlement version is accepted. This deny-by-
+                    // default bootstrap policy prevents a partially processed
+                    // registration from spending credit.
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::ZERO,
+                    idempotency_key: Some(provisioning_idempotency_key.to_owned()),
+                },
+                pepper,
+            )
+            .await?;
+        Ok(ProvisionedCloudCredential {
+            key_id: issued.key_id,
+            account_id: issued.account_id,
+            alias: issued.alias,
+            currency: issued.currency,
+            credential_generation: issued.credential_generation,
+            fingerprint: issued.fingerprint,
+            key: Some(issued.key),
+        })
+    }
+
     pub async fn list_managed_keys(
         &self,
         tenant_external_id: Option<&str>,
         principal_external_id: Option<&str>,
     ) -> Result<Vec<ManagedKeyView>, AppError> {
+        self.list_managed_keys_page(tenant_external_id, principal_external_id, 500, None)
+            .await
+    }
+
+    /// Lists stable credential identities using an exclusive descending
+    /// `(created_at, key_id)` cursor. The cursor is deliberately composed only
+    /// from public response fields, so a caller reconciling a timed-out create
+    /// never needs the one-time secret to continue scanning.
+    pub async fn list_managed_keys_page(
+        &self,
+        tenant_external_id: Option<&str>,
+        principal_external_id: Option<&str>,
+        limit: i64,
+        before: Option<(i64, Uuid)>,
+    ) -> Result<Vec<ManagedKeyView>, AppError> {
+        let (before_created_at, before_id) = before
+            .map(|(created_at, id)| (created_at, id.to_string()))
+            .unwrap_or_else(|| (i64::MAX, "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned()));
         let rows = sqlx::query(
-            "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, COALESCE((SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1), (SELECT lc.fingerprint FROM legacy_key_credentials lc WHERE lc.key_id = k.id AND lc.generation = k.credential_generation AND lc.revoked_at IS NULL ORDER BY lc.id LIMIT 1)) AS fingerprint, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) ORDER BY k.created_at DESC, k.id DESC LIMIT 500",
+            "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, COALESCE((SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1), (SELECT lc.fingerprint FROM legacy_key_credentials lc WHERE lc.key_id = k.id AND lc.generation = k.credential_generation AND lc.revoked_at IS NULL ORDER BY lc.id LIMIT 1)) AS fingerprint, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND (k.created_at < $3 OR (k.created_at = $3 AND k.id < $4)) ORDER BY k.created_at DESC, k.id DESC LIMIT $5",
         )
         .bind(tenant_external_id.unwrap_or_default())
         .bind(principal_external_id.unwrap_or_default())
+        .bind(before_created_at)
+        .bind(before_id)
+        .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(managed_key_view).collect()
@@ -121,7 +257,7 @@ impl Database {
         let issued = crypto::issue_credential(key_id, pepper);
         let policy_json = serde_json::to_string(&input.policy).map_err(|_| AppError::Internal)?;
         let initial_balance_micros = decimal_to_micros(input.initial_balance)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
 
         if let Some(idempotency_key) = idempotency_key {
             if matches!(self.backend, DatabaseBackend::PostgreSql) {
@@ -277,7 +413,7 @@ impl Database {
         key_id: Uuid,
         policy: KeyPolicy,
     ) -> Result<KeyPolicy, AppError> {
-        validate_policy_budgets(&policy)?;
+        validate_key_policy(&policy)?;
         let policy_json = serde_json::to_string(&policy).map_err(|_| AppError::Internal)?;
         let result = sqlx::query(
             "UPDATE key_records SET policy_json = $1, updated_at = $2 WHERE id = $3 AND status = 'active'",
@@ -292,6 +428,41 @@ impl Database {
         }
         Ok(policy)
     }
+
+    /// Applies a Cloud policy snapshot only while the corresponding durable
+    /// subscription version is still current. This compare-and-set prevents a
+    /// delayed older webhook from rolling policy back after a newer quota
+    /// snapshot has committed.
+    pub async fn update_key_policy_for_entitlement_version(
+        &self,
+        key_id: Uuid,
+        tenant_external_id: &str,
+        provider: &str,
+        external_subscription_id: &str,
+        version: i64,
+        policy: KeyPolicy,
+    ) -> Result<KeyPolicy, AppError> {
+        validate_key_policy(&policy)?;
+        let policy_json = serde_json::to_string(&policy).map_err(|_| AppError::Internal)?;
+        let result = sqlx::query(
+            "UPDATE key_records SET policy_json = $1, updated_at = $2 WHERE id = $3 AND status = 'active' AND EXISTS (SELECT 1 FROM subscription_entitlements e JOIN tenants t ON t.id = e.tenant_id WHERE t.external_id = $4 AND e.account_id = key_records.account_id AND e.provider = $5 AND e.external_subscription_id = $6 AND e.version = $7)",
+        )
+        .bind(policy_json)
+        .bind(unix_millis())
+        .bind(key_id.to_string())
+        .bind(tenant_external_id)
+        .bind(provider)
+        .bind(external_subscription_id)
+        .bind(version)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "credential policy snapshot is stale or the credential is not active".into(),
+            ));
+        }
+        Ok(policy)
+    }
     pub async fn rotate_key(
         &self,
         key_id: Uuid,
@@ -303,7 +474,7 @@ impl Database {
         let now = unix_millis();
         let request_hash = credential_rotation_request_hash(KEY_ROTATION_RESOURCE, key_id);
         let expires_at = now.saturating_add(CREDENTIAL_ROTATION_REPLAY_TTL_MILLIS);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         if let Some(replay) = claim_credential_rotation(
             &mut tx,
             KEY_ROTATION_RESOURCE,
@@ -599,6 +770,49 @@ impl Database {
     }
 }
 
+fn provisioned_cloud_credential_from_row(
+    row: AnyRow,
+    expected_principal: &str,
+    expected_currency: Option<&str>,
+    pepper: &[u8],
+) -> Result<ProvisionedCloudCredential, AppError> {
+    let principal: String = row.try_get("principal_external_id")?;
+    let alias: String = row.try_get("alias")?;
+    let currency: String = row.try_get("currency")?;
+    if principal != expected_principal
+        || alias != "MemeLoop Cloud"
+        || expected_currency.is_some_and(|expected| !currency.eq_ignore_ascii_case(expected))
+    {
+        return Err(AppError::Conflict(
+            "MemeLoop Cloud principal identity or currency does not match its stable credential"
+                .into(),
+        ));
+    }
+    let fingerprint: Option<String> = row.try_get("fingerprint")?;
+    let fingerprint = fingerprint.ok_or_else(|| {
+        AppError::Conflict("the stable MemeLoop Cloud credential is not active".into())
+    })?;
+    let generation: i64 = row.try_get("credential_generation")?;
+    let ciphertext: Option<String> = row.try_get("issued_key_ciphertext")?;
+    let issued = if generation == 1 {
+        ciphertext
+            .as_deref()
+            .map(|ciphertext| open_private_json(ciphertext, pepper, KEY_PROVISIONING_AAD))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(ProvisionedCloudCredential {
+        key_id: parse_uuid(row.try_get("id")?)?,
+        account_id: parse_uuid(row.try_get("account_id")?)?,
+        alias,
+        currency,
+        credential_generation: generation,
+        fingerprint,
+        key: issued.map(|issued: IssuedKey| issued.key),
+    })
+}
+
 async fn insert_credential(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     issued: &crypto::IssuedCredential,
@@ -637,7 +851,7 @@ fn managed_key_view(row: AnyRow) -> Result<ManagedKeyView, AppError> {
         reserved_balance: micros_to_decimal_string(row.try_get("reserved_micros")?),
     })
 }
-fn validate_policy_budgets(policy: &KeyPolicy) -> Result<(), AppError> {
+pub(crate) fn validate_key_policy(policy: &KeyPolicy) -> Result<(), AppError> {
     if policy.requests_per_minute == 0
         || policy.tokens_per_minute == 0
         || policy.max_concurrency == 0
@@ -697,7 +911,7 @@ fn validate_key_input(input: &CreateKeyInput) -> Result<(), AppError> {
             )));
         }
     }
-    validate_policy_budgets(&input.policy)
+    validate_key_policy(&input.policy)
 }
 fn validate_key_alias(alias: &str) -> Result<(), AppError> {
     if alias.is_empty() || alias.chars().count() > 200 || alias.chars().any(char::is_control) {

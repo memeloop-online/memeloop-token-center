@@ -971,7 +971,7 @@ async fn exercise_atomic_generation_start(database_url: &str, postgres: bool) {
 
     fixture
         .database
-        .cancel_queued_generation_job(fixture.key.key_id, job_id)
+        .cancel_generation_job(fixture.key.key_id, job_id)
         .await
         .unwrap();
     let before_failure = atomic_generation_state(&pool, &fixture.key).await;
@@ -1390,7 +1390,7 @@ async fn queued_cancellation_is_idempotent_and_refunds_in_one_transaction() {
     );
 
     let cancelled = database
-        .cancel_queued_generation_job(key.key_id, job.job_id)
+        .cancel_generation_job(key.key_id, job.job_id)
         .await
         .unwrap();
     assert_eq!(cancelled.status, "cancelled");
@@ -1402,7 +1402,7 @@ async fn queued_cancellation_is_idempotent_and_refunds_in_one_transaction() {
     );
 
     let replayed = database
-        .cancel_queued_generation_job(key.key_id, job.job_id)
+        .cancel_generation_job(key.key_id, job.job_id)
         .await
         .unwrap();
     assert_eq!(replayed.status, "cancelled");
@@ -1420,9 +1420,117 @@ async fn queued_cancellation_is_idempotent_and_refunds_in_one_transaction() {
         0,
         "replayed cancellation must release active concurrency exactly once"
     );
-    let stats = database.stats(key.key_id).await.unwrap();
+    let stats = database
+        .stats_filtered(
+            key.key_id,
+            StatsFilter {
+                from_created_at: Some(job.created_at),
+                to_created_at: Some(unix_millis().saturating_add(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(stats.summary.total_requests, 1);
     assert_eq!(stats.summary.failed_requests, 1);
+}
+
+#[tokio::test]
+async fn running_cancellation_fences_the_polling_lease_and_refunds_only_after_confirmation() {
+    let (_directory, database, key, upstream_id, price) = fixture().await;
+    let reservation = reserve(&database, &key, &price).await;
+    let job = database
+        .create_generation_job(input(&key, upstream_id, reservation, &price))
+        .await
+        .unwrap();
+    let submit_worker = "generation-cancel-submit-worker";
+    database
+        .claim_generation_job(submit_worker)
+        .await
+        .unwrap()
+        .expect("queued job");
+    let submission_nonce = Uuid::now_v7();
+    database
+        .mark_generation_submitting(job.job_id, submit_worker, submission_nonce)
+        .await
+        .unwrap();
+    database
+        .mark_generation_submitted(
+            job.job_id,
+            submit_worker,
+            submission_nonce,
+            "upstream-running-job",
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2_050)).await;
+    let stale_worker = "generation-cancel-stale-poller";
+    let stale_claim = database
+        .claim_generation_job(stale_worker)
+        .await
+        .unwrap()
+        .expect("running job claim");
+    assert_eq!(stale_claim.status, "running");
+
+    let cancelling = database
+        .cancel_generation_job(key.key_id, job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(cancelling.status, "cancelling");
+    assert_eq!(
+        database.key_view(&key).await.unwrap().available_balance,
+        "9.75",
+        "an unconfirmed upstream cancellation must remain reserved"
+    );
+    assert!(matches!(
+        database
+            .finish_generation_job(FinishGenerationJobInput {
+                job_id: job.job_id,
+                worker_id: stale_worker,
+                status: "failed",
+                billed_units: 0,
+                error_code: Some("comfyui_failed"),
+                assets: &[],
+                staged_assets: None,
+            })
+            .await,
+        Err(AppError::NotFound)
+    ));
+
+    let replay = database
+        .cancel_generation_job(key.key_id, job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(replay.status, "cancelling");
+    let cancel_worker = "generation-cancel-confirm-worker";
+    let cancel_claim = database
+        .claim_generation_job(cancel_worker)
+        .await
+        .unwrap()
+        .expect("cancellation claim");
+    assert_eq!(cancel_claim.status, "cancelling");
+    database
+        .finish_generation_job(FinishGenerationJobInput {
+            job_id: job.job_id,
+            worker_id: cancel_worker,
+            status: "cancelled",
+            billed_units: 0,
+            error_code: Some("cancelled_by_user"),
+            assets: &[],
+            staged_assets: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        database.key_view(&key).await.unwrap().available_balance,
+        "10"
+    );
+    let terminal_replay = database
+        .cancel_generation_job(key.key_id, job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(terminal_replay.status, "cancelled");
+    assert_eq!(terminal_replay.cost, "0");
 }
 
 #[tokio::test]
@@ -1490,7 +1598,17 @@ async fn terminal_generation_stats_are_idempotent_and_keep_exact_filters() {
     let completed_at = finished.completed_at.unwrap();
     let duration_ms = completed_at.saturating_sub(job.created_at);
 
-    let stats = database.stats(key.key_id).await.unwrap();
+    let stats = database
+        .stats_filtered(
+            key.key_id,
+            StatsFilter {
+                from_created_at: Some(job.created_at),
+                to_created_at: Some(unix_millis().saturating_add(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(stats.summary.total_requests, 1);
     assert_eq!(stats.summary.successful_requests, 1);
 
@@ -1514,7 +1632,7 @@ async fn terminal_generation_stats_are_idempotent_and_keep_exact_filters() {
         .await
         .unwrap();
     assert_eq!(exact.summary.total_requests, 1);
-    assert_eq!(exact.summary.total_cost, "0.25");
+    assert_eq!(exact.summary.total_cost.as_deref(), Some("0.25"));
 
     let excludes_first_millisecond = database
         .stats_filtered(
@@ -1914,9 +2032,7 @@ async fn an_active_generation_lease_blocks_client_cancellation() {
         .await
         .unwrap();
     assert!(matches!(
-        database
-            .cancel_queued_generation_job(key.key_id, job.job_id)
-            .await,
+        database.cancel_generation_job(key.key_id, job.job_id).await,
         Err(AppError::BadRequest(_))
     ));
     assert_eq!(

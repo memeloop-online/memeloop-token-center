@@ -13,7 +13,10 @@ use crate::{
     model::ModelPriceView,
     network::{self, OutboundScope},
 };
-const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_SYNC_MODELS: usize = 500;
+const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SOURCE_PRICES: usize = 20_000;
+const MAX_CANDIDATES_PER_MODEL: usize = 8;
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Debug)]
@@ -103,6 +106,11 @@ async fn sync_model_prices_with_sources(
     source_specs: &[(&'static str, &str)],
     allow_test_loopback: bool,
 ) -> Result<ModelPriceSyncResult, AppError> {
+    if models.len() > MAX_SYNC_MODELS {
+        return Err(AppError::BadRequest(format!(
+            "model price sync accepts at most {MAX_SYNC_MODELS} models"
+        )));
+    }
     models = normalized_models(models);
     if models.is_empty() {
         return Err(AppError::BadRequest(
@@ -150,7 +158,7 @@ async fn sync_model_prices_with_sources(
     }
 
     let existing = db
-        .list_model_prices(currency)
+        .model_price_views_for_models(currency, &models)
         .await?
         .into_iter()
         .map(|price| (price.model.clone(), price))
@@ -349,6 +357,7 @@ fn parse_models_dev(document: &Value) -> Result<(Vec<RemotePrice>, usize), AppEr
                 output_per_million: output,
                 service_tier: "default".to_owned(),
             });
+            ensure_price_count("models.dev", prices.len())?;
         }
     }
     ensure_prices("models.dev", prices, skipped)
@@ -385,6 +394,7 @@ fn parse_litellm(document: &Value) -> Result<(Vec<RemotePrice>, usize), AppError
                 .unwrap_or("default")
                 .to_owned(),
         });
+        ensure_price_count("litellm", prices.len())?;
     }
     ensure_prices("litellm", prices, skipped)
 }
@@ -433,8 +443,19 @@ fn parse_openrouter(document: &Value) -> Result<(Vec<RemotePrice>, usize), AppEr
             output_per_million: output * million,
             service_tier: "default".to_owned(),
         });
+        ensure_price_count("openrouter", prices.len())?;
     }
     ensure_prices("openrouter", prices, skipped)
+}
+
+fn ensure_price_count(source: &str, count: usize) -> Result<(), AppError> {
+    if count > MAX_SOURCE_PRICES {
+        Err(AppError::Upstream(format!(
+            "{source} catalog exceeded the model limit"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn ensure_prices(
@@ -474,36 +495,47 @@ fn match_price(
     prices: &[RemotePrice],
 ) -> (Option<RemotePrice>, Vec<SyncCandidate>) {
     let requested = normalize_identity(requested);
-    let exact = prices
-        .iter()
-        .filter(|price| normalize_identity(&price.source_model_id) == requested)
-        .cloned()
-        .collect::<Vec<_>>();
-    if exact.len() == 1 {
+    let (exact_count, exact) = bounded_matches(prices, |price| {
+        normalize_identity(&price.source_model_id) == requested
+    });
+    if exact_count == 1 {
         return (exact.into_iter().next(), Vec::new());
     }
-    if exact.len() > 1 {
+    if exact_count > 1 {
         return (None, candidates(exact, "ambiguous exact identity"));
     }
     let requested_tail = model_tail(&requested);
-    let tail = prices
-        .iter()
-        .filter(|price| model_tail(&normalize_identity(&price.source_model_id)) == requested_tail)
-        .cloned()
-        .collect::<Vec<_>>();
-    if tail.len() == 1 {
+    let (tail_count, tail) = bounded_matches(prices, |price| {
+        model_tail(&normalize_identity(&price.source_model_id)) == requested_tail
+    });
+    if tail_count == 1 {
         return (tail.into_iter().next(), Vec::new());
     }
-    if tail.len() > 1 {
+    if tail_count > 1 {
         return (None, candidates(tail, "provider prefix is ambiguous"));
     }
     (None, Vec::new())
 }
 
+fn bounded_matches(
+    prices: &[RemotePrice],
+    mut predicate: impl FnMut(&RemotePrice) -> bool,
+) -> (usize, Vec<RemotePrice>) {
+    let mut count = 0_usize;
+    let mut matches = Vec::with_capacity(MAX_CANDIDATES_PER_MODEL);
+    for price in prices.iter().filter(|price| predicate(price)) {
+        count = count.saturating_add(1);
+        if matches.len() < MAX_CANDIDATES_PER_MODEL {
+            matches.push(price.clone());
+        }
+    }
+    (count, matches)
+}
+
 fn candidates(prices: Vec<RemotePrice>, reason: &str) -> Vec<SyncCandidate> {
     prices
         .into_iter()
-        .take(8)
+        .take(MAX_CANDIDATES_PER_MODEL)
         .map(|price| SyncCandidate {
             source_model_id: price.source_model_id,
             source: price.source.to_owned(),
@@ -523,7 +555,6 @@ fn normalized_models(models: Vec<String>) -> Vec<String> {
         .collect::<Vec<_>>();
     models.sort();
     models.dedup();
-    models.truncate(500);
     models
 }
 
@@ -641,6 +672,62 @@ mod tests {
         let (matched, candidates) = match_price("gpt-5", &prices);
         assert!(matched.is_none());
         assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn ambiguous_matches_retain_only_a_bounded_candidate_sample() {
+        let prices = (0..(MAX_CANDIDATES_PER_MODEL + 5))
+            .map(|index| price("models.dev", &format!("provider-{index}/gpt-5")))
+            .collect::<Vec<_>>();
+        let (matched, candidates) = match_price("gpt-5", &prices);
+        assert!(matched.is_none());
+        assert_eq!(candidates.len(), MAX_CANDIDATES_PER_MODEL);
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_model_lists_over_the_hard_limit_before_fetching() {
+        let (_directory, database) = test_database().await;
+        let models = (0..=MAX_SYNC_MODELS)
+            .map(|index| format!("model-{index}"))
+            .collect();
+        let error = sync_model_prices_with_sources(
+            &database,
+            &reqwest::Client::new(),
+            models,
+            "USD",
+            &[],
+            true,
+        )
+        .await
+        .expect_err("oversized explicit model list must fail closed");
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert!(error.to_string().contains("at most 500 models"));
+    }
+
+    #[tokio::test]
+    async fn model_price_listing_pages_models_with_their_tiers() {
+        let (_directory, database) = test_database().await;
+        for model in ["model-a", "model-b"] {
+            database
+                .upsert_model_price(model, "USD", Decimal::ONE, Decimal::TWO)
+                .await
+                .expect("model price fixture");
+        }
+
+        let page = database
+            .list_model_prices_page("USD", 1, 1)
+            .await
+            .expect("bounded model price page");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].model, "model-b");
+        assert_eq!(page[0].tiers.len(), 1);
+        assert_eq!(page[0].tiers[0].service_tier, "default");
+
+        let error = database
+            .list_model_prices_page("USD", 1_001, 0)
+            .await
+            .expect_err("oversized model price pages must fail closed");
+        assert!(matches!(error, AppError::BadRequest(_)));
     }
 
     #[test]

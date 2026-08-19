@@ -1,0 +1,234 @@
+use std::time::Duration;
+
+use chrono::{Days, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use sqlx::{
+    Any, AnyConnection, AnyPool, Row, Transaction,
+    any::{AnyPoolOptions, AnyQueryResult, AnyRow},
+};
+use uuid::Uuid;
+
+use crate::{
+    conversation::{ConversationHints, RelationKind, build_prefix, extract_atoms},
+    crypto,
+    error::{AppError, LimitReason},
+    model::{
+        ArchivedGenerationAsset, AuthenticatedKey, AuthenticatedService, ConversationClusterDetail,
+        ConversationClusterView, ConversationCursor, ConversationEdgeView, ConversationRequestView,
+        EntitlementReconcileResult, EntitlementView, GenerationAssetDownload, GenerationAssetView,
+        GenerationJobView, GenerationJobWork, GenerationPrice, GenerationStagedAssets, IssuedKey,
+        IssuedServiceToken, JSON_SAFE_INTEGER_MAX, KeyAliasView, KeyBudgetSnapshot,
+        KeyConcurrencySnapshot, KeyLimitSnapshot, KeyPolicy, KeyRateLimitSnapshot, KeyView,
+        LedgerEntryView, LegacyCredentialView, ManagedKeyView, ModelPrice, ModelPriceTier,
+        ModelPriceTierView, ModelPriceView, OperatorStats, RequestArchiveRefs, RequestEventView,
+        RequestProvenanceView, RequestView, SelfStats, ServiceTokenView, StatsBucket, StatsSummary,
+        TenantView, TokenUsage, UsageReservation, micros_to_decimal_string, priced_tokens,
+    },
+    provider::{
+        ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
+        open_private_json, seal_credential, seal_private_json, validate_config,
+    },
+};
+
+mod archive_staging;
+mod billing;
+mod constants;
+mod credentials;
+mod generation;
+mod migrations;
+mod plugin_configurations;
+mod plugin_kv;
+mod providers;
+mod requests;
+mod rotation;
+mod rows;
+mod time;
+mod usage_analysis;
+mod validation;
+
+use constants::*;
+use rotation::*;
+use rows::generation_asset_download;
+pub use time::unix_millis;
+use validation::*;
+
+pub(crate) use billing::validate_entitlement_operation;
+pub use billing::{
+    CancelEntitlementInput, CloudSubscriptionEventInput, EntitlementOperation,
+    ReconcileEntitlementInput, ReplaceEntitlementInput,
+};
+pub(crate) use credentials::validate_key_policy;
+pub use credentials::{
+    CloudCredentialEntitlementBinding, CreateKeyInput, CreateServiceTokenInput,
+    ProvisionedCloudCredential,
+};
+pub use generation::{
+    AttachGenerationJobResult, AttachSynchronousImageRequestObject, CreateGenerationJobInput,
+    CreateGenerationJobResult, FinishGenerationJobInput, FinishSynchronousImageRequest,
+    FinishSynchronousImageResult, GenerationJobIdempotency, StartGenerationJobInput,
+    StartSynchronousImageRequest, StartSynchronousImageResult, SynchronousImageIdempotencyClaim,
+};
+pub use migrations::{BlockedPartition, PartitionMaintenanceReport};
+pub(crate) use migrations::{POSTGRES_MIGRATIONS, SQLITE_MIGRATIONS};
+#[cfg(test)]
+use migrations::{apply_migration_range, maintain_postgres_partitions};
+pub use providers::{
+    CreateModelRouteInput, CreateUpstreamAccountInput, ImportManagedOAuthAccountInput,
+    ManagedOAuthImportResult, ManagedOAuthImportStatus, ReauthorizeUpstreamAccountInput,
+    UpdateModelRouteInput, UpdateUpstreamAccountInput,
+};
+#[cfg(test)]
+pub(crate) use requests::claim_request_record_locator;
+pub use requests::{
+    AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter, FinishProxyRequest,
+    FinishProxyRequestResult, FinishRequest, NewRequest, ProxyConversationInput, RequestListFilter,
+    SessionArchiveCommitInput, SessionArchiveCorrelation, SessionArchiveImportLock,
+    SessionArchiveImportMatch, SessionArchiveImportMatchInput, SessionArchiveMatchInput,
+    SessionArchiveQuarantineBatchInput, SessionArchiveQuarantineCommitInput,
+    SessionArchiveQuarantineFilter, SessionArchiveQuarantineRecordView,
+    SessionArchiveQuarantineResolutionInput, SessionArchiveQuarantineResolutionView,
+    SessionArchiveQuarantineTarget, SessionArchiveTarget, SessionArchiveUnlinkedCommitInput,
+    SessionArchiveUnlinkedMetadata, SessionArchiveUnlinkedTarget, StartProxyRequest, StatsFilter,
+    normalize_proxy_usage,
+};
+pub(crate) use requests::{
+    ConversationObservationInput, MAX_STATS_RANGE_MILLIS,
+    attach_conversation_upstream_response_in_transaction, claim_request_event_locator,
+    lock_key_budget_state, price_token_usage, proxy_contract_ceiling_micros,
+    record_request_finished_in_transaction, record_request_started_in_transaction,
+    reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
+    settle_token_usage_in_transaction_with_charge, valid_archive_identifier,
+    validate_numeric_range,
+};
+#[cfg(test)]
+pub(crate) use requests::{
+    FILTERED_ACTIVITY_SOURCE_FACTS, FILTERED_ACTIVITY_SOURCE_PENDING,
+    FILTERED_ACTIVITY_SOURCE_ROLLUPS,
+};
+pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
+
+#[derive(Clone)]
+pub struct Database {
+    pool: AnyPool,
+    backend: DatabaseBackend,
+}
+
+#[derive(Clone, Copy)]
+enum DatabaseBackend {
+    PostgreSql,
+    Sqlite,
+}
+
+impl Database {
+    pub async fn readiness_check(&self) -> Result<(), AppError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        self.archive_staging_readiness_check().await?;
+        Ok(())
+    }
+
+    pub async fn list_tenants(&self) -> Result<Vec<TenantView>, AppError> {
+        self.list_tenants_page(None, 100).await
+    }
+
+    pub async fn list_tenants_page(
+        &self,
+        after_external_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<TenantView>, AppError> {
+        let rows = sqlx::query(
+            "SELECT external_id FROM tenants WHERE external_id > $1 ORDER BY external_id ASC LIMIT $2",
+        )
+        .bind(after_external_id.unwrap_or_default())
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TenantView {
+                    external_id: row.try_get("external_id")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
+        Self::connect_with_max(database_url, 8).await
+    }
+
+    pub async fn connect_with_max(
+        database_url: &str,
+        maximum_connections: u32,
+    ) -> Result<Self, sqlx::Error> {
+        // `$n` placeholders are accepted by both PostgreSQL and SQLite. `sqlx::Any` deliberately
+        // does not translate `?` into PostgreSQL placeholders, so all queries in this module use
+        // the shared `$n` form.
+        sqlx::any::install_default_drivers();
+        let backend = if database_url.starts_with("sqlite:") {
+            DatabaseBackend::Sqlite
+        } else {
+            DatabaseBackend::PostgreSql
+        };
+        let mut pool_options = AnyPoolOptions::new()
+            .min_connections(0)
+            .max_connections(maximum_connections.clamp(1, 32))
+            .acquire_timeout(Duration::from_secs(10))
+            .idle_timeout(Some(Duration::from_secs(5 * 60)))
+            .max_lifetime(Some(Duration::from_secs(30 * 60)));
+        if matches!(backend, DatabaseBackend::Sqlite) {
+            // SQLite is a supported lightweight/test backend and can have a
+            // background worker and an HTTP handler contend for its single
+            // writer slot. Without a busy handler, SQLite returns SQLITE_BUSY
+            // immediately and turns a safe, short write race into a spurious
+            // HTTP 500. Install the bound on every pooled connection; this
+            // changes no PostgreSQL behavior and still fails within the pool's
+            // ten-second acquisition deadline.
+            pool_options = pool_options.after_connect(|connection, _metadata| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA busy_timeout = 10000")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            });
+        }
+        let pool = pool_options.connect(database_url).await?;
+        Ok(Self { pool, backend })
+    }
+
+    async fn begin_write_transaction(&self) -> Result<Transaction<'static, Any>, sqlx::Error> {
+        // SQLite's default deferred transaction can fail immediately with
+        // SQLITE_BUSY when a read-before-write transaction races another
+        // writer: the shared lock cannot be upgraded after that writer has
+        // reserved the database. Claim the SQLite write reservation at BEGIN
+        // so the configured busy handler can wait and serialize test/local
+        // writers. PostgreSQL keeps its normal transaction semantics.
+        self.pool
+            .begin_with(match self.backend {
+                DatabaseBackend::PostgreSql => "BEGIN",
+                DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
+            })
+            .await
+    }
+
+    pub async fn require_account_tenant(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+    ) -> Result<(), AppError> {
+        let exists = sqlx::query(
+            "SELECT a.id FROM credit_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2",
+        )
+        .bind(account_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some();
+        exists.then_some(()).ok_or(AppError::Forbidden)
+    }
+}
+
+#[cfg(test)]
+mod tests;

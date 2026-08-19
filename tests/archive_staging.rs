@@ -60,13 +60,13 @@ fn created(
 }
 
 #[tokio::test]
-async fn fresh_sqlite_migrates_v35_and_schema_rejects_untyped_rows() {
+async fn fresh_sqlite_migrates_latest_schema_and_rejects_untyped_rows() {
     let (_directory, _url, database, pool) = sqlite_fixture().await;
     let latest: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(latest, 35);
+    assert_eq!(latest, 42);
     database.readiness_check().await.unwrap();
 
     let invalid = sqlx::query(

@@ -7,6 +7,7 @@ import type {
   OperatorUsageAnalysis, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisHeatmapBucket,
   UsageAnalysisMetrics, UsageAnalysisTimeBucket, UpstreamAccount,
 } from '../types';
+import { trendCurrencies, trendMetrics, trendValue, type TrendMetric } from './usageTrend';
 
 type UsageTab = 'overview' | 'trend' | 'models' | 'keys' | 'upstreams' | 'heatmap';
 type Preset = '24h' | 'today' | 'yesterday' | '7d' | '30d' | 'custom';
@@ -125,32 +126,53 @@ function pointLabel(point: UsageAnalysisTimeBucket, locale: 'zh-CN' | 'en', gran
     : { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
 }
 
-function TrendChart({ points, granularity, onSelectBucket }: { points: UsageAnalysisTimeBucket[]; granularity: 'hour' | 'day'; onSelectBucket: (point: UsageAnalysisTimeBucket) => void }) {
+function trendFormattedValue(value: number, metric: TrendMetric, currency: string, locale: 'zh-CN' | 'en') {
+  if (metric === 'cost') return formatCurrency(value, currency, locale);
+  if (metric === 'avg_latency' || metric === 'p95_latency') return formatMilliseconds(value, locale);
+  return formatNumber(value, locale, metric === 'tokens' ? 0 : 2);
+}
+
+function TrendChart({ points, granularity, metric, currency, onSelectBucket }: {
+  points: UsageAnalysisTimeBucket[];
+  granularity: 'hour' | 'day';
+  metric: TrendMetric;
+  currency: string;
+  onSelectBucket: (point: UsageAnalysisTimeBucket) => void;
+}) {
   const { locale, t } = useI18n();
-  if (!points.length) return <div className="empty">{t('usage.noTrendData')}</div>;
+  const valuedPoints = points.map((point) => ({ point, value: trendValue(point, metric, currency) }));
+  if (!valuedPoints.some(({ value }) => value !== null)) return <div className="empty">{t('usage.noTrendData')}</div>;
   const width = 760;
   const height = 240;
   const paddingX = 34;
   const paddingY = 25;
-  const maximum = Math.max(1, ...points.map((point) => point.requests));
-  const coordinates = points.map((point, index) => ({
+  const maximum = Math.max(1, ...valuedPoints.map(({ value }) => value ?? 0));
+  const coordinates = valuedPoints.map(({ point, value }, index) => ({
     point,
+    value,
     x: points.length === 1 ? width / 2 : paddingX + (index / (points.length - 1)) * (width - paddingX * 2),
-    y: height - paddingY - (point.requests / maximum) * (height - paddingY * 2),
+    y: value === null ? null : height - paddingY - (value / maximum) * (height - paddingY * 2),
   }));
-  const path = coordinates.map(({ x, y }, index) => `${index ? 'L' : 'M'} ${x.toFixed(2)} ${y.toFixed(2)}`).join(' ');
+  let drawing = false;
+  const path = coordinates.map(({ x, y }) => {
+    if (y === null) { drawing = false; return ''; }
+    const command = drawing ? 'L' : 'M';
+    drawing = true;
+    return `${command} ${x.toFixed(2)} ${y.toFixed(2)}`;
+  }).filter(Boolean).join(' ');
   const labelStep = Math.max(1, Math.ceil(points.length / 6));
-  return <div className="usage-trend-chart"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={t('usage.trendChartLabel')}>
-    <title>{t('usage.trendChartLabel')}</title>
+  const metricLabel = t(`usage.trendMetric.${metric}`);
+  const chartLabel = t('usage.trendChartLabel', { metric: metricLabel, currency: metric === 'cost' ? ` (${currency})` : '' });
+  return <div className="usage-trend-chart"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={chartLabel}>
+    <title>{chartLabel}</title>
     <line className="usage-chart-axis" x1={paddingX} y1={height - paddingY} x2={width - paddingX} y2={height - paddingY} />
-    <path className="usage-chart-area" d={`${path} L ${coordinates.at(-1)?.x} ${height - paddingY} L ${coordinates[0].x} ${height - paddingY} Z`} />
     <path className="usage-chart-line" d={path} />
-    {coordinates.map(({ point, x, y }, index) => <g key={point.bucket_start}>
-      <circle className="usage-chart-point" cx={x} cy={y} r="4"><title>{`${pointLabel(point, locale, granularity)}: ${formatNumber(point.requests, locale)}`}</title></circle>
+    {coordinates.map(({ point, value, x, y }, index) => <g key={point.bucket_start}>
+      {value !== null && y !== null && <circle className="usage-chart-point" cx={x} cy={y} r="4"><title>{`${pointLabel(point, locale, granularity)}: ${trendFormattedValue(value, metric, currency, locale)}`}</title></circle>}
       {(index % labelStep === 0 || index === coordinates.length - 1) && <text className="usage-chart-label" x={x} y={height - 6} textAnchor={index === 0 ? 'start' : index === coordinates.length - 1 ? 'end' : 'middle'}>{pointLabel(point, locale, granularity)}</text>}
     </g>)}
   </svg><div className="usage-trend-points" aria-label={t('usage.trendData')}>
-    {points.map((point) => <button type="button" className="secondary" key={point.bucket_start} onClick={() => onSelectBucket(point)}>{pointLabel(point, locale, granularity)} · {formatNumber(point.requests, locale)}</button>)}
+    {coordinates.map(({ point, value }) => <button type="button" className="secondary" key={point.bucket_start} onClick={() => onSelectBucket(point)}>{pointLabel(point, locale, granularity)} · {value === null ? '—' : trendFormattedValue(value, metric, currency, locale)}</button>)}
   </div></div>;
 }
 
@@ -182,6 +204,8 @@ export function UsageAnalysis({ token, tenant, upstreams }: { token: string; ten
   });
   const [applied, setApplied] = useState(selection);
   const [stats, setStats] = useState<OperatorUsageAnalysis>();
+  const [trendMetric, setTrendMetric] = useState<TrendMetric>('requests');
+  const [trendCurrency, setTrendCurrency] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const requestSequence = useRef(0);
@@ -209,6 +233,10 @@ export function UsageAnalysis({ token, tenant, upstreams }: { token: string; ten
     setSelection(next); setApplied(next);
   };
   const summarySuccessRate = stats ? successRate(stats.summary) : undefined;
+  const availableTrendCurrencies = stats ? trendCurrencies(stats.time_series) : [];
+  const effectiveTrendCurrency = availableTrendCurrencies.includes(trendCurrency)
+    ? trendCurrency
+    : (availableTrendCurrencies[0] ?? '');
 
   return <div className="usage-page">
     <div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('usage.description')}</p></div><button type="button" className="secondary" disabled={loading || !token.trim()} onClick={() => setApplied({ ...selection })}>{loading ? t('common.loading') : t('usage.refresh')}</button></div>
@@ -255,10 +283,14 @@ export function UsageAnalysis({ token, tenant, upstreams }: { token: string; ten
           <DimensionTable title={t('usage.errors')} values={stats.errors} onSelect={(bucket) => applyDimension('errorCode', bucket)} />
         </section>
       </>}
-      {tab === 'trend' && <article className="panel"><div className="panel-title"><h2>{t('usage.trend')}</h2><span>{stats.time_zone} · {t(`usage.granularity.${stats.granularity}`)}</span></div><TrendChart points={stats.time_series} granularity={stats.granularity} onSelectBucket={selectUtcBucket} /></article>}
+      {tab === 'trend' && <article className="panel"><div className="panel-title usage-trend-title"><h2>{t('usage.trend')}</h2><div className="usage-trend-controls">
+        <label>{t('usage.trendMetric')}<select aria-label={t('usage.trendMetric')} value={trendMetric} onChange={(event) => setTrendMetric(event.target.value as TrendMetric)}>{trendMetrics.map((metric) => <option value={metric} key={metric}>{t(`usage.trendMetric.${metric}`)}</option>)}</select></label>
+        {trendMetric === 'cost' && <label>{t('usage.trendCurrency')}<select aria-label={t('usage.trendCurrency')} value={effectiveTrendCurrency} disabled={!availableTrendCurrencies.length} onChange={(event) => setTrendCurrency(event.target.value)}>{availableTrendCurrencies.map((currency) => <option value={currency} key={currency}>{currency}</option>)}</select></label>}
+        <span>{stats.time_zone} · {t(`usage.granularity.${stats.granularity}`)}</span>
+      </div></div><TrendChart points={stats.time_series} granularity={stats.granularity} metric={trendMetric} currency={effectiveTrendCurrency} onSelectBucket={selectUtcBucket} /></article>}
       {tab === 'models' && <DimensionTable title={t('usage.models')} values={stats.by_model} onSelect={(bucket) => applyDimension('model', bucket)} />}
       {tab === 'keys' && <DimensionTable title={t('usage.keys')} values={stats.by_key} onSelect={(bucket) => applyDimension('keyId', bucket)} />}
-      {tab === 'upstreams' && <DimensionTable title={t('usage.upstreams')} values={stats.by_upstream} labelForValue={(bucket) => bucket.id === 'unassigned' ? t('usage.unassigned') : bucket.label} onSelect={(bucket) => applyDimension('upstreamId', bucket)} />}
+      {tab === 'upstreams' && <><p className="usage-dimension-contract">{t(`usage.upstreamGrouping.${stats.upstream_grouping}`)}</p><DimensionTable title={t('usage.upstreams')} values={stats.by_upstream} labelForValue={(bucket) => bucket.id === 'unassigned' ? t('usage.unassigned') : bucket.label} onSelect={(bucket) => applyDimension('upstreamId', bucket)} /></>}
       {tab === 'heatmap' && <article className="panel"><div className="panel-title"><h2>{t('usage.heatmap')}</h2><span>{stats.time_zone}</span></div><Heatmap values={stats.heatmap} /></article>}
     </section>}
     {!loading && token.trim() && !error && !stats && <div className="empty">{t('usage.noData')}</div>}

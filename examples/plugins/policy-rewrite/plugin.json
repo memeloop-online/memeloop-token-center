@@ -6,6 +6,7 @@
   "capabilities": [],
   "contributions": {
     "traffic_policy": true,
+    "request_rewrite": true,
     "providers": [
       {
         "id": "example-oauth-http",

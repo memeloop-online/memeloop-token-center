@@ -5,7 +5,10 @@ use axum::{
 use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
-    db::{CreateModelRouteInput, CreateServiceTokenInput, CreateUpstreamAccountInput},
+    db::{
+        CreateModelRouteInput, CreateServiceTokenInput, CreateUpstreamAccountInput,
+        ReauthorizeUpstreamAccountInput,
+    },
     provider::{UpstreamAccountView, UpstreamCredential},
 };
 use serde_json::{Value, json};
@@ -53,6 +56,248 @@ async fn json_request(
 
 fn account(value: Value) -> UpstreamAccountView {
     serde_json::from_value(value).unwrap()
+}
+
+#[tokio::test]
+async fn interactive_reauthorization_preserves_stable_identity_routes_and_replays_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("oauth-reauthorize.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let original_session = Uuid::now_v7();
+    let original = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "reauthorize-tenant".into(),
+                name: "stable-oauth".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url": "https://api.example.test"}),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "old-access-secret".into(),
+                    refresh_token: Some("old-refresh-secret".into()),
+                    expires_at: Some(memeloop_token_center::db::unix_millis() + 60_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: None,
+                },
+                oauth_session_id: Some(original_session),
+                oauth_driver: Some("cursor".into()),
+                oauth_refresh_url: Some("https://oauth.example.test/refresh".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert!(original.can_reauthorize);
+    let route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: "reauthorize-tenant".into(),
+            public_model: "stable-public".into(),
+            upstream_account_id: original.id,
+            upstream_model: "stable-upstream".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let completed_session = Uuid::now_v7();
+    let new_credential = || UpstreamCredential::OAuth {
+        access_token: "new-access-secret".into(),
+        refresh_token: Some("new-refresh-secret".into()),
+        expires_at: Some(memeloop_token_center::db::unix_millis() + 120_000),
+        header: "authorization".into(),
+        prefix: "Bearer ".into(),
+        adapter_state: None,
+    };
+    let reauthorized = state
+        .db
+        .reauthorize_upstream_account(
+            original.id,
+            ReauthorizeUpstreamAccountInput {
+                tenant_external_id: "reauthorize-tenant".into(),
+                expected_updated_at: original.updated_at,
+                driver: "http-json".into(),
+                oauth_session_id: completed_session,
+                oauth_driver: "cursor".into(),
+                oauth_refresh_url: Some("https://oauth.example.test/refresh".into()),
+                credential: new_credential(),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reauthorized.id, original.id);
+    assert_eq!(reauthorized.created_at, original.created_at);
+    assert_eq!(reauthorized.credential_generation, 2);
+    assert_eq!(reauthorized.route_count, 1);
+    assert!(reauthorized.can_refresh);
+    assert!(reauthorized.can_reauthorize);
+
+    let replay = state
+        .db
+        .reauthorize_upstream_account(
+            original.id,
+            ReauthorizeUpstreamAccountInput {
+                tenant_external_id: "reauthorize-tenant".into(),
+                expected_updated_at: original.updated_at,
+                driver: "http-json".into(),
+                oauth_session_id: completed_session,
+                oauth_driver: "cursor".into(),
+                oauth_refresh_url: Some("https://oauth.example.test/refresh".into()),
+                credential: new_credential(),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.id, original.id);
+    assert_eq!(replay.credential_generation, 2);
+    assert_eq!(replay.route_count, 1);
+    let routes = state
+        .db
+        .list_model_routes(Some("reauthorize-tenant"))
+        .await
+        .unwrap();
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].id, route.id);
+    assert_eq!(routes[0].upstream_account_id, original.id);
+
+    let audit_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    let ciphertext: String = sqlx::query_scalar(
+        "SELECT credential_ciphertext FROM upstream_credentials WHERE upstream_account_id = ?1 AND generation = 2",
+    )
+    .bind(original.id.to_string())
+    .fetch_one(&audit_pool)
+    .await
+    .unwrap();
+    assert!(!ciphertext.contains("new-access-secret"));
+    assert!(!ciphertext.contains("new-refresh-secret"));
+
+    let stale = state
+        .db
+        .reauthorize_upstream_account(
+            original.id,
+            ReauthorizeUpstreamAccountInput {
+                tenant_external_id: "reauthorize-tenant".into(),
+                expected_updated_at: original.updated_at,
+                driver: "http-json".into(),
+                oauth_session_id: Uuid::now_v7(),
+                oauth_driver: "cursor".into(),
+                oauth_refresh_url: Some("https://oauth.example.test/refresh".into()),
+                credential: new_credential(),
+            },
+            pepper,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        memeloop_token_center::error::AppError::Conflict(_)
+    ));
+
+    let cross_tenant = state
+        .db
+        .reauthorize_upstream_account(
+            original.id,
+            ReauthorizeUpstreamAccountInput {
+                tenant_external_id: "other-tenant".into(),
+                expected_updated_at: reauthorized.updated_at,
+                driver: "http-json".into(),
+                oauth_session_id: Uuid::now_v7(),
+                oauth_driver: "cursor".into(),
+                oauth_refresh_url: Some("https://oauth.example.test/refresh".into()),
+                credential: new_credential(),
+            },
+            pepper,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        cross_tenant,
+        memeloop_token_center::error::AppError::Forbidden
+    ));
+}
+
+#[tokio::test]
+async fn subscription_reauthorization_retains_an_omitted_encrypted_bridge_secret() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("subscription-reauthorize.db")
+            .display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "subscription-tenant".into(),
+                name: "copilot-primary".into(),
+                driver: "cpa-subscription-bridge".into(),
+                config: json!({
+                    "base_url": "http://subscription.default.svc",
+                    "provider": "copilot",
+                    "network_scope": "private"
+                }),
+                credential: UpstreamCredential::SubscriptionBridge {
+                    handle: "oldhandle".into(),
+                    secret: Some("encrypted-bridge-secret".into()),
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("subscription_bridge".into()),
+                oauth_refresh_url: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert!(account.can_reauthorize);
+    let updated = state
+        .db
+        .reauthorize_upstream_account(
+            account.id,
+            ReauthorizeUpstreamAccountInput {
+                tenant_external_id: "subscription-tenant".into(),
+                expected_updated_at: account.updated_at,
+                driver: "cpa-subscription-bridge".into(),
+                oauth_session_id: Uuid::now_v7(),
+                oauth_driver: "subscription_bridge".into(),
+                oauth_refresh_url: None,
+                credential: UpstreamCredential::SubscriptionBridge {
+                    handle: "newhandle".into(),
+                    secret: None,
+                },
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.id, account.id);
+    assert_eq!(updated.credential_generation, 2);
+    let (_, credential) = state
+        .db
+        .upstream_account_with_credential(account.id, pepper)
+        .await
+        .unwrap();
+    match credential {
+        UpstreamCredential::SubscriptionBridge { handle, secret } => {
+            assert_eq!(handle, "newhandle");
+            assert_eq!(secret.as_deref(), Some("encrypted-bridge-secret"));
+        }
+        _ => panic!("expected subscription bridge credential"),
+    }
 }
 
 #[tokio::test]

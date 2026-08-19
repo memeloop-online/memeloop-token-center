@@ -1517,7 +1517,9 @@ async fn read_bounded_upstream(
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| AppError::Upstream(error.to_string()))?;
+        // reqwest's display text may include a credential-bearing upstream
+        // URL. Use the centralized redacting conversion instead.
+        let chunk = chunk.map_err(AppError::from)?;
         if body.len().saturating_add(chunk.len()) > maximum {
             return Err(AppError::Upstream("upstream response is too large".into()));
         }

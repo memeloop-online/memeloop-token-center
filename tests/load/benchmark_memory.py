@@ -10,6 +10,7 @@ release evidence.
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import contextlib
 import datetime as dt
@@ -23,6 +24,7 @@ import platform
 import shutil
 import signal
 import socket
+import sqlite3
 import statistics
 import subprocess
 import sys
@@ -31,6 +33,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections.abc import Iterable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -51,6 +54,7 @@ class PrerequisiteFailure(RuntimeError):
 class MockState:
     def __init__(self) -> None:
         self.assets: dict[str, int] = {}
+        self.image_raw_bytes = 11 * MIB
         self.active_streams = 0
         self.peak_streams = 0
         self.lock = threading.Lock()
@@ -176,6 +180,24 @@ class MockHandler(BaseHTTPRequestHandler):
             with self.state.lock:
                 self.state.assets[job_id] = asset_mib * MIB
             self._send_json(200, {"id": job_id})
+            return
+
+        if self.path == "/v1/responses":
+            result = base64.b64encode(b"x" * self.state.image_raw_bytes).decode("ascii")
+            self._send_json(
+                200,
+                {
+                    "id": "resp_memory_image",
+                    "output": [
+                        {
+                            "type": "image_generation_call",
+                            "id": "ig_memory_image",
+                            "result": result,
+                        }
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                },
+            )
             return
 
         self._send_json(404, {"error": "mock route not found"})
@@ -361,12 +383,15 @@ def api_request(
     token: str,
     payload: object | None = None,
     timeout: float = 30.0,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[int, bytes, dict[str, str]]:
     parsed = urllib.parse.urlsplit(base_url)
     body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
     headers = {"authorization": f"Bearer {token}", "connection": "close"}
     if body is not None:
         headers["content-type"] = "application/json"
+    if extra_headers is not None:
+        headers.update(extra_headers)
     connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
     try:
         connection.request(method, path, body=body, headers=headers)
@@ -464,6 +489,7 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
     tenant = "memory-benchmark"
     text_model = "benchmark-text"
     asset_model = "benchmark-seedance"
+    image_model = "benchmark-image"
     text_upstream = api_json(
         control_url,
         "POST",
@@ -532,6 +558,44 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
         service_token,
         {"billing_unit": "second", "price_per_unit": "0.01"},
     )
+    image_upstream = api_json(
+        control_url,
+        "POST",
+        "/internal/v1/upstreams",
+        service_token,
+        {
+            "tenant_external_id": tenant,
+            "name": "Memory benchmark image",
+            "driver": "http-json",
+            "config": {
+                "base_url": mock_url,
+                "image_api_mode": "responses-tool",
+                "image_main_model": "benchmark-main",
+            },
+            "credential": {"type": "none"},
+        },
+    )
+    api_json(
+        control_url,
+        "POST",
+        "/internal/v1/model-routes",
+        service_token,
+        {
+            "tenant_external_id": tenant,
+            "public_model": image_model,
+            "upstream_account_id": image_upstream["id"],
+            "upstream_model": "benchmark-image-upstream",
+            "protocol": "generation",
+            "priority": 0,
+        },
+    )
+    api_json(
+        control_url,
+        "POST",
+        f"/internal/v1/generation-prices/USD/{image_model}",
+        service_token,
+        {"billing_unit": "image", "price_per_unit": "0.01"},
+    )
     issued = api_json(
         control_url,
         "POST",
@@ -544,7 +608,7 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
             "currency": "USD",
             "initial_balance": "100000",
             "policy": {
-                "allowed_models": [text_model, asset_model],
+                "allowed_models": [text_model, asset_model, image_model],
                 "requests_per_minute": 1000000,
                 "tokens_per_minute": 1000000000,
                 "max_concurrency": 32,
@@ -558,6 +622,168 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
     # Prove the key is accepted by the gateway before measuring it.
     small_chat(gateway_url, key)
     return key
+
+
+def bulk_insert(
+    connection: sqlite3.Connection,
+    sql: str,
+    rows: Iterable[tuple[object, ...]],
+    batch_size: int = 1000,
+) -> None:
+    batch: list[tuple[object, ...]] = []
+    for row in rows:
+        batch.append(row)
+        if len(batch) == batch_size:
+            connection.executemany(sql, batch)
+            batch.clear()
+    if batch:
+        connection.executemany(sql, batch)
+
+
+def scale_uuid(namespace: int, sequence: int) -> str:
+    return str(uuid.UUID(int=(namespace << 112) | sequence))
+
+
+def seed_control_scale(database: pathlib.Path, row_count: int = 100000) -> None:
+    connection = sqlite3.connect(database, timeout=60)
+    try:
+        connection.execute("PRAGMA busy_timeout = 60000")
+        tenant_id = connection.execute(
+            "SELECT id FROM tenants WHERE external_id = ?", ("memory-benchmark",)
+        ).fetchone()[0]
+        bulk_insert(
+            connection,
+            "INSERT INTO tenants (id, external_id, created_at) VALUES (?, ?, ?)",
+            (
+                (scale_uuid(5, index), f"scale-tenant-{index:06d}", index)
+                for index in range(1, row_count + 1)
+            ),
+        )
+        bulk_insert(
+            connection,
+            "INSERT INTO upstream_accounts "
+            "(id, tenant_id, name, driver, auth_kind, config_json, status, "
+            "credential_generation, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'http-json', 'none', '{}', 'active', 1, ?, ?)",
+            (
+                (
+                    scale_uuid(6, index),
+                    tenant_id,
+                    f"scale-upstream-{index:06d}",
+                    index,
+                    index,
+                )
+                for index in range(1, row_count + 1)
+            ),
+        )
+        bulk_insert(
+            connection,
+            "INSERT INTO model_routes "
+            "(id, tenant_id, public_model, upstream_account_id, upstream_model, "
+            "protocol, priority, enabled, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'openai', 0, 1, ?, ?)",
+            (
+                (
+                    scale_uuid(7, index),
+                    tenant_id,
+                    f"scale-model-{index:06d}",
+                    scale_uuid(6, index),
+                    f"scale-model-{index:06d}",
+                    index,
+                    index,
+                )
+                for index in range(1, row_count + 1)
+            ),
+        )
+        bulk_insert(
+            connection,
+            "INSERT INTO service_principals "
+            "(id, name, status, credential_generation, created_at, updated_at) "
+            "VALUES (?, ?, 'active', 1, ?, ?)",
+            (
+                (
+                    scale_uuid(8, index),
+                    f"scale-service-{index:06d}",
+                    index,
+                    index,
+                )
+                for index in range(1, row_count + 1)
+            ),
+        )
+        bulk_insert(
+            connection,
+            "INSERT INTO service_credentials "
+            "(id, service_principal_id, generation, secret_hash, fingerprint, "
+            "scopes_json, tenant_external_id, created_at, revoked_at) "
+            "VALUES (?, ?, 1, ?, ?, '[\"requests:read\"]', NULL, ?, NULL)",
+            (
+                (
+                    scale_uuid(9, index),
+                    scale_uuid(8, index),
+                    b"scale-fixture-hash",
+                    f"scale-fingerprint-{index:06d}",
+                    index,
+                )
+                for index in range(1, row_count + 1)
+            ),
+        )
+        connection.commit()
+        for table in ("tenants", "upstream_accounts", "model_routes", "service_principals"):
+            connection.execute(f"ANALYZE {table}")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def run_control_scale(
+    control_url: str,
+    service_token: str,
+    control_pid: int,
+    idle_control_rss: float,
+) -> dict[str, Any]:
+    paths = [
+        "/internal/v1/tenants?limit=1000000",
+        "/internal/v1/service-tokens?limit=1000000",
+        "/internal/v1/upstreams?limit=1000000",
+        "/internal/v1/model-routes?limit=1000000",
+    ]
+
+    def fetch(path: str) -> dict[str, Any]:
+        started = time.monotonic()
+        status, body, _headers = api_request(
+            control_url, "GET", path, service_token, timeout=60
+        )
+        try:
+            rows = json.loads(body)
+        except json.JSONDecodeError as error:
+            raise HarnessFailure(f"control scale path returned invalid JSON: {path}") from error
+        if status != 200 or not isinstance(rows, list):
+            raise HarnessFailure(f"control scale path failed with HTTP {status}: {path}")
+        return {
+            "path": path,
+            "status": status,
+            "rows": len(rows),
+            "response_bytes": len(body),
+            "latency_ms": round((time.monotonic() - started) * 1000, 3),
+        }
+
+    started = time.monotonic()
+    with Sampler({"control": control_pid}) as sampler:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            pages = list(pool.map(fetch, paths * 4))
+    peak = sampler.max_current_rss("control")
+    return {
+        "fixture_rows_per_resource": 100000,
+        "concurrency": 16,
+        "pages": pages,
+        "maximum_page_rows": max(page["rows"] for page in pages),
+        "maximum_response_bytes": max(page["response_bytes"] for page in pages),
+        "maximum_latency_ms": max(page["latency_ms"] for page in pages),
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "control_peak_rss_mib": round(peak, 3),
+        "control_delta_rss_mib": round(peak - idle_control_rss, 3),
+        "sample_count": len(sampler.samples),
+    }
 
 
 def chat_payload(mode: str = "small", byte_count: int = 0, delay_ms: float = 0) -> dict[str, Any]:
@@ -604,6 +830,50 @@ def stream_chat(gateway_url: str, key: str, byte_count: int, delay_ms: float = 0
             f"stream returned HTTP {status} and {len(body)} bytes; expected {byte_count}"
         )
     return len(body)
+
+
+def run_synchronous_images(
+    gateway_url: str,
+    key: str,
+    gateway_pid: int,
+    idle_gateway_rss: float,
+) -> dict[str, Any]:
+    def generate(index: int) -> int:
+        status, body, _headers = api_request(
+            gateway_url,
+            "POST",
+            "/v1/images/generations",
+            key,
+            {
+                "model": "benchmark-image",
+                "prompt": "bounded memory image",
+                "n": 1,
+                "response_format": "b64_json",
+            },
+            timeout=120,
+            extra_headers={"idempotency-key": f"memory-image-{index}-{uuid.uuid4()}"},
+        )
+        if status != 200:
+            raise HarnessFailure(f"synchronous image failed with HTTP {status}")
+        response = json.loads(body)
+        if len(response.get("data", [])) != 1:
+            raise HarnessFailure("synchronous image did not return exactly one result")
+        return len(body)
+
+    started = time.monotonic()
+    with Sampler({"gateway": gateway_pid}) as sampler:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            response_bytes = list(pool.map(generate, range(2)))
+    peak = sampler.max_current_rss("gateway")
+    return {
+        "concurrency": 2,
+        "responses": len(response_bytes),
+        "maximum_response_bytes": max(response_bytes),
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "gateway_peak_rss_mib": round(peak, 3),
+        "gateway_delta_rss_mib": round(peak - idle_gateway_rss, 3),
+        "sample_count": len(sampler.samples),
+    }
 
 
 def disconnect_chat(gateway_url: str, key: str, byte_count: int) -> int:
@@ -926,6 +1196,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-rps", type=float, default=20.0)
     parser.add_argument("--idle-max-mib", type=float, default=96.0)
     parser.add_argument("--stream-delta-max-mib", type=float, default=128.0)
+    parser.add_argument("--control-list-delta-max-mib", type=float, default=64.0)
+    parser.add_argument("--image-delta-max-mib", type=float, default=128.0)
     parser.add_argument("--asset-gateway-delta-max-mib", type=float, default=96.0)
     parser.add_argument("--asset-worker-delta-max-mib", type=float, default=192.0)
     parser.add_argument("--retained-delta-max-mib", type=float, default=64.0)
@@ -988,6 +1260,8 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "target-rps": args.target_rps,
         "idle-max-mib": args.idle_max_mib,
         "stream-delta-max-mib": args.stream_delta_max_mib,
+        "control-list-delta-max-mib": args.control_list_delta_max_mib,
+        "image-delta-max-mib": args.image_delta_max_mib,
         "asset-gateway-delta-max-mib": args.asset_gateway_delta_max_mib,
         "asset-worker-delta-max-mib": args.asset_worker_delta_max_mib,
         "retained-delta-max-mib": args.retained_delta_max_mib,
@@ -1098,6 +1372,15 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             }
             idle_gateway = idle["gateway"]["rss_mib_median"]
             idle_worker = idle["worker"]["rss_mib_median"]
+            idle_control = idle["control"]["rss_mib_median"]
+
+            seed_control_scale(database)
+            control_scale = run_control_scale(
+                urls["control"],
+                service_token,
+                processes["control"].pid,
+                idle_control,
+            )
 
             stream_bytes = values["stream_mib"] * MIB
             stream_started = time.monotonic()
@@ -1130,6 +1413,10 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 ),
                 "sample_count": len(stream_sampler.samples),
             }
+
+            synchronous_image = run_synchronous_images(
+                urls["gateway"], key, processes["gateway"].pid, idle_gateway
+            )
 
             disconnect_attempts = max(2, min(4, values["concurrency"]))
             with Sampler({"gateway": processes["gateway"].pid}) as disconnect_sampler:
@@ -1225,6 +1512,28 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
             checks = [
                 check(
+                    "100k-row control resources remain page bounded",
+                    control_scale["maximum_page_rows"],
+                    "<=",
+                    100,
+                    control_scale["maximum_page_rows"] <= 100,
+                ),
+                check(
+                    "bounded control pages remain below 1 MiB",
+                    control_scale["maximum_response_bytes"],
+                    "<=",
+                    MIB,
+                    control_scale["maximum_response_bytes"] <= MIB,
+                ),
+                check(
+                    "concurrent control list RSS delta",
+                    control_scale["control_delta_rss_mib"],
+                    "<=",
+                    args.control_list_delta_max_mib,
+                    control_scale["control_delta_rss_mib"]
+                    <= args.control_list_delta_max_mib,
+                ),
+                check(
                     "gateway idle RSS",
                     idle_gateway,
                     "<=",
@@ -1258,6 +1567,28 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     "<=",
                     args.stream_delta_max_mib,
                     stream["gateway_delta_rss_mib"] <= args.stream_delta_max_mib,
+                ),
+                check(
+                    "two bounded synchronous image responses completed",
+                    synchronous_image["responses"],
+                    "==",
+                    2,
+                    synchronous_image["responses"] == 2,
+                ),
+                check(
+                    "synchronous image final response cap",
+                    synchronous_image["maximum_response_bytes"],
+                    "<=",
+                    16 * MIB,
+                    synchronous_image["maximum_response_bytes"] <= 16 * MIB,
+                ),
+                check(
+                    "synchronous image RSS delta",
+                    synchronous_image["gateway_delta_rss_mib"],
+                    "<=",
+                    args.image_delta_max_mib,
+                    synchronous_image["gateway_delta_rss_mib"]
+                    <= args.image_delta_max_mib,
                 ),
                 check(
                     "disconnects recorded as downstream disconnects",
@@ -1400,7 +1731,7 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             )
 
             report = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "benchmark": "memeloop-token-center-memory",
                 "profile": args.profile,
                 "started_at": started_at.isoformat(),
@@ -1432,7 +1763,9 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     "reserved_for": "container and cgroup-charged overhead outside process RSS",
                 },
                 "idle": idle,
+                "control_scale": control_scale,
                 "stream": stream,
+                "synchronous_image": synchronous_image,
                 "disconnect": disconnect,
                 "response_limit": response_limit,
                 "asset": asset,

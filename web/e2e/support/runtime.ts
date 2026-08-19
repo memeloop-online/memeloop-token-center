@@ -16,6 +16,7 @@ export interface SeedState {
   clientCredential: string;
   clientKeyId: string;
   otherClientKeyId: string;
+  globalServiceCredential: string;
   serviceCredential: string;
   upstreamId: string;
   upstreamName: string;
@@ -244,8 +245,18 @@ async function seedThroughHttp(): Promise<SeedState> {
       name: 'Browser E2E tenant operator',
       tenant_external_id: tenant,
       scopes: [
-        'requests:read', 'providers:read', 'providers:write', 'plugins:read', 'schemas:read',
-        'keys:read', 'keys:write', 'routes:read', 'routes:write', 'prices:read', 'oauth:write',
+        'requests:read', 'providers:read', 'providers:write', 'plugins:read', 'plugins:write', 'schemas:read',
+        'keys:read', 'keys:write', 'routes:read', 'routes:write', 'prices:read', 'prices:write', 'oauth:write',
+      ],
+    },
+  });
+  const globalService = await requestJson<{ token: string }>('/internal/v1/service-tokens', {
+    method: 'POST', credential: bootstrapToken,
+    body: {
+      name: 'Browser E2E global operator',
+      scopes: [
+        'requests:read', 'providers:read', 'providers:write', 'plugins:read', 'plugins:write', 'schemas:read',
+        'keys:read', 'keys:write', 'routes:read', 'routes:write', 'prices:read', 'prices:write', 'oauth:write',
       ],
     },
   });
@@ -310,6 +321,7 @@ async function seedThroughHttp(): Promise<SeedState> {
   return {
     clientCredential: client.key,
     clientKeyId: client.key_id,
+    globalServiceCredential: globalService.token,
     otherClientKeyId: otherClient.key_id,
     serviceCredential: service.token,
     upstreamId: upstream.id,

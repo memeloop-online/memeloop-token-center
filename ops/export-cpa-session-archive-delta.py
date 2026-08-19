@@ -926,7 +926,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--since")
     result.add_argument("--overlap-seconds", type=int, default=86_400)
     result.add_argument("--session-limit", type=int, default=1000)
-    result.add_argument("--max-line-bytes", type=int, default=128 * 1024 * 1024)
+    result.add_argument("--max-line-bytes", type=int, default=16 * 1024 * 1024)
     result.add_argument("--max-download-bytes", type=int, default=64 * 1024**3)
     result.add_argument("--max-output-bytes", type=int, default=64 * 1024**3)
     result.add_argument("--timeout-seconds", type=float, default=60.0)
@@ -943,8 +943,8 @@ def main() -> int:
         raise DeltaError("overlap seconds must be between one second and 31 days")
     if args.session_limit < 1 or args.session_limit > 1000:
         raise DeltaError("session limit must be between 1 and 1000")
-    if args.max_line_bytes < 1024 or args.max_line_bytes > 256 * 1024 * 1024:
-        raise DeltaError("max line bytes must be between 1 KiB and 256 MiB")
+    if args.max_line_bytes < 1024 or args.max_line_bytes > 16 * 1024 * 1024:
+        raise DeltaError("max line bytes must be between 1 KiB and 16 MiB")
     if args.max_download_bytes < args.max_line_bytes or args.max_download_bytes > 1024**4:
         raise DeltaError("max download bytes must cover one line and be at most 1 TiB")
     if args.max_output_bytes < args.max_line_bytes or args.max_output_bytes > 1024**4:

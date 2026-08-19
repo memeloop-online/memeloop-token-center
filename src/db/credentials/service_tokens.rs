@@ -2,6 +2,37 @@ use super::super::*;
 
 const SERVICE_TOKEN_ROTATION_RESOURCE: &str = "service_token";
 
+// Managed credentials deliberately use an exact, versioned capability set.
+// The bootstrap credential is the only principal that owns `*`; accepting a
+// wildcard or an unknown value here would let a stored credential bypass the
+// public service-token schema or silently acquire authority from a future
+// release that introduces a matching scope.
+const SUPPORTED_SERVICE_SCOPES: &[&str] = &[
+    "credits:read",
+    "credits:write",
+    "entitlements:read",
+    "entitlements:write",
+    "imports:cpa:write",
+    "imports:session_archive:quarantine:read",
+    "imports:session_archive:quarantine:resolve",
+    "keys:read",
+    "keys:write",
+    "metrics:read",
+    "oauth:write",
+    "plugins:read",
+    "plugins:write",
+    "prices:read",
+    "prices:write",
+    "providers:read",
+    "providers:write",
+    "requests:read",
+    "routes:read",
+    "routes:write",
+    "schemas:read",
+    "service_tokens:read",
+    "service_tokens:write",
+];
+
 #[derive(Serialize, Deserialize)]
 struct StoredIssuedServiceToken {
     service_id: Uuid,
@@ -49,9 +80,25 @@ pub struct CreateServiceTokenInput {
 
 impl Database {
     pub async fn list_service_tokens(&self) -> Result<Vec<ServiceTokenView>, AppError> {
+        self.list_service_tokens_page(None, None, 100).await
+    }
+
+    pub async fn list_service_tokens_page(
+        &self,
+        before_created_at: Option<i64>,
+        before_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<ServiceTokenView>, AppError> {
+        let before_created_at = before_created_at.unwrap_or(i64::MAX);
+        let before_id = before_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned());
         let rows = sqlx::query(
-            "SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at, c.fingerprint, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation ORDER BY p.created_at DESC, p.id DESC",
+            "SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at, c.fingerprint, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation WHERE p.created_at < $1 OR (p.created_at = $1 AND p.id < $2) ORDER BY p.created_at DESC, p.id DESC LIMIT $3",
         )
+        .bind(before_created_at)
+        .bind(before_id)
+        .bind(limit.clamp(1, 100))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(service_token_view).collect()
@@ -204,6 +251,7 @@ impl Database {
         let scopes_json: String = row.try_get("scopes_json")?;
         let scopes: Vec<String> =
             serde_json::from_str(&scopes_json).map_err(|_| AppError::Internal)?;
+        validate_service_scopes(&scopes)?;
         let tenant_external_id: Option<String> = row.try_get("tenant_external_id")?;
         let name: String = row.try_get("name")?;
         let issued = crypto::issue_service_credential(service_id, pepper);
@@ -279,9 +327,16 @@ impl Database {
             return Err(AppError::Unauthorized);
         }
         let scopes_json: String = row.try_get("scopes_json")?;
+        let scopes: Vec<String> =
+            serde_json::from_str(&scopes_json).map_err(|_| AppError::Unauthorized)?;
+        // Existing rows are untrusted input too. Fail closed instead of
+        // allowing a legacy wildcard/unknown scope to become authoritative.
+        if validate_service_scopes(&scopes).is_err() {
+            return Err(AppError::Unauthorized);
+        }
         Ok(AuthenticatedService {
             service_id: Some(parsed.key_id),
-            scopes: serde_json::from_str(&scopes_json).map_err(|_| AppError::Internal)?,
+            scopes,
             tenant_external_id: row.try_get("tenant_external_id")?,
         })
     }
@@ -308,22 +363,7 @@ fn validate_service_token_input(input: &CreateServiceTokenInput) -> Result<(), A
             "service token name must contain 1 to 120 characters".into(),
         ));
     }
-    if input.scopes.is_empty() || input.scopes.len() > 32 {
-        return Err(AppError::BadRequest(
-            "service token must contain 1 to 32 scopes".into(),
-        ));
-    }
-    if input.scopes.iter().any(|scope| {
-        scope.is_empty()
-            || scope.len() > 80
-            || !scope.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-' | b'*')
-            })
-    }) {
-        return Err(AppError::BadRequest(
-            "service token scopes contain unsupported characters".into(),
-        ));
-    }
+    validate_service_scopes(&input.scopes)?;
     if input
         .tenant_external_id
         .as_deref()
@@ -336,9 +376,46 @@ fn validate_service_token_input(input: &CreateServiceTokenInput) -> Result<(), A
     Ok(())
 }
 
+fn validate_service_scopes(scopes: &[String]) -> Result<(), AppError> {
+    if scopes.is_empty() || scopes.len() > SUPPORTED_SERVICE_SCOPES.len() {
+        return Err(AppError::BadRequest(
+            "service token must contain a bounded set of supported scopes".into(),
+        ));
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    if scopes.iter().any(|scope| {
+        !SUPPORTED_SERVICE_SCOPES.contains(&scope.as_str()) || !unique.insert(scope.as_str())
+    }) {
+        return Err(AppError::BadRequest(
+            "service token scopes must be unique supported exact scopes".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::*;
+    use super::SUPPORTED_SERVICE_SCOPES;
+
+    #[test]
+    fn managed_service_scope_allowlist_matches_the_public_json_schema() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/service-token.schema.json"))
+                .unwrap();
+        let schema_scopes = schema
+            .pointer("/properties/scopes/items/enum")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|scope| scope.as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        let runtime_scopes = SUPPORTED_SERVICE_SCOPES
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(schema_scopes, runtime_scopes);
+    }
 
     #[tokio::test]
     async fn service_token_rotation_preserves_identity_and_revokes_old_generation() {
@@ -393,5 +470,121 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn managed_service_tokens_reject_wildcard_unknown_and_duplicate_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("service-token-scope.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"a service credential pepper longer than thirty-two bytes";
+
+        for scopes in [
+            vec!["*".to_owned()],
+            vec!["keys:*".to_owned()],
+            vec!["future:admin".to_owned()],
+            vec!["keys:read".to_owned(), "keys:read".to_owned()],
+        ] {
+            assert!(matches!(
+                database
+                    .create_service_token(
+                        CreateServiceTokenInput {
+                            name: "rejected-scope".to_owned(),
+                            scopes,
+                            tenant_external_id: None,
+                        },
+                        pepper,
+                    )
+                    .await,
+                Err(AppError::BadRequest(_))
+            ));
+        }
+
+        let supported = database
+            .create_service_token(
+                CreateServiceTokenInput {
+                    name: "quarantine-operator".to_owned(),
+                    scopes: vec![
+                        "imports:session_archive:quarantine:read".to_owned(),
+                        "imports:session_archive:quarantine:resolve".to_owned(),
+                    ],
+                    tenant_external_id: None,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        assert!(
+            database
+                .authenticate_service_token(&supported.token, pepper)
+                .await
+                .is_ok()
+        );
+
+        sqlx::query(
+            "UPDATE service_credentials SET scopes_json = '[\"*\"]' WHERE service_principal_id = $1",
+        )
+        .bind(supported.service_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            database
+                .authenticate_service_token(&supported.token, pepper)
+                .await,
+            Err(AppError::Unauthorized)
+        ));
+        assert!(matches!(
+            database
+                .rotate_service_token(supported.service_id, "reject-stored-wildcard", pepper)
+                .await,
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn service_token_pages_are_bounded_and_keyset_disjoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("service-token-pages.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"a service credential pepper longer than thirty-two bytes";
+        for name in ["page-a", "page-b", "page-c"] {
+            database
+                .create_service_token(
+                    CreateServiceTokenInput {
+                        name: name.to_owned(),
+                        scopes: vec!["requests:read".to_owned()],
+                        tenant_external_id: None,
+                    },
+                    pepper,
+                )
+                .await
+                .unwrap();
+        }
+
+        let first = database
+            .list_service_tokens_page(None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        let cursor = first.last().unwrap();
+        let second = database
+            .list_service_tokens_page(Some(cursor.created_at), Some(cursor.service_id), 2)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(first.iter().all(|left| {
+            second
+                .iter()
+                .all(|right| left.service_id != right.service_id)
+        }));
     }
 }

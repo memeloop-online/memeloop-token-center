@@ -1,6 +1,8 @@
 use super::super::*;
 
 impl Database {
+    const MAX_LISTED_MODEL_PRICES: i64 = 1_000;
+
     pub async fn list_generation_prices(
         &self,
         currency: &str,
@@ -236,18 +238,68 @@ impl Database {
     }
 
     pub async fn list_model_prices(&self, currency: &str) -> Result<Vec<ModelPriceView>, AppError> {
+        self.list_model_prices_page(currency, Self::MAX_LISTED_MODEL_PRICES as usize, 0)
+            .await
+    }
+
+    pub async fn list_model_prices_page(
+        &self,
+        currency: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ModelPriceView>, AppError> {
         validate_currency(currency)?;
+        if limit == 0 || limit > Self::MAX_LISTED_MODEL_PRICES as usize {
+            return Err(AppError::BadRequest(format!(
+                "model price page limit must be between 1 and {}",
+                Self::MAX_LISTED_MODEL_PRICES
+            )));
+        }
+        let limit = i64::try_from(limit).map_err(|_| AppError::Internal)?;
+        let offset = i64::try_from(offset)
+            .map_err(|_| AppError::BadRequest("model price offset is too large".into()))?;
         let rows = sqlx::query(
-            "SELECT model, currency, input_micros_per_million, output_micros_per_million, source, updated_at FROM model_prices WHERE currency = $1 ORDER BY model ASC",
+            "WITH limited_prices AS (SELECT model, currency, input_micros_per_million, output_micros_per_million, source, updated_at FROM model_prices WHERE currency = $1 ORDER BY model ASC LIMIT $2 OFFSET $3) SELECT p.model, p.currency, p.input_micros_per_million, p.output_micros_per_million, p.source, p.updated_at, t.service_tier AS tier_service_tier, t.input_micros_per_million AS tier_input_micros_per_million, t.cached_input_micros_per_million AS tier_cached_input_micros_per_million, t.cache_write_micros_per_million AS tier_cache_write_micros_per_million, t.output_micros_per_million AS tier_output_micros_per_million, t.source AS tier_source, t.updated_at AS tier_updated_at, t.cache_price_estimated AS tier_cache_price_estimated FROM limited_prices p LEFT JOIN model_price_tiers t ON t.model = p.model AND t.currency = p.currency ORDER BY p.model ASC, CASE WHEN t.service_tier = 'default' THEN 0 ELSE 1 END, t.service_tier",
         )
         .bind(currency.to_uppercase())
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
-        let mut prices = Vec::with_capacity(rows.len());
-        for row in rows {
-            prices.push(self.model_price_view_from_base_row(row).await?);
+        model_price_views_from_joined_rows(rows)
+    }
+
+    pub async fn model_price_views_for_models(
+        &self,
+        currency: &str,
+        models: &[String],
+    ) -> Result<Vec<ModelPriceView>, AppError> {
+        use std::fmt::Write as _;
+
+        validate_currency(currency)?;
+        if models.len() > crate::pricing::MAX_SYNC_MODELS {
+            return Err(AppError::BadRequest(format!(
+                "at most {} model prices can be loaded at once",
+                crate::pricing::MAX_SYNC_MODELS
+            )));
         }
-        Ok(prices)
+        if models.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statement = "SELECT p.model, p.currency, p.input_micros_per_million, p.output_micros_per_million, p.source, p.updated_at, t.service_tier AS tier_service_tier, t.input_micros_per_million AS tier_input_micros_per_million, t.cached_input_micros_per_million AS tier_cached_input_micros_per_million, t.cache_write_micros_per_million AS tier_cache_write_micros_per_million, t.output_micros_per_million AS tier_output_micros_per_million, t.source AS tier_source, t.updated_at AS tier_updated_at, t.cache_price_estimated AS tier_cache_price_estimated FROM model_prices p LEFT JOIN model_price_tiers t ON t.model = p.model AND t.currency = p.currency WHERE p.currency = $1 AND p.model IN (".to_owned();
+        for index in 0..models.len() {
+            if index > 0 {
+                statement.push_str(", ");
+            }
+            write!(statement, "${}", index + 2).map_err(|_| AppError::Internal)?;
+        }
+        statement.push_str(") ORDER BY p.model ASC, CASE WHEN t.service_tier = 'default' THEN 0 ELSE 1 END, t.service_tier");
+        let mut query = sqlx::query(&statement).bind(currency.to_uppercase());
+        for model in models {
+            query = query.bind(model);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        model_price_views_from_joined_rows(rows)
     }
 
     pub async fn model_price_view(
@@ -272,17 +324,19 @@ impl Database {
     ) -> Result<Vec<String>, AppError> {
         let rows = if let Some(tenant) = tenant_external_id {
             sqlx::query(
-                "SELECT model FROM model_prices UNION SELECT a.model FROM usage_daily_aggregates a JOIN key_records k ON k.id = a.key_id JOIN tenants t ON t.id = k.tenant_id WHERE t.external_id = $1 UNION SELECT g.public_model AS model FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $2 UNION SELECT r.public_model AS model FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = $3 ORDER BY model ASC",
+                "SELECT model FROM (SELECT model FROM model_prices UNION SELECT a.model FROM usage_daily_aggregates a JOIN key_records k ON k.id = a.key_id JOIN tenants t ON t.id = k.tenant_id WHERE t.external_id = $1 UNION SELECT g.public_model AS model FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $2 UNION SELECT r.public_model AS model FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE t.external_id = $3) discovered_models ORDER BY model ASC LIMIT $4",
             )
             .bind(tenant)
             .bind(tenant)
             .bind(tenant)
+            .bind((crate::pricing::MAX_SYNC_MODELS + 1) as i64)
             .fetch_all(&self.pool)
             .await?
         } else {
             sqlx::query(
-                "SELECT model FROM model_prices UNION SELECT model FROM usage_daily_aggregates UNION SELECT public_model AS model FROM generation_jobs UNION SELECT public_model AS model FROM model_routes ORDER BY model ASC",
+                "SELECT model FROM (SELECT model FROM model_prices UNION SELECT model FROM usage_daily_aggregates UNION SELECT public_model AS model FROM generation_jobs UNION SELECT public_model AS model FROM model_routes) discovered_models ORDER BY model ASC LIMIT $1",
             )
+            .bind((crate::pricing::MAX_SYNC_MODELS + 1) as i64)
             .fetch_all(&self.pool)
             .await?
         };
@@ -441,6 +495,54 @@ impl Database {
             micros_per_unit,
         })
     }
+}
+
+fn model_price_views_from_joined_rows(rows: Vec<AnyRow>) -> Result<Vec<ModelPriceView>, AppError> {
+    let mut prices = Vec::<ModelPriceView>::new();
+    for row in rows {
+        let model: String = row.try_get("model")?;
+        if prices.last().is_none_or(|price| price.model != model) {
+            prices.push(ModelPriceView {
+                model,
+                currency: row.try_get("currency")?,
+                input_per_million: micros_to_decimal_string(
+                    row.try_get("input_micros_per_million")?,
+                ),
+                output_per_million: micros_to_decimal_string(
+                    row.try_get("output_micros_per_million")?,
+                ),
+                source: row.try_get("source")?,
+                updated_at: row.try_get("updated_at")?,
+                tiers: Vec::new(),
+            });
+        }
+        let Some(service_tier) = row.try_get::<Option<String>, _>("tier_service_tier")? else {
+            continue;
+        };
+        prices
+            .last_mut()
+            .ok_or(AppError::Internal)?
+            .tiers
+            .push(ModelPriceTierView {
+                service_tier,
+                input_per_million: micros_to_decimal_string(
+                    row.try_get("tier_input_micros_per_million")?,
+                ),
+                cached_input_per_million: micros_to_decimal_string(
+                    row.try_get("tier_cached_input_micros_per_million")?,
+                ),
+                cache_write_per_million: micros_to_decimal_string(
+                    row.try_get("tier_cache_write_micros_per_million")?,
+                ),
+                output_per_million: micros_to_decimal_string(
+                    row.try_get("tier_output_micros_per_million")?,
+                ),
+                source: row.try_get("tier_source")?,
+                updated_at: row.try_get("tier_updated_at")?,
+                cache_price_estimated: row.try_get::<i64, _>("tier_cache_price_estimated")? != 0,
+            });
+    }
+    Ok(prices)
 }
 
 fn generation_price_view(row: AnyRow) -> Result<GenerationPrice, AppError> {

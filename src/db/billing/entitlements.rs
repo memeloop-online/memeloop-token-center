@@ -88,7 +88,7 @@ impl Database {
         let tenant_external_id = operation.tenant_external_id().to_owned();
         let now = unix_millis();
         let reconciliation_id = Uuid::now_v7();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let tenant = sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
             .bind(&tenant_external_id)
             .fetch_optional(&mut *tx)
@@ -739,7 +739,9 @@ fn validate_reconcile_entitlement(input: &ReconcileEntitlementInput) -> Result<(
     Ok(())
 }
 
-fn validate_entitlement_operation(operation: &EntitlementOperation) -> Result<(), AppError> {
+pub(crate) fn validate_entitlement_operation(
+    operation: &EntitlementOperation,
+) -> Result<(), AppError> {
     match operation {
         EntitlementOperation::Reconcile(input) => validate_reconcile_entitlement(input),
         EntitlementOperation::Cancel(input) => {

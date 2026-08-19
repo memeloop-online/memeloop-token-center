@@ -25,6 +25,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: npm ci
       - run: npm run typecheck
+      - run: npm run test:localization
       - run: npm run build
       - name: Build the browser-test service before Cucumber.js starts it
         run: cargo build --locked --manifest-path ../Cargo.toml --bin memeloop-token-center
@@ -65,12 +66,21 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install dependency vulnerability scanner
         run: cargo install cargo-audit --locked
-      - name: Verify ignored advisories remain unreachable optional dependencies
+      - name: Verify scoped advisory exceptions
         run: |
+          # The long-running service does not link either advisory-bearing crate.
           test -z "$(cargo tree --locked --target all -i rsa 2>/dev/null)"
           test -z "$(cargo tree --locked --target all -i rkyv 2>/dev/null)"
-          # These advisories occur only in disabled optional lockfile entries;
-          # the two `cargo tree` assertions above keep that assumption audited.
+          # Even with every product feature enabled, rkyv must remain unreachable.
+          test -z "$(cargo tree --locked --all-features --target all -i rkyv 2>/dev/null)"
+          # The opt-in OCI installer reaches rsa only through Sigstore's
+          # OpenID verifier. Production installer code accepts public keys and
+          # invokes verification only; it never accepts or performs an RSA
+          # private-key operation affected by RUSTSEC-2023-0071.
+          rsa_tree="$(cargo tree --locked --all-features --target all -i rsa)"
+          printf '%s\n' "$rsa_tree" | grep -q '^rsa v'
+          printf '%s\n' "$rsa_tree" | grep -q 'openidconnect v'
+          printf '%s\n' "$rsa_tree" | grep -q 'sigstore v'
           cargo audit \
             --ignore RUSTSEC-2023-0071 \
             --ignore RUSTSEC-2026-0235
@@ -185,13 +195,39 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install PostgreSQL client for scale-plan acceptance
+        timeout-minutes: 15
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=60 update
+          sudo apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=60 \
+            install --yes --no-install-recommends postgresql-client
       - name: PostgreSQL migration smoke test
         env:
           MTC_DATABASE_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
           MTC_KEY_PEPPER: ci-key-pepper-with-more-than-thirty-two-bytes
           MTC_SERVICE_TOKEN: ci-bootstrap-token-not-for-production
-          MTC_ARCHIVE_BACKEND: memory
+          MTC_ARCHIVE_BACKEND: filesystem
+          MTC_ARCHIVE_PATH: /tmp/mtc-migration-smoke-archive
         run: cargo run --locked --bin memeloop-token-center -- migrate
+      - name: Seed 100k-row observability scale fixture
+        env:
+          PGDATABASE: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+        run: psql -X --no-psqlrc -v ON_ERROR_STOP=1 -f tests/load/seed_postgres_observability.sql
+      - name: Enforce PostgreSQL observability plans and latency
+        env:
+          MTC_BENCH_DATABASE_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+        run: |
+          python3 tests/load/postgres_explain.py \
+            --output /tmp/postgres-explain-${GITHUB_SHA}.json
+      - name: Retain PostgreSQL scale-plan evidence
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: postgres-explain-${{ github.sha }}
+          path: /tmp/postgres-explain-${{ github.sha }}.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Validate resumable CPA session-archive delta export
         run: python3 tests/ops/test-session-archive-delta-export.py
 

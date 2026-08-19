@@ -59,13 +59,39 @@ pub(super) async fn configuration_schemas(
 pub(super) async fn list_tenants(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<TenantListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
-    let mut tenants = state.db.list_tenants().await?;
     if let Some(scoped_tenant) = service.tenant_external_id {
-        tenants.retain(|tenant| tenant.external_id == scoped_tenant);
+        let visible = query
+            .after_external_id
+            .as_deref()
+            .is_none_or(|after| scoped_tenant.as_str() > after);
+        return Ok(Json(if visible {
+            vec![crate::model::TenantView {
+                external_id: scoped_tenant,
+            }]
+        } else {
+            Vec::new()
+        }));
     }
-    Ok(Json(tenants))
+    Ok(Json(
+        state
+            .db
+            .list_tenants_page(query.after_external_id.as_deref(), query.limit)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct TenantListQuery {
+    after_external_id: Option<String>,
+    #[serde(default = "default_control_list_limit")]
+    limit: i64,
+}
+
+fn default_control_list_limit() -> i64 {
+    100
 }
 
 pub(super) async fn internal_requests(

@@ -1,0 +1,105 @@
+[
+  {
+    "name": "closed provider configuration",
+    "schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_url"],
+      "properties": {
+        "base_url": { "type": "string", "format": "uri" },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 600 }
+      }
+    },
+    "cases": [
+      { "valid": true, "value": { "base_url": "https://api.example.com", "timeout_seconds": 30 } },
+      { "valid": false, "value": { "base_url": "not a URI" } },
+      { "valid": false, "value": { "base_url": "https://api.example.com/bad percent" } },
+      { "valid": false, "value": { "base_url": "https://api.example.com/%zz" } },
+      { "valid": false, "value": { "base_url": "https://api.example.com", "unknown": true } },
+      { "valid": false, "value": { "base_url": "https://api.example.com", "timeout_seconds": 1.5 } }
+    ]
+  },
+  {
+    "name": "UUID format parity",
+    "schema": { "type": "string", "format": "uuid" },
+    "cases": [
+      { "valid": true, "value": "00000000-0000-0000-0000-000000000000" },
+      { "valid": true, "value": "f308a72c-fa84-11eb-9a03-0242ac130003" },
+      { "valid": false, "value": "f308a72cfa8411eb9a030242ac130003" },
+      { "valid": false, "value": "not-a-uuid" }
+    ]
+  },
+  {
+    "name": "local references and unicode lengths",
+    "schema": {
+      "$defs": { "short": { "type": "string", "minLength": 1, "maxLength": 1 } },
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label"],
+      "properties": { "label": { "$ref": "#/$defs/short" } }
+    },
+    "cases": [
+      { "valid": true, "value": { "label": "🙂" } },
+      { "valid": false, "value": { "label": "" } },
+      { "valid": false, "value": { "label": "ab" } },
+      { "valid": false, "value": {} }
+    ]
+  },
+  {
+    "name": "required only checks property presence",
+    "schema": {
+      "type": "object",
+      "required": ["label"],
+      "properties": { "label": { "type": "string" } }
+    },
+    "cases": [
+      { "valid": true, "value": { "label": "" } },
+      { "valid": false, "value": {} }
+    ]
+  },
+  {
+    "name": "property names and numeric constraints",
+    "schema": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 2,
+      "propertyNames": { "pattern": "^[a-z]+$" },
+      "additionalProperties": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "multipleOf": 0.5
+      }
+    },
+    "cases": [
+      { "valid": true, "value": { "model": 1.5 } },
+      { "valid": false, "value": {} },
+      { "valid": false, "value": { "Bad": 1.5 } },
+      { "valid": false, "value": { "model": 1.25 } },
+      { "valid": false, "value": { "one": 1, "two": 2, "three": 3 } }
+    ]
+  },
+  {
+    "name": "conditionals and structural uniqueness",
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "items"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["public", "private"] },
+        "token": { "type": "string", "minLength": 1 },
+        "items": { "type": "array", "uniqueItems": true }
+      },
+      "if": { "properties": { "kind": { "const": "private" } } },
+      "then": { "required": ["token"] },
+      "else": { "not": { "required": ["token"] } }
+    },
+    "cases": [
+      { "valid": true, "value": { "kind": "private", "token": "x", "items": [{ "a": 1, "b": 2 }] } },
+      { "valid": false, "value": { "kind": "private", "items": [] } },
+      { "valid": true, "value": { "kind": "public", "items": [] } },
+      { "valid": false, "value": { "kind": "public", "token": "x", "items": [] } },
+      { "valid": false, "value": { "kind": "public", "items": [{ "a": 1, "b": 2 }, { "b": 2, "a": 1 }] } }
+    ]
+  }
+]

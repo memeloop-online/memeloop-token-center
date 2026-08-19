@@ -11,7 +11,9 @@ use axum::{
 use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
-    db::{CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput, unix_millis},
+    db::{
+        CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput, StatsFilter, unix_millis,
+    },
     model::{IssuedKey, KeyPolicy},
     provider::UpstreamCredential,
 };
@@ -262,7 +264,14 @@ async fn deny_policy_covers_text_images_seedance_and_comfyui_before_any_upstream
     assert_eq!(
         state
             .db
-            .stats(key.key_id)
+            .stats_filtered(
+                key.key_id,
+                StatsFilter {
+                    from_created_at: Some(unix_millis().saturating_sub(60_000)),
+                    to_created_at: Some(unix_millis().saturating_add(1)),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap()
             .summary
@@ -429,7 +438,7 @@ async fn image_rewrite_rechecks_effective_permission_route_price_and_archives_ch
             .await
             .unwrap();
         if stats.summary.total_requests == 1 {
-            assert_eq!(stats.summary.total_cost, "0.05");
+            assert_eq!(stats.summary.total_cost.as_deref(), Some("0.05"));
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

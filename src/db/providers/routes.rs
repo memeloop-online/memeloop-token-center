@@ -24,10 +24,28 @@ impl Database {
         &self,
         tenant_external_id: Option<&str>,
     ) -> Result<Vec<ModelRouteView>, AppError> {
+        self.list_model_routes_page(tenant_external_id, None, None, 100)
+            .await
+    }
+
+    pub async fn list_model_routes_page(
+        &self,
+        tenant_external_id: Option<&str>,
+        before_created_at: Option<i64>,
+        before_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<ModelRouteView>, AppError> {
+        let before_created_at = before_created_at.unwrap_or(i64::MAX);
+        let before_id = before_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned());
         let rows = sqlx::query(
-            "SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE ($1 = '' OR t.external_id = $1) ORDER BY r.public_model, r.priority, r.id",
+            "SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE ($1 = '' OR t.external_id = $1) AND (r.created_at < $2 OR (r.created_at = $2 AND r.id < $3)) ORDER BY r.created_at DESC, r.id DESC LIMIT $4",
         )
         .bind(tenant_external_id.unwrap_or_default())
+        .bind(before_created_at)
+        .bind(before_id)
+        .bind(limit.clamp(1, 100))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(model_route_view).collect()
@@ -550,5 +568,40 @@ mod tests {
                 .await
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn route_pages_are_bounded_and_keyset_disjoint() {
+        let (_directory, database, upstream_account_id) = sqlite_database().await;
+        for index in 0..3 {
+            database
+                .create_model_route(CreateModelRouteInput {
+                    tenant_external_id: TENANT.to_owned(),
+                    public_model: format!("route-page-{index}"),
+                    upstream_account_id,
+                    upstream_model: format!("upstream-page-{index}"),
+                    protocol: "openai".to_owned(),
+                    priority: index,
+                })
+                .await
+                .unwrap();
+        }
+
+        let first = database
+            .list_model_routes_page(Some(TENANT), None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        let cursor = first.last().unwrap();
+        let second = database
+            .list_model_routes_page(Some(TENANT), Some(cursor.created_at), Some(cursor.id), 2)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(
+            first
+                .iter()
+                .all(|left| second.iter().all(|right| left.id != right.id))
+        );
     }
 }

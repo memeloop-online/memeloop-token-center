@@ -1,6 +1,6 @@
 # Security audit
 
-Last reviewed: 2026-08-14
+Last reviewed: 2026-08-20
 
 This document records the security boundary reviewed before exposing the control
 and gateway services to dogfood traffic. It is not a substitute for an external
@@ -31,7 +31,7 @@ escape from its declared capabilities.
 | Browser boundary | Responses set a restrictive CSP, deny framing and object embedding, and constrain scripts/connects to the same origin. Bearer credentials are sent only in authorization headers. |
 | Resource bounds | Request bodies, upstream bodies, archive reads, image concurrency, gateway concurrency, plugin memory/table/instance counts, plugin HTTP bodies, and plugin execution time are bounded. Redirect following is disabled. |
 | Plugin isolation | Wasmtime components receive only declared host capabilities. Plugin/provider IDs are restricted to 1–64 lowercase ASCII letters, digits or hyphens. Traffic-policy reasons and `host.log` guest messages are never retained, reflected to clients or recorded verbatim; plugin logs contain only the validated plugin ID and host-owned fixed decision/event codes. HTTP allowlists are exact HTTPS origins, and plugin HTTP remains public-only until private-destination approval metadata exists. |
-| Dependency surface | SQLx and `rust_decimal` default features are disabled to avoid unused MySQL/RSA and `rkyv` dependency paths. A freshly fetched 1,216-entry RustSec database reported zero known vulnerabilities on the review date. Registry yanked-status queries returned HTTP 403 in this environment, so that separate signal was not verified. |
+| Dependency surface | SQLx and `rust_decimal` default features are disabled to avoid unused MySQL and `rkyv` dependency paths. The default service does not link `rsa`, `rkyv`, Sigstore or the OCI client. The opt-in offline OCI installer uses the official Sigstore client only for public-key verification; Sigstore's OpenID dependency includes `rsa`, whose RUSTSEC-2023-0071 advisory affects private-key timing operations that the installer neither accepts nor invokes. CI proves the exact dependency path and fails if `rsa` enters the default service or `rkyv` becomes reachable under any feature. A freshly fetched 1,217-entry RustSec database found no other known vulnerability on the review date. Registry yanked-status queries were not separately verified. |
 
 ## Outbound network boundary
 
@@ -134,7 +134,7 @@ cargo check --all-targets
 cargo test network::tests --lib
 cargo test pinned_client_keeps_the_original_http_host --lib
 cargo test plugin::tests --lib
-cargo audit
+cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0235
 helm lint charts/memeloop-token-center
 ```
 

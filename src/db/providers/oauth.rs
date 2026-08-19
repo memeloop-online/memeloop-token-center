@@ -1,7 +1,167 @@
 use super::super::*;
+use super::accounts::upstream_account_view;
 use super::*;
 
+pub struct ReauthorizeUpstreamAccountInput {
+    pub tenant_external_id: String,
+    pub expected_updated_at: i64,
+    pub driver: String,
+    pub oauth_session_id: Uuid,
+    pub oauth_driver: String,
+    pub oauth_refresh_url: Option<String>,
+    pub credential: UpstreamCredential,
+}
+
 impl Database {
+    /// Completes an interactive OAuth flow against an existing stable
+    /// upstream identity. The opaque OAuth session id is the replay key: a
+    /// repeated poll returns the already-installed generation instead of
+    /// rotating twice.
+    pub async fn reauthorize_upstream_account(
+        &self,
+        account_id: Uuid,
+        mut input: ReauthorizeUpstreamAccountInput,
+        key_material: &[u8],
+    ) -> Result<UpstreamAccountView, AppError> {
+        if input.credential.auth_kind() != "oauth" {
+            return Err(AppError::BadRequest(
+                "interactive authorization must produce an OAuth credential".into(),
+            ));
+        }
+        if !matches!(
+            input.oauth_driver.as_str(),
+            "cursor" | "provider_adapter" | "subscription_bridge"
+        ) {
+            return Err(AppError::BadRequest(
+                "unsupported OAuth reauthorization lifecycle".into(),
+            ));
+        }
+        if (input.driver == "cpa-subscription-bridge")
+            != (input.oauth_driver == "subscription_bridge")
+        {
+            return Err(AppError::BadRequest(
+                "OAuth reauthorization lifecycle does not match the provider".into(),
+            ));
+        }
+        if input.oauth_driver != "subscription_bridge" && input.oauth_refresh_url.is_none() {
+            return Err(AppError::BadRequest(
+                "OAuth reauthorization refresh endpoint is required".into(),
+            ));
+        }
+        let now = unix_millis();
+        let mut tx = self.pool.begin().await?;
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2"
+            }
+        };
+        let row = sqlx::query(select)
+            .bind(account_id.to_string())
+            .bind(&input.tenant_external_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::Forbidden)?;
+        let current_session = row.try_get::<Option<String>, _>("oauth_session_id")?;
+        let completed_session = input.oauth_session_id.to_string();
+        if current_session.as_deref() == Some(completed_session.as_str()) {
+            let view = upstream_account_view(row)?;
+            tx.commit().await?;
+            return Ok(view);
+        }
+        let current_driver: String = row.try_get("driver")?;
+        let current_auth_kind: String = row.try_get("auth_kind")?;
+        let current_oauth_driver = row.try_get::<Option<String>, _>("oauth_driver")?;
+        let expected_oauth_driver = if current_driver == "cpa-subscription-bridge" {
+            Some("subscription_bridge")
+        } else {
+            current_oauth_driver.as_deref()
+        };
+        if current_driver != input.driver
+            || expected_oauth_driver != Some(input.oauth_driver.as_str())
+            || !upstream_can_reauthorize(
+                &current_driver,
+                &current_auth_kind,
+                current_session.as_deref(),
+                current_oauth_driver.as_deref(),
+            )
+        {
+            return Err(AppError::BadRequest(
+                "upstream account does not support interactive reauthorization".into(),
+            ));
+        }
+        if !matches!(
+            row.try_get::<String, _>("status")?.as_str(),
+            "active" | "disabled"
+        ) {
+            return Err(AppError::Forbidden);
+        }
+        if row.try_get::<i64, _>("updated_at")? != input.expected_updated_at {
+            return Err(AppError::Conflict(
+                "reload the upstream provider before authorizing it again".into(),
+            ));
+        }
+        if let UpstreamCredential::SubscriptionBridge { secret, .. } = &mut input.credential
+            && secret.is_none()
+        {
+            let current_ciphertext: String = row.try_get("credential_ciphertext")?;
+            if let UpstreamCredential::SubscriptionBridge {
+                secret: current_secret,
+                ..
+            } = open_credential(&current_ciphertext, key_material)?
+            {
+                *secret = current_secret;
+            }
+        }
+        input.credential.validate(now)?;
+        let ciphertext = seal_credential(&input.credential, key_material)?;
+        let current_generation: i64 = row.try_get("credential_generation")?;
+        let generation = current_generation
+            .checked_add(1)
+            .ok_or(AppError::Internal)?;
+        let updated_at = now.max(input.expected_updated_at.saturating_add(1));
+        sqlx::query(
+            "UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(account_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(account_id.to_string())
+        .bind(generation)
+        .bind(ciphertext)
+        .bind(input.credential.expires_at())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let changed = sqlx::query(
+            "UPDATE upstream_accounts SET auth_kind = 'oauth', credential_generation = $1, oauth_session_id = $2, oauth_driver = $3, oauth_refresh_url = $4, updated_at = $5 WHERE id = $6 AND updated_at = $7",
+        )
+        .bind(generation)
+        .bind(input.oauth_session_id.to_string())
+        .bind(&input.oauth_driver)
+        .bind(&input.oauth_refresh_url)
+        .bind(updated_at)
+        .bind(account_id.to_string())
+        .bind(input.expected_updated_at)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "upstream provider changed while authorization was completing".into(),
+            ));
+        }
+        tx.commit().await?;
+        self.upstream_account_for_reauthorization(account_id, &input.tenant_external_id)
+            .await
+    }
+
     pub async fn rotate_upstream_credential(
         &self,
         account_id: Uuid,
@@ -563,9 +723,18 @@ impl Database {
                 && row
                     .try_get::<Option<String>, _>("oauth_refresh_url")?
                     .is_some()
-                && row.try_get::<String, _>("driver")? != "cpa-gemini-oauth-legacy",
+                && !matches!(
+                    row.try_get::<String, _>("driver")?.as_str(),
+                    "cpa-subscription-bridge" | "cpa-gemini-oauth-legacy"
+                ),
             can_rotate: auth_kind != "none",
-            can_reauthorize: false,
+            can_reauthorize: upstream_can_reauthorize(
+                &row.try_get::<String, _>("driver")?,
+                &auth_kind,
+                row.try_get::<Option<String>, _>("oauth_session_id")?
+                    .as_deref(),
+                row.try_get::<Option<String>, _>("oauth_driver")?.as_deref(),
+            ),
             route_count: row.try_get("route_count")?,
             created_at: row.try_get("created_at")?,
             updated_at,

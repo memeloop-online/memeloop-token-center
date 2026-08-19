@@ -7,7 +7,7 @@ use memeloop_token_center::{
     db::{
         CreateKeyInput, Database, FinishProxyRequest, FinishProxyRequestResult,
         FinishSynchronousImageRequest, FinishSynchronousImageResult, StartProxyRequest,
-        StartSynchronousImageRequest, StartSynchronousImageResult,
+        StartSynchronousImageRequest, StartSynchronousImageResult, StatsFilter, unix_millis,
     },
     model::{ArchivedGenerationAsset, KeyPolicy, TokenUsage},
 };
@@ -275,7 +275,17 @@ async fn postgres_proxy_terminal_owner_is_exactly_once() {
             .count(),
         1
     );
-    let stats = database.stats(key_id).await.unwrap();
+    let stats = database
+        .stats_filtered(
+            key_id,
+            StatsFilter {
+                from_created_at: Some(unix_millis().saturating_sub(60_000)),
+                to_created_at: Some(unix_millis().saturating_add(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(stats.summary.total_requests, 1);
     assert_eq!(stats.summary.successful_requests, 1);
     assert_eq!(stats.summary.input_tokens, 11);
@@ -415,7 +425,17 @@ async fn postgres_synchronous_image_terminal_ack_recovery_is_exactly_once_withou
             .len(),
         1
     );
-    let stats = database.stats(key.key_id).await.unwrap();
+    let stats = database
+        .stats_filtered(
+            key.key_id,
+            StatsFilter {
+                from_created_at: Some(unix_millis().saturating_sub(60_000)),
+                to_created_at: Some(unix_millis().saturating_add(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(stats.summary.total_requests, 1);
     assert_eq!(stats.summary.successful_requests, 1);
     assert_eq!(stats.summary.output_tokens, 1);

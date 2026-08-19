@@ -7,10 +7,7 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::{
-    ManagementTenantQuery, default_tenant, management_tenant, require_service,
-    require_service_tenant,
-};
+use super::{default_tenant, management_tenant, require_service, require_service_tenant};
 use crate::{
     AppState,
     db::{CreateModelRouteInput, UpdateModelRouteInput},
@@ -72,11 +69,34 @@ pub(super) async fn create_model_route(
 pub(super) async fn list_model_routes(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ManagementTenantQuery>,
+    Query(query): Query<ModelRouteListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "routes:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id)?;
-    Ok(Json(state.db.list_model_routes(tenant.as_deref()).await?))
+    Ok(Json(
+        state
+            .db
+            .list_model_routes_page(
+                tenant.as_deref(),
+                query.before_created_at,
+                query.before_id,
+                query.limit,
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ModelRouteListQuery {
+    tenant_external_id: Option<String>,
+    before_created_at: Option<i64>,
+    before_id: Option<Uuid>,
+    #[serde(default = "default_model_route_list_limit")]
+    limit: i64,
+}
+
+fn default_model_route_list_limit() -> i64 {
+    100
 }
 
 #[derive(Debug, Deserialize)]

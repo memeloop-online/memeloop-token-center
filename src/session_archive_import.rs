@@ -22,17 +22,21 @@ use crate::{
     archive::ArchiveStore,
     conversation::ConversationHints,
     db::{
-        Database, SessionArchiveCommitInput, SessionArchiveCorrelation, SessionArchiveMatchInput,
-        SessionArchiveTarget, SessionArchiveUnlinkedCommitInput, SessionArchiveUnlinkedMetadata,
+        Database, SessionArchiveCommitInput, SessionArchiveCorrelation, SessionArchiveImportMatch,
+        SessionArchiveImportMatchInput, SessionArchiveQuarantineBatchInput,
+        SessionArchiveQuarantineCommitInput, SessionArchiveQuarantineTarget, SessionArchiveTarget,
+        SessionArchiveUnlinkedCommitInput, SessionArchiveUnlinkedMetadata,
         SessionArchiveUnlinkedTarget,
     },
     error::AppError,
     model::{AuthenticatedKey, KeyPolicy},
 };
 
-const IMPORT_PLAN_VERSION: i64 = 3;
+const IMPORT_PLAN_VERSION: i64 = 4;
 const MAX_PLAN_RECORD_BYTES: usize = 512 * 1024;
 const PLAN_SIZE_CHECK_INTERVAL: u64 = 32;
+pub const MAX_SESSION_ARCHIVE_LINE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_SESSION_ARCHIVE_PLAN_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct SessionArchiveImportOptions<'a> {
@@ -46,7 +50,51 @@ pub struct SessionArchiveImportOptions<'a> {
     pub max_line_bytes: usize,
     pub max_plan_bytes: u64,
     pub allow_unmapped: bool,
+    pub quarantine_unknown_identities: bool,
+    pub quarantine_tenant_binding_kind: Option<&'a str>,
+    pub quarantine_tenant_binding_proof: Option<&'a str>,
+    pub quarantine_approved_by_service_id: Option<Uuid>,
     pub apply: bool,
+}
+
+pub fn validate_session_archive_import_options(
+    options: &SessionArchiveImportOptions<'_>,
+) -> Result<(), String> {
+    validate_name(options.tenant_external_id, "tenant external id")?;
+    validate_name(options.cpamp_source, "CPAMP source")?;
+    validate_name(options.archive_source, "archive source")?;
+    if !(1024..=MAX_SESSION_ARCHIVE_LINE_BYTES).contains(&options.max_line_bytes) {
+        return Err(format!(
+            "max line bytes must be between 1 KiB and the compiled-in {} MiB hard limit",
+            MAX_SESSION_ARCHIVE_LINE_BYTES / (1024 * 1024)
+        ));
+    }
+    if !(1024 * 1024..=MAX_SESSION_ARCHIVE_PLAN_BYTES).contains(&options.max_plan_bytes) {
+        return Err(format!(
+            "max plan bytes must be between 1 MiB and the compiled-in {} GiB hard limit",
+            MAX_SESSION_ARCHIVE_PLAN_BYTES / (1024 * 1024 * 1024)
+        ));
+    }
+    if options.apply && options.allow_unmapped {
+        return Err("allow-unmapped is diagnostic-only and cannot be combined with apply".into());
+    }
+    if options.quarantine_unknown_identities {
+        let kind = options
+            .quarantine_tenant_binding_kind
+            .filter(|value| valid_plan_text(value, 128))
+            .ok_or("quarantine requires a tenant binding kind")?;
+        let proof = options
+            .quarantine_tenant_binding_proof
+            .filter(|value| is_digest_hex(value))
+            .ok_or("quarantine requires a 64-hex tenant binding proof")?;
+        let _ = (kind, proof);
+    } else if options.quarantine_tenant_binding_kind.is_some()
+        || options.quarantine_tenant_binding_proof.is_some()
+        || options.quarantine_approved_by_service_id.is_some()
+    {
+        return Err("quarantine binding options require quarantine admission".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,6 +107,11 @@ struct ImportPlanHeader {
     source_size_bytes: u64,
     source_blake3: String,
     record_count: u64,
+    quarantine_records: u64,
+    quarantine_batch_id: Option<Uuid>,
+    tenant_binding_kind: Option<String>,
+    tenant_binding_proof: Option<String>,
+    approved_by_service_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -139,6 +192,19 @@ enum ImportPlanCorrelation {
     Unlinked {
         target: ImportPlanUnlinkedTarget,
     },
+    Quarantined {
+        target: ImportPlanQuarantineTarget,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportPlanQuarantineTarget {
+    tenant_id: Uuid,
+    quarantine_id: Uuid,
+    reason_code: String,
+    identity_claim_digest: Option<String>,
+    proof_digest: String,
 }
 
 impl From<&SessionArchiveCorrelation> for ImportPlanCorrelation {
@@ -165,6 +231,30 @@ impl From<&SessionArchiveCorrelation> for ImportPlanCorrelation {
                     correlation_proof_digest: target.correlation_proof_digest.clone(),
                 },
             },
+        }
+    }
+}
+
+impl From<&SessionArchiveQuarantineTarget> for ImportPlanQuarantineTarget {
+    fn from(target: &SessionArchiveQuarantineTarget) -> Self {
+        Self {
+            tenant_id: target.tenant_id,
+            quarantine_id: target.quarantine_id,
+            reason_code: target.reason_code.clone(),
+            identity_claim_digest: target.identity_claim_digest.clone(),
+            proof_digest: target.proof_digest.clone(),
+        }
+    }
+}
+
+impl From<ImportPlanQuarantineTarget> for SessionArchiveQuarantineTarget {
+    fn from(target: ImportPlanQuarantineTarget) -> Self {
+        Self {
+            tenant_id: target.tenant_id,
+            quarantine_id: target.quarantine_id,
+            reason_code: target.reason_code,
+            identity_claim_digest: target.identity_claim_digest,
+            proof_digest: target.proof_digest,
         }
     }
 }
@@ -264,6 +354,7 @@ struct SealedImportPlan {
 struct ValidatedImportPlan {
     connection: SqliteConnection,
     record_count: u64,
+    header: ImportPlanHeader,
     _path: PlanPathGuard,
 }
 
@@ -274,6 +365,9 @@ pub struct SessionArchiveImportStats {
     pub before_overlap: u64,
     pub mapped: u64,
     pub unmapped: u64,
+    pub quarantined: u64,
+    pub quarantine_imported: u64,
+    pub quarantine_replayed: u64,
     pub replayed: u64,
     pub imported: u64,
     pub input_device: u64,
@@ -457,18 +551,7 @@ pub async fn import_session_archive(
     archive: &ArchiveStore,
     options: &SessionArchiveImportOptions<'_>,
 ) -> Result<SessionArchiveImportStats, Box<dyn std::error::Error + Send + Sync>> {
-    validate_name(options.tenant_external_id, "tenant external id")?;
-    validate_name(options.cpamp_source, "CPAMP source")?;
-    validate_name(options.archive_source, "archive source")?;
-    if options.max_line_bytes < 1024 || options.max_line_bytes > 256 * 1024 * 1024 {
-        return Err("max line bytes must be between 1 KiB and 256 MiB".into());
-    }
-    if options.max_plan_bytes < 1024 * 1024 || options.max_plan_bytes > 16 * 1024 * 1024 * 1024 {
-        return Err("max plan bytes must be between 1 MiB and 16 GiB".into());
-    }
-    if options.apply && options.allow_unmapped {
-        return Err("allow-unmapped is diagnostic-only and cannot be combined with apply".into());
-    }
+    validate_session_archive_import_options(options)?;
     if options.apply {
         validate_plan_directory(options.plan_directory).await?;
     }
@@ -537,7 +620,10 @@ async fn import_session_archive_locked(
         &seal,
     )
     .await?;
-    stats.imported = apply_validated_plan(db, archive, options, &mut plan).await?;
+    let applied = apply_validated_plan(db, archive, options, &mut plan).await?;
+    stats.imported = applied.imported;
+    stats.quarantine_imported = applied.quarantine_imported;
+    stats.quarantine_replayed = applied.quarantine_replayed;
     // The explicit read transaction is the immutable SQLite snapshot used by
     // apply. It never contains writes and is discarded after the final row.
     sqlx::query("ROLLBACK")
@@ -587,30 +673,50 @@ async fn build_import_plan(
             continue;
         }
         stats.eligible += 1;
-        let correlation = match match_record(db, options, &record, &record_digest).await {
-            Ok(correlation) => correlation,
-            Err(AppError::BadRequest(_)) => {
+        let matched = match match_record(db, options, &record, &record_digest).await {
+            Ok(matched) => matched,
+            Err(AppError::BadRequest(_)) if options.allow_unmapped => {
                 stats.unmapped += 1;
                 continue;
             }
             Err(error) => return Err(error.into()),
         };
-        preflight_gap_compatibility(db, options, &record, &correlation).await?;
-        stats.mapped += 1;
-        stats.replayed += u64::from(correlation.replay());
+        let plan_correlation = match &matched {
+            SessionArchiveImportMatch::Correlated(correlation) => {
+                preflight_gap_compatibility(db, options, &record, correlation.as_ref()).await?;
+                stats.mapped += 1;
+                stats.replayed += u64::from(correlation.replay());
+                ImportPlanCorrelation::from(correlation.as_ref())
+            }
+            SessionArchiveImportMatch::Quarantine(target)
+                if options.quarantine_unknown_identities =>
+            {
+                stats.quarantined += 1;
+                ImportPlanCorrelation::Quarantined {
+                    target: ImportPlanQuarantineTarget::from(target),
+                }
+            }
+            SessionArchiveImportMatch::Quarantine(_) => {
+                stats.unmapped += 1;
+                continue;
+            }
+        };
 
+        // Stage one payload at a time and transfer ownership of its buffer to
+        // Bytes. This keeps request/response serialization buffers from
+        // overlapping and avoids a second full-payload copy before upload.
         let request = payload_bytes(&record.request)?;
-        let response = payload_bytes(&record.response)?;
-        let request_digest = request.as_ref().map(|body| digest(body));
-        let response_digest = response.as_ref().map(|body| digest(body));
+        let request_digest = request.as_deref().map(digest);
         // These are the only durable writes allowed before both seals validate.
         // Content addressing makes an orphan harmless if planning later fails.
-        let request_object = match request.as_ref() {
-            Some(body) => Some(archive.put_content(Bytes::copy_from_slice(body)).await?),
+        let request_object = match request {
+            Some(body) => Some(archive.put_content(Bytes::from(body)).await?),
             None => None,
         };
-        let response_object = match response.as_ref() {
-            Some(body) => Some(archive.put_content(Bytes::copy_from_slice(body)).await?),
+        let response = payload_bytes(&record.response)?;
+        let response_digest = response.as_deref().map(digest);
+        let response_object = match response {
+            Some(body) => Some(archive.put_content(Bytes::from(body)).await?),
             None => None,
         };
         let source_started_at = record.started_at.timestamp_millis();
@@ -621,7 +727,7 @@ async fn build_import_plan(
         let plan_record = ImportPlanRecord {
             version: IMPORT_PLAN_VERSION,
             external_request_id: record.request_id.clone(),
-            correlation: ImportPlanCorrelation::from(&correlation),
+            correlation: plan_correlation,
             record_digest,
             request_digest,
             response_digest,
@@ -695,6 +801,17 @@ async fn build_import_plan(
         source_size_bytes: source_seal.identity.size,
         source_blake3: source_seal.digest.to_hex().to_string(),
         record_count,
+        quarantine_records: stats.quarantined,
+        quarantine_batch_id: (stats.quarantined > 0).then(|| {
+            quarantine_batch_id(
+                options.tenant_external_id,
+                options.archive_source,
+                source_seal.digest.to_hex().as_ref(),
+            )
+        }),
+        tenant_binding_kind: options.quarantine_tenant_binding_kind.map(str::to_owned),
+        tenant_binding_proof: options.quarantine_tenant_binding_proof.map(str::to_owned),
+        approved_by_service_id: options.quarantine_approved_by_service_id,
     };
     sqlx::query("INSERT INTO import_plan_metadata (singleton, header_json) VALUES (1, $1)")
         .bind(serde_json::to_vec(&header)?)
@@ -871,7 +988,8 @@ async fn open_validated_plan(
     // SQLite writer from changing later rows after earlier rows have committed.
     // Apply therefore reads the exact snapshot that was parsed and hashed.
     sqlx::query("BEGIN").execute(&mut connection).await?;
-    validate_plan_contents(&mut connection, options, source_seal, plan.record_count).await?;
+    let header =
+        validate_plan_contents(&mut connection, options, source_seal, plan.record_count).await?;
     // Hash again after SQLite parsed every row. This closes path replacement or
     // in-place mutation races before the first target database transaction.
     verify_plan_file(&plan).await?;
@@ -880,6 +998,7 @@ async fn open_validated_plan(
     Ok(ValidatedImportPlan {
         connection,
         record_count: plan.record_count,
+        header,
         _path: plan.path,
     })
 }
@@ -889,7 +1008,7 @@ async fn validate_plan_contents(
     options: &SessionArchiveImportOptions<'_>,
     source_seal: &SealedInput,
     expected_records: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ImportPlanHeader, Box<dyn std::error::Error + Send + Sync>> {
     let header_bytes: Vec<u8> =
         sqlx::query_scalar("SELECT header_json FROM import_plan_metadata WHERE singleton = 1")
             .fetch_one(&mut *connection)
@@ -902,6 +1021,22 @@ async fn validate_plan_contents(
         || header.source_size_bytes != source_seal.identity.size
         || header.source_blake3 != source_seal.digest.to_hex().as_str()
         || header.record_count != expected_records
+        || header.quarantine_records > header.record_count
+        || (header.quarantine_records > 0
+            && (header.quarantine_batch_id.is_none()
+                || header
+                    .tenant_binding_kind
+                    .as_deref()
+                    .is_none_or(|value| !valid_plan_text(value, 128))
+                || header
+                    .tenant_binding_proof
+                    .as_deref()
+                    .is_none_or(|value| !is_digest_hex(value))))
+        || (header.quarantine_records == 0
+            && (header.quarantine_batch_id.is_some()
+                || header.tenant_binding_kind.is_some()
+                || header.tenant_binding_proof.is_some()
+                || header.approved_by_service_id.is_some()))
     {
         return Err(plan_changed_error().into());
     }
@@ -933,7 +1068,7 @@ async fn validate_plan_contents(
     if count != expected_records {
         return Err(plan_changed_error().into());
     }
-    Ok(())
+    Ok(header)
 }
 
 fn validate_plan_record(record: &ImportPlanRecord) -> Result<(), io::Error> {
@@ -958,6 +1093,19 @@ fn validate_plan_record(record: &ImportPlanRecord) -> Result<(), io::Error> {
                 && valid_plan_text(&target.identity_proof_kind, 200)
                 && is_digest_hex(&target.identity_proof_digest)
                 && is_digest_hex(&target.correlation_proof_digest)
+        }
+        ImportPlanCorrelation::Quarantined { target } => {
+            !target.tenant_id.is_nil()
+                && !target.quarantine_id.is_nil()
+                && matches!(
+                    target.reason_code.as_str(),
+                    "missing_credential_hash" | "unproven_identity"
+                )
+                && target
+                    .identity_claim_digest
+                    .as_deref()
+                    .is_none_or(is_digest_hex)
+                && is_digest_hex(&target.proof_digest)
         }
     };
     let timing_valid = match (record.source_completed_at, record.duration_ms) {
@@ -1031,8 +1179,8 @@ async fn apply_validated_plan(
     archive: &ArchiveStore,
     options: &SessionArchiveImportOptions<'_>,
     plan: &mut ValidatedImportPlan,
-) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let mut imported = 0_u64;
+) -> Result<ApplyStats, Box<dyn std::error::Error + Send + Sync>> {
+    let mut applied = ApplyStats::default();
     let mut seen = 0_u64;
     let mut rows = sqlx::query(
         "SELECT sequence, source_started_at, source_checkpoint_ms, external_request_id, record_json FROM import_plan_records ORDER BY source_checkpoint_ms ASC, external_request_id ASC, sequence ASC",
@@ -1108,13 +1256,72 @@ async fn apply_validated_plan(
                 })
                 .await?
             }
+            ImportPlanCorrelation::Quarantined { target } => {
+                let target: SessionArchiveQuarantineTarget = target.clone().into();
+                let header = &plan.header;
+                let batch_id = header.quarantine_batch_id.ok_or_else(plan_changed_error)?;
+                let source_size_bytes = i64::try_from(header.source_size_bytes)?;
+                let eligible_records = i64::try_from(header.record_count)?;
+                let quarantine_records = i64::try_from(header.quarantine_records)?;
+                let sequence: i64 = row.try_get("sequence")?;
+                let committed = db
+                    .commit_session_archive_quarantine(SessionArchiveQuarantineCommitInput {
+                        batch: SessionArchiveQuarantineBatchInput {
+                            batch_id,
+                            tenant_external_id: options.tenant_external_id,
+                            archive_source: options.archive_source,
+                            cpamp_source: options.cpamp_source,
+                            source_digest: &header.source_blake3,
+                            source_size_bytes,
+                            eligible_records,
+                            quarantine_records,
+                            tenant_binding_kind: header
+                                .tenant_binding_kind
+                                .as_deref()
+                                .ok_or_else(plan_changed_error)?,
+                            tenant_binding_proof: header
+                                .tenant_binding_proof
+                                .as_deref()
+                                .ok_or_else(plan_changed_error)?,
+                            approved_by_service_id: header.approved_by_service_id,
+                        },
+                        sequence,
+                        target: &target,
+                        external_request_id: &record.external_request_id,
+                        record_digest: &record.record_digest,
+                        source_started_at: record.source_started_at,
+                        source_completed_at: record.source_completed_at,
+                        protocol: &record.protocol,
+                        model: &record.model,
+                        status_code: record.status_code,
+                        duration_ms: record.duration_ms,
+                        input_tokens: record.input_tokens,
+                        output_tokens: record.output_tokens,
+                        error_code: record.error_code.as_deref(),
+                        request_digest: record.request_digest.as_deref(),
+                        response_digest: record.response_digest.as_deref(),
+                        request_object: record.request_object.as_deref(),
+                        response_object: record.response_object.as_deref(),
+                    })
+                    .await?;
+                applied.quarantine_imported += u64::from(committed);
+                applied.quarantine_replayed += u64::from(!committed);
+                false
+            }
         };
-        imported += u64::from(committed);
+        applied.imported += u64::from(committed);
     }
     if seen != plan.record_count {
         return Err(plan_changed_error().into());
     }
-    Ok(imported)
+    Ok(applied)
+}
+
+#[derive(Default)]
+struct ApplyStats {
+    imported: u64,
+    quarantine_imported: u64,
+    quarantine_replayed: u64,
 }
 
 async fn load_structured_plan_request(
@@ -1166,15 +1373,19 @@ async fn preflight_pass(
         }
         stats.eligible += 1;
         match match_record(db, options, &record, &digest).await {
-            Ok(correlation) => {
-                preflight_gap_compatibility(db, options, &record, &correlation).await?;
+            Ok(SessionArchiveImportMatch::Correlated(correlation)) => {
+                preflight_gap_compatibility(db, options, &record, correlation.as_ref()).await?;
                 stats.mapped += 1;
                 stats.replayed += u64::from(correlation.replay());
             }
-            Err(AppError::BadRequest(_)) if options.allow_unmapped => stats.unmapped += 1,
-            Err(AppError::BadRequest(_)) => {
-                stats.unmapped += 1;
+            Ok(SessionArchiveImportMatch::Quarantine(_))
+                if options.quarantine_unknown_identities =>
+            {
+                stats.quarantined += 1;
             }
+            Ok(SessionArchiveImportMatch::Quarantine(_)) => stats.unmapped += 1,
+            Err(AppError::BadRequest(_)) if options.allow_unmapped => stats.unmapped += 1,
+            Err(AppError::BadRequest(error)) => return Err(AppError::BadRequest(error).into()),
             Err(error) => return Err(error.into()),
         }
     }
@@ -1186,9 +1397,9 @@ async fn match_record(
     options: &SessionArchiveImportOptions<'_>,
     record: &ArchiveRecord,
     record_digest: &str,
-) -> Result<SessionArchiveCorrelation, AppError> {
+) -> Result<SessionArchiveImportMatch, AppError> {
     let source_key_hash = archived_credential_hash(record)?;
-    db.correlate_session_archive_request(SessionArchiveMatchInput {
+    db.match_session_archive_import(SessionArchiveImportMatchInput {
         tenant_external_id: options.tenant_external_id,
         cpamp_source: options.cpamp_source,
         archive_source: options.archive_source,
@@ -1196,7 +1407,7 @@ async fn match_record(
         started_at: record.started_at.timestamp_millis(),
         requested_model: nonempty(&record.requested_model),
         resolved_model: nonempty(&record.model),
-        source_key_hash: &source_key_hash,
+        source_key_hash: source_key_hash.as_deref(),
         input_tokens: None,
         output_tokens: None,
         record_digest,
@@ -1240,6 +1451,20 @@ fn content_location(digest: &str) -> String {
     format!("objects/blake3/{}/{digest}", &digest[..2])
 }
 
+fn quarantine_batch_id(tenant_external_id: &str, source: &str, source_digest: &str) -> Uuid {
+    let digest = blake3::hash(
+        format!(
+            "memeloop-session-archive-quarantine-batch-v1\0{tenant_external_id}\0{source}\0{source_digest}"
+        )
+        .as_bytes(),
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
 fn gap_compatible(current: &str, replacement: Option<&str>) -> Result<(), AppError> {
     if replacement.is_none() || current.starts_with("gap://") || Some(current) == replacement {
         return Ok(());
@@ -1272,8 +1497,10 @@ fn parse_record(
     {
         return Err("archive record contains an invalid identity or time range".into());
     }
-    let canonical = serde_json::to_vec(&record)?;
-    Ok(Some((record, digest(&canonical))))
+    let mut canonical_hasher = blake3::Hasher::new();
+    serde_json::to_writer(&mut canonical_hasher, &record)?;
+    let record_digest = canonical_hasher.finalize().to_hex().to_string();
+    Ok(Some((record, record_digest)))
 }
 
 fn archive_record_inside_overlap(record: &ArchiveRecord, lower_bound: i64) -> bool {
@@ -1284,23 +1511,30 @@ fn archive_record_inside_overlap(record: &ArchiveRecord, lower_bound: i64) -> bo
     started_at >= lower_bound || completed_at >= lower_bound
 }
 
-fn archived_credential_hash(record: &ArchiveRecord) -> Result<String, AppError> {
-    let normalized = match record.schema_version {
+fn archived_credential_hash(record: &ArchiveRecord) -> Result<Option<String>, AppError> {
+    let candidate = match record.schema_version {
         // Schema 1 defines key_id itself as the legacy bare digest.  Do not
         // broaden that older envelope by interpreting labels or prefixes.
-        1 => nonempty(&record.key_id).and_then(normalize_bare_sha256),
+        1 => nonempty(&record.key_id),
         2 => match nonempty(&record.credential_hash) {
             // An explicit schema-2 field is authoritative: malformed data must
             // not fall back to key_id.  Only the specified sha256 prefix is
             // stripped, and the digest is canonicalized for proof stability.
-            Some(value) => normalize_schema_v2_sha256(value),
-            None => nonempty(&record.key_id).and_then(normalize_bare_sha256),
+            Some(value) => {
+                return normalize_schema_v2_sha256(value).map(Some).ok_or_else(|| {
+                    AppError::BadRequest("archive credential hash is malformed".into())
+                });
+            }
+            None => nonempty(&record.key_id),
         },
         _ => None,
     };
-    normalized.ok_or_else(|| {
-        AppError::BadRequest("archive request has no verified credential hash".into())
-    })
+    candidate
+        .map(|value| {
+            normalize_bare_sha256(value)
+                .ok_or_else(|| AppError::BadRequest("archive credential hash is malformed".into()))
+        })
+        .transpose()
 }
 
 fn normalize_bare_sha256(value: &str) -> Option<String> {
@@ -1440,6 +1674,13 @@ async fn read_bounded_line(
     reader: &mut BufReader<tokio::fs::File>,
     maximum: usize,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    if maximum > MAX_SESSION_ARCHIVE_LINE_BYTES {
+        return Err(format!(
+            "max line bytes exceeds the compiled-in {} MiB hard limit",
+            MAX_SESSION_ARCHIVE_LINE_BYTES / (1024 * 1024)
+        )
+        .into());
+    }
     let mut line = Vec::new();
     loop {
         let available = reader.fill_buf().await?;
@@ -1466,6 +1707,85 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    fn validation_options(
+        max_line_bytes: usize,
+        max_plan_bytes: u64,
+    ) -> SessionArchiveImportOptions<'static> {
+        SessionArchiveImportOptions {
+            input: Path::new("/archive.jsonl"),
+            plan_directory: Path::new("/plan"),
+            tenant_external_id: "archive-fixture",
+            cpamp_source: "cpamp-usage-events-v1",
+            archive_source: "cpa-session-archive-v2",
+            overlap_ms: 0,
+            time_tolerance_ms: 0,
+            max_line_bytes,
+            max_plan_bytes,
+            allow_unmapped: false,
+            quarantine_unknown_identities: false,
+            quarantine_tenant_binding_kind: None,
+            quarantine_tenant_binding_proof: None,
+            quarantine_approved_by_service_id: None,
+            apply: false,
+        }
+    }
+
+    #[test]
+    fn import_resource_limits_accept_boundaries_and_reject_overrides() {
+        for (line, plan) in [
+            (1024, 1024 * 1024),
+            (
+                MAX_SESSION_ARCHIVE_LINE_BYTES,
+                MAX_SESSION_ARCHIVE_PLAN_BYTES,
+            ),
+        ] {
+            validate_session_archive_import_options(&validation_options(line, plan))
+                .expect("compiled-in resource boundary must be accepted");
+        }
+
+        let line_error = validate_session_archive_import_options(&validation_options(
+            MAX_SESSION_ARCHIVE_LINE_BYTES + 1,
+            MAX_SESSION_ARCHIVE_PLAN_BYTES,
+        ))
+        .expect_err("line limit must not override the compiled-in ceiling");
+        assert!(line_error.contains("compiled-in 16 MiB hard limit"));
+
+        let plan_error = validate_session_archive_import_options(&validation_options(
+            MAX_SESSION_ARCHIVE_LINE_BYTES,
+            MAX_SESSION_ARCHIVE_PLAN_BYTES + 1,
+        ))
+        .expect_err("plan limit must not override the compiled-in ceiling");
+        assert!(plan_error.contains("compiled-in 1 GiB hard limit"));
+    }
+
+    #[tokio::test]
+    async fn bounded_line_accepts_exact_limit_and_rejects_one_byte_over() {
+        let exact = tempfile::NamedTempFile::new().expect("exact-limit input");
+        std::fs::write(exact.path(), [vec![b'a'; 1023], vec![b'\n']].concat())
+            .expect("write exact-limit input");
+        let mut exact_input = ReadOnlyInput::open(exact.path()).await.expect("open input");
+        let line = read_bounded_line(&mut exact_input.reader, 1024)
+            .await
+            .expect("exact-limit line must be accepted")
+            .expect("exact-limit line");
+        assert_eq!(line.len(), 1024);
+
+        let over = tempfile::NamedTempFile::new().expect("over-limit input");
+        std::fs::write(over.path(), [vec![b'a'; 1024], vec![b'\n']].concat())
+            .expect("write over-limit input");
+        let mut over_input = ReadOnlyInput::open(over.path()).await.expect("open input");
+        let error = read_bounded_line(&mut over_input.reader, 1024)
+            .await
+            .expect_err("one byte over the line limit must fail");
+        assert!(error.to_string().contains("exceeds 1024 bytes"));
+
+        let hard_limit_error =
+            read_bounded_line(&mut over_input.reader, MAX_SESSION_ARCHIVE_LINE_BYTES + 1)
+                .await
+                .expect_err("bounded reader must enforce the compiled-in hard limit");
+        assert!(hard_limit_error.to_string().contains("compiled-in 16 MiB"));
+    }
 
     #[test]
     fn payload_strings_restore_raw_bytes_and_objects_restore_json() {
@@ -1498,7 +1818,7 @@ mod tests {
             "credential_hash": "b".repeat(64)
         }))
         .expect("schema-v1 fixture");
-        assert_eq!(archived_credential_hash(&v1).unwrap(), "a".repeat(64));
+        assert_eq!(archived_credential_hash(&v1).unwrap(), Some("a".repeat(64)));
 
         let v2: ArchiveRecord = serde_json::from_value(serde_json::json!({
             "schema_version": 2,
@@ -1511,7 +1831,7 @@ mod tests {
             "principal_id": "untrusted-source-principal"
         }))
         .expect("schema-v2 fixture");
-        assert_eq!(archived_credential_hash(&v2).unwrap(), "b".repeat(64));
+        assert_eq!(archived_credential_hash(&v2).unwrap(), Some("b".repeat(64)));
 
         let v2_prefixed: ArchiveRecord = serde_json::from_value(serde_json::json!({
             "schema_version": 2,
@@ -1526,7 +1846,7 @@ mod tests {
         .expect("prefixed schema-v2 fixture");
         assert_eq!(
             archived_credential_hash(&v2_prefixed).unwrap(),
-            "a".repeat(64)
+            Some("a".repeat(64))
         );
 
         let v2_legacy_fallback: ArchiveRecord = serde_json::from_value(serde_json::json!({
@@ -1540,7 +1860,7 @@ mod tests {
         .expect("schema-v2 legacy fallback fixture");
         assert_eq!(
             archived_credential_hash(&v2_legacy_fallback).unwrap(),
-            "c".repeat(64)
+            Some("c".repeat(64))
         );
 
         let v2_invalid_explicit: ArchiveRecord = serde_json::from_value(serde_json::json!({
@@ -1601,6 +1921,11 @@ mod tests {
             parse_record(format!("{}\n", serde_json::to_string(&with_path).unwrap()).as_bytes())
                 .unwrap()
                 .unwrap();
+        assert_eq!(
+            without_digest,
+            digest(&serde_json::to_vec(&without_record).unwrap()),
+            "streaming canonical hashing must match the legacy buffered encoding"
+        );
         assert_eq!(without_digest, with_digest);
         assert_eq!(archive_protocol(&without_record), "session-archive");
         assert_eq!(archive_protocol(&with_record), "/v1/responses");
@@ -1790,6 +2115,10 @@ mod tests {
             max_line_bytes: 1024,
             max_plan_bytes: 16 * 1024 * 1024,
             allow_unmapped: false,
+            quarantine_unknown_identities: false,
+            quarantine_tenant_binding_kind: None,
+            quarantine_tenant_binding_proof: None,
+            quarantine_approved_by_service_id: None,
             apply: true,
         };
         let (guard, mut connection) = create_import_plan(directory.path())
@@ -1806,6 +2135,11 @@ mod tests {
             source_size_bytes: source_seal.identity.size,
             source_blake3: source_seal.digest.to_hex().to_string(),
             record_count: 0,
+            quarantine_records: 0,
+            quarantine_batch_id: None,
+            tenant_binding_kind: None,
+            tenant_binding_proof: None,
+            approved_by_service_id: None,
         };
         sqlx::query("INSERT INTO import_plan_metadata (singleton, header_json) VALUES (1, $1)")
             .bind(serde_json::to_vec(&header).expect("encode header"))

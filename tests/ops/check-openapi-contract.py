@@ -538,6 +538,58 @@ def validate_product_contracts(document: dict[str, Any]) -> None:
     }:
         raise ContractFailure("completed image replay regained mutable route/price dependencies")
 
+    cloud = operation_at(
+        document,
+        "put",
+        "/internal/v1/integrations/memeloop-cloud/subscription",
+    )
+    if cloud.get("security") != [{"memeloopCloudHmac": []}]:
+        raise ContractFailure("MemeLoop Cloud subscription sync lost HMAC security")
+    cloud_parameters = {
+        parameter.get("name"): parameter
+        for parameter in cloud.get("parameters", [])
+        if isinstance(parameter, dict) and "name" in parameter
+    }
+    if parameter_references(cloud) != {
+        "#/components/parameters/RequiredIdempotencyKey"
+    } or set(cloud_parameters) != {
+        "X-MTC-Webhook-Timestamp",
+        "X-MTC-Webhook-Signature",
+    }:
+        raise ContractFailure("MemeLoop Cloud signature/idempotency headers changed")
+    if not {"200", "201", "400", "401", "403", "404", "409"}.issubset(
+        set(cloud.get("responses", {}))
+    ):
+        raise ContractFailure("MemeLoop Cloud lifecycle response contract regressed")
+    signature = cloud.get("x-signature-contract")
+    if signature != {
+        "algorithm": "HMAC-SHA-256",
+        "encoding": "base64url-no-padding",
+        "envelope": "ascii-timestamp-dot-exact-body",
+        "tolerance-seconds": 300,
+        "disabled-without-secret": True,
+    }:
+        raise ContractFailure("MemeLoop Cloud signature contract changed")
+    cloud_idempotency = cloud.get("x-idempotency-contract")
+    if cloud_idempotency != {
+        "namespace": "tenant-and-event-id-digest",
+        "payload": "canonical-full-snapshot",
+        "different-payload-status": 409,
+        "stale-version-status": 409,
+        "quota-version-source": "durable-subscription-entitlement",
+        "policy-update": "compare-and-set-on-current-entitlement-version",
+        "stable-history-owner": "key-id-and-account-id",
+        "raw-event-id-persisted": False,
+    }:
+        raise ContractFailure("MemeLoop Cloud ordered idempotency contract changed")
+    snapshot = document.get("components", {}).get("schemas", {}).get(
+        "MemeLoopCloudSubscriptionSnapshot", {}
+    )
+    if snapshot.get("additionalProperties") is not False or set(
+        snapshot.get("properties", {}).get("status", {}).get("enum", [])
+    ) != {"active", "cancelled"}:
+        raise ContractFailure("MemeLoop Cloud full snapshot schema changed")
+
 
 def matching_rule(path: str, boundary: dict[str, Any]) -> dict[str, Any]:
     matches = []
@@ -629,7 +681,7 @@ def check_contract(
 def parse_args() -> argparse.Namespace:
     repository = pathlib.Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=pathlib.Path, default=repository / "src/api.rs")
+    parser.add_argument("--source", type=pathlib.Path, default=repository / "src/api")
     parser.add_argument("--openapi", type=pathlib.Path, default=repository / "openapi/openapi.yaml")
     parser.add_argument(
         "--boundaries",
@@ -640,10 +692,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def read_rust_source(path: pathlib.Path) -> str:
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    if not path.is_dir():
+        raise ContractFailure(f"Rust API source does not exist: {path}")
+    sources = sorted(path.rglob("*.rs"))
+    if not sources:
+        raise ContractFailure(f"Rust API source directory is empty: {path}")
+    return "\n".join(
+        f"// source: {source.relative_to(path).as_posix()}\n"
+        f"{source.read_text(encoding='utf-8')}"
+        for source in sources
+    )
+
+
 def main() -> int:
     args = parse_args()
     try:
-        source = args.source.read_text(encoding="utf-8")
+        source = read_rust_source(args.source)
         spec = yaml.safe_load(args.openapi.read_text(encoding="utf-8"))
         boundary = json.loads(args.boundaries.read_text(encoding="utf-8"))
         if not isinstance(spec, dict) or not isinstance(boundary, dict):

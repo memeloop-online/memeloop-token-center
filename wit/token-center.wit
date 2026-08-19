@@ -36,6 +36,11 @@ interface host {
 
 interface traffic-policy {
   use types.{request-context, decision};
+
+  /// Combined bounded post-auth hook used by the separately auditable
+  /// `traffic_policy` and `request_rewrite` manifest contributions. A package
+  /// may declare either or both without receiving the downstream/upstream
+  /// credential.
   post-auth: func(context: request-context, request-json: string) -> result<decision, string>;
 }
 

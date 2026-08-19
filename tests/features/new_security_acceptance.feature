@@ -23,6 +23,10 @@ Feature: Black-box credential policy and tenant isolation acceptance
     Given a token center backed by SQLite and memory object storage
     Then tenant scoped OAuth cannot target private or metadata endpoints while a global private connection is allowed
 
+  Scenario: Provider JSON Schemas reject invalid and undeclared values
+    Given a token center backed by SQLite and memory object storage
+    Then provider configuration and credential schemas are authoritative on every write
+
   Scenario: Authentication precedes parsing and request size enforcement
     Given a token center backed by SQLite and memory object storage
     Then malformed and oversized unauthenticated bodies are rejected as unauthorized

@@ -66,6 +66,13 @@ spec:
                 secretKeyRef:
                   name: {{ $.Values.config.serviceTokenSecret.name }}
                   key: {{ $.Values.config.serviceTokenSecret.key }}
+            {{- if $.Values.config.memeloopCloudWebhookSecret.name }}
+            - name: MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.config.memeloopCloudWebhookSecret.name }}
+                  key: {{ $.Values.config.memeloopCloudWebhookSecret.key }}
+            {{- end }}
             {{- else }}
             - name: MTC_SERVICE_TOKEN
               # Non-authenticating 32-byte sentinel that satisfies config parsing.

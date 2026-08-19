@@ -35,6 +35,12 @@ impl Database {
         let credential_ciphertext = seal_credential(&input.credential, key_material)?;
         let auth_kind = input.credential.auth_kind();
         let credential_expires_at = input.credential.expires_at();
+        let can_reauthorize = upstream_can_reauthorize(
+            &input.driver,
+            auth_kind,
+            input.oauth_session_id.is_some().then_some("present"),
+            input.oauth_driver.as_deref(),
+        );
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
@@ -121,7 +127,7 @@ impl Database {
                     "cpa-subscription-bridge" | "cpa-gemini-oauth-legacy"
                 ),
             can_rotate: auth_kind != "none",
-            can_reauthorize: false,
+            can_reauthorize,
             route_count: 0,
             created_at: now,
             updated_at: now,
@@ -361,10 +367,28 @@ impl Database {
         &self,
         tenant_external_id: &str,
     ) -> Result<Vec<UpstreamAccountView>, AppError> {
+        self.list_upstream_accounts_page(Some(tenant_external_id), None, None, 100)
+            .await
+    }
+
+    pub async fn list_upstream_accounts_page(
+        &self,
+        tenant_external_id: Option<&str>,
+        before_created_at: Option<i64>,
+        before_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<UpstreamAccountView>, AppError> {
+        let before_created_at = before_created_at.unwrap_or(i64::MAX);
+        let before_id = before_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned());
         let rows = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE t.external_id = $1 ORDER BY a.created_at DESC, a.id DESC",
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE ($1 = '' OR t.external_id = $1) AND (a.created_at < $2 OR (a.created_at = $2 AND a.id < $3)) ORDER BY a.created_at DESC, a.id DESC LIMIT $4",
         )
-        .bind(tenant_external_id)
+        .bind(tenant_external_id.unwrap_or_default())
+        .bind(before_created_at)
+        .bind(before_id)
+        .bind(limit.clamp(1, 100))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(upstream_account_view).collect()
@@ -373,12 +397,8 @@ impl Database {
     /// operators must use `list_upstream_accounts` so the authorization scope
     /// remains visible at the call site.
     pub async fn list_all_upstream_accounts(&self) -> Result<Vec<UpstreamAccountView>, AppError> {
-        let rows = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL ORDER BY a.created_at DESC, a.id DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(upstream_account_view).collect()
+        self.list_upstream_accounts_page(None, None, None, 100)
+            .await
     }
     pub async fn require_upstream_tenant(
         &self,
@@ -394,6 +414,21 @@ impl Database {
         .await?
         .is_some();
         exists.then_some(()).ok_or(AppError::Forbidden)
+    }
+    pub async fn upstream_account_for_reauthorization(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+    ) -> Result<UpstreamAccountView, AppError> {
+        let row = sqlx::query(
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
+        )
+        .bind(account_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::Forbidden)?;
+        upstream_account_view(row)
     }
     pub async fn upstream_driver(&self, account_id: Uuid) -> Result<String, AppError> {
         sqlx::query("SELECT driver FROM upstream_accounts WHERE id = $1")
@@ -412,11 +447,15 @@ pub(super) fn upstream_account_view(
     let config_json: String = row.try_get("config_json")?;
     let driver: String = row.try_get("driver")?;
     let auth_kind: String = row.try_get("auth_kind")?;
-    let managed_oauth = row
+    let oauth_session_id = row
         .try_get::<Option<String>, _>("oauth_session_id")
         .ok()
-        .flatten()
-        .is_some()
+        .flatten();
+    let oauth_driver = row
+        .try_get::<Option<String>, _>("oauth_driver")
+        .ok()
+        .flatten();
+    let managed_oauth = oauth_session_id.is_some()
         && row
             .try_get::<Option<String>, _>("oauth_refresh_url")
             .ok()
@@ -429,6 +468,12 @@ pub(super) fn upstream_account_view(
             "cpa-subscription-bridge" | "cpa-gemini-oauth-legacy"
         );
     let can_rotate = auth_kind != "none";
+    let can_reauthorize = upstream_can_reauthorize(
+        &driver,
+        &auth_kind,
+        oauth_session_id.as_deref(),
+        oauth_driver.as_deref(),
+    );
     Ok(UpstreamAccountView {
         id: parse_uuid(row.try_get("id")?)?,
         tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
@@ -443,7 +488,7 @@ pub(super) fn upstream_account_view(
         credential_expires_at: row.try_get("expires_at")?,
         can_refresh,
         can_rotate,
-        can_reauthorize: false,
+        can_reauthorize,
         route_count: row.try_get("route_count")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,

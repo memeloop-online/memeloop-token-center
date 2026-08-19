@@ -1,6 +1,8 @@
 use super::super::*;
 use super::money::parse_decimal;
 
+static MODEL_PRICE_SYNC_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct PriceRequest {
     input_per_million: String,
@@ -17,13 +19,28 @@ pub(in crate::api) struct ModelPricesQuery {
     currency: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub(in crate::api) struct ModelPriceListQuery {
+    #[serde(default = "default_currency")]
+    currency: String,
+    #[serde(default = "default_model_price_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
 pub(in crate::api) async fn list_model_prices(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ModelPricesQuery>,
+    Query(query): Query<ModelPriceListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     require_service(&headers, &state, "requests:read").await?;
-    Ok(Json(state.db.list_model_prices(&query.currency).await?))
+    Ok(Json(
+        state
+            .db
+            .list_model_prices_page(&query.currency, query.limit, query.offset)
+            .await?,
+    ))
 }
 
 pub(in crate::api) async fn model_price_usage_summary(
@@ -64,12 +81,24 @@ pub(in crate::api) async fn sync_model_prices(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "prices:write").await?;
     require_global_service(&service)?;
+    let _permit = MODEL_PRICE_SYNC_PERMITS
+        .try_acquire()
+        .map_err(|_| AppError::LimitExceeded {
+            reason: crate::error::LimitReason::ConcurrencyExhausted,
+            retry_after_seconds: Some(1),
+        })?;
     let tenant = management_tenant(&service, body.tenant_external_id)?;
     let models = if body.models.is_empty() {
         state.db.pricing_models(tenant.as_deref()).await?
     } else {
         body.models
     };
+    if models.len() > crate::pricing::MAX_SYNC_MODELS {
+        return Err(AppError::BadRequest(format!(
+            "model price sync accepts at most {} models",
+            crate::pricing::MAX_SYNC_MODELS
+        )));
+    }
     let sources = crate::pricing::model_price_sources(&state.config);
     Ok(Json(
         crate::pricing::sync_model_prices(
@@ -125,6 +154,10 @@ pub(in crate::api) async fn upsert_price(
 
 fn default_service_tier() -> String {
     "default".to_owned()
+}
+
+fn default_model_price_limit() -> usize {
+    1_000
 }
 
 #[derive(Debug, Deserialize)]

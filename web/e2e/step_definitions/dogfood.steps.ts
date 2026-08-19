@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { Given, Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
-import { baseURL, eventually, model, runtime, tenant } from '../support/runtime.js';
+import { baseURL, eventually, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 
 interface RealtimeReconnectObservation {
@@ -13,9 +14,17 @@ interface RealtimeReconnectObservation {
 interface StrictUsageObservation {
   requestUrls: string[];
 }
+interface MultimodalObservation {
+  blockerCredential: string;
+  clientCredential: string;
+  clientKeyId: string;
+  imageModel: string;
+  videoModel: string;
+}
 
 const realtimeReconnectObservations = new WeakMap<DogfoodWorld, RealtimeReconnectObservation>();
 const strictUsageObservations = new WeakMap<DogfoodWorld, StrictUsageObservation>();
+const multimodalObservations = new WeakMap<DogfoodWorld, MultimodalObservation>();
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 Given('dogfood 服务已有隔离租户、统一上游、请求记录和多模态价格', function () {
@@ -193,6 +202,22 @@ Then('管理员可以重命名凭据并查看当前限制状态', async function
   await page.getByRole('tab', { name: '模型计费', exact: true }).click();
 });
 
+Then('插件配置由 Schema 渲染并可保存租户覆盖', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  await page.getByRole('tab', { name: '插件', exact: true }).click();
+  const plugin = page.locator('.managed-resource').filter({ hasText: 'browser-configuration' });
+  await assertContains(plugin, '插件默认值');
+  await plugin.getByLabel('Mode').selectOption('configured');
+  const saveResponse = page.waitForResponse((response) =>
+    response.url().endsWith('/internal/v1/plugins/browser-configuration/configuration')
+      && response.request().method() === 'PUT');
+  await plugin.getByRole('button', { name: '保存', exact: true }).click();
+  assert.equal((await saveResponse).status(), 200);
+  await assertContains(page.getByRole('status'), '已保存 browser-configuration 的配置');
+  await assertContains(plugin, '租户配置');
+  await assertContains(plugin, '写入版本 1');
+});
+
 When('管理员切换为亮色英文界面和手机视口', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.locator('.rail').getByRole('button', { name: '切换到亮色主题' }).click();
@@ -228,7 +253,7 @@ Then('总览、趋势、模型、客户端凭据、上游凭证和热力图六�
   await assertContains(page.getByRole('tabpanel'), '成功');
 
   await page.getByRole('tab', { name: '趋势分析', exact: true }).click();
-  await assertVisible(page.getByRole('img', { name: '请求量时间趋势图', exact: true }));
+  await assertVisible(page.getByRole('img', { name: '请求数 · 时间趋势图', exact: true }));
   assert.ok(await page.locator('.usage-trend-points button').count() > 0, 'trend must expose real data points');
 
   await page.getByRole('tab', { name: '模型分析', exact: true }).click();
@@ -239,6 +264,7 @@ Then('总览、趋势、模型、客户端凭据、上游凭证和热力图六�
 
   await page.getByRole('tab', { name: '上游凭证分析', exact: true }).click();
   await assertContains(page.getByRole('tabpanel'), 'Browser mock upstream');
+  await assertContains(page.getByRole('tabpanel'), '按稳定上游账户归集');
 
   await page.getByRole('tab', { name: '用量热力图', exact: true }).click();
   await assertVisible(page.getByRole('img', { name: '按星期和 UTC 小时显示的请求量热力图', exact: true }));
@@ -465,6 +491,31 @@ Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', as
   const costs = page.locator('.usage-cost-lines');
   await assertContains(costs, '¥2.5');
   await assertContains(costs, 'US$1.25');
+
+  await page.getByRole('tab', { name: '趋势分析', exact: true }).click();
+  const trendMetric = page.getByLabel('趋势指标', { exact: true });
+  await trendMetric.selectOption('tokens');
+  await assertVisible(page.getByRole('img', { name: '总 Token · 时间趋势图', exact: true }));
+  await assertContains(page.locator('.usage-trend-points'), '1,000,100,111,227');
+
+  await trendMetric.selectOption('cost');
+  const trendCurrency = page.getByLabel('成本币种', { exact: true });
+  await assertValue(trendCurrency, 'CNY');
+  await assertVisible(page.getByRole('img', { name: '成本 (CNY) · 时间趋势图', exact: true }));
+  await assertContains(page.locator('.usage-trend-points'), '¥2.5');
+  await assertNotContains(page.locator('.usage-trend-points'), 'US$1.25');
+  await trendCurrency.selectOption('USD');
+  await assertVisible(page.getByRole('img', { name: '成本 (USD) · 时间趋势图', exact: true }));
+  await assertContains(page.locator('.usage-trend-points'), 'US$1.25');
+  await assertNotContains(page.locator('.usage-trend-points'), '¥2.5');
+
+  await trendMetric.selectOption('avg_latency');
+  await assertVisible(page.getByRole('img', { name: '平均延迟 · 时间趋势图', exact: true }));
+  await assertContains(page.locator('.usage-trend-points'), '18.5 ms');
+  await trendMetric.selectOption('p95_latency');
+  await assertVisible(page.getByRole('img', { name: 'P95 延迟 · 时间趋势图', exact: true }));
+  await assertContains(page.locator('.usage-trend-points'), '25 ms');
+  await page.getByRole('tab', { name: '总览', exact: true }).click();
 });
 
 When('管理员将请求统计切换为英文', async function (this: DogfoodWorld) {
@@ -680,6 +731,251 @@ Then('多模态模型 {string} 以 {string} 计费并显示价格 {string}', asy
   this.assertNoBrowserFailures();
 });
 
+When('管理员通过真实控件创建多模态上游、价格、路由和凭据', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const seed = runtime.requireSeed();
+  const mockBaseUrl = `http://127.0.0.1:${Number(process.env.MTC_E2E_MOCK_PORT ?? 41740)}`;
+  const imageModel = 'browser-ui-comfy-image';
+  const videoModel = 'browser-ui-seedance-video';
+
+  // The ComfyUI graph is an administrator-owned JSON fixture; the resources named in
+  // the acceptance sentence below are deliberately created with the visible console.
+  const comfyUpstream = await requestJson<{ id: string }>('/internal/v1/upstreams', {
+    method: 'POST', credential: seed.globalServiceCredential,
+    body: {
+      tenant_external_id: tenant,
+      name: 'Browser UI ComfyUI fixture',
+      driver: 'comfyui',
+      config: {
+        base_url: mockBaseUrl,
+        network_scope: 'public',
+        api_prefix: '',
+        workflow_id: 'browser-workflow-v1',
+        workflow_template: {
+          '9': { class_type: 'SaveImage', inputs: { filename_prefix: { $mtc_param: 'prompt' } } },
+        },
+      },
+      credential: { type: 'none' },
+    },
+  });
+  await requestJson('/internal/v1/model-routes', {
+    method: 'POST', credential: seed.globalServiceCredential,
+    body: {
+      tenant_external_id: tenant,
+      public_model: imageModel,
+      upstream_account_id: comfyUpstream.id,
+      upstream_model: 'browser-workflow-v1',
+      protocol: 'generation',
+      priority: 0,
+    },
+  });
+  await requestJson(`/internal/v1/generation-prices/USD/${imageModel}`, {
+    method: 'POST', credential: seed.globalServiceCredential,
+    body: { billing_unit: 'job', price_per_unit: '0.2' },
+  });
+
+  await connectOperator(this, 'light', seed.globalServiceCredential);
+  await page.getByRole('tab', { name: '上游提供商', exact: true }).click();
+  const onboarding = page.locator('.provider-onboarding');
+  await onboarding.getByLabel('提供商').selectOption('volcengine-seedance');
+  const providerForm = onboarding.locator('form');
+  await providerForm.locator('#root_name').fill('Browser UI Seedance');
+  await providerForm.locator('#root_config_base_url').fill(mockBaseUrl);
+  const credentialType = providerForm.locator('#root_credential__oneof_select');
+  if (await credentialType.count()) await credentialType.selectOption({ index: 1 });
+  await providerForm.locator('#root_credential_value').fill('browser-seedance-secret-not-real');
+  const upstreamResponsePromise = page.waitForResponse(
+    (response) => response.url().endsWith('/internal/v1/upstreams') && response.request().method() === 'POST',
+    { timeout: 10_000 },
+  ).catch(() => undefined);
+  await providerForm.locator('button[type="submit"]').click();
+  await page.waitForTimeout(100);
+  if (await providerForm.locator('.schema-errors').count()) {
+    throw new Error(`Seedance browser form validation failed: ${await providerForm.locator('.schema-errors').innerText()}`);
+  }
+  const upstreamResponse = await upstreamResponsePromise;
+  if (!upstreamResponse) {
+    const fields = await providerForm.locator('input, select, textarea').evaluateAll((elements) => elements.map((element) => ({
+      id: element.id,
+      value: (element as HTMLInputElement).value,
+      disabled: (element as HTMLInputElement).disabled,
+    })));
+    throw new Error(`Seedance browser form did not submit: fields=${JSON.stringify(fields)} console=${JSON.stringify(this.consoleErrors)}`);
+  }
+  assert.equal(upstreamResponse.status(), 201);
+  const seedanceUpstream = await upstreamResponse.json() as { id: string };
+  assert.match(seedanceUpstream.id, uuidPattern);
+  await assertContains(page.getByRole('status'), '上游提供商已添加');
+
+  await page.getByRole('tab', { name: '模型路由', exact: true }).click();
+  const routeForm = page.locator('article.form-panel').filter({ has: page.getByRole('heading', { name: '创建模型路由', exact: true }) });
+  await routeForm.getByLabel('公开模型').fill(videoModel);
+  await routeForm.getByLabel('上游提供商').selectOption(seedanceUpstream.id);
+  await routeForm.getByLabel('上游模型').fill('seedance-browser-v1');
+  await routeForm.getByLabel('协议').selectOption('generation');
+  const routeResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
+  await routeForm.getByRole('button', { name: '创建路由', exact: true }).click();
+  assert.equal((await routeResponsePromise).status(), 201);
+  await assertContains(page.getByRole('status'), '路由已创建');
+
+  await page.getByRole('tab', { name: '模型计费', exact: true }).click();
+  const manualPricing = page.locator('details.manual-pricing');
+  await manualPricing.locator('summary').click();
+  await manualPricing.getByLabel('类型').selectOption('generation');
+  await manualPricing.getByRole('textbox', { name: '模型', exact: true }).fill(videoModel);
+  await manualPricing.getByRole('textbox', { name: '币种', exact: true }).fill('USD');
+  await manualPricing.getByLabel('计费单位').selectOption('second');
+  await manualPricing.getByLabel('单位价格').fill('0.1');
+  const priceResponsePromise = page.waitForResponse((response) => response.url().includes(`/internal/v1/generation-prices/USD/${videoModel}`) && response.request().method() === 'POST');
+  await manualPricing.getByRole('button', { name: '保存手动价格', exact: true }).click();
+  assert.equal((await priceResponsePromise).status(), 200);
+  await assertContains(page.getByRole('status'), '价格已保存');
+
+  await page.getByRole('tab', { name: '凭据管理', exact: true }).click();
+  const credentialPanel = page.locator('article.form-panel').filter({ has: page.getByRole('heading', { name: '创建下游凭据', exact: true }) });
+  const credentialForm = credentialPanel.locator('form');
+  await credentialForm.locator('#root_principal_external_id').fill('browser-multimodal-user');
+  await credentialForm.locator('#root_alias').fill('Browser multimodal credential');
+  await credentialForm.locator('#root_currency').selectOption('USD');
+  await credentialForm.locator('#root_initial_balance').fill('10');
+  const allowedModels = credentialForm.locator('#root_policy_allowed_models');
+  await allowedModels.getByRole('button', { name: /添加一项/ }).click();
+  await allowedModels.locator('input').nth(0).fill(imageModel);
+  await allowedModels.getByRole('button', { name: /添加一项/ }).click();
+  await allowedModels.locator('input').nth(1).fill(videoModel);
+  const keyResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/keys') && response.request().method() === 'POST');
+  await credentialForm.getByRole('button', { name: '创建凭据', exact: true }).click();
+  const keyResponse = await keyResponsePromise;
+  assert.equal(keyResponse.status(), 201);
+  const created = await keyResponse.json() as { key: string; key_id: string };
+  assert.match(created.key_id, uuidPattern);
+  const oneTimeSecret = page.locator('.one-time code');
+  await assertExactText(oneTimeSecret, created.key);
+  const blocker = await requestJson<{ key: string }>('/internal/v1/keys', {
+    method: 'POST', credential: seed.globalServiceCredential,
+    body: {
+      tenant_external_id: tenant,
+      principal_external_id: 'browser-multimodal-worker-blocker',
+      alias: 'Browser worker blocker fixture',
+      currency: 'USD',
+      initial_balance: '1',
+      policy: { allowed_models: [imageModel] },
+    },
+  });
+  multimodalObservations.set(this, {
+    blockerCredential: blocker.key,
+    clientCredential: created.key,
+    clientKeyId: created.key_id,
+    imageModel,
+    videoModel,
+  });
+  this.assertNoBrowserFailures();
+});
+
+When('普通凭据用户通过中文亮色门户创建图片和视频任务', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const observation = requireMultimodalObservation(this);
+  await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 390, height: 844 } });
+  await page.locator('input[type="password"]').fill(observation.clientCredential);
+  await page.getByRole('button', { name: '载入', exact: true }).click();
+  await assertVisible(page.getByRole('heading', { name: '创建多模态任务', exact: true }));
+  await submitPortalGeneration(page, 'image', observation.imageModel, '画一个明亮的橙色圆形');
+  await waitForGenerationStatus(page, observation.imageModel, '已成功');
+  await submitPortalGeneration(page, 'video', observation.videoModel, '一只狐狸跑过草地', '5');
+});
+
+Then('门户自动轮询到图片和视频成功并显示准确计费', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const observation = requireMultimodalObservation(this);
+  const imageRow = await waitForGenerationStatus(page, observation.imageModel, '已成功');
+  const videoRow = await waitForGenerationStatus(page, observation.videoModel, '已成功');
+  await assertContains(imageRow, '$0.2');
+  await assertContains(imageRow, '1');
+  await assertContains(videoRow, '$0.5');
+  await assertContains(videoRow, '5');
+  await assertContains(metric(page, '可用余额 (USD)'), '$9.3');
+  await assertContains(metric(page, '总费用'), '$0.7');
+  await assertAttribute(page.locator('html'), 'data-theme', 'light');
+});
+
+Then('用户通过真实下载控件取得归档图片和视频', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const observation = requireMultimodalObservation(this);
+  await assertGenerationDownload(page, observation.imageModel, 'browser-result.png', 'browser-png-asset');
+  await assertGenerationDownload(page, observation.videoModel, 'asset-0.mp4', 'browser-video-asset');
+  this.assertNoBrowserFailures();
+});
+
+When('用户通过门户创建并取消排队中的图片任务', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const observation = requireMultimodalObservation(this);
+  const blocker = await requestJson<{ job_id: string }>('/v1/images/generations', {
+    method: 'POST', credential: observation.blockerCredential,
+    body: { model: observation.imageModel, input: { parameters: { prompt: 'browser-worker-blocker' } } },
+  });
+  await eventually(async () => {
+    assert.ok(blocker.job_id);
+    const mockPort = Number(process.env.MTC_E2E_MOCK_PORT ?? 41740);
+    const response = await fetch(`http://127.0.0.1:${mockPort}/__e2e/blocker-active`, { signal: AbortSignal.timeout(1_000) });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json() as { active: boolean }).active, true);
+  }, 10_000, 'the deterministic fixture did not occupy the single generation worker');
+  await submitPortalGeneration(page, 'image', observation.imageModel, '这个任务将在排队时取消');
+  const generationTable = generationTableFor(page);
+  const row = generationTable.locator('tbody tr').filter({ hasText: observation.imageModel }).first();
+  const cancellationResponse = page.waitForResponse((response) => response.url().includes('/self/v1/generations/') && response.request().method() === 'DELETE');
+  await row.getByRole('button', { name: '取消任务', exact: true }).click();
+  const response = await cancellationResponse;
+  assert.equal(response.status(), 200, '任务应在 worker 获取 lease 之前由真实门户控件取消');
+  await assertContains(row, '已取消');
+  await assertContains(row, '$0');
+});
+
+Then('取消任务不扣费且请求统计反映多模态用量', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  await assertContains(metric(page, '可用余额 (USD)'), '$9.3');
+  await assertContains(metric(page, '总费用'), '$0.7');
+  await assertExactText(metric(page, '总请求'), '3');
+  await assertContains(generationTableFor(page), '已取消');
+});
+
+Then('普通凭据在英文暗色主题下仍无法访问管理端', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const observation = requireMultimodalObservation(this);
+  await page.locator('.mobile-controls .language-toggle').click();
+  await page.locator('.mobile-controls').getByRole('button', { name: 'Switch to dark theme' }).click();
+  await assertAttribute(page.locator('html'), 'lang', 'en');
+  await assertAttribute(page.locator('html'), 'data-theme', 'dark');
+  await eventually(async () => {
+    assert.deepEqual(await page.evaluate(() => ({
+      locale: localStorage.getItem('mtc-locale'),
+      theme: localStorage.getItem('mtc-theme'),
+    })), { locale: 'en', theme: 'dark' });
+  });
+  assert.ok(this.context);
+  const operatorPage = await this.context.newPage();
+  operatorPage.on('console', (message) => { if (message.type() === 'error') this.consoleErrors.push(message.text()); });
+  operatorPage.on('pageerror', (reason) => this.consoleErrors.push(reason.message));
+  await operatorPage.goto('/operator');
+  await page.close();
+  this.page = operatorPage;
+  await assertAttribute(operatorPage.locator('html'), 'lang', 'en');
+  await assertAttribute(operatorPage.locator('html'), 'data-theme', 'dark');
+  await operatorPage.locator('input[type="password"]').fill(observation.clientCredential);
+  await operatorPage.locator('.operator-credential button').click();
+  await eventually(async () => {
+    const messages = (await operatorPage.getByRole('alert').allTextContents()).join(' ');
+    assert.match(messages, /unauthorized|authentication required|HTTP 401|invalid|credential|permission denied/i);
+  });
+  await assertNoCount(operatorPage.locator('.tenant-picker'));
+  await operatorPage.waitForTimeout(100);
+  assert.ok(this.consoleErrors.length > 0, 'the browser must observe rejected management resource requests');
+  assert.ok(this.consoleErrors.every((message) => message.includes('401 (Unauthorized)')),
+    `unexpected console error while checking management isolation: ${JSON.stringify(this.consoleErrors)}`);
+  this.consoleErrors.splice(0);
+  this.assertNoBrowserFailures();
+});
+
 When('浏览器模拟实时请求流断线超过五秒并重放最后事件', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const eventAt = Date.now();
@@ -729,7 +1025,10 @@ When('浏览器模拟实时请求流断线超过五秒并重放最后事件', as
       secondDeliveredAt = Date.now();
       return;
     }
-    await route.continue();
+    // Keep this reconnect contract isolated from real fixture events that may finish
+    // asynchronously in an earlier scenario. An empty successful tail preserves the
+    // last mocked cursor while still exercising close/reconnect and tab resets.
+    await route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
   });
 
   await connectOperator(this, 'dark');
@@ -812,17 +1111,68 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   this.assertNoBrowserFailures();
 });
 
-async function connectOperator(world: DogfoodWorld, theme: 'dark' | 'light'): Promise<void> {
+async function connectOperator(world: DogfoodWorld, theme: 'dark' | 'light', credential?: string): Promise<void> {
   const page = world.requirePage();
   const seed = runtime.requireSeed();
   await world.open('/operator', { theme, locale: 'zh-CN' });
-  await page.locator('input[type="password"]').fill(seed.serviceCredential);
+  await page.locator('input[type="password"]').fill(credential ?? seed.serviceCredential);
   await page.getByRole('button', { name: '连接', exact: true }).click();
   const tenantPicker = page.locator('.tenant-picker select');
   await assertContains(tenantPicker, tenant);
   await tenantPicker.selectOption(tenant);
   await assertValue(tenantPicker, tenant);
   await assertNoCount(page.locator('.notice.error'));
+}
+
+function requireMultimodalObservation(world: DogfoodWorld): MultimodalObservation {
+  const observation = multimodalObservations.get(world);
+  assert.ok(observation, 'the browser multimodal fixture was not created');
+  return observation;
+}
+
+function generationTableFor(page: Page): Locator {
+  return page.locator('article.panel').filter({ has: page.getByRole('heading', { name: '多模态生成任务', exact: true }) });
+}
+
+async function submitPortalGeneration(
+  page: Page,
+  kind: 'image' | 'video',
+  generationModel: string,
+  prompt: string,
+  duration = '5',
+): Promise<void> {
+  const panel = page.locator('.generation-create');
+  await panel.getByLabel('生成类型').selectOption(kind);
+  await panel.getByLabel('模型').fill(generationModel);
+  await panel.getByLabel('提示词').fill(prompt);
+  if (kind === 'video') await panel.getByLabel('时长（秒）').fill(duration);
+  const endpoint = kind === 'video' ? '/v1/videos/generations' : '/v1/images/generations';
+  const responsePromise = page.waitForResponse((response) => response.url().endsWith(endpoint) && response.request().method() === 'POST');
+  await panel.getByRole('button', { name: '开始生成', exact: true }).click();
+  const response = await responsePromise;
+  assert.equal(response.status(), 202);
+  await assertContains(panel.getByRole('status'), '任务已提交');
+}
+
+async function waitForGenerationStatus(page: Page, generationModel: string, status: string): Promise<Locator> {
+  const row = generationTableFor(page).locator('tbody tr').filter({ hasText: generationModel }).first();
+  await eventually(async () => assert.ok(((await row.textContent()) ?? '').includes(status)), 20_000,
+    `${generationModel} did not reach ${status} through portal polling`);
+  return row;
+}
+
+async function assertGenerationDownload(page: Page, generationModel: string, filename: string, expectedBody: string): Promise<void> {
+  const row = generationTableFor(page).locator('tbody tr').filter({ hasText: generationModel }).first();
+  await row.getByRole('button', { name: `查看 ${generationModel} 生成任务`, exact: true }).click();
+  const drawer = page.getByRole('dialog');
+  const downloadPromise = page.waitForEvent('download');
+  await drawer.getByRole('button', { name: '下载资产', exact: true }).click();
+  const download = await downloadPromise;
+  assert.equal(download.suggestedFilename(), filename);
+  const path = await download.path();
+  assert.ok(path, 'Playwright did not persist the generated asset download');
+  assert.equal((await readFile(path)).toString('utf8'), expectedBody);
+  await drawer.getByRole('button', { name: '关闭', exact: true }).click();
 }
 
 function requestEventFixture(eventId: string, requestId: string, eventAt: number, eventModel: string) {
@@ -992,6 +1342,7 @@ function localizationUsageFixture() {
     time_zone: 'UTC',
     p95_is_approximate: true,
     p95_method: 'fixed_histogram_upper_bound_capped_60000ms',
+    upstream_grouping: 'stable_account',
     summary,
     time_series: [{ bucket_start: bucketStart, ...summary }],
     by_model: [{ id: model, label: model, ...summary }],
@@ -1074,6 +1425,7 @@ function strictDimensionUsageFixture(query: URLSearchParams) {
     time_zone: 'UTC',
     p95_is_approximate: true,
     p95_method: 'fixed_histogram_upper_bound_capped_60000ms',
+    upstream_grouping: 'stable_account',
     summary,
     time_series: [{ bucket_start: bucketStart, ...summary }],
     by_model: [{ id: model, label: model, ...summary }],
@@ -1117,6 +1469,7 @@ function emptyUsageFixture() {
     time_zone: 'UTC',
     p95_is_approximate: true,
     p95_method: 'fixed_histogram_upper_bound_capped_60000ms',
+    upstream_grouping: 'stable_account',
     summary: empty,
     time_series: [],
     by_model: [],

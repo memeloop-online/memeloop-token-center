@@ -5,7 +5,11 @@ use memeloop_token_center::{
     archive::ArchiveStore,
     config::Config,
     db::Database,
-    session_archive_import::{SessionArchiveImportOptions, import_session_archive},
+    session_archive_import::{
+        MAX_SESSION_ARCHIVE_LINE_BYTES, MAX_SESSION_ARCHIVE_PLAN_BYTES,
+        SessionArchiveImportOptions, import_session_archive,
+        validate_session_archive_import_options,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -45,13 +49,13 @@ struct Args {
     #[arg(
         long,
         env = "SESSION_ARCHIVE_MAX_LINE_BYTES",
-        default_value_t = 134_217_728
+        default_value_t = MAX_SESSION_ARCHIVE_LINE_BYTES
     )]
     max_line_bytes: usize,
     #[arg(
         long,
         env = "SESSION_ARCHIVE_MAX_PLAN_BYTES",
-        default_value_t = 1_073_741_824
+        default_value_t = MAX_SESSION_ARCHIVE_PLAN_BYTES
     )]
     max_plan_bytes: u64,
     /// Count unmapped records during dry-run. Deliberately incompatible with --apply.
@@ -62,6 +66,21 @@ struct Args {
         action = clap::ArgAction::Set
     )]
     allow_unmapped: bool,
+    /// Admit only records whose identity is absent or unknown into the sealed
+    /// operator-only quarantine. Malformed or ambiguous evidence remains fatal.
+    #[arg(
+        long,
+        env = "SESSION_ARCHIVE_QUARANTINE_UNKNOWN_IDENTITIES",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    quarantine_unknown_identities: bool,
+    #[arg(long, env = "SESSION_ARCHIVE_TENANT_BINDING_KIND")]
+    quarantine_tenant_binding_kind: Option<String>,
+    #[arg(long, env = "SESSION_ARCHIVE_TENANT_BINDING_PROOF")]
+    quarantine_tenant_binding_proof: Option<String>,
+    #[arg(long, env = "SESSION_ARCHIVE_APPROVED_BY_SERVICE_ID")]
+    quarantine_approved_by_service_id: Option<uuid::Uuid>,
     /// Perform writes. Without this flag the command is a fail-closed dry run.
     #[arg(long)]
     apply: bool,
@@ -70,28 +89,30 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
+    let options = SessionArchiveImportOptions {
+        input: &args.input,
+        plan_directory: &args.plan_directory,
+        tenant_external_id: &args.tenant_external_id,
+        cpamp_source: &args.cpamp_source,
+        archive_source: &args.archive_source,
+        overlap_ms: args.overlap_ms,
+        time_tolerance_ms: args.time_tolerance_ms,
+        max_line_bytes: args.max_line_bytes,
+        max_plan_bytes: args.max_plan_bytes,
+        allow_unmapped: args.allow_unmapped,
+        quarantine_unknown_identities: args.quarantine_unknown_identities,
+        quarantine_tenant_binding_kind: args.quarantine_tenant_binding_kind.as_deref(),
+        quarantine_tenant_binding_proof: args.quarantine_tenant_binding_proof.as_deref(),
+        quarantine_approved_by_service_id: args.quarantine_approved_by_service_id,
+        apply: args.apply,
+    };
+    // Reject unsafe resource settings before opening database or object-store connections.
+    validate_session_archive_import_options(&options)?;
     let config = Config::from_session_archive_import_env()?;
     let db = Database::connect_with_max(&config.database_url, 2).await?;
     db.ensure_session_archive_import_schema().await?;
     let archive = ArchiveStore::from_config(&config).await?;
-    let stats = import_session_archive(
-        &db,
-        &archive,
-        &SessionArchiveImportOptions {
-            input: &args.input,
-            plan_directory: &args.plan_directory,
-            tenant_external_id: &args.tenant_external_id,
-            cpamp_source: &args.cpamp_source,
-            archive_source: &args.archive_source,
-            overlap_ms: args.overlap_ms,
-            time_tolerance_ms: args.time_tolerance_ms,
-            max_line_bytes: args.max_line_bytes,
-            max_plan_bytes: args.max_plan_bytes,
-            allow_unmapped: args.allow_unmapped,
-            apply: args.apply,
-        },
-    )
-    .await?;
+    let stats = import_session_archive(&db, &archive, &options).await?;
     println!("{}", serde_json::to_string(&stats)?);
     Ok(())
 }

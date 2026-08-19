@@ -169,6 +169,9 @@ pub(super) async fn apply_traffic_policy(
         return Err(AppError::Forbidden);
     }
     let plugins = state.plugins.clone();
+    let plugin_configurations = plugins
+        .resolved_traffic_configurations(key.tenant_id)
+        .await?;
     let plugin_request = original_request_json.clone();
     let plugin_context = RequestContext {
         tenant_id: key.tenant_id.to_string(),
@@ -185,7 +188,7 @@ pub(super) async fn apply_traffic_policy(
             .map_err(|_| AppError::Internal)?;
     let plugin_task = tokio::task::spawn_blocking(move || {
         let _plugin_permit = plugin_permit;
-        plugins.apply_traffic(plugin_context, &plugin_request)
+        plugins.apply_traffic_with_config(plugin_context, &plugin_request, &plugin_configurations)
     });
     let plugin_decision = tokio::time::timeout(Duration::from_secs(35), plugin_task)
         .await

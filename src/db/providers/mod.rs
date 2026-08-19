@@ -7,6 +7,7 @@ pub use accounts::{CreateUpstreamAccountInput, UpdateUpstreamAccountInput};
 pub use imports::{
     ImportManagedOAuthAccountInput, ManagedOAuthImportResult, ManagedOAuthImportStatus,
 };
+pub use oauth::ReauthorizeUpstreamAccountInput;
 pub use routes::{CreateModelRouteInput, UpdateModelRouteInput};
 
 const UPSTREAM_CREDENTIAL_ROTATION_RESOURCE: &str = "upstream_credential";
@@ -19,4 +20,16 @@ pub(super) fn upstream_connection_method(driver: &str, auth_kind: &str) -> Strin
     } else {
         auth_kind.to_owned()
     }
+}
+
+pub(super) fn upstream_can_reauthorize(
+    driver: &str,
+    auth_kind: &str,
+    oauth_session_id: Option<&str>,
+    oauth_driver: Option<&str>,
+) -> bool {
+    auth_kind == "oauth"
+        && oauth_session_id.is_some()
+        && (driver == "cpa-subscription-bridge"
+            || matches!(oauth_driver, Some("cursor" | "provider_adapter")))
 }

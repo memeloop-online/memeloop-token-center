@@ -124,6 +124,7 @@
         "databaseUrlSecret",
         "keyPepperSecret",
         "serviceTokenSecret",
+        "memeloopCloudWebhookSecret",
         "archiveBackend",
         "s3",
         "upstream",
@@ -134,6 +135,16 @@
         "databaseUrlSecret": { "$ref": "#/definitions/secretKeyRef" },
         "keyPepperSecret": { "$ref": "#/definitions/secretKeyRef" },
         "serviceTokenSecret": { "$ref": "#/definitions/secretKeyRef" },
+        "memeloopCloudWebhookSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "key"],
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string", "minLength": 1 }
+          },
+          "description": "Optional existing Secret reference for the MemeLoop Cloud HMAC webhook. An empty name disables the integration fail-closed."
+        },
         "archiveBackend": {
           "const": "s3",
           "description": "The Kubernetes chart deliberately supports only S3-compatible external object storage. Filesystem and memory backends remain test-only runtime options."

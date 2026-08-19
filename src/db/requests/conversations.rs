@@ -1,4 +1,14 @@
+use std::collections::HashSet;
+
 use super::super::*;
+
+// Candidate selection reads at most 50 observations. Persisting the complete
+// atom list for a near-limit request would otherwise let one ordinary request
+// make the next request materialize hundreds of MiB of JSON. The full Merkle
+// leaf remains in `leaf_node_hash`, so retries and true prefix continuations do
+// not lose precision when the diagnostic fingerprint is capped.
+const MAX_CONVERSATION_FINGERPRINT_ATOMS: usize = 1_024;
+const MAX_CONVERSATION_FINGERPRINT_JSON_BYTES: usize = 70_000;
 
 #[derive(Clone, Debug)]
 pub struct ConversationListFilter {
@@ -22,6 +32,7 @@ struct ConversationSelection {
     direct_parent: bool,
     same_turn: bool,
     semantic_prefix: bool,
+    compaction_overlap: bool,
     client_match: bool,
     write_edge: bool,
 }
@@ -81,7 +92,7 @@ impl Database {
         } = input;
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
-        let atom_hashes: Vec<_> = atoms.iter().map(|atom| atom.content_hash.clone()).collect();
+        let atom_hashes = bounded_atom_hashes(&atoms);
         let atom_hashes_json =
             serde_json::to_string(&atom_hashes).map_err(|_| AppError::Internal)?;
         let leaf = nodes.last().map(|node| node.node_hash.clone());
@@ -141,7 +152,7 @@ impl Database {
             || hints.session_id.is_some()
         {
             sqlx::query(
-                "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND (($4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4)) OR ($5 IS NOT NULL AND o.turn_id = $5) OR ($6 IS NOT NULL AND o.explicit_session_id = $6)) ORDER BY CASE WHEN $4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4) THEN 0 WHEN $5 IS NOT NULL AND o.turn_id = $5 THEN 1 ELSE 2 END, o.created_at DESC LIMIT 50",
+                "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND (($4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4)) OR ($5 IS NOT NULL AND o.turn_id = $5) OR ($6 IS NOT NULL AND o.explicit_session_id = $6)) ORDER BY CASE WHEN $4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4) THEN 0 WHEN $5 IS NOT NULL AND o.turn_id = $5 THEN 1 ELSE 2 END, o.created_at DESC LIMIT 50",
             )
             .bind(&tenant_id)
             .bind(&principal_id)
@@ -155,7 +166,7 @@ impl Database {
             Vec::new()
         };
         let recent_candidates = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 ORDER BY o.created_at DESC LIMIT 50",
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 ORDER BY o.created_at DESC LIMIT 50",
         )
         .bind(&tenant_id)
         .bind(&principal_id)
@@ -175,6 +186,9 @@ impl Database {
         }
 
         let has_semantic_atoms = !atom_hashes.is_empty();
+        debug_assert!(atom_hashes_json.len() <= MAX_CONVERSATION_FINGERPRINT_JSON_BYTES);
+        let current_node_hashes: HashSet<&str> =
+            nodes.iter().map(|node| node.node_hash.as_str()).collect();
         let mut selected: Option<ConversationSelection> = None;
         let mut candidate_selection: Option<ConversationSelection> = None;
         for row in candidates {
@@ -183,15 +197,29 @@ impl Database {
             let candidate_response: Option<String> = row.try_get("upstream_response_id")?;
             let candidate_branch: Option<String> = row.try_get("branch_id")?;
             let candidate_client: Option<String> = row.try_get("client_name")?;
+            let candidate_leaf: Option<String> = row.try_get("leaf_node_hash")?;
             let previous_hashes_json: String = row.try_get("atom_hashes_json")?;
             let previous_hashes: Vec<String> =
                 serde_json::from_str(&previous_hashes_json).unwrap_or_default();
             let has_previous_semantic_atoms = !previous_hashes.is_empty();
-            let (relation, confidence) = if has_semantic_atoms && has_previous_semantic_atoms {
-                infer_hash_relation(&previous_hashes, &atom_hashes)
-            } else {
-                (RelationKind::Candidate, 0)
-            };
+            let merkle_prefix = leaf.is_some()
+                && (leaf.as_deref() == candidate_leaf.as_deref()
+                    || candidate_leaf
+                        .as_deref()
+                        .is_some_and(|candidate| current_node_hashes.contains(candidate)));
+            let (relation, confidence) =
+                if leaf.as_deref() == candidate_leaf.as_deref() && leaf.is_some() {
+                    (RelationKind::Retry, 980)
+                } else if candidate_leaf
+                    .as_deref()
+                    .is_some_and(|candidate| current_node_hashes.contains(candidate))
+                {
+                    (RelationKind::Continues, 950)
+                } else if has_semantic_atoms && has_previous_semantic_atoms {
+                    infer_hash_relation(&previous_hashes, &atom_hashes)
+                } else {
+                    (RelationKind::Candidate, 0)
+                };
             let created_at: i64 = row.try_get("created_at")?;
             let direct_parent = hints.parent_turn_id.is_some()
                 && (hints.parent_turn_id.as_deref() == candidate_turn.as_deref()
@@ -202,14 +230,19 @@ impl Database {
                 && hints.session_id.as_deref() == candidate_session.as_deref();
             let conflicting_sessions =
                 hints.session_id.is_some() && candidate_session.is_some() && !explicit_match;
-            let exact_prefix =
-                has_semantic_atoms && has_previous_semantic_atoms && confidence >= 700;
+            let exact_prefix = merkle_prefix
+                || (has_semantic_atoms && has_previous_semantic_atoms && confidence >= 700);
             let recent_candidate = now.saturating_sub(created_at) <= 30 * 60 * 1_000;
             let same_client = client_name.is_some() && client_name == candidate_client.as_deref();
+            let compaction_overlap = hints.compaction
+                && recent_candidate
+                && same_client
+                && meaningful_atom_overlap(&previous_hashes, &atom_hashes);
             if direct_parent
                 || same_turn
                 || explicit_match
                 || (exact_prefix && !conflicting_sessions)
+                || (compaction_overlap && !conflicting_sessions)
             {
                 let branch_changed = hints.branch_id.is_some()
                     && candidate_branch.is_some()
@@ -231,6 +264,8 @@ impl Database {
                     995
                 } else if explicit_match {
                     confidence.max(990)
+                } else if compaction_overlap {
+                    confidence.max(880)
                 } else {
                     confidence
                 };
@@ -242,6 +277,7 @@ impl Database {
                     direct_parent,
                     same_turn,
                     semantic_prefix: exact_prefix,
+                    compaction_overlap,
                     client_match: same_client,
                     // A durable session id is sufficient to place observations in one
                     // cluster, but it does not prove that two adjacent requests are a
@@ -268,6 +304,7 @@ impl Database {
                     direct_parent: false,
                     same_turn: false,
                     semantic_prefix: false,
+                    compaction_overlap: false,
                     client_match: true,
                     write_edge: true,
                 });
@@ -336,6 +373,7 @@ impl Database {
                 "branch": hints.branch_id.is_some(),
                 "compaction": hints.compaction,
                 "semantic_prefix": selection.semantic_prefix,
+                "compaction_overlap": selection.compaction_overlap,
                 "client_match": selection.client_match,
                 "inference_version": 2
             }).to_string())
@@ -615,13 +653,46 @@ fn infer_hash_relation(previous: &[String], current: &[String]) -> (RelationKind
         (RelationKind::Retry, 980)
     } else if shared == previous.len() && current.len() > previous.len() {
         (RelationKind::Continues, 950)
-    } else if shared > 0 && shared + 1 >= previous.len().min(current.len()) {
+    // A single shared leading atom is commonly just the client's standard
+    // system prompt. It is not sufficient ancestry evidence on its own.
+    } else if shared >= 2 && shared + 1 >= previous.len().min(current.len()) {
         (RelationKind::Edit, 820)
     } else if shared >= 2 {
         (RelationKind::Branch, 720)
     } else {
         (RelationKind::Candidate, 350)
     }
+}
+
+/// Compaction replaces the beginning of a prompt, so a Merkle-prefix match is
+/// impossible even when the client retained a real turn from the old context.
+/// One exact atom outside the first/first position is useful evidence when it
+/// is combined with the explicit compaction marker, the stable key, the same
+/// client and the bounded recency window. Ignoring the first/first match avoids
+/// merging unrelated requests merely because they share a standard system
+/// prompt. With no such evidence the caller records only a candidate edge.
+fn meaningful_atom_overlap(previous: &[String], current: &[String]) -> bool {
+    if previous.is_empty() || current.is_empty() {
+        return false;
+    }
+    let previous_positions: std::collections::HashMap<&str, usize> = previous
+        .iter()
+        .enumerate()
+        .map(|(index, hash)| (hash.as_str(), index))
+        .collect();
+    current.iter().enumerate().any(|(current_index, hash)| {
+        previous_positions
+            .get(hash.as_str())
+            .is_some_and(|previous_index| *previous_index > 0 || current_index > 0)
+    })
+}
+
+fn bounded_atom_hashes(atoms: &[crate::conversation::SemanticAtom]) -> Vec<String> {
+    atoms
+        .iter()
+        .take(MAX_CONVERSATION_FINGERPRINT_ATOMS)
+        .map(|atom| atom.content_hash.clone())
+        .collect()
 }
 
 fn relation_name(relation: RelationKind) -> &'static str {
@@ -633,5 +704,50 @@ fn relation_name(relation: RelationKind) -> &'static str {
         RelationKind::Compacts => "compacts",
         RelationKind::Subagent => "subagent",
         RelationKind::Candidate => "candidate",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_fingerprint_has_a_fixed_serialized_memory_bound() {
+        let request = serde_json::json!({
+            "messages": (0..(MAX_CONVERSATION_FINGERPRINT_ATOMS + 100))
+                .map(|index| serde_json::json!({"role": "user", "content": index.to_string()}))
+                .collect::<Vec<_>>()
+        });
+        let atoms = extract_atoms(&request);
+        let fingerprint = bounded_atom_hashes(&atoms);
+        let encoded = serde_json::to_vec(&fingerprint).unwrap();
+
+        assert_eq!(fingerprint.len(), MAX_CONVERSATION_FINGERPRINT_ATOMS);
+        assert!(encoded.len() <= MAX_CONVERSATION_FINGERPRINT_JSON_BYTES);
+    }
+
+    #[test]
+    fn compaction_overlap_ignores_a_shared_leading_system_prompt() {
+        let shared_system = "system".to_owned();
+        let retained_turn = "retained".to_owned();
+        assert!(!meaningful_atom_overlap(
+            &[shared_system.clone(), "old".into()],
+            &[shared_system.clone(), "new".into()]
+        ));
+        assert!(meaningful_atom_overlap(
+            &[shared_system, retained_turn.clone()],
+            &["summary".into(), retained_turn]
+        ));
+    }
+
+    #[test]
+    fn a_single_shared_leading_atom_never_becomes_a_merge_relation() {
+        assert_eq!(
+            infer_hash_relation(
+                &["shared-system".into(), "old-user".into()],
+                &["shared-system".into(), "unrelated-user".into()]
+            ),
+            (RelationKind::Candidate, 350)
+        );
     }
 }

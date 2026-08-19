@@ -740,7 +740,7 @@ async fn image_response_limit_accepts_exactly_16_mib_and_rejects_one_more_byte()
 #[test]
 fn responses_tool_requires_exactly_one_valid_base64_image() {
     assert!(has_one_valid_bounded_image(&[STANDARD.encode(b"png")]));
-    assert!(!has_one_valid_bounded_image(&[]));
+    assert!(!has_one_valid_bounded_image(&[] as &[&str]));
     assert!(!has_one_valid_bounded_image(&[String::new()]));
     assert!(!has_one_valid_bounded_image(&[
         STANDARD.encode(b"one"),
@@ -908,6 +908,29 @@ async fn authentication_rejects_requests_before_json_body_parsing() {
     .expect("unauthenticated request must not read a pending body")
     .unwrap();
     assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn authenticated_control_rejects_declared_oversized_body_before_reading_it() {
+    let (state, _directory) = test_state().await;
+    let service_token = state.config.service_token.clone();
+    let response = tokio::time::timeout(
+        Duration::from_millis(100),
+        router_for_role(state, RuntimeRole::Control).oneshot(
+            Request::post("/internal/v1/keys")
+                .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, MAX_DEFAULT_REQUEST_BODY + 1)
+                .body(Body::from_stream(futures_util::stream::pending::<
+                    Result<Bytes, Infallible>,
+                >()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("declared oversized control request is rejected before reading")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]
