@@ -21,11 +21,16 @@ work_dir="/tmp/$ACCEPTANCE_RUN_ID"
 mkdir -p "$work_dir"
 source_db="$work_dir/source.sqlite"
 unmapped_db="$work_dir/unmapped.sqlite"
+same_duplicate_db="$work_dir/same-duplicate.sqlite"
+conflicting_duplicate_db="$work_dir/conflicting-duplicate.sqlite"
 tenant="cpamp-$ACCEPTANCE_RUN_ID-main"
 other_tenant="cpamp-$ACCEPTANCE_RUN_ID-tenant"
 unmapped_tenant="cpamp-$ACCEPTANCE_RUN_ID-unmapped"
+same_duplicate_tenant="cpamp-$ACCEPTANCE_RUN_ID-same-duplicate"
+conflicting_duplicate_tenant="cpamp-$ACCEPTANCE_RUN_ID-conflicting-duplicate"
 source="cpamp-acceptance:$ACCEPTANCE_RUN_ID"
 other_source="cpamp-acceptance:$ACCEPTANCE_RUN_ID:source"
+duplicate_source="cpamp-acceptance:$ACCEPTANCE_RUN_ID:duplicates"
 
 psql_target() {
   psql -X -v ON_ERROR_STOP=1 --no-psqlrc "$@"
@@ -71,6 +76,73 @@ psql_target -f /work/0021_request_locators.sql >/dev/null
 psql_target -f /work/0023_generation_daily_aggregates.sql >/dev/null
 psql_target -f /work/0024_request_stats_rollups.sql >/dev/null
 psql_target -f /work/0027_cpamp_source_digests.sql >/dev/null
+
+sqlite3 "$same_duplicate_db" < /work/initial.sql
+sqlite3 "$same_duplicate_db" <<'SQL'
+DELETE FROM usage_events;
+INSERT INTO usage_events VALUES
+  ('fixture-event-same-duplicate', 'legacy-request-same-duplicate', 100000000,
+   'openai', 'fixture-model', '/v1/responses',
+   'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+   5, 2, 40, 0, NULL, NULL),
+  ('fixture-event-same-duplicate', 'legacy-request-same-duplicate', 100000000,
+   'openai', 'fixture-model', '/v1/responses',
+   'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+   5, 2, 40, 0, NULL, NULL);
+SQL
+run_import "$same_duplicate_tenant" "$duplicate_source" "$same_duplicate_db"
+run_import "$same_duplicate_tenant" "$duplicate_source" "$same_duplicate_db"
+same_duplicate_source=$(sqlite3 "$same_duplicate_db" \
+  "SELECT count(*) || '|' || count(DISTINCT event_hash) FROM usage_events;")
+assert_equal "$same_duplicate_source" "2|1" "same-payload duplicate source fixture"
+same_duplicate_state=$(psql_scalar \
+  -v tenant="$same_duplicate_tenant" -v source="$duplicate_source" <<'SQL'
+SELECT
+  (SELECT count(*) FROM request_records r JOIN tenants t ON t.id = r.tenant_id
+    WHERE t.external_id = :'tenant') || '|' ||
+  (SELECT count(*) FROM import_request_links l JOIN tenants t ON t.id = l.tenant_id
+    WHERE t.external_id = :'tenant' AND l.source = :'source') || '|' ||
+  (SELECT count(*) FROM request_stats_facts f JOIN tenants t ON t.id = f.tenant_id
+    WHERE t.external_id = :'tenant') || '|' ||
+  (SELECT imported_events FROM cpamp_import_checkpoints
+    WHERE tenant_external_id = :'tenant' AND source = :'source');
+SQL
+)
+assert_equal "$same_duplicate_state" "1|1|1|1" \
+  "same event hash and payload deduplicate idempotently"
+echo "phase=same-payload-duplicate source_rows=2 distinct_hashes=1 requests=1 links=1 replay=stable"
+
+sqlite3 "$conflicting_duplicate_db" < /work/initial.sql
+sqlite3 "$conflicting_duplicate_db" <<'SQL'
+DELETE FROM usage_events;
+INSERT INTO usage_events VALUES
+  ('fixture-event-conflicting-duplicate', 'legacy-request-conflicting-duplicate', 100000000,
+   'openai', 'fixture-model', '/v1/responses',
+   'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+   5, 2, 40, 0, NULL, NULL),
+  ('fixture-event-conflicting-duplicate', 'legacy-request-conflicting-duplicate', 100000000,
+   'openai', 'fixture-model', '/v1/responses',
+   'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+   6, 2, 40, 0, NULL, NULL);
+SQL
+if run_import "$conflicting_duplicate_tenant" "$duplicate_source" \
+  "$conflicting_duplicate_db" >"$work_dir/conflicting-duplicate.log" 2>&1; then
+  echo "conflicting duplicate import unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'CPAMP import stopped: 1 event hashes map to conflicting source rows' \
+  "$work_dir/conflicting-duplicate.log"
+conflicting_duplicate_state=$(psql_scalar \
+  -v tenant="$conflicting_duplicate_tenant" -v source="$duplicate_source" <<'SQL'
+SELECT
+  (SELECT count(*) FROM tenants WHERE external_id = :'tenant') || '|' ||
+  (SELECT count(*) FROM cpamp_import_checkpoints
+    WHERE tenant_external_id = :'tenant' AND source = :'source');
+SQL
+)
+assert_equal "$conflicting_duplicate_state" "0|0" \
+  "same event hash with different payload fails closed"
+echo "phase=conflicting-payload-duplicate exit=nonzero tenant_rows=0 checkpoints=0"
 
 sqlite3 "$source_db" < /work/initial.sql
 run_import "$tenant" "$source" "$source_db"

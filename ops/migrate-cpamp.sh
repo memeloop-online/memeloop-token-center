@@ -306,25 +306,39 @@ unmapped_count=$(psql_target -Atc "SELECT count(*) FROM cpamp_import_usage WHERE
 invalid_alias_count=$(psql_target -Atc "SELECT count(*) FROM cpamp_import_aliases WHERE COALESCE(api_key_hash, '') !~ '^[0-9a-f]{64}$'")
 duplicate_count=$(psql_target -Atc "SELECT COALESCE(sum(events - 1), 0) FROM (SELECT count(*) AS events FROM cpamp_import_usage GROUP BY event_hash HAVING count(*) > 1) duplicates")
 conflicting_duplicate_count=$(psql_target -At <<'SQL'
-WITH digested AS (
-  SELECT event_hash,
-         encode(sha256(convert_to(jsonb_build_array(
-           request_id, timestamp_ms, provider, model, endpoint, api_key_hash,
-           input_tokens, output_tokens, latency_ms, failed,
-           fail_status_code, fail_summary
-         )::text, 'UTF8')), 'hex') AS source_digest
+WITH duplicate_event_hashes AS MATERIALIZED (
+  SELECT event_hash
     FROM cpamp_import_usage
+   GROUP BY event_hash
+  HAVING count(*) > 1
+),
+-- Keep both CTEs materialized so PostgreSQL cannot move sha256 evaluation
+-- ahead of the cheap event-hash candidate reduction.
+digested_duplicates AS MATERIALIZED (
+  SELECT u.event_hash,
+         encode(sha256(convert_to(jsonb_build_array(
+           u.request_id, u.timestamp_ms, u.provider, u.model, u.endpoint, u.api_key_hash,
+           u.input_tokens, u.output_tokens, u.latency_ms, u.failed,
+           u.fail_status_code, u.fail_summary
+         )::text, 'UTF8')), 'hex') AS source_digest
+    FROM cpamp_import_usage u
+    JOIN duplicate_event_hashes d ON d.event_hash = u.event_hash
 )
 SELECT count(*)
   FROM (
     SELECT event_hash
-      FROM digested
+      FROM digested_duplicates
      GROUP BY event_hash
     HAVING count(DISTINCT source_digest) > 1
   ) conflicts;
 SQL
 )
-case "$staged_count:$unmapped_count:$invalid_alias_count:$duplicate_count:$conflicting_duplicate_count" in *[!0-9:]*|'') echo "invalid CPAMP staging validation result" >&2; exit 2;; esac
+case "$staged_count:$unmapped_count:$invalid_alias_count:$duplicate_count:$conflicting_duplicate_count" in
+  *[!0-9:]*|:*|*::*|*:)
+    echo "invalid CPAMP staging validation result" >&2
+    exit 2
+    ;;
+esac
 if [ "$unmapped_count" -gt 0 ] && [ "$CPAMP_ALLOW_UNMAPPED" != true ]; then
   echo "CPAMP import stopped: $unmapped_count staged events have no supported key identity; set CPAMP_ALLOW_UNMAPPED=true only after accepting that data loss" >&2
   exit 2
