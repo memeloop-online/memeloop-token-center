@@ -15,11 +15,14 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+static POSTGRES_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn postgres_proxy_terminal_owner_is_exactly_once() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
+    let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
     let database = Database::connect_with_max(&database_url, 16).await.unwrap();
     database.migrate().await.unwrap();
     let unique = Uuid::now_v7();
@@ -284,6 +287,7 @@ async fn postgres_synchronous_image_terminal_ack_recovery_is_exactly_once_withou
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
+    let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
     let database = Database::connect_with_max(&database_url, 16).await.unwrap();
     database.migrate().await.unwrap();
     let unique = Uuid::now_v7();
