@@ -446,7 +446,7 @@ Then('趋势下钻使用 UTC 毫秒完整闭区间', async function (this: Dogfo
   await page.getByRole('tab', { name: '总览', exact: true }).click();
 });
 
-Then('中文指标显示 11.12万、亿、USD 与 CNY 并保留精确值', async function (this: DogfoodWorld) {
+Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.route('**/internal/v1/usage-analysis?**', async (route) => {
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(localizationUsageFixture()) });
@@ -454,10 +454,14 @@ Then('中文指标显示 11.12万、亿、USD 与 CNY 并保留精确值', async
   await page.getByRole('button', { name: '刷新', exact: true }).click();
   await assertExactText(metric(page, '请求数'), '11.12万');
   await assertAttribute(metric(page, '请求数').locator('span'), 'title', '111,227');
-  await assertTextMatches(metric(page, '总 Token'), /^1(?:\.\d+)?亿$/);
-  await assertAttribute(metric(page, '总 Token').locator('span'), 'title', '100,111,227');
+  await assertExactText(metric(page, '输入 Token'), '1亿');
+  await assertAttribute(metric(page, '输入 Token').locator('span'), 'title', '100,000,000');
   await assertExactText(metric(page, '输出 Token'), '11.12万');
   await assertAttribute(metric(page, '输出 Token').locator('span'), 'title', '111,227');
+  await assertExactText(metric(page, '缓存写入 Token'), '1万亿');
+  await assertAttribute(metric(page, '缓存写入 Token').locator('span'), 'title', '1,000,000,000,000');
+  await assertExactText(metric(page, '总 Token'), '1万亿');
+  await assertAttribute(metric(page, '总 Token').locator('span'), 'title', '1,000,100,111,227');
   const costs = page.locator('.usage-cost-lines');
   await assertContains(costs, '¥2.5');
   await assertContains(costs, 'US$1.25');
@@ -471,14 +475,15 @@ When('管理员将请求统计切换为英文', async function (this: DogfoodWor
   await page.getByRole('tab', { name: 'Overview', exact: true }).click();
 });
 
-Then('英文 111,227 使用千分位而非 K 或 M 且亮暗主题均可切换', async function (this: DogfoodWorld) {
+Then('英文大数使用完整千分位而非 K 或 M 且亮暗主题均可切换', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await assertExactText(metric(page, 'Requests'), '111,227');
   await assertNotContains(metric(page, 'Requests'), 'K');
   await assertNotContains(metric(page, 'Requests'), 'M');
-  await assertExactText(metric(page, 'Total tokens'), '100,111,227');
+  await assertExactText(metric(page, 'Total tokens'), '1,000,100,111,227');
   await assertExactText(metric(page, 'Input tokens'), '100,000,000');
   await assertExactText(metric(page, 'Output tokens'), '111,227');
+  await assertExactText(metric(page, 'Cache-write tokens'), '1,000,000,000,000');
   await assertAttribute(page.locator('html'), 'data-theme', 'dark');
   await page.locator('.rail').getByRole('button', { name: 'Switch to light theme' }).click();
   await assertAttribute(page.locator('html'), 'data-theme', 'light');
@@ -870,12 +875,6 @@ async function assertExactText(locator: Locator, expected: string): Promise<void
   });
 }
 
-async function assertTextMatches(locator: Locator, expected: RegExp): Promise<void> {
-  await eventually(async () => {
-    assert.match(((await locator.first().textContent()) ?? '').trim(), expected);
-  });
-}
-
 async function assertCount(locator: Locator, expected: number): Promise<void> {
   await eventually(async () => assert.equal(await locator.count(), expected));
 }
@@ -985,7 +984,7 @@ function usageMetrics(overrides: Record<string, unknown> = {}) {
 
 function localizationUsageFixture() {
   const bucketStart = Date.UTC(2026, 7, 16, 12);
-  const summary = usageMetrics();
+  const summary = usageMetrics({ cache_write_tokens: 1_000_000_000_000 });
   return {
     from_created_at: bucketStart,
     to_created_at: bucketStart + 3_600_000 - 1,
@@ -1000,7 +999,7 @@ function localizationUsageFixture() {
     by_upstream: [{ id: runtime.requireSeed().upstreamId, label: runtime.requireSeed().upstreamName, ...summary }],
     by_protocol: [{ id: 'openai', label: 'openai', ...summary }],
     by_status: [
-      { id: 'success', label: 'success', ...usageMetrics({ requests: 111_226, success: 111_226, failed: 0 }) },
+      { id: 'success', label: 'success', ...usageMetrics({ requests: 111_226, success: 111_226, failed: 0, cache_write_tokens: 1_000_000_000_000 }) },
       { id: 'error', label: 'failed', ...usageMetrics({ requests: 1, success: 0, failed: 1 }) },
     ],
     errors: [{ id: 'http_429', label: 'http_429', ...usageMetrics({ requests: 1, success: 0, failed: 1 }) }],

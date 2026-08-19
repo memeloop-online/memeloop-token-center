@@ -1,4 +1,4 @@
-import type { Locale } from './i18n';
+import type { Locale } from './i18n.js';
 
 export interface FormattedValue {
   text: string;
@@ -17,9 +17,10 @@ export function formatMetricNumber(value: number | null | undefined, locale: Loc
   const exact = formatNumber(value, locale);
   if (locale !== 'zh-CN') return { text: exact };
   const absolute = Math.abs(value);
-  const unit = absolute >= 100_000_000 ? { divisor: 100_000_000, suffix: '亿' }
-    : absolute >= 10_000 ? { divisor: 10_000, suffix: '万' }
-      : undefined;
+  const unit = absolute >= 1_000_000_000_000 ? { divisor: 1_000_000_000_000, suffix: '万亿' }
+    : absolute >= 100_000_000 ? { divisor: 100_000_000, suffix: '亿' }
+      : absolute >= 10_000 ? { divisor: 10_000, suffix: '万' }
+        : undefined;
   if (!unit) return { text: exact };
   const compact = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(value / unit.divisor);
   return { text: `${compact}${unit.suffix}`, title: exact };

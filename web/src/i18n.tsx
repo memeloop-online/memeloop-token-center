@@ -3,7 +3,7 @@ import { createContext, useContext, useEffect, useMemo, useState, type ReactNode
 export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
-const zh: Record<string, string> = {
+const zh = {
   'language.zh': '中文', 'language.en': 'English',
   'theme.light': '切换到亮色主题', 'theme.dark': '切换到暗色主题',
   'common.connect': '连接', 'common.load': '载入', 'common.loading': '载入中…', 'common.none': '无', 'common.running': '运行中',
@@ -174,10 +174,9 @@ const zh: Record<string, string> = {
   'schemaError.format': '必须符合 {{expected}} 格式', 'schemaError.pattern': '格式约束无效或不安全',
   'schemaError.additionalProperty': '此字段不在配置定义中', 'schemaError.oneOf': '必须且只能匹配一种配置结构',
   'schemaError.anyOf': '必须匹配至少一种配置结构', 'schemaError.not': '不能使用被禁止的配置结构', 'schemaError.invalid': '值无效',
-};
+} as const;
 
-const en: Record<string, string> = {
-  ...Object.fromEntries(Object.keys(zh).map((key) => [key, key])),
+const en = {
   'language.zh': '中文', 'language.en': 'English', 'theme.light': 'Switch to light theme', 'theme.dark': 'Switch to dark theme',
   'common.connect': 'Connect', 'common.load': 'Load', 'common.loading': 'Loading…', 'common.none': 'None', 'common.running': 'Running', 'common.select': 'Select', 'common.all': 'All',
   'common.back': 'Back', 'common.openAuthorization': 'Open authorization', 'common.checkAuthorization': 'Check authorization',
@@ -343,6 +342,11 @@ const en: Record<string, string> = {
   'schemaError.format': 'Must be a valid {{expected}}', 'schemaError.pattern': 'The format constraint is invalid or unsafe',
   'schemaError.additionalProperty': 'This field is not defined by the configuration', 'schemaError.oneOf': 'Must match exactly one configuration shape',
   'schemaError.anyOf': 'Must match at least one configuration shape', 'schemaError.not': 'This configuration shape is forbidden', 'schemaError.invalid': 'Invalid value',
+} as const satisfies Record<keyof typeof zh, string>;
+
+export const translationCatalogs: Readonly<Record<Locale, Readonly<Record<string, string>>>> = {
+  'zh-CN': zh,
+  en,
 };
 
 const schemaFields: Record<string, [string, string]> = {
@@ -371,7 +375,7 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     locale,
     setLocale,
     t: (key, variables) => {
-      const template = (locale === 'zh-CN' ? zh : en)[key] ?? en[key] ?? key;
+      const template = translationCatalogs[locale][key] ?? translationCatalogs.en[key] ?? key;
       return Object.entries(variables ?? {}).reduce((text, [name, replacement]) =>
         text.replaceAll(`{{${name}}}`, String(replacement)), template);
     },
@@ -392,7 +396,7 @@ export function localizeSchema<T>(schema: T, locale: Locale): T {
   const localized: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(source)) {
     if ((key === 'title' || key === 'description') && typeof value === 'string') {
-      localized[key] = (locale === 'zh-CN' ? zh : en)[`schema.${value}`] ?? value;
+      localized[key] = translationCatalogs[locale][`schema.${value}`] ?? value;
     } else if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
       localized[key] = Object.fromEntries(Object.entries(value).map(([property, definition]) => {
         const next = localizeSchema(definition, locale) as Record<string, unknown>;
