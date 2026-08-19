@@ -44,7 +44,7 @@ impl Database {
         )?;
         let now = unix_millis();
         let route_id = Uuid::now_v7();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let tenant_id: String = sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
             .bind(&input.tenant_external_id)
             .fetch_optional(&mut *tx)
@@ -126,7 +126,7 @@ impl Database {
         )?;
         let public_model = input.public_model.trim();
         let upstream_model = input.upstream_model.trim();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let current = sqlx::query(
             "SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
         )
@@ -219,7 +219,7 @@ impl Database {
         enabled: bool,
         expected_updated_at: i64,
     ) -> Result<ModelRouteView, AppError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let current = sqlx::query(
             "SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
         )
@@ -265,7 +265,7 @@ impl Database {
         tenant_external_id: &str,
         expected_updated_at: i64,
     ) -> Result<(), AppError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let route = sqlx::query(
             "SELECT r.tenant_id, r.enabled, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
         )
@@ -418,4 +418,137 @@ fn validate_model_route_fields(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::Future, time::Duration};
+
+    use super::*;
+
+    const PEPPER: &[u8] = b"route-test-pepper-at-least-32-bytes";
+    const TENANT: &str = "route-writer-race";
+
+    async fn sqlite_database() -> (tempfile::TempDir, Database, Uuid) {
+        let directory = tempfile::tempdir().expect("route race temporary directory");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("routes.db").display()
+        );
+        let database = Database::connect(&database_url)
+            .await
+            .expect("connect route race database");
+        database
+            .migrate()
+            .await
+            .expect("migrate route race database");
+        let account = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: TENANT.to_owned(),
+                    name: "route-race-upstream".to_owned(),
+                    driver: "http-json".to_owned(),
+                    config: serde_json::json!({"base_url": "http://127.0.0.1:1"}),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                PEPPER,
+            )
+            .await
+            .expect("create route race upstream");
+        (directory, database, account.id)
+    }
+
+    async fn while_competing_writer<T>(
+        database: &Database,
+        operation: impl Future<Output = Result<T, AppError>> + Send + 'static,
+    ) -> T
+    where
+        T: Send + 'static,
+    {
+        let mut writer = database
+            .begin_write_transaction()
+            .await
+            .expect("begin competing SQLite writer");
+        let updated =
+            sqlx::query("UPDATE tenants SET created_at = created_at WHERE external_id = $1")
+                .bind(TENANT)
+                .execute(&mut *writer)
+                .await
+                .expect("hold competing SQLite write reservation");
+        assert_eq!(updated.rows_affected(), 1);
+
+        let operation = tokio::spawn(operation);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !operation.is_finished(),
+            "route mutation must wait for the competing SQLite writer"
+        );
+        writer
+            .commit()
+            .await
+            .expect("release competing SQLite writer");
+        tokio::time::timeout(Duration::from_secs(2), operation)
+            .await
+            .expect("route mutation resumed after competing writer")
+            .expect("route mutation task completed")
+            .expect("route mutation succeeded")
+    }
+
+    #[tokio::test]
+    async fn sqlite_route_mutations_wait_for_a_competing_writer() {
+        let (_directory, database, upstream_account_id) = sqlite_database().await;
+
+        let operation_database = database.clone();
+        let route = while_competing_writer(&database, async move {
+            operation_database
+                .create_model_route(CreateModelRouteInput {
+                    tenant_external_id: TENANT.to_owned(),
+                    public_model: "route-race-public".to_owned(),
+                    upstream_account_id,
+                    upstream_model: "route-race-upstream-model".to_owned(),
+                    protocol: "openai".to_owned(),
+                    priority: 0,
+                })
+                .await
+        })
+        .await;
+
+        let operation_database = database.clone();
+        let route = while_competing_writer(&database, async move {
+            operation_database
+                .update_model_route(
+                    route.id,
+                    TENANT,
+                    UpdateModelRouteInput {
+                        public_model: "route-race-renamed".to_owned(),
+                        upstream_account_id,
+                        upstream_model: "route-race-upstream-model".to_owned(),
+                        protocol: "openai".to_owned(),
+                        priority: 0,
+                        expected_updated_at: route.updated_at,
+                    },
+                )
+                .await
+        })
+        .await;
+
+        let operation_database = database.clone();
+        let route = while_competing_writer(&database, async move {
+            operation_database
+                .set_model_route_enabled(route.id, TENANT, false, route.updated_at)
+                .await
+        })
+        .await;
+
+        let operation_database = database.clone();
+        while_competing_writer(&database, async move {
+            operation_database
+                .delete_model_route(route.id, TENANT, route.updated_at)
+                .await
+        })
+        .await;
+    }
 }
