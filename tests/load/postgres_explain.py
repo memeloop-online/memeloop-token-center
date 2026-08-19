@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 from typing import Any
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 
 SAFE_ID = re.compile(r"^[0-9A-Fa-f-]{36}$")
@@ -33,15 +34,74 @@ class PrerequisiteFailure(RuntimeError):
     pass
 
 
-def run_psql(database_url: str, sql: str, timeout_ms: int) -> str:
+LIBPQ_QUERY_ENV = {
+    "application_name": "PGAPPNAME",
+    "channel_binding": "PGCHANNELBINDING",
+    "client_encoding": "PGCLIENTENCODING",
+    "connect_timeout": "PGCONNECT_TIMEOUT",
+    "gssencmode": "PGGSSENCMODE",
+    "keepalives": "PGKEEPALIVES",
+    "keepalives_count": "PGKEEPALIVESCOUNT",
+    "keepalives_idle": "PGKEEPALIVESIDLE",
+    "keepalives_interval": "PGKEEPALIVESINTERVAL",
+    "options": "PGOPTIONS",
+    "passfile": "PGPASSFILE",
+    "requirepeer": "PGREQUIREPEER",
+    "sslcert": "PGSSLCERT",
+    "sslcrl": "PGSSLCRL",
+    "sslcrldir": "PGSSLCRLDIR",
+    "sslkey": "PGSSLKEY",
+    "sslmode": "PGSSLMODE",
+    "sslrootcert": "PGSSLROOTCERT",
+    "sslsni": "PGSSLSNI",
+    "ssl_max_protocol_version": "PGSSLMAXPROTOCOLVERSION",
+    "ssl_min_protocol_version": "PGSSLMINPROTOCOLVERSION",
+    "target_session_attrs": "PGTARGETSESSIONATTRS",
+    "tcp_user_timeout": "PGTCPUSER_TIMEOUT",
+}
+
+
+def libpq_environment(database_url: str) -> dict[str, str]:
+    """Translate a PostgreSQL URI to libpq env vars without exposing it in argv."""
+    parsed = urlsplit(database_url)
+    if parsed.scheme not in {"postgres", "postgresql"}:
+        raise PrerequisiteFailure("database URL must use postgres:// or postgresql://")
+    if not parsed.hostname:
+        raise PrerequisiteFailure("database URL must include a host")
+
     environment = os.environ.copy()
+    for key in (
+        "PGHOST",
+        "PGPORT",
+        "PGDATABASE",
+        "PGUSER",
+        "PGPASSWORD",
+    ):
+        environment.pop(key, None)
+    environment["PGHOST"] = unquote(parsed.hostname)
+    environment["PGDATABASE"] = unquote(parsed.path.removeprefix("/"))
+    if not environment["PGDATABASE"]:
+        raise PrerequisiteFailure("database URL must include a database name")
+    if parsed.port is not None:
+        environment["PGPORT"] = str(parsed.port)
+    if parsed.username is not None:
+        environment["PGUSER"] = unquote(parsed.username)
+    if parsed.password is not None:
+        environment["PGPASSWORD"] = unquote(parsed.password)
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        env_key = LIBPQ_QUERY_ENV.get(key)
+        if env_key is None:
+            raise PrerequisiteFailure(f"unsupported PostgreSQL URL option: {key}")
+        environment[env_key] = value
+    return environment
+
+
+def run_psql(database_url: str, sql: str, timeout_ms: int) -> str:
+    environment = libpq_environment(database_url)
     options = environment.get("PGOPTIONS", "")
     environment["PGOPTIONS"] = (
         f"{options} -c default_transaction_read_only=on -c statement_timeout={timeout_ms}"
     ).strip()
-    # Keep credentials out of argv/process listings. libpq accepts a connection
-    # URI in PGDATABASE just as it does in the dbname parameter.
-    environment["PGDATABASE"] = database_url
     result = subprocess.run(
         ["psql", "-X", "-q", "-A", "-t", "--no-psqlrc"],
         input=sql,

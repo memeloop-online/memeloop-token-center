@@ -213,7 +213,11 @@ jobs:
         run: cargo run --locked --bin memeloop-token-center -- migrate
       - name: Seed 100k-row observability scale fixture
         env:
-          PGDATABASE: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGDATABASE: memeloop_token_center_test
+          PGUSER: token_center
+          PGPASSWORD: token_center
         run: psql -X --no-psqlrc -v ON_ERROR_STOP=1 -f tests/load/seed_postgres_observability.sql
       - name: Enforce PostgreSQL observability plans and latency
         env:
