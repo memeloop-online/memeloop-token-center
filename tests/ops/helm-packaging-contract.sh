@@ -90,7 +90,10 @@ test "$(grep -c 'type: RollingUpdate' "$workspace/default.yaml")" -eq 3
   --namespace token-center \
   --set deploymentStrategy=Recreate >"$workspace/recreate.yaml"
 test "$(grep -c 'type: Recreate' "$workspace/recreate.yaml")" -eq 3
-test "$(grep -c 'rollingUpdate: null' "$workspace/recreate.yaml")" -eq 3
+if grep -q 'rollingUpdate:' "$workspace/recreate.yaml"; then
+  echo 'Recreate deployments must omit the RollingUpdate-only field' >&2
+  exit 1
+fi
 grep -q 'configMap:' "$workspace/configmap-plugin.yaml"
 grep -q 'persistentVolumeClaim:' "$workspace/pvc-plugin.yaml"
 test "$(grep -c 'name: MTC_RUN_MIGRATIONS_ON_START' "$workspace/default.yaml")" -eq 3
