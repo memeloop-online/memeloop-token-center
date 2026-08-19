@@ -8,6 +8,7 @@ on:
 jobs:
   web:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: web
@@ -28,11 +29,13 @@ jobs:
       - name: Build the browser-test service before Cucumber.js starts it
         run: cargo build --locked --manifest-path ../Cargo.toml --bin memeloop-token-center
       - name: Install the Chromium driver used by Cucumber.js steps
+        timeout-minutes: 15
         run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
 
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     # Wasmtime plus every integration-test binary can exhaust the hosted
     # runner while lld mmaps debug sections. CI does not consume test debug
     # symbols, so keep the release gate deterministic and bounded without
@@ -72,7 +75,18 @@ jobs:
             --ignore RUSTSEC-2023-0071 \
             --ignore RUSTSEC-2026-0235
       - name: Install PostgreSQL and SQLite migration clients
-        run: sudo apt-get update && sudo apt-get install --yes postgresql-client sqlite3
+        timeout-minutes: 15
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get \
+            -o Acquire::Retries=3 \
+            -o DPkg::Lock::Timeout=60 \
+            update
+          sudo apt-get \
+            -o Acquire::Retries=3 \
+            -o DPkg::Lock::Timeout=60 \
+            install --yes --no-install-recommends postgresql-client sqlite3
       - name: Run legacy credential operator failure-mode acceptance
         env:
           PYTHONDONTWRITEBYTECODE: "1"
