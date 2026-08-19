@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repository=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+repository=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 chart="$repository/charts/memeloop-token-center"
 workspace=$(mktemp -d "${TMPDIR:-/tmp}/mtc-helm-contract.XXXXXX")
 trap 'rm -rf -- "$workspace"' EXIT HUP INT TERM
@@ -34,6 +34,11 @@ reviewed_digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   --namespace token-center \
   --set plugins.enabled=true \
   --set plugins.existingClaim=token-center-plugins >"$workspace/pvc-plugin.yaml"
+"$helm_binary" template token-center-migration-pull-secret "$chart" \
+  --namespace token-center \
+  --show-only templates/migration-job.yaml \
+  --set imagePullSecrets[0].name=registry-credentials \
+  >"$workspace/migration-pull-secret.yaml"
 "$helm_binary" template token-center-gateway-ingress "$chart" \
   --namespace token-center \
   --show-only templates/ingress.yaml \
@@ -85,10 +90,14 @@ test "$(grep -c 'type: RollingUpdate' "$workspace/default.yaml")" -eq 3
   --namespace token-center \
   --set deploymentStrategy=Recreate >"$workspace/recreate.yaml"
 test "$(grep -c 'type: Recreate' "$workspace/recreate.yaml")" -eq 3
+test "$(grep -c 'rollingUpdate: null' "$workspace/recreate.yaml")" -eq 3
 grep -q 'configMap:' "$workspace/configmap-plugin.yaml"
 grep -q 'persistentVolumeClaim:' "$workspace/pvc-plugin.yaml"
 test "$(grep -c 'name: MTC_RUN_MIGRATIONS_ON_START' "$workspace/default.yaml")" -eq 3
 grep -Fq 'args: ["migrate"]' "$workspace/default.yaml"
+grep -Fq 'restartPolicy: Never' "$workspace/migration-pull-secret.yaml"
+grep -A2 -F 'imagePullSecrets:' "$workspace/migration-pull-secret.yaml" \
+  | grep -Fq -- '- name: registry-credentials'
 test "$(grep -c 'name: MTC_ARCHIVE_BACKEND' "$workspace/default.yaml")" -eq 3
 test "$(grep -A1 'name: MTC_ARCHIVE_BACKEND' "$workspace/default.yaml" | grep -c 'value: "s3"')" -eq 3
 test "$(grep -c '^kind: Ingress$' "$workspace/default.yaml" || true)" -eq 0
@@ -284,6 +293,7 @@ if [ -n "$kubeconform_binary" ]; then
     "$workspace/digest.yaml" \
     "$workspace/configmap-plugin.yaml" \
     "$workspace/pvc-plugin.yaml" \
+    "$workspace/migration-pull-secret.yaml" \
     "$workspace/gateway-ingress.yaml" \
     "$workspace/control-ingress.yaml" \
     "$workspace/both-ingresses.yaml" \

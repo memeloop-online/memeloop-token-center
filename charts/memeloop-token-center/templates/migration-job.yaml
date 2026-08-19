@@ -27,11 +27,15 @@ spec:
         {{- include "memeloop-token-center.labels" . | nindent 8 }}
         app.kubernetes.io/component: migration
     spec:
-      restartPolicy: OnFailure
+      restartPolicy: Never
       automountServiceAccountToken: false
       # This is a pre-install hook, so the release ServiceAccount does not
       # exist yet. The migrator only needs network and Secret access.
       serviceAccountName: default
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

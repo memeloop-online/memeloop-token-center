@@ -13,6 +13,10 @@ spec:
   revisionHistoryLimit: {{ $.Values.revisionHistoryLimit }}
   strategy:
     type: {{ $.Values.deploymentStrategy }}
+    {{- if eq $.Values.deploymentStrategy "Recreate" }}
+    # Explicitly clear the RollingUpdate-only field during SSA transitions.
+    rollingUpdate: null
+    {{- end }}
   {{- if not $roleConfig.autoscaling.enabled }}
   replicas: {{ $roleConfig.replicaCount }}
   {{- end }}
