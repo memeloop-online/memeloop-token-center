@@ -30,7 +30,14 @@ grep -Fq 'ENTRYPOINT ["/usr/local/bin/install-plugin-oci"]' "${dockerfile}" \
 ! grep -Eq '^sigstore[[:space:]]*=' "${repository_root}/Cargo.toml" \
   || fail "Rust Sigstore must not remain in the product dependency graph"
 
+case "$(docker info --format '{{.Architecture}}')" in
+  amd64 | x86_64) target_arch='amd64' ;;
+  arm64 | aarch64) target_arch='arm64' ;;
+  *) fail "Docker daemon architecture must be amd64 or arm64" ;;
+esac
+
 docker build --pull \
+  --build-arg "TARGETARCH=${target_arch}" \
   --file "${dockerfile}" \
   --tag "${image}" \
   "${repository_root}"
