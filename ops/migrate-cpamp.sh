@@ -253,6 +253,11 @@ DELETE FROM ledger_entries
    SELECT a.id FROM credit_accounts a JOIN tenants t ON t.id = a.tenant_id
     WHERE t.external_id = :'tenant_external_id'
  );
+DELETE FROM account_usage_state
+ WHERE account_id IN (
+   SELECT a.id FROM credit_accounts a JOIN tenants t ON t.id = a.tenant_id
+    WHERE t.external_id = :'tenant_external_id'
+ );
 DELETE FROM key_records
  WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
 DELETE FROM credit_accounts
@@ -416,6 +421,24 @@ SELECT i.account_id, t.id, p.id, 'USD', 0, 0,
   JOIN tenants t ON t.external_id = :'tenant_external_id'
   JOIN principals p ON p.tenant_id = t.id AND p.external_id = 'cpamp-import'
 ON CONFLICT (id) DO NOTHING;
+
+-- Schema v22 introduced this rollup after credit_accounts already existed.
+-- Keep imported and replayed identities grantable even when an older import
+-- created the account before the rollup row. Derive from durable usage ledger
+-- entries so repairing a non-empty legacy account never makes an old grant
+-- incorrectly reversible.
+INSERT INTO account_usage_state
+  (account_id, settled_lifetime_micros, updated_at)
+SELECT i.account_id,
+       COALESCE((
+         SELECT sum(CASE WHEN l.amount_micros < 0 THEN -l.amount_micros ELSE 0 END)
+           FROM ledger_entries l
+          WHERE l.account_id = i.account_id AND l.kind = 'usage'
+       ), 0),
+       (extract(epoch from clock_timestamp()) * 1000)::bigint
+  FROM cpamp_import_identities i
+  JOIN credit_accounts a ON a.id = i.account_id
+ON CONFLICT (account_id) DO NOTHING;
 
 INSERT INTO key_records
   (id, tenant_id, principal_id, account_id, alias, currency, policy_json,

@@ -1,5 +1,33 @@
 use super::super::*;
 
+async fn account_usage_snapshot(
+    transaction: &mut Transaction<'_, Any>,
+    account_id: Uuid,
+    now: i64,
+) -> Result<i64, AppError> {
+    // Migration-era and external importers may have created a legitimate
+    // credit account without the rollup row introduced in schema v22. Repair
+    // that invariant while the account is locked. Deriving the initial value
+    // from the durable ledger, instead of blindly assuming zero, preserves the
+    // rule that a grant cannot be reversed after settled usage.
+    sqlx::query(
+        "INSERT INTO account_usage_state (account_id, settled_lifetime_micros, updated_at) SELECT a.id, COALESCE((SELECT SUM(CASE WHEN l.amount_micros < 0 THEN -l.amount_micros ELSE 0 END) FROM ledger_entries l WHERE l.account_id = a.id AND l.kind = 'usage'), 0), $2 FROM credit_accounts a WHERE a.id = $1 ON CONFLICT(account_id) DO NOTHING",
+    )
+    .bind(account_id.to_string())
+    .bind(now)
+    .execute(&mut **transaction)
+    .await?;
+
+    let state = sqlx::query(
+        "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
+    )
+    .bind(account_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    Ok(state.try_get("settled_lifetime_micros")?)
+}
+
 impl Database {
     pub async fn require_account_exists(&self, account_id: Uuid) -> Result<(), AppError> {
         let exists = sqlx::query("SELECT id FROM credit_accounts WHERE id = $1")
@@ -89,13 +117,7 @@ impl Database {
             .await?
             .ok_or(AppError::NotFound)?;
         let currency: String = row.try_get("currency")?;
-        let usage_snapshot: i64 = sqlx::query(
-            "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
-        )
-        .bind(account_id.to_string())
-        .fetch_one(&mut *tx)
-        .await?
-        .try_get("settled_lifetime_micros")?;
+        let usage_snapshot = account_usage_snapshot(&mut tx, account_id, now).await?;
         let inserted = sqlx::query(
             "INSERT INTO ledger_entries (id, account_id, kind, amount_micros, currency, source, idempotency_key, created_at, account_usage_micros_snapshot) VALUES ($1, $2, 'grant', $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
         )
@@ -178,13 +200,7 @@ impl Database {
         let amount_micros: i64 = original.try_get("amount_micros")?;
         let currency: String = original.try_get("currency")?;
         let usage_snapshot: i64 = original.try_get("account_usage_micros_snapshot")?;
-        let current_usage: i64 = sqlx::query(
-            "SELECT settled_lifetime_micros FROM account_usage_state WHERE account_id = $1",
-        )
-        .bind(account_id.to_string())
-        .fetch_one(&mut *tx)
-        .await?
-        .try_get("settled_lifetime_micros")?;
+        let current_usage = account_usage_snapshot(&mut tx, account_id, now).await?;
         if current_usage != usage_snapshot {
             return Err(AppError::BadRequest(
                 "grant cannot be automatically reversed after account usage".into(),

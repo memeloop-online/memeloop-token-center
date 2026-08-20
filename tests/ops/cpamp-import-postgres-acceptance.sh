@@ -73,6 +73,7 @@ psql_target -f /work/0018_model_price_tiers.sql >/dev/null
 psql_target -f /work/0019_session_archive_import.sql >/dev/null
 psql_target -c 'CREATE TABLE IF NOT EXISTS request_records_default PARTITION OF request_records DEFAULT' >/dev/null
 psql_target -f /work/0021_request_locators.sql >/dev/null
+psql_target -f /work/0022_budget_rollups.sql >/dev/null
 psql_target -f /work/0023_generation_daily_aggregates.sql >/dev/null
 psql_target -f /work/0024_request_stats_rollups.sql >/dev/null
 psql_target -f /work/0027_cpamp_source_digests.sql >/dev/null
@@ -174,6 +175,14 @@ SELECT count(*) || '|' || count(*) FILTER (
 SQL
 )
 assert_equal "$initial_locators" "2|2" "initial request locator coverage"
+initial_account_usage_state=$(psql_scalar -v tenant_id="$tenant_id" <<'SQL'
+SELECT count(*) || '|' || count(s.account_id)
+  FROM credit_accounts a
+  LEFT JOIN account_usage_state s ON s.account_id = a.id
+ WHERE a.tenant_id = :'tenant_id';
+SQL
+)
+assert_equal "$initial_account_usage_state" "1|1" "imported account usage-state coverage"
 initial_aggregate=$(psql_scalar -v tenant_id="$tenant_id" <<'SQL'
 SELECT sum(a.requests) || '|' || sum(a.input_tokens) || '|' ||
        sum(a.output_tokens) || '|' || sum(a.cost_micros)
