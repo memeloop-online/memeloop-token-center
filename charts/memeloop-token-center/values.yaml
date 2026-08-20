@@ -233,9 +233,9 @@ probes:
     path: /readyz
     periodSeconds: 5
     # Archive write canaries are locally singleflight, refreshed on a
-    # process-jittered four-to-five-minute schedule, and retry for one bounded
-    # minute against the last success. Kubernetes still needs seven seconds
-    # for each five-second canary plus the dependency-aggregator headroom.
+    # process-jittered four-to-five-minute schedule, and retry for a bounded
+    # three minutes after the first failure. Kubernetes still needs seven
+    # seconds for each five-second canary plus dependency-aggregator headroom.
     timeoutSeconds: 7
     failureThreshold: 3
   liveness:

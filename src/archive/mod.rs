@@ -42,7 +42,7 @@ pub struct ArchiveStore {
 
 struct ReadinessCache {
     last_success_at: Option<tokio::time::Instant>,
-    stale_success_until: Option<tokio::time::Instant>,
+    failure_grace_until: Option<tokio::time::Instant>,
     next_check_at: Option<tokio::time::Instant>,
     refresh_jitter: Duration,
 }
@@ -51,7 +51,7 @@ impl Default for ReadinessCache {
     fn default() -> Self {
         Self {
             last_success_at: None,
-            stale_success_until: None,
+            failure_grace_until: None,
             next_check_at: None,
             refresh_jitter: readiness::refresh_jitter(uuid::Uuid::now_v7().as_u128() as u64),
         }
