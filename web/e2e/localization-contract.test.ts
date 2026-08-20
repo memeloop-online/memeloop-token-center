@@ -12,6 +12,13 @@ test('Chinese and English translation catalogs expose the same keys', () => {
   assert.deepEqual(englishKeys, chineseKeys);
 });
 
+test('product copy does not expose legacy migration or adapter terminology', () => {
+  for (const [locale, catalog] of Object.entries(translationCatalogs)) {
+    const exposed = Object.values(catalog).filter((value) => /CPA|bridge|桥接/i.test(value));
+    assert.deepEqual(exposed, [], `${locale} must not expose migration implementation terms`);
+  }
+});
+
 test('metric numbers use Chinese units through trillion and exact English grouping', () => {
   assert.deepEqual(formatMetricNumber(9_999, 'zh-CN'), { text: '9,999' });
   assert.deepEqual(formatMetricNumber(10_000, 'zh-CN'), { text: '1万', title: '10,000' });

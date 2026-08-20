@@ -35,6 +35,39 @@ When('管理员以中文暗色主题连接控制台', async function (this: Dogf
   await connectOperator(this, 'dark');
 });
 
+When('OAuth 服务目录包含 Codex 且管理员以中文连接控制台', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  await page.route('**/internal/v1/provider-types', async (route) => {
+    const response = await route.fetch();
+    const providers = await response.json() as Array<{ id: string }>;
+    await route.fulfill({ response, json: [...providers, {
+      id: 'browser-codex-oauth',
+      display_name: 'OpenAI Codex',
+      protocols: ['openai'],
+      modalities: ['text'],
+      config_schema: { type: 'object', additionalProperties: false, properties: {} },
+      credential_schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['type', 'access_token'],
+        properties: {
+          type: { const: 'oauth' },
+          access_token: { type: 'string', writeOnly: true },
+        },
+      },
+      oauth_adapter: {
+        api_version: 'oauth-adapter-v1',
+        flow_kind: 'cursor_pkce',
+        login_url: 'https://oauth.example.test/login',
+        poll_url: 'https://oauth.example.test/poll',
+        refresh_url: 'https://oauth.example.test/refresh',
+      },
+      source: 'browser fixture',
+    }] });
+  });
+  await connectOperator(this, 'dark');
+});
+
 Then('控制台提供有效 favicon', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const href = await page.locator('link[rel="icon"]').getAttribute('href');
@@ -102,8 +135,8 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
 
   await page.getByRole('tab', { name: '上游提供商', exact: true }).click();
   const onboarding = page.locator('.provider-onboarding');
-  await assertVisible(onboarding.getByRole('button', { name: '直接凭据', exact: true }));
-  await assertVisible(onboarding.getByRole('button', { name: 'OAuth / 订阅授权', exact: true }));
+  await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
+  await assertVisible(onboarding.getByRole('button', { name: '账户授权', exact: true }));
   await assertVisible(page.getByText('Browser mock upstream', { exact: true }));
   const providerAccount = page.locator('.provider-account').filter({ hasText: 'Browser mock upstream' });
   await assertContains(providerAccount, 'API 凭据');
@@ -121,8 +154,8 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await assertContains(providerAccount, '已停用');
   await providerAccount.getByRole('button', { name: '启用', exact: true }).click();
   await assertContains(providerAccount, '正常');
-  await onboarding.getByRole('button', { name: 'OAuth / 订阅授权', exact: true }).click();
-  await assertContains(onboarding.locator('select').first(), 'CPA Subscription Bridge');
+  await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
+  await assertContains(onboarding.getByLabel('服务提供商'), 'Cursor');
 
   await page.getByRole('tab', { name: '模型路由', exact: true }).click();
   const routeRow = page.locator('tbody tr').filter({ hasText: model });
@@ -137,6 +170,37 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await assertContains(routeRow, '已停用');
   await routeRow.getByRole('button', { name: '启用', exact: true }).click();
   await assertContains(routeRow, '已启用');
+});
+
+Then('中英文新增上游使用面向操作的产品文案', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  await page.getByRole('tab', { name: '上游提供商', exact: true }).click();
+  const onboarding = page.locator('.provider-onboarding');
+  await assertVisible(page.getByRole('heading', { name: '上游服务', exact: true }));
+  await assertContains(page.locator('.provider-list'), '连接并管理模型服务。');
+  await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
+  await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
+  await assertVisible(onboarding.getByLabel('服务提供商'));
+  await assertContains(onboarding.getByLabel('服务提供商'), 'Cursor');
+  await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
+  await assertNotContains(page.locator('body'), 'CPA');
+  await assertNotContains(page.locator('body'), 'Bridge');
+  await assertNotContains(page.locator('body'), '订阅桥接');
+  await assertNotContains(page.locator('body'), '插件 OAuth Adapter');
+
+  await page.locator('.rail .language-toggle').click();
+  await assertAttribute(page.locator('html'), 'lang', 'en');
+  await assertVisible(page.getByRole('heading', { name: 'Upstream services', exact: true }));
+  await assertContains(page.locator('.provider-list'), 'Connect and manage model services.');
+  await assertVisible(onboarding.getByRole('button', { name: 'API credential', exact: true }));
+  await assertVisible(onboarding.getByRole('button', { name: 'Account authorization', exact: true }));
+  await assertVisible(onboarding.getByLabel('Service provider'));
+  await assertContains(onboarding.getByLabel('Service provider'), 'Cursor');
+  await assertContains(onboarding.getByLabel('Service provider'), 'OpenAI Codex');
+  await assertNotContains(page.locator('body'), 'CPA');
+  await assertNotContains(page.locator('body'), 'Bridge');
+  await assertNotContains(page.locator('body'), 'Subscription bridge');
+  await assertNotContains(page.locator('body'), 'Plugin OAuth adapter');
 });
 
 Then('下游凭据表单使用本地化校验且模型计费可见', async function (this: DogfoodWorld) {
