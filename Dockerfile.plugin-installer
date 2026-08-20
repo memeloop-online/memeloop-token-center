@@ -5,7 +5,9 @@ ARG RUNTIME_IMAGE=debian:bookworm-slim
 
 FROM ${DOWNLOAD_IMAGE} AS cosign
 ARG TARGETARCH
-RUN apt-get update \
+ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian
+RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 # Cosign 3.1.3 fixes GHSA-fx35-mq7g-6g98. Both hashes come from the digest
@@ -43,6 +45,10 @@ COPY src ./src
 COPY migrations ./migrations
 COPY schemas ./schemas
 COPY wit ./wit
+# Cargo validates explicitly declared test targets even when only the installer
+# binary is built. Keep the production image context small while satisfying the
+# manifest contract; this placeholder is never compiled by the command below.
+RUN mkdir -p tests && printf 'fn main() {}\n' > tests/cucumber.rs
 RUN cargo build --locked --release --features plugin-distribution --bin install-plugin-oci \
     && install -m 0755 target/release/install-plugin-oci /tmp/install-plugin-oci
 
