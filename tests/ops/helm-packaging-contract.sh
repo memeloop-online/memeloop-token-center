@@ -102,7 +102,10 @@ fi
 grep -q 'configMap:' "$workspace/configmap-plugin.yaml"
 grep -q 'persistentVolumeClaim:' "$workspace/pvc-plugin.yaml"
 test "$(grep -c 'name: MTC_RUN_MIGRATIONS_ON_START' "$workspace/default.yaml")" -eq 3
-test "$(grep -A4 -F 'readinessProbe:' "$workspace/default.yaml" | grep -c 'timeoutSeconds: 7')" -eq 3
+readiness_probes="$(grep -A5 -F 'readinessProbe:' "$workspace/default.yaml")"
+test "$(printf '%s\n' "$readiness_probes" | grep -c 'periodSeconds: 5')" -eq 3
+test "$(printf '%s\n' "$readiness_probes" | grep -c 'timeoutSeconds: 7')" -eq 3
+test "$(printf '%s\n' "$readiness_probes" | grep -c 'failureThreshold: 3')" -eq 3
 grep -Fq 'args: ["migrate"]' "$workspace/default.yaml"
 grep -Fq 'restartPolicy: Never' "$workspace/migration-pull-secret.yaml"
 grep -A2 -F 'imagePullSecrets:' "$workspace/migration-pull-secret.yaml" \

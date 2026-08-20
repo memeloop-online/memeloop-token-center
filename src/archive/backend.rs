@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use object_store::{ObjectStore, RetryConfig, aws::AmazonS3Builder, memory::InMemory};
 
-use super::{ArchiveStore, ReadinessCache};
+use super::{ArchiveStore, ReadinessCache, path::archive_path};
 use crate::{
     config::{ArchiveBackend, Config},
     error::AppError,
@@ -56,9 +56,11 @@ impl ArchiveStore {
                 }
             };
 
+        let readiness_path = archive_path(&format!("readiness/{}.bin", uuid::Uuid::now_v7()))?;
         Ok(Self {
             inner,
             readiness: Arc::new(tokio::sync::Mutex::new(ReadinessCache::default())),
+            readiness_path,
         })
     }
 }

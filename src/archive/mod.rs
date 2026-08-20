@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use object_store::ObjectStore;
 
 #[cfg(test)]
-use std::{pin::Pin, time::Duration};
+use std::pin::Pin;
 
 #[cfg(test)]
 use crate::{
@@ -37,12 +37,25 @@ pub use staging::ArchiveStagingObjectStore;
 pub struct ArchiveStore {
     inner: Arc<dyn ObjectStore>,
     readiness: Arc<tokio::sync::Mutex<ReadinessCache>>,
+    readiness_path: object_store::path::Path,
 }
 
-#[derive(Default)]
 struct ReadinessCache {
-    checked_at: Option<tokio::time::Instant>,
-    healthy: bool,
+    last_success_at: Option<tokio::time::Instant>,
+    stale_success_until: Option<tokio::time::Instant>,
+    next_check_at: Option<tokio::time::Instant>,
+    refresh_jitter: Duration,
+}
+
+impl Default for ReadinessCache {
+    fn default() -> Self {
+        Self {
+            last_success_at: None,
+            stale_success_until: None,
+            next_check_at: None,
+            refresh_jitter: readiness::refresh_jitter(uuid::Uuid::now_v7().as_u128() as u64),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -205,9 +205,10 @@ probes:
   readiness:
     path: /readyz
     periodSeconds: 5
-    # The application gives each parallel PostgreSQL/S3 dependency check six
-    # seconds, including a five-second archive canary. Kubernetes must allow
-    # that bounded check to finish before it classifies the Pod as unready.
+    # Archive write canaries are locally singleflight, refreshed on a
+    # process-jittered four-to-five-minute schedule, and retry for one bounded
+    # minute against the last success. Kubernetes still needs seven seconds
+    # for each five-second canary plus the dependency-aggregator headroom.
     timeoutSeconds: 7
     failureThreshold: 3
   liveness:

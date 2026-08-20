@@ -68,16 +68,6 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dependency_readiness_checks_have_a_bounded_six_second_deadline() {
-        assert_eq!(CHECK_TIMEOUT, Duration::from_secs(6));
-    }
-}
-
 pub(super) async fn prometheus_metrics(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -190,4 +180,14 @@ pub(super) async fn security_headers(request: Request, next: Next) -> Response {
         ),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependency_readiness_checks_have_a_bounded_six_second_deadline() {
+        assert_eq!(CHECK_TIMEOUT, Duration::from_secs(6));
+    }
 }
