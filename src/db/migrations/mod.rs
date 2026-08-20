@@ -230,6 +230,14 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "bounded control list pagination indexes",
         sql: include_str!("../../../migrations/common/0042_control_list_pagination.sql"),
     },
+    Migration {
+        version: 43,
+        name: "tenant-scoped routing groups and grants",
+        sql: concat!(
+            include_str!("../../../migrations/sqlite/0043_drop_model_route_legacy_unique.sql"),
+            include_str!("../../../migrations/common/0043_routing_groups.sql")
+        ),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -446,6 +454,14 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         name: "bounded control list pagination indexes",
         sql: include_str!("../../../migrations/common/0042_control_list_pagination.sql"),
     },
+    Migration {
+        version: 43,
+        name: "tenant-scoped routing groups and grants",
+        sql: concat!(
+            include_str!("../../../migrations/postgres/0043_drop_model_route_legacy_unique.sql"),
+            include_str!("../../../migrations/common/0043_routing_groups.sql")
+        ),
+    },
 ];
 
 impl Database {
@@ -466,6 +482,15 @@ impl Database {
             DatabaseBackend::Sqlite => SQLITE_MIGRATIONS,
         };
         apply_migration_range(&mut transaction, migrations, i64::MIN, 1).await?;
+        // The legacy `*` policy is a snapshot of routes that existed at the
+        // upgrade boundary, not a standing grant for routes created later.
+        // Capture this before v43 is applied so subsequent startups never
+        // widen a credential's authorization.
+        let routing_groups_need_backfill =
+            sqlx::query("SELECT version FROM schema_migrations WHERE version = 43")
+                .fetch_optional(&mut *transaction)
+                .await?
+                .is_none();
         for column in ["upstream_account_id", "model_route_id"] {
             let exists = match self.backend {
                 DatabaseBackend::PostgreSql => sqlx::query(
@@ -521,6 +546,9 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         apply_migration_range(&mut transaction, migrations, 2, i64::MAX).await?;
+        if routing_groups_need_backfill {
+            backfill_routing_grants_from_legacy_policy(&mut transaction).await?;
+        }
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             maintain_postgres_partitions(&mut transaction).await?;
         }
@@ -540,6 +568,77 @@ impl Database {
         }
         Ok(PartitionMaintenanceReport::default())
     }
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyRoutingPolicy {
+    #[serde(default)]
+    allowed_models: Vec<String>,
+}
+
+/// Convert the legacy model allowlist into immutable route grants once, in the
+/// same transaction that applies v43. Malformed policy JSON aborts the entire
+/// migration; it must never silently turn into broader or narrower access.
+pub(super) async fn backfill_routing_grants_from_legacy_policy(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<u64, sqlx::Error> {
+    const PAGE_SIZE: i64 = 256;
+    let mut last_key_id = String::new();
+    let mut inserted = 0_u64;
+    loop {
+        let keys = sqlx::query(
+            "SELECT id, tenant_id, policy_json, created_at FROM key_records WHERE id > $1 ORDER BY id ASC LIMIT $2",
+        )
+        .bind(&last_key_id)
+        .bind(PAGE_SIZE)
+        .fetch_all(&mut **transaction)
+        .await?;
+        if keys.is_empty() {
+            break;
+        }
+        for key in &keys {
+            let key_id: String = key.try_get("id")?;
+            let tenant_id: String = key.try_get("tenant_id")?;
+            let policy_json: String = key.try_get("policy_json")?;
+            let created_at: i64 = key.try_get("created_at")?;
+            let policy: LegacyRoutingPolicy =
+                serde_json::from_str(&policy_json).map_err(|error| {
+                    sqlx::Error::Protocol(format!(
+                        "invalid legacy routing policy for key {key_id}: {error}"
+                    ))
+                })?;
+            let allowed_models = policy
+                .allowed_models
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            if allowed_models.contains("*") {
+                inserted += sqlx::query(
+                    "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at) SELECT r.tenant_id, $2, r.id, NULL, $3 FROM model_routes r WHERE r.tenant_id = $1 ON CONFLICT DO NOTHING",
+                )
+                .bind(&tenant_id)
+                .bind(&key_id)
+                .bind(created_at)
+                .execute(&mut **transaction)
+                .await?
+                .rows_affected();
+            } else {
+                for model in allowed_models {
+                    inserted += sqlx::query(
+                        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at) SELECT r.tenant_id, $2, r.id, NULL, $3 FROM model_routes r WHERE r.tenant_id = $1 AND r.public_model = $4 ON CONFLICT DO NOTHING",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&key_id)
+                    .bind(created_at)
+                    .bind(model)
+                    .execute(&mut **transaction)
+                    .await?
+                    .rows_affected();
+                }
+            }
+            last_key_id = key_id;
+        }
+    }
+    Ok(inserted)
 }
 
 pub(super) async fn apply_migration_range(

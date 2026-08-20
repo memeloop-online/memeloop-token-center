@@ -958,3 +958,367 @@ async fn sqlite_upgrade_adds_request_routing_columns() {
     .is_some();
     assert!(oauth_session_present);
 }
+
+#[tokio::test]
+async fn sqlite_routing_groups_are_tenant_safe_and_backfill_legacy_route_candidates() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("routing-groups.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    for statement in [
+        "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+        "CREATE TABLE tenants (id TEXT PRIMARY KEY)",
+        "CREATE TABLE upstream_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
+        "CREATE TABLE model_routes (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, public_model TEXT NOT NULL, upstream_account_id TEXT NOT NULL, upstream_model TEXT NOT NULL, protocol TEXT NOT NULL, priority BIGINT NOT NULL, enabled BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, public_model, protocol, priority))",
+        "CREATE TABLE key_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
+        "CREATE TABLE request_records (id TEXT PRIMARY KEY, model_route_id TEXT)",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("INSERT INTO tenants (id) VALUES ('tenant-a'), ('tenant-b')")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_accounts (id, tenant_id) VALUES ('account-a', 'tenant-a'), ('account-b', 'tenant-b')",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO request_records (id, model_route_id) VALUES ('request-a', 'route-a')")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ('route-a', 'tenant-a', 'public-model', 'account-a', 'upstream-model-a', 'openai-responses', 10, 1, 100, 100)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO key_records (id, tenant_id) VALUES ('key-a', 'tenant-a'), ('key-b', 'tenant-b')",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 43, 43)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let candidate = sqlx::query(
+        "SELECT tenant_id, upstream_account_id, upstream_model, scheduling_weight FROM model_route_upstream_accounts WHERE model_route_id = 'route-a'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(candidate.get::<String, _>("tenant_id"), "tenant-a");
+    assert_eq!(
+        candidate.get::<String, _>("upstream_account_id"),
+        "account-a"
+    );
+    assert_eq!(
+        candidate.get::<String, _>("upstream_model"),
+        "upstream-model-a"
+    );
+    assert_eq!(candidate.get::<i64, _>("scheduling_weight"), 100);
+    let preserved_route_id: String =
+        sqlx::query_scalar("SELECT id FROM model_routes WHERE id = 'route-a'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(preserved_route_id, "route-a");
+    let historical_route_id: Option<String> =
+        sqlx::query_scalar("SELECT model_route_id FROM request_records WHERE id = 'request-a'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(historical_route_id.as_deref(), Some("route-a"));
+    let request_route_foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('request_records') WHERE \"table\" = 'model_routes'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        request_route_foreign_keys, 0,
+        "v42 request history stores a stable route ID but has no model_routes foreign key to retarget"
+    );
+
+    // The legacy uniqueness rule prevented independent rules from sharing a
+    // public model and priority. Route identity and grants now disambiguate them.
+    sqlx::query(
+        "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ('route-a-2', 'tenant-a', 'public-model', 'account-a', 'upstream-model-a-2', 'openai-responses', 10, 1, 101, 101)",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("v43 must remove the legacy public model/priority uniqueness rule");
+
+    sqlx::query(
+        "INSERT INTO provider_groups (id, tenant_id, name, normalized_name, created_at, updated_at) VALUES ('provider-group-a', 'tenant-a', 'Codex', 'codex', 100, 100)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_groups (id, tenant_id, name, normalized_name, created_at, updated_at) VALUES ('route-group-a', 'tenant-a', 'Default', 'default', 100, 100)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO credential_groups (id, tenant_id, name, normalized_name, created_at, updated_at) VALUES ('credential-group-a', 'tenant-a', 'Reviewers', 'reviewers', 100, 100)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    for statement in [
+        "INSERT INTO upstream_account_provider_groups (tenant_id, provider_group_id, upstream_account_id, created_at) VALUES ('tenant-a', 'provider-group-a', 'account-a', 100)",
+        "INSERT INTO model_route_group_memberships (tenant_id, route_group_id, model_route_id, created_at) VALUES ('tenant-a', 'route-group-a', 'route-a', 100)",
+        "INSERT INTO credential_group_memberships (tenant_id, credential_group_id, key_id, created_at) VALUES ('tenant-a', 'credential-group-a', 'key-a', 100)",
+        "INSERT INTO model_route_included_provider_groups (tenant_id, model_route_id, provider_group_id, created_at) VALUES ('tenant-a', 'route-a', 'provider-group-a', 100)",
+        "INSERT INTO model_route_excluded_provider_groups (tenant_id, model_route_id, provider_group_id, created_at) VALUES ('tenant-a', 'route-a', 'provider-group-a', 100)",
+        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at) VALUES ('tenant-a', 'key-a', 'route-a', NULL, 100)",
+        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at) VALUES ('tenant-a', 'key-a', NULL, 'route-group-a', 100)",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+
+    for invalid_grant in [
+        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at) VALUES ('tenant-a', 'key-a', NULL, NULL, 100)",
+        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at) VALUES ('tenant-a', 'key-a', 'route-a', 'route-group-a', 100)",
+        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at) VALUES ('tenant-a', 'key-a', 'route-a', NULL, 101)",
+    ] {
+        assert!(
+            sqlx::query(invalid_grant)
+                .execute(&database.pool)
+                .await
+                .is_err(),
+            "invalid or duplicate routing grant was accepted"
+        );
+    }
+
+    let cross_tenant_membership = sqlx::query(
+        "INSERT INTO upstream_account_provider_groups (tenant_id, provider_group_id, upstream_account_id, created_at) VALUES ('tenant-a', 'provider-group-a', 'account-b', 100)",
+    )
+    .execute(&database.pool)
+    .await;
+    assert!(
+        cross_tenant_membership.is_err(),
+        "a provider group accepted another tenant's account"
+    );
+
+    sqlx::query("DELETE FROM provider_groups WHERE id = 'provider-group-a'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    for table in [
+        "upstream_account_provider_groups",
+        "model_route_included_provider_groups",
+        "model_route_excluded_provider_groups",
+    ] {
+        let remaining: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "provider group delete did not cascade in {table}"
+        );
+    }
+
+    // Credential grouping is deliberately classification-only: grants have no
+    // credential_group_id column and deleting a credential group leaves grants intact.
+    sqlx::query("DELETE FROM credential_groups WHERE id = 'credential-group-a'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let grants: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM routing_grants WHERE tenant_id = 'tenant-a' AND key_id = 'key-a'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(grants, 2);
+}
+
+#[tokio::test]
+async fn postgres_routing_groups_drop_legacy_route_uniqueness_and_backfill_candidates() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
+    let mut transaction = pool.begin().await.unwrap();
+    let schema = format!("routing_groups_{}", Uuid::now_v7().simple());
+    // Test-only identifier: a fixed literal prefix and a library-generated UUID.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL search_path = {schema}"
+    )))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    for statement in [
+        "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+        "CREATE TABLE tenants (id TEXT PRIMARY KEY)",
+        "CREATE TABLE upstream_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
+        "CREATE TABLE model_routes (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, public_model TEXT NOT NULL, upstream_account_id TEXT NOT NULL, upstream_model TEXT NOT NULL, protocol TEXT NOT NULL, priority BIGINT NOT NULL, enabled BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, public_model, protocol, priority))",
+        "CREATE TABLE key_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
+        "INSERT INTO tenants (id) VALUES ('tenant-a')",
+        "INSERT INTO upstream_accounts (id, tenant_id) VALUES ('account-a', 'tenant-a')",
+        "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ('route-a', 'tenant-a', 'public-model', 'account-a', 'upstream-model-a', 'openai-responses', 10, 1, 100, 100)",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+
+    apply_migration_range(&mut transaction, POSTGRES_MIGRATIONS, 43, 43)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ('route-b', 'tenant-a', 'public-model', 'account-a', 'upstream-model-b', 'openai-responses', 10, 1, 101, 101)",
+    )
+    .execute(&mut *transaction)
+    .await
+    .expect("PostgreSQL v43 must drop the legacy route uniqueness constraint");
+    let candidate: (String, String, i64) = sqlx::query_as(
+        "SELECT upstream_account_id, upstream_model, scheduling_weight FROM model_route_upstream_accounts WHERE model_route_id = 'route-a'",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(
+        candidate,
+        ("account-a".into(), "upstream-model-a".into(), 100)
+    );
+    transaction.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_legacy_model_policy_backfill_is_exact_bounded_and_fail_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("routing-grants-backfill.db")
+            .display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    for statement in [
+        "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+        "CREATE TABLE tenants (id TEXT PRIMARY KEY)",
+        "CREATE TABLE upstream_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
+        "CREATE TABLE model_routes (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, public_model TEXT NOT NULL, upstream_account_id TEXT NOT NULL, upstream_model TEXT NOT NULL, protocol TEXT NOT NULL, priority BIGINT NOT NULL, enabled BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, public_model, protocol, priority))",
+        "CREATE TABLE key_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, policy_json TEXT NOT NULL, created_at BIGINT NOT NULL)",
+        "INSERT INTO tenants (id) VALUES ('tenant-a')",
+        "INSERT INTO upstream_accounts (id, tenant_id) VALUES ('account-a', 'tenant-a')",
+        "INSERT INTO model_routes VALUES ('route-a', 'tenant-a', 'model-a', 'account-a', 'upstream-a', 'openai-responses', 10, 1, 100, 100)",
+        "INSERT INTO model_routes VALUES ('route-b', 'tenant-a', 'model-b', 'account-a', 'upstream-b', 'openai-responses', 10, 1, 100, 100)",
+        "INSERT INTO key_records VALUES ('key-empty', 'tenant-a', '{\"allowed_models\":[]}', 100)",
+        "INSERT INTO key_records VALUES ('key-exact', 'tenant-a', '{\"allowed_models\":[\"model-a\",\"model-a\"]}', 100)",
+        "INSERT INTO key_records VALUES ('key-wildcard', 'tenant-a', '{\"allowed_models\":[\"*\"]}', 100)",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 43, 43)
+        .await
+        .unwrap();
+    let inserted =
+        super::super::migrations::backfill_routing_grants_from_legacy_policy(&mut transaction)
+            .await
+            .unwrap();
+    assert_eq!(inserted, 3);
+    transaction.commit().await.unwrap();
+
+    let exact_routes: Vec<String> = sqlx::query_scalar(
+        "SELECT model_route_id FROM routing_grants WHERE key_id = 'key-exact' ORDER BY model_route_id",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(exact_routes, ["route-a"]);
+    let wildcard_routes: Vec<String> = sqlx::query_scalar(
+        "SELECT model_route_id FROM routing_grants WHERE key_id = 'key-wildcard' ORDER BY model_route_id",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(wildcard_routes, ["route-a", "route-b"]);
+    let empty_grants: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM routing_grants WHERE key_id = 'key-empty'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(empty_grants, 0);
+
+    sqlx::query(
+        "INSERT INTO model_routes VALUES ('route-future', 'tenant-a', 'model-a', 'account-a', 'upstream-future', 'openai-responses', 10, 1, 200, 200)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let future_grants: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM routing_grants WHERE model_route_id = 'route-future'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        future_grants, 0,
+        "a route created after the upgrade boundary must require an explicit grant"
+    );
+
+    sqlx::query(
+        "INSERT INTO key_records VALUES ('key-z-bad', 'tenant-a', '{\"allowed_models\":\"*\"}', 300)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let mut transaction = database.pool.begin().await.unwrap();
+    let error =
+        super::super::migrations::backfill_routing_grants_from_legacy_policy(&mut transaction)
+            .await
+            .expect_err("malformed legacy policy must abort the migration");
+    assert!(error.to_string().contains("invalid legacy routing policy"));
+    transaction.rollback().await.unwrap();
+    let bad_grants: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM routing_grants WHERE key_id = 'key-z-bad'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(bad_grants, 0);
+}
