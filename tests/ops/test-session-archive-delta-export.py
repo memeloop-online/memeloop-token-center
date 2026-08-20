@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import base64
+import datetime as dt
+import hashlib
 import http.server
+import importlib.util
 import json
 import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -21,6 +25,13 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 EXPORTER = ROOT / "ops" / "export-cpa-session-archive-delta.py"
 TOKEN = "management-token-that-must-never-appear"
+STABLE_CURSOR_PROTOCOL = "session-snapshot-cursor-v1"
+
+SPEC = importlib.util.spec_from_file_location("mtc_archive_delta_export", EXPORTER)
+assert SPEC is not None and SPEC.loader is not None
+DELTA_EXPORT = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = DELTA_EXPORT
+SPEC.loader.exec_module(DELTA_EXPORT)
 
 
 def record(
@@ -58,6 +69,50 @@ def summary(session_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def session_set_digest(sessions: list[dict[str, Any]]) -> str:
+    stable = sorted(
+        (
+            {
+                "session_id": item["session_id"],
+                "requests": item["requests"],
+                "first_at": item["first_at"].replace("Z", ".000000Z")
+                if "." not in item["first_at"]
+                else item["first_at"],
+                "last_at": item["last_at"].replace("Z", ".000000Z")
+                if "." not in item["last_at"]
+                else item["last_at"],
+                **(
+                    {"records_sha256": item["records_sha256"]}
+                    if "records_sha256" in item
+                    else {}
+                ),
+            }
+            for item in sessions
+        ),
+        key=lambda item: item["session_id"],
+    )
+    encoded = json.dumps(
+        stable, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def records_digest(rows: list[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for row in sorted(rows, key=lambda item: item["request_id"]):
+        digest.update(
+            json.dumps(
+                row, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            + b"\n"
+        )
+    return digest.hexdigest()
+
+
+def normalized_time(value: str) -> str:
+    return value.replace("Z", ".000000Z") if "." not in value else value
+
+
 class SourceState:
     def __init__(self) -> None:
         self.sessions: list[dict[str, Any]] = []
@@ -65,6 +120,7 @@ class SourceState:
         self.exports: dict[str, list[dict[str, Any]]] = {}
         self.stats_values: list[int] = []
         self.session_calls = 0
+        self.legacy_session_calls = 0
         self.stats_calls = 0
         self.export_calls = 0
         self.ticket_calls = 0
@@ -73,6 +129,20 @@ class SourceState:
         self.redirect_sessions = False
         self.cross_origin_ticket = False
         self.plugin_envelope = False
+        self.stable_cursor_supported = False
+        self.stable_snapshots: dict[
+            str,
+            tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]], str],
+        ] = {}
+        self.stable_snapshot_sequence = 0
+        self.after_snapshot_sessions: list[dict[str, Any]] = []
+        self.after_snapshot_exports: dict[str, list[dict[str, Any]]] = {}
+        self.stable_gap_offset: int | None = None
+        self.stable_cursor_loop = False
+        self.stable_ticket_snapshots_seen: list[str] = []
+        self.ingest_sequence = 0
+        self.record_ingest_sequence: dict[str, int] = {}
+        self.serve_live_snapshot_exports = False
 
     @property
     def request_count(self) -> int:
@@ -140,9 +210,127 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Location", "/leak")
                 self.end_headers()
                 return
+            query = urllib.parse.parse_qs(parsed.query)
+            if query.get("cursor_protocol", [""])[0] == STABLE_CURSOR_PROTOCOL:
+                if not state.stable_cursor_supported:
+                    # v0.7.21 treats unknown query parameters as facet filters.
+                    self.send_management_json({"sessions": []})
+                    return
+                limit = int(query.get("limit", ["100"])[0])
+                lower_bound = query.get("lower_bound_completed_at", [""])[0]
+                after_fence = query.get("after_ingest_fence", [""])[0]
+                snapshot = query.get("snapshot", [""])[0]
+                if not snapshot:
+                    for rows in state.exports.values():
+                        for row in rows:
+                            request_id = row["request_id"]
+                            if request_id in state.record_ingest_sequence:
+                                continue
+                            state.ingest_sequence += 1
+                            state.record_ingest_sequence[request_id] = (
+                                state.ingest_sequence
+                            )
+                    state.stable_snapshot_sequence += 1
+                    snapshot = f"snapshot-{state.stable_snapshot_sequence}"
+                    after_sequence = (
+                        int(after_fence)
+                        if after_fence
+                        else None
+                    )
+                    ordered = sorted(
+                        (
+                            {
+                                **dict(item),
+                                "first_at": normalized_time(item["first_at"]),
+                                "last_at": normalized_time(item["last_at"]),
+                                "records_sha256": records_digest(
+                                    state.exports.get(item["session_id"], [])
+                                ),
+                            }
+                            for item in state.sessions
+                            if after_sequence is None
+                            or item["last_at"] >= lower_bound
+                            or any(
+                                state.record_ingest_sequence[row["request_id"]]
+                                > after_sequence
+                                for row in state.exports.get(item["session_id"], [])
+                            )
+                        ),
+                        key=lambda item: item["session_id"],
+                    )
+                    ordered.sort(key=lambda item: item["last_at"], reverse=True)
+                    snapshot_exports = {
+                        key: [dict(row) for row in rows]
+                        for key, rows in state.exports.items()
+                        if key in {item["session_id"] for item in ordered}
+                    }
+                    ingest_fence = str(state.ingest_sequence)
+                    state.stable_snapshots[snapshot] = (
+                        ordered,
+                        snapshot_exports,
+                        ingest_fence,
+                    )
+                    if state.after_snapshot_sessions or state.after_snapshot_exports:
+                        pending_sessions = {
+                            item["session_id"]: item
+                            for item in state.after_snapshot_sessions
+                        }
+                        state.sessions = [
+                            pending_sessions.pop(item["session_id"], item)
+                            for item in state.sessions
+                        ]
+                        state.sessions.extend(pending_sessions.values())
+                        state.exports.update(state.after_snapshot_exports)
+                        state.after_snapshot_sessions = []
+                        state.after_snapshot_exports = {}
+                stored = state.stable_snapshots.get(snapshot)
+                if stored is None:
+                    self.send_json({"error": "snapshot expired"}, 409)
+                    return
+                all_sessions = stored[0]
+                cursor = query.get("cursor", [""])[0]
+                if cursor:
+                    try:
+                        offset = int(cursor.removeprefix("cursor-"))
+                    except ValueError:
+                        self.send_json({"error": "cursor"}, 400)
+                        return
+                else:
+                    offset = 0
+                end = min(offset + limit, len(all_sessions))
+                page = all_sessions[offset:end]
+                if state.stable_gap_offset is not None and offset <= state.stable_gap_offset < end:
+                    page = [
+                        item
+                        for index, item in enumerate(page, start=offset)
+                        if index != state.stable_gap_offset
+                    ]
+                complete = end == len(all_sessions)
+                next_cursor = None if complete else f"cursor-{end}"
+                if state.stable_cursor_loop and offset > 0 and not complete:
+                    next_cursor = cursor
+                self.send_management_json(
+                    {
+                        "cursor_protocol": STABLE_CURSOR_PROTOCOL,
+                        "snapshot": snapshot,
+                        "ingest_fence": stored[2],
+                        "session_count": len(all_sessions),
+                        "request_count": sum(
+                            item["requests"] for item in all_sessions
+                        ),
+                        "session_set_sha256": session_set_digest(all_sessions),
+                        "sessions": page,
+                        "complete": complete,
+                        "next_cursor": next_cursor,
+                    }
+                )
+                return
+            state.legacy_session_calls += 1
             snapshots = state.session_snapshots or [state.sessions]
-            index = min(state.session_calls - 1, len(snapshots) - 1)
-            self.send_management_json({"sessions": snapshots[index]})
+            index = min(state.legacy_session_calls - 1, len(snapshots) - 1)
+            query = urllib.parse.parse_qs(parsed.query)
+            limit = int(query.get("limit", ["100"])[0])
+            self.send_management_json({"sessions": snapshots[index][:limit]})
             return
         if parsed.path == stats_path:
             state.stats_calls += 1
@@ -161,7 +349,16 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
                 return
             query = urllib.parse.parse_qs(parsed.query)
             session_id = query.get("id", [""])[0]
-            if session_id not in state.exports:
+            snapshot = query.get("snapshot", [""])[0]
+            exports = state.exports
+            if snapshot:
+                stored = state.stable_snapshots.get(snapshot)
+                if stored is None:
+                    self.send_json({"error": "snapshot expired"}, 409)
+                    return
+                exports = stored[1]
+                state.stable_ticket_snapshots_seen.append(snapshot)
+            if session_id not in exports:
                 self.send_json({"error": "missing"}, 404)
                 return
             if state.cross_origin_ticket:
@@ -170,7 +367,18 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
                 url = "/archive-api/v1/exports/ticket-" + urllib.parse.quote(
                     session_id, safe=""
                 )
-            self.send_management_json({"url": url})
+                if snapshot:
+                    url += "?snapshot=" + urllib.parse.quote(snapshot, safe="")
+            response: dict[str, Any] = {"url": url}
+            if snapshot:
+                response.update(
+                    {
+                        "cursor_protocol": STABLE_CURSOR_PROTOCOL,
+                        "snapshot": snapshot,
+                        "records_sha256": records_digest(exports[session_id]),
+                    }
+                )
+            self.send_management_json(response)
             return
         ticket_prefix = "/archive-api/v1/exports/ticket-"
         if parsed.path.startswith(ticket_prefix):
@@ -178,7 +386,14 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
             if self.headers.get("Authorization"):
                 state.ticket_authorization_seen = True
             session_id = urllib.parse.unquote(parsed.path[len(ticket_prefix) :])
-            rows = state.exports.get(session_id)
+            query = urllib.parse.parse_qs(parsed.query)
+            snapshot = query.get("snapshot", [""])[0]
+            exports = state.exports
+            if snapshot:
+                stored = state.stable_snapshots.get(snapshot)
+                if not state.serve_live_snapshot_exports:
+                    exports = {} if stored is None else stored[1]
+            rows = exports.get(session_id)
             if rows is None:
                 self.send_json({"error": "ticket"}, 404)
                 return
@@ -485,7 +700,7 @@ class DeltaExporterTest(unittest.TestCase):
         output = self.temporary / "saturated.jsonl"
         result = self.run_export(output, extra=["--session-limit", "2"])
         self.assertEqual(result.returncode, 2)
-        self.assertIn("completeness is unprovable", result.stderr)
+        self.assertIn(STABLE_CURSOR_PROTOCOL, result.stderr)
         self.assertEqual(self.state.export_calls, 0)
         self.assertFalse(self.checkpoint.exists())
 
@@ -496,6 +711,241 @@ class DeltaExporterTest(unittest.TestCase):
         result = self.run_export(mismatch)
         self.assertEqual(result.returncode, 2)
         self.assertIn("count disagrees", result.stderr)
+        self.assertFalse(self.checkpoint.exists())
+
+    def test_stable_snapshot_exports_across_pages_and_defers_concurrent_addition(self) -> None:
+        rows = [
+            record(
+                f"request-{index}",
+                f"session-{index}",
+                f"2026-08-16T0{index}:00:00Z",
+                f"2026-08-16T0{index}:01:00Z",
+            )
+            for index in range(1, 4)
+        ]
+        self.state.stable_cursor_supported = True
+        self.state.exports = {row["session_id"]: [row] for row in rows}
+        self.state.sessions = sorted(
+            (summary(row["session_id"], [row]) for row in rows),
+            key=lambda item: item["last_at"],
+            reverse=True,
+        )
+        concurrent = record(
+            "request-4",
+            "session-4",
+            "2026-08-15T20:00:00Z",
+            "2026-08-15T20:01:00Z",
+        )
+        self.state.after_snapshot_sessions = [summary("session-4", [concurrent])]
+        self.state.after_snapshot_exports = {"session-4": [concurrent]}
+
+        output = self.temporary / "stable-page-delta.jsonl"
+        result = self.run_export(output, extra=["--session-limit", "2"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exported = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual(
+            [item["request_id"] for item in exported],
+            ["request-1", "request-2", "request-3"],
+        )
+        manifest = json.loads(Path(str(output) + ".manifest.json").read_text())
+        self.assertEqual(
+            manifest["session_projection_protocol"], STABLE_CURSOR_PROTOCOL
+        )
+        self.assertEqual(manifest["version"], 2)
+        self.assertIsNone(manifest["prior_source_ingest_fence"])
+        self.assertEqual(manifest["source_ingest_fence"], "3")
+        self.assertEqual(manifest["session_count"], 3)
+        self.assertEqual(manifest["source_projection_requests"], 3)
+        self.assertRegex(manifest["source_snapshot_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(len(self.state.stable_ticket_snapshots_seen), 3)
+        self.assertEqual(len(set(self.state.stable_ticket_snapshots_seen)), 1)
+
+        calls_before_resume = self.state.request_count
+        result = self.run_export(
+            output, extra=["--session-limit", "2", "--resume"]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.state.request_count, calls_before_resume)
+
+        replay = self.temporary / "stable-page-replay.jsonl"
+        result = self.run_export(replay, since=None, extra=["--session-limit", "2"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        replayed = [json.loads(line) for line in replay.read_text().splitlines()]
+        self.assertEqual(
+            [item["request_id"] for item in replayed],
+            ["request-4", "request-2", "request-3"],
+        )
+        replay_manifest = json.loads(
+            Path(str(replay) + ".manifest.json").read_text()
+        )
+        self.assertEqual(replay_manifest["prior_source_ingest_fence"], "3")
+        self.assertEqual(replay_manifest["source_ingest_fence"], "4")
+
+    def test_stable_fence_captures_old_record_appended_to_existing_session(self) -> None:
+        old = record(
+            "request-old",
+            "session-old",
+            "2026-08-10T01:00:00Z",
+            "2026-08-10T01:01:00Z",
+        )
+        recent = record(
+            "request-recent",
+            "session-recent",
+            "2026-08-20T01:00:00Z",
+            "2026-08-20T01:01:00Z",
+        )
+        late = record(
+            "request-late",
+            "session-old",
+            "2026-08-11T01:00:00Z",
+            "2026-08-11T01:01:00Z",
+        )
+        self.state.stable_cursor_supported = True
+        self.state.sessions = [
+            summary("session-recent", [recent]),
+            summary("session-old", [old]),
+        ]
+        self.state.exports = {
+            "session-recent": [recent],
+            "session-old": [old],
+        }
+        self.state.after_snapshot_sessions = [summary("session-old", [old, late])]
+        self.state.after_snapshot_exports = {"session-old": [old, late]}
+
+        first_output = self.temporary / "existing-session-first.jsonl"
+        result = self.run_export(first_output, since="2026-08-01T00:00:00Z")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        second_output = self.temporary / "existing-session-second.jsonl"
+        result = self.run_export(second_output, since=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exported = [
+            json.loads(line) for line in second_output.read_text().splitlines()
+        ]
+        self.assertEqual(
+            [item["request_id"] for item in exported],
+            ["request-old", "request-late", "request-recent"],
+        )
+        manifest = json.loads(
+            Path(str(second_output) + ".manifest.json").read_text()
+        )
+        self.assertEqual(manifest["prior_source_ingest_fence"], "2")
+        self.assertEqual(manifest["source_ingest_fence"], "3")
+
+    def test_stable_cursor_handles_more_than_one_thousand_equal_timestamps(self) -> None:
+        self.state.stable_cursor_supported = True
+        shared_time = "2026-08-16T01:00:00Z"
+        self.state.sessions = [
+            {
+                "session_id": f"session-{index:04d}",
+                "requests": 0,
+                "first_at": shared_time,
+                "last_at": shared_time,
+            }
+            for index in range(1001)
+        ]
+        client = DELTA_EXPORT.SourceClient(
+            self.base_url,
+            self.base_url,
+            TOKEN,
+            5,
+            True,
+        )
+        projection = client.stable_sessions(
+            1000,
+            dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc),
+        )
+        self.assertEqual(len(projection.sessions), 1001)
+        self.assertEqual(
+            [item["session_id"] for item in projection.sessions[:2]],
+            ["session-0000", "session-0001"],
+        )
+        replay = client.stable_sessions(
+            1000,
+            dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc),
+            projection.snapshot,
+        )
+        self.assertEqual(
+            session_set_digest(replay.sessions), session_set_digest(projection.sessions)
+        )
+
+    def test_stable_cursor_refuses_page_gap_and_cursor_loop(self) -> None:
+        self.state.stable_cursor_supported = True
+        shared_time = "2026-08-16T01:00:00Z"
+        self.state.sessions = [
+            {
+                "session_id": f"session-{index}",
+                "requests": 0,
+                "first_at": shared_time,
+                "last_at": shared_time,
+            }
+            for index in range(5)
+        ]
+        client = DELTA_EXPORT.SourceClient(
+            self.base_url,
+            self.base_url,
+            TOKEN,
+            5,
+            True,
+        )
+        self.state.stable_gap_offset = 2
+        with self.assertRaisesRegex(DELTA_EXPORT.DeltaError, "gap"):
+            client.stable_sessions(
+                2,
+                dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc),
+            )
+
+        self.state.stable_gap_offset = None
+        self.state.stable_cursor_loop = True
+        with self.assertRaisesRegex(DELTA_EXPORT.DeltaError, "cursor loop"):
+            client.stable_sessions(
+                2,
+                dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc),
+            )
+
+    def test_stable_snapshot_refuses_equal_count_live_export_substitution(self) -> None:
+        original = record(
+            "request-original",
+            "session-one",
+            "2026-08-16T01:00:00Z",
+            "2026-08-16T01:01:00Z",
+        )
+        replacement = record(
+            "request-replacement",
+            "session-one",
+            "2026-08-16T01:00:00Z",
+            "2026-08-16T01:02:00Z",
+        )
+        self.state.stable_cursor_supported = True
+        self.state.sessions = [summary("session-one", [original])]
+        self.state.exports = {"session-one": [original]}
+        self.state.after_snapshot_exports = {"session-one": [replacement]}
+        self.state.serve_live_snapshot_exports = True
+        result = self.run_export(
+            self.temporary / "live-substitution.jsonl",
+            extra=["--session-limit", "1"],
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("digest disagrees", result.stderr)
+        self.assertFalse(self.checkpoint.exists())
+
+    def test_final_stats_read_closes_stable_source_write_barrier(self) -> None:
+        row = record(
+            "request-1",
+            "session-one",
+            "2026-08-16T01:00:00Z",
+            "2026-08-16T01:01:00Z",
+        )
+        self.state.stable_cursor_supported = True
+        self.state.sessions = [summary("session-one", [row])]
+        self.state.exports = {"session-one": [row]}
+        self.state.stats_values = [1, 1, 2]
+        result = self.run_export(
+            self.temporary / "late-write-barrier.jsonl",
+            extra=["--session-limit", "1", "--require-stable-source"],
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("write barrier", result.stderr)
         self.assertFalse(self.checkpoint.exists())
 
     def test_refuses_redirect_cross_origin_ticket_and_unstable_freeze(self) -> None:

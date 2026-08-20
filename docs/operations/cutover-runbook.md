@@ -68,9 +68,13 @@ change source availability.
 
 ## Online catch-up
 
-Repeat this while CPA remains live. Run it frequently enough that fewer than
-1000 sessions can enter one overlap window, and choose an overlap longer than the
-maximum observed collector/CPAMP queue delay.
+Repeat this while CPA remains live. With the legacy v0.7.21 source, run it
+frequently enough that fewer than 1000 sessions can enter one overlap window.
+Larger windows require the reviewed
+`session-snapshot-cursor-v1`/snapshot-bound export contract documented in
+`docs/session-archive-import.md`; no client-side time split can replace its
+upper-fence guarantee. In either mode, choose an overlap longer than the maximum
+observed collector/CPAMP queue delay.
 
 1. Take an approved consistent CPAMP SQLite snapshot and run
    `ops/migrate-cpamp.sh`. The CPAMP importer must complete before the matching
@@ -89,15 +93,25 @@ maximum observed collector/CPAMP queue delay.
      --overlap-seconds 86400
    ```
 
-   The exporter fails closed if either session projection changes, a session
-   ticket disagrees with its summary count, or the 1000-session boundary could
-   hide records. Retry source drift with a new filename. Use `--resume` with the
-   same filename only when a durable manifest/pending output exists and its
-   checkpoint transition was interrupted.
+   The exporter fails closed if either legacy projection changes, a
+   snapshot-cursor page has a duplicate/gap/order/digest error, a
+   snapshot-bound ticket or export disagrees with its summary count/digest, or a
+   saturated legacy boundary cannot negotiate the stable protocol. A stable
+   export re-enumerates
+   the same opaque snapshot, so concurrent records beyond its upper fence are
+   deferred to the next run and selected by the persisted ingest fence even when
+   their provider timestamp predates the overlap. `--require-stable-source`
+   performs a final stats read after snapshot replay, but remains a verification
+   of an external write barrier rather than a replacement for one.
+   Retry genuine source drift with a new filename. Use `--resume` with the same
+   filename only when a durable manifest/pending output exists and its checkpoint
+   transition was interrupted.
 3. Independently verify the output SHA-256 against the adjacent manifest, retain
-   both files read-only, and record the manifest sequence, source record counts,
-   lower bound, watermarks and selected-session count. Do not copy payloads,
-   session ids or tickets into operator logs.
+   both files read-only, and record the manifest sequence, projection protocol,
+   source/snapshot request counts, lower bound, watermarks and selected-session
+   count. For a stable projection, also record the non-secret prior/current
+   ingest fences and retain only the opaque snapshot's digest; do not copy the
+   snapshot capability, payloads, session ids or tickets into operator logs.
 4. Mount the JSONL read-only and run `ops/import-cpa-session-archive.sh` in this
    order: dry run (`SESSION_ARCHIVE_APPLY=false`), apply
    (`SESSION_ARCHIVE_APPLY=true`), then the exact same apply once more. The

@@ -40,11 +40,14 @@ session projection into a conservative source-side cursor:
 
 1. read the exact indexed-record count and the `last_at`-ordered session list;
 2. select every session at or after `checkpoint - overlap`;
-3. export each selected session, reject a count mismatch, and retain records
-   whose `started_at` **or** `completed_at` is inside the overlap;
+3. export each selected session and reject a count mismatch. Legacy mode retains
+   records whose `started_at` **or** `completed_at` is inside the overlap;
+   snapshot mode retains each selected whole session so ingest-fence-selected
+   late records cannot be removed by their provider timestamp;
 4. coalesce canonical-equivalent duplicate request ids, but reject conflicting
-   identity/body pairs, an unstable second session projection, and a saturated
-   1000-session window whose completeness cannot be proved;
+   identity/body pairs and an unstable second session projection. A saturated
+   legacy list is retried only through the snapshot-cursor contract below; an
+   older source fails closed rather than omitting the tail;
 5. write canonical JSONL in `(started_at, request_id)` order, followed by a
    SHA-256 manifest chained to the prior output digest and the next source
    checkpoint.
@@ -81,7 +84,9 @@ The host needs private scratch space for the selected whole-session downloads,
 the bounded SQLite de-duplication spool and the final JSONL. The default download
 and output caps are 64 GiB each and can be adjusted explicitly up to 1 TiB. A
 session may contain records older than the overlap because the source ticket is
-whole-session; these records are validated but not emitted.
+whole-session. Legacy mode validates but does not emit them; stable mode emits
+them because the session may have been selected by ingest fence rather than
+provider time.
 
 The export host and CPA nodes must be time-synchronized. By default, a source
 session or record more than one hour ahead of the export host is rejected so one
@@ -98,6 +103,77 @@ apply/replay and its source/target checkpoints have been reconciled.
 During the final write barrier add `--require-stable-source`; this requires the
 indexed-record count to remain identical across the export, in addition to the
 two session-list projections.
+
+### Stable session cursor contract
+
+The deployed `cpa-session-archive` v0.7.21 list accepts only `limit=1..1000` and
+facet filters. It orders by `last_at DESC`, has no stable tie-breaker, time upper
+bound, total or cursor, and treats unknown query parameters as facet filters.
+Consequently, an empty response to a cursor-looking parameter is not proof of an
+empty page. The exporter actively negotiates the stable protocol on every new
+checkpoint transition. It falls back only when the source explicitly returns its
+legacy sessions representation and that selected window is provably below the
+limit; once a checkpoint contains an ingest fence, stable support is mandatory.
+
+The negotiation requests
+`cursor_protocol=session-snapshot-cursor-v1` on the same sessions endpoint. A
+compatible source must return an object containing `cursor_protocol`, an opaque
+`snapshot`, a decimal `ingest_fence`, `session_count`, `request_count`,
+`session_set_sha256`, `sessions`, `complete`, and `next_cursor`. Each session also
+contains a `records_sha256`. Subsequent requests repeat the inclusive
+`lower_bound_completed_at`, the prior checkpoint's optional
+`after_ingest_fence`, `limit`, and snapshot plus the opaque cursor.
+
+The source-side contract is deliberately strict:
+
+- the snapshot fixes a monotonically increasing signed-63-bit ingest-sequence
+  upper fence and remains replayable for the complete enumeration and export;
+- without `after_ingest_fence`, the first stable snapshot enumerates the complete
+  history. Later snapshots return the union of sessions inside the timestamp
+  overlap and sessions with a record inserted in `(after_ingest_fence,
+  ingest_fence]`; this makes old-timestamp late arrivals visible;
+- stable-protocol session ids are printable ASCII (maximum 512 bytes); pages use
+  the total order `(last_at DESC, session_id ASC bytewise)` and include every
+  session selected by that union;
+- every page repeats identical snapshot/count/digest metadata, `next_cursor` is
+  non-null exactly while another page exists, and cursors bind the snapshot,
+  bounds and final tuple;
+- `GET .../export?id=...&snapshot=...` returns `cursor_protocol`, the same
+  snapshot and the session `records_sha256`, then produces the exact version
+  counted by that snapshot summary; later appends are excluded. The digest is
+  SHA-256 over canonical record lines ordered by `request_id`; each line uses
+  sorted JSON object keys, UTF-8, no insignificant whitespace, and one trailing
+  newline;
+- invalid, expired or altered snapshots/cursors return a non-success response.
+  They must never silently fall back to a default page or facet filter.
+
+`session_set_sha256` is the SHA-256 of one UTF-8 JSON array sorted by
+`session_id`. Each element contains only `session_id`, integer `requests`,
+`records_sha256`, `first_at`, and `last_at`; stable-protocol timestamps must
+already be normalized to UTC with exactly six fractional digits and `Z`. Object
+keys are lexicographically sorted, non-ASCII JSON text is not escaped, and no
+insignificant whitespace or trailing newline is present.
+This is the same canonical projection retained in the manifest and makes a
+missing page detectable independently of page boundaries.
+
+The exporter verifies page order, duplicate identities, cursor loops, the total
+session and request counts, the complete projection digest, snapshot-bound
+per-session counts and record digests, and a second enumeration of the same
+snapshot. Stable mode emits every record in each selected session; target
+provenance coalesces the intentional replay. New and late records created after
+the upper fence are selected on the next run by the persisted ingest fence, not
+merely by provider timestamps. Only a SHA-256 digest of the opaque snapshot is
+retained; the non-secret numeric ingest fence is chained through the private
+manifest and checkpoint.
+Until the source implements this complete contract, a saturated legacy window
+remains a hard gate; client-side time splitting cannot prove an upper fence or a
+complete equal-timestamp boundary.
+
+New artifacts use manifest and checkpoint contract version 2. The reader accepts
+legacy version-1 artifacts for a one-way upgrade, but version 2 stores the
+projection protocol and optional ingest fence so an older exporter rejects the
+checkpoint instead of silently dropping cursor state. Do not roll back the
+exporter after it has committed a version-2 checkpoint.
 
 An archive request UUID is not assumed to equal CPAMP's short request id. A
 globally proven one-to-one edge is recorded as `exact`; only that disposition may
@@ -230,15 +306,17 @@ when available. An explicit session groups observations into one cluster; it doe
 not by itself create a directed continuation edge. Missing strong ancestry
 metadata is left as an unconnected observation rather than fabricated.
 
-The whole-database endpoint still has no `since` parameter. The bounded delta
-driver therefore depends on the source session index being complete and current.
+The whole-database endpoint still has no `since` parameter. The delta driver
+therefore depends on the source session index being complete and current.
 Before the baseline, run the collector's supported session-index repair/backfill
 and prove on a consistent source SQLite snapshot that every record has a non-empty
 session id and exactly one `session_indexed_requests` row, and that every indexed
 session has an exact summary count/time range. API2 alone cannot prove those
-invariants. If the overlap contains at least 1000 sessions, the tool refuses
-instead of silently omitting the tail; shorten the interval or deploy a reviewed
-source API with a real stable record cursor. Do not override that gate.
+invariants. If the overlap contains at least 1000 sessions, v0.7.21 cannot prove
+the tail. Deploy the snapshot-cursor and snapshot-bound export contract above or
+use a proven source write barrier plus a separately reviewed complete baseline;
+do not override the exporter gate or attempt client-side `since`/`offset`
+parameters that the source interprets as facets.
 
 ## Verification boundary
 
