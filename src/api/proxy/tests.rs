@@ -1115,6 +1115,9 @@ async fn compatibility_bridge_streaming_error_null_completes_and_non_null_error_
         assert_eq!(rows[0].error_code.as_deref(), expected_error);
         if expected_status == 200 {
             assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (309, 7));
+        } else {
+            assert_ne!(rows[0].cost, "0", "delivered failed streams are billed");
+            assert_eq!(rows[0].output_tokens, 16);
         }
     }
 }

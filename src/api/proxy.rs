@@ -722,7 +722,17 @@ pub(super) async fn proxy(
                         if let Some(sanitizer) = responses_streaming_sanitizer.as_mut() {
                             match sanitizer.push(&raw_chunk) {
                                 Ok(chunk) => {
-                                    let billable = sanitizer.last_push_billable();
+                                    let billable = if is_codex_route {
+                                        sanitizer.last_push_billable()
+                                    } else {
+                                        // Generic compatible Responses routes historically
+                                        // charge the admitted contract once any response event
+                                        // is delivered, including a redacted terminal failure.
+                                        // Direct Codex routes retain their narrower lifecycle
+                                        // classification because their trusted transport can
+                                        // distinguish non-billable control events.
+                                        !chunk.is_empty()
+                                    };
                                     (chunk, billable)
                                 }
                                 Err(error_code) => {
