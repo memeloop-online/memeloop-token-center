@@ -30,7 +30,7 @@ cosign sign --key cosign.key \
   "ghcr.io/example/token-center-plugins/example-policy@${digest}"
 ```
 
-安装器必须同时给出精确 registry/repository 来源 allowlist 和至少一个 Cosign 公钥；多个公钥仅用于无停机轮换，任一可信公钥验签成功即可。私有 registry 的 PAT/密码或 bearer token 只从挂载文件读取，不接受命令行明文。生产 CLI 固定 HTTPS；HTTP 只存在于 Rust mock-registry 测试入口。
+安装器必须同时给出精确 registry/repository 来源 allowlist 和至少一个 Cosign 公钥；多个公钥仅用于无停机轮换，任一可信公钥验签成功即可。验签委托给固定绝对路径 `/usr/local/bin/cosign` 的官方 Cosign v3.1.3（该版本修复 GHSA-fx35-mq7g-6g98），运行时会严格核对其 `gitVersion`。公钥模式使用 `--insecure-ignore-tlog`，以显式配置的离线公钥作为信任根；不会开启 SCT 忽略、deprecated offline 或 private-infrastructure 模式。私有 registry 的用户名、PAT/密码或直接 bearer token 只从挂载文件读取，不接受命令行明文或 Secret env。生产 CLI 固定 HTTPS；HTTP 只存在于 Rust mock-registry 测试入口。
 
 ```bash
 cargo run --features plugin-distribution --bin install-plugin-oci -- \
@@ -39,6 +39,8 @@ cargo run --features plugin-distribution --bin install-plugin-oci -- \
   --allowed-source ghcr.io/example/token-center-plugins/example-policy \
   --cosign-public-key /var/run/secrets/plugins/cosign.pub
 ```
+
+生产使用独立的 `memeloop-token-center-plugin-installer@sha256:...` init-container 镜像；Cosign 不进入长期运行的服务镜像。Helm 的 `plugins.ociInstaller` 只接受 digest-pinned installer 镜像和 artifact，公钥及可选 registry auth 通过 Secret 文件卷挂载，`/tmp` 是有上限的内存卷，插件输出是 Pod 专属 `emptyDir`。init container 非 root、只读 rootfs、无 service-account token、drop ALL，安装完成后服务容器只读挂载输出卷。每次安装失败都会阻止 Pod 启动；已经存在的插件目录不会被覆盖。
 
 安装器先验来源和 Cosign 签名，再读取 OCI manifest 并在下载 blob 前检查 descriptor：最多 64 个文件、总计 80 MiB、`plugin.json` 1 MiB、Wasm 64 MiB、单个 asset 8 MiB、config 16 KiB。blob 逐个流式写入有硬上限的 staging 文件，并由 OCI client 校验 descriptor digest；随后复用运行时的 manifest/schema/Wasm 路径校验。最后用 Linux `renameat2(RENAME_NOREPLACE)` 原子发布为 `/plugins/<plugin-id>`，绝不覆盖已有插件，失败会清理隐藏 staging 目录。成功目录包含不带凭据的 `.mtc-oci-install.json` 来源/digest/签名策略收据。升级应安装到新的空 volume 并经过独立实例验收后切换 Deployment；当前 MVP 有意不在运行目录内原地替换版本。
 

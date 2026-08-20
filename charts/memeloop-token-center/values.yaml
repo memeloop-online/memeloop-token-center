@@ -155,6 +155,33 @@ plugins:
   mountPath: /var/lib/memeloop-token-center/plugins
   existingConfigMap: ""
   existingClaim: ""
+  ociInstaller:
+    enabled: false
+    image:
+      repository: ghcr.io/linonetwo/memeloop-token-center-plugin-installer
+      # Required when enabled. Tags are deliberately unsupported for the
+      # privileged-before-start installer trust boundary.
+      digest: ""
+      pullPolicy: IfNotPresent
+    # Each artifact reference must be @sha256-pinned. An init container is
+    # rendered per item and installs atomically into the Pod-local output volume.
+    artifacts: []
+    cosignPublicKeysSecret:
+      name: ""
+      keys: []
+    # Leave name empty for anonymous registries. For Basic auth set usernameKey
+    # and passwordKey; for a direct bearer token set bearerTokenKey and clear
+    # usernameKey/passwordKey. Values are mounted as files, never env/argv.
+    registryAuthSecret:
+      name: ""
+      usernameKey: username
+      passwordKey: password
+      bearerTokenKey: ""
+    outputSizeLimit: 256Mi
+    tmpSizeLimit: 16Mi
+    resources:
+      requests: { cpu: 25m, memory: 32Mi }
+      limits: { cpu: 250m, memory: 128Mi }
 
 ingress:
   gateway:

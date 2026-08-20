@@ -193,12 +193,179 @@
     "plugins": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "mountPath", "existingConfigMap", "existingClaim"],
+      "required": ["enabled", "mountPath", "existingConfigMap", "existingClaim", "ociInstaller"],
       "properties": {
         "enabled": { "type": "boolean" },
         "mountPath": { "type": "string", "pattern": "^/", "minLength": 2 },
         "existingConfigMap": { "type": "string" },
-        "existingClaim": { "type": "string" }
+        "existingClaim": { "type": "string" },
+        "ociInstaller": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "image",
+            "artifacts",
+            "cosignPublicKeysSecret",
+            "registryAuthSecret",
+            "outputSizeLimit",
+            "tmpSizeLimit",
+            "resources"
+          ],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["repository", "digest", "pullPolicy"],
+              "properties": {
+                "repository": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[^@\\s]+$"
+                },
+                "digest": {
+                  "type": "string",
+                  "oneOf": [
+                    { "maxLength": 0 },
+                    { "pattern": "^sha256:[0-9a-f]{64}$" }
+                  ]
+                },
+                "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+              }
+            },
+            "artifacts": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["reference", "allowedSource"],
+                "properties": {
+                  "reference": {
+                    "type": "string",
+                    "pattern": "^[^@\\s]+@sha256:[0-9a-f]{64}$"
+                  },
+                  "allowedSource": {
+                    "type": "string",
+                    "pattern": "^[^@\\s]+$"
+                  }
+                }
+              }
+            },
+            "cosignPublicKeysSecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "keys"],
+              "properties": {
+                "name": { "type": "string" },
+                "keys": {
+                  "type": "array",
+                  "maxItems": 8,
+                  "uniqueItems": true,
+                  "items": {
+                    "allOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9._-]+$",
+                        "minLength": 1,
+                        "maxLength": 253
+                      },
+                      { "not": { "enum": [".", ".."] } }
+                    ]
+                  }
+                }
+              }
+            },
+            "registryAuthSecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "usernameKey", "passwordKey", "bearerTokenKey"],
+              "properties": {
+                "name": { "type": "string" },
+                "usernameKey": {
+                  "allOf": [
+                    { "type": "string", "pattern": "^[A-Za-z0-9._-]*$" },
+                    { "not": { "enum": [".", ".."] } }
+                  ]
+                },
+                "passwordKey": {
+                  "allOf": [
+                    { "type": "string", "pattern": "^[A-Za-z0-9._-]*$" },
+                    { "not": { "enum": [".", ".."] } }
+                  ]
+                },
+                "bearerTokenKey": {
+                  "allOf": [
+                    { "type": "string", "pattern": "^[A-Za-z0-9._-]*$" },
+                    { "not": { "enum": [".", ".."] } }
+                  ]
+                }
+              }
+            },
+            "outputSizeLimit": { "$ref": "#/definitions/resourceQuantity" },
+            "tmpSizeLimit": { "$ref": "#/definitions/resourceQuantity" },
+            "resources": { "$ref": "#/definitions/resources" }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "enabled": { "const": true } },
+                "required": ["enabled"]
+              },
+              "then": {
+                "properties": {
+                  "image": { "properties": { "digest": { "minLength": 71 } } },
+                  "artifacts": { "minItems": 1 },
+                  "cosignPublicKeysSecret": {
+                    "properties": {
+                      "name": { "minLength": 1 },
+                      "keys": { "minItems": 1 }
+                    }
+                  },
+                  "resources": {
+                    "properties": {
+                      "requests": { "required": ["cpu", "memory"] },
+                      "limits": { "required": ["cpu", "memory"] }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "registryAuthSecret": {
+                    "properties": { "name": { "minLength": 1 } }
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "registryAuthSecret": {
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "usernameKey": { "minLength": 1 },
+                          "passwordKey": { "minLength": 1 },
+                          "bearerTokenKey": { "maxLength": 0 }
+                        }
+                      },
+                      {
+                        "properties": {
+                          "usernameKey": { "maxLength": 0 },
+                          "passwordKey": { "maxLength": 0 },
+                          "bearerTokenKey": { "minLength": 1 }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
       },
       "allOf": [
         {
@@ -208,16 +375,49 @@
               {
                 "properties": {
                   "existingConfigMap": { "minLength": 1 },
-                  "existingClaim": { "maxLength": 0 }
+                  "existingClaim": { "maxLength": 0 },
+                  "ociInstaller": {
+                    "properties": { "enabled": { "const": false } }
+                  }
                 }
               },
               {
                 "properties": {
                   "existingConfigMap": { "maxLength": 0 },
-                  "existingClaim": { "minLength": 1 }
+                  "existingClaim": { "minLength": 1 },
+                  "ociInstaller": {
+                    "properties": { "enabled": { "const": false } }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "existingConfigMap": { "maxLength": 0 },
+                  "existingClaim": { "maxLength": 0 },
+                  "ociInstaller": {
+                    "properties": { "enabled": { "const": true } }
+                  }
                 }
               }
             ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "ociInstaller": {
+                "properties": { "enabled": { "const": true } },
+                "required": ["enabled"]
+              }
+            },
+            "required": ["ociInstaller"]
+          },
+          "then": {
+            "properties": {
+              "enabled": { "const": true },
+              "existingConfigMap": { "maxLength": 0 },
+              "existingClaim": { "maxLength": 0 }
+            }
           }
         }
       ]

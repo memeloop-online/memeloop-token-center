@@ -34,6 +34,19 @@ reviewed_digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   --namespace token-center \
   --set plugins.enabled=true \
   --set plugins.existingClaim=token-center-plugins >"$workspace/pvc-plugin.yaml"
+installer_digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+artifact_digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+"$helm_binary" template token-center-oci-plugin "$chart" \
+  --namespace token-center \
+  --set plugins.enabled=true \
+  --set plugins.ociInstaller.enabled=true \
+  --set-string plugins.ociInstaller.image.digest="$installer_digest" \
+  --set-string plugins.ociInstaller.artifacts[0].reference="ghcr.io/example/plugin@$artifact_digest" \
+  --set-string plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub \
+  --set-string plugins.ociInstaller.registryAuthSecret.name=plugin-registry-auth \
+  >"$workspace/oci-plugin.yaml"
 "$helm_binary" template token-center-migration-pull-secret "$chart" \
   --namespace token-center \
   --show-only templates/migration-job.yaml \
@@ -101,6 +114,28 @@ if grep -q 'rollingUpdate:' "$workspace/recreate.yaml"; then
 fi
 grep -q 'configMap:' "$workspace/configmap-plugin.yaml"
 grep -q 'persistentVolumeClaim:' "$workspace/pvc-plugin.yaml"
+test "$(grep -c 'name: install-plugin-0' "$workspace/oci-plugin.yaml")" -eq 3
+test "$(grep -c "image: \"ghcr.io/linonetwo/memeloop-token-center-plugin-installer@$installer_digest\"" "$workspace/oci-plugin.yaml")" -eq 3
+test "$(grep -c -- '- --registry-username-file' "$workspace/oci-plugin.yaml")" -eq 3
+test "$(grep -c -- '- --registry-password-file' "$workspace/oci-plugin.yaml")" -eq 3
+test "$(grep -c -- '- --cosign-public-key' "$workspace/oci-plugin.yaml")" -eq 3
+test "$(grep -c 'medium: Memory' "$workspace/oci-plugin.yaml")" -eq 3
+test "$(grep -c 'sizeLimit: \"16Mi\"' "$workspace/oci-plugin.yaml")" -eq 3
+test "$(grep -c 'secretName: plugin-cosign-keys' "$workspace/oci-plugin.yaml")" -eq 3
+test "$(grep -c 'secretName: plugin-registry-auth' "$workspace/oci-plugin.yaml")" -eq 3
+test "$(grep -c 'readOnlyRootFilesystem: true' "$workspace/oci-plugin.yaml")" -eq 7
+test "$(grep -c 'allowPrivilegeEscalation: false' "$workspace/oci-plugin.yaml")" -eq 7
+test "$(grep -c 'drop:.*ALL' "$workspace/oci-plugin.yaml")" -eq 7
+test "$(grep -c 'seccompProfile:.*RuntimeDefault' "$workspace/oci-plugin.yaml")" -ge 6
+if grep -Fq 'MTC_PLUGIN_REGISTRY_' "$workspace/oci-plugin.yaml"; then
+  echo 'OCI installer registry credentials must not be injected through env' >&2
+  exit 1
+fi
+if grep -Eq 'memeloop-token-center-plugin-installer:[^[:space:]]' "$workspace/oci-plugin.yaml"; then
+  echo 'OCI installer image must never render a mutable tag' >&2
+  exit 1
+fi
+test "$(grep -c 'install-plugin-' "$workspace/default.yaml" || true)" -eq 0
 test "$(grep -c 'name: MTC_RUN_MIGRATIONS_ON_START' "$workspace/default.yaml")" -eq 3
 readiness_probes="$(grep -A5 -F 'readinessProbe:' "$workspace/default.yaml")"
 test "$(printf '%s\n' "$readiness_probes" | grep -c 'periodSeconds: 5')" -eq 3
@@ -216,6 +251,75 @@ assert_invalid plugin-with-two-sources \
   --set plugins.enabled=true \
   --set plugins.existingConfigMap=token-center-plugins \
   --set plugins.existingClaim=token-center-plugins
+assert_invalid oci-installer-without-plugin-mode \
+  --set plugins.ociInstaller.enabled=true
+assert_invalid oci-installer-without-image-digest \
+  --set plugins.enabled=true \
+  --set plugins.ociInstaller.enabled=true \
+  --set-string plugins.ociInstaller.artifacts[0].reference="ghcr.io/example/plugin@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
+  --set-string plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub
+assert_invalid oci-installer-tagged-artifact \
+  --set plugins.enabled=true \
+  --set plugins.ociInstaller.enabled=true \
+  --set-string plugins.ociInstaller.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  --set-string plugins.ociInstaller.artifacts[0].reference=ghcr.io/example/plugin:latest \
+  --set-string plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub
+assert_invalid oci-installer-without-public-key \
+  --set plugins.enabled=true \
+  --set plugins.ociInstaller.enabled=true \
+  --set-string plugins.ociInstaller.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  --set-string plugins.ociInstaller.artifacts[0].reference="ghcr.io/example/plugin@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
+  --set-string plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin
+assert_invalid oci-installer-with-existing-pvc \
+  --set plugins.enabled=true \
+  --set plugins.existingClaim=token-center-plugins \
+  --set plugins.ociInstaller.enabled=true \
+  --set-string plugins.ociInstaller.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  --set-string plugins.ociInstaller.artifacts[0].reference="ghcr.io/example/plugin@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
+  --set-string plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub
+assert_invalid oci-installer-basic-bearer-mixed \
+  --set plugins.enabled=true \
+  --set plugins.ociInstaller.enabled=true \
+  --set-string plugins.ociInstaller.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  --set-string plugins.ociInstaller.artifacts[0].reference="ghcr.io/example/plugin@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
+  --set-string plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub \
+  --set-string plugins.ociInstaller.registryAuthSecret.name=plugin-registry-auth \
+  --set-string plugins.ociInstaller.registryAuthSecret.bearerTokenKey=bearer
+assert_invalid oci-installer-invalid-secret-key \
+  --set plugins.enabled=true \
+  --set plugins.ociInstaller.enabled=true \
+  --set-string plugins.ociInstaller.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  --set-string plugins.ociInstaller.artifacts[0].reference="ghcr.io/example/plugin@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
+  --set-string plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub \
+  --set-string plugins.ociInstaller.registryAuthSecret.name=plugin-registry-auth \
+  --set-string plugins.ociInstaller.registryAuthSecret.usernameKey=../username
+assert_invalid oci-installer-invalid-public-key-path \
+  --set plugins.enabled=true \
+  --set plugins.ociInstaller.enabled=true \
+  --set-string plugins.ociInstaller.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  --set-string plugins.ociInstaller.artifacts[0].reference="ghcr.io/example/plugin@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
+  --set-string plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=..
+assert_invalid oci-installer-repository-with-digest \
+  --set plugins.enabled=true \
+  --set plugins.ociInstaller.enabled=true \
+  --set-string plugins.ociInstaller.image.repository="ghcr.io/example/installer@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" \
+  --set-string plugins.ociInstaller.image.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  --set-string plugins.ociInstaller.artifacts[0].reference="ghcr.io/example/plugin@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" \
+  --set-string plugins.ociInstaller.artifacts[0].allowedSource=ghcr.io/example/plugin \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.name=plugin-cosign-keys \
+  --set-string plugins.ociInstaller.cosignPublicKeysSecret.keys[0]=cosign.pub
 assert_invalid misspelled-role-field \
   --set roles.gateway.replicaCounnt=2
 assert_invalid misspelled-ingress-field \

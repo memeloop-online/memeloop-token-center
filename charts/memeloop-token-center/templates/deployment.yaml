@@ -47,6 +47,55 @@ spec:
         runAsGroup: 10001
         fsGroup: 10001
         seccompProfile: { type: RuntimeDefault }
+      {{- if $.Values.plugins.ociInstaller.enabled }}
+      initContainers:
+        {{- range $index, $artifact := $.Values.plugins.ociInstaller.artifacts }}
+        - name: install-plugin-{{ $index }}
+          image: {{ printf "%s@%s" $.Values.plugins.ociInstaller.image.repository $.Values.plugins.ociInstaller.image.digest | quote }}
+          imagePullPolicy: {{ $.Values.plugins.ociInstaller.image.pullPolicy }}
+          args:
+            - {{ $artifact.reference | quote }}
+            - --plugin-dir
+            - {{ $.Values.plugins.mountPath | quote }}
+            - --allowed-source
+            - {{ $artifact.allowedSource | quote }}
+            {{- range $.Values.plugins.ociInstaller.cosignPublicKeysSecret.keys }}
+            - --cosign-public-key
+            - {{ printf "/var/run/secrets/mtc-plugin-cosign/%s" . | quote }}
+            {{- end }}
+            {{- if $.Values.plugins.ociInstaller.registryAuthSecret.name }}
+            {{- if $.Values.plugins.ociInstaller.registryAuthSecret.bearerTokenKey }}
+            - --registry-bearer-token-file
+            - /var/run/secrets/mtc-plugin-registry/bearer-token
+            {{- else }}
+            - --registry-username-file
+            - /var/run/secrets/mtc-plugin-registry/username
+            - --registry-password-file
+            - /var/run/secrets/mtc-plugin-registry/password
+            {{- end }}
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          resources:
+            {{- toYaml $.Values.plugins.ociInstaller.resources | nindent 12 }}
+          volumeMounts:
+            - name: plugins
+              mountPath: {{ $.Values.plugins.mountPath }}
+            - name: plugin-installer-tmp
+              mountPath: /tmp
+            - name: plugin-cosign-keys
+              mountPath: /var/run/secrets/mtc-plugin-cosign
+              readOnly: true
+            {{- if $.Values.plugins.ociInstaller.registryAuthSecret.name }}
+            - name: plugin-registry-auth
+              mountPath: /var/run/secrets/mtc-plugin-registry
+              readOnly: true
+            {{- end }}
+        {{- end }}
+      {{- end }}
       containers:
         - name: token-center
           image: {{ include "memeloop-token-center.image" $ | quote }}
@@ -108,7 +157,10 @@ spec:
       {{- if $.Values.plugins.enabled }}
       volumes:
         - name: plugins
-          {{- if $.Values.plugins.existingConfigMap }}
+          {{- if $.Values.plugins.ociInstaller.enabled }}
+          emptyDir:
+            sizeLimit: {{ $.Values.plugins.ociInstaller.outputSizeLimit | quote }}
+          {{- else if $.Values.plugins.existingConfigMap }}
           configMap:
             name: {{ $.Values.plugins.existingConfigMap }}
           {{- else if $.Values.plugins.existingClaim }}
@@ -117,6 +169,37 @@ spec:
           {{- else }}
           {{- fail "plugins.enabled requires plugins.existingConfigMap or plugins.existingClaim" }}
           {{- end }}
+        {{- if $.Values.plugins.ociInstaller.enabled }}
+        - name: plugin-installer-tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ $.Values.plugins.ociInstaller.tmpSizeLimit | quote }}
+        - name: plugin-cosign-keys
+          secret:
+            secretName: {{ $.Values.plugins.ociInstaller.cosignPublicKeysSecret.name }}
+            defaultMode: 0440
+            items:
+              {{- range $.Values.plugins.ociInstaller.cosignPublicKeysSecret.keys }}
+              - key: {{ . | quote }}
+                path: {{ . | quote }}
+              {{- end }}
+        {{- if $.Values.plugins.ociInstaller.registryAuthSecret.name }}
+        - name: plugin-registry-auth
+          secret:
+            secretName: {{ $.Values.plugins.ociInstaller.registryAuthSecret.name }}
+            defaultMode: 0440
+            items:
+              {{- if $.Values.plugins.ociInstaller.registryAuthSecret.bearerTokenKey }}
+              - key: {{ $.Values.plugins.ociInstaller.registryAuthSecret.bearerTokenKey | quote }}
+                path: bearer-token
+              {{- else }}
+              - key: {{ $.Values.plugins.ociInstaller.registryAuthSecret.usernameKey | quote }}
+                path: username
+              - key: {{ $.Values.plugins.ociInstaller.registryAuthSecret.passwordKey | quote }}
+                path: password
+              {{- end }}
+        {{- end }}
+        {{- end }}
       {{- end }}
       {{- with $.Values.nodeSelector }}
       nodeSelector:
