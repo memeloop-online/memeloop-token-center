@@ -16,35 +16,39 @@ spec:
     spec:
       restartPolicy: Never
       automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: REPLACE_IMAGE_PULL_SECRET
       nodeSelector:
         kubernetes.io/hostname: haixia
       securityContext:
         seccompProfile:
           type: RuntimeDefault
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: importer
           image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center-importer@sha256:REPLACE_DIGEST
           imagePullPolicy: IfNotPresent
           env:
             - name: PGHOST
-              value: memeloop-token-center-pg-rw.memeloop-token-center-dev.svc.cluster.local
+              value: REPLACE_TARGET_POSTGRES_HOST
             - name: PGPORT
               value: "5432"
             - name: PGUSER
               value: token_center
-            - name: PGPASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: memeloop-token-center-cpamp-import
-                  key: database-password
             - name: PGDATABASE
-              value: memeloop_token_center_dogfood
+              value: REPLACE_TARGET_DATABASE
+            - name: PGPASSFILE
+              value: /secrets/database/pgpass
             - name: CPAMP_SQLITE_PATH
               value: /source/usage.sqlite
             - name: IMPORT_TENANT_EXTERNAL_ID
               value: cpa-dogfood-import
             - name: CPAMP_OVERLAP_MS
               value: "86400000"
+            - name: CPAMP_IMPORT_SOURCE
+              value: REPLACE_CPAMP_IMPORT_SOURCE
             - name: CPAMP_RESET_IMPORT
               value: "false"
           resources:
@@ -62,12 +66,22 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
+            - name: database-credentials
+              mountPath: /secrets/database
+              readOnly: true
             - name: source
               mountPath: /source
               readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: database-credentials
+          secret:
+            secretName: REPLACE_DATABASE_PGPASS_SECRET
+            defaultMode: 0440
+            items:
+              - key: pgpass
+                path: pgpass
         - name: source
           persistentVolumeClaim:
             claimName: cpa-manager-plus-data

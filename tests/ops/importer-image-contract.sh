@@ -173,11 +173,14 @@ job="$repository/ops/kubernetes/legacy-credential-import-job.yaml"
 grep -Fq 'image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center-importer@sha256:REPLACE_DIGEST' "$job"
 grep -Fq 'command: ["/usr/local/bin/attach-legacy-cpa-credentials"]' "$job"
 grep -Fq 'automountServiceAccountToken: false' "$job"
+grep -A1 -F 'imagePullSecrets:' "$job" | grep -Fq 'name: REPLACE_IMAGE_PULL_SECRET'
 grep -Fq 'readOnlyRootFilesystem: true' "$job"
 grep -Fq 'allowPrivilegeEscalation: false' "$job"
 grep -Fq 'fsGroup: 10001' "$job"
 grep -Fq 'runAsUser: 10001' "$job"
 grep -Fq 'name: PGPASSFILE' "$job"
+grep -A1 -F 'name: PGHOST' "$job" | grep -Fq 'value: REPLACE_TARGET_POSTGRES_HOST'
+grep -A1 -F 'name: PGDATABASE' "$job" | grep -Fq 'value: REPLACE_TARGET_DATABASE'
 if grep -Eq '^[[:space:]]*-[[:space:]]*--apply[[:space:]]*$' "$job"; then
   echo 'checked-in legacy credential Job must remain a dry-run' >&2
   exit 1
@@ -190,12 +193,26 @@ fi
 cpamp_job="$repository/ops/kubernetes/cpamp-import-job.yaml"
 grep -Fq 'image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center-importer@sha256:REPLACE_DIGEST' "$cpamp_job"
 grep -Fq 'automountServiceAccountToken: false' "$cpamp_job"
+grep -A1 -F 'imagePullSecrets:' "$cpamp_job" | grep -Fq 'name: REPLACE_IMAGE_PULL_SECRET'
 grep -Fq 'readOnlyRootFilesystem: true' "$cpamp_job"
 grep -Fq 'allowPrivilegeEscalation: false' "$cpamp_job"
 grep -Fq 'runAsUser: 10001' "$cpamp_job"
+grep -Fq 'fsGroup: 10001' "$cpamp_job"
 grep -Fq 'readOnly: true' "$cpamp_job"
+grep -Fq 'name: PGPASSFILE' "$cpamp_job"
 grep -Fq 'name: CPAMP_RESET_IMPORT' "$cpamp_job"
 grep -A1 -F 'name: CPAMP_RESET_IMPORT' "$cpamp_job" | grep -Fq 'value: "false"'
+grep -A1 -F 'name: PGHOST' "$cpamp_job" | grep -Fq 'value: REPLACE_TARGET_POSTGRES_HOST'
+grep -A1 -F 'name: PGDATABASE' "$cpamp_job" | grep -Fq 'value: REPLACE_TARGET_DATABASE'
+grep -A1 -F 'name: CPAMP_IMPORT_SOURCE' "$cpamp_job" | grep -Fq 'value: REPLACE_CPAMP_IMPORT_SOURCE'
+if grep -Fq 'memeloop_token_center_dogfood' "$job" "$cpamp_job"; then
+  echo 'checked-in import Jobs must not pin the retired dogfood database name' >&2
+  exit 1
+fi
+if grep -Eq '^[[:space:]]*-[[:space:]]*name:[[:space:]]*PGPASSWORD[[:space:]]*$' "$job" "$cpamp_job"; then
+  echo 'database passwords must not be exposed through import Job environments' >&2
+  exit 1
+fi
 if grep -Eq 'image:[[:space:]]+[^[:space:]]+@sha256:[0-9a-f]{64}' "$cpamp_job"; then
   echo 'checked-in CPAMP Job must use a release-time digest placeholder' >&2
   exit 1

@@ -205,7 +205,10 @@ probes:
   readiness:
     path: /readyz
     periodSeconds: 5
-    timeoutSeconds: 1
+    # The application gives each parallel PostgreSQL/S3 dependency check two
+    # seconds. Kubernetes must allow that bounded check to finish before it
+    # classifies the Pod as unready.
+    timeoutSeconds: 3
     failureThreshold: 3
   liveness:
     path: /livez

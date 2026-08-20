@@ -251,7 +251,16 @@
       "required": ["startup", "readiness", "liveness"],
       "properties": {
         "startup": { "$ref": "#/definitions/probe" },
-        "readiness": { "$ref": "#/definitions/probe" },
+        "readiness": {
+          "allOf": [
+            { "$ref": "#/definitions/probe" },
+            {
+              "properties": {
+                "timeoutSeconds": { "minimum": 3 }
+              }
+            }
+          ]
+        },
         "liveness": { "$ref": "#/definitions/probe" }
       }
     },

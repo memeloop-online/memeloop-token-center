@@ -10,6 +10,7 @@ test "$(grep -c 'namespace: memeloop-token-center-dev' "$job")" -eq 3
 grep -Fq 'image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center@sha256:REPLACE_DIGEST' "$job"
 grep -Fq 'command: ["/usr/local/bin/import-cpa-session-archive"]' "$job"
 grep -Fq 'automountServiceAccountToken: false' "$job"
+grep -A1 -F 'imagePullSecrets:' "$job" | grep -Fq 'name: REPLACE_IMAGE_PULL_SECRET'
 grep -Fq 'readOnlyRootFilesystem: true' "$job"
 grep -Fq 'allowPrivilegeEscalation: false' "$job"
 grep -Fq 'runAsNonRoot: true' "$job"
@@ -36,6 +37,9 @@ test "$(grep -c 'kubernetes.io/metadata.name: memeloop-token-center-dev' "$job")
 grep -Fq 'cnpg.io/cluster: memeloop-token-center-pg' "$job"
 grep -Fq 'app.kubernetes.io/name: minio' "$job"
 grep -Fq 'value: http://minio.memeloop-token-center-dev.svc.cluster.local:9000' "$job"
+grep -A1 -F 'name: MTC_S3_BUCKET' "$job" | grep -Fq 'value: REPLACE_TARGET_S3_BUCKET'
+grep -A1 -F -- '- --cpamp-source' "$job" | grep -Fq -- '- REPLACE_CPAMP_IMPORT_SOURCE'
+grep -A1 -F -- '- --archive-source' "$job" | grep -Fq -- '- REPLACE_ARCHIVE_IMPORT_SOURCE'
 grep -A1 -F 'name: MTC_S3_ALLOW_HTTP' "$job" | grep -Fq 'value: "true"'
 grep -Fq -- '- Ingress' "$job"
 grep -Fq -- '- Egress' "$job"
@@ -46,6 +50,11 @@ if grep -Eq 'name: MTC_(KEY_PEPPER|SERVICE_TOKEN)' "$job"; then
 fi
 if grep -Fq '0.0.0.0/0' "$job"; then
   echo "session archive Job must not allow unrestricted egress" >&2
+  exit 1
+fi
+
+if grep -Eq 'memeloop-token-center-dogfood|cpa-session-archive-v[0-9]+' "$job"; then
+  echo "session archive Job must not pin a retired bucket or checkpoint source" >&2
   exit 1
 fi
 

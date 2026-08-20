@@ -102,6 +102,7 @@ fi
 grep -q 'configMap:' "$workspace/configmap-plugin.yaml"
 grep -q 'persistentVolumeClaim:' "$workspace/pvc-plugin.yaml"
 test "$(grep -c 'name: MTC_RUN_MIGRATIONS_ON_START' "$workspace/default.yaml")" -eq 3
+test "$(grep -A4 -F 'readinessProbe:' "$workspace/default.yaml" | grep -c 'timeoutSeconds: 3')" -eq 3
 grep -Fq 'args: ["migrate"]' "$workspace/default.yaml"
 grep -Fq 'restartPolicy: Never' "$workspace/migration-pull-secret.yaml"
 grep -A2 -F 'imagePullSecrets:' "$workspace/migration-pull-secret.yaml" \
@@ -202,6 +203,8 @@ assert_invalid memory-archive \
   --set config.archiveBackend=memory
 assert_invalid malformed-image-digest \
   --set-string image.digest=sha256:abc123
+assert_invalid readiness-timeout-shorter-than-dependency-check \
+  --set probes.readiness.timeoutSeconds=2
 assert_invalid uppercase-image-digest \
   --set-string image.digest=sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 assert_invalid plugin-without-source \
