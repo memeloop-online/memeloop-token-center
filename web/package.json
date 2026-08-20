@@ -7,7 +7,8 @@
     "build": "tsc -b && vite build",
     "dev": "vite --host 0.0.0.0",
     "test:e2e": "cucumber-js",
-    "test:localization": "node --import tsx --test e2e/*-contract.test.ts",
+    "test:e2e:live:readonly": "cucumber-js --config cucumber.live.mjs",
+    "test:localization": "node --import tsx --test e2e/*-contract.test.ts e2e/live/*-contract.test.ts",
     "typecheck": "tsc -b --pretty false && tsc -p e2e/tsconfig.json --pretty false"
   },
   "dependencies": {

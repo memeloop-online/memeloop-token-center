@@ -1,0 +1,72 @@
+import assert from 'node:assert/strict';
+import { chromium, type Browser } from 'playwright';
+import { readCredentialFile } from '../security.js';
+
+interface LiveConfiguration {
+  controlURL: URL;
+  gatewayURL: URL;
+  serviceCredential: string;
+  clientCredential: string;
+  expectedKeyId: string;
+}
+
+class LiveRuntime {
+  private browser?: Browser;
+  private configuration?: LiveConfiguration;
+
+  async start(): Promise<void> {
+    assert.equal(this.browser, undefined, 'live browser runtime must start only once');
+    const controlURL = requiredURL('MTC_LIVE_CONTROL_URL');
+    const gatewayURL = requiredURL('MTC_LIVE_GATEWAY_URL');
+    const service = await readCredentialFile(requiredEnvironment('MTC_LIVE_SERVICE_CREDENTIAL_FILE'));
+    const client = await readCredentialFile(requiredEnvironment('MTC_LIVE_CLIENT_CREDENTIAL_FILE'));
+    const environmentKeyId = process.env.MTC_LIVE_EXPECTED_KEY_ID?.trim();
+    if (environmentKeyId && client.expectedKeyId) {
+      assert.equal(environmentKeyId, client.expectedKeyId, 'configured stable key IDs do not match');
+    }
+    const expectedKeyId = environmentKeyId || client.expectedKeyId;
+    assert.ok(expectedKeyId, 'MTC_LIVE_EXPECTED_KEY_ID or key_id in the client credential file is required');
+    this.configuration = {
+      controlURL,
+      gatewayURL,
+      serviceCredential: service.credential,
+      clientCredential: client.credential,
+      expectedKeyId,
+    };
+    this.browser = await chromium.launch({ headless: true });
+  }
+
+  async stop(): Promise<void> {
+    const browser = this.browser;
+    this.browser = undefined;
+    this.configuration = undefined;
+    await browser?.close();
+  }
+
+  requireBrowser(): Browser {
+    assert.ok(this.browser, 'live browser runtime is not initialized');
+    return this.browser;
+  }
+
+  requireConfiguration(): LiveConfiguration {
+    assert.ok(this.configuration, 'live configuration is not initialized');
+    return this.configuration;
+  }
+}
+
+function requiredEnvironment(name: string): string {
+  const value = process.env[name]?.trim();
+  assert.ok(value, `${name} is required for live read-only acceptance`);
+  return value;
+}
+
+function requiredURL(name: string): URL {
+  const url = new URL(requiredEnvironment(name));
+  assert.ok(['http:', 'https:'].includes(url.protocol), `${name} must use HTTP or HTTPS`);
+  assert.equal(url.username, '', `${name} must not contain credentials`);
+  assert.equal(url.password, '', `${name} must not contain credentials`);
+  assert.equal(url.hash, '', `${name} must not contain a fragment`);
+  return url;
+}
+
+export const liveRuntime = new LiveRuntime();
