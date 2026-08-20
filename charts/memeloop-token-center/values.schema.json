@@ -256,7 +256,7 @@
             { "$ref": "#/definitions/probe" },
             {
               "properties": {
-                "timeoutSeconds": { "minimum": 3 }
+                "timeoutSeconds": { "minimum": 7 }
               }
             }
           ]

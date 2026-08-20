@@ -1,5 +1,11 @@
 use super::*;
 
+// The archive check has its own five-second deadline. Keep one second of
+// headroom here so it can return a deliberate failure instead of being
+// cancelled by the dependency aggregator first. The Helm probe adds one
+// further second around this handler.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(6);
+
 pub(super) async fn liveness() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
@@ -18,7 +24,6 @@ pub(super) async fn deprecated_health() -> Response {
 }
 
 pub(super) async fn readiness(State(state): State<AppState>) -> Response {
-    const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
     let database = state.db.clone();
     let archive = state.archive.clone();
     let (database_ready, archive_ready) = state
@@ -61,6 +66,16 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependency_readiness_checks_have_a_bounded_six_second_deadline() {
+        assert_eq!(CHECK_TIMEOUT, Duration::from_secs(6));
+    }
 }
 
 pub(super) async fn prometheus_metrics(

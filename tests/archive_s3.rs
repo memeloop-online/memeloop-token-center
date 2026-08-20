@@ -274,10 +274,15 @@ async fn minio_outage_is_bounded_and_http_error_does_not_leak_storage_details() 
         .await
         .expect("construct unavailable archive store");
 
-    let error = tokio::time::timeout(Duration::from_secs(20), store.readiness_check())
+    let started = tokio::time::Instant::now();
+    let error = tokio::time::timeout(Duration::from_secs(6), store.readiness_check())
         .await
         .expect("S3 outage must be reported within the readiness deadline")
         .expect_err("unavailable S3 endpoint must fail");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "S3 outage must fail before the outer dependency deadline"
+    );
     let response = error.into_response();
     assert_eq!(
         response.status(),

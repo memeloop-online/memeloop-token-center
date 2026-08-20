@@ -8,7 +8,11 @@ use crate::error::AppError;
 
 const READINESS_SUCCESS_TTL: Duration = Duration::from_secs(5 * 60);
 const READINESS_FAILURE_TTL: Duration = Duration::from_secs(10);
-const READINESS_DEADLINE: Duration = Duration::from_millis(1_500);
+// A cross-node S3/MinIO canary performs list, put, get and delete operations.
+// Give that bounded sequence enough time to survive ordinary network jitter,
+// while still failing a genuine storage outage before the outer readiness and
+// Kubernetes probe deadlines.
+const READINESS_DEADLINE: Duration = Duration::from_secs(5);
 const READINESS_CANARY: &[u8] = b"memeloop-token-center/archive-readiness/v1";
 
 impl ArchiveStore {
@@ -76,5 +80,15 @@ impl ArchiveStore {
         cache.checked_at = Some(tokio::time::Instant::now());
         cache.healthy = check.is_ok();
         check.map_err(|_| AppError::Storage("archive readiness canary failed".to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_readiness_canary_has_a_bounded_five_second_deadline() {
+        assert_eq!(READINESS_DEADLINE, Duration::from_secs(5));
     }
 }
