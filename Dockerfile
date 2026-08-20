@@ -27,6 +27,7 @@ RUN mkdir -p /usr/local/cargo \
 WORKDIR /build
 COPY .cargo/config.toml /build/.cargo/config.toml
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 RUN mkdir -p src tests \
     && printf 'pub fn dependency_cache_marker() {}\n' > src/lib.rs \
     && printf 'fn main() {}\n' > src/main.rs \

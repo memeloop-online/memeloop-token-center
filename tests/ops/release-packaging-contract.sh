@@ -16,15 +16,21 @@ test ! -e "$repository/.forgejo/workflows/build.yaml"
 grep -Fq 'ARG NODE_IMAGE=node:24.18.0-bookworm-slim' "$dockerfile"
 grep -Fq 'ARG RUST_IMAGE=rust:1.95.0-bookworm' "$dockerfile"
 grep -Fq 'COPY .cargo/config.toml /build/.cargo/config.toml' "$dockerfile"
+grep -Fq 'COPY vendor ./vendor' "$dockerfile"
 grep -Fq \
   'JEMALLOC_SYS_WITH_MALLOC_CONF = { value = "abort_conf:true,background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0", force = true }' \
   "$cargo_config"
 
 config_copy_line=$(grep -n -F 'COPY .cargo/config.toml /build/.cargo/config.toml' "$dockerfile" \
   | cut -d: -f1)
+vendor_copy_line=$(grep -n -F 'COPY vendor ./vendor' "$dockerfile" | cut -d: -f1)
 first_cargo_build_line=$(grep -n -F 'cargo build --locked' "$dockerfile" | head -n 1 | cut -d: -f1)
 if [ "$config_copy_line" -ge "$first_cargo_build_line" ]; then
   echo '.cargo/config.toml must enter the Docker builder before dependency compilation' >&2
+  exit 1
+fi
+if [ "$vendor_copy_line" -ge "$first_cargo_build_line" ]; then
+  echo 'vendored path dependencies must enter the Docker builder before dependency compilation' >&2
   exit 1
 fi
 grep -Fq \
