@@ -53,6 +53,34 @@ fn buffered_usage_capture_only_accepts_plausible_json_content_types() {
 }
 
 #[test]
+fn trusted_input_overhead_is_http_json_only_and_defaults_to_zero() {
+    assert_eq!(
+        trusted_input_token_overhead_ceiling(
+            Some("http-json"),
+            Some(&json!({"base_url": "https://example.com"})),
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        trusted_input_token_overhead_ceiling(
+            Some(codex_transport::DRIVER),
+            Some(&json!({"input_token_overhead_ceiling": 1_000_000})),
+        )
+        .unwrap(),
+        0,
+        "direct Codex transport must not double-count compatible-upstream overhead"
+    );
+    assert!(
+        trusted_input_token_overhead_ceiling(
+            Some("http-json"),
+            Some(&json!({"input_token_overhead_ceiling": 1_000_001})),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn json_and_sse_usage_parsing_contracts_are_preserved() {
     let json_body = br#"{"usage":{"input_tokens":12,"output_tokens":34}}"#;
     let ExtractedUsage::Valid(json_usage) = extract_usage_checked(json_body) else {
@@ -192,6 +220,115 @@ async fn codex_route_fixture(label: &str) -> CodexRouteFixture {
     }
 }
 
+async fn compatibility_bridge_fixture(
+    label: &str,
+    upstream: &MockServer,
+    input_token_overhead_ceiling: i64,
+) -> CodexRouteFixture {
+    let directory = tempfile::tempdir().unwrap();
+    let archive_path = directory.path().join("archive");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join(format!("compatibility-{label}.db"))
+            .display()
+    );
+    let mut config = Config::for_test(database_url.clone());
+    config.archive_backend = ArchiveBackend::Filesystem;
+    config.archive_path = Some(archive_path.display().to_string());
+    let state = AppState::initialize(config).await.unwrap();
+    let tenant = format!("compatibility-route-{label}");
+    let model = "gpt-5.6-sol".to_owned();
+    let issued = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: tenant.clone(),
+                principal_external_id: "member".to_owned(),
+                alias: format!("compatibility-{label}"),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    allowed_models: vec![model.clone()],
+                    max_concurrency: 4,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let upstream_account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.clone(),
+                name: format!("compatibility-{label}"),
+                driver: "http-json".to_owned(),
+                config: json!({
+                    "base_url": upstream.uri(),
+                    "network_scope": "public",
+                    "input_token_overhead_ceiling": input_token_overhead_ceiling
+                }),
+                credential: UpstreamCredential::ApiKey {
+                    value: "compatibility-upstream-secret".to_owned(),
+                    header: "authorization".to_owned(),
+                    prefix: "Bearer ".to_owned(),
+                },
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant,
+            public_model: model.clone(),
+            upstream_account_id: upstream_account.id,
+            upstream_model: model.clone(),
+            protocol: "openai".to_owned(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    state
+        .db
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    CodexRouteFixture {
+        state,
+        database_url,
+        archive_path,
+        key: issued.key,
+        key_id: issued.key_id,
+        upstream_account_id: upstream_account.id,
+        route_id: route.id,
+        model: model.clone(),
+        upstream_model: model,
+        _directory: directory,
+    }
+}
+
+async fn send_compatibility_bridge(fixture: &CodexRouteFixture, body: &Value) -> Response {
+    router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
 fn archive_file_count(root: &std::path::Path) -> usize {
     std::fs::read_dir(root)
         .map(|entries| {
@@ -256,13 +393,14 @@ async fn wait_for_request_settlement(fixture: &CodexRouteFixture, expected: usiz
 async fn assert_exactly_once_side_effects(
     fixture: &CodexRouteFixture,
     request_id: Uuid,
-    has_response_id: bool,
+    expected_response_id: Option<&str>,
 ) {
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let row = sqlx::query(
-        "SELECT q.upstream_account_id, q.model_route_id, r.status AS reservation_status, (SELECT COUNT(*) FROM usage_reservations x WHERE x.id = q.reservation_id) AS reservation_count, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = q.id) AS fact_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS event_count, (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id) AS observation_count, (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id AND o.upstream_response_id = 'resp-codex') AS response_observation_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1",
+        "SELECT q.upstream_account_id, q.model_route_id, r.status AS reservation_status, (SELECT COUNT(*) FROM usage_reservations x WHERE x.id = q.reservation_id) AS reservation_count, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = q.id) AS fact_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS event_count, (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id) AS observation_count, (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id AND o.upstream_response_id = $2) AS response_observation_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1",
     )
     .bind(request_id.to_string())
+    .bind(expected_response_id.unwrap_or(""))
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -286,7 +424,7 @@ async fn assert_exactly_once_side_effects(
     }
     assert_eq!(
         row.get::<i64, _>("response_observation_count"),
-        i64::from(has_response_id)
+        i64::from(expected_response_id.is_some())
     );
     pool.close().await;
 }
@@ -532,7 +670,7 @@ async fn codex_buffered_route_rewrites_wire_and_archives_final_json_once() {
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, true).await;
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     let refs = fixture
         .state
         .db
@@ -616,7 +754,7 @@ async fn codex_streaming_route_preserves_sse_and_settles_usage_once() {
         .unwrap();
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, true).await;
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     let refs = fixture
         .state
         .db
@@ -695,7 +833,7 @@ async fn codex_streaming_failure_is_redacted_for_client_and_archive() {
         rows[0].error_code.as_deref(),
         Some("upstream_failed_response")
     );
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, false).await;
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     let refs = fixture
         .state
         .db
@@ -759,7 +897,235 @@ async fn codex_streaming_output_then_failure_charges_the_contract_ceiling_once()
     assert!(rows[0].input_tokens > 0);
     assert_eq!(rows[0].output_tokens, 64);
     assert_ne!(rows[0].cost, "0");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, false).await;
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+fn real_cpa_completed_response(input_tokens: i64, output_tokens: i64) -> Value {
+    json!({
+        "id": "resp-cpa-compatibility",
+        "object": "response",
+        "status": "completed",
+        "error": null,
+        "incomplete_details": null,
+        "output": [{
+            "id": "msg-cpa-compatibility",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "cutover-ok", "annotations": []}]
+        }],
+        "usage": {
+            "input_tokens": input_tokens,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": output_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": input_tokens + output_tokens
+        }
+    })
+}
+
+#[tokio::test]
+async fn compatibility_bridge_buffered_usage_uses_trusted_overhead_and_settles_http_200() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(real_cpa_completed_response(309, 7)))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = compatibility_bridge_fixture("buffered-real-cpa", &upstream, 256).await;
+    let request = json!({
+        "model": fixture.model,
+        "input": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "stream": false,
+        "max_output_tokens": 16
+    });
+    assert_eq!(serde_json::to_vec(&request).unwrap().len(), 98);
+    let response = send_compatibility_bridge(&fixture, &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        real_cpa_completed_response(309, 7)
+    );
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (309, 7));
+    assert_eq!(rows[0].error_code, None);
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-cpa-compatibility"))
+        .await;
+}
+
+#[tokio::test]
+async fn compatibility_bridge_buffered_usage_still_rejects_usage_above_total_reservation() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(real_cpa_completed_response(400, 7)))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = compatibility_bridge_fixture("buffered-over-reservation", &upstream, 256).await;
+    let request = json!({
+        "model": fixture.model,
+        "input": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "stream": false,
+        "max_output_tokens": 16
+    });
+    assert_eq!(serde_json::to_vec(&request).unwrap().len(), 98);
+    let response = send_compatibility_bridge(&fixture, &request).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_invalid_usage")
+    );
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+}
+
+#[tokio::test]
+async fn compatibility_bridge_buffered_failed_response_is_redacted_and_settled_as_502() {
+    let upstream = MockServer::start().await;
+    let mut failed = real_cpa_completed_response(309, 7);
+    failed["status"] = json!("failed");
+    failed["error"] = json!({"message": "provider-secret", "token": "secret-token"});
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(failed))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = compatibility_bridge_fixture("buffered-failure", &upstream, 256).await;
+    let request = json!({
+        "model": fixture.model,
+        "input": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "stream": false,
+        "max_output_tokens": 16
+    });
+    let response = send_compatibility_bridge(&fixture, &request).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let rendered = String::from_utf8(body.to_vec()).unwrap();
+    assert!(rendered.contains("upstream request failed"));
+    assert!(!rendered.contains("provider-secret"));
+    assert!(!rendered.contains("secret-token"));
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_failed_response")
+    );
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+}
+
+#[tokio::test]
+async fn compatibility_bridge_streaming_error_null_completes_and_non_null_error_fails() {
+    for (label, input_tokens, response_error, expected_status, expected_error) in [
+        ("stream-null-error", 309, Value::Null, 200, None),
+        (
+            "stream-non-null-error",
+            309,
+            json!({"message": "provider-secret"}),
+            502,
+            Some("upstream_failed_response"),
+        ),
+        (
+            "stream-over-reservation",
+            400,
+            Value::Null,
+            502,
+            Some("upstream_invalid_usage"),
+        ),
+    ] {
+        let upstream = MockServer::start().await;
+        let completed = real_cpa_completed_response(input_tokens, 7);
+        let response_error_is_null = response_error.is_null();
+        let sse = format!(
+            concat!(
+                "event: response.created\n",
+                "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-cpa-compatibility\",\"error\":null}}}}\n\n",
+                "event: response.completed\n",
+                "data: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            completed = {
+                let mut value = completed;
+                value["error"] = response_error;
+                value
+            }
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let fixture = compatibility_bridge_fixture(label, &upstream, 256).await;
+        let request = json!({
+            "model": fixture.model,
+            "input": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "stream": true,
+            "max_output_tokens": 16
+        });
+        let response = send_compatibility_bridge(&fixture, &request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8(body.to_vec()).unwrap();
+        assert!(rendered.contains("response.created"));
+        if response_error_is_null {
+            assert!(rendered.contains("response.completed"));
+            assert!(rendered.contains("\"error\":null"));
+        } else {
+            assert!(rendered.contains("upstream request failed"));
+            assert!(!rendered.contains("provider-secret"));
+        }
+        wait_for_request_settlement(&fixture, 1).await;
+        let rows = fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].status_code, Some(expected_status));
+        assert_eq!(rows[0].error_code.as_deref(), expected_error);
+        if expected_status == 200 {
+            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (309, 7));
+        }
+    }
+}
+
+#[test]
+fn responses_sse_requires_terminal_event_and_payload_to_match() {
+    let mut capture = ResponsesSseCapture::for_responses();
+    capture.push(
+        b"event: response.failed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-mismatch\",\"error\":null}}\n\n",
+    );
+    assert_eq!(capture.finish(), ResponsesSseOutcome::Failed);
 }
 
 #[test]

@@ -457,6 +457,14 @@ impl ProviderCatalog {
                     "description": "Private destinations require a global operator credential."
                 },
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "default": 120},
+                "input_token_overhead_ceiling": {
+                    "title": "Input token overhead ceiling",
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000000,
+                    "default": 0,
+                    "description": "Trusted reservation allowance for input tokens added by a compatible upstream outside the forwarded request body."
+                },
                 "image_api_mode": {
                     "title": "Image generation API",
                     "type": "string",
@@ -1336,6 +1344,49 @@ mod tests {
                 .managed_oauth_adapter_for_driver("cpa-gemini-oauth-legacy")
                 .unwrap()
                 .can_refresh()
+        );
+    }
+
+    #[test]
+    fn builtin_http_json_optionally_bounds_trusted_input_token_overhead() {
+        let catalog = ProviderCatalog::builtins();
+        let http_json = catalog.get("http-json").unwrap();
+        let overhead = http_json
+            .config_schema
+            .pointer("/properties/input_token_overhead_ceiling")
+            .unwrap();
+        assert_eq!(overhead.get("minimum"), Some(&json!(0)));
+        assert_eq!(overhead.get("maximum"), Some(&json!(1_000_000)));
+        assert_eq!(overhead.get("default"), Some(&json!(0)));
+        assert!(
+            http_json
+                .config_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| !required.contains(&json!("input_token_overhead_ceiling")))
+        );
+        crate::schema::validate_instance(
+            &http_json.config_schema,
+            &json!({"base_url": "https://example.com"}),
+        )
+        .unwrap();
+        crate::schema::validate_instance(
+            &http_json.config_schema,
+            &json!({
+                "base_url": "https://example.com",
+                "input_token_overhead_ceiling": 256
+            }),
+        )
+        .unwrap();
+        assert!(
+            crate::schema::validate_instance(
+                &http_json.config_schema,
+                &json!({
+                    "base_url": "https://example.com",
+                    "input_token_overhead_ceiling": 1_000_001
+                }),
+            )
+            .is_err()
         );
     }
 }

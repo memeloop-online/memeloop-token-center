@@ -7,6 +7,7 @@ mod codex_transport;
 mod tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
+const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
 
 pub(super) async fn proxy(
     state: AppState,
@@ -182,7 +183,7 @@ pub(super) async fn proxy(
         None
     };
     let price = state.db.model_price(&model, &key.currency).await?;
-    let input_token_ceiling = i64::try_from(
+    let request_body_ceiling = i64::try_from(
         body.len().max(forwarded_body.len()).max(
             component_request
                 .as_ref()
@@ -191,6 +192,17 @@ pub(super) async fn proxy(
         ),
     )
     .unwrap_or(i64::MAX);
+    let input_token_ceiling = request_body_ceiling
+        .checked_add(trusted_input_token_overhead_ceiling(
+            route_driver.as_deref(),
+            route_config.as_ref(),
+        )?)
+        .filter(|ceiling| *ceiling <= MAX_REPORTED_TOKENS)
+        .ok_or_else(|| {
+            AppError::Upstream(
+                "upstream input token reservation is outside the supported range".into(),
+            )
+        })?;
     let requested_service_tier = match forwarded_json.get("service_tier") {
         None => None,
         Some(Value::String(tier)) if is_supported_service_tier(tier) => Some(tier.clone()),
@@ -525,6 +537,52 @@ pub(super) async fn proxy(
             .and_then(|value| value.split(';').next())
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
     let capture_json_usage = should_capture_buffered_usage(is_sse, content_type.as_ref());
+    if !is_sse && !bridge_stream {
+        let response_content_type = content_type
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/json")
+            .to_owned();
+        let response_body = match read_bounded_upstream(upstream, MAX_PROXY_RESPONSE_BODY).await {
+            Ok(body) => Bytes::from(body),
+            Err(error) => {
+                return finish_proxy_failure(&buffered_request, error.code()).await;
+            }
+        };
+        if matches!(protocol, Protocol::OpenAiResponses)
+            && let Err(error_code) = validate_buffered_responses_success(&response_body)
+        {
+            return finish_proxy_failure(&buffered_request, error_code).await;
+        }
+        let usage = if capture_json_usage {
+            match extract_usage_checked(&response_body) {
+                ExtractedUsage::Valid(usage) => usage,
+                ExtractedUsage::Missing => TokenUsage {
+                    input_tokens: input_token_ceiling,
+                    output_tokens: output_token_ceiling,
+                    ..TokenUsage::default()
+                },
+                ExtractedUsage::Invalid => {
+                    return finish_proxy_failure(&buffered_request, "upstream_invalid_usage").await;
+                }
+            }
+        } else {
+            TokenUsage {
+                input_tokens: input_token_ceiling,
+                output_tokens: output_token_ceiling,
+                ..TokenUsage::default()
+            }
+        };
+        return finish_buffered_request(
+            &buffered_request,
+            status,
+            response_body,
+            &response_content_type,
+            usage,
+            None,
+        )
+        .await;
+    }
     let mut response_archive_attempt =
         match begin_proxy_archive_attempt(&state.db, request_id, ArchiveStagingPurpose::Response)
             .await
@@ -567,14 +625,15 @@ pub(super) async fn proxy(
         let mut response_archive_attempt = response_archive_attempt;
         let mut usage_capture = Vec::new();
         let mut sse_capture = is_sse.then(|| {
-            if is_codex_route {
-                ResponsesSseCapture::for_codex()
+            if matches!(protocol, Protocol::OpenAiResponses) {
+                ResponsesSseCapture::for_responses()
             } else {
                 ResponsesSseCapture::default()
             }
         });
-        let mut codex_streaming_sanitizer =
-            is_codex_route.then(codex_transport::CodexStreamingSanitizer::default);
+        let mut responses_streaming_sanitizer = (is_sse
+            && matches!(protocol, Protocol::OpenAiResponses))
+        .then(codex_transport::ResponsesStreamingSanitizer::default);
         let mut transport_error: Option<&'static str> = None;
         let mut response_bytes = 0_usize;
         let mut delivered_any = false;
@@ -634,7 +693,7 @@ pub(super) async fn proxy(
                 }
             };
             let Some(next) = next else {
-                if codex_streaming_sanitizer
+                if responses_streaming_sanitizer
                     .as_ref()
                     .is_some_and(|sanitizer| !sanitizer.is_complete())
                 {
@@ -660,7 +719,7 @@ pub(super) async fn proxy(
                         break;
                     }
                     let (chunk, chunk_billable) =
-                        if let Some(sanitizer) = codex_streaming_sanitizer.as_mut() {
+                        if let Some(sanitizer) = responses_streaming_sanitizer.as_mut() {
                             match sanitizer.push(&raw_chunk) {
                                 Ok(chunk) => {
                                     let billable = sanitizer.last_push_billable();
@@ -1009,6 +1068,45 @@ fn record_delivered_chunk(
     *delivered_billable |= chunk_billable;
 }
 
+fn trusted_input_token_overhead_ceiling(
+    route_driver: Option<&str>,
+    route_config: Option<&Value>,
+) -> Result<i64, AppError> {
+    if route_driver != Some("http-json") {
+        return Ok(0);
+    }
+    let Some(value) = route_config.and_then(|config| config.get("input_token_overhead_ceiling"))
+    else {
+        return Ok(0);
+    };
+    value
+        .as_i64()
+        .filter(|ceiling| (0..=MAX_INPUT_TOKEN_OVERHEAD_CEILING).contains(ceiling))
+        .ok_or_else(|| {
+            AppError::Upstream("HTTP JSON upstream input token overhead ceiling is invalid".into())
+        })
+}
+
+fn validate_buffered_responses_success(body: &[u8]) -> Result<(), &'static str> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| "upstream_invalid_response")?;
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Err("upstream_failed_response");
+    }
+    match value.get("status") {
+        None => Ok(()),
+        Some(Value::String(status)) if status == "completed" => Ok(()),
+        Some(Value::String(status))
+            if matches!(status.as_str(), "failed" | "incomplete" | "cancelled") =>
+        {
+            Err("upstream_failed_response")
+        }
+        Some(Value::String(status)) if matches!(status.as_str(), "queued" | "in_progress") => {
+            Err("upstream_incomplete_response")
+        }
+        Some(_) => Err("upstream_invalid_response"),
+    }
+}
+
 #[derive(Clone)]
 struct ProxyConversation {
     key: AuthenticatedKey,
@@ -1146,10 +1244,9 @@ async fn execute_component_provider(
     };
     let upstream_body = match read_bounded_upstream(upstream, maximum).await {
         Ok(body) => body,
-        Err(_) => {
+        Err(error) => {
             tracing::warn!(request_id = %request.request_id, stage = "component_response", "component provider request failed");
-            return finish_component_provider_failure(&request, "upstream_response_too_large")
-                .await;
+            return finish_component_provider_failure(&request, error.code()).await;
         }
     };
     let normalized = match normalize_component_provider(
@@ -1281,7 +1378,7 @@ async fn finish_subscription_bridge_response(
     }
     let raw = match read_bounded_upstream(upstream, MAX_SUBSCRIPTION_BRIDGE_RESPONSE).await {
         Ok(raw) => raw,
-        Err(_) => {
+        Err(error) => {
             tracing::warn!(%request_id, stage = "bridge_response", "subscription bridge response failed");
             return finish_buffered_request(
                 &request,
@@ -1291,7 +1388,7 @@ async fn finish_subscription_bridge_response(
                 ),
                 "application/json",
                 TokenUsage::default(),
-                Some("upstream_stream".to_owned()),
+                Some(error.code().to_owned()),
             )
             .await;
         }
@@ -1504,24 +1601,39 @@ async fn finish_buffered_request(
         .map_err(|_| AppError::Internal)
 }
 
+#[derive(Clone, Copy)]
+enum BoundedUpstreamError {
+    ResponseTooLarge,
+    Stream,
+}
+
+impl BoundedUpstreamError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::ResponseTooLarge => "upstream_response_too_large",
+            Self::Stream => "upstream_stream",
+        }
+    }
+}
+
 async fn read_bounded_upstream(
     response: reqwest::Response,
     maximum: usize,
-) -> Result<Vec<u8>, AppError> {
+) -> Result<Vec<u8>, BoundedUpstreamError> {
     if response
         .content_length()
         .is_some_and(|length| length > maximum as u64)
     {
-        return Err(AppError::Upstream("upstream response is too large".into()));
+        return Err(BoundedUpstreamError::ResponseTooLarge);
     }
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        // reqwest's display text may include a credential-bearing upstream
-        // URL. Use the centralized redacting conversion instead.
-        let chunk = chunk.map_err(AppError::from)?;
+        // Never retain or display reqwest's error: its URL can contain
+        // credential-bearing upstream configuration.
+        let chunk = chunk.map_err(|_| BoundedUpstreamError::Stream)?;
         if body.len().saturating_add(chunk.len()) > maximum {
-            return Err(AppError::Upstream("upstream response is too large".into()));
+            return Err(BoundedUpstreamError::ResponseTooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -1648,7 +1760,7 @@ struct ResponsesSseSummary {
 }
 
 impl ResponsesSseCapture {
-    fn for_codex() -> Self {
+    fn for_responses() -> Self {
         Self {
             require_explicit_completed: true,
             ..Self::default()
@@ -1798,7 +1910,11 @@ impl ResponsesSseCapture {
                 }
             }
         }
-        if value.get("error").is_some() || value.pointer("/response/error").is_some() {
+        if value.get("error").is_some_and(|error| !error.is_null())
+            || value
+                .pointer("/response/error")
+                .is_some_and(|error| !error.is_null())
+        {
             self.terminal_failure = true;
         }
         let payload_kind = value

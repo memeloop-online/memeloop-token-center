@@ -314,14 +314,17 @@ enum StreamTerminal {
     Failed,
 }
 
+/// Validates and redacts the standard Responses SSE protocol. Codex routes
+/// require it, and compatible HTTP JSON Responses routes share the same wire
+/// contract so failures cannot leak provider response bodies downstream.
 #[derive(Default)]
-pub(super) struct CodexStreamingSanitizer {
+pub(super) struct ResponsesStreamingSanitizer {
     pending: Vec<u8>,
     terminal: Option<StreamTerminal>,
     last_push_billable: bool,
 }
 
-impl CodexStreamingSanitizer {
+impl ResponsesStreamingSanitizer {
     pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Bytes, &'static str> {
         self.last_push_billable = false;
         let mut output = Vec::new();
@@ -961,7 +964,7 @@ mod tests {
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"post-terminal-secret\"}\n\n",
             "data: [DONE]\n\n"
         );
-        let mut sanitizer = CodexStreamingSanitizer::default();
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
         let mut output = Vec::new();
         for byte in failed.as_bytes() {
             output.extend_from_slice(&sanitizer.push(&[*byte]).unwrap());
@@ -972,7 +975,7 @@ mod tests {
             assert!(!output.contains(secret));
         }
 
-        let mut conflict = CodexStreamingSanitizer::default();
+        let mut conflict = ResponsesStreamingSanitizer::default();
         assert!(
             conflict
                 .push(
@@ -980,7 +983,7 @@ mod tests {
                 )
                 .is_err()
         );
-        let mut after_completed = CodexStreamingSanitizer::default();
+        let mut after_completed = ResponsesStreamingSanitizer::default();
         after_completed
             .push(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n")
             .unwrap();
@@ -997,12 +1000,12 @@ mod tests {
         let repeats = MAX_RESPONSES_SSE_EVENT_BYTES / event.len() + 2;
         let network_chunk = event.repeat(repeats);
         assert!(network_chunk.len() > MAX_RESPONSES_SSE_EVENT_BYTES);
-        let mut sanitizer = CodexStreamingSanitizer::default();
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
         let output = sanitizer.push(&network_chunk).unwrap();
         assert_eq!(output.as_ref(), network_chunk);
         assert!(sanitizer.is_complete());
 
-        let mut oversized = CodexStreamingSanitizer::default();
+        let mut oversized = ResponsesStreamingSanitizer::default();
         let first = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES / 2];
         let second = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES / 2 + 1];
         assert!(oversized.push(&first).is_ok());
@@ -1011,7 +1014,7 @@ mod tests {
 
     #[test]
     fn streaming_billable_classification_survives_separate_network_chunks() {
-        let mut sanitizer = CodexStreamingSanitizer::default();
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
         sanitizer
             .push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n")
             .unwrap();
