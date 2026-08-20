@@ -381,6 +381,80 @@ async fn explicit_compaction_with_retained_content_links_but_weak_similarity_doe
 }
 
 #[tokio::test]
+async fn out_of_order_compaction_never_uses_a_future_observation_as_its_parent() {
+    let fixture = Fixture::new("future-compaction").await;
+    let session_hints = ConversationHints {
+        session_id: Some("archive-thread".into()),
+        ..ConversationHints::default()
+    };
+    let future_request = fixture.start_request("memory://future-full-context").await;
+    let future_cluster = fixture
+        .state
+        .db
+        .record_conversation_observation(
+            &fixture.key,
+            future_request,
+            &json!({"input": [
+                {"role": "system", "content": "shared client bootstrap"},
+                {"role": "user", "content": "retain this exact turn"},
+                {"role": "assistant", "content": "future full answer"}
+            ]}),
+            &session_hints,
+            Some("OutOfOrderArchiveClient"),
+        )
+        .await
+        .expect("record future full-context observation");
+
+    // Archive rows are applied in completed-at order but observations use the
+    // source started-at timestamp. Model that inversion explicitly: the row
+    // already present in the database occurred after the observation that will
+    // be recorded next.
+    let future_observed_at = chrono::Utc::now().timestamp_millis() + 60_000;
+    sqlx::query("UPDATE conversation_observations SET created_at = $1 WHERE request_id = $2")
+        .bind(future_observed_at)
+        .bind(future_request.to_string())
+        .execute(&fixture.pool)
+        .await
+        .expect("move first observation into the source-time future");
+
+    let compacted_request = fixture
+        .start_request("memory://older-compacted-context")
+        .await;
+    let compacted_cluster = fixture
+        .state
+        .db
+        .record_conversation_observation(
+            &fixture.key,
+            compacted_request,
+            &json!({"input": [
+                {"role": "system", "content": "replacement summary"},
+                {"role": "user", "content": "retain this exact turn"},
+                {"role": "user", "content": "continue after compaction"}
+            ]}),
+            &ConversationHints {
+                session_id: Some("archive-thread".into()),
+                compaction: true,
+                ..ConversationHints::default()
+            },
+            Some("OutOfOrderArchiveClient"),
+        )
+        .await
+        .expect("record older compacted observation after future row");
+
+    assert_ne!(
+        compacted_cluster, future_cluster,
+        "an explicit session and compaction overlap must not reverse source-time ancestry"
+    );
+    let reversed_edges: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_edges e JOIN conversation_observations source ON source.id = e.from_observation_id JOIN conversation_observations target ON target.id = e.to_observation_id WHERE source.created_at > target.created_at",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count temporally reversed conversation edges");
+    assert_eq!(reversed_edges, 0);
+}
+
+#[tokio::test]
 async fn self_conversations_never_infer_or_expose_metadata_across_stable_keys() {
     let directory = tempfile::tempdir().expect("temporary database directory");
     let database_url = format!(

@@ -152,7 +152,7 @@ impl Database {
             || hints.session_id.is_some()
         {
             sqlx::query(
-                "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND (($4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4)) OR ($5 IS NOT NULL AND o.turn_id = $5) OR ($6 IS NOT NULL AND o.explicit_session_id = $6)) ORDER BY CASE WHEN $4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4) THEN 0 WHEN $5 IS NOT NULL AND o.turn_id = $5 THEN 1 ELSE 2 END, o.created_at DESC LIMIT 50",
+                "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $7 AND (($4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4)) OR ($5 IS NOT NULL AND o.turn_id = $5) OR ($6 IS NOT NULL AND o.explicit_session_id = $6)) ORDER BY CASE WHEN $4 IS NOT NULL AND (o.turn_id = $4 OR o.upstream_response_id = $4) THEN 0 WHEN $5 IS NOT NULL AND o.turn_id = $5 THEN 1 ELSE 2 END, o.created_at DESC LIMIT 50",
             )
             .bind(&tenant_id)
             .bind(&principal_id)
@@ -160,17 +160,19 @@ impl Database {
             .bind(hints.parent_turn_id.as_deref())
             .bind(hints.turn_id.as_deref())
             .bind(hints.session_id.as_deref())
+            .bind(now)
             .fetch_all(&mut **transaction)
             .await?
         } else {
             Vec::new()
         };
         let recent_candidates = sqlx::query(
-            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 ORDER BY o.created_at DESC LIMIT 50",
+            "SELECT o.id, o.cluster_id, CASE WHEN LENGTH(o.atom_hashes_json) <= 70000 THEN o.atom_hashes_json ELSE '[]' END AS atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 ORDER BY o.created_at DESC LIMIT 50",
         )
         .bind(&tenant_id)
         .bind(&principal_id)
         .bind(key.key_id.to_string())
+        .bind(now)
         .fetch_all(&mut **transaction)
         .await?;
         for recent in recent_candidates {
