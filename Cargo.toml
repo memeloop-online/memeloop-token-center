@@ -24,7 +24,7 @@ harness = false
 
 [features]
 default = []
-plugin-distribution = ["dep:oci-client", "dep:rustix", "dep:sigstore"]
+plugin-distribution = ["dep:oci-client", "dep:rustix", "dep:tempfile"]
 
 [dependencies]
 async-trait = "0.1"
@@ -45,17 +45,17 @@ object_store = { version = "0.14.1", features = ["aws"] }
 oci-client = { version = "0.17", optional = true, default-features = false, features = ["rustls-tls"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 regex = "1"
-rust_decimal = { version = "1", default-features = false, features = ["serde-with-str", "std"] }
+rust_decimal = { version = "=1.42.1", default-features = false, features = ["serde-with-str", "std"] }
 rustix = { version = "1", optional = true, features = ["fs"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-sigstore = { version = "0.14", optional = true, default-features = false, features = ["cosign", "rustls-tls"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "any", "postgres", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "any", "postgres", "sqlite"] }
 subtle = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tempfile = { version = "3", optional = true }
+tokio = { version = "1", features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "request-id", "trace"] }
@@ -72,6 +72,7 @@ tikv-jemallocator = "0.7.0"
 cucumber = { version = "0.23.0", features = ["macros"] }
 percent-encoding = "2"
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["limit", "util"] }
 wat = "1.252"
 wiremock = "0.6.5"
@@ -82,3 +83,10 @@ wit-parser = "0.252"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[patch.crates-io]
+# Upstream 1.42.1 declares an optional, unused rkyv dependency that is still
+# resolved into Cargo.lock and therefore audited even though no application
+# feature can reach it. This source-identical, manifest-only fork removes that
+# dormant surface; see vendor/rust_decimal/MEMELOOP-FORK.md.
+rust_decimal = { path = "vendor/rust_decimal" }

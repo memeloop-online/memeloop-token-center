@@ -1,13 +1,17 @@
 use std::{
     collections::BTreeSet,
-    io,
+    ffi::OsString,
+    io::{self, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     pin::Pin,
+    process::Stdio,
     task::{Context, Poll},
     time::Duration,
 };
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use oci_client::{
     Reference,
     client::{Client, ClientConfig, ClientProtocol},
@@ -15,15 +19,8 @@ use oci_client::{
     secrets::RegistryAuth,
 };
 use serde::{Deserialize, Serialize};
-use sigstore::{
-    cosign::{
-        ClientBuilder as CosignClientBuilder, CosignCapabilities,
-        verification_constraint::{PublicKeyVerifier, VerificationConstraintVec},
-        verify_constraints,
-    },
-    registry::{Auth as SigstoreAuth, ClientConfig as SigstoreClientConfig},
-};
-use tokio::io::AsyncWrite;
+use tempfile::{Builder as TempDirBuilder, TempDir};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use uuid::Uuid;
 
 use crate::plugin::{PluginManifest, validate_plugin_package};
@@ -45,6 +42,10 @@ const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 const MAX_TOTAL_BYTES: u64 = 80 * 1024 * 1024;
 const MAX_PUBLIC_KEYS: usize = 8;
 const MAX_PUBLIC_KEY_BYTES: u64 = 64 * 1024;
+const MAX_COSIGN_OUTPUT_BYTES: u64 = 64 * 1024;
+const COSIGN_TIMEOUT: Duration = Duration::from_secs(60);
+pub const COSIGN_VERIFIER_PATH: &str = "/usr/local/bin/cosign";
+pub const COSIGN_VERIFIER_VERSION: &str = "v3.1.3";
 
 #[derive(Clone, Default)]
 pub enum RegistryCredentials {
@@ -65,16 +66,6 @@ impl RegistryCredentials {
                 RegistryAuth::Basic(username.clone(), password.clone())
             }
             Self::Bearer(token) => RegistryAuth::Bearer(token.clone()),
-        }
-    }
-
-    fn sigstore_auth(&self) -> SigstoreAuth {
-        match self {
-            Self::Anonymous => SigstoreAuth::Anonymous,
-            Self::Basic { username, password } => {
-                SigstoreAuth::Basic(username.clone(), password.clone())
-            }
-            Self::Bearer(token) => SigstoreAuth::Bearer(token.clone()),
         }
     }
 }
@@ -129,7 +120,7 @@ trait SignatureVerifier: Send + Sync {
 
 struct CosignPublicKeySignatureVerifier<'a> {
     keys: &'a [Vec<u8>],
-    allow_plain_http: bool,
+    runner: &'a dyn CosignRunner,
 }
 
 #[async_trait]
@@ -150,45 +141,238 @@ impl SignatureVerifier for CosignPublicKeySignatureVerifier<'_> {
         {
             return Err(PluginDistributionError::SignatureVerification);
         }
-        let image = reference
+        let image: Reference = reference
             .parse()
             .map_err(|_| PluginDistributionError::SignatureVerification)?;
-        let mut client = CosignClientBuilder::default()
-            .with_oci_client_config(SigstoreClientConfig {
-                protocol: if self.allow_plain_http {
-                    sigstore::registry::ClientProtocol::Http
-                } else {
-                    sigstore::registry::ClientProtocol::Https
-                },
-                ..Default::default()
-            })
-            .build()
-            .map_err(|_| PluginDistributionError::SignatureVerification)?;
-        let auth = credentials.sigstore_auth();
-        let (_, resolved_digest) = client
-            .triangulate(&image, &auth)
-            .await
-            .map_err(|_| PluginDistributionError::SignatureVerification)?;
-        if resolved_digest != expected_digest {
+        if image.digest() != Some(expected_digest) {
             return Err(PluginDistributionError::SignatureVerification);
         }
-        let layers = client
-            .trusted_signature_layers(&auth, &image)
+        let source = format!("{}/{}", image.registry(), image.repository());
+        let verified_reference = format!("{source}@{expected_digest}");
+        let workspace = CosignWorkspace::new(image.registry(), credentials, self.keys)
+            .map_err(|_| PluginDistributionError::SignatureVerification)?;
+
+        let version = self
+            .runner
+            .run(&cosign_version_command(&workspace))
             .await
             .map_err(|_| PluginDistributionError::SignatureVerification)?;
-        if layers.is_empty() {
+        if !version.success || !cosign_version_matches(&version.stdout) {
             return Err(PluginDistributionError::SignatureVerification);
         }
-        for key in self.keys {
-            let verifier = PublicKeyVerifier::try_from(key.as_slice())
+        for key_path in &workspace.key_paths {
+            let outcome = self
+                .runner
+                .run(&cosign_verify_command(
+                    &workspace,
+                    key_path,
+                    &verified_reference,
+                ))
+                .await
                 .map_err(|_| PluginDistributionError::SignatureVerification)?;
-            let constraints: VerificationConstraintVec = vec![Box::new(verifier)];
-            if verify_constraints(&layers, constraints.iter()).is_ok() {
+            if outcome.success {
                 return Ok(());
             }
         }
         Err(PluginDistributionError::SignatureVerification)
     }
+}
+
+struct CosignWorkspace {
+    directory: TempDir,
+    docker_config: PathBuf,
+    key_paths: Vec<PathBuf>,
+}
+
+impl CosignWorkspace {
+    fn new(
+        registry: &str,
+        credentials: &RegistryCredentials,
+        keys: &[Vec<u8>],
+    ) -> io::Result<Self> {
+        let directory = TempDirBuilder::new()
+            .prefix(".mtc-cosign-")
+            .tempdir_in("/tmp")?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let docker_config = directory.path().join("docker");
+        std::fs::create_dir(&docker_config)?;
+        std::fs::set_permissions(&docker_config, std::fs::Permissions::from_mode(0o700))?;
+        let auth = match credentials {
+            RegistryCredentials::Anonymous => serde_json::json!({}),
+            RegistryCredentials::Basic { username, password } => serde_json::json!({
+                "auth": BASE64_STANDARD.encode(format!("{username}:{password}").as_bytes())
+            }),
+            RegistryCredentials::Bearer(token) => serde_json::json!({"registrytoken": token}),
+        };
+        let config = serde_json::to_vec(&serde_json::json!({
+            "auths": {registry: auth}
+        }))?;
+        write_private_file(&docker_config.join("config.json"), &config)?;
+
+        let mut key_paths = Vec::with_capacity(keys.len());
+        for (index, key) in keys.iter().enumerate() {
+            let path = directory.path().join(format!("cosign-{index}.pub"));
+            write_private_file(&path, key)?;
+            key_paths.push(path);
+        }
+        Ok(Self {
+            directory,
+            docker_config,
+            key_paths,
+        })
+    }
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+struct CosignCommandSpec {
+    arguments: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+    current_directory: PathBuf,
+}
+
+fn cosign_base_command(workspace: &CosignWorkspace) -> CosignCommandSpec {
+    CosignCommandSpec {
+        arguments: Vec::new(),
+        environment: vec![
+            (
+                OsString::from("DOCKER_CONFIG"),
+                workspace.docker_config.clone().into_os_string(),
+            ),
+            (
+                OsString::from("HOME"),
+                workspace.directory.path().as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("XDG_CACHE_HOME"),
+                workspace.directory.path().as_os_str().to_owned(),
+            ),
+        ],
+        current_directory: workspace.directory.path().to_owned(),
+    }
+}
+
+fn cosign_version_command(workspace: &CosignWorkspace) -> CosignCommandSpec {
+    let mut command = cosign_base_command(workspace);
+    command.arguments = vec![OsString::from("version"), OsString::from("--json")];
+    command
+}
+
+fn cosign_verify_command(
+    workspace: &CosignWorkspace,
+    key_path: &Path,
+    verified_reference: &str,
+) -> CosignCommandSpec {
+    let mut command = cosign_base_command(workspace);
+    command.arguments = vec![
+        OsString::from("verify"),
+        OsString::from("--key"),
+        key_path.as_os_str().to_owned(),
+        // Plugin packages use an explicitly provisioned public-key trust root.
+        // Do not require a Rekor entry for this offline verification policy.
+        OsString::from("--insecure-ignore-tlog"),
+        OsString::from(verified_reference),
+    ];
+    command
+}
+
+fn cosign_version_matches(stdout: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(stdout) else {
+        return false;
+    };
+    value.get("gitVersion").and_then(serde_json::Value::as_str) == Some(COSIGN_VERIFIER_VERSION)
+}
+
+struct CosignProcessOutput {
+    success: bool,
+    stdout: Vec<u8>,
+}
+
+#[async_trait]
+trait CosignRunner: Send + Sync {
+    async fn run(&self, command: &CosignCommandSpec) -> io::Result<CosignProcessOutput>;
+}
+
+struct SystemCosignRunner;
+
+#[async_trait]
+impl CosignRunner for SystemCosignRunner {
+    async fn run(&self, command: &CosignCommandSpec) -> io::Result<CosignProcessOutput> {
+        run_cosign_process(Path::new(COSIGN_VERIFIER_PATH), command, COSIGN_TIMEOUT).await
+    }
+}
+
+async fn run_cosign_process(
+    program: &Path,
+    command: &CosignCommandSpec,
+    timeout: Duration,
+) -> io::Result<CosignProcessOutput> {
+    let mut child = tokio::process::Command::new(program);
+    child
+        .args(&command.arguments)
+        .env_clear()
+        .envs(command.environment.iter().cloned())
+        .current_dir(&command.current_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = child.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("cosign stdout unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("cosign stderr unavailable"))?;
+    let stdout_task = tokio::spawn(read_bounded_output(stdout));
+    let stderr_task = tokio::spawn(read_bounded_output(stderr));
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            // Deterministically join both readers after the child closes
+            // its pipe ends. No detached task may retain a verifier pipe
+            // or delay temporary workspace cleanup.
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "cosign timed out"));
+        }
+    };
+    let stdout = stdout_task
+        .await
+        .map_err(|_| io::Error::other("cosign stdout task failed"))??;
+    // Drain and bound stderr, but never return it to callers or logs: registry
+    // implementations have historically echoed credential-bearing errors.
+    stderr_task
+        .await
+        .map_err(|_| io::Error::other("cosign stderr task failed"))??;
+    Ok(CosignProcessOutput {
+        success: status.success(),
+        stdout,
+    })
+}
+
+async fn read_bounded_output<R: AsyncRead + Unpin>(reader: R) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_COSIGN_OUTPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > MAX_COSIGN_OUTPUT_BYTES {
+        return Err(io::Error::other("cosign output exceeded limit"));
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,9 +399,10 @@ struct InstallReceipt<'a> {
 pub async fn install_plugin_oci(
     options: &InstallPluginOptions,
 ) -> Result<InstalledPlugin, PluginDistributionError> {
+    let runner = SystemCosignRunner;
     let verifier = CosignPublicKeySignatureVerifier {
         keys: &options.cosign_public_keys,
-        allow_plain_http: false,
+        runner: &runner,
     };
     install_plugin_oci_with_verifier(options, &verifier, false).await
 }
@@ -227,21 +412,32 @@ async fn install_plugin_oci_with_verifier(
     verifier: &dyn SignatureVerifier,
     allow_plain_http: bool,
 ) -> Result<InstalledPlugin, PluginDistributionError> {
-    let reference: Reference = options
+    let supplied_reference: Reference = options
         .reference
         .parse()
         .map_err(|_| PluginDistributionError::DigestPinRequired)?;
-    let expected_digest = reference
+    let expected_digest = supplied_reference
         .digest()
         .filter(|digest| valid_sha256_digest(digest))
         .ok_or(PluginDistributionError::DigestPinRequired)?;
-    let source = format!("{}/{}", reference.registry(), reference.repository());
+    let source = format!(
+        "{}/{}",
+        supplied_reference.registry(),
+        supplied_reference.repository()
+    );
     if !options.allowed_sources.contains(&source) {
         return Err(PluginDistributionError::SourceDenied);
     }
+    // Discard any supplied tag before both verification and pulling. A tag may
+    // coexist syntactically with a digest, but it must never influence either
+    // operation after the digest policy check succeeds.
+    let verified_reference = format!("{source}@{expected_digest}");
+    let reference: Reference = verified_reference
+        .parse()
+        .map_err(|_| PluginDistributionError::DigestPinRequired)?;
 
     verifier
-        .verify(&options.reference, expected_digest, &options.credentials)
+        .verify(&verified_reference, expected_digest, &options.credentials)
         .await?;
 
     let client = Client::new(ClientConfig {

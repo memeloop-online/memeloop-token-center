@@ -66,24 +66,28 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install dependency vulnerability scanner
         run: cargo install cargo-audit --locked
-      - name: Verify scoped advisory exceptions
+      - name: Verify zero-exception dependency and advisory surface
         run: |
-          # The long-running service does not link either advisory-bearing crate.
-          test -z "$(cargo tree --locked --target all -i rsa 2>/dev/null)"
-          test -z "$(cargo tree --locked --target all -i rkyv 2>/dev/null)"
-          # Even with every product feature enabled, rkyv must remain unreachable.
-          test -z "$(cargo tree --locked --all-features --target all -i rkyv 2>/dev/null)"
-          # The opt-in OCI installer reaches rsa only through Sigstore's
-          # OpenID verifier. Production installer code accepts public keys and
-          # invokes verification only; it never accepts or performs an RSA
-          # private-key operation affected by RUSTSEC-2023-0071.
-          rsa_tree="$(cargo tree --locked --all-features --target all -i rsa)"
-          printf '%s\n' "$rsa_tree" | grep -q '^rsa v'
-          printf '%s\n' "$rsa_tree" | grep -q 'openidconnect v'
-          printf '%s\n' "$rsa_tree" | grep -q 'sigstore v'
-          cargo audit \
-            --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0235
+          tests/ops/rust-decimal-vendor-contract.sh
+          default_tree="$(cargo tree --locked --target all --prefix none)"
+          all_features_tree="$(cargo tree --locked --all-features --target all --prefix none)"
+          for crate in rsa rkyv rkyv_derive sqlx-mysql sigstore; do
+            if printf '%s\n' "$default_tree" | grep -E "^${crate} v"; then
+              echo "$crate entered the default dependency tree" >&2
+              exit 1
+            fi
+            if printf '%s\n' "$all_features_tree" | grep -E "^${crate} v"; then
+              echo "$crate entered the all-features dependency tree" >&2
+              exit 1
+            fi
+          done
+          for crate in rsa rkyv rkyv_derive sigstore; do
+            if grep -Fq "name = \"${crate}\"" Cargo.lock; then
+              echo "$crate remains in Cargo.lock" >&2
+              exit 1
+            fi
+          done
+          cargo audit
       - name: Install PostgreSQL and SQLite migration clients
         timeout-minutes: 15
         env:
@@ -271,6 +275,9 @@ jobs:
           - image: ghcr.io/linonetwo/memeloop-token-center-importer
             dockerfile: Dockerfile.importer
             cache_scope: importer
+          - image: ghcr.io/linonetwo/memeloop-token-center-plugin-installer
+            dockerfile: Dockerfile.plugin-installer
+            cache_scope: plugin-installer
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -349,6 +356,8 @@ jobs:
         run: tests/ops/release-packaging-contract.sh
       - name: Build and exercise the hardened importer image
         run: tests/ops/importer-image-contract.sh
+      - name: Build and exercise the hardened plugin installer image
+        run: tests/ops/plugin-installer-image-contract.sh
       - name: Validate the hardened session archive import Job
         run: tests/ops/session-archive-import-job-contract.sh
       - run: docker compose config --quiet

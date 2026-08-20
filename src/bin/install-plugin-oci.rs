@@ -33,9 +33,9 @@ struct Arguments {
     #[arg(long = "cosign-public-key", required = true, num_args = 1..=8)]
     cosign_public_keys: Vec<PathBuf>,
 
-    /// Basic-auth username. The password must come from a mounted file.
-    #[arg(long, env = "MTC_PLUGIN_REGISTRY_USERNAME")]
-    registry_username: Option<String>,
+    /// Mounted file containing the Basic-auth username.
+    #[arg(long, env = "MTC_PLUGIN_REGISTRY_USERNAME_FILE")]
+    registry_username_file: Option<PathBuf>,
 
     /// Mounted file containing the Basic-auth password/PAT.
     #[arg(long, env = "MTC_PLUGIN_REGISTRY_PASSWORD_FILE")]
@@ -74,7 +74,8 @@ fn credentials(
     arguments: &Arguments,
 ) -> Result<RegistryCredentials, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(path) = &arguments.registry_bearer_token_file {
-        if arguments.registry_username.is_some() || arguments.registry_password_file.is_some() {
+        if arguments.registry_username_file.is_some() || arguments.registry_password_file.is_some()
+        {
             return Err(
                 "bearer-token and Basic registry authentication are mutually exclusive".into(),
             );
@@ -82,14 +83,20 @@ fn credentials(
         return Ok(RegistryCredentials::Bearer(read_secret(path)?));
     }
     match (
-        arguments.registry_username.as_deref(),
+        arguments.registry_username_file.as_ref(),
         arguments.registry_password_file.as_ref(),
     ) {
         (None, None) => Ok(RegistryCredentials::Anonymous),
-        (Some(username), Some(path)) if !username.is_empty() => Ok(RegistryCredentials::Basic {
-            username: username.to_owned(),
-            password: read_secret(path)?,
-        }),
+        (Some(username_path), Some(password_path)) => {
+            let username = read_secret(username_path)?;
+            if username.contains(':') {
+                return Err("registry username must not contain ':'".into());
+            }
+            Ok(RegistryCredentials::Basic {
+                username,
+                password: read_secret(password_path)?,
+            })
+        }
         _ => Err("registry username and password file must be provided together".into()),
     }
 }

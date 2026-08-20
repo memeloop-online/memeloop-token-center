@@ -1,0 +1,59 @@
+--- Cargo.toml.upstream
++++ Cargo.toml
+@@ -94,8 +94,6 @@
+ ndarray = ["dep:ndarray"]
+ proptest = ["dep:proptest"]
+ rand = ["dep:rand"]
+-rkyv = ["dep:rkyv"]
+-rkyv-safe = ["rkyv/validation"]
+ rocket-traits = [
+     "dep:rocket",
+     "std",
+@@ -123,7 +121,6 @@
+     "borsh?/std",
+     "bytes?/std",
+     "rand?/std",
+-    "rkyv?/std",
+     "serde?/std",
+     "serde_json?/std",
+ ]
+@@ -134,10 +131,10 @@
+ name = "rust_decimal"
+ path = "src/lib.rs"
+ 
+-[[example]]
+-name = "rkyv-remote"
+-path = "examples/rkyv-remote.rs"
+-required-features = ["macros"]
++[lints.rust]
++unexpected_cfgs = { level = "warn", check-cfg = [
++    'cfg(feature, values("rkyv", "rkyv-safe"))',
++] }
+ 
+ [[test]]
+ name = "decimal_tests"
+@@ -234,14 +231,6 @@
+ default-features = false
+ package = "rand"
+ 
+-[dependencies.rkyv]
+-version = "0.7.46"
+-features = [
+-    "size_32",
+-    "std",
+-]
+-optional = true
+-default-features = false
+ 
+ [dependencies.rocket]
+ version = "0.5.0-rc.3"
+@@ -331,9 +320,6 @@
+ default-features = false
+ package = "rand"
+ 
+-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies.rkyv-0_8]
+-version = "0.8.13"
+-package = "rkyv"
+ 
+ [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies.tokio]
+ version = "1.0"
