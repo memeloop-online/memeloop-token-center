@@ -167,7 +167,7 @@ async fn observe_request(
     (request_id, cluster_id)
 }
 
-async fn execute_sql_script(pool: &AnyPool, sql: &str) {
+async fn execute_sql_script(pool: &AnyPool, sql: &'static str) {
     for statement in sql
         .split(';')
         .map(str::trim)
@@ -727,7 +727,9 @@ async fn archive_conversation_and_import_metadata_are_one_atomic_idempotent_comm
         "CREATE TRIGGER fail_archive_reference BEFORE UPDATE OF request_object ON request_records WHEN OLD.id = '{}' BEGIN SELECT RAISE(ABORT, 'injected archive reference failure'); END",
         child_request
     );
-    sqlx::query(&trigger)
+    // Test-only SQL safety boundary: `child_request` is a typed UUID and therefore cannot inject
+    // SQL syntax. SQLite trigger definitions cannot contain bind parameters.
+    sqlx::query(sqlx::AssertSqlSafe(trigger))
         .execute(&fixture.pool)
         .await
         .expect("install failure trigger");
@@ -864,8 +866,18 @@ async fn archive_state(fixture: &Fixture) -> ArchiveState {
 }
 
 async fn count(pool: &AnyPool, table: &str) -> i64 {
-    let query = format!("SELECT COUNT(*) FROM {table}");
-    sqlx::query_scalar(&query)
+    let query = match table {
+        "conversation_observations" => "SELECT COUNT(*) FROM conversation_observations",
+        "conversation_edges" => "SELECT COUNT(*) FROM conversation_edges",
+        "semantic_atoms" => "SELECT COUNT(*) FROM semantic_atoms",
+        "context_nodes" => "SELECT COUNT(*) FROM context_nodes",
+        "session_archive_import_records" => "SELECT COUNT(*) FROM session_archive_import_records",
+        "session_archive_import_checkpoints" => {
+            "SELECT COUNT(*) FROM session_archive_import_checkpoints"
+        }
+        _ => panic!("test table names are a closed internal set: {table}"),
+    };
+    sqlx::query_scalar(query)
         .fetch_one(pool)
         .await
         .expect("table count")
@@ -1215,7 +1227,7 @@ async fn postgres_110k_conversation_pages_are_indexed_and_bounded() {
     assert!(execution_time_ms(&detail_plan) <= 250.0, "{detail_plan}");
 }
 
-async fn postgres_plan(pool: &AnyPool, sql: &str, binds: &[String]) -> String {
+async fn postgres_plan(pool: &AnyPool, sql: &'static str, binds: &[String]) -> String {
     let mut query = sqlx::query(sql);
     for value in binds {
         query = query.bind(value);

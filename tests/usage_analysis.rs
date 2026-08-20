@@ -260,7 +260,9 @@ async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
                    1, $11, 0, 0, 0, $12, 1, 20, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $13
                )"#
         );
-        sqlx::query(&sql)
+        // Test-only SQL safety boundary: `table` and `bucket_column` come from the two literal
+        // tuples in this loop. All fixture values remain bind parameters below.
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&tenant_id)
             .bind(&key_id)
             .bind(bucket)

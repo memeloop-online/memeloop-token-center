@@ -99,19 +99,13 @@ impl Database {
         let route_id = filter.route_id.map(|id| id.to_string()).unwrap_or_default();
         let key_alias = search_prefix(filter.key_alias.as_deref());
         let principal = search_prefix(filter.principal.as_deref());
-        let (table, bucket_column, bucket_millis) = match range.granularity {
-            UsageAnalysisGranularity::Hour => ("usage_analysis_hourly", "hour_bucket", 3_600_000),
-            UsageAnalysisGranularity::Day => ("usage_analysis_daily", "day_bucket", 86_400_000),
+        let bucket_millis = match range.granularity {
+            UsageAnalysisGranularity::Hour => 3_600_000,
+            UsageAnalysisGranularity::Day => 86_400_000,
         };
         let main_plan =
             UsageAnalysisBucketPlan::new(range.from_created_at, range.to_created_at, bucket_millis);
-        let main_sql = usage_analysis_main_sql(
-            self.backend,
-            table,
-            bucket_column,
-            bucket_millis,
-            tenant_scoped,
-        );
+        let main_sql = usage_analysis_main_sql(self.backend, range.granularity, tenant_scoped);
 
         macro_rules! bind_usage_filter {
             ($query:expr, $plan:expr) => {
@@ -135,7 +129,9 @@ impl Database {
             };
         }
 
-        let rows = bind_usage_filter!(sqlx::query(&main_sql), main_plan)
+        // SQL safety boundary: the generator accepts only backend/granularity enums and a scope
+        // boolean. User filters are always bound below and are never interpolated into SQL.
+        let rows = bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(main_sql)), main_plan)
             .fetch_all(&self.pool)
             .await?;
         let mut projections: BTreeMap<(String, String), UsageMetricsAccumulator> = BTreeMap::new();
@@ -143,12 +139,14 @@ impl Database {
             accumulate_usage_row(&mut projections, &row)?;
         }
 
-        let heatmap_sql = usage_analysis_heatmap_sql(self.backend, tenant_scoped);
+        let heatmap_sql = usage_analysis_heatmap_sql(tenant_scoped);
         let heatmap_plan =
             UsageAnalysisBucketPlan::new(range.from_created_at, range.to_created_at, 3_600_000);
-        let heatmap_rows = bind_usage_filter!(sqlx::query(&heatmap_sql), heatmap_plan)
-            .fetch_all(&self.pool)
-            .await?;
+        // Same closed generator boundary as the main analysis statement above.
+        let heatmap_rows =
+            bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(heatmap_sql)), heatmap_plan)
+                .fetch_all(&self.pool)
+                .await?;
         let mut heatmap_projection: BTreeMap<(String, String), UsageMetricsAccumulator> =
             BTreeMap::new();
         for row in heatmap_rows {
@@ -440,12 +438,11 @@ CAST(COALESCE(SUM(duration_bucket_11), 0) AS BIGINT) AS duration_bucket_11,
 CAST(COALESCE(SUM(cost_micros), 0) AS BIGINT) AS cost_micros
 "#;
 
-fn usage_analysis_source_sql(
-    table: &str,
-    bucket_column: &str,
-    bucket_millis: i64,
-    tenant_scoped: bool,
-) -> String {
+fn usage_analysis_source_sql(granularity: UsageAnalysisGranularity, tenant_scoped: bool) -> String {
+    let (table, bucket_column, bucket_millis) = match granularity {
+        UsageAnalysisGranularity::Hour => ("usage_analysis_hourly", "hour_bucket", 3_600_000),
+        UsageAnalysisGranularity::Day => ("usage_analysis_daily", "day_bucket", 86_400_000),
+    };
     let tenant_predicate = if tenant_scoped {
         "AND {alias}.tenant_id = $1"
     } else {
@@ -624,12 +621,10 @@ fn usage_analysis_generation_fact_sql(
 
 fn usage_analysis_main_sql(
     backend: DatabaseBackend,
-    table: &str,
-    bucket_column: &str,
-    bucket_millis: i64,
+    granularity: UsageAnalysisGranularity,
     tenant_scoped: bool,
 ) -> String {
-    let source = usage_analysis_source_sql(table, bucket_column, bucket_millis, tenant_scoped);
+    let source = usage_analysis_source_sql(granularity, tenant_scoped);
     let grouped = match backend {
         DatabaseBackend::PostgreSql => format!(
             r#"SELECT CASE
@@ -753,13 +748,8 @@ SELECT bucket_kind, bucket_id, bucket_label, currency, requests, successful_requ
     )
 }
 
-fn usage_analysis_heatmap_sql(_backend: DatabaseBackend, tenant_scoped: bool) -> String {
-    let source = usage_analysis_source_sql(
-        "usage_analysis_hourly",
-        "hour_bucket",
-        3_600_000,
-        tenant_scoped,
-    );
+fn usage_analysis_heatmap_sql(tenant_scoped: bool) -> String {
+    let source = usage_analysis_source_sql(UsageAnalysisGranularity::Hour, tenant_scoped);
     format!(
         r#"WITH filtered_activity AS MATERIALIZED ({source})
 SELECT 'heatmap' AS bucket_kind,
@@ -899,8 +889,8 @@ mod tests {
     use sqlx::Row;
 
     use super::{
-        Database, DatabaseBackend, UsageAnalysisBucketPlan, UsageMetricsAccumulator,
-        usage_analysis_heatmap_sql, usage_analysis_main_sql,
+        Database, DatabaseBackend, UsageAnalysisBucketPlan, UsageAnalysisGranularity,
+        UsageMetricsAccumulator, usage_analysis_heatmap_sql, usage_analysis_main_sql,
     };
 
     #[test]
@@ -961,13 +951,7 @@ mod tests {
     #[test]
     fn aggregate_sql_groups_every_projection_by_currency() {
         for backend in [DatabaseBackend::PostgreSql, DatabaseBackend::Sqlite] {
-            let sql = usage_analysis_main_sql(
-                backend,
-                "usage_analysis_daily",
-                "day_bucket",
-                86_400_000,
-                false,
-            );
+            let sql = usage_analysis_main_sql(backend, UsageAnalysisGranularity::Day, false);
             assert!(sql.contains("currency"));
             assert!(!sql.contains("request_records"));
             assert!(!sql.contains("generation_jobs"));
@@ -990,9 +974,7 @@ mod tests {
     fn tenant_scope_is_pushed_into_every_rollup_and_fact_branch() {
         let sql = usage_analysis_main_sql(
             DatabaseBackend::PostgreSql,
-            "usage_analysis_daily",
-            "day_bucket",
-            86_400_000,
+            UsageAnalysisGranularity::Day,
             true,
         );
         assert!(sql.contains("a.tenant_id = $1"), "{sql}");
@@ -1026,9 +1008,7 @@ mod tests {
                 (
                     usage_analysis_main_sql(
                         DatabaseBackend::PostgreSql,
-                        "usage_analysis_hourly",
-                        "hour_bucket",
-                        bucket_millis,
+                        UsageAnalysisGranularity::Hour,
                         true,
                     ),
                     UsageAnalysisBucketPlan::new(from, to, bucket_millis),
@@ -1044,9 +1024,7 @@ mod tests {
                 (
                     usage_analysis_main_sql(
                         DatabaseBackend::PostgreSql,
-                        "usage_analysis_daily",
-                        "day_bucket",
-                        bucket_millis,
+                        UsageAnalysisGranularity::Day,
                         true,
                     ),
                     UsageAnalysisBucketPlan::new(from, to, bucket_millis),
@@ -1061,9 +1039,7 @@ mod tests {
                 (
                     usage_analysis_main_sql(
                         DatabaseBackend::PostgreSql,
-                        "usage_analysis_daily",
-                        "day_bucket",
-                        bucket_millis,
+                        UsageAnalysisGranularity::Day,
                         true,
                     ),
                     UsageAnalysisBucketPlan::new(from, to, bucket_millis),
@@ -1119,12 +1095,7 @@ mod tests {
             bucket_start + bucket_millis + 15 * 60_000,
             bucket_millis,
         );
-        let heatmap = explain_usage_query(
-            pool,
-            &usage_analysis_heatmap_sql(DatabaseBackend::PostgreSql, true),
-            plan,
-        )
-        .await;
+        let heatmap = explain_usage_query(pool, &usage_analysis_heatmap_sql(true), plan).await;
         assert!(
             heatmap.contains("Index Scan using usage_analysis_hourly_"),
             "{heatmap}"
@@ -1163,7 +1134,9 @@ mod tests {
     ) -> String {
         let explain_sql =
             format!("EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, COSTS OFF, FORMAT TEXT) {sql}");
-        let rows = sqlx::query(&explain_sql)
+        // Test-only safety boundary: every caller passes output from the closed usage-analysis
+        // generators above. This helper is not exposed to request or configuration input.
+        let rows = sqlx::query(sqlx::AssertSqlSafe(explain_sql))
             .bind("00000000-0000-0000-0000-000000000001")
             .bind("")
             .bind(plan.rollup_from_bucket)

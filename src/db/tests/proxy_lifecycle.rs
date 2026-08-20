@@ -137,10 +137,13 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
         1
     );
 
-    sqlx::query(&format!(
-            "CREATE TRIGGER proxy_terminal_fault BEFORE INSERT ON request_stats_facts WHEN NEW.request_id = '{}' BEGIN SELECT RAISE(ABORT, 'proxy terminal fault'); END",
-            request_id
-        ))
+    // Test-only SQL safety boundary: `request_id` is a typed UUID generated in this test and its
+    // Display representation cannot contain SQL syntax. SQLite does not allow a bind parameter
+    // in a persisted trigger definition.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER proxy_terminal_fault BEFORE INSERT ON request_stats_facts WHEN NEW.request_id = '{}' BEGIN SELECT RAISE(ABORT, 'proxy terminal fault'); END",
+        request_id
+    )))
         .execute(&database.pool)
         .await
         .unwrap();

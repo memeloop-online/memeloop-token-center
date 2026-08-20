@@ -684,14 +684,18 @@ async fn postgres_locator_migration_rejects_duplicates_across_partitions() {
         .unwrap();
     let mut transaction = pool.begin().await.unwrap();
     let schema = format!("locator_duplicate_{}", Uuid::now_v7().simple());
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+    // Test-only SQL safety boundary: the identifier consists of a literal prefix plus a
+    // library-generated UUID rendered as lowercase hexadecimal; no external input is present.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&mut *transaction)
         .await
         .unwrap();
-    sqlx::query(&format!("SET LOCAL search_path = {schema}"))
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL search_path = {schema}"
+    )))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     sqlx::query(
             "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
         )
@@ -806,14 +810,18 @@ async fn postgres_partition_maintenance_skips_default_overlap_and_continues() {
         .unwrap();
     let mut transaction = pool.begin().await.unwrap();
     let schema = format!("partition_maintenance_{}", Uuid::now_v7().simple());
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+    // Test-only SQL safety boundary: the identifier consists of a literal prefix plus a
+    // library-generated UUID rendered as lowercase hexadecimal; no external input is present.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&mut *transaction)
         .await
         .unwrap();
-    sqlx::query(&format!("SET LOCAL search_path = {schema}"))
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL search_path = {schema}"
+    )))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     sqlx::query(
             "CREATE TABLE request_records (id TEXT NOT NULL, created_at BIGINT NOT NULL, payload TEXT NOT NULL) PARTITION BY RANGE (created_at)",
         )
@@ -827,12 +835,19 @@ async fn postgres_partition_maintenance_skips_default_overlap_and_continues() {
         .await
         .unwrap();
     for table in ["request_records", "request_events"] {
-        sqlx::query(&format!(
-            "CREATE TABLE {table}_default PARTITION OF {table} DEFAULT"
-        ))
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
+        let statement = match table {
+            "request_records" => {
+                "CREATE TABLE request_records_default PARTITION OF request_records DEFAULT"
+            }
+            "request_events" => {
+                "CREATE TABLE request_events_default PARTITION OF request_events DEFAULT"
+            }
+            _ => unreachable!("test table names are a closed internal set"),
+        };
+        sqlx::query(statement)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
     }
 
     let today = Utc::now().date_naive();

@@ -294,7 +294,10 @@ impl Database {
             write!(statement, "${}", index + 2).map_err(|_| AppError::Internal)?;
         }
         statement.push_str(") ORDER BY p.model ASC, CASE WHEN t.service_tier = 'default' THEN 0 ELSE 1 END, t.service_tier");
-        let mut query = sqlx::query(&statement).bind(currency.to_uppercase());
+        // SQL safety boundary: only monotonically generated `$N` placeholders are appended to
+        // the literal statement. Currency and every model value remain binds. QueryBuilder<Any>
+        // cannot be used here because PostgreSQL and SQLite use different native placeholders.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(statement)).bind(currency.to_uppercase());
         for model in models {
             query = query.bind(model);
         }

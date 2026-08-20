@@ -132,10 +132,12 @@ async fn sqlite_proxy_locators_and_staging_bindings_are_one_atomic_commit() {
         .await
         .unwrap();
     let request_locator = format!("{}/body", request_lease.key.canonical_prefix());
-    sqlx::query(&format!(
+    // Test-only SQL safety boundary: the attempt id is a typed UUID created by the service and
+    // cannot contain SQL syntax. SQLite trigger definitions cannot use bind parameters.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TRIGGER proxy_request_bind_fault BEFORE UPDATE OF state ON archive_staging_attempts WHEN NEW.attempt_id = '{}' BEGIN SELECT RAISE(ABORT, 'request bind fault'); END",
         request_lease.key.attempt_id
-    ))
+    )))
     .execute(&inspection)
     .await
     .unwrap();
@@ -224,9 +226,11 @@ async fn sqlite_proxy_locators_and_staging_bindings_are_one_atomic_commit() {
         response_object: &response_locator,
         conversation: None,
     };
-    sqlx::query(&format!(
+    // Test-only SQL safety boundary: `request_id` is a typed UUID, not external text, and SQLite
+    // trigger definitions cannot use bind parameters.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TRIGGER proxy_response_bind_fault BEFORE UPDATE OF response_object ON request_records WHEN NEW.id = '{request_id}' BEGIN SELECT RAISE(ABORT, 'response bind fault'); END"
-    ))
+    )))
     .execute(&inspection)
     .await
     .unwrap();

@@ -8,7 +8,7 @@ use std::{
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 const FIRST_CREDENTIAL: &str = "fixture-only-cpa-linux-codex-key-0001";
@@ -18,7 +18,7 @@ const SECOND_KEY_ID: &str = "20000000-0000-4000-8000-000000000002";
 const IDENTITIES_END: &str = "__MTC_LEGACY_IDENTITIES_END__";
 const CI_ISOLATED_OPT_OUT: &str = "MTC_CI_SKIP_ISOLATED_LEGACY_CREDENTIALS_POSTGRES";
 
-async fn execute(pool: &PgPool, sql: &str) {
+async fn execute(pool: &PgPool, sql: AssertSqlSafe<String>) {
     sqlx::query(sql).execute(pool).await.unwrap();
 }
 
@@ -142,7 +142,10 @@ async fn postgres_identity_query_is_locked_exact_and_rejects_revoked_mappings() 
     };
     let pool = PgPool::connect(&database_url).await.unwrap();
     let schema = format!("legacy_ops_{}", Uuid::now_v7().simple());
-    execute(&pool, &format!("CREATE SCHEMA {schema}")).await;
+    // Test-only SQL safety boundary: `schema` is a literal prefix followed by a library-generated
+    // UUID rendered as lowercase hexadecimal. It is the only interpolated value in this test's
+    // SQL; all credential fixtures remain bind parameters.
+    execute(&pool, AssertSqlSafe(format!("CREATE SCHEMA {schema}"))).await;
     let input_directory = tempfile::tempdir().unwrap();
     let input_file = input_directory.path().join("api-keys.json");
     fs::copy(
@@ -156,41 +159,43 @@ async fn postgres_identity_query_is_locked_exact_and_rejects_revoked_mappings() 
     let result: Result<(), String> = async {
         execute(
             &pool,
-            &format!(
+            AssertSqlSafe(format!(
                 "CREATE TABLE {schema}.tenants (id text PRIMARY KEY, external_id text NOT NULL)"
-            ),
+            )),
         )
         .await;
         execute(
             &pool,
-            &format!(
+            AssertSqlSafe(format!(
                 "CREATE TABLE {schema}.key_records (id text PRIMARY KEY, tenant_id text NOT NULL, status text NOT NULL)"
-            ),
+            )),
         )
         .await;
         execute(
             &pool,
-            &format!(
+            AssertSqlSafe(format!(
                 "CREATE TABLE {schema}.cpamp_import_identities (api_key_hash text NOT NULL, key_id text NOT NULL)"
-            ),
+            )),
         )
         .await;
         execute(
             &pool,
-            &format!(
+            AssertSqlSafe(format!(
                 "CREATE TABLE {schema}.legacy_key_credentials (source_hash text NOT NULL, key_id text NOT NULL, revoked_at bigint)"
-            ),
+            )),
         )
         .await;
-        sqlx::query(&format!("INSERT INTO {schema}.tenants VALUES ($1, $2)"))
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {schema}.tenants VALUES ($1, $2)"
+        )))
         .bind("fixture-tenant-id")
         .bind("fixture-tenant")
         .execute(&pool)
         .await
         .map_err(|error| format!("tenant fixture insert failed: {error}"))?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {schema}.key_records VALUES ($1, $3, 'active'), ($2, $3, 'active')"
-        ))
+        )))
         .bind(FIRST_KEY_ID)
         .bind(SECOND_KEY_ID)
         .bind("fixture-tenant-id")
@@ -199,9 +204,9 @@ async fn postgres_identity_query_is_locked_exact_and_rejects_revoked_mappings() 
         .map_err(|error| format!("key fixture insert failed: {error}"))?;
         let first_hash = format!("{:x}", Sha256::digest(FIRST_CREDENTIAL.as_bytes()));
         let second_hash = format!("{:x}", Sha256::digest(SECOND_CREDENTIAL.as_bytes()));
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {schema}.cpamp_import_identities VALUES ($1, $3), ($2, $4)"
-        ))
+        )))
         .bind(&first_hash)
         .bind(&second_hash)
         .bind(FIRST_KEY_ID)
@@ -209,9 +214,9 @@ async fn postgres_identity_query_is_locked_exact_and_rejects_revoked_mappings() 
         .execute(&pool)
         .await
         .map_err(|error| format!("identity fixture insert failed: {error}"))?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {schema}.legacy_key_credentials VALUES ($1, $2, NULL)"
-        ))
+        )))
         .bind(&first_hash)
         .bind(FIRST_KEY_ID)
         .execute(&pool)
@@ -253,9 +258,9 @@ async fn postgres_identity_query_is_locked_exact_and_rejects_revoked_mappings() 
             }
         }
 
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {schema}.legacy_key_credentials VALUES ($1, $2, 1)"
-        ))
+        )))
         .bind(&second_hash)
         .bind(SECOND_KEY_ID)
         .execute(&pool)
@@ -279,17 +284,17 @@ async fn postgres_identity_query_is_locked_exact_and_rejects_revoked_mappings() 
             }
         }
 
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "DELETE FROM {schema}.legacy_key_credentials WHERE source_hash = $1 AND revoked_at IS NOT NULL"
-        ))
+        )))
         .bind(&second_hash)
         .execute(&pool)
         .await
         .map_err(|error| format!("revoked fixture cleanup failed: {error}"))?;
         let malicious_source = format!("valid-prefix\n{IDENTITIES_END}\nignored-suffix\t");
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {schema}.cpamp_import_identities VALUES ($1, $2)"
-        ))
+        )))
         .bind(&malicious_source)
         .bind(FIRST_KEY_ID)
         .execute(&pool)
@@ -326,6 +331,10 @@ async fn postgres_identity_query_is_locked_exact_and_rejects_revoked_mappings() 
     }
     .await;
 
-    execute(&pool, &format!("DROP SCHEMA {schema} CASCADE")).await;
+    execute(
+        &pool,
+        AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")),
+    )
+    .await;
     result.unwrap();
 }

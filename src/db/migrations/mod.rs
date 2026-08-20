@@ -448,8 +448,6 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
     },
 ];
 
-const PARTITION_MAINTENANCE_SAVEPOINT: &str = "memeloop_partition_maintenance";
-
 impl Database {
     pub async fn migrate(&self) -> Result<(), sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
@@ -486,11 +484,16 @@ impl Database {
                 .is_some(),
             };
             if !exists {
-                sqlx::query(&format!(
-                    "ALTER TABLE request_records ADD COLUMN {column} TEXT"
-                ))
-                .execute(&mut *transaction)
-                .await?;
+                let statement = match column {
+                    "upstream_account_id" => {
+                        "ALTER TABLE request_records ADD COLUMN upstream_account_id TEXT"
+                    }
+                    "model_route_id" => {
+                        "ALTER TABLE request_records ADD COLUMN model_route_id TEXT"
+                    }
+                    _ => unreachable!("migration column names are a closed internal set"),
+                };
+                sqlx::query(statement).execute(&mut *transaction).await?;
             }
         }
         let oauth_session_column_exists = match self.backend {
@@ -613,32 +616,32 @@ pub(super) async fn maintain_postgres_partitions(
             let statement = format!(
                 "CREATE TABLE IF NOT EXISTS {partition} PARTITION OF {table} FOR VALUES FROM ({start}) TO ({end})"
             );
-            sqlx::query(&format!("SAVEPOINT {PARTITION_MAINTENANCE_SAVEPOINT}"))
+            sqlx::query("SAVEPOINT memeloop_partition_maintenance")
                 .execute(&mut *connection)
                 .await?;
-            match sqlx::query(&statement).execute(&mut *connection).await {
+            // SQL safety boundary: table is selected from the two literals above, suffix is a
+            // chrono-rendered YYYYMMDD date, and bounds are server-generated i64 timestamps.
+            // No request, configuration, or plugin value can enter this DDL statement.
+            match sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&mut *connection)
+                .await
+            {
                 Ok(_) => {
-                    sqlx::query(&format!(
-                        "RELEASE SAVEPOINT {PARTITION_MAINTENANCE_SAVEPOINT}"
-                    ))
-                    .execute(&mut *connection)
-                    .await?;
+                    sqlx::query("RELEASE SAVEPOINT memeloop_partition_maintenance")
+                        .execute(&mut *connection)
+                        .await?;
                     report.ready_partitions += 1;
                 }
                 Err(error) => {
                     // A PostgreSQL statement error aborts the transaction until it is rolled back.
                     // Keep each partition DDL behind a savepoint so a blocked day cannot prevent
                     // the migration transaction from committing or later days from being created.
-                    sqlx::query(&format!(
-                        "ROLLBACK TO SAVEPOINT {PARTITION_MAINTENANCE_SAVEPOINT}"
-                    ))
-                    .execute(&mut *connection)
-                    .await?;
-                    sqlx::query(&format!(
-                        "RELEASE SAVEPOINT {PARTITION_MAINTENANCE_SAVEPOINT}"
-                    ))
-                    .execute(&mut *connection)
-                    .await?;
+                    sqlx::query("ROLLBACK TO SAVEPOINT memeloop_partition_maintenance")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("RELEASE SAVEPOINT memeloop_partition_maintenance")
+                        .execute(&mut *connection)
+                        .await?;
 
                     if !is_default_partition_overlap(&error) {
                         return Err(error);
@@ -663,9 +666,16 @@ pub(super) async fn maintain_postgres_partitions(
         }
     }
     for table in ["request_records", "request_events"] {
-        let statement =
-            format!("CREATE TABLE IF NOT EXISTS {table}_default PARTITION OF {table} DEFAULT");
-        sqlx::query(&statement).execute(&mut *connection).await?;
+        let statement = match table {
+            "request_records" => {
+                "CREATE TABLE IF NOT EXISTS request_records_default PARTITION OF request_records DEFAULT"
+            }
+            "request_events" => {
+                "CREATE TABLE IF NOT EXISTS request_events_default PARTITION OF request_events DEFAULT"
+            }
+            _ => unreachable!("partitioned table names are a closed internal set"),
+        };
+        sqlx::query(statement).execute(&mut *connection).await?;
     }
     Ok(report)
 }

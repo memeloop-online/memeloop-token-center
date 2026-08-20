@@ -783,27 +783,30 @@ async fn install_generation_event_failure_trigger(
 ) -> (String, Option<String>) {
     let suffix = request_id.simple().to_string();
     let trigger = format!("generation_atomic_fail_{suffix}");
+    // Test-only SQL safety boundary for this helper and its cleanup counterpart: trigger/function
+    // identifiers and predicates are derived only from a typed UUID rendered as hexadecimal.
+    // Neither helper is reachable from product input.
     if postgres {
         let function = format!("generation_atomic_fail_fn_{suffix}");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN IF NEW.request_id = '{}' THEN RAISE EXCEPTION 'forced generation event failure'; END IF; RETURN NEW; END $body$",
             request_id
-        ))
+        )))
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TRIGGER {trigger} BEFORE INSERT ON request_events FOR EACH ROW EXECUTE FUNCTION {function}()"
-        ))
+        )))
         .execute(pool)
         .await
         .unwrap();
         (trigger, Some(function))
     } else {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TRIGGER {trigger} BEFORE INSERT ON request_events WHEN NEW.request_id = '{}' BEGIN SELECT RAISE(ABORT, 'forced generation event failure'); END",
             request_id
-        ))
+        )))
         .execute(pool)
         .await
         .unwrap();
@@ -816,12 +819,14 @@ async fn remove_generation_event_failure_trigger(
     trigger: &str,
     function: Option<&str>,
 ) {
-    sqlx::query(&format!("DROP TRIGGER {trigger} ON request_events"))
-        .execute(pool)
-        .await
-        .unwrap_or_else(|_| panic!("failed to drop PostgreSQL trigger {trigger}"));
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER {trigger} ON request_events"
+    )))
+    .execute(pool)
+    .await
+    .unwrap_or_else(|_| panic!("failed to drop PostgreSQL trigger {trigger}"));
     if let Some(function) = function {
-        sqlx::query(&format!("DROP FUNCTION {function}()"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP FUNCTION {function}()")))
             .execute(pool)
             .await
             .unwrap();
@@ -1032,7 +1037,7 @@ async fn exercise_atomic_generation_start(database_url: &str, postgres: bool) {
     if postgres {
         remove_generation_event_failure_trigger(&pool, &trigger, function.as_deref()).await;
     } else {
-        sqlx::query(&format!("DROP TRIGGER {trigger}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TRIGGER {trigger}")))
             .execute(&pool)
             .await
             .unwrap();

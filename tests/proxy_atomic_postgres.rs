@@ -102,15 +102,17 @@ async fn postgres_proxy_terminal_owner_is_exactly_once() {
     let suffix = request_id.simple();
     let function_name = format!("proxy_bind_fault_{suffix}");
     let trigger_name = format!("proxy_bind_fault_trigger_{suffix}");
-    sqlx::query(&format!(
+    // Test-only SQL safety boundary for the DDL below: every identifier and predicate value is
+    // derived from the typed `request_id` UUID rendered as hexadecimal; no external input enters.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $function$ BEGIN RAISE EXCEPTION 'proxy bind fault'; END; $function$"
-    ))
+    )))
     .execute(&inspection)
     .await
     .unwrap();
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TRIGGER {trigger_name} BEFORE UPDATE OF response_object ON request_records FOR EACH ROW WHEN (NEW.id = '{request_id}') EXECUTE FUNCTION {function_name}()"
-    ))
+    )))
     .execute(&inspection)
     .await
     .unwrap();
@@ -151,14 +153,18 @@ async fn postgres_proxy_terminal_owner_is_exactly_once() {
         ArchiveStagingState::Writing,
         "PostgreSQL must roll the staging bind back with the terminal locator"
     );
-    sqlx::query(&format!("DROP TRIGGER {trigger_name} ON request_records"))
-        .execute(&inspection)
-        .await
-        .unwrap();
-    sqlx::query(&format!("DROP FUNCTION {function_name}()"))
-        .execute(&inspection)
-        .await
-        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER {trigger_name} ON request_records"
+    )))
+    .execute(&inspection)
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP FUNCTION {function_name}()"
+    )))
+    .execute(&inspection)
+    .await
+    .unwrap();
     assert!(
         database
             .abandon_archive_staging_attempt(&fault_lease)

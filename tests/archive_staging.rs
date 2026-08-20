@@ -518,7 +518,9 @@ async fn postgres_skip_locked_claims_are_disjoint_across_pools() {
         .await
         .unwrap();
     let schema = format!("archive_staging_{}", Uuid::now_v7().simple());
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+    // Test-only SQL safety boundary: the schema identifier is a literal prefix followed by a
+    // library-generated UUID rendered as lowercase hexadecimal; no external input is present.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&admin)
         .await
         .unwrap();
@@ -569,7 +571,7 @@ async fn postgres_skip_locked_claims_are_disjoint_across_pools() {
     }
     assert_eq!(claimed.len(), 32);
     drop(databases);
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await
         .unwrap();

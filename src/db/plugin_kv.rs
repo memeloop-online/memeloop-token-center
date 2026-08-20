@@ -38,14 +38,15 @@ impl Database {
                 .execute(&mut *transaction)
                 .await?;
         }
-        let length_expression = match self.backend {
-            DatabaseBackend::PostgreSql => "OCTET_LENGTH(value)",
-            DatabaseBackend::Sqlite => "LENGTH(value)",
+        let usage_query = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT COALESCE(SUM(OCTET_LENGTH(value)), 0) AS total_bytes, COALESCE(MAX(CASE WHEN key = $2 THEN OCTET_LENGTH(value) ELSE 0 END), 0) AS current_bytes FROM plugin_kv WHERE plugin_id = $1"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT COALESCE(SUM(LENGTH(value)), 0) AS total_bytes, COALESCE(MAX(CASE WHEN key = $2 THEN LENGTH(value) ELSE 0 END), 0) AS current_bytes FROM plugin_kv WHERE plugin_id = $1"
+            }
         };
-        let usage_query = format!(
-            "SELECT COALESCE(SUM({length_expression}), 0) AS total_bytes, COALESCE(MAX(CASE WHEN key = $2 THEN {length_expression} ELSE 0 END), 0) AS current_bytes FROM plugin_kv WHERE plugin_id = $1"
-        );
-        let usage = sqlx::query(&usage_query)
+        let usage = sqlx::query(usage_query)
             .bind(plugin_id)
             .bind(key)
             .fetch_one(&mut *transaction)

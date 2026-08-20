@@ -600,7 +600,10 @@ SELECT bucket_kind, name, day_bucket, requests, successful_requests,
 "#
             ),
         };
-        let rows = bind_activity_filter!(sqlx::query(&stats_sql))
+        // SQL safety boundary: both outer templates are literals and `activity_source` is chosen
+        // exclusively from the three module constants above. All request filters remain binds;
+        // no caller-provided text is interpolated into this generated statement.
+        let rows = bind_activity_filter!(sqlx::query(sqlx::AssertSqlSafe(stats_sql)))
             .fetch_all(&self.pool)
             .await?;
         let mut projections: BTreeMap<(String, String, i64), StatsProjectionAccumulator> =
