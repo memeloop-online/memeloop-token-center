@@ -62,6 +62,7 @@ artifact_digest=sha256:ddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
   --show-only templates/ingress.yaml \
   --set ingress.gateway.enabled=true \
   --set ingress.gateway.className=public-gateway \
+  --set ingress.gateway.sourceRanges[0]=100.64.0.2/32 \
   --set-string ingress.gateway.annotations.marker=gateway-only \
   --set ingress.gateway.host=gateway.example.test \
   --set ingress.gateway.tlsSecretName=gateway-tls >"$workspace/gateway-ingress.yaml"
@@ -79,6 +80,7 @@ artifact_digest=sha256:ddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
   --show-only templates/ingress.yaml \
   --set ingress.gateway.enabled=true \
   --set ingress.gateway.className=public-gateway \
+  --set ingress.gateway.sourceRanges[0]=100.64.0.2/32 \
   --set-string ingress.gateway.annotations.marker=gateway-only \
   --set ingress.gateway.host=gateway.example.test \
   --set ingress.gateway.tlsSecretName=gateway-tls \
@@ -159,6 +161,7 @@ test "$(grep -c '^kind: Ingress$' "$workspace/control-ingress.yaml")" -eq 1
 test "$(grep -c '^kind: Ingress$' "$workspace/both-ingresses.yaml")" -eq 2
 grep -Fq 'ingressClassName: public-gateway' "$workspace/gateway-ingress.yaml"
 grep -Fq 'marker: gateway-only' "$workspace/gateway-ingress.yaml"
+grep -Fq 'nginx.ingress.kubernetes.io/whitelist-source-range: 100.64.0.2/32' "$workspace/gateway-ingress.yaml"
 grep -Fq 'host: "gateway.example.test"' "$workspace/gateway-ingress.yaml"
 grep -Fq 'secretName: gateway-tls' "$workspace/gateway-ingress.yaml"
 test "$(grep -c -- '- path:' "$workspace/gateway-ingress.yaml")" -eq 5
@@ -190,6 +193,8 @@ fi
 test "$(grep -c -- '- path:' "$workspace/both-ingresses.yaml")" -eq 8
 test "$(grep -c 'marker: gateway-only' "$workspace/both-ingresses.yaml")" -eq 1
 test "$(grep -c 'marker: control-only' "$workspace/both-ingresses.yaml")" -eq 1
+test "$(grep -c 'nginx.ingress.kubernetes.io/whitelist-source-range: 100.64.0.2/32' "$workspace/both-ingresses.yaml")" -eq 1
+test "$(grep -c 'nginx.ingress.kubernetes.io/whitelist-source-range: 10.0.0.0/8' "$workspace/both-ingresses.yaml")" -eq 1
 grep -Fq 'type: LoadBalancer' "$workspace/gateway-load-balancer.yaml"
 if grep -Eq 'type:[[:space:]]*(NodePort|LoadBalancer)' "$workspace/default.yaml"; then
   echo 'Control-bearing Services must remain ClusterIP by default' >&2

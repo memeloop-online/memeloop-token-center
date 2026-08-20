@@ -188,6 +188,9 @@ ingress:
     enabled: false
     className: ""
     annotations: {}
+    # Optional source restriction for a dogfood or private gateway. Non-empty
+    # values render the same Higress/ingress-nginx whitelist annotation as the
+    # control ingress; an empty list keeps the gateway public.
     sourceRanges: []
     host: ""
     tlsSecretName: ""

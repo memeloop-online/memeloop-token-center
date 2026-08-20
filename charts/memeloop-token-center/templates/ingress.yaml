@@ -6,8 +6,10 @@
 {{- fail (printf "ingress.%s.enabled requires roles.%s and its Service to be enabled" $role $role) }}
 {{- end }}
 {{- $annotations := deepCopy $ingressConfig.annotations }}
-{{- if eq $role "control" }}
+{{- if gt (len $ingressConfig.sourceRanges) 0 }}
 {{- $_ := set $annotations "nginx.ingress.kubernetes.io/whitelist-source-range" (join "," $ingressConfig.sourceRanges) }}
+{{- end }}
+{{- if eq $role "control" }}
 {{- $_ := set $annotations "nginx.ingress.kubernetes.io/ssl-redirect" "true" }}
 {{- $_ := set $annotations "nginx.ingress.kubernetes.io/force-ssl-redirect" "true" }}
 {{- end }}
