@@ -27,7 +27,13 @@ pub fn router_for_role(state: AppState, role: RuntimeRole) -> Router {
         .layer(middleware::from_fn(security_headers))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
-        .layer(TraceLayer::new_for_http())
+        // Never attach the raw URI to tracing spans: paths and query strings
+        // are attacker-controlled and commonly carry API keys or signed URLs.
+        // Matched route templates are already recorded by `observe_http` after
+        // routing; the request span only needs the non-secret method.
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &Request| tracing::info_span!("http_request", method = %request.method()),
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), observe_http))
         .with_state(state)
 }

@@ -60,17 +60,13 @@ impl std::fmt::Debug for UpstreamCredential {
                 .debug_struct("UpstreamCredential::LegacySubscriptionBridge")
                 .field("has_secret", &secret.is_some())
                 .finish(),
-            Self::ApiKey { header, prefix, .. } => formatter
+            Self::ApiKey { .. } => formatter
                 .debug_struct("UpstreamCredential::ApiKey")
-                .field("header", header)
-                .field("prefix", prefix)
-                .field("value", &"[redacted]")
+                .field("credential_material", &"[redacted]")
                 .finish(),
             Self::OAuth {
                 refresh_token,
                 expires_at,
-                header,
-                prefix,
                 adapter_state,
                 ..
             } => formatter
@@ -78,8 +74,6 @@ impl std::fmt::Debug for UpstreamCredential {
                 .field("access_token", &"[redacted]")
                 .field("has_refresh_token", &refresh_token.is_some())
                 .field("expires_at", expires_at)
-                .field("header", header)
-                .field("prefix", prefix)
                 .field("has_adapter_state", &adapter_state.is_some())
                 .finish(),
         }

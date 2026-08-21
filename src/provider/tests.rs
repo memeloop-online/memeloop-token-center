@@ -140,6 +140,52 @@ fn subscription_bridge_rejects_unsafe_handles() {
 }
 
 #[test]
+fn credential_debug_omits_custom_auth_metadata_and_secrets() {
+    let api_key = UpstreamCredential::ApiKey {
+        value: "MTC_CANARY_API_KEY_VALUE".to_owned(),
+        header: "MTC-CANARY-API-HEADER".to_owned(),
+        prefix: "MTC_CANARY_API_PREFIX ".to_owned(),
+    };
+    let oauth = UpstreamCredential::OAuth {
+        access_token: "MTC_CANARY_OAUTH_ACCESS".to_owned(),
+        refresh_token: Some("MTC_CANARY_OAUTH_REFRESH".to_owned()),
+        expires_at: Some(42),
+        header: "MTC-CANARY-OAUTH-HEADER".to_owned(),
+        prefix: "MTC_CANARY_OAUTH_PREFIX ".to_owned(),
+        adapter_state: Some(json!({"secret": "MTC_CANARY_ADAPTER_STATE"})),
+    };
+
+    for (credential, kind, canaries) in [
+        (
+            api_key,
+            "UpstreamCredential::ApiKey",
+            &[
+                "MTC_CANARY_API_KEY_VALUE",
+                "MTC-CANARY-API-HEADER",
+                "MTC_CANARY_API_PREFIX",
+            ][..],
+        ),
+        (
+            oauth,
+            "UpstreamCredential::OAuth",
+            &[
+                "MTC_CANARY_OAUTH_ACCESS",
+                "MTC_CANARY_OAUTH_REFRESH",
+                "MTC-CANARY-OAUTH-HEADER",
+                "MTC_CANARY_OAUTH_PREFIX",
+                "MTC_CANARY_ADAPTER_STATE",
+            ][..],
+        ),
+    ] {
+        let rendered = format!("{credential:?}");
+        assert!(rendered.contains(kind));
+        for canary in canaries {
+            assert!(!rendered.contains(canary), "Debug exposed {canary}");
+        }
+    }
+}
+
+#[test]
 fn oauth_adapter_state_is_bounded_redacted_and_backward_compatible() {
     let legacy: UpstreamCredential = serde_json::from_value(json!({
         "type": "oauth",

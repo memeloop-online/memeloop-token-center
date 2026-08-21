@@ -30,6 +30,7 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use tracing::instrument::WithSubscriber;
+use tracing_subscriber::fmt::format::FmtSpan;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
@@ -99,6 +100,8 @@ async fn body_text(response: axum::response::Response) -> String {
 
 #[tokio::test]
 async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canaries() {
+    const QUERY_CANARY: &str = "MTC_CANARY_QUERY_KEY_739c1a";
+    const PATH_CANARY: &str = "MTC_CANARY_PATH_SECRET_f1c2e8";
     const PROXY_CANARY: &str = "MTC_CANARY_PROXY_41c3b7";
     const OAUTH_CANARY: &str = "MTC_CANARY_OAUTH_8fca22";
     const IMPORT_CANARY: &str = "MTC_CANARY_IMPORT_a65049";
@@ -109,6 +112,7 @@ async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canari
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .without_time()
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .with_writer(capture.clone())
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
@@ -134,6 +138,20 @@ async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canari
         let mut config = Config::for_test(database_url);
         config.upstream_openai_url = Some(upstream.uri());
         let state = AppState::initialize(config).await.expect("security log state");
+        for uri in [
+            format!("/healthz?api_key={QUERY_CANARY}"),
+            format!("/ui-assets/{PATH_CANARY}"),
+        ] {
+            let response = api::router_for_role(state.clone(), RuntimeRole::Gateway)
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .expect("URI redaction probe response");
+            assert!(
+                response.status().is_success()
+                    || response.status().is_client_error()
+                    || response.status().is_server_error()
+            );
+        }
         let staging_key = ArchiveStagingKey::new(
             ArchiveStagingOwner::ProxyRequest(uuid::Uuid::now_v7()),
             ArchiveStagingPurpose::Request,
@@ -417,9 +435,15 @@ async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canari
         logs.contains("archive staging cleanup will retry"),
         "worker redaction probe did not reach the tracing collector"
     );
+    assert!(
+        logs.contains("http_request"),
+        "URI redaction probe did not reach the request tracing collector"
+    );
     for canary in [
         PROXY_CANARY,
         OAUTH_CANARY,
+        QUERY_CANARY,
+        PATH_CANARY,
         IMPORT_CANARY,
         DATABASE_CANARY,
         OBJECT_CANARY,
