@@ -107,8 +107,9 @@ export function SchemaJsonObjectField({
       setError('');
       onChange(parsed as Record<string, unknown>, fieldPathId.path, undefined, fieldPathId.$id);
     } catch {
-      setError(t('schemaError.jsonObject'));
-      onChange(undefined, fieldPathId.path, undefined, fieldPathId.$id);
+      const message = t('schemaError.jsonObject');
+      setError(message);
+      onChange(formData ?? {}, fieldPathId.path, { __errors: [message] }, fieldPathId.$id);
     }
   };
   return <div className="schema-json-object">

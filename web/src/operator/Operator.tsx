@@ -593,14 +593,17 @@ function Pricing({ token, tenant, schemas }: { token: string; tenant: string; sc
   const [currency, setCurrency] = useState('USD');
   const [displayCurrency, setDisplayCurrency] = useState('USD');
   const [message, setMessage] = useState('');
+  const loadSequence = useRef(0);
   const scope = queryForTenant(tenant);
   const load = async (requestedCurrency = displayCurrency) => {
+    const sequence = ++loadSequence.current;
     if (!token) return;
     const results = await Promise.allSettled([
       api<ModelPriceView[]>(`/internal/v1/model-prices?currency=${encodeURIComponent(requestedCurrency)}`, token),
       api<ModelPriceUsageSummary>(`/internal/v1/model-prices/usage-summary${scope}`, token),
       api<GenerationPriceView[]>(`/internal/v1/generation-prices?currency=${encodeURIComponent(requestedCurrency)}`, token),
     ]);
+    if (sequence !== loadSequence.current) return;
     const [nextPrices, nextUsage, nextGenerationPrices] = results;
     if (nextPrices.status === 'fulfilled') setPrices(nextPrices.value);
     if (nextUsage.status === 'fulfilled') setUsage(nextUsage.value);
