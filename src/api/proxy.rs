@@ -11,6 +11,16 @@ mod tests;
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
 
+async fn run_bounded_proxy_lifecycle<F>(
+    deadline: tokio::time::Instant,
+    lifecycle: F,
+) -> Result<F::Output, tokio::time::error::Elapsed>
+where
+    F: std::future::Future,
+{
+    tokio::time::timeout_at(deadline, lifecycle).await
+}
+
 pub(super) async fn proxy(
     state: AppState,
     headers: HeaderMap,
