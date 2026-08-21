@@ -141,9 +141,9 @@ async fn finish_claude_login(
     let reauthorizing = ready.reauthorize.is_some();
     let account = match ready.reauthorize {
         Some(target) => {
-            let (_, current) = state
+            let current = state
                 .db
-                .upstream_account_with_credential(
+                .upstream_oauth_identity_credential(
                     target.account_id,
                     state.config.key_pepper.as_bytes(),
                 )

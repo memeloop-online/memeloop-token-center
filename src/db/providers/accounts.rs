@@ -146,6 +146,26 @@ impl Database {
         let credential = open_credential(&ciphertext, key_material)?;
         Ok((upstream_account_view(row)?, credential))
     }
+
+    /// Reads the encrypted identity-bearing OAuth credential for a
+    /// reauthorization comparison. Unlike inference lookup, this deliberately
+    /// includes a locally revoked current generation so a disconnected stable
+    /// account cannot be rebound to a different external identity.
+    pub async fn upstream_oauth_identity_credential(
+        &self,
+        account_id: Uuid,
+        key_material: &[u8],
+    ) -> Result<UpstreamCredential, AppError> {
+        let row = sqlx::query(
+            "SELECT c.credential_ciphertext FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1 AND a.auth_kind = 'oauth'",
+        )
+        .bind(account_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        let ciphertext: String = row.try_get("credential_ciphertext")?;
+        open_credential(&ciphertext, key_material)
+    }
     pub async fn update_upstream_account(
         &self,
         account_id: Uuid,

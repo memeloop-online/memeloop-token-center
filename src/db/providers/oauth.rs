@@ -14,6 +14,83 @@ pub struct ReauthorizeUpstreamAccountInput {
 }
 
 impl Database {
+    pub async fn disconnect_upstream_oauth(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+        expected_updated_at: i64,
+        key_material: &[u8],
+    ) -> Result<(UpstreamAccountView, String, UpstreamCredential), AppError> {
+        let now = unix_millis();
+        let mut tx = self.pool.begin().await?;
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT a.auth_kind, a.oauth_session_id, a.oauth_driver, a.updated_at, c.credential_ciphertext, c.revoked_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a, c"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT a.auth_kind, a.oauth_session_id, a.oauth_driver, a.updated_at, c.credential_ciphertext, c.revoked_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1 AND t.external_id = $2"
+            }
+        };
+        let row = sqlx::query(select)
+            .bind(account_id.to_string())
+            .bind(tenant_external_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::Forbidden)?;
+        let oauth_driver = row
+            .try_get::<Option<String>, _>("oauth_driver")?
+            .ok_or_else(|| {
+                AppError::BadRequest("upstream account has no OAuth lifecycle".into())
+            })?;
+        if row.try_get::<String, _>("auth_kind")? != "oauth"
+            || row
+                .try_get::<Option<String>, _>("oauth_session_id")?
+                .is_none()
+        {
+            return Err(AppError::BadRequest(
+                "upstream account has no OAuth lifecycle".into(),
+            ));
+        }
+        let current_updated_at: i64 = row.try_get("updated_at")?;
+        if current_updated_at != expected_updated_at {
+            return Err(AppError::Conflict(
+                "reload the upstream provider before disconnecting it".into(),
+            ));
+        }
+        let credential = open_credential(
+            &row.try_get::<String, _>("credential_ciphertext")?,
+            key_material,
+        )?;
+        if row.try_get::<Option<i64>, _>("revoked_at")?.is_none() {
+            let updated_at = now.max(current_updated_at.saturating_add(1));
+            sqlx::query(
+                "UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND generation = (SELECT credential_generation FROM upstream_accounts WHERE id = $2) AND revoked_at IS NULL",
+            )
+            .bind(now)
+            .bind(account_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+            let changed = sqlx::query(
+                "UPDATE upstream_accounts SET status = 'disabled', updated_at = $1 WHERE id = $2 AND updated_at = $3",
+            )
+            .bind(updated_at)
+            .bind(account_id.to_string())
+            .bind(current_updated_at)
+            .execute(&mut *tx)
+            .await?;
+            if changed.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "upstream provider changed while it was being disconnected".into(),
+                ));
+            }
+        }
+        tx.commit().await?;
+        let view = self
+            .upstream_account_for_reauthorization(account_id, tenant_external_id)
+            .await?;
+        Ok((view, oauth_driver, credential))
+    }
+
     /// Completes an interactive OAuth flow against an existing stable
     /// upstream identity. The opaque OAuth session id is the replay key: a
     /// repeated poll returns the already-installed generation instead of

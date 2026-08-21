@@ -254,6 +254,85 @@ async fn interactive_reauthorization_preserves_stable_identity_routes_and_replay
 }
 
 #[tokio::test]
+async fn oauth_disconnect_revokes_inference_secret_but_preserves_reauthorization_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("oauth-disconnect.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let original = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "disconnect-tenant".into(),
+                name: "disconnect-oauth".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url": "https://api.example.test"}),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "disconnect-access-secret".into(),
+                    refresh_token: Some("disconnect-refresh-secret".into()),
+                    expires_at: Some(memeloop_token_center::db::unix_millis() + 60_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: Some(
+                        json!({"schema": "test-identity-v1", "account_id": "stable"}),
+                    ),
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("cursor".into()),
+                oauth_refresh_url: Some("https://oauth.example.test/refresh".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+
+    let (disconnected, oauth_driver, credential) = state
+        .db
+        .disconnect_upstream_oauth(
+            original.id,
+            "disconnect-tenant",
+            original.updated_at,
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(oauth_driver, "cursor");
+    assert_eq!(disconnected.id, original.id);
+    assert_eq!(disconnected.status, "disabled");
+    assert!(disconnected.can_reauthorize);
+    assert!(
+        state
+            .db
+            .upstream_account_with_credential(original.id, pepper)
+            .await
+            .is_err()
+    );
+    let retained = state
+        .db
+        .upstream_oauth_identity_credential(original.id, pepper)
+        .await
+        .unwrap();
+    match (retained, credential) {
+        (
+            UpstreamCredential::OAuth {
+                adapter_state: retained,
+                ..
+            },
+            UpstreamCredential::OAuth {
+                adapter_state: disconnected,
+                ..
+            },
+        ) => assert_eq!(retained, disconnected),
+        _ => panic!("disconnect must retain the encrypted OAuth identity credential"),
+    }
+}
+
+#[tokio::test]
 async fn retired_provider_rows_cannot_be_reactivated_through_the_api() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

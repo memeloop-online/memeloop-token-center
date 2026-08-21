@@ -168,9 +168,9 @@ pub(in crate::api) async fn poll_codex_oauth(
             let reauthorizing = ready.reauthorize.is_some();
             let account = match ready.reauthorize {
                 Some(target) => {
-                    let (_, current_credential) = state
+                    let current_credential = state
                         .db
-                        .upstream_account_with_credential(
+                        .upstream_oauth_identity_credential(
                             target.account_id,
                             state.config.key_pepper.as_bytes(),
                         )
@@ -462,6 +462,22 @@ pub(in crate::api) async fn poll_cursor_oauth(
             let reauthorizing = ready.reauthorize.is_some();
             let account = match ready.reauthorize {
                 Some(target) => {
+                    if ready.oauth_driver == "cursor" {
+                        let current = state
+                            .db
+                            .upstream_oauth_identity_credential(
+                                target.account_id,
+                                state.config.key_pepper.as_bytes(),
+                            )
+                            .await?;
+                        if crate::oauth::cursor_account_id(&current)?
+                            != crate::oauth::cursor_account_id(&ready.credential)?
+                        {
+                            return Err(AppError::Conflict(
+                                "reauthorization must use the same Cursor account".into(),
+                            ));
+                        }
+                    }
                     state
                         .db
                         .reauthorize_upstream_account(
@@ -536,6 +552,57 @@ pub(in crate::api) async fn refresh_upstream_oauth(
     Ok(Json(
         refresh_managed_upstream_oauth(&state, account_id, idempotency_key).await?,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct DisconnectUpstreamOAuthRequest {
+    #[serde(default = "default_tenant")]
+    tenant_external_id: String,
+    expected_updated_at: i64,
+}
+
+pub(in crate::api) async fn disconnect_upstream_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Json(body): Json<DisconnectUpstreamOAuthRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "oauth:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    let (account, oauth_driver, credential) = state
+        .db
+        .disconnect_upstream_oauth(
+            account_id,
+            &body.tenant_external_id,
+            body.expected_updated_at,
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?;
+    let provider_revocation = if oauth_driver == crate::oauth::claude::OAUTH_DRIVER {
+        let status = crate::oauth::claude::revoke_claude_credential(
+            &state.http,
+            &credential,
+            state.config.allow_oauth_loopback,
+        )
+        .await?;
+        json!({
+            "kind": "provider_and_local",
+            "attempted": status.attempted,
+            "revoked": status.revoked,
+            "status_code": status.status_code
+        })
+    } else {
+        json!({
+            "kind": "local_only",
+            "attempted": false,
+            "revoked": false
+        })
+    };
+    Ok(Json(json!({
+        "account": account,
+        "provider_revocation": provider_revocation
+    })))
 }
 
 /// Shared by the control endpoint and the proactive worker. It never retries

@@ -18,7 +18,7 @@ pub use cursor::{
     CursorOAuthEndpoints, CursorPollAuthority, CursorPollResult, DEFAULT_CURSOR_LOGIN_URL,
     DEFAULT_CURSOR_POLL_URL, DEFAULT_CURSOR_REFRESH_URL, OAuthLoginStart,
     OAuthReauthorizationTarget, ReadyCursorLogin, StartCursorLogin, poll_cursor_login,
-    refresh_cursor_credential, start_cursor_login,
+    cursor_account_id, refresh_cursor_credential, start_cursor_login,
 };
 #[cfg(test)]
 pub(crate) use endpoint::validate_oauth_endpoint;

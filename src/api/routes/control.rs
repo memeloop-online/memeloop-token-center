@@ -143,6 +143,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(refresh_upstream_oauth),
         )
         .route(
+            "/internal/v1/upstreams/{account_id}/oauth/disconnect",
+            post(disconnect_upstream_oauth),
+        )
+        .route(
             "/internal/v1/model-routes",
             get(list_model_routes).post(create_model_route),
         )
