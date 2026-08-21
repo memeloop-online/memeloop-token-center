@@ -2853,7 +2853,7 @@ paths:
     get:
       tags: [OpenAI compatible]
       operationId: listAllowedModels
-      summary: List priced models allowed by the current client policy
+      summary: List currently routable models granted to the current credential
       security: [{ clientBearer: [] }]
       responses:
         '200':
@@ -5334,11 +5334,20 @@ components:
           type: array
           items:
             type: object
-            required: [id, object, owned_by]
+            required: [id, object, owned_by, modalities]
             properties:
               id: { type: string }
               object: { const: model }
-              owned_by: { const: memeloop-token-center }
+              owned_by: { const: memeloop }
+              modalities:
+                type: array
+                uniqueItems: true
+                items:
+                  type: string
+                  enum: [text, image, video, embedding]
+              generation_schema:
+                type: object
+                description: JSON Schema for downstream input.parameters only. Omitted unless every effective generation candidate has the same safe schema.
     OpenAIChatRequest:
       type: object
       required: [model, messages]

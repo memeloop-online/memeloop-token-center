@@ -7,8 +7,9 @@ mod routes;
 mod types;
 
 pub use types::{
-    CreateRoutedModelRouteInput, CredentialRoutingView, ReplaceCredentialRoutingInput,
-    ReplaceRouteRoutingInput, RouteRoutingView, RouteSelectionOptions, UpdateRoutedModelRouteInput,
+    CreateRoutedModelRouteInput, CredentialRoutingView, GrantedModelCapabilitySource,
+    ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput, RouteRoutingView,
+    RouteSelectionOptions, UpdateRoutedModelRouteInput,
 };
 
 pub(crate) use associations::{

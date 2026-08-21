@@ -1,6 +1,17 @@
 use serde::Serialize;
 use uuid::Uuid;
 
+/// One concrete, currently usable provider candidate behind a model route that
+/// the credential may use. Callers use it only to derive downstream model
+/// capabilities, without exposing provider or route identifiers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrantedModelCapabilitySource {
+    pub public_model: String,
+    pub protocol: String,
+    pub driver: String,
+    pub config_json: String,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RouteSelectionOptions {
     pub upstream_account_hint: Option<Uuid>,

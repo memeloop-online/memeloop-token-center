@@ -636,6 +636,15 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
         .into_iter()
         .collect()
     );
+    let generation_model = exact_public_models_before["data"]
+        .as_array()
+        .expect("exact public model list")
+        .iter()
+        .find(|model| model["id"] == "secure-generation-model")
+        .expect("generation model capability");
+    assert_eq!(generation_model["owned_by"], "memeloop");
+    assert_eq!(generation_model["modalities"], json!(["image"]));
+    assert!(generation_model.get("generation_schema").is_none());
     assert_eq!(
         classified_public_models_before["data"]
             .as_array()

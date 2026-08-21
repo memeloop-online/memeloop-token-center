@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::super::{AppError, Database, parse_uuid};
 use crate::provider::{ResolvedUpstream, open_credential, validate_config};
 
-use super::types::RouteSelectionOptions;
+use super::types::{GrantedModelCapabilitySource, RouteSelectionOptions};
 
 impl Database {
     pub async fn reload_persisted_generation_upstream(
@@ -180,6 +180,60 @@ impl Database {
         .await?;
         rows.into_iter()
             .map(|row| row.try_get::<String, _>("model").map_err(AppError::from))
+            .collect()
+    }
+
+    /// Returns only candidates that can be selected right now by the normal
+    /// exact-route or route-group authorization path.
+    pub async fn granted_model_capability_sources(
+        &self,
+        key_id: Uuid,
+        tenant_id: Uuid,
+    ) -> Result<Vec<GrantedModelCapabilitySource>, AppError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT r.public_model, r.protocol, account.driver, account.config_json
+             FROM model_routes r
+             JOIN model_route_eligible_upstream_accounts candidate
+               ON candidate.tenant_id = r.tenant_id AND candidate.model_route_id = r.id
+             JOIN upstream_accounts account
+               ON account.tenant_id = r.tenant_id AND account.id = candidate.upstream_account_id
+              AND account.status = 'active'
+             JOIN upstream_credentials credential
+               ON credential.upstream_account_id = account.id
+              AND credential.generation = account.credential_generation
+              AND credential.revoked_at IS NULL
+             WHERE r.tenant_id = $1 AND r.enabled = 1
+               AND (
+                 EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $2 AND g.model_route_id = r.id)
+                 OR EXISTS (
+                   SELECT 1 FROM routing_grants g
+                   JOIN model_route_group_memberships membership
+                     ON membership.tenant_id = g.tenant_id AND membership.route_group_id = g.route_group_id
+                   WHERE g.tenant_id = r.tenant_id AND g.key_id = $2
+                     AND g.route_group_id IS NOT NULL AND membership.model_route_id = r.id
+                 )
+               )
+             ORDER BY r.public_model, r.protocol, account.driver, account.config_json
+             LIMIT 1001",
+        )
+        .bind(tenant_id.to_string())
+        .bind(key_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        if rows.len() > 1000 {
+            return Err(AppError::BadRequest(
+                "authorized model capability set exceeds the safety limit".into(),
+            ));
+        }
+        rows.into_iter()
+            .map(|row| {
+                Ok(GrantedModelCapabilitySource {
+                    public_model: row.try_get("public_model")?,
+                    protocol: row.try_get("protocol")?,
+                    driver: row.try_get("driver")?,
+                    config_json: row.try_get("config_json")?,
+                })
+            })
             .collect()
     }
 
