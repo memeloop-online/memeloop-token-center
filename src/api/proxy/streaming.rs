@@ -1,5 +1,35 @@
 use super::*;
 
+struct AbortTaskOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortTaskOnDrop<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(task))
+    }
+
+    fn abort(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+impl<T> Drop for AbortTaskOnDrop<T> {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+async fn run_bounded_proxy_lifecycle<F>(
+    deadline: tokio::time::Instant,
+    lifecycle: F,
+) -> Result<F::Output, tokio::time::error::Elapsed>
+where
+    F: std::future::Future,
+{
+    tokio::time::timeout_at(deadline, lifecycle).await
+}
+
 pub(super) struct StreamingResponse<'a> {
     pub(super) state: &'a AppState,
     pub(super) upstream: reqwest::Response,
@@ -68,6 +98,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         // Streaming responses outlive the handler response. Keep the workload
         // permit inside this task until archive and billing finalization end.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
+        let lifecycle_started = tokio::time::Instant::now();
+        let stream_deadline = lifecycle_started + MAX_PROXY_STREAM_LIFETIME;
+        let lifecycle_deadline = lifecycle_started + MAX_PROXY_LIFETIME;
+        let lifecycle = async move {
         let mut upstream_stream = upstream.bytes_stream();
         let mut archive_writer = archive_writer;
         let mut response_archive_attempt = response_archive_attempt;
@@ -86,12 +120,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let mut response_bytes = 0_usize;
         let mut delivered_any = false;
         let mut delivered_billable = false;
-        let hard_deadline = tokio::time::Instant::now() + MAX_PROXY_LIFETIME;
         let (archive_lease_lost_sender, mut archive_lease_lost_receiver) =
             tokio::sync::mpsc::channel(1);
         let archive_heartbeat_task = response_archive_attempt.clone().map(|mut attempt| {
             let heartbeat_database = background_state.db.clone();
-            tokio::spawn(async move {
+            AbortTaskOnDrop::new(tokio::spawn(async move {
                 let mut heartbeat = tokio::time::interval(Duration::from_millis(
                     u64::try_from(ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS).unwrap_or(20_000),
                 ));
@@ -107,13 +140,13 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         break;
                     }
                 }
-            })
+            }))
         });
         loop {
             let polled = tokio::select! {
                 biased;
                 _ = archive_lease_lost_receiver.recv(), if response_archive_attempt.is_some() => None,
-                next = tokio::time::timeout_at(hard_deadline, upstream_stream.next()) => Some(next),
+                next = tokio::time::timeout_at(stream_deadline, upstream_stream.next()) => Some(next),
             };
             let Some(polled) = polled else {
                 if let Some(writer) = archive_writer.take() {
@@ -496,7 +529,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         {
             abandon_proxy_archive_attempt(&background_state.db, attempt).await;
         }
-        if let Some(task) = archive_heartbeat_task {
+        if let Some(mut task) = archive_heartbeat_task {
             task.abort();
         }
         if terminal_result.is_err() {
@@ -504,6 +537,17 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             // Preserve this request-scoped archive until its database owner is
             // known; deleting it here could leave a committed row dangling.
             tracing::error!(%request_id, stage = "terminal_transaction", "proxy request finalization failed");
+        }
+        };
+        if run_bounded_proxy_lifecycle(lifecycle_deadline, lifecycle)
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                %request_id,
+                stage = "lifecycle_deadline",
+                "proxy request lifecycle exceeded its absolute deadline"
+            );
         }
     });
     let mut response = Response::builder()

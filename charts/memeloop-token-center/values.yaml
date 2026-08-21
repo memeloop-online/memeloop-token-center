@@ -218,9 +218,10 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 topologySpreadConstraints: []
-# Shared upstream requests may run for up to ten minutes. Keep enough time for
-# Axum's graceful shutdown to drain them during a rollout.
-terminationGracePeriodSeconds: 660
+# Shared HTTP requests may run for 21 minutes, and the worker receives a final
+# 30-second shutdown window. Keep the Kubernetes deadline above both so a
+# rollout cannot truncate an admitted stream or synchronous generation.
+terminationGracePeriodSeconds: 1320
 revisionHistoryLimit: 5
 # Use Recreate for the one-time transition from releases that predate atomic
 # request admission. RollingUpdate is safe again once every running replica

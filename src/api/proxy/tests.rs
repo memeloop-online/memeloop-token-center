@@ -370,6 +370,23 @@ async fn exhausted_proxy_lifecycle_budget_rejects_before_upstream_or_reservation
     drop(held);
 }
 
+#[tokio::test(start_paused = true)]
+async fn absolute_proxy_deadline_releases_the_lifecycle_permit() {
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = permits.clone().acquire_owned().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let task = tokio::spawn(async move {
+        let _permit = permit;
+        let _ = run_bounded_proxy_lifecycle(deadline, std::future::pending::<()>()).await;
+    });
+    tokio::task::yield_now().await;
+    assert!(permits.clone().try_acquire_owned().is_err());
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    task.await.unwrap();
+    assert!(permits.try_acquire_owned().is_ok());
+}
+
 fn archive_file_count(root: &std::path::Path) -> usize {
     std::fs::read_dir(root)
         .map(|entries| {

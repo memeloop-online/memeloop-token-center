@@ -14,7 +14,10 @@ use crate::{
     model::UsageReservation,
 };
 
-pub(crate) const MAX_PROXY_LIFETIME: Duration = Duration::from_secs(20 * 60);
+pub(crate) const MAX_PROXY_STREAM_LIFETIME: Duration = Duration::from_secs(20 * 60);
+pub(crate) const MAX_PROXY_FINALIZATION_LIFETIME: Duration = Duration::from_secs(30);
+pub(crate) const MAX_PROXY_LIFETIME: Duration =
+    MAX_PROXY_STREAM_LIFETIME.saturating_add(MAX_PROXY_FINALIZATION_LIFETIME);
 pub(crate) const MAX_DOWNSTREAM_SEND_WAIT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_UNCONFIRMED_DELIVERY_BYTES: usize = 64 * 1024;
 

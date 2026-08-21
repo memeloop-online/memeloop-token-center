@@ -72,9 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     match cli.command {
         Command::Migrate => {
-            let database =
-                Database::connect_with_max(&config.database_url, config.database_max_connections)
-                    .await?;
+            let database = Database::connect_for_migration(
+                &config.database_url,
+                config.database_max_connections,
+            )
+            .await?;
             database.migrate().await?;
             info!("database schema is current");
         }
@@ -90,9 +92,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 (None, None)
             };
             info!(%address, ?role, "token center listening");
-            let result = axum::serve(listener, api::router_for_role(state, role))
-                .with_graceful_shutdown(shutdown_signal())
-                .await;
+            let result = memeloop_token_center::server::serve(
+                listener,
+                api::router_for_role(state, role),
+                shutdown_signal(),
+            )
+            .await;
             if let Some(sender) = worker_shutdown {
                 let _ = sender.send(true);
             }

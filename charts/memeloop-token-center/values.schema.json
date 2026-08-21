@@ -445,7 +445,7 @@
       "type": "array",
       "items": { "$ref": "#/definitions/topologySpreadConstraint" }
     },
-    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1320 },
     "revisionHistoryLimit": { "type": "integer", "minimum": 0 },
     "probes": {
       "type": "object",

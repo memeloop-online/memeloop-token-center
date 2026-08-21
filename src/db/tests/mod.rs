@@ -1,3 +1,4 @@
+mod connection_limits;
 mod migrations;
 mod operations;
 mod proxy_lifecycle;

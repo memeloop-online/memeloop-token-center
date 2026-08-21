@@ -67,6 +67,21 @@ pub(crate) use session_projection::{
 pub use time::unix_millis;
 use validation::*;
 
+const POSTGRES_SERVE_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 30000";
+const POSTGRES_SERVE_LOCK_TIMEOUT: &str = "SET lock_timeout = 10000";
+const POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT: &str =
+    "SET idle_in_transaction_session_timeout = 30000";
+const POSTGRES_MIGRATION_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 900000";
+const POSTGRES_MIGRATION_LOCK_TIMEOUT: &str = "SET lock_timeout = 60000";
+const POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT: &str =
+    "SET idle_in_transaction_session_timeout = 300000";
+
+#[derive(Clone, Copy)]
+enum ConnectionProfile {
+    Serve,
+    Migration,
+}
+
 pub(crate) use billing::validate_entitlement_operation;
 pub use billing::{
     ApplyCloudEntitlementInput, ApplyCloudEntitlementResult, CancelEntitlementInput,
@@ -185,6 +200,31 @@ impl Database {
         database_url: &str,
         maximum_connections: u32,
     ) -> Result<Self, sqlx::Error> {
+        Self::connect_with_profile(database_url, maximum_connections, ConnectionProfile::Serve)
+            .await
+    }
+
+    pub async fn connect_for_migration(
+        database_url: &str,
+        maximum_connections: u32,
+    ) -> Result<Self, sqlx::Error> {
+        Self::connect_with_profile(
+            database_url,
+            maximum_connections,
+            ConnectionProfile::Migration,
+        )
+        .await
+    }
+
+    pub(crate) async fn close(&self) {
+        self.pool.close().await;
+    }
+
+    async fn connect_with_profile(
+        database_url: &str,
+        maximum_connections: u32,
+        profile: ConnectionProfile,
+    ) -> Result<Self, sqlx::Error> {
         // `$n` placeholders are accepted by both PostgreSQL and SQLite. `sqlx::Any` deliberately
         // does not translate `?` into PostgreSQL placeholders, so all queries in this module use
         // the shared `$n` form.
@@ -212,6 +252,32 @@ impl Database {
                 Box::pin(async move {
                     sqlx::query("PRAGMA busy_timeout = 10000")
                         .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            });
+        } else {
+            pool_options = pool_options.after_connect(move |connection, _metadata| {
+                Box::pin(async move {
+                    let (statement_timeout, lock_timeout, idle_transaction_timeout) = match profile
+                    {
+                        ConnectionProfile::Serve => (
+                            POSTGRES_SERVE_STATEMENT_TIMEOUT,
+                            POSTGRES_SERVE_LOCK_TIMEOUT,
+                            POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT,
+                        ),
+                        ConnectionProfile::Migration => (
+                            POSTGRES_MIGRATION_STATEMENT_TIMEOUT,
+                            POSTGRES_MIGRATION_LOCK_TIMEOUT,
+                            POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT,
+                        ),
+                    };
+                    sqlx::query(statement_timeout)
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query(lock_timeout).execute(&mut *connection).await?;
+                    sqlx::query(idle_transaction_timeout)
+                        .execute(&mut *connection)
                         .await?;
                     Ok(())
                 })

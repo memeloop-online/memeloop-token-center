@@ -21,6 +21,7 @@ pub mod provider;
 mod proxy_lifecycle;
 mod request_event_stream;
 pub mod schema;
+pub mod server;
 pub mod session_archive_import;
 pub mod worker;
 
@@ -55,11 +56,17 @@ pub struct AppState {
 
 impl AppState {
     pub async fn initialize(config: Config) -> anyhow_free::Result<Self> {
+        if config.run_migrations_on_start {
+            let migration_db = Database::connect_for_migration(
+                &config.database_url,
+                config.database_max_connections,
+            )
+            .await?;
+            migration_db.migrate().await?;
+            migration_db.close().await;
+        }
         let db = Database::connect_with_max(&config.database_url, config.database_max_connections)
             .await?;
-        if config.run_migrations_on_start {
-            db.migrate().await?;
-        }
         let archive = ArchiveStore::from_config(&config).await?;
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())?;
         plugins.validate_stored_configurations().await?;
