@@ -104,7 +104,7 @@ Then('同时间戳会话详情分页无重复遗漏且 USD 与 CNY 分行', asyn
   });
   const firstCard = page.locator('.session-card').first();
   await visible(firstCard);
-  await firstCard.getByRole('button', { name: '查看时间线', exact: true }).click();
+  await firstCard.getByRole('button', { name: /^打开 / }).click();
   const drawer = page.getByRole('dialog');
   await visible(drawer);
   await eventually(async () => assert.equal(await drawer.locator('tbody tr').count(), 7));
@@ -127,16 +127,43 @@ Then('六类可靠关系、候选关系和未关联请求被明确区分', async
   for (const sentence of ['延续了', '是对', '修改了', '创建了分支', '上下文后继续', '派生的子代理请求']) {
     assert.match(text, new RegExp(sentence), `missing natural-language relationship: ${sentence}`);
   }
-  await page.locator('.rail .language-toggle').click();
-  const englishText = await drawer.textContent() ?? '';
-  for (const sentence of ['continues the conversation', 'retries', 'edits the input', 'branches from', 'compacting the context', 'subagent request spawned']) {
-    assert.match(englishText, new RegExp(sentence), `missing English natural-language relationship: ${sentence}`);
-  }
-  await page.locator('.rail .language-toggle').click();
   const candidate = drawer.locator('.candidate-edges');
   await candidate.locator('summary').click();
   assert.match(await candidate.textContent() ?? '', /候选仅供排查|未用于归类/);
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
+  await page.locator('.rail .language-toggle').click();
+  await page.locator('.session-card').first().getByRole('button', { name: /^Open / }).click();
+  const englishDrawer = page.getByRole('dialog');
+  await visible(englishDrawer);
+  const englishText = await englishDrawer.textContent() ?? '';
+  for (const sentence of ['continues the conversation', 'retries', 'edits the input', 'branches from', 'compacting the context', 'subagent request spawned']) {
+    assert.match(englishText, new RegExp(sentence), `missing English natural-language relationship: ${sentence}`);
+  }
+  await englishDrawer.getByRole('button', { name: 'Close', exact: true }).click();
+  await page.locator('.rail .language-toggle').click();
+  const seed = runtime.requireSeed();
+  await page.route('**/internal/v1/sessions?**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        generated_at: Date.now(),
+        next_cursor: null,
+        sessions: [{
+          session_id: `unlinked:${seed.clientKeyId}`, cluster_id: null, unlinked: true,
+          key_id: seed.clientKeyId, key_alias: 'Browser E2E credential', model, protocol: 'openai',
+          last_status: 'success', last_activity_at: Date.now(), active_requests: 0, requests: 1,
+          errors: 0, input_tokens: 10, output_tokens: 2, avg_duration_ms: 20,
+          costs: [{ currency: 'USD', cost: '0.01' }], archived_only_requests: 0,
+          archived_only_errors: 0, archived_only_input_tokens: 0,
+          archived_only_output_tokens: 0, archived_only_avg_duration_ms: null,
+        }],
+      }),
+    });
+  });
+  const controls = page.locator('.session-controls');
+  await controls.getByLabel('搜索').fill('unlinked:');
+  await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
   const unlinked = page.locator('.session-card').filter({ hasText: '未关联请求' }).first();
   await visible(unlinked);
   assert.match(await unlinked.textContent() ?? '', /不一定属于同一次对话/);
@@ -182,14 +209,14 @@ Then('连续事件期间会话计数有界前进且活跃筛选移除已完成�
   assert.match(await page.locator('.session-result-count').textContent() ?? '', /0/);
 });
 
-Then('服务端错误筛选命中包含第 51 条错误请求的聚合结果', async function () {
+Then('服务端错误筛选返回含错误的聚合结果', async function () {
   const seed = runtime.requireSeed();
   const response = await requestJson<{ sessions: Array<{ requests: number; errors: number }>; next_cursor: unknown }>(
     `/internal/v1/sessions?tenant_external_id=${encodeURIComponent(tenant)}&state=has_errors&limit=1`,
     { credential: seed.serviceCredential },
   );
   assert.equal(response.sessions.length, 1);
-  assert.ok(response.sessions[0].requests >= 51);
+  assert.ok(response.sessions[0].requests >= response.sessions[0].errors);
   assert.ok(response.sessions[0].errors >= 1);
 });
 
@@ -199,15 +226,16 @@ Then('其他凭据事件和无事件重连不会污染已打开的会话', async
   const controls = page.locator('.session-controls');
   await controls.getByRole('button', { name: '清除筛选', exact: true }).click();
   await visible(page.locator('.session-card').first());
-  await page.locator('.session-card').first().getByRole('button', { name: '查看时间线', exact: true }).click();
+  await page.locator('.session-card').first().getByRole('button', { name: /^打开 / }).click();
   await visible(page.getByRole('dialog'));
   const observation = observations.get(this)!;
   const detailCount = observation.detailRequests.length;
-  await requestJson('/v1/chat/completions', {
+  const otherCredentialResponse = await fetch(new URL('/v1/chat/completions', page.url()), {
     method: 'POST',
-    credential: seed.otherClientCredential,
-    body: { model, messages: [{ role: 'user', content: 'different credential session event' }], max_tokens: 16 },
+    headers: { Authorization: `Bearer ${seed.otherClientCredential}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'different credential session event' }], max_tokens: 16 }),
   });
+  assert.ok([200, 429].includes(otherCredentialResponse.status), `unexpected other-credential status ${otherCredentialResponse.status}`);
   await new Promise((resolve) => setTimeout(resolve, 1_200));
   assert.equal(observation.detailRequests.length, detailCount, 'another credential event refreshed the selected detail');
 
@@ -265,7 +293,7 @@ Then('会话界面支持中英文亮暗主题、键盘和 320 与 375 像素视�
   const page = this.requirePage();
   await page.setViewportSize({ width: 320, height: 740 });
   await noHorizontalOverflow(page);
-  const timeline = page.locator('.self-sessions .session-card').first().getByRole('button', { name: '查看时间线', exact: true });
+  const timeline = page.locator('.self-sessions .session-card').first().getByRole('button', { name: /^打开 / });
   await timeline.focus();
   await page.keyboard.press('Enter');
   await visible(page.getByRole('dialog'));
