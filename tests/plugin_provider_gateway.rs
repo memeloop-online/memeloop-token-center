@@ -6,7 +6,8 @@ use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
     db::{
-        CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput, StatsFilter, unix_millis,
+        CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput,
+        ReplaceCredentialRoutingInput, StatsFilter, unix_millis,
     },
     model::KeyPolicy,
     provider::UpstreamCredential,
@@ -83,7 +84,8 @@ async fn plugin_provider_onboards_through_the_real_management_api() {
                         "upstream_account_id": account["id"],
                         "upstream_model": "plugin-private-model",
                         "protocol": "openai",
-                        "priority": 0
+                        "priority": 0,
+                        "custom_model_confirmed": true
                     }))
                     .unwrap(),
                 ))
@@ -166,7 +168,19 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         )
         .await
         .unwrap();
-    state
+    let requested_route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: "component-provider-tenant".into(),
+            public_model: "requested-model".into(),
+            upstream_account_id: account.id,
+            upstream_model: "vendor-route-model".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let rewritten_route = state
         .db
         .create_model_route(CreateModelRouteInput {
             tenant_external_id: "component-provider-tenant".into(),
@@ -176,6 +190,26 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             protocol: "openai".into(),
             priority: 0,
         })
+        .await
+        .unwrap();
+    let current_routing = state
+        .db
+        .credential_routing(issued.key_id, "component-provider-tenant")
+        .await
+        .unwrap();
+    let mut route_ids = current_routing.route_ids;
+    route_ids.extend([requested_route.id, rewritten_route.id]);
+    state
+        .db
+        .replace_credential_routing(
+            issued.key_id,
+            ReplaceCredentialRoutingInput {
+                tenant_external_id: "component-provider-tenant".into(),
+                route_ids,
+                route_group_ids: current_routing.route_group_ids,
+                expected_grant_revision: current_routing.grant_revision,
+            },
+        )
         .await
         .unwrap();
 
