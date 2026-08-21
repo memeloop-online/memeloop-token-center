@@ -125,6 +125,325 @@
   grid-template-columns: minmax(0, 1.35fr) minmax(340px, .65fr);
 }
 
+.group-manager {
+  margin-top: 18px;
+}
+
+.routing-group-managers {
+  align-items: start;
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.provider-group-summary {
+  margin-top: 7px;
+}
+
+.group-create,
+.group-rename {
+  align-items: end;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  margin: 14px 0;
+}
+
+.group-create label,
+.group-rename label,
+.credential-group-filter {
+  color: #81949c;
+  font-size: 10px;
+}
+
+.group-create input,
+.group-rename input,
+.credential-group-filter select {
+  margin-top: 5px;
+}
+
+.group-editor-layout {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(180px, .35fr) minmax(280px, .65fr);
+}
+
+.group-list {
+  border: 1px solid #263b41;
+  display: grid;
+  max-height: 340px;
+  overflow-y: auto;
+}
+
+.group-list button {
+  align-items: flex-start;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid #21343a;
+  border-radius: 0;
+  color: #a9bcc1;
+  display: flex;
+  justify-content: space-between;
+  margin: 0;
+  padding: 10px 12px;
+  text-align: left;
+}
+
+.group-list button.active {
+  background: #13302f;
+  color: #7de1d2;
+}
+
+.group-list small {
+  color: #657b82;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.group-editor {
+  min-width: 0;
+}
+
+.group-editor-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.multi-combobox {
+  margin-bottom: 12px;
+  position: relative;
+}
+
+.multi-combobox > label {
+  color: #91a5ac;
+  display: block;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.field-hint {
+  color: #647a81;
+  display: block;
+  font-size: 10px;
+  line-height: 1.45;
+  margin: -2px 0 6px;
+}
+
+.field-hint.field-error {
+  color: #e28484;
+}
+
+.multi-combobox-control {
+  align-items: center;
+  background: #071115;
+  border: 1px solid #2c434a;
+  cursor: text;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-height: 40px;
+  padding: 5px;
+}
+
+.multi-combobox-control:focus-within {
+  border-color: #55cdbb;
+  box-shadow: 0 0 0 2px rgb(85 205 187 / 15%);
+}
+
+.multi-combobox-control input {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  flex: 1 1 130px;
+  margin: 0;
+  min-width: 100px;
+  padding: 5px;
+}
+
+.selection-chip,
+.table-chip-list span {
+  align-items: center;
+  background: #17302f;
+  border: 1px solid #32645e;
+  color: #83dace;
+  display: inline-flex;
+  font-size: 10px;
+  gap: 5px;
+  max-width: 100%;
+  padding: 4px 6px;
+}
+
+.selection-chip.pending {
+  border-style: dashed;
+}
+
+.selection-chip button {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  line-height: 1;
+  margin: 0;
+  padding: 0 2px;
+}
+
+.combobox-popover {
+  background: #0b171b;
+  border: 1px solid #355159;
+  box-shadow: 0 12px 28px rgb(0 0 0 / 34%);
+  display: grid;
+  left: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  position: absolute;
+  right: 0;
+  top: calc(100% - 8px);
+  z-index: 20;
+}
+
+.combobox-popover button {
+  align-items: flex-start;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: #b6c9ce;
+  display: flex;
+  justify-content: space-between;
+  margin: 0;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.combobox-popover button.active,
+.combobox-popover button:hover {
+  background: #17302f;
+  color: #83dace;
+}
+
+.combobox-popover small {
+  color: #688087;
+  font-size: 9px;
+  margin-left: 10px;
+}
+
+.combobox-empty {
+  color: #63777e;
+  font-size: 11px;
+  padding: 11px;
+}
+
+.model-combobox {
+  margin-bottom: 12px;
+  position: relative;
+}
+
+.model-combobox > label {
+  color: #91a5ac;
+  display: block;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.model-combobox > input {
+  margin: 0;
+}
+
+.catalog-status {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  margin-top: 5px;
+}
+
+.catalog-status .field-hint {
+  margin: 0;
+}
+
+.catalog-status button {
+  flex: 0 0 auto;
+  font-size: 10px;
+  margin: 0;
+  padding: 5px 8px;
+}
+
+.model-options button > span {
+  display: grid;
+  gap: 3px;
+}
+
+.model-options button > span:first-child {
+  min-width: 0;
+}
+
+.model-options b {
+  overflow-wrap: anywhere;
+}
+
+.model-limits {
+  color: #789096;
+  font-size: 9px;
+  text-align: right;
+}
+
+.custom-model-confirm {
+  background: #151d1c;
+  border: 1px solid #6a5b32;
+  color: #d5bf7a;
+  font-size: 11px;
+  line-height: 1.45;
+  margin-top: 8px;
+  padding: 9px;
+}
+
+.custom-model-confirm label {
+  align-items: flex-start;
+  display: flex;
+  gap: 8px;
+}
+
+.custom-model-confirm input {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  width: auto;
+}
+
+.custom-model-confirm.disabled {
+  border-color: #693d3d;
+  color: #e28484;
+}
+
+.notice.compact {
+  margin-top: 8px;
+  padding: 8px 10px;
+}
+
+.route-group-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.table-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.credential-group-chips {
+  margin-top: 10px;
+}
+
+.credential-group-filter {
+  display: block;
+  margin: 12px 0;
+  max-width: 260px;
+}
+
+.routing-editor .multi-combobox {
+  margin-top: 12px;
+}
+
 .managed-resource {
   border: 1px solid #24383e;
   min-width: 0;
@@ -266,14 +585,14 @@
   overflow-wrap: anywhere;
 }
 
-.tag-list {
+.model-name-list {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
   padding-top: 10px;
 }
 
-.tag-list code {
+.model-name-list code {
   background: #0d1d21;
   overflow-wrap: anywhere;
   padding: 5px 7px;
@@ -304,6 +623,32 @@
 .authorization-form > .button-row {
   flex-wrap: wrap;
   margin-top: 16px;
+}
+
+.device-authorization {
+  background: #151d1c;
+  border: 1px solid #6a5b32;
+  margin-top: 12px;
+  padding: 12px;
+}
+
+.device-authorization p {
+  color: #d5bf7a;
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 0 0 9px;
+}
+
+.device-authorization b,
+.device-authorization code {
+  display: block;
+}
+
+.device-authorization code {
+  color: #f4df9b;
+  font-size: 18px;
+  letter-spacing: .12em;
+  margin-top: 5px;
 }
 
 .pricing-page {
@@ -646,6 +991,22 @@
   color: #087d70;
 }
 
+:root[data-theme='light'] .device-authorization {
+  background: #fff9e8;
+  border-color: #d6bd77;
+}
+
+:root[data-theme='light'] .device-authorization p,
+:root[data-theme='light'] .device-authorization code {
+  color: #765f17;
+}
+
+:root[data-theme='light'] .custom-model-confirm {
+  background: #fff9e8;
+  border-color: #d6bd77;
+  color: #765f17;
+}
+
 :root[data-theme='light'] .source-card b {
   color: #24444a;
 }
@@ -655,9 +1016,38 @@
 :root[data-theme='light'] .usage-controls,
 :root[data-theme='light'] .policy-chips span,
 :root[data-theme='light'] .candidate-list > div,
-:root[data-theme='light'] .tag-list code {
+:root[data-theme='light'] .model-name-list code {
   background: #f3f8f6;
   border-color: #c5d6d2;
+}
+
+:root[data-theme='light'] .multi-combobox-control,
+:root[data-theme='light'] .combobox-popover {
+  background: #fff;
+  border-color: #b9cfca;
+}
+
+:root[data-theme='light'] .combobox-popover {
+  box-shadow: 0 12px 28px rgb(45 72 69 / 18%);
+}
+
+:root[data-theme='light'] .selection-chip,
+:root[data-theme='light'] .table-chip-list span,
+:root[data-theme='light'] .group-list button.active,
+:root[data-theme='light'] .combobox-popover button.active,
+:root[data-theme='light'] .combobox-popover button:hover {
+  background: #dcefeb;
+  border-color: #9cc8c0;
+  color: #087d70;
+}
+
+:root[data-theme='light'] .group-list {
+  border-color: #c5d6d2;
+}
+
+:root[data-theme='light'] .group-list button {
+  border-bottom-color: #d4e1de;
+  color: #37575d;
 }
 
 :root[data-theme='light'] .usage-chart-point {
@@ -670,7 +1060,9 @@
 
 @media (width <= 1000px) {
   .provider-layout,
-  .management-layout {
+  .management-layout,
+  .group-editor-layout,
+  .routing-group-managers {
     grid-template-columns: 1fr;
   }
 
@@ -733,7 +1125,10 @@
   }
 
   .managed-resource-header,
-  .schema-array-item {
+  .schema-array-item,
+  .group-create,
+  .group-rename,
+  .route-group-grid {
     align-items: stretch;
     grid-template-columns: minmax(0, 1fr);
   }

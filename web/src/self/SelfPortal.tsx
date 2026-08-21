@@ -117,6 +117,7 @@ export function SelfPortal() {
   const [credential, setCredential] = useState('');
   const [stats, setStats] = useState<SelfStats>();
   const [credentialView, setCredentialView] = useState<KeyView>();
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [limitSnapshot, setLimitSnapshot] = useState<KeyLimitSnapshot>();
   const [requests, setRequests] = useState<RequestView[]>([]);
   const [requestFilters, setRequestFilters] = useState<RequestFilters>(emptyRequestFilters);
@@ -149,10 +150,11 @@ export function SelfPortal() {
         api<RequestView[]>(requestsPath(requestFilters), value),
         api<GenerationJob[]>('/self/v1/generations?limit=100', value),
         api<ConversationCluster[]>(conversationsPath(), value),
+        api<{ data: Array<{ id: string }> }>('/v1/models', value),
       ]);
       const failures = results.filter((result) => result.status === 'rejected');
       if (failures.length === results.length) throw failures[0].reason;
-      const [nextCredential, nextLimits, nextStats, nextRequests, nextGenerations, nextConversations] = results;
+      const [nextCredential, nextLimits, nextStats, nextRequests, nextGenerations, nextConversations, nextModels] = results;
       setCredentialView(nextCredential.status === 'fulfilled' ? nextCredential.value : undefined);
       setLimitSnapshot(nextLimits.status === 'fulfilled' ? nextLimits.value : undefined);
       setStats(nextStats.status === 'fulfilled' ? nextStats.value : undefined);
@@ -163,10 +165,11 @@ export function SelfPortal() {
       setGenerations(nextGenerations.status === 'fulfilled' ? nextGenerations.value : []);
       const conversationPage = nextConversations.status === 'fulfilled' ? nextConversations.value : [];
       setConversations(conversationPage);
+      setAvailableModels(nextModels.status === 'fulfilled' ? nextModels.value.data.map((item) => item.id) : []);
       setHasOlderConversations(nextConversations.status === 'fulfilled' && conversationPage.length === conversationPageSize);
       if (failures.length) setError(t('self.partialLoad', { count: formatNumber(failures.length, locale) }));
     } catch (reason) {
-      setCredentialView(undefined); setLimitSnapshot(undefined); setStats(undefined); setRequests([]); setGenerations([]); setConversations([]);
+      setCredentialView(undefined); setAvailableModels([]); setLimitSnapshot(undefined); setStats(undefined); setRequests([]); setGenerations([]); setConversations([]);
       setDetail(undefined); setGenerationDetail(undefined); setConversationDetail(undefined);
       setHasOlderRequests(false);
       setHasOlderConversations(false);
@@ -369,7 +372,7 @@ export function SelfPortal() {
     {error && <div className="notice error" role="alert">{error}</div>}
     {stats && <>
       <section className="metrics"><Metric label={t('self.balance', { currency: credentialView?.currency ?? '' })} value={credentialView ? <span title={`${credentialView.available_balance} ${credentialView.currency}`}>{formatCurrency(credentialView.available_balance, credentialView.currency, locale)}</span> : '—'} tone="positive" /><SelfNumberMetric label={t('traffic.total')} value={stats.summary.total_requests} /><SelfNumberMetric label={t('traffic.success')} value={stats.summary.successful_requests} tone="positive" /><SelfNumberMetric label={t('traffic.failure')} value={stats.summary.failed_requests} tone="negative" /><SelfNumberMetric label={t('request.tokens')} value={stats.summary.input_tokens + stats.summary.output_tokens} /><Metric label={t('traffic.cost')} value={credentialView ? <span title={`${stats.summary.total_cost} ${credentialView.currency}`}>{formatCurrency(stats.summary.total_cost, credentialView.currency, locale)}</span> : '—'} /></section>
-      {credentialView && <article className="panel key-summary"><div><span className="eyebrow">{t('self.stableCredential')}</span><h2>{credentialView.alias}</h2><code>{credentialView.key_id}</code></div><div className="policy-grid"><span><b>{t('self.credentialGeneration')}</b>{formatNumber(credentialView.credential_generation, locale)}</span><span><b>RPM</b>{formatNumber(credentialView.policy.requests_per_minute, locale)}</span><span><b>TPM</b>{formatNumber(credentialView.policy.tokens_per_minute, locale)}</span><span><b>{t('self.concurrency')}</b>{formatNumber(credentialView.policy.max_concurrency, locale)}</span><span><b>{t('budget.daily')}</b>{credentialView.policy.daily_budget === null ? '—' : formatCurrency(credentialView.policy.daily_budget, credentialView.currency, locale)}</span><span><b>{t('budget.weekly')}</b>{credentialView.policy.weekly_budget === null ? '—' : formatCurrency(credentialView.policy.weekly_budget, credentialView.currency, locale)}</span><span><b>{t('budget.lifetime')}</b>{credentialView.policy.lifetime_budget === null ? '—' : formatCurrency(credentialView.policy.lifetime_budget, credentialView.currency, locale)}</span><span><b>{t('self.allowedModels')}</b>{credentialView.policy.allowed_models.length ? credentialView.policy.allowed_models.join(', ') : t('credentials.noModelsAllowed')}</span></div></article>}
+      {credentialView && <article className="panel key-summary"><div><span className="eyebrow">{t('self.stableCredential')}</span><h2>{credentialView.alias}</h2><code>{credentialView.key_id}</code></div><div className="policy-grid"><span><b>{t('self.credentialGeneration')}</b>{formatNumber(credentialView.credential_generation, locale)}</span><span><b>RPM</b>{formatNumber(credentialView.policy.requests_per_minute, locale)}</span><span><b>TPM</b>{formatNumber(credentialView.policy.tokens_per_minute, locale)}</span><span><b>{t('self.concurrency')}</b>{formatNumber(credentialView.policy.max_concurrency, locale)}</span><span><b>{t('budget.daily')}</b>{credentialView.policy.daily_budget === null ? '—' : formatCurrency(credentialView.policy.daily_budget, credentialView.currency, locale)}</span><span><b>{t('budget.weekly')}</b>{credentialView.policy.weekly_budget === null ? '—' : formatCurrency(credentialView.policy.weekly_budget, credentialView.currency, locale)}</span><span><b>{t('budget.lifetime')}</b>{credentialView.policy.lifetime_budget === null ? '—' : formatCurrency(credentialView.policy.lifetime_budget, credentialView.currency, locale)}</span><span><b>{t('self.allowedModels')}</b>{availableModels.length ? availableModels.join(', ') : t('credentials.noModelsAllowed')}</span></div></article>}
       {limitSnapshot && <article className="panel"><LimitSnapshot value={limitSnapshot} /></article>}
       <section className="two-column"><article className="panel"><h2>{t('traffic.models')}</h2><Buckets values={stats.by_model} onSelect={(bucket) => filterRequests({ model: bucket.name })} /></article><article className="panel"><h2>{t('traffic.days')}</h2><Buckets values={stats.by_day} onSelect={(bucket) => { if (/^\d{4}-\d{2}-\d{2}$/.test(bucket.name)) filterRequests({ from: `${bucket.name}T00:00`, to: `${bucket.name}T23:59` }); }} /></article></section>
       {stats.errors.length > 0 && <article className="panel"><h2>{t('traffic.errors')}</h2><Buckets values={stats.errors} onSelect={(bucket) => filterRequests({ status: 'error', errorCode: bucket.name })} /></article>}
@@ -397,7 +400,7 @@ export function SelfPortal() {
         {generationMessage && <div className="notice success" role="status">{generationMessage}</div>}
         <form onSubmit={createGeneration}>
           <label>{t('self.generationKind')}<select value={generationKind} onChange={(event) => setGenerationKind(event.target.value as 'image' | 'video')}><option value="image">{t('self.image')}</option><option value="video">{t('self.video')}</option></select></label>
-          <label>{t('self.generationModel')}<input list="self-generation-models" value={generationModel} onChange={(event) => setGenerationModel(event.target.value)} /><datalist id="self-generation-models">{credentialView?.policy.allowed_models.map((allowedModel) => <option value={allowedModel} key={allowedModel} />)}</datalist></label>
+          <label>{t('self.generationModel')}<input list="self-generation-models" value={generationModel} onChange={(event) => setGenerationModel(event.target.value)} /><datalist id="self-generation-models">{availableModels.map((allowedModel) => <option value={allowedModel} key={allowedModel} />)}</datalist></label>
           <label>{t('self.generationPrompt')}<textarea value={generationPrompt} onChange={(event) => setGenerationPrompt(event.target.value)} /></label>
           {generationKind === 'video' && <label>{t('self.generationDuration')}<input type="number" min="1" max="60" step="1" value={generationDuration} onChange={(event) => setGenerationDuration(event.target.value)} /></label>}
           <button type="submit" disabled={generationSubmitting || !generationModel.trim() || !generationPrompt.trim()}>{generationSubmitting ? t('common.loading') : t('self.submitGeneration')}</button>

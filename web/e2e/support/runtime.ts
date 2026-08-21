@@ -175,6 +175,14 @@ async function seedThroughHttp(): Promise<SeedState> {
       credential: { type: 'api_key', value: 'browser-mock-upstream-not-a-secret' },
     },
   });
+  await eventually(async () => {
+    const catalog = await requestJson<{ status: string; models: Array<{ id: string }> }>(
+      `/internal/v1/upstreams/${upstream.id}/models/sync?tenant_external_id=${encodeURIComponent(tenant)}`,
+      { method: 'POST', credential: bootstrapToken },
+    );
+    assert.equal(catalog.status, 'ready');
+    assert.ok(catalog.models.length > 0);
+  }, 30_000, 'mock upstream model catalog did not become ready');
   const route = await requestJson<{ id: string }>('/internal/v1/model-routes', {
     method: 'POST', credential: bootstrapToken,
     body: {
@@ -218,6 +226,8 @@ async function seedThroughHttp(): Promise<SeedState> {
         weekly_budget: null,
         lifetime_budget: '1000',
       },
+      route_ids: [route.id],
+      route_group_ids: [],
     },
   });
   const otherClient = await requestJson<{ key_id: string }>('/internal/v1/keys', {
@@ -237,6 +247,8 @@ async function seedThroughHttp(): Promise<SeedState> {
         weekly_budget: null,
         lifetime_budget: '1',
       },
+      route_ids: [route.id],
+      route_group_ids: [],
     },
   });
   const service = await requestJson<{ token: string }>('/internal/v1/service-tokens', {

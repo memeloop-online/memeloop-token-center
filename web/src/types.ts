@@ -185,6 +185,28 @@ export interface KeyView {
   fingerprint?: string | null;
 }
 
+export type GroupKind = 'provider' | 'route' | 'credential';
+
+export interface GroupView {
+  id: string;
+  tenant_id?: string;
+  tenant_external_id?: string;
+  name: string;
+  member_count: number;
+  member_ids: string[];
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CredentialRoutingView {
+  key_id: string;
+  route_ids: string[];
+  route_group_ids: string[];
+  effective_route_ids: string[];
+  updated_at: number;
+  grant_revision: number;
+}
+
 export interface KeyLimitSnapshot {
   key_id: string;
   captured_at: number;
@@ -223,13 +245,20 @@ export interface ModelRouteView {
   tenant_id?: string;
   tenant_external_id?: string;
   public_model: string;
-  upstream_account_id: string;
+  upstream_account_id?: string;
+  upstream_account_ids?: string[];
+  included_provider_group_ids?: string[];
+  excluded_provider_group_ids?: string[];
+  route_group_ids?: string[];
+  granted_credential_ids?: string[];
+  custom_model_confirmed?: boolean;
   upstream_model: string;
   protocol: string;
   priority: number;
   enabled: boolean;
   created_at: number;
   updated_at: number;
+  grant_revision: number;
 }
 
 export interface GenerationPriceView {
@@ -356,7 +385,7 @@ export interface UpstreamAccount {
   name: string;
   driver: string;
   auth_kind: string;
-  connection_method: 'api_key' | 'oauth' | 'subscription_bridge' | 'none' | string;
+  connection_method: 'api_key' | 'oauth' | 'legacy' | 'none' | string;
   credential_generation: number;
   status: string;
   credential_expires_at: number | null;

@@ -19,6 +19,13 @@ test('product copy does not expose legacy migration or adapter terminology', () 
   }
 });
 
+test('routing copy consistently names provider, route, and credential groups', () => {
+  for (const [locale, catalog] of Object.entries(translationCatalogs)) {
+    const exposed = Object.values(catalog).filter((value) => /标签|规则组|候选池|\b(?:provider|route|credential)\s+(?:tag|pool|rule group)s?\b/i.test(value));
+    assert.deepEqual(exposed, [], `${locale} must use the three product group names consistently`);
+  }
+});
+
 test('metric numbers use Chinese units through trillion and exact English grouping', () => {
   assert.deepEqual(formatMetricNumber(9_999, 'zh-CN'), { text: '9,999' });
   assert.deepEqual(formatMetricNumber(10_000, 'zh-CN'), { text: '1万', title: '10,000' });

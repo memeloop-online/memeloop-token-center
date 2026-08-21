@@ -47,7 +47,8 @@ const upstream = createServer((request, response) => {
     const requestUrl = new URL(request.url ?? '/', `http://127.0.0.1:${mockPort}`);
     if (request.method === 'GET' && requestUrl.pathname === '/v1/models') {
       response.writeHead(200, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({ data: [{ id: 'mock-provider-model' }] }));
+      const filler = Array.from({ length: 205 }, (_, index) => ({ id: `mock-filler-model-${String(index).padStart(3, '0')}` }));
+      response.end(JSON.stringify({ data: [{ id: 'mock-provider-model' }, ...filler, { id: 'mock-provider-model-v2' }] }));
       return;
     }
     if (request.method === 'GET' && requestUrl.pathname === '/__e2e/blocker-active') {
