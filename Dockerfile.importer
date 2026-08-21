@@ -13,9 +13,10 @@ RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.
     && rm -rf /var/lib/apt/lists/* \
     && (getent passwd 10001 >/dev/null || useradd --system --uid 10001 --create-home importer)
 COPY ops/migrate-cpamp.sh /usr/local/bin/migrate-cpamp
+COPY ops/audit-cpa-migration.sh /usr/local/bin/audit-cpa-migration
 COPY ops/legacy-credentials/attach-legacy-cpa-credentials.py /usr/local/bin/attach-legacy-cpa-credentials
 COPY ops/cpa-upstreams/import-cpa-upstreams.py /usr/local/bin/import-cpa-upstreams
-RUN chmod 0555 /usr/local/bin/migrate-cpamp \
+RUN chmod 0555 /usr/local/bin/migrate-cpamp /usr/local/bin/audit-cpa-migration \
     /usr/local/bin/attach-legacy-cpa-credentials \
     /usr/local/bin/import-cpa-upstreams
 USER 10001:10001

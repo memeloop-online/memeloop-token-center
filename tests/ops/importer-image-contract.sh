@@ -45,12 +45,15 @@ docker run --rm \
     test "$(id -u)" = 10001
     test "$(id -g)" = 10001
     test -x /usr/local/bin/migrate-cpamp
+    test -x /usr/local/bin/audit-cpa-migration
     test -x /usr/local/bin/attach-legacy-cpa-credentials
     test -x /usr/local/bin/import-cpa-upstreams
     test ! -w /usr/local/bin/migrate-cpamp
+    test ! -w /usr/local/bin/audit-cpa-migration
     test ! -w /usr/local/bin/attach-legacy-cpa-credentials
     test ! -w /usr/local/bin/import-cpa-upstreams
     test "$(stat -c %a /usr/local/bin/migrate-cpamp)" = 555
+    test "$(stat -c %a /usr/local/bin/audit-cpa-migration)" = 555
     test "$(stat -c %a /usr/local/bin/attach-legacy-cpa-credentials)" = 555
     test "$(stat -c %a /usr/local/bin/import-cpa-upstreams)" = 555
     command -v psql >/dev/null
@@ -150,10 +153,12 @@ container_id=$(docker create --entrypoint /bin/true "$image")
 docker export "$container_id" >"$workspace/rootfs.tar"
 docker cp "$container_id:/usr/local/bin/migrate-cpamp" "$workspace/image-migrate-cpamp"
 docker cp "$container_id:/usr/local/bin/attach-legacy-cpa-credentials" \
+docker cp "$container_id:/usr/local/bin/audit-cpa-migration" "$workspace/image-audit-cpa-migration"
   "$workspace/image-attach-legacy-cpa-credentials"
 docker cp "$container_id:/usr/local/bin/import-cpa-upstreams" \
   "$workspace/image-import-cpa-upstreams"
 cmp "$repository/ops/migrate-cpamp.sh" "$workspace/image-migrate-cpamp"
+cmp "$repository/ops/audit-cpa-migration.sh" "$workspace/image-audit-cpa-migration"
 cmp "$repository/ops/legacy-credentials/attach-legacy-cpa-credentials.py" \
   "$workspace/image-attach-legacy-cpa-credentials"
 cmp "$repository/ops/cpa-upstreams/import-cpa-upstreams.py" \
@@ -205,6 +210,18 @@ grep -A1 -F 'name: CPAMP_RESET_IMPORT' "$cpamp_job" | grep -Fq 'value: "false"'
 grep -A1 -F 'name: PGHOST' "$cpamp_job" | grep -Fq 'value: REPLACE_TARGET_POSTGRES_HOST'
 grep -A1 -F 'name: PGDATABASE' "$cpamp_job" | grep -Fq 'value: REPLACE_TARGET_DATABASE'
 grep -A1 -F 'name: CPAMP_IMPORT_SOURCE' "$cpamp_job" | grep -Fq 'value: REPLACE_CPAMP_IMPORT_SOURCE'
+for import_job in "$job" "$cpamp_job"; do
+  grep -Fq 'initContainers:' "$import_job"
+  grep -Fq 'name: prepare-database-credentials' "$import_job"
+  grep -Fq 'cp /secrets/database-source/pgpass /credentials/pgpass' "$import_job"
+  grep -Fq 'chmod 0600 /credentials/pgpass' "$import_job"
+  grep -Fq '"10001:10001:600"' "$import_job"
+  grep -A1 -F 'name: PGPASSFILE' "$import_job" | grep -Fq 'value: /credentials/pgpass'
+  grep -Fq 'name: database-secret' "$import_job"
+  grep -Fq 'name: database-credentials' "$import_job"
+  grep -Fq 'medium: Memory' "$import_job"
+  ! grep -Fq 'value: /secrets/database/pgpass' "$import_job"
+done
 if grep -Fq 'memeloop_token_center_dogfood' "$job" "$cpamp_job"; then
   echo 'checked-in import Jobs must not pin the retired dogfood database name' >&2
   exit 1

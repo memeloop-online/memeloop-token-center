@@ -119,7 +119,16 @@ observed collector/CPAMP queue delay.
    overlap is deliberate. Set `SESSION_ARCHIVE_OVERLAP_MS` to at least the
    manifest's `overlap_seconds * 1000` for all three invocations.
 5. Record CPAMP and archive importer JSON summaries plus their target checkpoint
-   rows. If the target correlation count lags API2's indexed-record count, first
+   rows separately. A nonzero CPAMP checkpoint proves only usage/request
+   statistics migration; it does not prove that request/response bodies entered
+   object storage. Before any traffic shift, run
+   `ops/audit-cpa-migration.sh` with `EXPECTED_CPAMP_EVENTS` from the
+   consistent CPAMP snapshot and `EXPECTED_ARCHIVE_RECORDS` from the verified
+   API2 manifest. The command must pass and report its archive checkpoint,
+   exact/unlinked correlations, unresolved quarantine, watermark, correlated
+   conversation clusters/observations/edges, and CPAMP link counts. A zero
+   archive checkpoint or remaining `gap://` baseline is incomplete migration.
+   If the target correlation count lags API2's indexed-record count, first
    widen the overlap (up to the exporter limit) or fall back to a new consistent
    full export; never advance a checkpoint by hand.
 
