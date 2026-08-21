@@ -237,6 +237,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await assertVisible(page.getByRole('heading', { name: '上游服务', exact: true }));
   await assertContains(page.locator('.provider-list'), '连接并管理模型服务。');
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
+  await assertNotContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
   await assertVisible(onboarding.getByLabel('服务提供商'));
   await assertContains(onboarding.getByLabel('服务提供商'), 'Cursor');

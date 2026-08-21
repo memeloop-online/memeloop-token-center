@@ -415,7 +415,11 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const providerGroups = useGroups('provider', token, tenant);
-  const provider = providers.find((value) => value.id === driver) ?? providers[0];
+  // OpenAI Codex is intentionally authorization-only. Keep it in the same
+  // provider catalog and account list, but do not offer a direct form that the
+  // server must reject.
+  const directProviders = providers.filter((value) => value.id !== 'openai-codex');
+  const provider = directProviders.find((value) => value.id === driver) ?? directProviders[0];
   const schema = useMemo<RJSFSchema | undefined>(() => {
     if (!provider) return undefined;
     const config = structuredClone(provider.config_schema) as { properties?: Record<string, unknown> };
@@ -528,7 +532,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
     </> : <><h2>{t('providers.add')}</h2>
       <div className="segmented" role="group" aria-label={t('providers.method')}><button type="button" aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</button><button type="button" aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</button></div>
       {method === 'direct' ? <>
-        <label>{t('providers.provider')}<select value={provider?.id ?? ''} onChange={(event) => setDriver(event.target.value)}>{providers.map((value) => <option key={value.id} value={value.id}>{value.display_name} · {value.source}</option>)}</select></label>
+        <label>{t('providers.provider')}<select value={provider?.id ?? ''} onChange={(event) => setDriver(event.target.value)}>{directProviders.map((value) => <option key={value.id} value={value.id}>{value.display_name} · {value.source}</option>)}</select></label>
         {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant }) }); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
       </> : <AuthorizationConnection token={token} tenant={tenant} providers={providers} onChanged={onChanged} />}</>}
     </article>
