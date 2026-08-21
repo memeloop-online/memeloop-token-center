@@ -120,6 +120,12 @@ async fn create_key(
             .expect("policy object")
             .insert(name.clone(), value.clone());
     }
+    let grants_model = policy["allowed_models"].as_array().is_some_and(|models| {
+        models
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|allowed| allowed == "*" || allowed == model)
+    });
     let response = world
         .client
         .post(format!("{}/internal/v1/keys", world.service_url))
@@ -140,10 +146,14 @@ async fn create_key(
         StatusCode::CREATED,
         "principal={principal}"
     );
-    response
+    let issued = response
         .json()
         .await
-        .expect("security acceptance credential JSON")
+        .expect("security acceptance credential JSON");
+    if grants_model {
+        grant_fixture_model(world, tenant, &issued, model, "openai").await;
+    }
+    issued
 }
 
 async fn call_model(world: &TokenCenterWorld, key: &str, model: &str) -> reqwest::Response {
@@ -1093,12 +1103,14 @@ async fn self_service_idor_is_closed(world: &mut TokenCenterWorld) {
             "public_model": "idor-comfy",
             "upstream_account_id": upstream["id"],
             "upstream_model": "idor-workflow",
-            "protocol": "generation"
+            "protocol": "generation",
+            "custom_model_confirmed": true
         }))
         .send()
         .await
         .expect("create IDOR generation route");
     assert_eq!(route.status(), StatusCode::CREATED);
+    grant_fixture_model(world, "matrix-second", second, "idor-comfy", "generation").await;
     let price = world
         .client
         .post(format!(

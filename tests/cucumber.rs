@@ -361,7 +361,7 @@ async fn create_seedance_route_and_key(world: &mut TokenCenterWorld) {
         .json(&json!({
             "name": "seedance",
             "driver": "volcengine-seedance",
-            "config": {"base_url": mock_url},
+            "config": {"base_url": mock_url, "network_scope": "private"},
             "credential": {"type": "api_key", "value": "seedance-secret"}
         }))
         .send()
@@ -382,7 +382,8 @@ async fn create_seedance_route_and_key(world: &mut TokenCenterWorld) {
             "public_model": "seedance-public",
             "upstream_account_id": account["id"],
             "upstream_model": "seedance-upstream",
-            "protocol": "generation"
+            "protocol": "generation",
+            "custom_model_confirmed": true
         }))
         .send()
         .await
@@ -420,6 +421,7 @@ async fn create_seedance_route_and_key(world: &mut TokenCenterWorld) {
         .as_str()
         .and_then(|value| Uuid::parse_str(value).ok());
     world.current_key = key["key"].as_str().expect("Seedance key").to_owned();
+    grant_fixture_model(world, "default", &key, "seedance-public", "generation").await;
 }
 
 #[when("the client creates a five second Seedance generation")]
@@ -942,7 +944,8 @@ async fn create_metered_comfyui_route_and_key(
             "public_model": public_model,
             "upstream_account_id": account["id"],
             "upstream_model": workflow_id,
-            "protocol": "generation"
+            "protocol": "generation",
+            "custom_model_confirmed": true
         }))
         .send()
         .await
@@ -980,6 +983,7 @@ async fn create_metered_comfyui_route_and_key(
         .as_str()
         .and_then(|value| Uuid::parse_str(value).ok());
     world.current_key = key["key"].as_str().expect("ComfyUI key").to_owned();
+    grant_fixture_model(world, "default", &key, public_model, "generation").await;
 }
 
 #[when("the service creates a megapixel-priced ComfyUI route and key")]
@@ -1020,7 +1024,8 @@ async fn create_megapixel_comfyui_route_and_key(world: &mut TokenCenterWorld) {
             "public_model": "comfy-megapixel-public",
             "upstream_account_id": upstream["id"],
             "upstream_model": "workflow-megapixel-v1",
-            "protocol": "generation"
+            "protocol": "generation",
+            "custom_model_confirmed": true
         }))
         .send()
         .await
@@ -1058,6 +1063,14 @@ async fn create_megapixel_comfyui_route_and_key(world: &mut TokenCenterWorld) {
     assert_eq!(key.status(), StatusCode::CREATED);
     let key = key.json::<Value>().await.expect("megapixel key JSON");
     world.current_key = key["key"].as_str().expect("megapixel key").to_owned();
+    grant_fixture_model(
+        world,
+        "default",
+        &key,
+        "comfy-megapixel-public",
+        "generation",
+    )
+    .await;
 }
 
 #[when("the client creates a three-output ComfyUI megapixel generation")]
@@ -1289,10 +1302,35 @@ async fn create_generation_admission_key(
         .await
         .expect("create generation admission key");
     assert_eq!(response.status(), StatusCode::CREATED);
-    response
+    let issued = response
         .json::<Value>()
         .await
-        .expect("generation admission key JSON")["key"]
+        .expect("generation admission key JSON");
+    let existing_route = world
+        .state
+        .as_ref()
+        .expect("state")
+        .db
+        .list_model_routes(Some("default"))
+        .await
+        .expect("list generation admission routes")
+        .into_iter()
+        .find(|route| route.public_model == allowed_model && route.protocol == "generation");
+    if let Some(route) = existing_route {
+        grant_fixture_routes(
+            world,
+            "default",
+            Uuid::parse_str(
+                issued["key_id"]
+                    .as_str()
+                    .expect("generation admission key id"),
+            )
+            .expect("generation admission key UUID"),
+            &[route.id],
+        )
+        .await;
+    }
+    issued["key"]
         .as_str()
         .expect("issued generation admission key")
         .to_owned()
@@ -1331,6 +1369,7 @@ async fn assert_generation_admission_matrix(
 ) {
     if let Some(worker) = world.worker_task.take() {
         worker.abort();
+        let _ = worker.await;
     }
     let mock_url = world.mock.as_ref().expect("mock server").uri();
     let endpoint = if driver == "comfyui" {
@@ -1380,7 +1419,8 @@ async fn assert_generation_admission_matrix(
             "public_model": model,
             "upstream_account_id": upstream["id"],
             "upstream_model": if driver == "comfyui" { "admission-workflow" } else { "seedance-admission" },
-            "protocol": "generation"
+            "protocol": "generation",
+            "custom_model_confirmed": true
         }))
         .send()
         .await
@@ -2374,7 +2414,7 @@ async fn create_openai_image_route_and_key(world: &mut TokenCenterWorld) {
         .json(&json!({
             "name": "openai-images",
             "driver": "http-json",
-            "config": {"base_url": mock_url},
+            "config": {"base_url": mock_url, "network_scope": "private"},
             "credential": {"type": "api_key", "value": "image-secret"}
         }))
         .send()
@@ -2390,7 +2430,8 @@ async fn create_openai_image_route_and_key(world: &mut TokenCenterWorld) {
             "public_model": "gpt-image-public",
             "upstream_account_id": account["id"],
             "upstream_model": "gpt-image-upstream",
-            "protocol": "generation"
+            "protocol": "generation",
+            "custom_model_confirmed": true
         }))
         .send()
         .await
@@ -2436,6 +2477,7 @@ async fn create_openai_image_route_and_key(world: &mut TokenCenterWorld) {
     world.stable_account_id = key["account_id"]
         .as_str()
         .and_then(|id| Uuid::parse_str(id).ok());
+    grant_fixture_model(world, "default", &key, "gpt-image-public", "generation").await;
 }
 
 #[when("the client creates an OpenAI-compatible image")]
@@ -2654,6 +2696,7 @@ async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
                 .json::<Value>()
                 .await
                 .expect("second image identity JSON");
+            grant_fixture_model(world, "default", &other, "gpt-image-public", "generation").await;
             let second = world
                 .client
                 .post(format!("{}/v1/images/generations", world.service_url))
@@ -3303,7 +3346,8 @@ async fn create_codex_responses_image_route_and_key(world: &mut TokenCenterWorld
             "public_model": "codex-image-public",
             "upstream_account_id": account["id"],
             "upstream_model": "gpt-image-2",
-            "protocol": "generation"
+            "protocol": "generation",
+            "custom_model_confirmed": true
         }))
         .send()
         .await
@@ -3341,6 +3385,7 @@ async fn create_codex_responses_image_route_and_key(world: &mut TokenCenterWorld
     world.stable_key_id = key["key_id"]
         .as_str()
         .and_then(|id| Uuid::parse_str(id).ok());
+    grant_fixture_model(world, "default", &key, "codex-image-public", "generation").await;
 }
 
 #[when("the client creates a Codex-backed OpenAI-compatible image")]
@@ -3722,6 +3767,7 @@ async fn record_requests_for_two_tenants(
             .expect("create tenant credential");
         assert_eq!(response.status(), StatusCode::CREATED);
         let body: Value = response.json().await.expect("tenant credential JSON");
+        grant_fixture_model(world, &tenant, &body, "global-stats-model", "openai").await;
         let credential = body["key"].as_str().expect("tenant credential");
         let response = world
             .client
@@ -3822,10 +3868,12 @@ async fn create_matrix_key(world: &TokenCenterWorld, tenant: &str, principal: &s
         .await
         .expect("create authorization-matrix downstream credential");
     assert_eq!(response.status(), StatusCode::CREATED);
-    response
+    let issued = response
         .json::<Value>()
         .await
-        .expect("authorization-matrix downstream credential JSON")["key"]
+        .expect("authorization-matrix downstream credential JSON");
+    grant_fixture_model(world, tenant, &issued, "matrix-model", "openai").await;
+    issued["key"]
         .as_str()
         .expect("issued authorization-matrix key")
         .to_owned()
@@ -4200,7 +4248,7 @@ async fn create_route(
     public_model: &str,
     upstream_account_id: &str,
     upstream_model: &str,
-) {
+) -> Uuid {
     let response = world
         .client
         .post(format!("{}/internal/v1/model-routes", world.service_url))
@@ -4209,12 +4257,152 @@ async fn create_route(
             "public_model": public_model,
             "upstream_account_id": upstream_account_id,
             "upstream_model": upstream_model,
-            "protocol": "openai"
+            "protocol": "openai",
+            "custom_model_confirmed": true
         }))
         .send()
         .await
         .expect("create model route");
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let status = response.status();
+    let body: Value = response.json().await.expect("model route JSON");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    Uuid::parse_str(body["id"].as_str().expect("model route id")).expect("model route UUID")
+}
+
+async fn ensure_fixture_route(
+    world: &TokenCenterWorld,
+    tenant_external_id: &str,
+    public_model: &str,
+    protocol: &str,
+) -> Uuid {
+    let state = world.state.as_ref().expect("state");
+    if let Some(route) = state
+        .db
+        .list_model_routes(Some(tenant_external_id))
+        .await
+        .expect("list fixture routes")
+        .into_iter()
+        .find(|route| route.public_model == public_model && route.protocol == protocol)
+    {
+        return route.id;
+    }
+
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let account = world
+        .client
+        .post(format!("{}/internal/v1/upstreams", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "tenant_external_id": tenant_external_id,
+            "name": format!("fixture-{public_model}-{}", Uuid::now_v7()),
+            "driver": "http-json",
+            "config": {"base_url": mock_url},
+            "credential": {"type": "none"}
+        }))
+        .send()
+        .await
+        .expect("create fixture upstream account");
+    let status = account.status();
+    let account: Value = account.json().await.expect("fixture upstream account JSON");
+    assert_eq!(status, StatusCode::CREATED, "{account}");
+
+    let route = world
+        .client
+        .post(format!("{}/internal/v1/model-routes", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "tenant_external_id": tenant_external_id,
+            "public_model": public_model,
+            "upstream_account_id": account["id"],
+            "upstream_model": public_model,
+            "protocol": protocol,
+            "custom_model_confirmed": true
+        }))
+        .send()
+        .await
+        .expect("create fixture model route");
+    let status = route.status();
+    let route: Value = route.json().await.expect("fixture model route JSON");
+    assert_eq!(status, StatusCode::CREATED, "{route}");
+    Uuid::parse_str(route["id"].as_str().expect("fixture route id")).expect("fixture route UUID")
+}
+
+async fn grant_fixture_routes(
+    world: &TokenCenterWorld,
+    tenant_external_id: &str,
+    key_id: Uuid,
+    route_ids: &[Uuid],
+) {
+    let current = world
+        .client
+        .get(format!(
+            "{}/internal/v1/keys/{key_id}/routing?tenant_external_id={tenant_external_id}",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .send()
+        .await
+        .expect("read fixture routing revision");
+    let current_status = current.status();
+    let current: Value = current.json().await.expect("fixture routing view JSON");
+    assert_eq!(current_status, StatusCode::OK, "{current}");
+    let expected_grant_revision = current["grant_revision"]
+        .as_i64()
+        .expect("fixture routing grant revision");
+    let mut merged_route_ids = current["route_ids"]
+        .as_array()
+        .expect("fixture routing route ids")
+        .iter()
+        .map(|value| {
+            Uuid::parse_str(value.as_str().expect("fixture routing route id"))
+                .expect("fixture routing route UUID")
+        })
+        .chain(route_ids.iter().copied())
+        .collect::<Vec<_>>();
+    merged_route_ids.sort_unstable();
+    merged_route_ids.dedup();
+    let route_group_ids = current["route_group_ids"]
+        .as_array()
+        .expect("fixture routing route group ids");
+    let response = world
+        .client
+        .put(format!(
+            "{}/internal/v1/keys/{key_id}/routing",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "tenant_external_id": tenant_external_id,
+            "route_ids": merged_route_ids,
+            "route_group_ids": route_group_ids,
+            "expected_grant_revision": expected_grant_revision
+        }))
+        .send()
+        .await
+        .expect("grant fixture routes");
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .expect("fixture routing response JSON");
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+async fn grant_fixture_model(
+    world: &TokenCenterWorld,
+    tenant_external_id: &str,
+    issued_key: &Value,
+    public_model: &str,
+    protocol: &str,
+) {
+    let key_id = Uuid::parse_str(
+        issued_key["key_id"]
+            .as_str()
+            .expect("fixture issued key id"),
+    )
+    .expect("fixture issued key UUID");
+    let route_id = ensure_fixture_route(world, tenant_external_id, public_model, protocol).await;
+    grant_fixture_routes(world, tenant_external_id, key_id, &[route_id]).await;
 }
 
 #[when("the service creates a key allowing both routed models")]
@@ -4250,6 +4438,15 @@ async fn create_key_for_routed_models(world: &mut TokenCenterWorld) {
     assert_eq!(response.status(), StatusCode::CREATED);
     let value: Value = response.json().await.expect("routed key JSON");
     world.current_key = value["key"].as_str().expect("issued key").to_owned();
+    let api_route = ensure_fixture_route(world, "default", "api-public", "openai").await;
+    let oauth_route = ensure_fixture_route(world, "default", "oauth-public", "openai").await;
+    grant_fixture_routes(
+        world,
+        "default",
+        Uuid::parse_str(value["key_id"].as_str().expect("routed key id")).expect("routed key UUID"),
+        &[api_route, oauth_route],
+    )
+    .await;
 }
 
 #[when("the client calls both routed models")]
@@ -4669,6 +4866,19 @@ async fn create_key(world: &mut TokenCenterWorld, principal: String, model: Stri
         Uuid::from_str(world.response["account_id"].as_str().expect("account id"))
             .expect("UUID account id"),
     );
+    let protocol = if model.starts_with("claude") {
+        "anthropic"
+    } else {
+        "openai"
+    };
+    let route_id = ensure_fixture_route(world, "default", &model, protocol).await;
+    grant_fixture_routes(
+        world,
+        "default",
+        world.stable_key_id.expect("stable key id"),
+        &[route_id],
+    )
+    .await;
 }
 
 #[when(expr = "the service renames the key alias to {string}")]
@@ -4795,6 +5005,7 @@ async fn create_and_use_policy_credential(world: &mut TokenCenterWorld) {
         )
         .expect("continuity account UUID"),
     );
+    grant_fixture_model(world, "continuity-tenant", &issued, "gpt-test", "openai").await;
 
     call_model(world, "gpt-test".to_owned()).await;
     assert_eq!(world.status, Some(StatusCode::OK));
@@ -5105,6 +5316,7 @@ async fn create_exhausted_key(world: &mut TokenCenterWorld, model: String) {
         .as_str()
         .expect("issued key")
         .to_owned();
+    grant_fixture_model(world, "default", &world.response, &model, "openai").await;
 }
 
 #[when(expr = "the service creates a key with RPM 1 allowing model {string}")]
@@ -5145,6 +5357,7 @@ async fn create_rate_limited_key(world: &mut TokenCenterWorld, model: String) {
         .as_str()
         .expect("issued key")
         .to_owned();
+    grant_fixture_model(world, "default", &world.response, &model, "openai").await;
 }
 
 #[when(expr = "the client calls model {string}")]
@@ -6352,7 +6565,7 @@ async fn mock_streaming_responses_parent_and_child(world: &mut TokenCenterWorld)
     }
     parent_stream.push_str(concat!(
         "event: response.completed\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-streaming-parent\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n",
         "data: [DONE]\n\n"
     ));
     assert!(
@@ -6364,11 +6577,7 @@ async fn mock_streaming_responses_parent_and_child(world: &mut TokenCenterWorld)
         .and(body_partial_json(
             json!({"input": "streaming parent", "stream": true}),
         ))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(parent_stream),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(parent_stream, "text/event-stream"))
         .expect(1)
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
@@ -6381,12 +6590,14 @@ async fn mock_streaming_responses_parent_and_child(world: &mut TokenCenterWorld)
         })))
         .respond_with(
             ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(concat!(
+                .set_body_raw(
+                    concat!(
                     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-streaming-child\"}}\n\n",
                     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-streaming-child\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
                     "data: [DONE]\n\n"
-                )),
+                    ),
+                    "text/event-stream",
+                ),
         )
         .expect(1)
         .mount(world.mock.as_ref().expect("mock server"))
@@ -6402,12 +6613,14 @@ async fn mock_failed_streaming_responses_parent_and_child(world: &mut TokenCente
         ))
         .respond_with(
             ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(concat!(
+                .set_body_raw(
+                    concat!(
                     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-failed-parent\"}}\n\n",
                     "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed-parent\"}}\n\n",
                     "data: [DONE]\n\n"
-                )),
+                    ),
+                    "text/event-stream",
+                ),
         )
         .expect(1)
         .mount(world.mock.as_ref().expect("mock server"))
@@ -6421,11 +6634,13 @@ async fn mock_failed_streaming_responses_parent_and_child(world: &mut TokenCente
         })))
         .respond_with(
             ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(concat!(
+                .set_body_raw(
+                    concat!(
                     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-after-failure\"}}\n\n",
                     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-after-failure\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
-                )),
+                    ),
+                    "text/event-stream",
+                ),
         )
         .expect(1)
         .mount(world.mock.as_ref().expect("mock server"))
@@ -6443,13 +6658,15 @@ async fn mock_streaming_responses_invalid_usage(world: &mut TokenCenterWorld) {
         })))
         .respond_with(
             ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(concat!(
+                .set_body_raw(
+                    concat!(
                     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-invalid-usage\"}}\n\n",
                     "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delivered output\"}\n\n",
                     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-invalid-usage\",\"usage\":{\"input_tokens\":1,\"output_tokens\":999}}}\n\n",
                     "data: [DONE]\n\n"
-                )),
+                    ),
+                    "text/event-stream",
+                ),
         )
         .expect(1)
         .mount(world.mock.as_ref().expect("mock server"))
@@ -6861,6 +7078,14 @@ async fn mock_utility_protocols(world: &mut TokenCenterWorld) {
 
 #[when(expr = "the client sends chat, embedding, and token counting requests for model {string}")]
 async fn send_chat_and_utility_requests(world: &mut TokenCenterWorld, model: String) {
+    let anthropic_route = ensure_fixture_route(world, "default", &model, "anthropic").await;
+    grant_fixture_routes(
+        world,
+        "default",
+        world.stable_key_id.expect("stable key id"),
+        &[anthropic_route],
+    )
+    .await;
     let requests = [
         (
             "/v1/chat/completions",
