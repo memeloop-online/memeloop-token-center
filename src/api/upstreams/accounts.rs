@@ -372,15 +372,17 @@ pub(in crate::api) async fn rotate_upstream_credential(
     let credential: UpstreamCredential = serde_json::from_value(body.credential)
         .map_err(|error| AppError::BadRequest(format!("invalid upstream credential: {error}")))?;
     credential.validate(unix_millis())?;
-    let account = state
+    let (account, changed) = state
         .db
-        .rotate_upstream_credential(
+        .rotate_upstream_credential_with_outcome(
             account_id,
             credential,
             idempotency_key,
             state.config.key_pepper.as_bytes(),
         )
         .await?;
-    super::trigger_upstream_model_sync(state, account_id);
+    if changed {
+        super::trigger_upstream_model_sync(state, account_id);
+    }
     Ok(Json(account))
 }

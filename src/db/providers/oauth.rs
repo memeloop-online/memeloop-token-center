@@ -150,6 +150,27 @@ impl Database {
         idempotency_key: &str,
         key_material: &[u8],
     ) -> Result<UpstreamAccountView, AppError> {
+        let (account, _) = self
+            .rotate_upstream_credential_with_outcome(
+                account_id,
+                credential,
+                idempotency_key,
+                key_material,
+            )
+            .await?;
+        Ok(account)
+    }
+
+    /// Rotates an upstream credential and reports whether this invocation
+    /// installed a new credential generation. An exact idempotency replay
+    /// returns the stored account view with `changed` set to false.
+    pub async fn rotate_upstream_credential_with_outcome(
+        &self,
+        account_id: Uuid,
+        credential: UpstreamCredential,
+        idempotency_key: &str,
+        key_material: &[u8],
+    ) -> Result<(UpstreamAccountView, bool), AppError> {
         validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
         let idempotency_key = idempotency_key.trim();
         let now = unix_millis();
@@ -177,7 +198,7 @@ impl Database {
                 now,
             )?;
             tx.commit().await?;
-            return Ok(view);
+            return Ok((view, false));
         }
         let view = self
             .rotate_upstream_credential_claimed(
@@ -194,7 +215,7 @@ impl Database {
             )
             .await?;
         tx.commit().await?;
-        Ok(view)
+        Ok((view, true))
     }
     /// Claim an OAuth refresh before contacting the authorization server. A
     /// retry with the same key returns the stored result, while a concurrent

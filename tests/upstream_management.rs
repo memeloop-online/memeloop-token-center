@@ -58,6 +58,30 @@ fn account(value: Value) -> UpstreamAccountView {
     serde_json::from_value(value).unwrap()
 }
 
+async fn wait_for_authorized_requests(mock: &MockServer, authorization: &str, expected: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let requests = mock.received_requests().await.unwrap();
+            let count = requests
+                .iter()
+                .filter(|request| {
+                    request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        == Some(authorization)
+                })
+                .count();
+            if count >= expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {expected} requests using {authorization}"));
+}
+
 #[tokio::test]
 async fn interactive_reauthorization_preserves_stable_identity_routes_and_replays_once() {
     let directory = tempfile::tempdir().unwrap();
@@ -577,6 +601,33 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
             ResponseTemplate::new(200)
                 .set_body_json(json!({"data": [], "never_return": "original-secret"})),
         )
+        // One request is the explicit health probe; the other is the model
+        // catalog refresh caused by the successful provider config update.
+        .expect(2)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(matches_header("authorization", "Bearer rotated-secret"))
+        .respond_with(ResponseTemplate::new(404))
+        // An exact Idempotency-Key replay must not trigger another sync.
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(matches_header(
+            "authorization",
+            "Bearer oauth-access-secret",
+        ))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(matches_header("authorization", "Bearer final-api-secret"))
+        .respond_with(ResponseTemplate::new(404))
         .expect(1)
         .mount(&mock)
         .await;
@@ -748,6 +799,7 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
     assert_eq!(status, StatusCode::OK);
     let updated = account(updated);
     assert!(updated.updated_at > upstream.updated_at);
+    wait_for_authorized_requests(&mock, "Bearer original-secret", 2).await;
 
     let (status, _) = json_request(
         &state,
@@ -782,6 +834,7 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
     let rotated = account(rotated);
     assert_eq!(rotated.id, upstream.id);
     assert_eq!(rotated.credential_generation, 2);
+    wait_for_authorized_requests(&mock, "Bearer rotated-secret", 1).await;
     let (status, replayed) = json_request(
         &state,
         "PUT",
@@ -793,6 +846,25 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(account(replayed).credential_generation, 2);
+    // Give a mistakenly spawned replay sync enough time to reach the local
+    // mock before the next credential generation replaces this secret.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        mock.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Bearer rotated-secret")
+            })
+            .count(),
+        1,
+        "an exact rotation replay must not trigger model synchronization"
+    );
     let (status, _) = json_request(
         &state,
         "PUT",
@@ -856,6 +928,7 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
         !oauth.can_refresh,
         "manual OAuth has no managed refresh lifecycle"
     );
+    wait_for_authorized_requests(&mock, "Bearer oauth-access-secret", 1).await;
 
     let (status, rotated) = json_request(
         &state,
@@ -876,6 +949,7 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
     assert_eq!(rotated.route_count, 1);
     assert!(rotated.can_rotate);
     assert!(!rotated.can_refresh);
+    wait_for_authorized_requests(&mock, "Bearer final-api-secret", 1).await;
 
     let (status, disabled) = json_request(
         &state,
