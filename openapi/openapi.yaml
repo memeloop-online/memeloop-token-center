@@ -1519,7 +1519,7 @@ paths:
       x-required-scope: routes:read
       parameters: [{ $ref: '#/components/parameters/RequiredTenant' }]
       responses:
-        '200': { $ref: '#/components/responses/RoutingGroupList' }
+        '200': { $ref: '#/components/responses/GroupList' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1533,9 +1533,9 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/CreateRoutingGroupRequest' }
+            schema: { $ref: '#/components/schemas/CreateGroupRequest' }
       responses:
-        '201': { $ref: '#/components/responses/RoutingGroupCreated' }
+        '201': { $ref: '#/components/responses/GroupCreated' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1553,9 +1553,9 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupRequest' }
+            schema: { $ref: '#/components/schemas/ReplaceGroupRequest' }
       responses:
-        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '200': { $ref: '#/components/responses/GroupUpdated' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1591,9 +1591,9 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupMembersRequest' }
+            schema: { $ref: '#/components/schemas/ReplaceGroupMembersRequest' }
       responses:
-        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '200': { $ref: '#/components/responses/GroupUpdated' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1610,7 +1610,7 @@ paths:
       x-required-scope: routes:read
       parameters: [{ $ref: '#/components/parameters/RequiredTenant' }]
       responses:
-        '200': { $ref: '#/components/responses/RoutingGroupList' }
+        '200': { $ref: '#/components/responses/GroupList' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1624,9 +1624,9 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/CreateRoutingGroupRequest' }
+            schema: { $ref: '#/components/schemas/CreateGroupRequest' }
       responses:
-        '201': { $ref: '#/components/responses/RoutingGroupCreated' }
+        '201': { $ref: '#/components/responses/GroupCreated' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1644,9 +1644,9 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupRequest' }
+            schema: { $ref: '#/components/schemas/ReplaceGroupRequest' }
       responses:
-        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '200': { $ref: '#/components/responses/GroupUpdated' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1682,9 +1682,9 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupMembersRequest' }
+            schema: { $ref: '#/components/schemas/ReplaceGroupMembersRequest' }
       responses:
-        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '200': { $ref: '#/components/responses/GroupUpdated' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1702,7 +1702,7 @@ paths:
       x-routing-effect: none
       parameters: [{ $ref: '#/components/parameters/RequiredTenant' }]
       responses:
-        '200': { $ref: '#/components/responses/RoutingGroupList' }
+        '200': { $ref: '#/components/responses/GroupList' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1718,9 +1718,9 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/CreateRoutingGroupRequest' }
+            schema: { $ref: '#/components/schemas/CreateGroupRequest' }
       responses:
-        '201': { $ref: '#/components/responses/RoutingGroupCreated' }
+        '201': { $ref: '#/components/responses/GroupCreated' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1739,9 +1739,9 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupRequest' }
+            schema: { $ref: '#/components/schemas/ReplaceGroupRequest' }
       responses:
-        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '200': { $ref: '#/components/responses/GroupUpdated' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1780,9 +1780,9 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupMembersRequest' }
+            schema: { $ref: '#/components/schemas/ReplaceGroupMembersRequest' }
       responses:
-        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '200': { $ref: '#/components/responses/GroupUpdated' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -3294,7 +3294,7 @@ components:
       schema: { type: integer, format: int64, minimum: 1, maximum: 500, default: 500 }
 
   responses:
-    RoutingGroupList:
+    GroupList:
       description: Tenant-scoped groups including bounded member identifiers.
       content:
         application/json:
@@ -3302,12 +3302,12 @@ components:
             type: array
             maxItems: 10000
             items: { $ref: '#/components/schemas/Group' }
-    RoutingGroupCreated:
+    GroupCreated:
       description: Created group, or an idempotent normalized-name replay.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Group' }
-    RoutingGroupUpdated:
+    GroupUpdated:
       description: Updated group and optimistic-concurrency version.
       content:
         application/json:
@@ -4240,14 +4240,14 @@ components:
         member_count: { type: integer, format: int64, minimum: 0, maximum: 10000 }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
-    CreateRoutingGroupRequest:
+    CreateGroupRequest:
       type: object
       additionalProperties: false
       required: [tenant_external_id, name]
       properties:
         tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
         name: { type: string, minLength: 1, maxLength: 100, pattern: '^[^\x00-\x1F\x7F]+$' }
-    ReplaceRoutingGroupRequest:
+    ReplaceGroupRequest:
       type: object
       additionalProperties: false
       required: [tenant_external_id, name, expected_updated_at]
@@ -4255,7 +4255,7 @@ components:
         tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
         name: { type: string, minLength: 1, maxLength: 100, pattern: '^[^\x00-\x1F\x7F]+$' }
         expected_updated_at: { type: integer, format: int64 }
-    ReplaceRoutingGroupMembersRequest:
+    ReplaceGroupMembersRequest:
       type: object
       additionalProperties: false
       required: [tenant_external_id, member_ids, expected_updated_at]

@@ -430,6 +430,21 @@ def validate_group_contracts(document: dict[str, Any]) -> None:
             raise ContractFailure(f"DELETE {resource} tenant/CAS parameters changed")
 
     schemas = document.get("components", {}).get("schemas", {})
+    for retired_schema_name in (
+        "CreateRoutingGroupRequest",
+        "ReplaceRoutingGroupRequest",
+        "ReplaceRoutingGroupMembersRequest",
+    ):
+        if retired_schema_name in schemas:
+            raise ContractFailure(f"group schema name is not neutral: {retired_schema_name}")
+    responses = document.get("components", {}).get("responses", {})
+    for retired_response_name in (
+        "RoutingGroupList",
+        "RoutingGroupCreated",
+        "RoutingGroupUpdated",
+    ):
+        if retired_response_name in responses:
+            raise ContractFailure(f"group response name is not neutral: {retired_response_name}")
     route = schemas.get("ModelRoute", {})
     route_required = set(route.get("required", []))
     enriched_fields = {
