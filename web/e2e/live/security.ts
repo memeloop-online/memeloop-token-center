@@ -12,6 +12,36 @@ export function assertReadOnlyMethod(method: string): void {
   assert.ok(isReadOnlyMethod(method), `live read-only guard rejected HTTP ${method.toUpperCase()}`);
 }
 
+export function assertSecureLiveURL(name: string, url: URL): void {
+  assert.equal(url.protocol, 'https:', `${name} must use HTTPS`);
+  assert.equal(url.username, '', `${name} must not contain credentials`);
+  assert.equal(url.password, '', `${name} must not contain credentials`);
+  assert.equal(url.hash, '', `${name} must not contain a fragment`);
+}
+
+export function isAllowedLiveDestination(requestURL: string, allowedOrigins: ReadonlySet<string>): boolean {
+  try {
+    const url = new URL(requestURL);
+    return url.protocol === 'https:'
+      && url.username === ''
+      && url.password === ''
+      && allowedOrigins.has(url.origin);
+  } catch {
+    return false;
+  }
+}
+
+export function urlContainsCredential(requestURL: string, credentials: readonly string[]): boolean {
+  try {
+    const url = new URL(requestURL);
+    const exposedValues = [url.pathname, ...url.searchParams.values()];
+    return credentials.some((credential) => credential.length > 0
+      && exposedValues.some((value) => value.includes(credential)));
+  } catch {
+    return true;
+  }
+}
+
 export interface CredentialFile {
   credential: string;
   expectedKeyId?: string;

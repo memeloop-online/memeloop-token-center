@@ -89,7 +89,7 @@ Then('公网网关不暴露操作台和内部 API', async function (this: LiveWo
   const gatewayURL = liveRuntime.requireConfiguration().gatewayURL;
   for (const path of ['/operator', '/internal/v1/tenants']) {
     const response = await page.goto(new URL(path, gatewayURL).toString(), { waitUntil: 'domcontentloaded' });
-    assert.ok([401, 403, 404].includes(response?.status() ?? 0), `${path} must be isolated by the public gateway`);
+    assert.equal(response?.status(), 404, `${path} must not be routed by the public gateway`);
   }
 });
 

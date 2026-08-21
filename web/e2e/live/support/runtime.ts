@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { chromium, type Browser } from 'playwright';
-import { readCredentialFile } from '../security.js';
+import { assertSecureLiveURL, readCredentialFile } from '../security.js';
 
 interface LiveConfiguration {
   controlURL: URL;
@@ -62,10 +62,7 @@ function requiredEnvironment(name: string): string {
 
 function requiredURL(name: string): URL {
   const url = new URL(requiredEnvironment(name));
-  assert.ok(['http:', 'https:'].includes(url.protocol), `${name} must use HTTP or HTTPS`);
-  assert.equal(url.username, '', `${name} must not contain credentials`);
-  assert.equal(url.password, '', `${name} must not contain credentials`);
-  assert.equal(url.hash, '', `${name} must not contain a fragment`);
+  assertSecureLiveURL(name, url);
   return url;
 }
 
