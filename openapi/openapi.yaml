@@ -2121,8 +2121,10 @@ paths:
         Provisions one stable principal, credit account, and downstream credential, then
         applies the exact subscription quota and credential policy. Credential rotation
         never changes the stable key/account IDs or their history. Active snapshots cover
-        registration, renewal, upgrade, downgrade, and explicit reactivation; cancelled
-        snapshots withdraw only the unconsumed entitlement remainder.
+        registration, renewal, upgrade, downgrade, and reactivation only while the stable
+        credential remains active. Suspended or revoked credentials reject active snapshots
+        atomically; only an operator may change credential lifecycle. Cancelled snapshots
+        still withdraw the unconsumed entitlement remainder.
 
         `version` is monotonically increasing for the stable external subscription. Older
         out-of-order events return 409 and cannot roll quota or policy back. The replay
@@ -2181,6 +2183,40 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/integrations/memeloop-cloud/events:
+    get:
+      tags: [Entitlements]
+      operationId: listMemeLoopCloudSubscriptionEvents
+      summary: List bounded MemeLoop Cloud subscription lifecycle events
+      description: |
+        Returns at most 500 sanitized audit rows newest first. Tenant-scoped service
+        credentials are always bound to their tenant; selecting another tenant returns
+        403. Raw webhook event identities and request digests are never returned.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: entitlements:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - name: principal_external_id
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 200 }
+        - name: key_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        '200':
+          description: Sanitized subscription lifecycle events.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 500
+                items: { $ref: '#/components/schemas/MemeLoopCloudSubscriptionEvent' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /internal/v1/entitlements/cancel:
     post:
       tags: [Entitlements]
@@ -2498,6 +2534,26 @@ paths:
           content:
             text/html:
               schema: { type: string }
+  /self/v1/entitlements:
+    get:
+      tags: [Self service]
+      operationId: getOwnMemeLoopCloudEntitlements
+      summary: Read subscription state and lifecycle events for the current stable credential
+      description: |
+        Resolves entitlement history through the authenticated stable key's credit account.
+        No tenant, principal, account, or key selector is accepted, and rotation leaves this
+        view attached to the same key_id and history.
+      security: [{ clientBearer: [] }]
+      responses:
+        '200':
+          description: Own current MemeLoop Cloud entitlements and sanitized lifecycle events.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SelfMemeLoopCloudEntitlements' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   /self/v1/key:
     get:
@@ -4925,6 +4981,34 @@ components:
         credential: { $ref: '#/components/schemas/ProvisionedCloudCredential' }
         entitlement: { $ref: '#/components/schemas/EntitlementResult' }
         policy: { $ref: '#/components/schemas/CredentialPolicy' }
+    MemeLoopCloudSubscriptionEvent:
+      type: object
+      additionalProperties: false
+      required: [event_id, tenant_external_id, principal_external_id, key_id, entitlement_id, provider, external_subscription_id, version, subscription_status, created_at]
+      properties:
+        event_id: { type: string, format: uuid }
+        tenant_external_id: { type: string }
+        principal_external_id: { type: string }
+        key_id: { type: string, format: uuid }
+        entitlement_id: { type: string, format: uuid }
+        provider: { type: string, const: memeloop-cloud }
+        external_subscription_id: { $ref: '#/components/schemas/EntitlementIdentity' }
+        version: { type: integer, format: int64, minimum: 1 }
+        subscription_status: { type: string, enum: [active, cancelled] }
+        created_at: { type: integer, format: int64 }
+    SelfMemeLoopCloudEntitlements:
+      type: object
+      additionalProperties: false
+      required: [entitlements, events]
+      properties:
+        entitlements:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/Entitlement' }
+        events:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/MemeLoopCloudSubscriptionEvent' }
     RequestSummary:
       type: object
       required: [request_id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost, error_code]

@@ -4,6 +4,10 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
     let authenticated = Router::new()
         .route("/self/v1/key", get(self_key))
         .route("/self/v1/key/limits", get(self_key_limits))
+        .route(
+            "/self/v1/entitlements",
+            get(self_memeloop_cloud_entitlements),
+        )
         .route("/self/v1/requests", get(self_requests))
         .route("/self/v1/requests/{request_id}", get(self_request_detail))
         .route(

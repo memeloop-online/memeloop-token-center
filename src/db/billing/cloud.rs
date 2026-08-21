@@ -12,6 +12,69 @@ pub struct CloudSubscriptionEventInput {
     pub subscription_status: String,
 }
 
+/// Bounded audit projection for operator and credential self-service reads.
+/// The raw webhook event identifier and payload hash are deliberately omitted:
+/// callers need lifecycle evidence, not a replayable integration namespace.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CloudSubscriptionEventView {
+    pub event_id: Uuid,
+    pub tenant_external_id: String,
+    pub principal_external_id: String,
+    pub key_id: Uuid,
+    pub entitlement_id: Uuid,
+    pub provider: String,
+    pub external_subscription_id: String,
+    pub version: i64,
+    pub subscription_status: String,
+    pub created_at: i64,
+}
+
+impl Database {
+    /// Lists lifecycle events newest first. Every optional selector is applied
+    /// in SQL and the result is hard-bounded so this audit endpoint cannot turn
+    /// into an unbounded history export.
+    pub async fn list_cloud_subscription_events(
+        &self,
+        tenant_external_id: Option<&str>,
+        principal_external_id: Option<&str>,
+        key_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<CloudSubscriptionEventView>, AppError> {
+        if !(1..=500).contains(&limit) {
+            return Err(AppError::BadRequest(
+                "limit must be between 1 and 500".into(),
+            ));
+        }
+        let rows = sqlx::query(
+            "SELECT ev.id AS event_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, ev.key_id, ev.entitlement_id, e.provider, e.external_subscription_id, ev.version, ev.subscription_status, ev.created_at FROM memeloop_cloud_subscription_events ev JOIN tenants t ON t.id = ev.tenant_id JOIN principals p ON p.id = ev.principal_id AND p.tenant_id = ev.tenant_id JOIN key_records k ON k.id = ev.key_id AND k.tenant_id = ev.tenant_id AND k.principal_id = ev.principal_id JOIN subscription_entitlements e ON e.id = ev.entitlement_id AND e.tenant_id = ev.tenant_id AND e.account_id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND ($3 = '' OR ev.key_id = $3) ORDER BY ev.created_at DESC, ev.id DESC LIMIT $4",
+        )
+        .bind(tenant_external_id.unwrap_or_default())
+        .bind(principal_external_id.unwrap_or_default())
+        .bind(key_id.map(|id| id.to_string()).unwrap_or_default())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(cloud_subscription_event_view)
+            .collect()
+    }
+}
+
+fn cloud_subscription_event_view(row: AnyRow) -> Result<CloudSubscriptionEventView, AppError> {
+    Ok(CloudSubscriptionEventView {
+        event_id: parse_uuid(row.try_get("event_id")?)?,
+        tenant_external_id: row.try_get("tenant_external_id")?,
+        principal_external_id: row.try_get("principal_external_id")?,
+        key_id: parse_uuid(row.try_get("key_id")?)?,
+        entitlement_id: parse_uuid(row.try_get("entitlement_id")?)?,
+        provider: row.try_get("provider")?,
+        external_subscription_id: row.try_get("external_subscription_id")?,
+        version: row.try_get("version")?,
+        subscription_status: row.try_get("subscription_status")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
 fn validate_cloud_subscription_event(input: &CloudSubscriptionEventInput) -> Result<(), AppError> {
     if input.event_key_hash.len() != 64
         || input.request_hash.len() != 64

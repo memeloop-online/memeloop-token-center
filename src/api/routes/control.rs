@@ -208,6 +208,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             "/internal/v1/entitlements/replace",
             post(replace_entitlement),
         )
+        .route(
+            "/internal/v1/integrations/memeloop-cloud/events",
+            get(list_memeloop_cloud_subscription_events),
+        )
         .route_layer(middleware::from_fn_with_state(
             state,
             authenticate_control_before_body,

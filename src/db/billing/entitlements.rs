@@ -110,6 +110,22 @@ impl Database {
         rows.into_iter().map(entitlement_view).collect()
     }
 
+    /// Self-service projection bound to the stable key identity. The join goes
+    /// through the durable credit account, so rotating credential material does
+    /// not move subscription history and no caller-supplied tenant is trusted.
+    pub async fn list_cloud_entitlements_for_key(
+        &self,
+        key_id: Uuid,
+    ) -> Result<Vec<EntitlementView>, AppError> {
+        let rows = sqlx::query(
+            "SELECT e.id AS entitlement_id, c.id AS cycle_id, t.external_id AS tenant_external_id, e.account_id, e.provider, e.external_subscription_id, c.external_cycle_id, c.period_start, c.period_end, c.currency, c.desired_micros, c.consumed_micros, c.funded_micros, e.status, e.version, e.replaced_by_entitlement_id, e.created_at, e.updated_at FROM key_records k JOIN subscription_entitlements e ON e.tenant_id = k.tenant_id AND e.account_id = k.account_id JOIN tenants t ON t.id = e.tenant_id JOIN entitlement_cycles c ON c.id = e.current_cycle_id WHERE k.id = $1 AND e.provider = 'memeloop-cloud' ORDER BY e.updated_at DESC, e.id DESC LIMIT 100",
+        )
+        .bind(key_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(entitlement_view).collect()
+    }
+
     /// Reconciles an external subscription snapshot against durable account
     /// credit. The tenant and idempotency key form the replay namespace, while
     /// the stable provider/subscription identity survives credential rotation.
@@ -262,22 +278,8 @@ impl Database {
         )
         .await?;
 
-        if replayed {
-            input.policy.allowed_models.clear();
-            input.audit.key_id = credential.key_id;
-            input.audit.entitlement_id = entitlement.entitlement.entitlement_id;
-            super::cloud::record_cloud_subscription_event_in_transaction(&mut tx, input.audit, now)
-                .await?;
-            tx.commit().await?;
-            return Ok(ApplyCloudEntitlementResult {
-                credential,
-                entitlement,
-                policy: input.policy,
-            });
-        }
-
-        let key_status: String = sqlx::query(
-            "SELECT k.status FROM key_records k JOIN subscription_entitlements e ON e.tenant_id = k.tenant_id AND e.account_id = k.account_id WHERE k.id = $1 AND k.tenant_id = $2 AND e.provider = $3 AND e.external_subscription_id = $4 AND e.version = $5",
+        let key_row = sqlx::query(
+            "SELECT k.status, k.policy_json FROM key_records k JOIN subscription_entitlements e ON e.tenant_id = k.tenant_id AND e.account_id = k.account_id WHERE k.id = $1 AND k.tenant_id = $2 AND e.provider = $3 AND e.external_subscription_id = $4 AND e.version = $5",
         )
         .bind(credential.key_id.to_string())
         .bind(&tenant_id)
@@ -290,31 +292,61 @@ impl Database {
             AppError::Conflict(
                 "credential policy snapshot is stale or belongs to another entitlement".into(),
             )
-        })?
-        .try_get("status")?;
+        })?;
+        let key_status: String = key_row.try_get("status")?;
+        let mut effective_policy: KeyPolicy =
+            serde_json::from_str(&key_row.try_get::<String, _>("policy_json")?)
+                .map_err(|_| AppError::Internal)?;
 
-        // `allowed_models` remains accepted only as an input compatibility
-        // source. Clearing it before persistence prevents it becoming a second
-        // runtime authority beside normalized grants.
-        input.policy.allowed_models.clear();
-        let policy_json = serde_json::to_string(&input.policy).map_err(|_| AppError::Internal)?;
-        let updated = sqlx::query(
-            "UPDATE key_records SET policy_json = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
-        )
-        .bind(policy_json)
-        .bind(now)
-        .bind(credential.key_id.to_string())
-        .bind(&tenant_id)
-        .execute(&mut *tx)
-        .await?;
-        if updated.rows_affected() != 1 {
+        if replayed {
+            input.audit.key_id = credential.key_id;
+            input.audit.entitlement_id = entitlement.entitlement.entitlement_id;
+            super::cloud::record_cloud_subscription_event_in_transaction(&mut tx, input.audit, now)
+                .await?;
+            tx.commit().await?;
+            return Ok(ApplyCloudEntitlementResult {
+                credential,
+                entitlement,
+                policy: effective_policy,
+            });
+        }
+
+        // Subscription automation owns financial snapshots, but it does not own
+        // the operator-controlled credential lifecycle. A disabled stable key
+        // must be explicitly reactivated by an operator before a later active
+        // snapshot may fund it or alter its access policy.
+        if active_snapshot && key_status != "active" {
             return Err(AppError::Conflict(
-                "credential policy snapshot is stale".into(),
+                "suspended or revoked credentials cannot receive active subscription updates"
+                    .into(),
             ));
         }
 
-        let may_grant = active_snapshot && key_status == "active";
-        let (route_ids, route_group_ids, legacy_models) = if may_grant {
+        if active_snapshot {
+            // `allowed_models` remains accepted only as an input compatibility
+            // source. Clearing it before persistence prevents it becoming a
+            // second runtime authority beside normalized grants.
+            input.policy.allowed_models.clear();
+            let policy_json =
+                serde_json::to_string(&input.policy).map_err(|_| AppError::Internal)?;
+            let updated = sqlx::query(
+                "UPDATE key_records SET policy_json = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+            )
+            .bind(policy_json)
+            .bind(now)
+            .bind(credential.key_id.to_string())
+            .bind(&tenant_id)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "credential policy snapshot is stale".into(),
+                ));
+            }
+            effective_policy = input.policy;
+        }
+
+        let (route_ids, route_group_ids, legacy_models) = if active_snapshot {
             match &input.routing {
                 CloudRoutingGrantSnapshot::Explicit {
                     route_ids,
@@ -347,7 +379,7 @@ impl Database {
         Ok(ApplyCloudEntitlementResult {
             credential,
             entitlement,
-            policy: input.policy,
+            policy: effective_policy,
         })
     }
 }

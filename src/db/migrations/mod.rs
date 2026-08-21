@@ -263,6 +263,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "routing grant relation revisions",
         sql: include_str!("../../../migrations/common/0048_routing_grant_relation_revisions.sql"),
     },
+    Migration {
+        version: 49,
+        name: "MemeLoop Cloud event query indexes",
+        sql: include_str!("../../../migrations/common/0049_memeloop_cloud_event_queries.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -511,6 +516,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 48,
         name: "routing grant relation revisions",
         sql: include_str!("../../../migrations/common/0048_routing_grant_relation_revisions.sql"),
+    },
+    Migration {
+        version: 49,
+        name: "MemeLoop Cloud event query indexes",
+        sql: include_str!("../../../migrations/common/0049_memeloop_cloud_event_queries.sql"),
     },
 ];
 

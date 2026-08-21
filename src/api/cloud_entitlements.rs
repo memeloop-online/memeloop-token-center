@@ -37,6 +37,20 @@ struct CloudSubscriptionWebhook {
     proration: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct CloudSubscriptionEventQuery {
+    tenant_external_id: Option<String>,
+    principal_external_id: Option<String>,
+    key_id: Option<Uuid>,
+    #[serde(default = "default_cloud_event_limit")]
+    limit: i64,
+}
+
+fn default_cloud_event_limit() -> i64 {
+    100
+}
+
 fn required_ascii_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, AppError> {
     headers
         .get(name)
@@ -274,6 +288,54 @@ pub(in crate::api) async fn sync_memeloop_cloud_subscription(
             "credential": result.credential,
             "entitlement": result.entitlement,
             "policy": result.policy,
+        })),
+    ))
+}
+
+pub(in crate::api) async fn list_memeloop_cloud_subscription_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CloudSubscriptionEventQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "entitlements:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let principal = query
+        .principal_external_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if principal.as_ref().is_some_and(|value| value.len() > 200) {
+        return Err(AppError::BadRequest(
+            "principal_external_id must contain at most 200 characters".into(),
+        ));
+    }
+    Ok(Json(
+        state
+            .db
+            .list_cloud_subscription_events(
+                tenant.as_deref(),
+                principal.as_deref(),
+                query.key_id,
+                query.limit,
+            )
+            .await?,
+    ))
+}
+
+pub(in crate::api) async fn self_memeloop_cloud_entitlements(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let key = authenticate_downstream(&headers, &state).await?;
+    let entitlements = state.db.list_cloud_entitlements_for_key(key.key_id).await?;
+    let events = state
+        .db
+        .list_cloud_subscription_events(None, None, Some(key.key_id), 100)
+        .await?;
+    Ok((
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(json!({
+            "entitlements": entitlements,
+            "events": events,
         })),
     ))
 }

@@ -61,8 +61,8 @@ use validation::*;
 pub(crate) use billing::validate_entitlement_operation;
 pub use billing::{
     ApplyCloudEntitlementInput, ApplyCloudEntitlementResult, CancelEntitlementInput,
-    CloudRoutingGrantSnapshot, CloudSubscriptionEventInput, EntitlementOperation,
-    ReconcileEntitlementInput, ReplaceEntitlementInput,
+    CloudRoutingGrantSnapshot, CloudSubscriptionEventInput, CloudSubscriptionEventView,
+    EntitlementOperation, ReconcileEntitlementInput, ReplaceEntitlementInput,
 };
 pub(crate) use credentials::{
     CloudCredentialProvisioningInput, replace_key_routing_grants_in_transaction,

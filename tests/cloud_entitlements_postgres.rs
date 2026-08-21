@@ -293,7 +293,7 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
         )
         .await
         .status(),
-        StatusCode::CREATED
+        StatusCode::CONFLICT
     );
     assert!(
         test_state
@@ -329,7 +329,7 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
         )
         .await
         .status(),
-        StatusCode::CREATED
+        StatusCode::CONFLICT
     );
     assert!(
         test_state

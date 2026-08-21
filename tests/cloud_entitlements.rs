@@ -3,9 +3,9 @@ use memeloop_token_center::{
     config::Config,
     crypto,
     db::{
-        CreateGroupInput, CreateModelRouteInput, CreateUpstreamAccountInput,
-        DiscoveredUpstreamModel, GroupKind, ReplaceCredentialRoutingInput,
-        ReplaceGroupMembersInput,
+        CreateGroupInput, CreateModelRouteInput, CreateServiceTokenInput,
+        CreateUpstreamAccountInput, DiscoveredUpstreamModel, GroupKind,
+        ReplaceCredentialRoutingInput, ReplaceGroupMembersInput,
     },
     provider::UpstreamCredential,
 };
@@ -823,7 +823,203 @@ async fn concurrent_first_cloud_events_cannot_leave_a_losing_principal_key() {
 }
 
 #[tokio::test]
-async fn suspended_and_revoked_cloud_identity_updates_finance_without_expanding_access() {
+async fn entitlement_and_event_queries_are_bound_to_service_tenant_or_authenticated_key() {
+    let fixture = Fixture::new().await;
+    let first_tenant = "cloud-query-a";
+    let second_tenant = "cloud-query-b";
+    let first: Value = fixture
+        .send(
+            "cloud-query-event-a",
+            &active(
+                first_tenant,
+                "member-a",
+                "subscription-a",
+                "cycle-a",
+                "7",
+                1,
+                7,
+            ),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let second: Value = fixture
+        .send(
+            "cloud-query-event-b",
+            &active(
+                second_tenant,
+                "member-b",
+                "subscription-b",
+                "cycle-b",
+                "9",
+                1,
+                9,
+            ),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let first_key = first["credential"]["key"].as_str().unwrap();
+    let first_key_id = first["credential"]["key_id"].as_str().unwrap();
+    let second_key_id = second["credential"]["key_id"].as_str().unwrap();
+
+    let self_view = fixture
+        .client
+        .get(format!(
+            "{}/self/v1/entitlements?tenant_external_id={second_tenant}&key_id={second_key_id}",
+            fixture.base_url
+        ))
+        .bearer_auth(first_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(self_view.status(), StatusCode::OK);
+    assert_eq!(self_view.headers()["cache-control"], "private, no-store");
+    let self_view: Value = self_view.json().await.unwrap();
+    assert_eq!(self_view["entitlements"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        self_view["entitlements"][0]["tenant_external_id"],
+        first_tenant
+    );
+    assert_eq!(self_view["events"].as_array().unwrap().len(), 1);
+    assert_eq!(self_view["events"][0]["key_id"], first_key_id);
+    let serialized = serde_json::to_string(&self_view).unwrap();
+    assert!(!serialized.contains("event_key_hash"));
+    assert!(!serialized.contains("request_hash"));
+
+    let parsed_first_key_id = Uuid::parse_str(first_key_id).unwrap();
+    let rotated = fixture
+        .state
+        .db
+        .rotate_key(
+            parsed_first_key_id,
+            "cloud-query-self-service-rotation",
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotated.key_id, parsed_first_key_id);
+    let rotated_view: Value = fixture
+        .client
+        .get(format!("{}/self/v1/entitlements", fixture.base_url))
+        .bearer_auth(&rotated.key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rotated_view["events"][0]["key_id"], first_key_id);
+    assert_eq!(
+        rotated_view["entitlements"][0]["account_id"],
+        first["credential"]["account_id"]
+    );
+    assert_eq!(
+        fixture
+            .client
+            .get(format!("{}/self/v1/entitlements", fixture.base_url))
+            .bearer_auth(first_key)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let scoped = fixture
+        .state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "cloud-query-a-reader".into(),
+                scopes: vec!["entitlements:read".into()],
+                tenant_external_id: Some(first_tenant.into()),
+            },
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let own_events = fixture
+        .client
+        .get(format!(
+            "{}/internal/v1/integrations/memeloop-cloud/events",
+            fixture.base_url
+        ))
+        .bearer_auth(&scoped.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(own_events.status(), StatusCode::OK);
+    let own_events: Value = own_events.json().await.unwrap();
+    assert_eq!(own_events.as_array().unwrap().len(), 1);
+    assert_eq!(own_events[0]["tenant_external_id"], first_tenant);
+
+    let wrong_scope = fixture
+        .state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "cloud-query-wrong-scope".into(),
+                scopes: vec!["requests:read".into()],
+                tenant_external_id: Some(first_tenant.into()),
+            },
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .client
+            .get(format!(
+                "{}/internal/v1/integrations/memeloop-cloud/events",
+                fixture.base_url
+            ))
+            .bearer_auth(&wrong_scope.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let cross_tenant = fixture
+        .client
+        .get(format!(
+            "{}/internal/v1/integrations/memeloop-cloud/events?tenant_external_id={second_tenant}",
+            fixture.base_url
+        ))
+        .bearer_auth(&scoped.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant.status(), StatusCode::FORBIDDEN);
+
+    let foreign_key_filter = fixture
+        .client
+        .get(format!(
+            "{}/internal/v1/integrations/memeloop-cloud/events?key_id={second_key_id}",
+            fixture.base_url
+        ))
+        .bearer_auth(&scoped.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign_key_filter.status(), StatusCode::OK);
+    assert!(
+        foreign_key_filter
+            .json::<Value>()
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn suspended_and_revoked_cloud_identity_rejects_active_refills_but_allows_cancellation() {
     let fixture = Fixture::new().await;
     let tenant = "cloud-disabled-identity";
     let principal = "disabled-member";
@@ -849,27 +1045,41 @@ async fn suspended_and_revoked_cloud_identity_updates_finance_without_expanding_
     suspended_update["route_ids"] = json!([route_id]);
     assert_eq!(
         fixture.send("disabled-2", &suspended_update).await.status(),
-        StatusCode::CREATED
+        StatusCode::CONFLICT
     );
-    assert!(
-        fixture
-            .state
-            .db
-            .credential_routing(key_id, tenant)
-            .await
-            .unwrap()
-            .effective_route_ids
-            .is_empty()
-    );
+    let suspended = fixture
+        .state
+        .db
+        .list_managed_keys(Some(tenant), Some(principal))
+        .await
+        .unwrap();
+    assert_eq!(suspended[0].status, "suspended");
+    assert_eq!(suspended[0].available_balance, "10");
+    assert_eq!(suspended[0].policy.requests_per_minute, 10);
+    let entitlement = fixture
+        .state
+        .db
+        .list_entitlements(Some(tenant), Some("memeloop-cloud"), Some(subscription))
+        .await
+        .unwrap();
+    assert_eq!(entitlement[0].version, 1);
+    assert_eq!(entitlement[0].remaining, "10");
+
+    let cancelled_response: Value = fixture
+        .send(
+            "disabled-3",
+            &cancelled(tenant, principal, subscription, "cycle", 3),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled_response["entitlement"]["status"], "cancelled");
+    assert_eq!(cancelled_response["entitlement"]["remaining"], "0");
     assert_eq!(
-        fixture
-            .send(
-                "disabled-3",
-                &cancelled(tenant, principal, subscription, "cycle", 3),
-            )
-            .await
-            .status(),
-        StatusCode::OK
+        cancelled_response["policy"]["requests_per_minute"],
+        json!(10),
+        "cancellation must not replace the persisted policy with payload filler"
     );
 
     fixture
@@ -882,7 +1092,26 @@ async fn suspended_and_revoked_cloud_identity_updates_finance_without_expanding_
     revoked_update["route_ids"] = json!([route_id]);
     assert_eq!(
         fixture.send("disabled-4", &revoked_update).await.status(),
-        StatusCode::CREATED
+        StatusCode::CONFLICT
+    );
+    let revoked = fixture
+        .state
+        .db
+        .list_managed_keys(Some(tenant), Some(principal))
+        .await
+        .unwrap();
+    assert_eq!(revoked[0].status, "revoked");
+    assert_eq!(revoked[0].available_balance, "0");
+    assert_eq!(revoked[0].policy.requests_per_minute, 10);
+    assert_eq!(
+        fixture
+            .send(
+                "disabled-5",
+                &cancelled(tenant, principal, subscription, "cycle", 5),
+            )
+            .await
+            .status(),
+        StatusCode::OK
     );
     assert!(
         fixture
@@ -894,21 +1123,14 @@ async fn suspended_and_revoked_cloud_identity_updates_finance_without_expanding_
             .effective_route_ids
             .is_empty()
     );
-    assert_eq!(
-        fixture
-            .send(
-                "disabled-5",
-                &cancelled(tenant, principal, subscription, "cycle", 5),
-            )
-            .await
-            .status(),
-        StatusCode::OK
-    );
-    let keys = fixture
+    let events = fixture
         .state
         .db
-        .list_managed_keys(Some(tenant), Some(principal))
+        .list_cloud_subscription_events(Some(tenant), Some(principal), Some(key_id), 100)
         .await
         .unwrap();
-    assert_eq!(keys[0].status, "revoked");
+    let mut versions = events.iter().map(|event| event.version).collect::<Vec<_>>();
+    versions.sort_unstable();
+    assert_eq!(versions, vec![1, 3, 5]);
+    assert!(events.iter().all(|event| event.key_id == key_id));
 }
