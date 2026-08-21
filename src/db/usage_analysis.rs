@@ -1,5 +1,12 @@
 use std::collections::BTreeMap;
 
+mod generation_sql;
+mod session_accumulator;
+mod session_sql;
+use generation_sql::generation_usage_dimension_sql;
+use session_accumulator::{SessionUsageAccumulator, accumulate_session_usage_row};
+use session_sql::session_usage_dimension_sql;
+
 use sqlx::{Row, any::AnyRow};
 use uuid::Uuid;
 
@@ -9,7 +16,8 @@ use super::{
 use crate::model::{
     UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisGenerationUnitsByBillingUnit,
     UsageAnalysisGenerationUnitsByModality, UsageAnalysisHeatmapBucket, UsageAnalysisMetrics,
-    UsageAnalysisResponse, UsageAnalysisTimeBucket, micros_to_decimal_string,
+    UsageAnalysisResponse, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket,
+    micros_to_decimal_string,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -203,7 +211,7 @@ impl Database {
             bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(session_sql)), main_plan)
                 .fetch_all(&self.pool)
                 .await?;
-        let mut session_projection: BTreeMap<(String, String), UsageMetricsAccumulator> =
+        let mut session_projection: BTreeMap<(String, String), SessionUsageAccumulator> =
             BTreeMap::new();
         for row in session_rows {
             accumulate_session_usage_row(&mut session_projection, &row)?;
@@ -218,12 +226,17 @@ impl Database {
         let mut by_key = Vec::new();
         let mut by_session = session_projection
             .into_iter()
-            .map(|((_kind, id), accumulator)| UsageAnalysisBucket {
-                id,
-                label: accumulator.label.clone(),
-                metrics: accumulator.finish_without_p95(),
+            .map(|((_id, _key_id), accumulator)| {
+                Ok(UsageAnalysisSessionBucket {
+                    unlinked: accumulator.id.starts_with("unlinked:"),
+                    id: accumulator.id.clone(),
+                    label: accumulator.id,
+                    key_id: parse_uuid(accumulator.key_id)?,
+                    key_alias: accumulator.key_alias,
+                    metrics: accumulator.metrics.finish_without_p95(),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, AppError>>()?;
         let mut by_upstream = Vec::new();
         let mut by_protocol = Vec::new();
         let mut by_status = Vec::new();
@@ -256,7 +269,6 @@ impl Database {
         for buckets in [
             &mut by_model,
             &mut by_key,
-            &mut by_session,
             &mut by_upstream,
             &mut by_protocol,
             &mut by_status,
@@ -270,6 +282,14 @@ impl Database {
                     .then_with(|| left.id.cmp(&right.id))
             });
         }
+        by_session.sort_by(|left, right| {
+            right
+                .metrics
+                .requests
+                .cmp(&left.metrics.requests)
+                .then_with(|| left.key_id.cmp(&right.key_id))
+                .then_with(|| left.id.cmp(&right.id))
+        });
         errors.truncate(100);
         let mut heatmap = heatmap_projection
             .into_iter()
@@ -687,215 +707,6 @@ fn usage_analysis_generation_fact_sql(
     )
 }
 
-fn generation_usage_dimension_sql(
-    granularity: UsageAnalysisGranularity,
-    tenant_scoped: bool,
-) -> String {
-    let (table, bucket_column) = match granularity {
-        UsageAnalysisGranularity::Hour => ("generation_usage_dimensions_hourly", "hour_bucket"),
-        UsageAnalysisGranularity::Day => ("generation_usage_dimensions_daily", "day_bucket"),
-    };
-    let tenant_predicate = if tenant_scoped {
-        "AND {alias}.tenant_id = $1"
-    } else {
-        "AND CAST($1 AS TEXT) = ''"
-    };
-    let filters = |alias: &str| {
-        format!(
-            r#"{tenant_predicate}
-              AND ($2 = '' OR {alias}.key_id = $2)
-              AND ($5 = '' OR {alias}.model = $5)
-              AND ($8 = '' OR {alias}.error_code = $8)
-              AND ($9 = ''
-                   OR ($9 = 'unassigned' AND {alias}.upstream_account_id = '')
-                   OR {alias}.upstream_account_id = $9)
-              AND ($10 = '' OR {alias}.model_route_id = $10)"#,
-            tenant_predicate = tenant_predicate.replace("{alias}", alias),
-        )
-    };
-    let rollup_filters = filters("a");
-    let fact_filters = filters("f");
-    format!(
-        r#"WITH generation_activity AS (
-               SELECT a.tenant_id, a.key_id, a.model, a.status_class, a.error_code,
-                      a.upstream_account_id, a.model_route_id, a.modality,
-                      a.billing_unit, a.currency, a.units
-                 FROM {table} a
-                WHERE a.{bucket_column} >= $3 AND a.{bucket_column} < $4
-                  {rollup_filters}
-               UNION ALL
-               SELECT f.tenant_id, f.key_id, f.model, f.status_class, f.error_code,
-                      f.upstream_account_id, f.model_route_id, f.modality,
-                      f.billing_unit, f.currency, f.billed_units
-                 FROM generation_stats_facts f
-                WHERE $13 <= $14 AND f.created_at >= $13 AND f.created_at <= $14
-                  {fact_filters}
-               UNION ALL
-               SELECT f.tenant_id, f.key_id, f.model, f.status_class, f.error_code,
-                      f.upstream_account_id, f.model_route_id, f.modality,
-                      f.billing_unit, f.currency, f.billed_units
-                 FROM generation_stats_facts f
-                WHERE $15 <= $16 AND f.created_at >= $15 AND f.created_at <= $16
-                  {fact_filters}
-           ),
-           filtered_generation AS (
-               SELECT activity.*
-                 FROM generation_activity activity
-                 JOIN key_records k
-                   ON k.id = activity.key_id AND k.tenant_id = activity.tenant_id
-                 JOIN principals principal
-                   ON principal.id = k.principal_id
-                  AND principal.tenant_id = k.tenant_id
-                WHERE ($6 = '' OR $6 = 'generation')
-                  AND ($7 = ''
-                       OR ($7 = 'success' AND activity.status_class = 'success')
-                       OR ($7 = 'error' AND activity.status_class = 'failure'))
-                  AND ($11 = '' OR LOWER(k.alias) LIKE $11 ESCAPE '\')
-                  AND ($12 = '' OR LOWER(principal.external_id) LIKE $12 ESCAPE '\')
-           )
-           SELECT 'modality' AS dimension, modality AS dimension_id, currency,
-                  CAST(COALESCE(SUM(units), 0) AS BIGINT) AS units
-             FROM filtered_generation
-            GROUP BY modality, currency
-           UNION ALL
-           SELECT 'billing_unit' AS dimension, billing_unit AS dimension_id, currency,
-                  CAST(COALESCE(SUM(units), 0) AS BIGINT) AS units
-             FROM filtered_generation
-            GROUP BY billing_unit, currency"#,
-    )
-}
-
-fn session_usage_dimension_sql(
-    granularity: UsageAnalysisGranularity,
-    tenant_scoped: bool,
-) -> String {
-    let (table, bucket_column) = match granularity {
-        UsageAnalysisGranularity::Hour => ("session_usage_hourly", "hour_bucket"),
-        UsageAnalysisGranularity::Day => ("session_usage_daily", "day_bucket"),
-    };
-    let tenant_predicate = if tenant_scoped {
-        "AND {alias}.tenant_id = $1"
-    } else {
-        "AND CAST($1 AS TEXT) = ''"
-    };
-    let filters = |alias: &str| {
-        format!(
-            r#"{tenant_predicate}
-              AND ($2 = '' OR {alias}.key_id = $2)
-              AND ($5 = '' OR {alias}.model = $5)
-              AND ($6 = '' OR {alias}.protocol = $6)
-              AND ($7 = ''
-                   OR ($7 = 'success' AND {alias}.status_class = 'success')
-                   OR ($7 = 'error' AND {alias}.status_class = 'failure'))
-              AND ($8 = '' OR {alias}.error_code = $8)
-              AND ($9 = ''
-                   OR ($9 = 'unassigned' AND {alias}.upstream_account_id = '')
-                   OR {alias}.upstream_account_id = $9)
-              AND ($10 = '' OR {alias}.model_route_id = $10)"#,
-            tenant_predicate = tenant_predicate.replace("{alias}", alias),
-        )
-    };
-    let rollup_filters = filters("rollup");
-    let fact_filters = filters("fact");
-    format!(
-        r#"WITH session_activity AS (
-               SELECT rollup.tenant_id, rollup.key_id, rollup.session_id,
-                      rollup.model, rollup.protocol, rollup.status_class,
-                      rollup.error_code, rollup.upstream_account_id,
-                      rollup.model_route_id, rollup.currency, rollup.requests,
-                      rollup.input_tokens, rollup.output_tokens,
-                      rollup.duration_count, rollup.duration_sum_ms,
-                      rollup.cost_micros
-                 FROM {table} rollup
-                WHERE rollup.{bucket_column} >= $3 AND rollup.{bucket_column} < $4
-                  {rollup_filters}
-               UNION ALL
-               SELECT fact.tenant_id, fact.key_id,
-                      COALESCE(record.conversation_cluster_id, 'unlinked:' || fact.key_id),
-                      fact.model,
-                      CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%'
-                           THEN 'anthropic'
-                           WHEN fact.protocol = 'openai-image' THEN 'openai-image'
-                           ELSE 'openai' END,
-                      fact.status_class, fact.error_code, fact.upstream_account_id,
-                      fact.model_route_id, fact.currency, 1, fact.input_tokens,
-                      fact.output_tokens, 1, fact.duration_ms, fact.cost_micros
-                 FROM request_stats_facts fact
-                 JOIN request_records record
-                   ON record.id = fact.request_id AND record.created_at = fact.created_at
-                WHERE $13 <= $14 AND fact.created_at >= $13 AND fact.created_at <= $14
-                  {fact_filters}
-               UNION ALL
-               SELECT fact.tenant_id, fact.key_id,
-                      COALESCE(record.conversation_cluster_id, 'unlinked:' || fact.key_id),
-                      fact.model,
-                      CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%'
-                           THEN 'anthropic'
-                           WHEN fact.protocol = 'openai-image' THEN 'openai-image'
-                           ELSE 'openai' END,
-                      fact.status_class, fact.error_code, fact.upstream_account_id,
-                      fact.model_route_id, fact.currency, 1, fact.input_tokens,
-                      fact.output_tokens, 1, fact.duration_ms, fact.cost_micros
-                 FROM request_stats_facts fact
-                 JOIN request_records record
-                   ON record.id = fact.request_id AND record.created_at = fact.created_at
-                WHERE $15 <= $16 AND fact.created_at >= $15 AND fact.created_at <= $16
-                  {fact_filters}
-           ),
-           filtered_sessions AS (
-               SELECT activity.*
-                 FROM session_activity activity
-                 JOIN key_records key_record
-                   ON key_record.id = activity.key_id
-                  AND key_record.tenant_id = activity.tenant_id
-                 JOIN principals principal
-                   ON principal.id = key_record.principal_id
-                  AND principal.tenant_id = key_record.tenant_id
-                WHERE ($11 = '' OR LOWER(key_record.alias) LIKE $11 ESCAPE '\')
-                  AND ($12 = '' OR LOWER(principal.external_id) LIKE $12 ESCAPE '\')
-           ),
-           grouped_sessions AS (
-               SELECT session_id, currency, SUM(requests) AS requests,
-                      SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END)
-                          AS successful_requests,
-                      SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END)
-                          AS failed_requests,
-                      SUM(input_tokens) AS input_tokens,
-                      SUM(output_tokens) AS output_tokens,
-                      SUM(duration_count) AS duration_count,
-                      SUM(duration_sum_ms) AS duration_sum_ms,
-                      SUM(cost_micros) AS cost_micros
-                 FROM filtered_sessions
-                GROUP BY session_id, currency
-           ),
-           with_session_totals AS (
-               SELECT grouped_sessions.*,
-                      SUM(requests) OVER (PARTITION BY session_id) AS session_requests
-                 FROM grouped_sessions
-           ),
-           ranked_sessions AS (
-               SELECT with_session_totals.*,
-                      DENSE_RANK() OVER (
-                          ORDER BY session_requests DESC, session_id ASC
-                      ) AS session_rank
-                 FROM with_session_totals
-           )
-           SELECT 'session' AS bucket_kind, session_id AS bucket_id,
-                  session_id AS bucket_label, currency,
-                  CAST(requests AS BIGINT) AS requests,
-                  CAST(successful_requests AS BIGINT) AS successful_requests,
-                  CAST(failed_requests AS BIGINT) AS failed_requests,
-                  CAST(input_tokens AS BIGINT) AS input_tokens,
-                  CAST(output_tokens AS BIGINT) AS output_tokens,
-                  CAST(duration_count AS BIGINT) AS duration_count,
-                  CAST(duration_sum_ms AS BIGINT) AS duration_sum_ms,
-                  CAST(cost_micros AS BIGINT) AS cost_micros
-             FROM ranked_sessions
-            WHERE session_rank <= 100
-            ORDER BY session_rank, session_id, currency"#,
-    )
-}
-
 fn usage_analysis_main_sql(
     backend: DatabaseBackend,
     granularity: UsageAnalysisGranularity,
@@ -1111,48 +922,6 @@ impl UsageMetricsAccumulator {
     }
 }
 
-fn accumulate_session_usage_row(
-    projections: &mut BTreeMap<(String, String), UsageMetricsAccumulator>,
-    row: &AnyRow,
-) -> Result<(), AppError> {
-    let kind: String = row.try_get("bucket_kind")?;
-    let id: String = row.try_get("bucket_id")?;
-    let label: String = row.try_get("bucket_label")?;
-    let accumulator = projections.entry((kind, id)).or_default();
-    if accumulator.label.is_empty() {
-        accumulator.label = label;
-    }
-    accumulator.requests = accumulator
-        .requests
-        .saturating_add(row.try_get("requests")?);
-    accumulator.successful_requests = accumulator
-        .successful_requests
-        .saturating_add(row.try_get("successful_requests")?);
-    accumulator.failed_requests = accumulator
-        .failed_requests
-        .saturating_add(row.try_get("failed_requests")?);
-    accumulator.input_tokens = accumulator
-        .input_tokens
-        .saturating_add(row.try_get("input_tokens")?);
-    accumulator.output_tokens = accumulator
-        .output_tokens
-        .saturating_add(row.try_get("output_tokens")?);
-    accumulator.duration_count = accumulator
-        .duration_count
-        .saturating_add(row.try_get("duration_count")?);
-    accumulator.duration_sum_ms = accumulator
-        .duration_sum_ms
-        .saturating_add(row.try_get("duration_sum_ms")?);
-    let currency: String = row.try_get("currency")?;
-    let cost_micros: i64 = row.try_get("cost_micros")?;
-    accumulator
-        .costs
-        .entry(currency)
-        .and_modify(|cost| *cost = cost.saturating_add(cost_micros))
-        .or_insert(cost_micros);
-    Ok(())
-}
-
 fn accumulate_usage_row(
     projections: &mut BTreeMap<(String, String), UsageMetricsAccumulator>,
     row: &AnyRow,
@@ -1227,312 +996,4 @@ fn approximate_p95(duration_count: i64, buckets: &[i64; 12]) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use sqlx::Row;
-
-    use super::{
-        Database, DatabaseBackend, UsageAnalysisBucketPlan, UsageAnalysisGranularity,
-        UsageMetricsAccumulator, usage_analysis_heatmap_sql, usage_analysis_main_sql,
-    };
-
-    #[test]
-    fn inclusive_bucket_plan_separates_exact_edges_from_complete_interior() {
-        let plan = UsageAnalysisBucketPlan::new(900, 9_900, 3_600);
-        assert_eq!(plan.rollup_from_bucket, 1);
-        assert_eq!(plan.rollup_to_bucket, 2);
-        assert_eq!(
-            (plan.left_from_created_at, plan.left_to_created_at),
-            (900, 3_599)
-        );
-        assert_eq!(
-            (plan.right_from_created_at, plan.right_to_created_at),
-            (7_200, 9_900)
-        );
-    }
-
-    #[test]
-    fn inclusive_bucket_plan_handles_aligned_and_maximum_timestamps() {
-        let aligned = UsageAnalysisBucketPlan::new(3_600, 7_199, 3_600);
-        assert_eq!(aligned.rollup_from_bucket, 1);
-        assert_eq!(aligned.rollup_to_bucket, 2);
-        assert!(aligned.left_from_created_at > aligned.left_to_created_at);
-        assert!(aligned.right_from_created_at > aligned.right_to_created_at);
-
-        let maximum = UsageAnalysisBucketPlan::new(i64::MAX, i64::MAX, 3_600_000);
-        assert_eq!(maximum.left_from_created_at, i64::MAX);
-        assert_eq!(maximum.left_to_created_at, i64::MAX);
-        assert!(maximum.right_from_created_at > maximum.right_to_created_at);
-    }
-
-    #[test]
-    fn maximum_daily_range_uses_only_complete_rollup_buckets() {
-        const DAY: i64 = 86_400_000;
-        let from = 20_000 * DAY;
-        let to = from + 93 * DAY - 1;
-        let plan = UsageAnalysisBucketPlan::new(from, to, DAY);
-        assert_eq!(plan.rollup_from_bucket, 20_000);
-        assert_eq!(plan.rollup_to_bucket, 20_093);
-        assert!(plan.left_from_created_at > plan.left_to_created_at);
-        assert!(plan.right_from_created_at > plan.right_to_created_at);
-    }
-
-    #[test]
-    fn costs_remain_separate_and_deterministically_sorted_by_currency() {
-        let metrics = UsageMetricsAccumulator {
-            costs: BTreeMap::from([("USD".to_owned(), 1_250_000), ("CNY".to_owned(), 2_500_000)]),
-            ..UsageMetricsAccumulator::default()
-        }
-        .finish();
-        assert_eq!(metrics.costs.len(), 2);
-        assert_eq!(metrics.costs[0].currency, "CNY");
-        assert_eq!(metrics.costs[0].cost, "2.5");
-        assert_eq!(metrics.costs[1].currency, "USD");
-        assert_eq!(metrics.costs[1].cost, "1.25");
-    }
-
-    #[test]
-    fn aggregate_sql_groups_every_projection_by_currency() {
-        for backend in [DatabaseBackend::PostgreSql, DatabaseBackend::Sqlite] {
-            let sql = usage_analysis_main_sql(backend, UsageAnalysisGranularity::Day, false);
-            assert!(sql.contains("currency"));
-            assert!(!sql.contains("request_records"));
-            assert!(!sql.contains("generation_jobs"));
-            match backend {
-                DatabaseBackend::PostgreSql => {
-                    assert!(sql.contains("(bucket_start, currency)"));
-                    assert!(sql.contains("(analysis_upstream_id, upstream_label, currency)"));
-                }
-                DatabaseBackend::Sqlite => {
-                    assert!(sql.contains("GROUP BY bucket_start, currency"));
-                    assert!(
-                        sql.contains("GROUP BY analysis_upstream_id, upstream_label, currency")
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn tenant_scope_is_pushed_into_every_rollup_and_fact_branch() {
-        let sql = usage_analysis_main_sql(
-            DatabaseBackend::PostgreSql,
-            UsageAnalysisGranularity::Day,
-            true,
-        );
-        assert!(sql.contains("a.tenant_id = $1"), "{sql}");
-        assert_eq!(sql.matches("f.tenant_id = $1").count(), 4, "{sql}");
-        assert!(!sql.contains("JOIN tenants"), "{sql}");
-        assert!(!sql.contains("$1 = '' OR"), "{sql}");
-    }
-
-    #[test]
-    fn session_dimension_uses_time_indexes_and_never_sums_cost_across_currencies() {
-        for (granularity, rollup_table, bucket_column) in [
-            (
-                UsageAnalysisGranularity::Hour,
-                "session_usage_hourly",
-                "hour_bucket",
-            ),
-            (
-                UsageAnalysisGranularity::Day,
-                "session_usage_daily",
-                "day_bucket",
-            ),
-        ] {
-            let sql = session_usage_dimension_sql(granularity, true);
-            assert!(
-                sql.contains(&format!("FROM {rollup_table} rollup")),
-                "{sql}"
-            );
-            assert!(
-                sql.contains(&format!("rollup.{bucket_column} >= $3")),
-                "{sql}"
-            );
-            assert_eq!(sql.matches("fact.created_at >=").count(), 2, "{sql}");
-            assert_eq!(sql.matches("fact.tenant_id = $1").count(), 2, "{sql}");
-            assert!(sql.contains("GROUP BY session_id, currency"), "{sql}");
-            assert!(!sql.contains("SUM(cost_micros) OVER"), "{sql}");
-        }
-    }
-
-    #[tokio::test]
-    async fn postgres_boundary_queries_use_bounded_fact_index_ranges() {
-        let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
-            return;
-        };
-        // Unit tests run before integration-test binaries in the same Cargo
-        // invocation, so this plan check must not depend on another test
-        // having migrated the shared CI PostgreSQL service first.
-        let database = Database::connect_with_max(&database_url, 1).await.unwrap();
-        database.migrate().await.unwrap();
-        let pool = &database.pool;
-        sqlx::query("SET enable_seqscan = off")
-            .execute(pool)
-            .await
-            .unwrap();
-
-        for (sql, plan, rollup_index_prefix, bucket_column) in [
-            {
-                let bucket_millis = 3_600_000;
-                let bucket_start = 1_786_982_400_000_i64;
-                let from = bucket_start - 15 * 60_000;
-                let to = bucket_start + bucket_millis + 15 * 60_000;
-                (
-                    usage_analysis_main_sql(
-                        DatabaseBackend::PostgreSql,
-                        UsageAnalysisGranularity::Hour,
-                        true,
-                    ),
-                    UsageAnalysisBucketPlan::new(from, to, bucket_millis),
-                    "Index Scan using usage_analysis_hourly_",
-                    "hour_bucket",
-                )
-            },
-            {
-                let bucket_millis = 86_400_000;
-                let bucket_start = 1_786_924_800_000_i64;
-                let from = bucket_start - 15 * 60_000;
-                let to = bucket_start + bucket_millis + 15 * 60_000;
-                (
-                    usage_analysis_main_sql(
-                        DatabaseBackend::PostgreSql,
-                        UsageAnalysisGranularity::Day,
-                        true,
-                    ),
-                    UsageAnalysisBucketPlan::new(from, to, bucket_millis),
-                    "Index Scan using usage_analysis_daily_",
-                    "day_bucket",
-                )
-            },
-            {
-                let bucket_millis = 86_400_000;
-                let from = 20_000 * bucket_millis;
-                let to = from + 93 * bucket_millis - 1;
-                (
-                    usage_analysis_main_sql(
-                        DatabaseBackend::PostgreSql,
-                        UsageAnalysisGranularity::Day,
-                        true,
-                    ),
-                    UsageAnalysisBucketPlan::new(from, to, bucket_millis),
-                    "Index Scan using usage_analysis_daily_",
-                    "day_bucket",
-                )
-            },
-        ] {
-            let expected_fact_scans =
-                usize::from(plan.left_from_created_at <= plan.left_to_created_at)
-                    + usize::from(plan.right_from_created_at <= plan.right_to_created_at);
-            let explain = explain_usage_query(pool, &sql, plan).await;
-            // PostgreSQL can legitimately select either the plain tenant/time
-            // index or a more selective tenant/dimension/time index (including
-            // skip scans) as statistics change. Assert the bounded access
-            // semantics rather than freezing one planner-selected index name.
-            assert!(explain.contains(rollup_index_prefix), "{explain}");
-            assert!(explain.contains("tenant_id ="), "{explain}");
-            assert!(
-                explain.contains(&format!("{bucket_column} >=")),
-                "{explain}"
-            );
-            assert!(
-                explain
-                    .matches("Index Scan using request_stats_facts_")
-                    .count()
-                    >= expected_fact_scans,
-                "{explain}"
-            );
-            assert!(
-                explain
-                    .matches("Index Scan using generation_stats_facts_")
-                    .count()
-                    >= expected_fact_scans,
-                "{explain}"
-            );
-            assert!(
-                !explain.contains("Seq Scan on request_stats_facts"),
-                "{explain}"
-            );
-            assert!(
-                !explain.contains("Seq Scan on generation_stats_facts"),
-                "{explain}"
-            );
-            assert!(!explain.contains("request_records"), "{explain}");
-            assert!(!explain.contains("generation_jobs"), "{explain}");
-        }
-
-        let bucket_millis = 3_600_000;
-        let bucket_start = 1_786_982_400_000_i64;
-        let plan = UsageAnalysisBucketPlan::new(
-            bucket_start - 15 * 60_000,
-            bucket_start + bucket_millis + 15 * 60_000,
-            bucket_millis,
-        );
-        let heatmap = explain_usage_query(pool, &usage_analysis_heatmap_sql(true), plan).await;
-        assert!(
-            heatmap.contains("Index Scan using usage_analysis_hourly_"),
-            "{heatmap}"
-        );
-        assert!(heatmap.contains("tenant_id ="), "{heatmap}");
-        assert!(heatmap.contains("hour_bucket >="), "{heatmap}");
-        assert!(
-            heatmap
-                .matches("Index Scan using request_stats_facts_")
-                .count()
-                >= 2,
-            "{heatmap}"
-        );
-        assert!(
-            heatmap
-                .matches("Index Scan using generation_stats_facts_")
-                .count()
-                >= 2,
-            "{heatmap}"
-        );
-        assert!(
-            !heatmap.contains("Seq Scan on request_stats_facts"),
-            "{heatmap}"
-        );
-        assert!(
-            !heatmap.contains("Seq Scan on generation_stats_facts"),
-            "{heatmap}"
-        );
-        database.pool.close().await;
-    }
-
-    async fn explain_usage_query(
-        pool: &sqlx::AnyPool,
-        sql: &str,
-        plan: UsageAnalysisBucketPlan,
-    ) -> String {
-        let explain_sql =
-            format!("EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, COSTS OFF, FORMAT TEXT) {sql}");
-        // Test-only safety boundary: every caller passes output from the closed usage-analysis
-        // generators above. This helper is not exposed to request or configuration input.
-        let rows = sqlx::query(sqlx::AssertSqlSafe(explain_sql))
-            .bind("00000000-0000-0000-0000-000000000001")
-            .bind("")
-            .bind(plan.rollup_from_bucket)
-            .bind(plan.rollup_to_bucket)
-            .bind("")
-            .bind("")
-            .bind("")
-            .bind("")
-            .bind("")
-            .bind("")
-            .bind("")
-            .bind("")
-            .bind(plan.left_from_created_at)
-            .bind(plan.left_to_created_at)
-            .bind(plan.right_from_created_at)
-            .bind(plan.right_to_created_at)
-            .fetch_all(pool)
-            .await
-            .unwrap();
-        rows.into_iter()
-            .map(|row| row.try_get::<String, _>(0).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
+mod tests;

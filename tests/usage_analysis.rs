@@ -226,9 +226,9 @@ async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
                        request_id, tenant_id, key_id, created_at, model, protocol,
                        status_class, error_code, upstream_account_id, model_route_id,
                        duration_ms, input_tokens, output_tokens, cached_input_tokens,
-                       cache_write_tokens, service_tier, currency, cost_micros
+                       cache_write_tokens, service_tier, currency, cost_micros, session_id
                    ) VALUES ($1, $2, $3, $4, $5, 'openai-responses', $6, $7, $8, '',
-                             20, $9, 0, 0, 0, 'default', $10, $11)"#,
+                             20, $9, 0, 0, 0, 'default', $10, $11, $12)"#,
                 )
                 .bind(&request_id)
                 .bind(&tenant_id)
@@ -241,6 +241,7 @@ async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
                 .bind(input_tokens)
                 .bind(activity.currency)
                 .bind(activity.cost_micros)
+                .bind(format!("unlinked:{key_id}"))
                 .execute(pool)
                 .await
                 .unwrap();

@@ -1,3 +1,4 @@
+mod aggregation;
 mod jobs;
 mod synchronous;
 
@@ -9,6 +10,7 @@ use crate::{
 };
 
 use super::unix_millis;
+pub(super) use aggregation::aggregate_terminal_generation_job;
 
 pub use jobs::{
     AttachGenerationJobResult, CreateGenerationJobInput, CreateGenerationJobResult,

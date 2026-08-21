@@ -535,6 +535,13 @@ impl Database {
                 .bind(quarantine.try_get::<Option<String>,_>("request_object")?).bind(quarantine.try_get::<Option<String>,_>("response_object")?)
                 .bind(now)
                 .execute(&mut *tx).await?;
+            rebuild_archive_session_projection_in_transaction(
+                &mut tx,
+                tenant_id,
+                key_id,
+                &format!("unlinked:{key_id}"),
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(SessionArchiveQuarantineResolutionView {

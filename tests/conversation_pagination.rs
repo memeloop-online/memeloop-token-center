@@ -6,7 +6,9 @@ use memeloop_token_center::{
     AppState, api,
     config::Config,
     conversation::ConversationHints,
-    db::{CreateKeyInput, NewRequest, SessionArchiveCommitInput, SessionArchiveTarget},
+    db::{
+        CreateKeyInput, FinishRequest, NewRequest, SessionArchiveCommitInput, SessionArchiveTarget,
+    },
     model::{AuthenticatedKey, KeyPolicy},
 };
 use rust_decimal::Decimal;
@@ -181,6 +183,86 @@ async fn execute_sql_script(pool: &AnyPool, sql: &'static str) {
 }
 
 #[tokio::test]
+async fn completed_request_is_transactionally_reclassified_from_unlinked_session() {
+    let fixture = Fixture::new("session-reclassification").await;
+    let request_id = fixture.start_request("memory://reclassification").await;
+    fixture
+        .state
+        .db
+        .record_request_finished(FinishRequest {
+            request_id,
+            status_code: 200,
+            duration_ms: 42,
+            input_tokens: 11,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 7,
+            service_tier: None,
+            cost_micros: 123,
+            error_code: None,
+            response_object: "memory://response".into(),
+        })
+        .await
+        .expect("finish unlinked request");
+    let unlinked = format!("unlinked:{}", fixture.key.key_id);
+    let before: String =
+        sqlx::query("SELECT session_id FROM request_stats_facts WHERE request_id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap()
+            .try_get("session_id")
+            .unwrap();
+    assert_eq!(before, unlinked);
+
+    let cluster = fixture
+        .state
+        .db
+        .record_conversation_observation(
+            &fixture.key,
+            request_id,
+            &json!({"input": [{"role": "user", "content": "late archive evidence"}]}),
+            &ConversationHints::default(),
+            Some("Codex"),
+        )
+        .await
+        .expect("attach late evidence");
+    let authoritative = cluster.to_string();
+    let fact: String =
+        sqlx::query("SELECT session_id FROM request_stats_facts WHERE request_id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap()
+            .try_get("session_id")
+            .unwrap();
+    assert_eq!(fact, authoritative);
+    let old_count: i64 = sqlx::query(
+        "SELECT COUNT(*) AS count FROM session_usage_totals WHERE key_id = $1 AND session_id = $2",
+    )
+    .bind(fixture.key.key_id.to_string())
+    .bind(&unlinked)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap()
+    .try_get("count")
+    .unwrap();
+    assert_eq!(old_count, 0);
+    let projection = sqlx::query(
+        "SELECT requests, input_tokens, output_tokens, cost_micros FROM session_usage_totals WHERE key_id = $1 AND session_id = $2",
+    )
+    .bind(fixture.key.key_id.to_string())
+    .bind(authoritative)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(projection.try_get::<i64, _>("requests").unwrap(), 1);
+    assert_eq!(projection.try_get::<i64, _>("input_tokens").unwrap(), 11);
+    assert_eq!(projection.try_get::<i64, _>("output_tokens").unwrap(), 7);
+    assert_eq!(projection.try_get::<i64, _>("cost_micros").unwrap(), 123);
+}
+
+#[tokio::test]
 async fn logical_session_api_is_stable_key_scoped_and_cursor_paginated() {
     let fixture = Fixture::new("logical-session-api").await;
     let (first_request, first_cluster) = observe_request(
@@ -203,7 +285,7 @@ async fn logical_session_api_is_stable_key_scoped_and_cursor_paginated() {
 
     let (status, first_page) = fixture.get("/self/v1/sessions?limit=1").await;
     assert_eq!(status, StatusCode::OK, "{first_page}");
-    let first_page = first_page.as_array().expect("session list");
+    let first_page = first_page["sessions"].as_array().expect("session list");
     assert_eq!(first_page.len(), 1);
     assert_eq!(first_page[0]["key_id"], fixture.key.key_id.to_string());
     assert_eq!(first_page[0]["active_requests"], 1);
@@ -215,7 +297,9 @@ async fn logical_session_api_is_stable_key_scoped_and_cursor_paginated() {
         ))
         .await;
     assert_eq!(status, StatusCode::OK, "{second_page}");
-    let second_page = second_page.as_array().expect("second session page");
+    let second_page = second_page["sessions"]
+        .as_array()
+        .expect("second session page");
     assert_eq!(second_page.len(), 1);
     assert_ne!(second_page[0]["session_id"], cursor_session);
 

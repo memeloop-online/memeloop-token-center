@@ -363,6 +363,7 @@ pub struct ConversationRequestView {
     pub source: String,
     pub provenance: String,
     pub unlinked: bool,
+    pub currency: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -397,6 +398,25 @@ pub struct LogicalSessionSummary {
     pub output_tokens: i64,
     pub avg_duration_ms: Option<f64>,
     pub costs: Vec<UsageAnalysisCost>,
+    /// Imported archive entries that have no authoritative request fact.
+    pub archived_only_requests: i64,
+    pub archived_only_errors: i64,
+    pub archived_only_input_tokens: i64,
+    pub archived_only_output_tokens: i64,
+    pub archived_only_avg_duration_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LogicalSessionListCursor {
+    pub before_last_activity_at: i64,
+    pub before_session_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LogicalSessionListResponse {
+    pub generated_at: i64,
+    pub sessions: Vec<LogicalSessionSummary>,
+    pub next_cursor: Option<LogicalSessionListCursor>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -496,6 +516,17 @@ pub struct UsageAnalysisBucket {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct UsageAnalysisSessionBucket {
+    pub id: String,
+    pub label: String,
+    pub key_id: Uuid,
+    pub key_alias: String,
+    pub unlinked: bool,
+    #[serde(flatten)]
+    pub metrics: UsageAnalysisMetrics,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct UsageAnalysisTimeBucket {
     /// Inclusive UTC bucket start as Unix epoch milliseconds.
     pub bucket_start: i64,
@@ -528,7 +559,7 @@ pub struct UsageAnalysisResponse {
     pub time_series: Vec<UsageAnalysisTimeBucket>,
     pub by_model: Vec<UsageAnalysisBucket>,
     pub by_key: Vec<UsageAnalysisBucket>,
-    pub by_session: Vec<UsageAnalysisBucket>,
+    pub by_session: Vec<UsageAnalysisSessionBucket>,
     pub by_upstream: Vec<UsageAnalysisBucket>,
     pub by_protocol: Vec<UsageAnalysisBucket>,
     pub by_status: Vec<UsageAnalysisBucket>,

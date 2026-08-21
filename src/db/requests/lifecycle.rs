@@ -912,7 +912,7 @@ pub(crate) async fn record_request_finished_in_transaction(
     .execute(&mut **tx)
     .await?;
     let fact_inserted = sqlx::query(
-        "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, service_tier, currency, cost_micros) SELECT id, tenant_id, key_id, created_at, model, protocol, CASE WHEN status_code BETWEEN 200 AND 399 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), COALESCE(model_route_id, ''), COALESCE(duration_ms, 0), input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, service_tier, currency, cost_micros FROM request_records WHERE id = $1 AND created_at = $2 AND completed_at IS NOT NULL AND status_code IS NOT NULL ON CONFLICT(request_id) DO NOTHING",
+        "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, service_tier, currency, cost_micros, session_id) SELECT id, tenant_id, key_id, created_at, model, protocol, CASE WHEN status_code BETWEEN 200 AND 399 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), COALESCE(model_route_id, ''), COALESCE(duration_ms, 0), input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, service_tier, currency, cost_micros, COALESCE(conversation_cluster_id, 'unlinked:' || key_id) FROM request_records WHERE id = $1 AND created_at = $2 AND completed_at IS NOT NULL AND status_code IS NOT NULL ON CONFLICT(request_id) DO NOTHING",
     )
     .bind(&request_id)
     .bind(created_at)
@@ -927,106 +927,7 @@ pub(crate) async fn record_request_finished_in_transaction(
         .bind(&request_id)
         .execute(&mut **tx)
         .await?;
-        sqlx::query(
-            r#"INSERT INTO session_usage_totals (
-                   tenant_id, key_id, session_id, currency, last_activity_at,
-                   requests, errors, input_tokens, output_tokens, duration_count,
-                   duration_sum_ms, cost_micros)
-               SELECT fact.tenant_id, fact.key_id,
-                      COALESCE(record.conversation_cluster_id, 'unlinked:' || fact.key_id),
-                      fact.currency, fact.created_at, 1,
-                      CASE WHEN fact.status_class = 'failure' THEN 1 ELSE 0 END,
-                      fact.input_tokens, fact.output_tokens, 1, fact.duration_ms,
-                      fact.cost_micros
-                 FROM request_stats_facts fact
-                 JOIN request_records record
-                   ON record.id = fact.request_id AND record.created_at = fact.created_at
-                WHERE fact.request_id = $1
-               ON CONFLICT (tenant_id, key_id, session_id, currency)
-               DO UPDATE SET
-                   last_activity_at = CASE
-                       WHEN session_usage_totals.last_activity_at < excluded.last_activity_at
-                       THEN excluded.last_activity_at
-                       ELSE session_usage_totals.last_activity_at END,
-                   requests = session_usage_totals.requests + excluded.requests,
-                   errors = session_usage_totals.errors + excluded.errors,
-                   input_tokens = session_usage_totals.input_tokens + excluded.input_tokens,
-                   output_tokens = session_usage_totals.output_tokens + excluded.output_tokens,
-                   duration_count = session_usage_totals.duration_count + excluded.duration_count,
-                   duration_sum_ms = session_usage_totals.duration_sum_ms + excluded.duration_sum_ms,
-                   cost_micros = session_usage_totals.cost_micros + excluded.cost_micros"#,
-        )
-        .bind(&request_id)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"INSERT INTO session_usage_hourly (
-                   tenant_id, key_id, session_id, hour_bucket, model, protocol,
-                   status_class, error_code, upstream_account_id, model_route_id,
-                   currency, requests, input_tokens, output_tokens, duration_count,
-                   duration_sum_ms, cost_micros)
-               SELECT fact.tenant_id, fact.key_id,
-                      COALESCE(record.conversation_cluster_id, 'unlinked:' || fact.key_id),
-                      fact.created_at / 3600000, fact.model,
-                      CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%'
-                           THEN 'anthropic'
-                           WHEN fact.protocol = 'openai-image' THEN 'openai-image'
-                           ELSE 'openai' END,
-                      fact.status_class, fact.error_code, fact.upstream_account_id,
-                      fact.model_route_id, fact.currency, 1, fact.input_tokens,
-                      fact.output_tokens, 1, fact.duration_ms, fact.cost_micros
-                 FROM request_stats_facts fact
-                 JOIN request_records record
-                   ON record.id = fact.request_id AND record.created_at = fact.created_at
-                WHERE fact.request_id = $1
-               ON CONFLICT (
-                   tenant_id, key_id, session_id, hour_bucket, model, protocol,
-                   status_class, error_code, upstream_account_id, model_route_id, currency)
-               DO UPDATE SET
-                   requests = session_usage_hourly.requests + excluded.requests,
-                   input_tokens = session_usage_hourly.input_tokens + excluded.input_tokens,
-                   output_tokens = session_usage_hourly.output_tokens + excluded.output_tokens,
-                   duration_count = session_usage_hourly.duration_count + excluded.duration_count,
-                   duration_sum_ms = session_usage_hourly.duration_sum_ms + excluded.duration_sum_ms,
-                   cost_micros = session_usage_hourly.cost_micros + excluded.cost_micros"#,
-        )
-        .bind(&request_id)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"INSERT INTO session_usage_daily (
-                   tenant_id, key_id, session_id, day_bucket, model, protocol,
-                   status_class, error_code, upstream_account_id, model_route_id,
-                   currency, requests, input_tokens, output_tokens, duration_count,
-                   duration_sum_ms, cost_micros)
-               SELECT fact.tenant_id, fact.key_id,
-                      COALESCE(record.conversation_cluster_id, 'unlinked:' || fact.key_id),
-                      fact.created_at / 86400000, fact.model,
-                      CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%'
-                           THEN 'anthropic'
-                           WHEN fact.protocol = 'openai-image' THEN 'openai-image'
-                           ELSE 'openai' END,
-                      fact.status_class, fact.error_code, fact.upstream_account_id,
-                      fact.model_route_id, fact.currency, 1, fact.input_tokens,
-                      fact.output_tokens, 1, fact.duration_ms, fact.cost_micros
-                 FROM request_stats_facts fact
-                 JOIN request_records record
-                   ON record.id = fact.request_id AND record.created_at = fact.created_at
-                WHERE fact.request_id = $1
-               ON CONFLICT (
-                   tenant_id, key_id, session_id, day_bucket, model, protocol,
-                   status_class, error_code, upstream_account_id, model_route_id, currency)
-               DO UPDATE SET
-                   requests = session_usage_daily.requests + excluded.requests,
-                   input_tokens = session_usage_daily.input_tokens + excluded.input_tokens,
-                   output_tokens = session_usage_daily.output_tokens + excluded.output_tokens,
-                   duration_count = session_usage_daily.duration_count + excluded.duration_count,
-                   duration_sum_ms = session_usage_daily.duration_sum_ms + excluded.duration_sum_ms,
-                   cost_micros = session_usage_daily.cost_micros + excluded.cost_micros"#,
-        )
-        .bind(&request_id)
-        .execute(&mut **tx)
-        .await?;
+        add_request_fact_to_session_projection_in_transaction(tx, &request_id).await?;
         sqlx::query(
             r#"INSERT INTO usage_analysis_hourly (
                    tenant_id, key_id, hour_bucket, source_kind, model, protocol, status_class,

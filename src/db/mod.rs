@@ -49,6 +49,7 @@ mod rotation;
 mod routing;
 mod rows;
 mod session_analytics;
+mod session_projection;
 mod time;
 mod usage_analysis;
 mod validation;
@@ -56,6 +57,11 @@ mod validation;
 use constants::*;
 use rotation::*;
 use rows::generation_asset_download;
+pub use session_analytics::LogicalSessionListFilter;
+pub(crate) use session_projection::{
+    add_request_fact_to_session_projection_in_transaction,
+    rebuild_archive_session_projection_in_transaction, reclassify_request_session_in_transaction,
+};
 pub use time::unix_millis;
 use validation::*;
 

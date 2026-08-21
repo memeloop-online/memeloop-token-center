@@ -411,6 +411,8 @@ impl Database {
             if attached.rows_affected() != 1 {
                 return Err(AppError::Internal);
             }
+            reclassify_request_session_in_transaction(transaction, parse_uuid(request_id.clone())?)
+                .await?;
         }
         Ok(cluster_id)
     }
@@ -500,7 +502,7 @@ impl Database {
             (filter.before_created_at, filter.before_request_id)
         {
             sqlx::query(
-                "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code, source_kind, provenance_kind, unlinked, archive_source, external_request_id FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests WHERE created_at < $3 OR (created_at = $3 AND id < $4) ORDER BY created_at DESC, id DESC LIMIT $5",
+                "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, source_kind, provenance_kind, unlinked, archive_source, external_request_id FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests WHERE created_at < $3 OR (created_at = $3 AND id < $4) ORDER BY created_at DESC, id DESC LIMIT $5",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -511,7 +513,7 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code, source_kind, provenance_kind, unlinked, archive_source, external_request_id FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests ORDER BY created_at DESC, id DESC LIMIT $3",
+                "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, source_kind, provenance_kind, unlinked, archive_source, external_request_id FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests ORDER BY created_at DESC, id DESC LIMIT $3",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -638,6 +640,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                 source: row.try_get("source_kind")?,
                 provenance: row.try_get("provenance_kind")?,
                 unlinked: row.try_get::<i64, _>("unlinked")? != 0,
+                currency: row.try_get("currency")?,
                 archive_source: row.try_get("archive_source")?,
                 external_request_id: row.try_get("external_request_id")?,
             })
