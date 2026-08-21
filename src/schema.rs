@@ -230,6 +230,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn published_routing_schemas_match_normalized_grant_contracts() {
+        let route: Value =
+            serde_json::from_str(include_str!("../schemas/model-route.schema.json")).unwrap();
+        let key_create: Value =
+            serde_json::from_str(include_str!("../schemas/key-create.schema.json")).unwrap();
+        let key_policy: Value =
+            serde_json::from_str(include_str!("../schemas/key-policy.schema.json")).unwrap();
+        compile(&route).unwrap();
+        compile(&key_create).unwrap();
+        compile(&key_policy).unwrap();
+
+        assert!(key_policy["properties"].get("allowed_models").is_none());
+        assert!(
+            key_create["properties"]["policy"]["properties"]
+                .get("allowed_models")
+                .is_none()
+        );
+        assert!(key_create["properties"].get("route_ids").is_some());
+        assert!(key_create["properties"].get("route_group_ids").is_some());
+
+        let direct = json!({
+            "public_model": "codex-public",
+            "upstream_model": "codex-upstream",
+            "protocol": "openai",
+            "upstream_account_ids": [uuid::Uuid::now_v7()]
+        });
+        validate_instance(&route, &direct).unwrap();
+        let grouped = json!({
+            "public_model": "claude-public",
+            "upstream_model": "claude-upstream",
+            "protocol": "anthropic",
+            "included_provider_group_ids": [uuid::Uuid::now_v7()],
+            "excluded_provider_group_ids": [uuid::Uuid::now_v7()],
+            "route_group_names": ["production"],
+            "granted_credential_ids": [uuid::Uuid::now_v7()]
+        });
+        validate_instance(&route, &grouped).unwrap();
+        assert!(
+            validate_instance(
+                &route,
+                &json!({
+                    "public_model": "orphan",
+                    "upstream_model": "orphan",
+                    "protocol": "openai"
+                })
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn enforces_required_properties_and_rejects_unknown_properties() {
         let schema = json!({
             "type": "object",

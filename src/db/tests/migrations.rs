@@ -1067,7 +1067,7 @@ async fn sqlite_routing_groups_are_tenant_safe_and_backfill_legacy_route_candida
         "CREATE TABLE tenants (id TEXT PRIMARY KEY)",
         "CREATE TABLE upstream_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
         "CREATE TABLE model_routes (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, public_model TEXT NOT NULL, upstream_account_id TEXT NOT NULL, upstream_model TEXT NOT NULL, protocol TEXT NOT NULL, priority BIGINT NOT NULL, enabled BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, public_model, protocol, priority))",
-        "CREATE TABLE key_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, policy_json TEXT NOT NULL, created_at BIGINT NOT NULL)",
+        "CREATE TABLE key_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
         "CREATE TABLE request_records (id TEXT PRIMARY KEY, model_route_id TEXT)",
     ] {
         sqlx::query(statement)
@@ -1091,7 +1091,6 @@ async fn sqlite_routing_groups_are_tenant_safe_and_backfill_legacy_route_candida
         .unwrap();
     sqlx::query(
         "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ('route-a', 'tenant-a', 'public-model', 'account-a', 'upstream-model-a', 'openai-responses', 10, 1, 100, 100)",
-        "INSERT INTO key_records (id, tenant_id, policy_json, created_at) VALUES ('key-a', 'tenant-a', '{\"allowed_models\":[\"public-model\"]}', 100)",
     )
     .execute(&database.pool)
     .await
@@ -1278,10 +1277,11 @@ async fn postgres_routing_groups_drop_legacy_route_uniqueness_and_backfill_candi
         "CREATE TABLE tenants (id TEXT PRIMARY KEY)",
         "CREATE TABLE upstream_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
         "CREATE TABLE model_routes (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, public_model TEXT NOT NULL, upstream_account_id TEXT NOT NULL, upstream_model TEXT NOT NULL, protocol TEXT NOT NULL, priority BIGINT NOT NULL, enabled BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, public_model, protocol, priority))",
-        "CREATE TABLE key_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
+        "CREATE TABLE key_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, policy_json TEXT NOT NULL, created_at BIGINT NOT NULL)",
         "INSERT INTO tenants (id) VALUES ('tenant-a')",
         "INSERT INTO upstream_accounts (id, tenant_id) VALUES ('account-a', 'tenant-a')",
         "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ('route-a', 'tenant-a', 'public-model', 'account-a', 'upstream-model-a', 'openai-responses', 10, 1, 100, 100)",
+        "INSERT INTO key_records (id, tenant_id, policy_json, created_at) VALUES ('key-a', 'tenant-a', '{\"allowed_models\":[\"public-model\"]}', 100)",
     ] {
         sqlx::query(statement)
             .execute(&mut *transaction)
@@ -1433,6 +1433,10 @@ async fn sqlite_legacy_model_policy_backfill_is_exact_bounded_and_fail_closed() 
             .unwrap();
     assert_eq!(bad_grants, 0);
 
+    sqlx::query("UPDATE key_records SET policy_json = 'not-json' WHERE id = 'key-z-bad'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
     let mut transaction = database.pool.begin().await.unwrap();
     apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 52, 52)
         .await

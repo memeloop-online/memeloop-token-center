@@ -99,6 +99,47 @@ fn default_concurrency() -> u32 {
     4
 }
 
+#[cfg(test)]
+mod key_policy_contract_tests {
+    use serde_json::json;
+
+    use super::{KeyPolicy, KeyPolicyInput};
+
+    #[test]
+    fn public_policy_rejects_legacy_model_names_and_views_never_emit_them() {
+        assert!(
+            serde_json::from_value::<KeyPolicyInput>(json!({
+                "allowed_models": ["*"] ,
+                "requests_per_minute": 60,
+                "tokens_per_minute": 100_000,
+                "max_concurrency": 4,
+                "daily_budget": null,
+                "weekly_budget": null,
+                "lifetime_budget": null
+            }))
+            .is_err()
+        );
+
+        let legacy: KeyPolicy = serde_json::from_value(json!({
+            "allowed_models": ["legacy-model"],
+            "requests_per_minute": 60,
+            "tokens_per_minute": 100_000,
+            "max_concurrency": 4,
+            "daily_budget": null,
+            "weekly_budget": null,
+            "lifetime_budget": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.allowed_models, ["legacy-model"]);
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("allowed_models")
+                .is_none()
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AuthenticatedKey {
     pub key_id: Uuid,

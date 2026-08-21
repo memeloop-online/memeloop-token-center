@@ -108,9 +108,10 @@ async fn create_key(
     tenant: &str,
     principal: &str,
     model: &str,
+    grant_model: bool,
     policy_overrides: Value,
 ) -> Value {
-    let mut policy = json!({"allowed_models": [model]});
+    let mut policy = json!({});
     for (name, value) in policy_overrides
         .as_object()
         .expect("policy overrides object")
@@ -120,12 +121,6 @@ async fn create_key(
             .expect("policy object")
             .insert(name.clone(), value.clone());
     }
-    let grants_model = policy["allowed_models"].as_array().is_some_and(|models| {
-        models
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|allowed| allowed == "*" || allowed == model)
-    });
     let response = world
         .client
         .post(format!("{}/internal/v1/keys", world.service_url))
@@ -150,7 +145,7 @@ async fn create_key(
         .json()
         .await
         .expect("security acceptance credential JSON");
-    if grants_model {
+    if grant_model {
         grant_fixture_model(world, tenant, &issued, model, "openai").await;
     }
     issued
@@ -186,15 +181,30 @@ async fn upsert_price(world: &TokenCenterWorld, model: &str) {
     assert_eq!(response.status(), StatusCode::OK, "model={model}");
 }
 
-#[then("a credential with an empty model allowlist cannot list or call a priced model")]
-async fn empty_model_allowlist_is_deny_all(world: &mut TokenCenterWorld) {
+#[then("legacy model policy is rejected and a credential without route grants is deny-all")]
+async fn route_grants_are_the_only_model_authority(world: &mut TokenCenterWorld) {
     upsert_price(world, "deny-all-priced-model").await;
+    let rejected = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "tenant_external_id": "deny-all-tenant",
+            "principal_external_id": "legacy-policy-user",
+            "alias": "legacy-policy-user",
+            "policy": {"allowed_models": ["*"]}
+        }))
+        .send()
+        .await
+        .expect("legacy policy rejection");
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     let issued = create_key(
         world,
         "deny-all-tenant",
         "deny-all-user",
         "deny-all-priced-model",
-        json!({"allowed_models": []}),
+        false,
+        json!({}),
     )
     .await;
     let key = issued["key"].as_str().expect("deny-all credential");
@@ -223,6 +233,7 @@ async fn downstream_status_lifecycle_is_terminal(world: &mut TokenCenterWorld) {
         "status-tenant",
         "status-user",
         "unused-status-model",
+        true,
         json!({}),
     )
     .await;
@@ -431,6 +442,7 @@ async fn every_service_scope_is_exact(world: &mut TokenCenterWorld) {
         "scope-tenant",
         "scope-seed-user",
         "scope-seed-model",
+        true,
         json!({}),
     )
     .await;
@@ -1067,7 +1079,7 @@ async fn self_service_idor_is_closed(world: &mut TokenCenterWorld) {
             second["key_id"].as_str().expect("second key id")
         ))
         .bearer_auth("test-service-token")
-        .json(&json!({"allowed_models": ["matrix-model", "idor-comfy"]}))
+        .json(&json!({}))
         .send()
         .await
         .expect("allow IDOR generation model");
@@ -1174,6 +1186,7 @@ async fn grant_payload_replay_is_exact(world: &mut TokenCenterWorld) {
         "grant-replay-tenant",
         "grant-replay-user",
         "unused-grant-model",
+        true,
         json!({}),
     )
     .await;
@@ -1242,6 +1255,7 @@ async fn all_runtime_limits_are_enforced(world: &mut TokenCenterWorld) {
         "limit-tenant",
         "tpm-policy-user",
         "tpm-policy-model",
+        true,
         json!({"tokens_per_minute": 1}),
     )
     .await;
@@ -1273,6 +1287,7 @@ async fn all_runtime_limits_are_enforced(world: &mut TokenCenterWorld) {
             "limit-tenant",
             principal,
             model,
+            true,
             Value::Object(overrides),
         )
         .await;
@@ -1313,6 +1328,7 @@ async fn all_runtime_limits_are_enforced(world: &mut TokenCenterWorld) {
         "limit-tenant",
         "concurrency-policy-user",
         "concurrency-policy-model",
+        true,
         json!({"max_concurrency": 1}),
     )
     .await;

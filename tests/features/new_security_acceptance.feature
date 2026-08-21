@@ -2,10 +2,10 @@ Feature: Black-box credential policy and tenant isolation acceptance
   Public and control-plane authorization must fail closed before parsing attacker
   input, and stable credentials must preserve strict status and quota semantics.
 
-  Scenario: An empty model allowlist is deny-all
+  Scenario: Credentials authorize only stable route grants
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI upstream returns a successful completion
-    Then a credential with an empty model allowlist cannot list or call a priced model
+    Then legacy model policy is rejected and a credential without route grants is deny-all
 
   Scenario: Managed downstream credential states are enforced and revocation is terminal
     Given a token center backed by SQLite and memory object storage
