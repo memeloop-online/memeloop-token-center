@@ -2217,8 +2217,8 @@ mod tests {
                 "managed_oauth_adapter": {
                     "api_version": "cpa-managed-oauth-adapter-v1",
                     "source_types": ["codex-account", "gemini-account"],
-                    "normalize_url": "http://managed-oauth.default.svc/normalize",
-                    "refresh_url": "http://managed-oauth.default.svc/refresh"
+                    "normalize_url": "https://managed-oauth.example/normalize",
+                    "refresh_url": "https://managed-oauth.example/refresh"
                 }
             }]}
         }))

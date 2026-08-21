@@ -1349,9 +1349,9 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
             oauth_adapter: Some(crate::provider::OAuthAdapterContribution {
                 api_version: "oauth-adapter-v1".to_owned(),
                 flow_kind: crate::provider::OAuthFlowKind::CursorPkce,
-                login_url: "http://oauth-adapter.default.svc/login".to_owned(),
-                poll_url: "http://oauth-adapter.default.svc/poll".to_owned(),
-                refresh_url: "http://oauth-adapter.default.svc/refresh".to_owned(),
+                login_url: "http://10.0.0.1:8080/login".to_owned(),
+                poll_url: "http://10.0.0.1:8080/poll".to_owned(),
+                refresh_url: "http://10.0.0.1:8080/refresh".to_owned(),
             }),
             managed_oauth_adapter: None,
             component_adapter: None,
@@ -1359,18 +1359,30 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
         }])
         .unwrap();
     let response = router_for_role(state, RuntimeRole::Control)
-            .oneshot(
-                Request::post("/internal/v1/oauth/provider-adapter/start")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::AUTHORIZATION, "Bearer test-service-token")
-                    .body(Body::from(
-                        r#"{"account_name":"plugin-primary","provider_driver":"plugin-provider","provider_config":{"base_url":"http://plugin-upstream.default.svc","network_scope":"private"}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+        .oneshot(
+            Request::post("/internal/v1/oauth/provider-adapter/start")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test-service-token")
+                .body(Body::from(
+                    serde_json::json!({
+                        "account_name": "plugin-primary",
+                        "provider_driver": "plugin-provider",
+                        "provider_config": {
+                            "base_url": "http://10.0.0.1:8080",
+                            "network_scope": "private"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 }
 
 #[test]

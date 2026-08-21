@@ -121,7 +121,10 @@ fn session_dimension_uses_time_indexes_and_never_sums_cost_across_currencies() {
         );
         assert_eq!(sql.matches("fact.created_at >=").count(), 2, "{sql}");
         assert_eq!(sql.matches("fact.tenant_id = $1").count(), 2, "{sql}");
-        assert!(sql.contains("GROUP BY session_id, currency"), "{sql}");
+        assert!(
+            sql.contains("GROUP BY key_id, key_alias, session_id, currency"),
+            "{sql}"
+        );
         assert!(!sql.contains("SUM(cost_micros) OVER"), "{sql}");
     }
 }
