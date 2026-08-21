@@ -1,25 +1,5 @@
 use super::*;
 
-struct AbortTaskOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
-
-impl<T> AbortTaskOnDrop<T> {
-    fn new(task: tokio::task::JoinHandle<T>) -> Self {
-        Self(Some(task))
-    }
-
-    fn abort(&mut self) {
-        if let Some(task) = self.0.take() {
-            task.abort();
-        }
-    }
-}
-
-impl<T> Drop for AbortTaskOnDrop<T> {
-    fn drop(&mut self) {
-        self.abort();
-    }
-}
-
 pub(super) struct StreamingResponse<'a> {
     pub(super) state: &'a AppState,
     pub(super) upstream: reqwest::Response,

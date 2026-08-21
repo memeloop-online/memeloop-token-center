@@ -11,6 +11,26 @@ mod tests;
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
 
+struct AbortTaskOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortTaskOnDrop<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(task))
+    }
+
+    fn abort(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+impl<T> Drop for AbortTaskOnDrop<T> {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 async fn run_bounded_proxy_lifecycle<F>(
     deadline: tokio::time::Instant,
     lifecycle: F,

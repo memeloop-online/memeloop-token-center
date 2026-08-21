@@ -1,5 +1,6 @@
 mod aggregation;
 mod jobs;
+mod operator;
 mod synchronous;
 
 use sqlx::{Any, Transaction};
