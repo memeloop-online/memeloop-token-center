@@ -126,7 +126,7 @@ impl Database {
                     input.driver.as_str(),
                     "cpa-subscription-bridge" | "cpa-gemini-oauth-legacy"
                 ),
-            can_rotate: auth_kind != "none",
+            can_rotate: auth_kind != "none" && input.driver != "cpa-subscription-bridge",
             can_reauthorize,
             route_count: 0,
             created_at: now,
@@ -237,6 +237,11 @@ impl Database {
         .await?
         .ok_or(AppError::NotFound)?;
         let mut view = upstream_account_view(current)?;
+        if view.driver == "cpa-subscription-bridge" && status == "active" {
+            return Err(AppError::BadRequest(
+                "this legacy upstream type is retired".into(),
+            ));
+        }
         if view.status == status {
             tx.commit().await?;
             return Ok(view);
@@ -467,7 +472,7 @@ pub(super) fn upstream_account_view(
             driver.as_str(),
             "cpa-subscription-bridge" | "cpa-gemini-oauth-legacy"
         );
-    let can_rotate = auth_kind != "none";
+    let can_rotate = auth_kind != "none" && driver != "cpa-subscription-bridge";
     let can_reauthorize = upstream_can_reauthorize(
         &driver,
         &auth_kind,

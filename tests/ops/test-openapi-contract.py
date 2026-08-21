@@ -209,7 +209,7 @@ class ProductContractTests(unittest.TestCase):
         cases = [
             ("cursor", "StartCursorOAuthRequest"),
             ("provider-adapter", "StartProviderAdapterOAuthRequest"),
-            ("subscription-bridge", "StartSubscriptionBridgeRequest"),
+            ("codex", "StartCodexOAuthRequest"),
         ]
         for path_segment, request_schema in cases:
             start = self.document["paths"][
@@ -230,6 +230,26 @@ class ProductContractTests(unittest.TestCase):
                     "schema"
                 ]["$ref"],
             )
+        paths = self.document["paths"]
+        self.assertNotIn("/internal/v1/oauth/subscription-bridge/start", paths)
+        self.assertNotIn("/internal/v1/oauth/subscription-bridge/poll", paths)
+        self.assertNotIn("/internal/v1/imports/cpa/subscription-accounts", paths)
+        schemas = self.document["components"]["schemas"]
+        self.assertNotIn("StartSubscriptionBridgeRequest", schemas)
+        self.assertNotIn("SubscriptionBridgeCredential", schemas)
+        codex_start = paths["/internal/v1/oauth/codex/start"]["post"]
+        self.assertEqual(
+            "#/components/schemas/CodexDeviceLoginStart",
+            codex_start["responses"]["200"]["content"]["application/json"][
+                "schema"
+            ]["$ref"],
+        )
+        self.assertEqual(
+            "only_continue_if_you_started_this_login",
+            schemas["CodexDeviceLoginStart"]["properties"]["security_notice"][
+                "const"
+            ],
+        )
 
     def test_session_archive_quarantine_is_persistent_global_operator_only(self) -> None:
         base = "/internal/v1/imports/session-archive/quarantine"

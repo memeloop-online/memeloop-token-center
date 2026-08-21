@@ -45,17 +45,6 @@
           }
         },
         {
-          "title": "Subscription bridge",
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "handle"],
-          "properties": {
-            "type": { "const": "subscription_bridge" },
-            "handle": { "type": "string", "pattern": "^[A-Za-z0-9]{1,80}$", "writeOnly": true },
-            "secret": { "type": "string", "minLength": 1, "writeOnly": true }
-          }
-        },
-        {
           "title": "API key",
           "type": "object",
           "additionalProperties": false,

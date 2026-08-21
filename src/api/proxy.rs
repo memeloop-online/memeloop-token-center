@@ -16,6 +16,7 @@ pub(super) async fn proxy(
     protocol: Protocol,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
+    let request_id = Uuid::now_v7();
     let original_request_json: Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
     let applied =
@@ -24,18 +25,21 @@ pub(super) async fn proxy(
     let model = applied.model;
     let resolved_route = state
         .db
-        .resolve_upstream_with_hint(
+        .resolve_authorized_upstream_with_hint(
+            key.key_id,
             key.tenant_id,
             &model,
             protocol.name(),
-            applied.upstream_account_hint,
+            RouteSelectionOptions {
+                upstream_account_hint: applied.upstream_account_hint,
+                selection_seed: request_id,
+            },
             state.config.key_pepper.as_bytes(),
         )
         .await?;
     let (
         base_url,
         upstream_credential,
-        legacy_upstream_key,
         upstream_model,
         upstream_account_id,
         model_route_id,
@@ -48,11 +52,15 @@ pub(super) async fn proxy(
                 route.driver
             )));
         }
+        if route.driver == "cpa-subscription-bridge" {
+            return Err(AppError::BadRequest(
+                "this legacy upstream type is retired".into(),
+            ));
+        }
         route.credential.validate(unix_millis())?;
         (
             route.base_url,
             Some(route.credential),
-            None,
             route.upstream_model,
             Some(route.account_id),
             Some(route.route_id),
@@ -60,63 +68,26 @@ pub(super) async fn proxy(
             Some(route.config),
         )
     } else {
-        let (base_url, upstream_key) = if protocol.is_openai() {
-            (
-                state.config.upstream_openai_url.clone(),
-                state.config.upstream_openai_key.clone(),
-            )
-        } else {
-            (
-                state.config.upstream_anthropic_url.clone(),
-                state.config.upstream_anthropic_key.clone(),
-            )
-        };
-        (
-            base_url.ok_or_else(|| AppError::Upstream(protocol.name().into()))?,
-            None,
-            upstream_key,
-            model.clone(),
-            None,
-            None,
-            None,
-            None,
-        )
+        // Normalized grants are the sole downstream authorization source.
+        // A missing route must never fall back to process-wide legacy secrets.
+        return Err(AppError::Forbidden);
     };
-    if route_driver.as_deref() == Some("cpa-subscription-bridge") {
-        if !matches!(protocol, Protocol::OpenAiChat) {
-            return Err(AppError::BadRequest(
-                "CPA subscription bridge supports OpenAI chat completions only".into(),
-            ));
-        }
-        let valid_provider = route_config
-            .as_ref()
-            .and_then(|config| config.get("provider"))
-            .and_then(Value::as_str)
-            .is_some_and(|provider| matches!(provider, "copilot" | "cursor"));
-        let has_handle = upstream_credential
-            .as_ref()
-            .and_then(UpstreamCredential::subscription_bridge_handle)
-            .is_some();
-        if !valid_provider || !has_handle {
-            return Err(AppError::Upstream(
-                "subscription bridge account configuration is invalid".into(),
-            ));
-        }
-    }
-    let is_codex_route = route_driver.as_deref() == Some(codex_transport::DRIVER);
+    let is_codex_route = route_driver
+        .as_deref()
+        .is_some_and(codex_transport::is_driver);
     if is_codex_route {
         codex_transport::validate_protocol(protocol)?;
         if base_url != codex_transport::BASE_URL {
             return Err(AppError::BadRequest(
-                "CPA Codex OAuth account has an invalid fixed base URL".into(),
+                "OpenAI Codex account has an invalid fixed base URL".into(),
             ));
         }
-        let credential = upstream_credential.as_ref().ok_or_else(|| {
-            AppError::BadRequest("CPA Codex OAuth account has no credential".into())
-        })?;
+        let credential = upstream_credential
+            .as_ref()
+            .ok_or_else(|| AppError::BadRequest("OpenAI Codex account has no credential".into()))?;
         codex_transport::validate_credential_contract(credential)?;
         codex_transport::validate_route_config(route_config.as_ref().ok_or_else(|| {
-            AppError::BadRequest("CPA Codex OAuth account has no configuration".into())
+            AppError::BadRequest("OpenAI Codex account has no configuration".into())
         })?)?;
     }
     let mut forwarded_json = request_json.clone();
@@ -128,7 +99,7 @@ pub(super) async fn proxy(
             &mut forwarded_json,
             &upstream_model,
             route_config.as_ref().ok_or_else(|| {
-                AppError::BadRequest("CPA Codex OAuth account has no configuration".into())
+                AppError::BadRequest("OpenAI Codex account has no configuration".into())
             })?,
         )?)
     } else {
@@ -225,7 +196,6 @@ pub(super) async fn proxy(
             "the requested service_tier has no configured price".into(),
         ));
     }
-    let request_id = Uuid::now_v7();
     let request_digest = blake3::hash(&body).to_hex();
     let admitted_request_object = format!("gap://{request_id}/request");
     let request_archive_attempt =
@@ -346,41 +316,11 @@ pub(super) async fn proxy(
         )
         .await;
     }
-    let bridge_stream = forwarded_json
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let codex_downstream_stream = codex_plan
         .as_ref()
         .is_some_and(|plan| plan.downstream_stream);
     let (request_path, request_body) = if is_codex_route {
         (codex_transport::RESPONSES_PATH, forwarded_body)
-    } else if route_driver.as_deref() == Some("cpa-subscription-bridge") {
-        let Some(provider) = route_config
-            .as_ref()
-            .and_then(|config| config.get("provider"))
-            .and_then(Value::as_str)
-            .filter(|provider| matches!(*provider, "copilot" | "cursor"))
-        else {
-            return finish_proxy_failure(&buffered_request, "provider_configuration").await;
-        };
-        let Some(handle) = upstream_credential
-            .as_ref()
-            .and_then(UpstreamCredential::subscription_bridge_handle)
-        else {
-            return finish_proxy_failure(&buffered_request, "provider_credential").await;
-        };
-        let bridge_body = match serde_json::to_vec(&json!({
-            "provider": provider,
-            "handle": handle,
-            "model": forwarded_json.get("model").and_then(Value::as_str),
-            "stream": bridge_stream,
-            "payload": forwarded_json
-        })) {
-            Ok(body) => body,
-            Err(_) => return finish_proxy_failure(&buffered_request, "provider_request").await,
-        };
-        ("/v1/execute", bridge_body)
     } else {
         (protocol.path(), forwarded_body)
     };
@@ -443,21 +383,6 @@ pub(super) async fn proxy(
                 return finish_proxy_failure(&buffered_request, "provider_credential").await;
             }
         };
-    } else if let Some(upstream_key) = legacy_upstream_key.as_ref() {
-        request = request
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(
-                header::ACCEPT,
-                headers
-                    .get(header::ACCEPT)
-                    .cloned()
-                    .unwrap_or(HeaderValue::from_static("application/json")),
-            );
-        request = if protocol.is_openai() {
-            request.bearer_auth(upstream_key)
-        } else {
-            request.header("x-api-key", upstream_key)
-        };
     }
     if !is_codex_route {
         if let Some(version) = headers.get("anthropic-version") {
@@ -488,10 +413,6 @@ pub(super) async fn proxy(
             return finish_proxy_failure(&buffered_request, "upstream_connection").await;
         }
     };
-    if route_driver.as_deref() == Some("cpa-subscription-bridge") {
-        return finish_subscription_bridge_response(buffered_request, upstream, bridge_stream)
-            .await;
-    }
     let status = upstream.status();
     if !status.is_success() {
         drop(upstream);
@@ -530,14 +451,13 @@ pub(super) async fn proxy(
         )
         .await;
     }
-    let is_sse = bridge_stream
-        || content_type
-            .as_ref()
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    let is_sse = content_type
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
     let capture_json_usage = should_capture_buffered_usage(is_sse, content_type.as_ref());
-    if !is_sse && !bridge_stream {
+    if !is_sse {
         let response_content_type = content_type
             .as_ref()
             .and_then(|value| value.to_str().ok())
@@ -1365,123 +1285,6 @@ async fn finish_proxy_failure(
     .await
 }
 
-async fn finish_subscription_bridge_response(
-    request: BufferedRequest<'_>,
-    upstream: reqwest::Response,
-    stream: bool,
-) -> Result<Response, AppError> {
-    let request_id = request.request_id;
-    let upstream_status = upstream.status();
-    if !upstream_status.is_success() {
-        drop(upstream);
-        return finish_buffered_request(
-            &request,
-            upstream_status,
-            Bytes::from_static(
-                b"{\"error\":{\"message\":\"subscription bridge rejected the request\"}}",
-            ),
-            "application/json",
-            TokenUsage::default(),
-            Some(format!("http_{}", upstream_status.as_u16())),
-        )
-        .await;
-    }
-    let raw = match read_bounded_upstream(upstream, MAX_SUBSCRIPTION_BRIDGE_RESPONSE).await {
-        Ok(raw) => raw,
-        Err(error) => {
-            tracing::warn!(%request_id, stage = "bridge_response", "subscription bridge response failed");
-            return finish_buffered_request(
-                &request,
-                StatusCode::BAD_GATEWAY,
-                Bytes::from_static(
-                    b"{\"error\":{\"message\":\"subscription bridge response failed\"}}",
-                ),
-                "application/json",
-                TokenUsage::default(),
-                Some(error.code().to_owned()),
-            )
-            .await;
-        }
-    };
-    let wrapper: Value = match serde_json::from_slice(&raw) {
-        Ok(wrapper) => wrapper,
-        Err(_) => {
-            return finish_buffered_request(
-                &request,
-                StatusCode::BAD_GATEWAY,
-                Bytes::from_static(
-                    b"{\"error\":{\"message\":\"subscription bridge returned invalid JSON\"}}",
-                ),
-                "application/json",
-                TokenUsage::default(),
-                Some("upstream_invalid_json".to_owned()),
-            )
-            .await;
-        }
-    };
-    let (body, content_type) = match unwrap_subscription_bridge_body(&wrapper, stream) {
-        Ok(response) => response,
-        Err(_) => {
-            tracing::warn!(%request_id, stage = "bridge_shape", "subscription bridge response failed");
-            return finish_buffered_request(
-                &request,
-                StatusCode::BAD_GATEWAY,
-                Bytes::from_static(b"{\"error\":{\"message\":\"subscription bridge returned an invalid response\"}}"),
-                "application/json",
-                TokenUsage::default(),
-                Some("upstream_invalid_response".to_owned()),
-            )
-            .await;
-        }
-    };
-    let usage = match extract_usage_checked(&body) {
-        ExtractedUsage::Invalid => {
-            return finish_proxy_failure(&request, "upstream_invalid_usage").await;
-        }
-        ExtractedUsage::Valid(usage) if usage.total_tokens() > 0 => usage,
-        ExtractedUsage::Valid(_) | ExtractedUsage::Missing => TokenUsage {
-            input_tokens: estimated_tokens(request.input_token_ceiling),
-            output_tokens: estimated_tokens(i64::try_from(body.len()).unwrap_or(i64::MAX))
-                .min(request.output_token_ceiling),
-            ..TokenUsage::default()
-        },
-    };
-    finish_buffered_request(&request, StatusCode::OK, body, content_type, usage, None).await
-}
-
-fn unwrap_subscription_bridge_body(
-    wrapper: &Value,
-    stream: bool,
-) -> Result<(Bytes, &'static str), AppError> {
-    if stream {
-        let chunks = wrapper
-            .get("chunks")
-            .and_then(Value::as_array)
-            .ok_or_else(|| AppError::Upstream("subscription bridge returned no chunks".into()))?;
-        let mut body = Vec::new();
-        for chunk in chunks {
-            let chunk = chunk.as_str().ok_or_else(|| {
-                AppError::Upstream("subscription bridge returned an invalid chunk".into())
-            })?;
-            if body.len().saturating_add(chunk.len()) > MAX_SUBSCRIPTION_BRIDGE_RESPONSE {
-                return Err(AppError::Upstream(
-                    "subscription bridge stream is too large".into(),
-                ));
-            }
-            body.extend_from_slice(chunk.as_bytes());
-        }
-        Ok((Bytes::from(body), "text/event-stream"))
-    } else {
-        let payload = wrapper
-            .get("payload")
-            .ok_or_else(|| AppError::Upstream("subscription bridge returned no payload".into()))?;
-        Ok((
-            Bytes::from(serde_json::to_vec(payload).map_err(|_| AppError::Internal)?),
-            "application/json",
-        ))
-    }
-}
-
 async fn finish_buffered_request(
     request: &BufferedRequest<'_>,
     mut status: StatusCode,
@@ -1648,10 +1451,6 @@ async fn read_bounded_upstream(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
-}
-
-fn estimated_tokens(bytes: i64) -> i64 {
-    bytes.max(0).saturating_add(3) / 4
 }
 
 enum ExtractedUsage {

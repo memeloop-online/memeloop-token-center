@@ -129,10 +129,9 @@ The chart default is fail-closed for cross-namespace ingress and private egress:
 Production values must explicitly select every cross-namespace dependency. The
 following is the exact review-dogfood topology audited on 2026-08-14: Higress
 gateway pods run in `higress-system`, while CNPG and MinIO run in
-`memeloop-token-center-dev`. The active CPA subscription bridge runs in
-`cliproxyapi`; public OAuth, price catalogs and other providers use the single
-configured proxy. Reconfirm these labels before every rollout; they are not
-portable defaults.
+`memeloop-token-center-dev`. Public OAuth, price catalogs and other providers use
+the single configured proxy. Reconfirm these labels before every rollout; they
+are not portable defaults.
 
 ```yaml
 networkPolicy:

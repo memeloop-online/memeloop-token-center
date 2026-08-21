@@ -90,7 +90,7 @@ Balance and budgets are checked before upstream execution. Error code `insuffici
 
 ## Unified upstream providers
 
-An upstream account is one resource regardless of whether its authentication method is API credential, OAuth, CPA subscription bridge or no authentication. `auth_kind` is metadata about the current method; it is not a separate account type.
+An upstream account is one resource regardless of whether its authentication method is an API credential, native OAuth, plugin-provided authorization, or no authentication. `auth_kind` is metadata about the current method; it is not a separate account type. Retired connection records remain readable as legacy history but cannot be created, reactivated, refreshed, or routed.
 
 Direct credentials use `POST /internal/v1/upstreams`. OAuth start/poll endpoints create the same upstream resource, and routes always reference its stable `account_id`. The unified list exposes `connection_method`, `credential_expires_at` and `route_count` without returning authentication material.
 

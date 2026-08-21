@@ -1647,10 +1647,6 @@ fn validate_provider_contribution(
             "refresh_token": "contract-probe",
             "expires_at": 4_102_444_800_000_i64
         }),
-        serde_json::json!({
-            "type": "subscription_bridge",
-            "handle": "ContractProbe"
-        }),
     ];
     if !supported_credentials.iter().any(|credential| {
         crate::schema::validate_instance(&provider.credential_schema, credential).is_ok()

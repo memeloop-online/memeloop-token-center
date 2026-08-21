@@ -20,7 +20,7 @@ impl Database {
     pub async fn reauthorize_upstream_account(
         &self,
         account_id: Uuid,
-        mut input: ReauthorizeUpstreamAccountInput,
+        input: ReauthorizeUpstreamAccountInput,
         key_material: &[u8],
     ) -> Result<UpstreamAccountView, AppError> {
         if input.credential.auth_kind() != "oauth" {
@@ -30,20 +30,18 @@ impl Database {
         }
         if !matches!(
             input.oauth_driver.as_str(),
-            "cursor" | "provider_adapter" | "subscription_bridge"
+            "cursor" | "provider_adapter" | "openai_codex_device"
         ) {
             return Err(AppError::BadRequest(
                 "unsupported OAuth reauthorization lifecycle".into(),
             ));
         }
-        if (input.driver == "cpa-subscription-bridge")
-            != (input.oauth_driver == "subscription_bridge")
-        {
+        if input.driver == "cpa-subscription-bridge" {
             return Err(AppError::BadRequest(
-                "OAuth reauthorization lifecycle does not match the provider".into(),
+                "this legacy upstream type is retired".into(),
             ));
         }
-        if input.oauth_driver != "subscription_bridge" && input.oauth_refresh_url.is_none() {
+        if input.oauth_refresh_url.is_none() {
             return Err(AppError::BadRequest(
                 "OAuth reauthorization refresh endpoint is required".into(),
             ));
@@ -74,13 +72,8 @@ impl Database {
         let current_driver: String = row.try_get("driver")?;
         let current_auth_kind: String = row.try_get("auth_kind")?;
         let current_oauth_driver = row.try_get::<Option<String>, _>("oauth_driver")?;
-        let expected_oauth_driver = if current_driver == "cpa-subscription-bridge" {
-            Some("subscription_bridge")
-        } else {
-            current_oauth_driver.as_deref()
-        };
         if current_driver != input.driver
-            || expected_oauth_driver != Some(input.oauth_driver.as_str())
+            || current_oauth_driver.as_deref() != Some(input.oauth_driver.as_str())
             || !upstream_can_reauthorize(
                 &current_driver,
                 &current_auth_kind,
@@ -102,18 +95,6 @@ impl Database {
             return Err(AppError::Conflict(
                 "reload the upstream provider before authorizing it again".into(),
             ));
-        }
-        if let UpstreamCredential::SubscriptionBridge { secret, .. } = &mut input.credential
-            && secret.is_none()
-        {
-            let current_ciphertext: String = row.try_get("credential_ciphertext")?;
-            if let UpstreamCredential::SubscriptionBridge {
-                secret: current_secret,
-                ..
-            } = open_credential(&current_ciphertext, key_material)?
-            {
-                *secret = current_secret;
-            }
         }
         input.credential.validate(now)?;
         let ciphertext = seal_credential(&input.credential, key_material)?;
@@ -573,12 +554,17 @@ impl Database {
         account_id: Uuid,
     ) -> Result<(String, String), AppError> {
         let row = sqlx::query(
-            "SELECT auth_kind, oauth_session_id, oauth_driver, oauth_refresh_url, config_json FROM upstream_accounts WHERE id = $1",
+            "SELECT driver, auth_kind, oauth_session_id, oauth_driver, oauth_refresh_url, config_json FROM upstream_accounts WHERE id = $1",
         )
         .bind(account_id.to_string())
         .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
+        if row.try_get::<String, _>("driver")? == "cpa-subscription-bridge" {
+            return Err(AppError::BadRequest(
+                "this legacy upstream type is retired".into(),
+            ));
+        }
         if row.try_get::<String, _>("auth_kind")? != "oauth"
             || row
                 .try_get::<Option<String>, _>("oauth_session_id")?
@@ -612,7 +598,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<(Uuid, i64)>, AppError> {
         let rows = sqlx::query(
-            "SELECT a.id, a.credential_generation FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.status = 'active' AND a.auth_kind = 'oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND a.driver <> 'cpa-gemini-oauth-legacy' AND c.expires_at IS NOT NULL AND c.expires_at <= $1 ORDER BY c.expires_at, a.id LIMIT $2",
+            "SELECT a.id, a.credential_generation FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.status = 'active' AND a.auth_kind = 'oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND a.driver NOT IN ('cpa-subscription-bridge', 'cpa-gemini-oauth-legacy') AND c.expires_at IS NOT NULL AND c.expires_at <= $1 ORDER BY c.expires_at, a.id LIMIT $2",
         )
         .bind(refresh_before)
         .bind(limit.clamp(1, 100))
@@ -659,6 +645,11 @@ impl Database {
             .fetch_optional(&mut **tx)
             .await?
             .ok_or(AppError::NotFound)?;
+        if row.try_get::<String, _>("driver")? == "cpa-subscription-bridge" {
+            return Err(AppError::BadRequest(
+                "this legacy upstream type is retired".into(),
+            ));
+        }
         let status: String = row.try_get("status")?;
         if !matches!(status.as_str(), "active" | "disabled") {
             return Err(AppError::Forbidden);
@@ -727,7 +718,8 @@ impl Database {
                     row.try_get::<String, _>("driver")?.as_str(),
                     "cpa-subscription-bridge" | "cpa-gemini-oauth-legacy"
                 ),
-            can_rotate: auth_kind != "none",
+            can_rotate: auth_kind != "none"
+                && row.try_get::<String, _>("driver")? != "cpa-subscription-bridge",
             can_reauthorize: upstream_can_reauthorize(
                 &row.try_get::<String, _>("driver")?,
                 &auth_kind,

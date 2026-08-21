@@ -2,11 +2,14 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
 use getrandom::fill;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
+pub mod codex_device;
 pub mod managed;
 
 use crate::{
@@ -20,8 +23,6 @@ use crate::{
 };
 
 const CURSOR_LOGIN_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-login/v1";
-const SUBSCRIPTION_BRIDGE_LOGIN_AAD: &[u8] =
-    b"memeloop-token-center/subscription-bridge-oauth-login/v1";
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGED_OAUTH_REQUEST_BYTES: usize = MAX_OAUTH_RESPONSE_BYTES + 64 * 1024;
 #[cfg(not(test))]
@@ -125,48 +126,6 @@ pub struct ReadyCursorLogin {
 pub enum CursorPollResult {
     Pending { retry_after_seconds: u64 },
     Ready(Box<ReadyCursorLogin>),
-}
-
-#[derive(Clone, Debug)]
-pub struct StartSubscriptionBridgeLogin {
-    pub tenant_external_id: String,
-    pub account_name: String,
-    pub provider_config: Value,
-    pub bridge_secret: Option<String>,
-    pub allow_loopback: bool,
-    pub reauthorize: Option<OAuthReauthorizationTarget>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct SubscriptionBridgeLoginState {
-    session_id: Uuid,
-    tenant_external_id: String,
-    account_name: String,
-    provider_config: Value,
-    bridge_secret: Option<String>,
-    bridge_state: String,
-    expires_at: i64,
-    #[serde(default)]
-    reauthorize: Option<OAuthReauthorizationTarget>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ReadySubscriptionBridgeLogin {
-    pub session_id: Uuid,
-    pub tenant_external_id: String,
-    pub account_name: String,
-    pub provider_config: Value,
-    pub credential: UpstreamCredential,
-    pub reauthorize: Option<OAuthReauthorizationTarget>,
-}
-
-#[derive(Clone, Debug)]
-pub enum SubscriptionBridgePollResult {
-    Pending {
-        retry_after_seconds: u64,
-        message: Option<String>,
-    },
-    Ready(Box<ReadySubscriptionBridgeLogin>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -369,208 +328,6 @@ async fn managed_oauth_adapter_call(
         }
         _ => AppError::Internal,
     })
-}
-
-pub async fn start_subscription_bridge_login(
-    http: &reqwest::Client,
-    input: StartSubscriptionBridgeLogin,
-    key_material: &[u8],
-    now: i64,
-) -> Result<OAuthLoginStart, AppError> {
-    if input.account_name.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "OAuth account name is required".into(),
-        ));
-    }
-    let base_url =
-        validate_subscription_bridge_base_url(&input.provider_config, input.allow_loopback)?;
-    let provider = subscription_provider(&input.provider_config)?.to_owned();
-    validate_optional_bridge_secret(input.bridge_secret.as_deref())?;
-    let response = subscription_bridge_call(
-        http,
-        &base_url,
-        input.bridge_secret.as_deref(),
-        "/v1/oauth/start",
-        &json!({"provider": provider.as_str()}),
-    )
-    .await?;
-    let login_url = response
-        .get("url")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AppError::Upstream("subscription bridge returned no login URL".into()))?;
-    let login_url = validate_oauth_endpoint(login_url, "login_url")?.to_string();
-    let bridge_state = response
-        .get("state")
-        .and_then(Value::as_str)
-        .filter(|state| !state.is_empty())
-        .ok_or_else(|| AppError::Upstream("subscription bridge returned no login state".into()))?
-        .to_owned();
-    let expires_at = now.saturating_add(15 * 60 * 1_000);
-    let state = SubscriptionBridgeLoginState {
-        session_id: Uuid::now_v7(),
-        tenant_external_id: input.tenant_external_id,
-        account_name: input.account_name.trim().to_owned(),
-        provider_config: input.provider_config,
-        bridge_secret: input.bridge_secret,
-        bridge_state,
-        expires_at,
-        reauthorize: input.reauthorize,
-    };
-    Ok(OAuthLoginStart {
-        driver: format!("subscription-bridge:{provider}"),
-        login_url,
-        session_token: seal_private_json(&state, key_material, SUBSCRIPTION_BRIDGE_LOGIN_AAD)?,
-        expires_at,
-        poll_after_seconds: 1,
-    })
-}
-
-pub async fn poll_subscription_bridge_login(
-    http: &reqwest::Client,
-    session_token: &str,
-    key_material: &[u8],
-    now: i64,
-    required_tenant: Option<&str>,
-) -> Result<SubscriptionBridgePollResult, AppError> {
-    let state: SubscriptionBridgeLoginState =
-        open_private_json(session_token, key_material, SUBSCRIPTION_BRIDGE_LOGIN_AAD)
-            .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
-    if required_tenant.is_some_and(|tenant| tenant != state.tenant_external_id) {
-        return Err(AppError::Forbidden);
-    }
-    if state.expires_at <= now {
-        return Err(AppError::BadRequest("OAuth login session expired".into()));
-    }
-    let base_url = validate_config(&state.provider_config)?;
-    let provider = subscription_provider(&state.provider_config)?.to_owned();
-    let response = subscription_bridge_call(
-        http,
-        &base_url,
-        state.bridge_secret.as_deref(),
-        "/v1/oauth/poll",
-        &json!({"provider": provider.as_str(), "state": state.bridge_state}),
-    )
-    .await?;
-    let message = response
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    match response.get("status").and_then(Value::as_str) {
-        Some("success") => {
-            let auth = response
-                .get("auth")
-                .and_then(Value::as_object)
-                .ok_or_else(|| AppError::Upstream("subscription bridge returned no auth".into()))?;
-            if auth.get("upstream").and_then(Value::as_str) != Some(provider.as_str())
-                || auth.get("type").and_then(Value::as_str) != Some("subscription-bridge")
-            {
-                return Err(AppError::Upstream(
-                    "subscription bridge returned mismatched auth metadata".into(),
-                ));
-            }
-            let handle = auth
-                .get("handle")
-                .and_then(Value::as_str)
-                .filter(|handle| !handle.is_empty())
-                .ok_or_else(|| {
-                    AppError::Upstream("subscription bridge returned no account handle".into())
-                })?
-                .to_owned();
-            let credential = UpstreamCredential::SubscriptionBridge {
-                handle,
-                secret: state.bridge_secret,
-            };
-            credential.validate(now)?;
-            Ok(SubscriptionBridgePollResult::Ready(Box::new(
-                ReadySubscriptionBridgeLogin {
-                    session_id: state.session_id,
-                    tenant_external_id: state.tenant_external_id,
-                    account_name: state.account_name,
-                    provider_config: state.provider_config,
-                    credential,
-                    reauthorize: state.reauthorize,
-                },
-            )))
-        }
-        Some("error") => {
-            Err(AppError::Upstream(message.unwrap_or_else(|| {
-                "subscription bridge OAuth failed".to_owned()
-            })))
-        }
-        _ => Ok(SubscriptionBridgePollResult::Pending {
-            retry_after_seconds: 1,
-            message,
-        }),
-    }
-}
-
-fn subscription_provider(config: &Value) -> Result<&str, AppError> {
-    match config.get("provider").and_then(Value::as_str) {
-        Some(provider @ ("copilot" | "cursor")) => Ok(provider),
-        _ => Err(AppError::BadRequest(
-            "subscription bridge config.provider must be copilot or cursor".into(),
-        )),
-    }
-}
-
-fn validate_subscription_bridge_base_url(
-    config: &Value,
-    allow_loopback: bool,
-) -> Result<String, AppError> {
-    let base_url = validate_config(config)?;
-    let parsed = Url::parse(&base_url).map_err(|_| AppError::Internal)?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| AppError::BadRequest("subscription bridge host is required".into()))?;
-    let cluster_service = host.ends_with(".svc") || host.ends_with(".svc.cluster.local");
-    let loopback = allow_loopback
-        && host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
-    if !cluster_service && !loopback {
-        return Err(AppError::BadRequest(
-            "subscription bridge must use an in-cluster service origin".into(),
-        ));
-    }
-    Ok(base_url)
-}
-
-fn validate_optional_bridge_secret(secret: Option<&str>) -> Result<(), AppError> {
-    if let Some(secret) = secret {
-        if secret.is_empty() {
-            return Err(AppError::BadRequest(
-                "subscription bridge secret cannot be empty".into(),
-            ));
-        }
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}"))
-            .map_err(|_| AppError::BadRequest("invalid subscription bridge secret".into()))?;
-    }
-    Ok(())
-}
-
-async fn subscription_bridge_call(
-    http: &reqwest::Client,
-    base_url: &str,
-    secret: Option<&str>,
-    path: &str,
-    body: &Value,
-) -> Result<Value, AppError> {
-    let request = http.post(format!("{base_url}{path}")).json(body);
-    let request = match secret {
-        Some(secret) => request.bearer_auth(secret),
-        None => request,
-    };
-    let response = request.send().await.map_err(AppError::from)?;
-    let status = response.status();
-    let body = bounded_body(response).await?;
-    if !status.is_success() {
-        return Err(AppError::Upstream(format!(
-            "subscription bridge returned HTTP {}",
-            status.as_u16()
-        )));
-    }
-    serde_json::from_slice(&body)
-        .map_err(|_| AppError::Upstream("subscription bridge returned invalid JSON".into()))
 }
 
 pub fn start_cursor_login(
@@ -1025,17 +782,6 @@ mod tests {
         for secret in [query_secret, "old-refresh-secret", address.as_str()] {
             assert!(!rendered.contains(secret));
         }
-    }
-
-    #[test]
-    fn subscription_bridge_accepts_only_cluster_services_or_test_loopback() {
-        let cluster = json!({"base_url":"http://cpa-bridge.cliproxyapi.svc.cluster.local"});
-        assert!(validate_subscription_bridge_base_url(&cluster, false).is_ok());
-        let loopback = json!({"base_url":"http://127.0.0.1:1234"});
-        assert!(validate_subscription_bridge_base_url(&loopback, false).is_err());
-        assert!(validate_subscription_bridge_base_url(&loopback, true).is_ok());
-        let public = json!({"base_url":"https://example.com"});
-        assert!(validate_subscription_bridge_base_url(&public, false).is_err());
     }
 
     fn managed_adapter(server: &MockServer) -> ResolvedManagedOAuthAdapter {

@@ -111,11 +111,10 @@ impl UpstreamCredential {
         self.validate(now)?;
         let (secret, header, prefix) = match self {
             Self::None => return Ok(request),
-            Self::SubscriptionBridge { secret, .. } => {
-                return Ok(match secret {
-                    Some(secret) => request.bearer_auth(secret),
-                    None => request,
-                });
+            Self::SubscriptionBridge { .. } => {
+                return Err(AppError::BadRequest(
+                    "this legacy upstream credential cannot be used for requests".into(),
+                ));
             }
             Self::ApiKey {
                 value,
@@ -146,11 +145,11 @@ impl UpstreamCredential {
                 };
                 if secret.is_empty() {
                     return Err(AppError::BadRequest(
-                        "subscription bridge secret cannot be empty".into(),
+                        "legacy upstream credential secret cannot be empty".into(),
                     ));
                 }
                 reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).map_err(
-                    |_| AppError::BadRequest("invalid subscription bridge secret".into()),
+                    |_| AppError::BadRequest("invalid legacy upstream credential secret".into()),
                 )?;
                 return Ok(());
             }
@@ -271,7 +270,7 @@ fn validate_bridge_handle(handle: &str) -> Result<(), AppError> {
             .all(|character| character.is_ascii_alphanumeric())
     {
         return Err(AppError::BadRequest(
-            "subscription bridge handle must be 1-80 ASCII alphanumeric characters".into(),
+            "legacy upstream credential handle must be 1-80 ASCII alphanumeric characters".into(),
         ));
     }
     Ok(())
@@ -430,6 +429,7 @@ pub struct ProviderType {
 #[derive(Clone)]
 pub struct ProviderCatalog {
     types: Arc<Vec<ProviderType>>,
+    legacy_types: Arc<Vec<ProviderType>>,
     builtin_managed_oauth: Arc<Vec<BuiltinManagedOAuthRegistration>>,
 }
 
@@ -588,9 +588,9 @@ impl ProviderCatalog {
             component_adapter: None,
             source: "builtin".to_owned(),
         });
-        types.push(ProviderType {
+        let legacy_subscription_bridge = ProviderType {
             id: "cpa-subscription-bridge".to_owned(),
-            display_name: "CPA Copilot/Cursor subscription bridge".to_owned(),
+            display_name: "Retired legacy connection".to_owned(),
             protocols: vec!["openai".to_owned()],
             modalities: vec!["text".to_owned()],
             config_schema: json!({
@@ -619,7 +619,7 @@ impl ProviderCatalog {
             managed_oauth_adapter: None,
             component_adapter: None,
             source: "builtin".to_owned(),
-        });
+        };
         types.push(ProviderType {
             id: "comfyui".to_owned(),
             display_name: "ComfyUI".to_owned(),
@@ -654,19 +654,29 @@ impl ProviderCatalog {
             source: "builtin".to_owned(),
         });
         types.push(builtin_managed_oauth_provider(
-            "cpa-codex-oauth",
-            "CPA Codex OAuth (managed)",
-            "https://chatgpt.com/backend-api/codex",
+            crate::oauth::codex_device::PROVIDER_DRIVER,
+            "OpenAI Codex",
+            crate::oauth::codex_device::BASE_URL,
             true,
         ));
-        types.push(builtin_managed_oauth_provider(
-            "cpa-gemini-oauth-legacy",
-            "CPA legacy Gemini OAuth (managed)",
-            "https://cloudcode-pa.googleapis.com",
-            false,
-        ));
+        let legacy_types = vec![
+            builtin_managed_oauth_provider(
+                "cpa-codex-oauth",
+                "Legacy Codex OAuth import",
+                "https://chatgpt.com/backend-api/codex",
+                true,
+            ),
+            builtin_managed_oauth_provider(
+                "cpa-gemini-oauth-legacy",
+                "Legacy Gemini OAuth import",
+                "https://cloudcode-pa.googleapis.com",
+                false,
+            ),
+            legacy_subscription_bridge,
+        ];
         Self {
             types: Arc::new(types),
+            legacy_types: Arc::new(legacy_types),
             builtin_managed_oauth: Arc::new(vec![
                 BuiltinManagedOAuthRegistration {
                     provider_driver: "cpa-codex-oauth",
@@ -684,6 +694,19 @@ impl ProviderCatalog {
 
     pub fn list(&self) -> &[ProviderType] {
         &self.types
+    }
+
+    /// Public provider types are the only drivers accepted for newly created
+    /// accounts. Legacy drivers remain resolvable for imported rows and routes,
+    /// but are never advertised as product capabilities.
+    pub fn is_public(&self, driver: &str) -> bool {
+        self.types.iter().any(|provider| provider.id == driver)
+    }
+
+    /// Interactive-only builtins must be provisioned through their server-owned
+    /// authorization flow so callers cannot inject raw OAuth material.
+    pub fn supports_direct_creation(&self, driver: &str) -> bool {
+        self.is_public(driver) && driver != crate::oauth::codex_device::PROVIDER_DRIVER
     }
 
     /// Return only the controlled source identifiers accepted by the current
@@ -711,6 +734,10 @@ impl ProviderCatalog {
             if contribution.id.trim().is_empty()
                 || self
                     .types
+                    .iter()
+                    .any(|provider| provider.id == contribution.id)
+                || self
+                    .legacy_types
                     .iter()
                     .any(|provider| provider.id == contribution.id)
             {
@@ -741,11 +768,14 @@ impl ProviderCatalog {
     }
 
     pub fn contains(&self, driver: &str) -> bool {
-        self.types.iter().any(|provider| provider.id == driver)
+        self.get(driver).is_some()
     }
 
     pub fn get(&self, driver: &str) -> Option<&ProviderType> {
-        self.types.iter().find(|provider| provider.id == driver)
+        self.types
+            .iter()
+            .chain(self.legacy_types.iter())
+            .find(|provider| provider.id == driver)
     }
 
     pub fn managed_oauth_adapter_for_source(
@@ -803,6 +833,14 @@ impl ProviderCatalog {
         &self,
         driver: &str,
     ) -> Result<ResolvedManagedOAuthAdapter, AppError> {
+        if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+            return Ok(ResolvedManagedOAuthAdapter {
+                provider_driver: driver.to_owned(),
+                source_type: "codex".to_owned(),
+                api_version: MANAGED_OAUTH_ADAPTER_API_VERSION.to_owned(),
+                backend: ManagedOAuthAdapterBackend::BuiltinCodex,
+            });
+        }
         if let Some(registration) = self
             .builtin_managed_oauth
             .iter()
@@ -857,14 +895,14 @@ fn builtin_managed_oauth_provider(
             "type": "object",
             "additionalProperties": false,
             "required": if routes_openai_responses {
-                json!(["base_url", "network_scope", "output_token_limits"])
+                json!(["base_url", "network_scope", "reservation_token_bounds"])
             } else {
                 json!(["base_url"])
             },
             "properties": {
                 "base_url": {"const": base_url, "readOnly": true},
                 "network_scope": {"const": "public", "readOnly": true},
-                "output_token_limits": {
+                "reservation_token_bounds": {
                     "type": "object",
                     "default": {},
                     "propertyNames": {"minLength": 1, "maxLength": 500},
@@ -873,7 +911,7 @@ fn builtin_managed_oauth_provider(
                         "minimum": 1,
                         "maximum": 1000000000
                     },
-                    "description": "Hard output-token ceilings keyed by exact upstream model. Values must come from reviewed official limits or trusted model metadata; clients cannot supply or override them."
+                    "description": "Conservative token reservation bounds keyed by exact upstream model. Values come from trusted synchronized model metadata and prevent under-reservation; they are not advertised provider output limits."
                 }
             }
         }),
@@ -947,7 +985,7 @@ pub struct UpstreamAccountView {
     pub driver: String,
     pub auth_kind: String,
     /// How this provider was connected. This is presentation metadata only;
-    /// API keys, OAuth and subscription bridges remain the same account model.
+    /// every connection method uses the same stable upstream account model.
     pub connection_method: String,
     pub credential_generation: i64,
     pub status: String,
@@ -1154,6 +1192,11 @@ mod tests {
         let opened = open_credential(&envelope, b"a key material with at least 32 bytes").unwrap();
         assert_eq!(opened.auth_kind(), "oauth");
         assert_eq!(opened.subscription_bridge_handle(), Some("OpaqueHandle123"));
+        let request = reqwest::Client::new().get("https://example.test");
+        assert!(
+            opened.apply(request, 42).is_err(),
+            "historical credentials must remain decryptable but unusable"
+        );
     }
 
     #[test]
@@ -1303,7 +1346,7 @@ mod tests {
     #[test]
     fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
         let catalog = ProviderCatalog::builtins();
-        let codex = catalog.get("cpa-codex-oauth").unwrap();
+        let codex = catalog.get("openai-codex").unwrap();
         assert_eq!(codex.protocols, vec!["openai"]);
         assert_eq!(
             codex.config_schema.pointer("/properties/base_url/const"),
@@ -1312,7 +1355,7 @@ mod tests {
         assert_eq!(
             codex
                 .config_schema
-                .pointer("/properties/output_token_limits/additionalProperties/minimum"),
+                .pointer("/properties/reservation_token_bounds/additionalProperties/minimum"),
             Some(&json!(1))
         );
         assert!(
@@ -1320,7 +1363,7 @@ mod tests {
                 .config_schema
                 .get("required")
                 .and_then(Value::as_array)
-                .is_some_and(|required| required.contains(&json!("output_token_limits")))
+                .is_some_and(|required| required.contains(&json!("reservation_token_bounds")))
         );
         assert!(
             codex
@@ -1332,6 +1375,19 @@ mod tests {
 
         let gemini = catalog.get("cpa-gemini-oauth-legacy").unwrap();
         assert!(gemini.protocols.is_empty());
+
+        let public_ids = catalog
+            .list()
+            .iter()
+            .map(|provider| provider.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(public_ids.contains(&"openai-codex"));
+        assert!(!public_ids.iter().any(|driver| driver.starts_with("cpa-")));
+        assert!(catalog.get("cpa-codex-oauth").is_some());
+        assert!(catalog.get("cpa-subscription-bridge").is_some());
+        assert!(!catalog.is_public("cpa-codex-oauth"));
+        assert!(!catalog.is_public("cpa-subscription-bridge"));
+        assert!(!catalog.supports_direct_creation("openai-codex"));
 
         assert!(
             catalog

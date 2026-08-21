@@ -168,7 +168,7 @@ async fn codex_route_fixture(label: &str) -> CodexRouteFixture {
                 config: json!({
                     "base_url": codex_transport::BASE_URL,
                     "network_scope": "public",
-                    "output_token_limits": {upstream_model.clone(): 64}
+                    "reservation_token_bounds": {upstream_model.clone(): 64}
                 }),
                 credential: UpstreamCredential::OAuth {
                     access_token: "upstream-access-secret".to_owned(),
@@ -220,7 +220,7 @@ async fn codex_route_fixture(label: &str) -> CodexRouteFixture {
     }
 }
 
-async fn compatibility_bridge_fixture(
+async fn response_usage_fixture(
     label: &str,
     upstream: &MockServer,
     input_token_overhead_ceiling: i64,
@@ -316,7 +316,7 @@ async fn compatibility_bridge_fixture(
     }
 }
 
-async fn send_compatibility_bridge(fixture: &CodexRouteFixture, body: &Value) -> Response {
+async fn send_response_usage_request(fixture: &CodexRouteFixture, body: &Value) -> Response {
     router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
         .oneshot(
             Request::post("/v1/responses")
@@ -565,7 +565,7 @@ async fn malformed_codex_credential_and_config_fail_before_side_effects() {
                     json!({
                         "base_url": codex_transport::BASE_URL,
                         "network_scope": "private",
-                        "output_token_limits": {fixture.upstream_model.clone(): 64}
+                        "reservation_token_bounds": {fixture.upstream_model.clone(): 64}
                     })
                     .to_string(),
                 )
@@ -900,15 +900,15 @@ async fn codex_streaming_output_then_failure_charges_the_contract_ceiling_once()
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 
-fn real_cpa_completed_response(input_tokens: i64, output_tokens: i64) -> Value {
+fn completed_response_with_usage(input_tokens: i64, output_tokens: i64) -> Value {
     json!({
-        "id": "resp-cpa-compatibility",
+        "id": "resp-usage-contract",
         "object": "response",
         "status": "completed",
         "error": null,
         "incomplete_details": null,
         "output": [{
-            "id": "msg-cpa-compatibility",
+            "id": "msg-usage-contract",
             "type": "message",
             "status": "completed",
             "role": "assistant",
@@ -925,15 +925,17 @@ fn real_cpa_completed_response(input_tokens: i64, output_tokens: i64) -> Value {
 }
 
 #[tokio::test]
-async fn compatibility_bridge_buffered_usage_uses_trusted_overhead_and_settles_http_200() {
+async fn buffered_response_usage_uses_trusted_overhead_and_settles_http_200() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(real_cpa_completed_response(309, 7)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(completed_response_with_usage(309, 7)),
+        )
         .expect(1)
         .mount(&upstream)
         .await;
-    let fixture = compatibility_bridge_fixture("buffered-real-cpa", &upstream, 256).await;
+    let fixture = response_usage_fixture("buffered-response-usage", &upstream, 256).await;
     let request = json!({
         "model": fixture.model,
         "input": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
@@ -941,14 +943,14 @@ async fn compatibility_bridge_buffered_usage_uses_trusted_overhead_and_settles_h
         "max_output_tokens": 16
     });
     assert_eq!(serde_json::to_vec(&request).unwrap().len(), 98);
-    let response = send_compatibility_bridge(&fixture, &request).await;
+    let response = send_response_usage_request(&fixture, &request).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&body).unwrap(),
-        real_cpa_completed_response(309, 7)
+        completed_response_with_usage(309, 7)
     );
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
@@ -960,20 +962,22 @@ async fn compatibility_bridge_buffered_usage_uses_trusted_overhead_and_settles_h
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (309, 7));
     assert_eq!(rows[0].error_code, None);
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-cpa-compatibility"))
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-usage-contract"))
         .await;
 }
 
 #[tokio::test]
-async fn compatibility_bridge_buffered_usage_still_rejects_usage_above_total_reservation() {
+async fn buffered_response_usage_rejects_usage_above_total_reservation() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(real_cpa_completed_response(400, 7)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(completed_response_with_usage(400, 7)),
+        )
         .expect(1)
         .mount(&upstream)
         .await;
-    let fixture = compatibility_bridge_fixture("buffered-over-reservation", &upstream, 256).await;
+    let fixture = response_usage_fixture("buffered-over-reservation", &upstream, 256).await;
     let request = json!({
         "model": fixture.model,
         "input": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
@@ -981,7 +985,7 @@ async fn compatibility_bridge_buffered_usage_still_rejects_usage_above_total_res
         "max_output_tokens": 16
     });
     assert_eq!(serde_json::to_vec(&request).unwrap().len(), 98);
-    let response = send_compatibility_bridge(&fixture, &request).await;
+    let response = send_response_usage_request(&fixture, &request).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
@@ -999,9 +1003,9 @@ async fn compatibility_bridge_buffered_usage_still_rejects_usage_above_total_res
 }
 
 #[tokio::test]
-async fn compatibility_bridge_buffered_failed_response_is_redacted_and_settled_as_502() {
+async fn buffered_failed_response_is_redacted_and_settled_as_502() {
     let upstream = MockServer::start().await;
-    let mut failed = real_cpa_completed_response(309, 7);
+    let mut failed = completed_response_with_usage(309, 7);
     failed["status"] = json!("failed");
     failed["error"] = json!({"message": "provider-secret", "token": "secret-token"});
     Mock::given(method("POST"))
@@ -1010,14 +1014,14 @@ async fn compatibility_bridge_buffered_failed_response_is_redacted_and_settled_a
         .expect(1)
         .mount(&upstream)
         .await;
-    let fixture = compatibility_bridge_fixture("buffered-failure", &upstream, 256).await;
+    let fixture = response_usage_fixture("buffered-failure", &upstream, 256).await;
     let request = json!({
         "model": fixture.model,
         "input": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
         "stream": false,
         "max_output_tokens": 16
     });
-    let response = send_compatibility_bridge(&fixture, &request).await;
+    let response = send_response_usage_request(&fixture, &request).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
@@ -1042,7 +1046,7 @@ async fn compatibility_bridge_buffered_failed_response_is_redacted_and_settled_a
 }
 
 #[tokio::test]
-async fn compatibility_bridge_streaming_error_null_completes_and_non_null_error_fails() {
+async fn streaming_response_error_null_completes_and_non_null_error_fails() {
     for (label, input_tokens, response_error, expected_status, expected_error) in [
         ("stream-null-error", 309, Value::Null, 200, None),
         (
@@ -1061,12 +1065,12 @@ async fn compatibility_bridge_streaming_error_null_completes_and_non_null_error_
         ),
     ] {
         let upstream = MockServer::start().await;
-        let completed = real_cpa_completed_response(input_tokens, 7);
+        let completed = completed_response_with_usage(input_tokens, 7);
         let response_error_is_null = response_error.is_null();
         let sse = format!(
             concat!(
                 "event: response.created\n",
-                "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-cpa-compatibility\",\"error\":null}}}}\n\n",
+                "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-usage-contract\",\"error\":null}}}}\n\n",
                 "event: response.completed\n",
                 "data: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n",
                 "data: [DONE]\n\n"
@@ -1083,14 +1087,14 @@ async fn compatibility_bridge_streaming_error_null_completes_and_non_null_error_
             .expect(1)
             .mount(&upstream)
             .await;
-        let fixture = compatibility_bridge_fixture(label, &upstream, 256).await;
+        let fixture = response_usage_fixture(label, &upstream, 256).await;
         let request = json!({
             "model": fixture.model,
             "input": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
             "stream": true,
             "max_output_tokens": 16
         });
-        let response = send_compatibility_bridge(&fixture, &request).await;
+        let response = send_response_usage_request(&fixture, &request).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await

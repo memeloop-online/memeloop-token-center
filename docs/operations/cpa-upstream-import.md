@@ -27,21 +27,10 @@ Unknown `*-api-key`/`*-compatibility` sections and unknown auth JSON types also
 stop the import. No supported accounts are written before source inventory and
 target metadata conflict checks finish.
 
-Copilot and Cursor records are supported only when the CPA auth document contains
-an opaque subscription handle:
-
-```json
-{
-  "type": "subscription-bridge",
-  "upstream": "copilot",
-  "handle": "OpaqueAsciiHandle",
-  "label": "Account label"
-}
-```
-
-The importer reduces this document to the fields above and calls
-`POST /internal/v1/imports/cpa/subscription-accounts`. It never sends unrelated
-CPA auth metadata to the target. The same applies with `upstream: cursor`.
+Opaque Copilot and Cursor handle records are retired and are not imported. Their
+presence makes apply stop during preflight. Connect supported providers through
+their native or plugin-provided authorization flow after migration; do not
+create a compatibility relay.
 
 ## Secret and transport boundary
 
@@ -49,26 +38,26 @@ Before starting, make an immutable CPA volume snapshot and stage only its
 `config.yaml` and declared auth directory for the importer UID. The importer
 requires:
 
-- `config.yaml`, every auth JSON, the target service token and an optional bridge
-  secret to be owner-owned, single-link, regular mode-`0600` files;
+- `config.yaml`, every auth JSON and the target service token to be owner-owned,
+  single-link, regular mode-`0600` files;
 - the auth root and every nested directory to be owner-owned mode `0700`;
 - no symlink or non-JSON file anywhere below the auth root; and
 - source and target sizes to remain within the built-in bounded-read limits.
 
-Do not pass a credential, service token or bridge secret in argv, an environment
+Do not pass a credential or service token in argv, an environment
 variable, a ConfigMap or a shell substitution. Normal output is one count-only
 JSON object. Errors do not include filenames, URLs, response bodies, hashes or
 credential values. Core dumps are disabled.
 
-Every target, provider and bridge URL must use HTTPS. The
+Every target and provider URL must use HTTPS. The
 `--allow-http-loopback` option permits only `localhost`, `127.0.0.0/8` or `::1`
 and exists for black-box tests. It does not permit cluster DNS or private IP HTTP.
 The HTTP client never follows redirects. Use `--ca-file` for a private control
 plane CA instead of disabling TLS verification.
 
-The apply service credential needs `providers:read`, `providers:write` and the
-scope required by the CPA subscription import endpoint. Route it only to the
-private control Service.
+The apply service credential needs `providers:read`, `providers:write` and, for
+managed OAuth documents, `imports:cpa:write`. Route it only to the private
+control Service.
 
 ## Dry-run and apply
 
@@ -80,8 +69,7 @@ requirements above:
 /usr/local/bin/import-cpa-upstreams \
   --config /source/config.yaml \
   --auth-dir /source/auth \
-  --tenant cpa-dogfood-import \
-  --bridge-base-url https://cpa-subscription-bridge.internal.example
+  --tenant cpa-dogfood-import
 ```
 
 A successful dry-run returns counts only:
@@ -94,14 +82,13 @@ Preserve the source snapshot and count-only output for review. Do not reorder AP
 key entries or rename auth files between dry-run and apply: section/provider plus
 list ordinal, or auth relative path, is the stable CPA source identity.
 
-After approval, mount a least-privilege Token Center token and optional bridge
-secret as separate mode-`0600` files and add:
+After approval, mount a least-privilege Token Center token as a mode-`0600` file
+and add:
 
 ```text
 --apply
 --target-api-base-url https://token-center-control.internal.example
 --service-token-file /secrets/target/service-token
---bridge-secret-file /secrets/bridge/secret
 ```
 
 For API accounts, the target name includes a deterministic hash of the non-secret
@@ -115,13 +102,9 @@ source does not add an account or credential generation; changing credential
 material under the same source identity conflicts instead of silently rotating
 an audited migration source.
 
-The subscription import endpoint derives a stable OAuth session identity from
-tenant, provider and opaque handle. Replaying the identical source returns the
-same account. Any returned `skipped` record is treated as failure.
-
 Create a fresh apply Job for the replay. It must report every API account under
-`replayed_count`, keep the target account count unchanged, and succeed for every
-subscription account. An interrupted run is recovered by replaying the same
+`replayed_count` and keep the target account count unchanged. An interrupted run
+is recovered by replaying the same
 immutable snapshot, never by editing the snapshot or weakening a conflict gate.
 
 ## Managed OAuth import

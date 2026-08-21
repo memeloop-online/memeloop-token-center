@@ -1,6 +1,97 @@
 use super::super::*;
 
 #[tokio::test]
+async fn durable_oauth_migration_retires_bridge_routes_without_deleting_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("oauth-retirement.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 1, 44)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO tenants (id, external_id, created_at) VALUES ('tenant-oauth-retirement', 'oauth-retirement', 1)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, created_at, updated_at) VALUES ('bridge-account', 'tenant-oauth-retirement', 'historical connection', 'cpa-subscription-bridge', 'oauth', '{"base_url":"http://legacy.invalid"}', 'active', 1, NULL, NULL, NULL, 1, 1)"#,
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ('bridge-route', 'tenant-oauth-retirement', 'historical-model', 'bridge-account', 'historical-upstream', 'openai', 0, 1, 1, 1)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id, upstream_account_id, model_route_id) VALUES ('historical-request', 'tenant-oauth-retirement', 'historical-key', 1, 'openai', 'historical-model', 1, 1, 0, '{}', 'historical-reservation', 'bridge-account', 'bridge-route')",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 45, 45)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let account_status: String =
+        sqlx::query("SELECT status FROM upstream_accounts WHERE id = 'bridge-account'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap()
+            .try_get("status")
+            .unwrap();
+    let route_enabled: i64 =
+        sqlx::query("SELECT enabled FROM model_routes WHERE id = 'bridge-route'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap()
+            .try_get("enabled")
+            .unwrap();
+    let historical_links: (String, String) = {
+        let row = sqlx::query(
+            "SELECT upstream_account_id, model_route_id FROM request_records WHERE id = 'historical-request'",
+        )
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        (
+            row.try_get("upstream_account_id").unwrap(),
+            row.try_get("model_route_id").unwrap(),
+        )
+    };
+    assert_eq!(account_status, "disabled");
+    assert_eq!(route_enabled, 0);
+    assert_eq!(
+        historical_links,
+        ("bridge-account".to_owned(), "bridge-route".to_owned())
+    );
+    assert!(
+        sqlx::query("SELECT id FROM oauth_login_sessions LIMIT 1")
+            .fetch_optional(&database.pool)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
 async fn budget_rollup_migration_backfills_existing_usage_and_reservations() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

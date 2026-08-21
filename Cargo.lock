@@ -2222,6 +2222,7 @@ dependencies = [
  "hmac 0.12.1",
  "http",
  "jsonschema",
+ "jsonwebtoken",
  "mime_guess",
  "object_store",
  "oci-client",

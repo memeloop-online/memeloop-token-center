@@ -1,9 +1,7 @@
 use std::time::Duration;
 
 pub(super) const REQUEST_ID_HEADER: &str = "x-mtc-request-id";
-pub(super) const MAX_SUBSCRIPTION_BRIDGE_RESPONSE: usize = 16 * 1024 * 1024;
 pub(super) const MAX_IMAGE_RESPONSE: usize = 16 * 1024 * 1024;
-pub(super) const MAX_CPA_IMPORT_BODY: usize = 34 * 1024 * 1024;
 pub(super) const MAX_ARCHIVE_DETAIL_RESPONSE: usize = 4 * 1024 * 1024;
 pub(super) const MAX_PROXY_RESPONSE_BODY: usize = 64 * 1024 * 1024;
 pub(super) const MAX_DEFAULT_REQUEST_BODY: usize = 4 * 1024 * 1024;

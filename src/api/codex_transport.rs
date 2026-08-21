@@ -16,7 +16,8 @@ use crate::{
     error::AppError, oauth::managed::codex::account_header_value, provider::UpstreamCredential,
 };
 
-pub(super) const DRIVER: &str = "cpa-codex-oauth";
+pub(super) const DRIVER: &str = "openai-codex";
+pub(super) const LEGACY_DRIVER: &str = "cpa-codex-oauth";
 pub(super) const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub(super) const RESPONSES_PATH: &str = "/responses";
 // Keep a fixed, audited Codex-compatible identity. It must not be supplied by
@@ -25,6 +26,10 @@ const USER_AGENT: &str =
     "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)";
 const MAX_OUTPUT_ITEMS: usize = 16_384;
 const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
+
+pub(super) fn is_driver(driver: &str) -> bool {
+    matches!(driver, DRIVER | LEGACY_DRIVER)
+}
 
 #[cfg(test)]
 tokio::task_local! {
@@ -36,6 +41,7 @@ const CLIENT_OUTPUT_LIMIT_FIELDS: &[&str] = &[
     "max_completion_tokens",
     "max_tokens",
     "output_token_limits",
+    "reservation_token_bounds",
 ];
 
 const UNSUPPORTED_FIELDS: &[&str] = &[
@@ -62,7 +68,7 @@ pub(super) fn validate_protocol(protocol: Protocol) -> Result<(), AppError> {
         Ok(())
     } else {
         Err(AppError::BadRequest(
-            "CPA Codex OAuth supports OpenAI Responses only".into(),
+            "OpenAI Codex supports the Responses protocol only".into(),
         ))
     }
 }
@@ -111,7 +117,7 @@ pub(super) fn prepare_request(
         ));
     }
     validate_service_tier(object.get("service_tier"))?;
-    let output_token_ceiling = trusted_output_token_ceiling(config, upstream_model)?;
+    let output_token_ceiling = trusted_reservation_token_bound(config, upstream_model)?;
 
     object.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
     object.insert("stream".to_owned(), Value::Bool(true));
@@ -144,53 +150,60 @@ pub(super) fn prepare_request(
 pub(super) fn validate_route_config(config: &Value) -> Result<(), AppError> {
     let Some(object) = config.as_object() else {
         return Err(AppError::BadRequest(
-            "CPA Codex OAuth account has invalid fixed transport configuration".into(),
+            "OpenAI Codex account has invalid fixed transport configuration".into(),
         ));
     };
     if object.len() != 3
         || object.get("base_url").and_then(Value::as_str) != Some(BASE_URL)
         || object.get("network_scope").and_then(Value::as_str) != Some("public")
-        || !object
-            .get("output_token_limits")
-            .is_some_and(Value::is_object)
+        || reservation_bounds(config).is_none()
     {
         return Err(AppError::BadRequest(
-            "CPA Codex OAuth account has invalid fixed transport configuration".into(),
+            "OpenAI Codex account has invalid fixed transport configuration".into(),
         ));
     }
     Ok(())
 }
 
-fn trusted_output_token_ceiling(config: &Value, upstream_model: &str) -> Result<i64, AppError> {
-    let limits = config
-        .get("output_token_limits")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            AppError::BadRequest(
-                "Codex OAuth account requires trusted output-token model metadata".into(),
-            )
-        })?;
-    for (model, limit) in limits {
+fn trusted_reservation_token_bound(config: &Value, upstream_model: &str) -> Result<i64, AppError> {
+    let bounds = reservation_bounds(config).ok_or_else(|| {
+        AppError::BadRequest("OpenAI Codex account requires trusted reservation metadata".into())
+    })?;
+    for (model, bound) in bounds {
         if model.is_empty()
             || model.len() > 500
             || model.chars().any(char::is_control)
-            || !limit
+            || !bound
                 .as_i64()
                 .is_some_and(|value| (1..=MAX_REPORTED_TOKENS).contains(&value))
         {
             return Err(AppError::BadRequest(
-                "Codex OAuth output-token model metadata is invalid".into(),
+                "OpenAI Codex reservation metadata is invalid".into(),
             ));
         }
     }
-    limits
+    bounds
         .get(upstream_model)
         .and_then(Value::as_i64)
         .ok_or_else(|| {
             AppError::BadRequest(
-                "Codex OAuth route has no trusted output-token limit for its upstream model".into(),
+                "OpenAI Codex route has no trusted reservation bound for its upstream model".into(),
             )
         })
+}
+
+/// Existing imported Codex rows used the old field name. Treat it as the same
+/// conservative reservation bound internally, but never advertise or create
+/// new accounts with that legacy spelling.
+fn reservation_bounds(config: &Value) -> Option<&Map<String, Value>> {
+    let current = config
+        .get("reservation_token_bounds")
+        .and_then(Value::as_object);
+    let legacy = config.get("output_token_limits").and_then(Value::as_object);
+    match (current, legacy) {
+        (Some(bounds), None) | (None, Some(bounds)) => Some(bounds),
+        _ => None,
+    }
 }
 
 fn validate_service_tier(value: Option<&Value>) -> Result<(), AppError> {
@@ -301,7 +314,7 @@ pub(super) fn validate_credential_contract(
             if header == "authorization" && prefix == "Bearer "
     ) {
         return Err(AppError::BadRequest(
-            "CPA Codex OAuth credential has an invalid authorization contract".into(),
+            "OpenAI Codex credential has an invalid authorization contract".into(),
         ));
     }
     let _ = account_header_value(credential)?;
@@ -724,7 +737,7 @@ mod tests {
         json!({
             "base_url": BASE_URL,
             "network_scope": "public",
-            "output_token_limits": {model: limit}
+            "reservation_token_bounds": {model: limit}
         })
     }
 
@@ -787,12 +800,20 @@ mod tests {
             config("other", 10),
             config("gpt-codex", 0),
             config("gpt-codex", MAX_REPORTED_TOKENS + 1),
-            json!({"base_url": BASE_URL, "output_token_limits": {"gpt-codex": "10"}}),
+            json!({"base_url": BASE_URL, "reservation_token_bounds": {"gpt-codex": "10"}}),
         ];
         for config in cases {
             let mut request = json!({"model": "public", "input": []});
             assert!(prepare_request(&mut request, "gpt-codex", &config).is_err());
         }
+
+        let legacy = json!({
+            "base_url": BASE_URL,
+            "network_scope": "public",
+            "output_token_limits": {"gpt-codex": 10}
+        });
+        let mut request = json!({"model": "public", "input": []});
+        assert!(prepare_request(&mut request, "gpt-codex", &legacy).is_ok());
 
         for tier in ["flex", "scale", "batch"] {
             let mut request = json!({"model": "public", "input": [], "service_tier": tier});

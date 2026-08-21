@@ -10,7 +10,6 @@ fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> St
                 format!("{base}/v1/models")
             }
         }
-        "cpa-subscription-bridge" => format!("{base}/healthz"),
         "comfyui" => {
             let prefix = config
                 .get("api_prefix")
@@ -44,6 +43,14 @@ pub(in crate::api) async fn probe_upstream_health(
         .db
         .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
+    if account.driver == "cpa-subscription-bridge" {
+        return Ok(Json(json!({
+            "account_id": account_id,
+            "status": "unhealthy",
+            "error_code": "legacy_provider_retired",
+            "checked_at": unix_millis()
+        })));
+    }
     if credential.validate(unix_millis()).is_err() {
         return Ok(Json(json!({
             "account_id": account_id,

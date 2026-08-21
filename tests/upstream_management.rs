@@ -226,7 +226,7 @@ async fn interactive_reauthorization_preserves_stable_identity_routes_and_replay
 }
 
 #[tokio::test]
-async fn subscription_reauthorization_retains_an_omitted_encrypted_bridge_secret() {
+async fn retired_subscription_accounts_remain_readable_but_cannot_be_reactivated() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
@@ -263,29 +263,30 @@ async fn subscription_reauthorization_retains_an_omitted_encrypted_bridge_secret
         )
         .await
         .unwrap();
-    assert!(account.can_reauthorize);
-    let updated = state
-        .db
-        .reauthorize_upstream_account(
-            account.id,
-            ReauthorizeUpstreamAccountInput {
-                tenant_external_id: "subscription-tenant".into(),
-                expected_updated_at: account.updated_at,
-                driver: "cpa-subscription-bridge".into(),
-                oauth_session_id: Uuid::now_v7(),
-                oauth_driver: "subscription_bridge".into(),
-                oauth_refresh_url: None,
-                credential: UpstreamCredential::SubscriptionBridge {
-                    handle: "newhandle".into(),
-                    secret: None,
+    assert!(!account.can_reauthorize);
+    assert!(!account.can_rotate);
+    assert!(matches!(
+        state
+            .db
+            .reauthorize_upstream_account(
+                account.id,
+                ReauthorizeUpstreamAccountInput {
+                    tenant_external_id: "subscription-tenant".into(),
+                    expected_updated_at: account.updated_at,
+                    driver: "cpa-subscription-bridge".into(),
+                    oauth_session_id: Uuid::now_v7(),
+                    oauth_driver: "subscription_bridge".into(),
+                    oauth_refresh_url: None,
+                    credential: UpstreamCredential::SubscriptionBridge {
+                        handle: "newhandle".into(),
+                        secret: None,
+                    },
                 },
-            },
-            pepper,
-        )
-        .await
-        .unwrap();
-    assert_eq!(updated.id, account.id);
-    assert_eq!(updated.credential_generation, 2);
+                pepper,
+            )
+            .await,
+        Err(memeloop_token_center::error::AppError::BadRequest(_))
+    ));
     let (_, credential) = state
         .db
         .upstream_account_with_credential(account.id, pepper)
@@ -293,11 +294,46 @@ async fn subscription_reauthorization_retains_an_omitted_encrypted_bridge_secret
         .unwrap();
     match credential {
         UpstreamCredential::SubscriptionBridge { handle, secret } => {
-            assert_eq!(handle, "newhandle");
+            assert_eq!(handle, "oldhandle");
             assert_eq!(secret.as_deref(), Some("encrypted-bridge-secret"));
         }
         _ => panic!("expected subscription bridge credential"),
     }
+    let disabled = state
+        .db
+        .set_upstream_account_status(
+            account.id,
+            "subscription-tenant",
+            "disabled",
+            account.updated_at,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        state
+            .db
+            .set_upstream_account_status(
+                account.id,
+                "subscription-tenant",
+                "active",
+                disabled.updated_at,
+            )
+            .await,
+        Err(memeloop_token_center::error::AppError::BadRequest(_))
+    ));
+    assert!(state.db.upstream_oauth_lifecycle(account.id).await.is_err());
+    assert!(
+        state
+            .db
+            .rotate_upstream_credential(
+                account.id,
+                UpstreamCredential::None,
+                "retired-account-rotation",
+                pepper,
+            )
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

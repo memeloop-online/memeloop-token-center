@@ -26,7 +26,7 @@
 - Anthropic：`/v1/messages`、`/v1/messages/count_tokens`。
 - 多模态生成：`/v1/generations`、`/v1/videos/generations`、`/v1/images/generations`；内置火山引擎 Seedance 视频任务、ComfyUI 本地/Cloud 工作流、OpenAI Images API，以及把 Codex Responses `image_generation` 工具映射为标准 Images API 的路由模式，统一执行模型权限、额度预留、限流、计费和 S3/CAS 归档。
 - Service：创建/轮换凭据、更新模型/限流/预算 policy、设置同币种模型价格、幂等发放余额及撤销完整未消费的 grant；可创建 tenant 绑定、scope 最小化的服务凭据供 memeloop web 使用。服务凭据也有稳定 UUID 与 generation，轮换后旧 token 立即失效。
-- 上游提供商：在同一资源模型和管理界面中创建稳定上游账号；API 凭据、OAuth、订阅桥与无需认证的私有 ComfyUI 只是不同接入方式。统一列表提供接入方式、凭据到期时间和路由数；支持配置编辑、启停、无正文健康检查、审计安全删除、幂等 credential/OAuth 刷新、模型路由、Copilot/Cursor subscription bridge、Cursor PKCE 和插件贡献的 OAuth Adapter。
+- 上游提供商：在同一资源模型和管理界面中创建稳定上游账号；API 凭据、原生 OAuth 与无需认证的私有 ComfyUI 只是不同接入方式。统一列表提供接入方式、凭据到期时间和路由数；支持配置编辑、启停、无正文健康检查、审计安全删除、幂等凭据/OAuth 刷新、模型路由、OpenAI Codex 设备授权、Cursor PKCE 和插件贡献的 OAuth Adapter。
 - Self-service：key 信息、请求列表/详情、聚合统计、逻辑会话簇/关系边。
 - Operator：`/internal/v1/request-events` 以追加式 started/finished 事件提供 SSE 尾流，跨副本从 PostgreSQL 游标续读；请求列表支持时间、keyset 游标、凭据、模型、协议、状态、错误、上游、路由、耗时、费用、别名和主体筛选；统计复用这些维度，默认最近 30 天且最大 93 天。`/internal/v1/requests/{request_id}` 按需加载文本或生成任务归档正文。全部接口同时执行 service scope 与 tenant 边界检查。
 
@@ -40,7 +40,7 @@
 export MTC_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/memeloop_token_center
 export MTC_KEY_PEPPER=replace-with-at-least-32-random-bytes
 export MTC_SERVICE_TOKEN="$(openssl rand -hex 32)"
-# Optional: enables the signed MemeLoop Cloud registration/subscription bridge.
+# Optional: enables signed MemeLoop Cloud entitlement webhooks.
 export MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET="$(openssl rand -hex 32)"
 export MTC_ARCHIVE_BACKEND=s3
 export MTC_S3_BUCKET=memeloop-token-center
@@ -61,7 +61,7 @@ cargo test
 cargo test --test cucumber
 ```
 
-Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游。当前完整运行通过 5 个 feature、64 个场景、360 个步骤，包括稳定凭据轮换、CPA 原凭据兼容、权限/额度/限流、空模型 allowlist、鉴权先于正文解析、跨租户授权矩阵、Cloud 订阅 entitlement、OpenAI/Anthropic/兼容客户端、API/OAuth 同管线、Cursor PKCE、Copilot/Cursor subscription bridge、CPA 账号安全导入、逻辑会话，以及 Seedance、ComfyUI、OpenAI Images、Codex Responses 生图的转发、归档和计费。浏览器 dogfood 使用 TypeScript Cucumber.js，Playwright 仅作为步骤中的浏览器驱动；最近一次完整运行通过 11/11 场景和 87/87 步骤。`MTC_TEST_POSTGRES_URL` 会额外启用真实 PostgreSQL 数据库集成测试；当前工作树已在 fresh PostgreSQL 16 和 17 上从 v1 迁移到 v42，并复跑预算/结算、归档 staging、生成、managed OAuth、proxy exactly-once、110k 会话分页、历史凭据、session archive、隔离区与用量聚合门禁。生产规模迁移锁时和 live 部署仍必须单独验收。CPAMP 首次、重复、迟到重叠和新水位导入另由隔离 PostgreSQL acceptance 验证，不能等同于 live 数据迁移。
+Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，覆盖稳定凭据轮换、权限/额度/限流、空模型 allowlist、鉴权先于正文解析、跨租户授权矩阵、Cloud entitlement、OpenAI/Anthropic/兼容客户端、API/OAuth 同管线、原生 Codex 设备授权、Cursor PKCE、逻辑会话，以及 Seedance、ComfyUI、OpenAI Images、Codex Responses 生图的转发、归档和计费。浏览器 dogfood 使用 TypeScript Cucumber.js，Playwright 仅作为步骤中的浏览器驱动。`MTC_TEST_POSTGRES_URL` 会额外启用真实 PostgreSQL 数据库集成测试；生产规模迁移锁时和 live 部署仍必须单独验收。历史 CPA/CPAMP 数据导入由隔离的迁移 acceptance 验证，不能等同于 live 数据迁移。
 
 memeloop web 的服务端应以稳定用户、订阅和计费周期身份调用 `PUT /internal/v1/entitlements`，用单调 `version` 对账该周期应有的信用额度；取消使用 `/internal/v1/entitlements/cancel`，只有订阅身份确实更换时才使用 `/internal/v1/entitlements/replace`。每个注册或 webhook 事件必须使用可持久恢复的确定性 `Idempotency-Key`。旧的 account grant/reversal API 只适合一次性人工调整，不应用来表达会员订阅生命周期；服务凭据只能保存在 memeloop web 后端，不能下发到浏览器。
 

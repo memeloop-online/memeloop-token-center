@@ -21,7 +21,7 @@ const UPSTREAM_OAUTH_REFRESH_LEASE_MILLIS: i64 = 2 * 60 * 1_000;
 
 pub(super) fn upstream_connection_method(driver: &str, auth_kind: &str) -> String {
     if driver == "cpa-subscription-bridge" {
-        "subscription_bridge".to_owned()
+        "legacy".to_owned()
     } else {
         auth_kind.to_owned()
     }
@@ -35,6 +35,9 @@ pub(super) fn upstream_can_reauthorize(
 ) -> bool {
     auth_kind == "oauth"
         && oauth_session_id.is_some()
-        && (driver == "cpa-subscription-bridge"
-            || matches!(oauth_driver, Some("cursor" | "provider_adapter")))
+        && driver != "cpa-subscription-bridge"
+        && matches!(
+            oauth_driver,
+            Some("cursor" | "provider_adapter" | "openai_codex_device")
+        )
 }

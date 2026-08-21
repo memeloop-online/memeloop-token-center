@@ -332,16 +332,3 @@ Feature: Stable key identity and read-only self-service statistics
     And the client creates a Codex-backed OpenAI-compatible image
     Then the response status is 502
     And the invalid Codex image payload is sanitized and never archived
-
-  Scenario: Copilot subscription OAuth uses an opaque bridge handle
-    Given a token center backed by SQLite and memory object storage
-    And the mock CPA subscription bridge completes Copilot OAuth and inference
-    When the service creates a Copilot bridge account route and key
-    And the client calls model "copilot-public"
-    Then the response status is 200
-    And the Copilot response is unwrapped without exposing the bridge handle
-
-  Scenario: CPA subscription account import is idempotent and fail-closed
-    Given a token center backed by SQLite and memory object storage
-    When the service imports CPA Copilot and unsupported Codex auth documents twice
-    Then one opaque CPA account is imported and unsupported OAuth is skipped without echoing secrets

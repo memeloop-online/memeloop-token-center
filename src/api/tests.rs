@@ -868,6 +868,86 @@ async fn gateway_and_control_have_disjoint_route_surfaces() {
 }
 
 #[tokio::test]
+async fn retired_bridge_is_absent_and_native_codex_rejects_raw_credentials() {
+    let (state, _directory) = test_state().await;
+    let control = router_for_role(state, RuntimeRole::Control);
+    let providers = control
+        .clone()
+        .oneshot(
+            Request::get("/internal/v1/provider-types")
+                .header(header::AUTHORIZATION, "Bearer test-service-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(providers.status(), StatusCode::OK);
+    let providers: Value = serde_json::from_slice(
+        &axum::body::to_bytes(providers.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let ids = providers
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|provider| provider.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&"openai-codex"));
+    assert!(!ids.iter().any(|driver| driver.starts_with("cpa-")));
+
+    let direct = control
+        .clone()
+        .oneshot(
+            Request::post("/internal/v1/upstreams")
+                .header(header::AUTHORIZATION, "Bearer test-service-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "name":"raw-codex",
+                        "driver":"openai-codex",
+                        "config":{
+                            "base_url":"https://chatgpt.com/backend-api/codex",
+                            "network_scope":"public",
+                            "reservation_token_bounds":{}
+                        },
+                        "credential":{
+                            "type":"oauth",
+                            "access_token":"must-not-install",
+                            "refresh_token":"must-not-install",
+                            "expires_at":4102444800000,
+                            "adapter_state":{"schema":"openai-codex-oauth-v1","account_id":"account-test"}
+                        }
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct.status(), StatusCode::BAD_REQUEST);
+
+    for retired_path in [
+        "/internal/v1/oauth/subscription-bridge/start",
+        "/internal/v1/oauth/subscription-bridge/poll",
+        "/internal/v1/imports/cpa/subscription-accounts",
+    ] {
+        let response = control
+            .clone()
+            .oneshot(
+                Request::post(retired_path)
+                    .header(header::AUTHORIZATION, "Bearer test-service-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
 async fn authentication_rejects_requests_before_json_body_parsing() {
     let (state, _directory) = test_state().await;
     let control = router_for_role(state.clone(), RuntimeRole::Control)
@@ -1064,44 +1144,6 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
             .await
             .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[test]
-fn cpa_import_accepts_only_active_opaque_subscription_handles() {
-    let imported = cpa_subscription_account(&json!({
-        "type": "subscription-bridge",
-        "upstream": "copilot",
-        "handle": "opaqueHandle123",
-        "label": "GitHub Copilot",
-        "login": "redacted@example.test"
-    }))
-    .unwrap()
-    .expect("supported CPA subscription account");
-    assert_eq!(imported.0, "copilot");
-    assert_eq!(imported.1, "opaqueHandle123");
-    assert_eq!(imported.2.as_deref(), Some("GitHub Copilot"));
-
-    assert!(
-        cpa_subscription_account(&json!({
-            "type": "codex",
-            "access_token": "must-not-be-returned",
-            "refresh_token": "must-not-be-returned"
-        }))
-        .unwrap()
-        .is_none()
-    );
-    assert!(
-        cpa_subscription_account(&json!({
-            "upstream": "cursor",
-            "handle": "opaqueHandle123",
-            "disabled": true
-        }))
-        .unwrap()
-        .is_none()
-    );
-    assert!(cpa_subscription_account(&json!({"upstream": "cursor"})).is_err());
-    assert!(validate_cpa_auth_filename("../credential.json").is_err());
-    assert!(validate_cpa_auth_filename("cursor-account.json").is_ok());
 }
 
 #[test]

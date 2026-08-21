@@ -15,6 +15,8 @@ use crate::{
 pub const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const NATIVE_ADAPTER_SCHEMA: &str = "openai-codex-oauth-v1";
+const LEGACY_ADAPTER_SCHEMA: &str = "cpa-codex-oauth-v1";
 const RESPONSE_LIMIT: usize = 1024 * 1024;
 const MAX_EXPIRES_IN_SECONDS: i64 = 365 * 24 * 60 * 60;
 #[cfg(not(test))]
@@ -71,7 +73,7 @@ pub fn normalize(payload: &Value) -> Result<ManagedOAuthNormalizedAccount, AppEr
             // Empty is intentionally not a guessed default. An operator or a
             // reviewed model-metadata sync must populate the exact upstream
             // model limits before this account can carry traffic.
-            "output_token_limits": {},
+            "reservation_token_bounds": {},
         }),
         enabled: !document.disabled,
         credential: UpstreamCredential::OAuth {
@@ -109,11 +111,11 @@ async fn refresh_at(
     } = credential
     else {
         return Err(AppError::BadRequest(
-            "CPA Codex OAuth credential has no refresh token".into(),
+            "OpenAI Codex OAuth credential has no refresh token".into(),
         ));
     };
-    super::required_secret(refresh_token, "CPA Codex")
-        .map_err(|_| AppError::BadRequest("CPA Codex OAuth credential is invalid".into()))?;
+    super::required_secret(refresh_token, "OpenAI Codex")
+        .map_err(|_| AppError::BadRequest("OpenAI Codex OAuth credential is invalid".into()))?;
     validate_adapter_state(adapter_state.as_ref())?;
 
     let client =
@@ -148,11 +150,11 @@ async fn refresh_at(
         .await
         .map_err(|_| refresh_failed())??;
     let response: TokenResponse = serde_json::from_slice(&body).map_err(|_| refresh_failed())?;
-    super::bearer_token(&response.access_token, "CPA Codex").map_err(|_| refresh_failed())?;
+    super::bearer_token(&response.access_token, "OpenAI Codex").map_err(|_| refresh_failed())?;
     if response.refresh_token.as_deref().is_some_and(str::is_empty) {
         return Err(refresh_failed());
     }
-    super::optional_secret(response.refresh_token.as_deref(), "CPA Codex")
+    super::optional_secret(response.refresh_token.as_deref(), "OpenAI Codex")
         .map_err(|_| refresh_failed())?;
     if !(1..=MAX_EXPIRES_IN_SECONDS).contains(&response.expires_in) {
         return Err(refresh_failed());
@@ -181,33 +183,36 @@ async fn refresh_at(
 fn validate_adapter_state(state: Option<&Value>) -> Result<(), AppError> {
     let Some(state) = state else {
         return Err(AppError::BadRequest(
-            "CPA Codex OAuth credential has invalid adapter state".into(),
+            "OpenAI Codex OAuth credential has invalid adapter state".into(),
         ));
     };
     let Some(object) = state.as_object() else {
         return Err(AppError::BadRequest(
-            "CPA Codex OAuth credential has invalid adapter state".into(),
+            "OpenAI Codex OAuth credential has invalid adapter state".into(),
         ));
     };
     if object.len() != 2
-        || object.get("schema").and_then(Value::as_str) != Some("cpa-codex-oauth-v1")
+        || !matches!(
+            object.get("schema").and_then(Value::as_str),
+            Some(NATIVE_ADAPTER_SCHEMA | LEGACY_ADAPTER_SCHEMA)
+        )
     {
         return Err(AppError::BadRequest(
-            "CPA Codex OAuth credential has invalid adapter state".into(),
+            "OpenAI Codex OAuth credential has invalid adapter state".into(),
         ));
     }
     let account_id = object
         .get("account_id")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            AppError::BadRequest("CPA Codex OAuth credential has invalid adapter state".into())
+            AppError::BadRequest("OpenAI Codex OAuth credential has invalid adapter state".into())
         })?;
-    super::account_id(account_id, "CPA Codex").map_err(|_| {
-        AppError::BadRequest("CPA Codex OAuth credential has invalid adapter state".into())
+    super::account_id(account_id, "OpenAI Codex").map_err(|_| {
+        AppError::BadRequest("OpenAI Codex OAuth credential has invalid adapter state".into())
     })
 }
 
-/// Return the CPA account identity used by the audited Codex wire protocol.
+/// Return the OpenAI account identity used by the audited Codex wire protocol.
 /// This accessor is crate-private so decrypted adapter state cannot escape
 /// through provider views, logs, or public response types.
 pub(crate) fn account_header_value(
@@ -232,7 +237,7 @@ pub(crate) fn account_header_value(
 }
 
 fn invalid_adapter_state() -> AppError {
-    AppError::BadRequest("CPA Codex OAuth credential has invalid adapter state".into())
+    AppError::BadRequest("OpenAI Codex OAuth credential has invalid adapter state".into())
 }
 
 async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
@@ -259,7 +264,7 @@ fn invalid_document() -> AppError {
 }
 
 fn refresh_failed() -> AppError {
-    AppError::Upstream("CPA Codex OAuth refresh failed".into())
+    AppError::Upstream("OpenAI Codex OAuth refresh failed".into())
 }
 
 #[cfg(test)]
@@ -286,6 +291,10 @@ mod tests {
     }
 
     fn credential(refresh_token: &str) -> UpstreamCredential {
+        credential_with_schema(refresh_token, LEGACY_ADAPTER_SCHEMA)
+    }
+
+    fn credential_with_schema(refresh_token: &str, schema: &str) -> UpstreamCredential {
         UpstreamCredential::OAuth {
             access_token: "old-access-secret".to_owned(),
             refresh_token: Some(refresh_token.to_owned()),
@@ -293,7 +302,7 @@ mod tests {
             header: "authorization".to_owned(),
             prefix: "Bearer ".to_owned(),
             adapter_state: Some(json!({
-                "schema": "cpa-codex-oauth-v1",
+                "schema": schema,
                 "account_id": "account-123"
             })),
         }
@@ -305,7 +314,7 @@ mod tests {
         assert!(normalized.enabled);
         assert_eq!(normalized.account_name, "codex@example.test");
         assert_eq!(normalized.config["base_url"], BASE_URL);
-        assert_eq!(normalized.config["output_token_limits"], json!({}));
+        assert_eq!(normalized.config["reservation_token_bounds"], json!({}));
         let serialized = serde_json::to_value(&normalized.credential).unwrap();
         assert_eq!(serialized["expires_at"], 4_070_908_800_000_i64);
         assert_eq!(serialized["header"], "authorization");
@@ -345,6 +354,14 @@ mod tests {
     fn account_header_is_strict_and_never_falls_back_to_local_identity() {
         let valid = credential("refresh-secret");
         assert_eq!(account_header_value(&valid).unwrap(), "account-123");
+        assert_eq!(
+            account_header_value(&credential_with_schema(
+                "refresh-secret",
+                NATIVE_ADAPTER_SCHEMA
+            ))
+            .unwrap(),
+            "account-123"
+        );
 
         let rejected = [
             json!({"schema": "cpa-codex-oauth-v1", "account_id": "account 123"}),
@@ -364,7 +381,7 @@ mod tests {
             let error = account_header_value(&candidate).unwrap_err();
             assert_eq!(
                 error.to_string(),
-                "invalid request: CPA Codex OAuth credential has invalid adapter state"
+                "invalid request: OpenAI Codex OAuth credential has invalid adapter state"
             );
         }
     }
@@ -443,7 +460,7 @@ mod tests {
         let before = crate::db::unix_millis();
         let refreshed = refresh_at(
             &crate::build_http_client().unwrap(),
-            &credential("old-refresh-secret"),
+            &credential_with_schema("old-refresh-secret", NATIVE_ADAPTER_SCHEMA),
             true,
             &format!("{}/token", server.uri()),
         )
@@ -455,6 +472,7 @@ mod tests {
         assert_eq!(rendered["header"], "authorization");
         assert_eq!(rendered["prefix"], "Bearer ");
         assert_eq!(rendered["adapter_state"]["account_id"], "account-123");
+        assert_eq!(rendered["adapter_state"]["schema"], NATIVE_ADAPTER_SCHEMA);
         assert!(rendered["expires_at"].as_i64().unwrap() >= before + 3_600_000);
 
         let requests = server.received_requests().await.unwrap();
@@ -527,7 +545,7 @@ mod tests {
             let rendered = format!("{error:?} {error}");
             assert_eq!(
                 error.to_string(),
-                "configured upstream is unavailable: CPA Codex OAuth refresh failed"
+                "configured upstream is unavailable: OpenAI Codex OAuth refresh failed"
             );
             for secret in [
                 "response-body-secret",

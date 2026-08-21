@@ -39,7 +39,7 @@ fn optional_secret(value: Option<&str>, kind: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn account_id(value: &str, kind: &str) -> Result<(), AppError> {
+pub(super) fn account_id(value: &str, kind: &str) -> Result<(), AppError> {
     controlled_text(value, MAX_ACCOUNT_ID_BYTES, false, kind)
 }
 
@@ -47,7 +47,11 @@ fn project_id(value: &str, kind: &str) -> Result<(), AppError> {
     controlled_text(value, MAX_PROJECT_ID_BYTES, false, kind)
 }
 
-fn account_name(value: Option<&str>, fallback: &str, kind: &str) -> Result<String, AppError> {
+pub(super) fn account_name(
+    value: Option<&str>,
+    fallback: &str,
+    kind: &str,
+) -> Result<String, AppError> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return Ok(fallback.to_owned());
     };
