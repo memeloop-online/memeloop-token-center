@@ -223,7 +223,7 @@ async fn active_request_in_session(
 async fn rotation_contract(world: &TokenCenterWorld) {
     let tenant = unique("logical-session-rotation");
     let (issued, key) = issue_key(world, &tenant, "rotation-owner", "Rotation owner", "USD").await;
-    let (_, other) = issue_key(world, &tenant, "other-owner", "Other owner", "USD").await;
+    let (other_issued, _) = issue_key(world, &tenant, "other-owner", "Other owner", "USD").await;
     let session_id =
         completed_session(world, &key, "rotation-session", "rotation-model", 200, 125).await;
     let response = world
@@ -258,7 +258,7 @@ async fn rotation_contract(world: &TokenCenterWorld) {
     let (status, _) = get_json(
         world,
         &format!("/self/v1/sessions/{session_id}"),
-        &other.key,
+        &other_issued.key,
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);

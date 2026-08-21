@@ -17,9 +17,11 @@ pub use cursor::{
     DEFAULT_CURSOR_REFRESH_URL, OAuthLoginStart, OAuthReauthorizationTarget, ReadyCursorLogin,
     StartCursorLogin, poll_cursor_login, refresh_cursor_credential, start_cursor_login,
 };
+#[cfg(test)]
+pub(crate) use endpoint::validate_oauth_endpoint;
 pub(crate) use endpoint::{
     oauth_adapter_endpoint_scope, validate_managed_oauth_adapter_endpoint,
-    validate_oauth_adapter_endpoint, validate_oauth_endpoint,
+    validate_oauth_adapter_endpoint,
 };
 
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -48,8 +50,8 @@ use crate::{
     db::Database,
     network::OutboundScope,
     provider::{
-        ManagedOAuthAdapterBackend, ProviderCatalog, ResolvedManagedOAuthAdapter,
-        UpstreamCredential,
+        MANAGED_OAUTH_ADAPTER_API_VERSION, ManagedOAuthAdapterBackend, ProviderCatalog,
+        ResolvedManagedOAuthAdapter, UpstreamCredential,
     },
 };
 #[cfg(test)]

@@ -138,8 +138,6 @@ pub enum CursorPollResult {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub async fn start_cursor_login(
     db: &Database,
     input: StartCursorLogin,

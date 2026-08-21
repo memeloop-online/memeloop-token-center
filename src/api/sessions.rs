@@ -119,7 +119,7 @@ pub(super) async fn internal_sessions(
     Query(query): Query<RecentSessionsQuery>,
 ) -> Result<Json<LogicalSessionListResponse>, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
-    let tenant = management_tenant(&service, query.tenant_external_id)?
+    let tenant = management_tenant(&service, query.tenant_external_id.clone())?
         .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
     let filter = query.list_filter()?;
     Ok(Json(session_list_response(

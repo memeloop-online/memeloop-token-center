@@ -1,5 +1,5 @@
 use super::super::*;
-use super::aggregate_terminal_generation_job;
+use super::aggregation::aggregate_terminal_generation_job;
 use crate::archive_staging::{
     ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease, locator_matches_prefix,
 };

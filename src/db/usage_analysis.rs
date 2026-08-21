@@ -11,7 +11,8 @@ use sqlx::{Row, any::AnyRow};
 use uuid::Uuid;
 
 use super::{
-    AppError, Database, DatabaseBackend, MAX_STATS_RANGE_MILLIS, search_prefix, unix_millis,
+    AppError, Database, DatabaseBackend, MAX_STATS_RANGE_MILLIS, parse_uuid, search_prefix,
+    unix_millis,
 };
 use crate::model::{
     UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisGenerationUnitsByBillingUnit,

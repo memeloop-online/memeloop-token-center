@@ -14,6 +14,11 @@ use crate::{
     model::{AuthenticatedKey, AuthenticatedService},
 };
 
+use super::limits::{
+    CLOUD_WEBHOOK_BODY_PERMITS, CLOUD_WEBHOOK_BODY_READ_DEADLINE, IMAGE_RESPONSE_PERMITS,
+    MAX_CLOUD_WEBHOOK_BODY,
+};
+
 const CONTROL_BODY_READ_DEADLINE: Duration = Duration::from_secs(60);
 const CONTROL_BODY_PERMIT_WAIT: Duration = Duration::from_secs(1);
 const CONTROL_BODY_READ_CONCURRENCY: usize = 4;

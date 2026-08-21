@@ -52,9 +52,10 @@ async fn assert_rotation_preserves_route(
         .await
         .expect("routing before rotation");
     let models_before = public_models(state, old_key).await;
+    let rotation_idempotency_key = format!("rotation-{key_id}");
     let rotated = state
         .db
-        .rotate_key(key_id, format!("rotation-{key_id}"), pepper)
+        .rotate_key(key_id, &rotation_idempotency_key, pepper)
         .await
         .expect("rotate credential without changing its identity");
 
