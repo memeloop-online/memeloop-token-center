@@ -110,6 +110,20 @@ struct LoginState {
     poll_interval_seconds: u64,
     expires_at: i64,
     reauthorize: Option<OAuthReauthorizationTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization: Option<GitHubAuthorization>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GitHubAuthorization {
+    github_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+    scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    github_token_expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    github_refresh_token_expires_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -334,6 +348,7 @@ async fn start_at(
         poll_interval_seconds,
         expires_at,
         reauthorize: input.reauthorize,
+        authorization: None,
     };
     let token = SessionToken {
         session_id,
@@ -460,106 +475,140 @@ async fn poll_at(
     if state.session_id != session.session_id || state.expires_at != session.expires_at {
         return Err(AppError::Forbidden);
     }
-    let device_result =
-        poll_device_token(http, &state.device_code, allow_test_loopback, endpoints).await;
-    let device = match device_result {
-        Ok(DeviceOutcome::Pending { interval }) => {
-            let next_interval = interval
-                .filter(|interval| *interval > 0)
-                .unwrap_or(state.poll_interval_seconds)
-                .max(state.poll_interval_seconds);
-            reschedule_poll(
-                db,
-                &mut state,
-                lease_owner,
-                next_interval,
-                key_material,
-                now,
-            )
-            .await?;
-            return Ok(CopilotDevicePollResult::Pending {
-                retry_after_seconds: next_interval,
-            });
-        }
-        Ok(DeviceOutcome::SlowDown { interval }) => {
-            let increased = state
-                .poll_interval_seconds
-                .checked_add(SLOW_DOWN_SECONDS)
-                .ok_or_else(upstream_error)?;
-            let next_interval = interval
-                .filter(|interval| *interval > 0)
-                .unwrap_or(0)
-                .max(increased);
-            reschedule_poll(
-                db,
-                &mut state,
-                lease_owner,
-                next_interval,
-                key_material,
-                now,
-            )
-            .await?;
-            return Ok(CopilotDevicePollResult::Pending {
-                retry_after_seconds: next_interval,
-            });
-        }
-        Ok(DeviceOutcome::Denied) => {
-            db.fail_oauth_login_poll(state.session_id, lease_owner, now)
+    let authorization = if let Some(authorization) = state.authorization.clone() {
+        validate_authorization(&authorization)?;
+        authorization
+    } else {
+        let device_result =
+            poll_device_token(http, &state.device_code, allow_test_loopback, endpoints).await;
+        let device = match device_result {
+            Ok(DeviceOutcome::Pending { interval }) => {
+                let next_interval = interval
+                    .filter(|interval| *interval > 0)
+                    .unwrap_or(state.poll_interval_seconds)
+                    .max(state.poll_interval_seconds);
+                reschedule_poll(
+                    db,
+                    &mut state,
+                    lease_owner,
+                    next_interval,
+                    key_material,
+                    now,
+                )
                 .await?;
-            return Err(AppError::BadRequest(
-                "GitHub Copilot authorization was denied".into(),
-            ));
-        }
-        Ok(DeviceOutcome::Expired) => {
-            db.fail_oauth_login_poll(state.session_id, lease_owner, now)
+                return Ok(CopilotDevicePollResult::Pending {
+                    retry_after_seconds: next_interval,
+                });
+            }
+            Ok(DeviceOutcome::SlowDown { interval }) => {
+                let increased = state
+                    .poll_interval_seconds
+                    .checked_add(SLOW_DOWN_SECONDS)
+                    .ok_or_else(upstream_error)?;
+                let next_interval = interval
+                    .filter(|interval| *interval > 0)
+                    .unwrap_or(0)
+                    .max(increased);
+                reschedule_poll(
+                    db,
+                    &mut state,
+                    lease_owner,
+                    next_interval,
+                    key_material,
+                    now,
+                )
                 .await?;
-            return Err(AppError::BadRequest(
-                "GitHub Copilot authorization expired".into(),
-            ));
-        }
-        Ok(DeviceOutcome::Terminal) => {
-            db.fail_oauth_login_poll(state.session_id, lease_owner, now)
-                .await?;
-            return Err(AppError::BadRequest(
-                "GitHub Copilot authorization cannot continue".into(),
-            ));
-        }
-        Ok(DeviceOutcome::Ready(tokens)) => tokens,
+                return Ok(CopilotDevicePollResult::Pending {
+                    retry_after_seconds: next_interval,
+                });
+            }
+            Ok(DeviceOutcome::Denied) => {
+                db.fail_oauth_login_poll(state.session_id, lease_owner, now)
+                    .await?;
+                return Err(AppError::BadRequest(
+                    "GitHub Copilot authorization was denied".into(),
+                ));
+            }
+            Ok(DeviceOutcome::Expired) => {
+                db.fail_oauth_login_poll(state.session_id, lease_owner, now)
+                    .await?;
+                return Err(AppError::BadRequest(
+                    "GitHub Copilot authorization expired".into(),
+                ));
+            }
+            Ok(DeviceOutcome::Terminal) => {
+                db.fail_oauth_login_poll(state.session_id, lease_owner, now)
+                    .await?;
+                return Err(AppError::BadRequest(
+                    "GitHub Copilot authorization cannot continue".into(),
+                ));
+            }
+            Ok(DeviceOutcome::Ready(tokens)) => tokens,
+            Err(error) => {
+                let interval = state.poll_interval_seconds;
+                reschedule_poll(db, &mut state, lease_owner, interval, key_material, now).await?;
+                return Err(error);
+            }
+        };
+        let authorization = match authorization_from_device(device, now) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                db.fail_oauth_login_poll(state.session_id, lease_owner, now)
+                    .await?;
+                return Err(error);
+            }
+        };
+        state.device_code.clear();
+        state.authorization = Some(authorization);
+        reschedule_poll(db, &mut state, lease_owner, 1, key_material, now).await?;
+        return Ok(CopilotDevicePollResult::Pending {
+            retry_after_seconds: 1,
+        });
+    };
+
+    let completion = async {
+        let user = fetch_user(
+            http,
+            &authorization.github_token,
+            allow_test_loopback,
+            endpoints,
+        )
+        .await?;
+        let stable_account_id = stable_identity(user.id)?;
+        let copilot = exchange_copilot(
+            http,
+            &authorization.github_token,
+            now,
+            allow_test_loopback,
+            endpoints,
+        )
+        .await?;
+        let provider_config =
+            authoritative_provider_config(state.provider_config.clone(), &copilot.api_endpoint)?;
+        Ok::<_, AppError>((user, stable_account_id, copilot, provider_config))
+    }
+    .await;
+    let (user, stable_account_id, copilot, provider_config) = match completion {
+        Ok(completion) => completion,
         Err(error) => {
-            let interval = state.poll_interval_seconds;
+            let interval = state.poll_interval_seconds.max(1);
             reschedule_poll(db, &mut state, lease_owner, interval, key_material, now).await?;
             return Err(error);
         }
     };
-    let github_token = device.access_token.as_deref().ok_or_else(upstream_error)?;
-    validate_secret(github_token)?;
-    if device
-        .token_type
-        .as_deref()
-        .is_some_and(|kind| !kind.eq_ignore_ascii_case("bearer"))
-    {
-        return Err(upstream_error());
-    }
-    let user = fetch_user(http, github_token, allow_test_loopback, endpoints).await?;
-    let stable_account_id = stable_identity(user.id)?;
-    let copilot = exchange_copilot(http, github_token, now, allow_test_loopback, endpoints).await?;
-    let scope = normalized_scope(device.scope.as_deref().unwrap_or(REQUESTED_SCOPE))?;
-    let refresh_token = validated_optional_secret(device.refresh_token)?;
     let adapter_state = AdapterState {
         schema: "github-copilot-oauth-v1".into(),
-        github_token: github_token.to_owned(),
+        github_token: authorization.github_token,
         github_host: GITHUB_HOST.into(),
         github_user_id: user.id.to_string(),
         stable_account_id: stable_account_id.clone(),
         login: user.login.clone(),
-        scope: scope.clone(),
-        github_token_expires_at: optional_expiry(now, device.expires_in)?,
-        github_refresh_token_expires_at: optional_expiry(now, device.refresh_token_expires_in)?,
+        scope: authorization.scope.clone(),
+        github_token_expires_at: authorization.github_token_expires_at,
+        github_refresh_token_expires_at: authorization.github_refresh_token_expires_at,
         refresh_in: copilot.refresh_in,
         copilot_api_endpoint: copilot.api_endpoint.clone(),
     };
-    let provider_config =
-        authoritative_provider_config(state.provider_config, &copilot.api_endpoint)?;
     let ready = ReadyCopilotDeviceLogin {
         session_id: state.session_id,
         tenant_external_id: state.tenant_external_id,
@@ -567,7 +616,7 @@ async fn poll_at(
         provider_config,
         credential: UpstreamCredential::OAuth {
             access_token: copilot.access_token,
-            refresh_token,
+            refresh_token: authorization.refresh_token,
             expires_at: Some(copilot.expires_at),
             header: "authorization".into(),
             prefix: "Bearer ".into(),
@@ -577,7 +626,7 @@ async fn poll_at(
         },
         stable_account_id,
         login: user.login,
-        scope,
+        scope: authorization.scope,
         api_endpoint: copilot.api_endpoint,
         reauthorize: state.reauthorize,
     };
@@ -614,6 +663,41 @@ async fn poll_at(
         }),
         OAuthLoginClaim::Claimed { .. } => Err(AppError::Internal),
     }
+}
+
+fn authorization_from_device(
+    mut device: DeviceTokenResponse,
+    now: i64,
+) -> Result<GitHubAuthorization, AppError> {
+    if device
+        .token_type
+        .as_deref()
+        .is_some_and(|kind| !kind.eq_ignore_ascii_case("bearer"))
+    {
+        return Err(upstream_error());
+    }
+    let github_token = device.access_token.take().ok_or_else(upstream_error)?;
+    validate_secret(&github_token)?;
+    let authorization = GitHubAuthorization {
+        github_token,
+        refresh_token: validated_optional_secret(device.refresh_token)?,
+        scope: normalized_scope(device.scope.as_deref().unwrap_or(REQUESTED_SCOPE))?,
+        github_token_expires_at: optional_expiry(now, device.expires_in)?,
+        github_refresh_token_expires_at: optional_expiry(now, device.refresh_token_expires_in)?,
+    };
+    validate_authorization(&authorization)?;
+    Ok(authorization)
+}
+
+fn validate_authorization(authorization: &GitHubAuthorization) -> Result<(), AppError> {
+    validate_secret(&authorization.github_token)?;
+    if let Some(refresh_token) = &authorization.refresh_token {
+        validate_secret(refresh_token)?;
+    }
+    if normalized_scope(&authorization.scope)? != authorization.scope {
+        return Err(upstream_error());
+    }
+    Ok(())
 }
 
 async fn reschedule_poll(
@@ -1524,6 +1608,37 @@ mod tests {
         )
         .await
         .unwrap();
+        let checkpointed = poll_at(
+            &database,
+            &reqwest::Client::new(),
+            &started.session_token,
+            PollRuntime {
+                key_material: KEY,
+                now: NOW + 1_000,
+                scope: CopilotDevicePollScope {
+                    required_tenant: Some("tenant-a"),
+                    operator_service_id: None,
+                },
+                allow_test_loopback: true,
+                endpoints: &Endpoints::test(&server.uri()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            checkpointed,
+            CopilotDevicePollResult::Pending {
+                retry_after_seconds: 1
+            }
+        ));
+        let user_requests = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/user")
+            .count();
+        assert_eq!(user_requests, 0);
         drop(database);
         let restarted = Database::connect(&url).await.unwrap();
         let result = poll_at(
@@ -1532,7 +1647,7 @@ mod tests {
             &started.session_token,
             PollRuntime {
                 key_material: KEY,
-                now: NOW + 1_000,
+                now: NOW + 2_000,
                 scope: CopilotDevicePollScope {
                     required_tenant: Some("tenant-a"),
                     operator_service_id: None,
@@ -1581,7 +1696,7 @@ mod tests {
             .await
             .unwrap();
         restarted
-            .finish_oauth_login_session(login.session_id, lease_owner, account.id, NOW + 2_000)
+            .finish_oauth_login_session(login.session_id, lease_owner, account.id, NOW + 3_000)
             .await
             .unwrap();
         let consumed = poll_at(
@@ -1590,7 +1705,7 @@ mod tests {
             &started.session_token,
             PollRuntime {
                 key_material: KEY,
-                now: NOW + 2_000,
+                now: NOW + 3_000,
                 scope: CopilotDevicePollScope {
                     required_tenant: Some("tenant-a"),
                     operator_service_id: None,
