@@ -26,10 +26,20 @@ async fn request_json(
     path: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    request_json_with_token(state, method, path, body, SERVICE_TOKEN).await
+}
+
+async fn request_json_with_token(
+    state: &AppState,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+    token: &str,
+) -> (StatusCode, Value) {
     let mut request = Request::builder()
         .method(method)
         .uri(path)
-        .header(header::AUTHORIZATION, format!("Bearer {SERVICE_TOKEN}"));
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
     let body = match body {
         Some(body) => {
             request = request.header(header::CONTENT_TYPE, "application/json");
@@ -66,6 +76,7 @@ async fn exercise_injection_matrix(database_url: String, backend: &str) {
         .await
         .unwrap_or_else(|error| panic!("initialize {backend} security fixture: {error}"));
     let run = Uuid::now_v7().to_string();
+    let mut first_credential: Option<(String, String, Uuid)> = None;
 
     for (index, payload) in SQL_PAYLOADS.iter().enumerate() {
         let tenant = format!("security-{backend}-{run}-{index}-{payload}");
@@ -91,6 +102,7 @@ async fn exercise_injection_matrix(database_url: String, backend: &str) {
         .await;
         assert_eq!(status, StatusCode::CREATED, "{backend} payload={payload}");
         let key = issued["key"].as_str().expect("issued key");
+        let key_id = issued["key_id"].as_str().expect("issued key id");
         let account_id = issued["account_id"].as_str().expect("issued account id");
 
         let (status, _) = request_json(
@@ -156,6 +168,47 @@ async fn exercise_injection_matrix(database_url: String, backend: &str) {
             })
             .await
             .expect("finish injection fixture request");
+
+        if let Some((first_key, first_key_id, first_request_id)) = &first_credential {
+            let attacker_filter = query(
+                "/self/v1/requests",
+                &[
+                    ("key_id", first_key_id.as_str()),
+                    ("tenant_external_id", "attacker-controlled"),
+                ],
+            );
+            let (status, self_rows) =
+                request_json_with_token(&state, Method::GET, &attacker_filter, None, key).await;
+            assert_eq!(status, StatusCode::OK, "{backend} self request filter");
+            assert_eq!(self_rows.as_array().map(Vec::len), Some(1));
+            assert_eq!(self_rows[0]["request_id"], request_id.to_string());
+
+            for (viewer_key, foreign_request_id) in
+                [(key, first_request_id), (first_key.as_str(), &request_id)]
+            {
+                let (status, _) = request_json_with_token(
+                    &state,
+                    Method::GET,
+                    &format!("/self/v1/requests/{foreign_request_id}"),
+                    None,
+                    viewer_key,
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "{backend} cross-credential request detail must be hidden"
+                );
+            }
+
+            let stats_path = query("/self/v1/stats", &[("key_id", first_key_id.as_str())]);
+            let (status, stats) =
+                request_json_with_token(&state, Method::GET, &stats_path, None, key).await;
+            assert_eq!(status, StatusCode::OK, "{backend} self stats filter");
+            assert_eq!(stats["summary"]["total_requests"], 1);
+        } else {
+            first_credential = Some((key.to_owned(), key_id.to_owned(), request_id));
+        }
 
         for (field, value) in [
             ("model", model.as_str()),
