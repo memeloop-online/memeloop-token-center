@@ -3,6 +3,25 @@ use uuid::Uuid;
 
 use super::*;
 
+struct RequestSessionDelta {
+    tenant_id: String,
+    key_id: String,
+    previous_session_id: String,
+    authoritative_session_id: String,
+    created_at: i64,
+    model: String,
+    protocol: String,
+    status_class: String,
+    error_code: String,
+    upstream_account_id: String,
+    model_route_id: String,
+    currency: String,
+    duration_ms: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cost_micros: i64,
+}
+
 pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
     tx: &mut Transaction<'_, Any>,
     request_id: &str,
@@ -74,7 +93,11 @@ pub(crate) async fn reclassify_request_session_in_transaction(
 ) -> Result<bool, AppError> {
     let request_id = request_id.to_string();
     let row = sqlx::query(
-        r#"SELECT fact.tenant_id, fact.key_id, fact.session_id,
+        r#"SELECT fact.tenant_id, fact.key_id, fact.session_id, fact.created_at,
+                  fact.model, fact.protocol, fact.status_class, fact.error_code,
+                  fact.upstream_account_id, fact.model_route_id, fact.currency,
+                  fact.duration_ms, fact.input_tokens, fact.output_tokens,
+                  fact.cost_micros,
                   COALESCE(record.conversation_cluster_id,
                            'unlinked:' || fact.key_id) AS authoritative_session_id
              FROM request_stats_facts fact
@@ -90,11 +113,25 @@ pub(crate) async fn reclassify_request_session_in_transaction(
         // authoritative request_records cluster later in the same transaction.
         return Ok(false);
     };
-    let tenant_id: String = row.try_get("tenant_id")?;
-    let key_id: String = row.try_get("key_id")?;
-    let previous_session_id: String = row.try_get("session_id")?;
-    let authoritative_session_id: String = row.try_get("authoritative_session_id")?;
-    if previous_session_id == authoritative_session_id {
+    let delta = RequestSessionDelta {
+        tenant_id: row.try_get("tenant_id")?,
+        key_id: row.try_get("key_id")?,
+        previous_session_id: row.try_get("session_id")?,
+        authoritative_session_id: row.try_get("authoritative_session_id")?,
+        created_at: row.try_get("created_at")?,
+        model: row.try_get("model")?,
+        protocol: row.try_get("protocol")?,
+        status_class: row.try_get("status_class")?,
+        error_code: row.try_get("error_code")?,
+        upstream_account_id: row.try_get("upstream_account_id")?,
+        model_route_id: row.try_get("model_route_id")?,
+        currency: row.try_get("currency")?,
+        duration_ms: row.try_get("duration_ms")?,
+        input_tokens: row.try_get("input_tokens")?,
+        output_tokens: row.try_get("output_tokens")?,
+        cost_micros: row.try_get("cost_micros")?,
+    };
+    if delta.previous_session_id == delta.authoritative_session_id {
         return Ok(false);
     }
 
@@ -104,31 +141,232 @@ pub(crate) async fn reclassify_request_session_in_transaction(
     let moved = sqlx::query(
         "UPDATE request_stats_facts SET session_id = $1 WHERE request_id = $2 AND session_id = $3",
     )
-    .bind(&authoritative_session_id)
+    .bind(&delta.authoritative_session_id)
     .bind(&request_id)
-    .bind(&previous_session_id)
+    .bind(&delta.previous_session_id)
     .execute(&mut **tx)
     .await?;
     if moved.rows_affected() == 0 {
         return Ok(false);
     }
-    if !previous_session_id.is_empty() {
+    if !delta.previous_session_id.is_empty() {
+        remove_request_fact_from_session_projection_in_transaction(tx, &delta).await?;
+    }
+    add_request_fact_to_session_projection_in_transaction(tx, &request_id).await?;
+    Ok(true)
+}
+
+async fn remove_request_fact_from_session_projection_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    delta: &RequestSessionDelta,
+) -> Result<(), AppError> {
+    let error_delta = i64::from(delta.status_class == "failure");
+    let totals = sqlx::query(
+        r#"UPDATE session_usage_totals SET
+               requests = requests - 1,
+               errors = errors - $1,
+               input_tokens = input_tokens - $2,
+               output_tokens = output_tokens - $3,
+               duration_count = duration_count - 1,
+               duration_sum_ms = duration_sum_ms - $4,
+               cost_micros = cost_micros - $5
+           WHERE tenant_id = $6 AND key_id = $7 AND session_id = $8 AND currency = $9
+             AND requests >= 1 AND errors >= $1 AND input_tokens >= $2
+             AND output_tokens >= $3 AND duration_count >= 1
+             AND duration_sum_ms >= $4 AND cost_micros >= $5"#,
+    )
+    .bind(error_delta)
+    .bind(delta.input_tokens)
+    .bind(delta.output_tokens)
+    .bind(delta.duration_ms)
+    .bind(delta.cost_micros)
+    .bind(&delta.tenant_id)
+    .bind(&delta.key_id)
+    .bind(&delta.previous_session_id)
+    .bind(&delta.currency)
+    .execute(&mut **tx)
+    .await?;
+    let mut rebuild_old = totals.rows_affected() != 1;
+    if !rebuild_old {
+        let deleted = sqlx::query(
+            "DELETE FROM session_usage_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND currency = $4 AND requests = 0",
+        )
+        .bind(&delta.tenant_id)
+        .bind(&delta.key_id)
+        .bind(&delta.previous_session_id)
+        .bind(&delta.currency)
+        .execute(&mut **tx)
+        .await?;
+        if deleted.rows_affected() == 0 {
+            let last_activity_at: i64 = sqlx::query_scalar(
+                "SELECT last_activity_at FROM session_usage_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND currency = $4",
+            )
+            .bind(&delta.tenant_id)
+            .bind(&delta.key_id)
+            .bind(&delta.previous_session_id)
+            .bind(&delta.currency)
+            .fetch_one(&mut **tx)
+            .await?;
+            if last_activity_at == delta.created_at {
+                let next_activity: Option<i64> = sqlx::query_scalar(
+                    "SELECT MAX(created_at) FROM request_stats_facts WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND currency = $4",
+                )
+                .bind(&delta.tenant_id)
+                .bind(&delta.key_id)
+                .bind(&delta.previous_session_id)
+                .bind(&delta.currency)
+                .fetch_one(&mut **tx)
+                .await?;
+                let Some(next_activity) = next_activity else {
+                    return rebuild_request_session_projection_in_transaction(
+                        tx,
+                        &delta.tenant_id,
+                        &delta.key_id,
+                        &delta.previous_session_id,
+                    )
+                    .await;
+                };
+                sqlx::query(
+                    "UPDATE session_usage_totals SET last_activity_at = $1 WHERE tenant_id = $2 AND key_id = $3 AND session_id = $4 AND currency = $5",
+                )
+                .bind(next_activity)
+                .bind(&delta.tenant_id)
+                .bind(&delta.key_id)
+                .bind(&delta.previous_session_id)
+                .bind(&delta.currency)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+    }
+
+    let canonical_protocol = canonical_session_protocol(&delta.protocol);
+    for (table, bucket_column, divisor) in [
+        ("session_usage_hourly", "hour_bucket", 3_600_000_i64),
+        ("session_usage_daily", "day_bucket", 86_400_000_i64),
+    ] {
+        let statement = format!(
+            r#"UPDATE {table} SET
+                   requests = requests - 1,
+                   input_tokens = input_tokens - $1,
+                   output_tokens = output_tokens - $2,
+                   duration_count = duration_count - 1,
+                   duration_sum_ms = duration_sum_ms - $3,
+                   cost_micros = cost_micros - $4
+               WHERE tenant_id = $5 AND key_id = $6 AND session_id = $7
+                 AND {bucket_column} = $8 AND model = $9 AND protocol = $10
+                 AND status_class = $11 AND error_code = $12
+                 AND upstream_account_id = $13 AND model_route_id = $14
+                 AND currency = $15 AND requests >= 1 AND input_tokens >= $1
+                 AND output_tokens >= $2 AND duration_count >= 1
+                 AND duration_sum_ms >= $3 AND cost_micros >= $4"#,
+        );
+        let updated = sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind(delta.input_tokens)
+            .bind(delta.output_tokens)
+            .bind(delta.duration_ms)
+            .bind(delta.cost_micros)
+            .bind(&delta.tenant_id)
+            .bind(&delta.key_id)
+            .bind(&delta.previous_session_id)
+            .bind(delta.created_at / divisor)
+            .bind(&delta.model)
+            .bind(canonical_protocol)
+            .bind(&delta.status_class)
+            .bind(&delta.error_code)
+            .bind(&delta.upstream_account_id)
+            .bind(&delta.model_route_id)
+            .bind(&delta.currency)
+            .execute(&mut **tx)
+            .await?;
+        if updated.rows_affected() != 1 {
+            rebuild_old = true;
+            continue;
+        }
+        let delete = format!(
+            "DELETE FROM {table} WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3 AND {bucket_column} = $4 AND model = $5 AND protocol = $6 AND status_class = $7 AND error_code = $8 AND upstream_account_id = $9 AND model_route_id = $10 AND currency = $11 AND requests = 0"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(delete))
+            .bind(&delta.tenant_id)
+            .bind(&delta.key_id)
+            .bind(&delta.previous_session_id)
+            .bind(delta.created_at / divisor)
+            .bind(&delta.model)
+            .bind(canonical_protocol)
+            .bind(&delta.status_class)
+            .bind(&delta.error_code)
+            .bind(&delta.upstream_account_id)
+            .bind(&delta.model_route_id)
+            .bind(&delta.currency)
+            .execute(&mut **tx)
+            .await?;
+    }
+    if rebuild_old {
         rebuild_request_session_projection_in_transaction(
             tx,
-            &tenant_id,
-            &key_id,
-            &previous_session_id,
+            &delta.tenant_id,
+            &delta.key_id,
+            &delta.previous_session_id,
         )
         .await?;
     }
-    rebuild_request_session_projection_in_transaction(
-        tx,
-        &tenant_id,
-        &key_id,
-        &authoritative_session_id,
+    Ok(())
+}
+
+fn canonical_session_protocol(protocol: &str) -> &str {
+    if protocol == "anthropic" || protocol.starts_with("anthropic-") {
+        "anthropic"
+    } else if protocol == "openai-image" {
+        "openai-image"
+    } else {
+        "openai"
+    }
+}
+
+pub(crate) async fn add_archive_record_to_session_projection_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    tenant_id: Uuid,
+    key_id: Uuid,
+    source: &str,
+    external_request_id: &str,
+) -> Result<(), AppError> {
+    let inserted = sqlx::query(
+        r#"INSERT INTO session_archive_totals (
+               tenant_id, key_id, session_id, last_activity_at, requests, errors,
+               input_tokens, output_tokens, duration_count, duration_sum_ms)
+           SELECT tenant_id, key_id,
+                  COALESCE(conversation_cluster_id, 'unlinked:' || key_id),
+                  source_started_at, 1,
+                  CASE WHEN status_code IS NOT NULL
+                             AND (status_code < 200 OR status_code >= 400)
+                       THEN 1 ELSE 0 END,
+                  input_tokens, output_tokens,
+                  CASE WHEN duration_ms IS NULL THEN 0 ELSE 1 END,
+                  COALESCE(duration_ms, 0)
+             FROM session_archive_unlinked_requests
+            WHERE tenant_id = $1 AND key_id = $2 AND source = $3
+              AND external_request_id = $4
+           ON CONFLICT (tenant_id, key_id, session_id) DO UPDATE SET
+               last_activity_at = CASE
+                   WHEN session_archive_totals.last_activity_at < excluded.last_activity_at
+                   THEN excluded.last_activity_at ELSE session_archive_totals.last_activity_at END,
+               requests = session_archive_totals.requests + 1,
+               errors = session_archive_totals.errors + excluded.errors,
+               input_tokens = session_archive_totals.input_tokens + excluded.input_tokens,
+               output_tokens = session_archive_totals.output_tokens + excluded.output_tokens,
+               duration_count = session_archive_totals.duration_count + excluded.duration_count,
+               duration_sum_ms = session_archive_totals.duration_sum_ms + excluded.duration_sum_ms"#,
     )
+    .bind(tenant_id.to_string())
+    .bind(key_id.to_string())
+    .bind(source)
+    .bind(external_request_id)
+    .execute(&mut **tx)
     .await?;
-    Ok(true)
+    if inserted.rows_affected() != 1 {
+        return Err(AppError::Internal);
+    }
+    Ok(())
 }
 
 async fn rebuild_request_session_projection_in_transaction(
@@ -205,48 +443,5 @@ async fn rebuild_request_session_projection_in_transaction(
             .execute(&mut **tx)
             .await?;
     }
-    Ok(())
-}
-
-pub(crate) async fn rebuild_archive_session_projection_in_transaction(
-    tx: &mut Transaction<'_, Any>,
-    tenant_id: Uuid,
-    key_id: Uuid,
-    session_id: &str,
-) -> Result<(), AppError> {
-    let tenant_id = tenant_id.to_string();
-    let key_id = key_id.to_string();
-    sqlx::query(
-        "DELETE FROM session_archive_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3",
-    )
-    .bind(&tenant_id)
-    .bind(&key_id)
-    .bind(session_id)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        r#"INSERT INTO session_archive_totals (
-               tenant_id, key_id, session_id, last_activity_at, requests, errors,
-               input_tokens, output_tokens, duration_count, duration_sum_ms)
-           SELECT tenant_id, key_id,
-                  COALESCE(conversation_cluster_id, 'unlinked:' || key_id),
-                  MAX(source_started_at), COUNT(*),
-                  SUM(CASE WHEN status_code IS NOT NULL
-                                AND (status_code < 200 OR status_code >= 400)
-                           THEN 1 ELSE 0 END),
-                  SUM(input_tokens), SUM(output_tokens),
-                  SUM(CASE WHEN duration_ms IS NULL THEN 0 ELSE 1 END),
-                  SUM(COALESCE(duration_ms, 0))
-             FROM session_archive_unlinked_requests
-            WHERE tenant_id = $1 AND key_id = $2
-              AND COALESCE(conversation_cluster_id, 'unlinked:' || key_id) = $3
-            GROUP BY tenant_id, key_id,
-                     COALESCE(conversation_cluster_id, 'unlinked:' || key_id)"#,
-    )
-    .bind(&tenant_id)
-    .bind(&key_id)
-    .bind(session_id)
-    .execute(&mut **tx)
-    .await?;
     Ok(())
 }

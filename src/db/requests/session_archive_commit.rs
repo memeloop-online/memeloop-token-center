@@ -512,18 +512,12 @@ impl Database {
         if attached.rows_affected() != 1 {
             return Err(AppError::Internal);
         }
-        rebuild_archive_session_projection_in_transaction(
+        add_archive_record_to_session_projection_in_transaction(
             &mut tx,
             input.target.tenant_id,
             input.target.key.key_id,
-            &format!("unlinked:{}", input.target.key.key_id),
-        )
-        .await?;
-        rebuild_archive_session_projection_in_transaction(
-            &mut tx,
-            input.target.tenant_id,
-            input.target.key.key_id,
-            &cluster_id.to_string(),
+            input.archive_source,
+            input.external_request_id,
         )
         .await?;
 

@@ -490,6 +490,16 @@ async fn sqlite_association_is_key_scoped_and_resolution_audit_is_immutable() {
     assert_eq!(after.ledger_entries, before.ledger_entries);
     assert_eq!(after.conversations, before.conversations);
     assert_eq!(after.unlinked, before.unlinked + 1);
+    let diagnostic_projection: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT requests, errors, input_tokens, output_tokens, duration_count, duration_sum_ms FROM session_archive_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3",
+    )
+    .bind(selected.tenant_id.to_string())
+    .bind(selected.key_id.to_string())
+    .bind(format!("unlinked:{}", selected.key_id))
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("quarantine association diagnostic projection");
+    assert_eq!(diagnostic_projection, (1, 0, 13, 7, 1, 500));
     let refs = fixture
         .db
         .request_archive_refs(selected.key_id, target.quarantine_id)

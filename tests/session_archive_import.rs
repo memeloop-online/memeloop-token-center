@@ -430,6 +430,32 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
             Some("rate_limited".into()),
         )
     );
+    let archive_only_cluster: String = sqlx::query_scalar(
+        "SELECT conversation_cluster_id FROM session_archive_unlinked_requests WHERE source = 'cpa-session-archive-v2' AND external_request_id = 'archive-only-request-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("archive-only conversation cluster");
+    let archive_only_projection: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT requests, errors, input_tokens, output_tokens, duration_count, duration_sum_ms FROM session_archive_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(&archive_only_cluster)
+    .fetch_one(&pool)
+    .await
+    .expect("archive-only diagnostic projection");
+    assert_eq!(archive_only_projection, (1, 1, 11, 7, 1, 1_500));
+    let stale_unlinked_projection: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_archive_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(format!("unlinked:{}", key.key_id))
+    .fetch_one(&pool)
+    .await
+    .expect("stale unlinked archive projection count");
+    assert_eq!(stale_unlinked_projection, 0);
     let live_counts_after: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM request_records), (SELECT COUNT(*) FROM request_stats_facts), (SELECT COUNT(*) FROM usage_reservations), (SELECT COUNT(*) FROM ledger_entries)",
     )
@@ -457,6 +483,16 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
     .await
     .expect("idempotent mixed counts");
     assert_eq!(stable_counts, (2, 1, 2, 2));
+    let replayed_archive_projection: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT requests, errors, input_tokens, output_tokens, duration_count, duration_sum_ms FROM session_archive_totals WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(&archive_only_cluster)
+    .fetch_one(&pool)
+    .await
+    .expect("idempotent archive projection");
+    assert_eq!(replayed_archive_projection, archive_only_projection);
 
     let duplicate_one = Uuid::now_v7();
     let duplicate_one_hash = "b".repeat(64);

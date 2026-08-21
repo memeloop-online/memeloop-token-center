@@ -263,6 +263,113 @@ async fn completed_request_is_transactionally_reclassified_from_unlinked_session
 }
 
 #[tokio::test]
+async fn many_completed_facts_move_into_one_session_without_projection_drift() {
+    const REQUESTS: i64 = 64;
+    let fixture = Fixture::new("bulk-session-reclassification").await;
+    let hints = ConversationHints {
+        session_id: Some("bulk-import-session".into()),
+        ..ConversationHints::default()
+    };
+    let mut cluster = None;
+    for index in 0..REQUESTS {
+        let request_id = fixture
+            .start_request(&format!("memory://bulk-request-{index}"))
+            .await;
+        fixture
+            .state
+            .db
+            .record_request_finished(FinishRequest {
+                request_id,
+                status_code: if index % 8 == 0 { 500 } else { 200 },
+                duration_ms: 10 + index,
+                input_tokens: 2,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 3,
+                service_tier: None,
+                cost_micros: 5,
+                error_code: (index % 8 == 0).then(|| "bulk_error".into()),
+                response_object: format!("memory://bulk-response-{index}"),
+            })
+            .await
+            .expect("finish bulk request");
+        let attached = fixture
+            .state
+            .db
+            .record_conversation_observation(
+                &fixture.key,
+                request_id,
+                &json!({"input": [{"role": "user", "content": format!("bulk {index}")}]}),
+                &hints,
+                Some("CPA archive importer"),
+            )
+            .await
+            .expect("attach bulk request");
+        if let Some(cluster) = cluster {
+            assert_eq!(attached, cluster);
+        } else {
+            cluster = Some(attached);
+        }
+    }
+    let cluster = cluster.unwrap().to_string();
+    let totals = sqlx::query(
+        "SELECT requests, errors, input_tokens, output_tokens, duration_count, duration_sum_ms, cost_micros FROM session_usage_totals WHERE key_id = $1 AND session_id = $2",
+    )
+    .bind(fixture.key.key_id.to_string())
+    .bind(&cluster)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(totals.try_get::<i64, _>("requests").unwrap(), REQUESTS);
+    assert_eq!(totals.try_get::<i64, _>("errors").unwrap(), 8);
+    assert_eq!(
+        totals.try_get::<i64, _>("input_tokens").unwrap(),
+        REQUESTS * 2
+    );
+    assert_eq!(
+        totals.try_get::<i64, _>("output_tokens").unwrap(),
+        REQUESTS * 3
+    );
+    assert_eq!(
+        totals.try_get::<i64, _>("duration_count").unwrap(),
+        REQUESTS
+    );
+    assert_eq!(
+        totals.try_get::<i64, _>("duration_sum_ms").unwrap(),
+        (10..10 + REQUESTS).sum::<i64>()
+    );
+    assert_eq!(
+        totals.try_get::<i64, _>("cost_micros").unwrap(),
+        REQUESTS * 5
+    );
+    for table in ["session_usage_hourly", "session_usage_daily"] {
+        let sql = format!(
+            "SELECT COALESCE(SUM(requests), 0) AS requests, MIN(input_tokens) AS min_input, MIN(output_tokens) AS min_output, MIN(duration_sum_ms) AS min_duration, MIN(cost_micros) AS min_cost FROM {table} WHERE key_id = $1 AND session_id = $2"
+        );
+        let projection = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(fixture.key.key_id.to_string())
+            .bind(&cluster)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+        assert_eq!(projection.try_get::<i64, _>("requests").unwrap(), REQUESTS);
+        assert!(projection.try_get::<i64, _>("min_input").unwrap() >= 0);
+        assert!(projection.try_get::<i64, _>("min_output").unwrap() >= 0);
+        assert!(projection.try_get::<i64, _>("min_duration").unwrap() >= 0);
+        assert!(projection.try_get::<i64, _>("min_cost").unwrap() >= 0);
+    }
+    let old_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_usage_totals WHERE key_id = $1 AND session_id = $2",
+    )
+    .bind(fixture.key.key_id.to_string())
+    .bind(format!("unlinked:{}", fixture.key.key_id))
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(old_rows, 0);
+}
+
+#[tokio::test]
 async fn logical_session_api_is_stable_key_scoped_and_cursor_paginated() {
     let fixture = Fixture::new("logical-session-api").await;
     let (first_request, first_cluster) = observe_request(
