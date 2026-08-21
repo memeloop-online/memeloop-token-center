@@ -6,13 +6,38 @@ import { baseURL, eventually, model, requestJson, runtime, tenant } from '../sup
 import type { DogfoodWorld } from '../support/world.js';
 
 import { assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertValue, assertVisible, applyUsageFilter, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
-When('OAuth 服务目录包含 Codex 且管理员以中文连接控制台', async function (this: DogfoodWorld) {
+When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且不显示旧桥接项', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.route('**/internal/v1/provider-types', async (route) => {
     const response = await route.fetch();
     const providers = await response.json() as Array<{ id: string }>;
-    if (providers.some((provider) => provider.id === 'openai-codex')) { await route.fulfill({ response, json: providers }); return; }
-    await route.fulfill({ response, json: [...providers, {
+    const contributed = [
+      ['anthropic-claude', 'Anthropic Claude'],
+      ['github-copilot', 'GitHub Copilot'],
+      ['cursor', 'Cursor'],
+    ].filter(([id]) => !providers.some((provider) => provider.id === id))
+      .map(([id, display_name]) => ({
+        id,
+        display_name,
+        protocols: ['openai'],
+        modalities: ['text'],
+        config_schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['base_url'],
+          properties: { base_url: { type: 'string', format: 'uri', default: `https://${id}.example.test` } },
+        },
+        credential_schema: { type: 'object', additionalProperties: true },
+        oauth_adapter: {
+          api_version: 'oauth-adapter-v1',
+          flow_kind: 'cursor_pkce',
+          login_url: `http://${id}-oauth.default.svc/login`,
+          poll_url: `http://${id}-oauth.default.svc/poll`,
+          refresh_url: `http://${id}-oauth.default.svc/refresh`,
+        },
+        source: `plugin:${id}@1.0.0`,
+      }));
+    const codex = providers.some((provider) => provider.id === 'openai-codex') ? [] : [{
       id: 'openai-codex',
       display_name: 'OpenAI Codex',
       protocols: ['openai'],
@@ -21,7 +46,8 @@ When('OAuth 服务目录包含 Codex 且管理员以中文连接控制台', asyn
       credential_schema: { type: 'object', additionalProperties: false, properties: {} },
       oauth_adapter: null,
       source: 'built-in',
-    }] });
+    }];
+    await route.fulfill({ response, json: [...providers, ...codex, ...contributed] });
   });
   await page.route('**/internal/v1/oauth/codex/start', async (route) => {
     assert.equal(route.request().method(), 'POST');
@@ -173,6 +199,8 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
   await assertVisible(onboarding.getByLabel('服务提供商'));
   await assertContains(onboarding.getByLabel('服务提供商'), 'Cursor');
+  await assertContains(onboarding.getByLabel('服务提供商'), 'Anthropic Claude');
+  await assertContains(onboarding.getByLabel('服务提供商'), 'GitHub Copilot');
   await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
   await onboarding.getByLabel('服务提供商').selectOption('provider:openai-codex');
   await onboarding.getByLabel('上游名称').fill('codex-primary');
@@ -197,6 +225,8 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await assertVisible(onboarding.getByRole('button', { name: 'Account authorization', exact: true }));
   await assertVisible(onboarding.getByLabel('Service provider'));
   await assertContains(onboarding.getByLabel('Service provider'), 'Cursor');
+  await assertContains(onboarding.getByLabel('Service provider'), 'Anthropic Claude');
+  await assertContains(onboarding.getByLabel('Service provider'), 'GitHub Copilot');
   await assertContains(onboarding.getByLabel('Service provider'), 'OpenAI Codex');
   await assertContains(onboarding.getByRole('status'), 'Continue on OpenAI only if you just started this login.');
   await assertNotContains(page.locator('body'), 'CPA');
