@@ -240,12 +240,14 @@ async fn deny_policy_covers_text_images_seedance_and_comfyui_before_any_upstream
         &state,
         "policy-deny",
         &issued,
-        "http-json",
-        json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
-        UpstreamCredential::None,
-        "denied-upstream",
-        &["openai", "generation"],
-        &["requested-model", "example-rewritten"],
+        RouteFixture {
+            driver: "http-json",
+            config: json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
+            credential: UpstreamCredential::None,
+            upstream_model: "denied-upstream",
+            protocols: &["openai", "generation"],
+            granted_public_models: &["requested-model", "example-rewritten"],
+        },
     )
     .await;
     for (path, body) in [
@@ -304,12 +306,14 @@ async fn malicious_denial_reason_is_absent_from_logs_and_http_response() {
         &state,
         "policy-malicious-reason",
         &issued,
-        "http-json",
-        json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
-        UpstreamCredential::None,
-        "denied-upstream",
-        &["openai"],
-        &["requested-model", "example-rewritten"],
+        RouteFixture {
+            driver: "http-json",
+            config: json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
+            credential: UpstreamCredential::None,
+            upstream_model: "denied-upstream",
+            protocols: &["openai"],
+            granted_public_models: &["requested-model", "example-rewritten"],
+        },
     )
     .await;
     let capture = LogCapture::default();
@@ -354,12 +358,14 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
         &state,
         "policy-malicious-log",
         &issued,
-        "http-json",
-        json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
-        UpstreamCredential::None,
-        "denied-upstream",
-        &["openai"],
-        &["requested-model", "example-rewritten"],
+        RouteFixture {
+            driver: "http-json",
+            config: json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
+            credential: UpstreamCredential::None,
+            upstream_model: "denied-upstream",
+            protocols: &["openai"],
+            granted_public_models: &["requested-model", "example-rewritten"],
+        },
     )
     .await;
     let capture = LogCapture::default();
@@ -431,16 +437,18 @@ async fn image_rewrite_rechecks_effective_permission_route_price_and_archives_ch
         &state,
         "policy-image-rewrite",
         &issued,
-        "http-json",
-        json!({"base_url": mock.uri(), "network_scope": "public"}),
-        UpstreamCredential::ApiKey {
-            value: "image-secret".into(),
-            header: "authorization".into(),
-            prefix: "Bearer ".into(),
+        RouteFixture {
+            driver: "http-json",
+            config: json!({"base_url": mock.uri(), "network_scope": "public"}),
+            credential: UpstreamCredential::ApiKey {
+                value: "image-secret".into(),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+            },
+            upstream_model: "image-upstream",
+            protocols: &["generation"],
+            granted_public_models: &["requested-model", "example-rewritten"],
         },
-        "image-upstream",
-        &["generation"],
-        &["requested-model", "example-rewritten"],
     )
     .await;
     state
@@ -520,12 +528,14 @@ async fn async_rewrite_rechecks_seedance_and_comfyui_routes_and_billing_units() 
             &state,
             &format!("policy-{label}"),
             &issued,
-            driver,
-            config,
-            UpstreamCredential::None,
-            "provider-model",
-            &["generation"],
-            &["requested-model", "example-rewritten"],
+            RouteFixture {
+                driver,
+                config,
+                credential: UpstreamCredential::None,
+                upstream_model: "provider-model",
+                protocols: &["generation"],
+                granted_public_models: &["requested-model", "example-rewritten"],
+            },
         )
         .await;
         state
@@ -558,12 +568,14 @@ async fn rewritten_model_is_checked_again_against_the_stable_key_policy() {
         &state,
         "policy-permission",
         &issued,
-        "http-json",
-        json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
-        UpstreamCredential::None,
-        "denied-upstream",
-        &["generation"],
-        &["requested-model"],
+        RouteFixture {
+            driver: "http-json",
+            config: json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
+            credential: UpstreamCredential::None,
+            upstream_model: "denied-upstream",
+            protocols: &["generation"],
+            granted_public_models: &["requested-model"],
+        },
     )
     .await;
     let response = call(
@@ -576,26 +588,30 @@ async fn rewritten_model_is_checked_again_against_the_stable_key_policy() {
     assert_eq!(response.0, StatusCode::FORBIDDEN);
 }
 
+struct RouteFixture<'a> {
+    driver: &'a str,
+    config: Value,
+    credential: UpstreamCredential,
+    upstream_model: &'a str,
+    protocols: &'a [&'a str],
+    granted_public_models: &'a [&'a str],
+}
+
 async fn create_account_and_routes(
     state: &AppState,
     tenant: &str,
     issued: &IssuedKey,
-    driver: &str,
-    config: Value,
-    credential: UpstreamCredential,
-    upstream_model: &str,
-    protocols: &[&str],
-    granted_public_models: &[&str],
+    fixture: RouteFixture<'_>,
 ) -> memeloop_token_center::provider::UpstreamAccountView {
     let account = state
         .db
         .create_upstream_account(
             CreateUpstreamAccountInput {
                 tenant_external_id: tenant.into(),
-                name: format!("{driver}-account"),
-                driver: driver.into(),
-                config,
-                credential,
+                name: format!("{}-account", fixture.driver),
+                driver: fixture.driver.into(),
+                config: fixture.config,
+                credential: fixture.credential,
                 oauth_session_id: None,
                 oauth_driver: None,
                 oauth_refresh_url: None,
@@ -605,14 +621,14 @@ async fn create_account_and_routes(
         .await
         .unwrap();
     let mut new_route_ids = Vec::new();
-    for protocol in protocols {
+    for protocol in fixture.protocols {
         for public_model in ["requested-model", "example-rewritten"] {
             let (route, _) = state
                 .db
                 .create_routed_model_route(CreateRoutedModelRouteInput {
                     tenant_external_id: tenant.into(),
                     public_model: public_model.into(),
-                    upstream_model: upstream_model.into(),
+                    upstream_model: fixture.upstream_model.into(),
                     protocol: (*protocol).into(),
                     priority: 0,
                     upstream_account_ids: vec![account.id],
@@ -625,7 +641,7 @@ async fn create_account_and_routes(
                 })
                 .await
                 .unwrap();
-            if granted_public_models.contains(&public_model) {
+            if fixture.granted_public_models.contains(&public_model) {
                 new_route_ids.push(route.id);
             }
         }
