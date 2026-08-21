@@ -37,7 +37,6 @@ const READY_AAD: &[u8] = b"memeloop-token-center/github-copilot-device-ready/v1"
 const RESPONSE_LIMIT: usize = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_POLL_SECONDS: u64 = 5;
-const MAX_POLL_SECONDS: u64 = 60;
 const SLOW_DOWN_SECONDS: u64 = 5;
 const MAX_DEVICE_LIFETIME_SECONDS: i64 = 60 * 60;
 const DEFAULT_DEVICE_LIFETIME_SECONDS: i64 = 15 * 60;
@@ -203,6 +202,8 @@ struct DeviceTokenResponse {
     refresh_token_expires_in: Option<i64>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -307,10 +308,10 @@ async fn start_at(
     validate_secret(&response.device_code)?;
     validate_user_code(&response.user_code)?;
     validate_verification_uri(&response.verification_uri, allow_test_loopback)?;
-    let poll_interval_seconds = response
-        .interval
-        .unwrap_or(DEFAULT_POLL_SECONDS)
-        .clamp(1, 60);
+    let poll_interval_seconds = response.interval.unwrap_or(DEFAULT_POLL_SECONDS);
+    if poll_interval_seconds == 0 {
+        return Err(upstream_error());
+    }
     let lifetime = response
         .expires_in
         .unwrap_or(DEFAULT_DEVICE_LIFETIME_SECONDS);
@@ -418,7 +419,7 @@ async fn poll_at(
         operator_service_id: session.operator_service_id,
         expires_at: session.expires_at,
     };
-    let (lease_owner, state) = match db
+    let (lease_owner, mut state) = match db
         .claim_oauth_login_poll(&reference, now, session.poll_interval_seconds)
         .await?
     {
@@ -462,44 +463,71 @@ async fn poll_at(
     let device_result =
         poll_device_token(http, &state.device_code, allow_test_loopback, endpoints).await;
     let device = match device_result {
-        Ok(DeviceOutcome::Pending) => {
-            db.release_oauth_login_poll(state.session_id, lease_owner, now)
-                .await?;
+        Ok(DeviceOutcome::Pending { interval }) => {
+            let next_interval = interval
+                .filter(|interval| *interval > 0)
+                .unwrap_or(state.poll_interval_seconds)
+                .max(state.poll_interval_seconds);
+            reschedule_poll(
+                db,
+                &mut state,
+                lease_owner,
+                next_interval,
+                key_material,
+                now,
+            )
+            .await?;
             return Ok(CopilotDevicePollResult::Pending {
-                retry_after_seconds: state.poll_interval_seconds,
+                retry_after_seconds: next_interval,
             });
         }
-        Ok(DeviceOutcome::SlowDown) => {
-            db.release_oauth_login_poll(state.session_id, lease_owner, now)
-                .await?;
+        Ok(DeviceOutcome::SlowDown { interval }) => {
+            let increased = state
+                .poll_interval_seconds
+                .checked_add(SLOW_DOWN_SECONDS)
+                .ok_or_else(upstream_error)?;
+            let next_interval = interval
+                .filter(|interval| *interval > 0)
+                .unwrap_or(0)
+                .max(increased);
+            reschedule_poll(
+                db,
+                &mut state,
+                lease_owner,
+                next_interval,
+                key_material,
+                now,
+            )
+            .await?;
             return Ok(CopilotDevicePollResult::Pending {
-                retry_after_seconds: state
-                    .poll_interval_seconds
-                    .saturating_add(SLOW_DOWN_SECONDS)
-                    .min(MAX_POLL_SECONDS),
+                retry_after_seconds: next_interval,
             });
         }
         Ok(DeviceOutcome::Denied) => {
-            let _ = db
-                .release_oauth_login_poll(state.session_id, lease_owner, now)
-                .await;
+            db.fail_oauth_login_poll(state.session_id, lease_owner, now)
+                .await?;
             return Err(AppError::BadRequest(
                 "GitHub Copilot authorization was denied".into(),
             ));
         }
         Ok(DeviceOutcome::Expired) => {
-            let _ = db
-                .release_oauth_login_poll(state.session_id, lease_owner, now)
-                .await;
+            db.fail_oauth_login_poll(state.session_id, lease_owner, now)
+                .await?;
             return Err(AppError::BadRequest(
                 "GitHub Copilot authorization expired".into(),
             ));
         }
+        Ok(DeviceOutcome::Terminal) => {
+            db.fail_oauth_login_poll(state.session_id, lease_owner, now)
+                .await?;
+            return Err(AppError::BadRequest(
+                "GitHub Copilot authorization cannot continue".into(),
+            ));
+        }
         Ok(DeviceOutcome::Ready(tokens)) => tokens,
         Err(error) => {
-            let _ = db
-                .release_oauth_login_poll(state.session_id, lease_owner, now)
-                .await;
+            let interval = state.poll_interval_seconds;
+            reschedule_poll(db, &mut state, lease_owner, interval, key_material, now).await?;
             return Err(error);
         }
     };
@@ -588,11 +616,49 @@ async fn poll_at(
     }
 }
 
+async fn reschedule_poll(
+    db: &Database,
+    state: &mut LoginState,
+    lease_owner: Uuid,
+    next_interval_seconds: u64,
+    key_material: &[u8],
+    now: i64,
+) -> Result<(), AppError> {
+    if next_interval_seconds == 0 {
+        return Err(upstream_error());
+    }
+    let next_poll_at = now
+        .checked_add(
+            i64::try_from(next_interval_seconds)
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1_000))
+                .ok_or_else(upstream_error)?,
+        )
+        .ok_or_else(upstream_error)?;
+    if next_poll_at >= state.expires_at {
+        db.fail_oauth_login_poll(state.session_id, lease_owner, now)
+            .await?;
+        return Err(AppError::BadRequest(
+            "GitHub Copilot authorization expired".into(),
+        ));
+    }
+    state.poll_interval_seconds = next_interval_seconds;
+    db.reschedule_oauth_login_poll(
+        state.session_id,
+        lease_owner,
+        seal_private_json(state, key_material, STATE_AAD)?,
+        next_poll_at,
+        now,
+    )
+    .await
+}
+
 enum DeviceOutcome {
-    Pending,
-    SlowDown,
+    Pending { interval: Option<u64> },
+    SlowDown { interval: Option<u64> },
     Denied,
     Expired,
+    Terminal,
     Ready(DeviceTokenResponse),
 }
 
@@ -618,16 +684,32 @@ async fn poll_device_token(
         .send()
         .await
         .map_err(|_| upstream_error())?;
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(AppError::RateLimited);
+    }
+    if response.status().is_client_error() {
+        return Ok(DeviceOutcome::Terminal);
+    }
     if !response.status().is_success() {
         return Err(upstream_error());
     }
     let response: DeviceTokenResponse =
         serde_json::from_slice(&bounded_body(response).await?).map_err(|_| upstream_error())?;
     match response.error.as_deref() {
-        Some("authorization_pending") => Ok(DeviceOutcome::Pending),
-        Some("slow_down") => Ok(DeviceOutcome::SlowDown),
+        Some("authorization_pending") => Ok(DeviceOutcome::Pending {
+            interval: response.interval,
+        }),
+        Some("slow_down") => Ok(DeviceOutcome::SlowDown {
+            interval: response.interval,
+        }),
         Some("access_denied") => Ok(DeviceOutcome::Denied),
         Some("expired_token") => Ok(DeviceOutcome::Expired),
+        Some(
+            "incorrect_client_credentials"
+            | "incorrect_device_code"
+            | "device_flow_disabled"
+            | "unsupported_grant_type",
+        ) => Ok(DeviceOutcome::Terminal),
         Some(_) => Err(upstream_error()),
         None if response.access_token.is_some() => Ok(DeviceOutcome::Ready(response)),
         None => Err(upstream_error()),
@@ -1203,11 +1285,194 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 (expected, result),
-                ("pending", DeviceOutcome::Pending)
-                    | ("slow", DeviceOutcome::SlowDown)
+                ("pending", DeviceOutcome::Pending { .. })
+                    | ("slow", DeviceOutcome::SlowDown { .. })
                     | ("denied", DeviceOutcome::Denied)
                     | ("expired", DeviceOutcome::Expired)
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_down_interval_is_cumulative_durable_and_never_clamped_down() {
+        let server = MockServer::start().await;
+        mount_start(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": "slow_down",
+                "interval": 75
+            })))
+            .mount(&server)
+            .await;
+        let (_directory, url, database) = sqlite_database().await;
+        let started = start_at(
+            &database,
+            &reqwest::Client::new(),
+            input(),
+            KEY,
+            NOW,
+            true,
+            &Endpoints::test(&server.uri()),
+        )
+        .await
+        .unwrap();
+        let first_poll_at = NOW + 1_000;
+        let first = poll_at(
+            &database,
+            &reqwest::Client::new(),
+            &started.session_token,
+            PollRuntime {
+                key_material: KEY,
+                now: first_poll_at,
+                scope: CopilotDevicePollScope {
+                    required_tenant: Some("tenant-a"),
+                    operator_service_id: None,
+                },
+                allow_test_loopback: true,
+                endpoints: &Endpoints::test(&server.uri()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            first,
+            CopilotDevicePollResult::Pending {
+                retry_after_seconds: 75
+            }
+        ));
+        drop(database);
+        let restarted = Database::connect(&url).await.unwrap();
+        let early = poll_at(
+            &restarted,
+            &reqwest::Client::new(),
+            &started.session_token,
+            PollRuntime {
+                key_material: KEY,
+                now: first_poll_at + 74_000,
+                scope: CopilotDevicePollScope {
+                    required_tenant: Some("tenant-a"),
+                    operator_service_id: None,
+                },
+                allow_test_loopback: true,
+                endpoints: &Endpoints::test(&server.uri()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            early,
+            CopilotDevicePollResult::Pending {
+                retry_after_seconds: 1
+            }
+        ));
+        let second = poll_at(
+            &restarted,
+            &reqwest::Client::new(),
+            &started.session_token,
+            PollRuntime {
+                key_material: KEY,
+                now: first_poll_at + 75_000,
+                scope: CopilotDevicePollScope {
+                    required_tenant: Some("tenant-a"),
+                    operator_service_id: None,
+                },
+                allow_test_loopback: true,
+                endpoints: &Endpoints::test(&server.uri()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            second,
+            CopilotDevicePollResult::Pending {
+                retry_after_seconds: 80
+            }
+        ));
+        let token_polls = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/login/oauth/access_token")
+            .count();
+        assert_eq!(token_polls, 2);
+    }
+
+    #[tokio::test]
+    async fn denied_and_expired_device_sessions_are_terminal() {
+        for (oauth_error, expected_message) in
+            [("access_denied", "denied"), ("expired_token", "expired")]
+        {
+            let server = MockServer::start().await;
+            mount_start(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/login/oauth/access_token"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"error": oauth_error})),
+                )
+                .mount(&server)
+                .await;
+            let (_directory, _url, database) = sqlite_database().await;
+            let started = start_at(
+                &database,
+                &reqwest::Client::new(),
+                input(),
+                KEY,
+                NOW,
+                true,
+                &Endpoints::test(&server.uri()),
+            )
+            .await
+            .unwrap();
+            let first_error = poll_at(
+                &database,
+                &reqwest::Client::new(),
+                &started.session_token,
+                PollRuntime {
+                    key_material: KEY,
+                    now: NOW + 1_000,
+                    scope: CopilotDevicePollScope {
+                        required_tenant: Some("tenant-a"),
+                        operator_service_id: None,
+                    },
+                    allow_test_loopback: true,
+                    endpoints: &Endpoints::test(&server.uri()),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(first_error.to_string().contains(expected_message));
+            let second_error = poll_at(
+                &database,
+                &reqwest::Client::new(),
+                &started.session_token,
+                PollRuntime {
+                    key_material: KEY,
+                    now: NOW + 2_000,
+                    scope: CopilotDevicePollScope {
+                        required_tenant: Some("tenant-a"),
+                        operator_service_id: None,
+                    },
+                    allow_test_loopback: true,
+                    endpoints: &Endpoints::test(&server.uri()),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                second_error
+                    .to_string()
+                    .contains("OAuth login session is no longer active")
+            );
+            let token_polls = server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|request| request.url.path() == "/login/oauth/access_token")
+                .count();
+            assert_eq!(token_polls, 1);
         }
     }
 
