@@ -1593,7 +1593,7 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
                         "account_name": "plugin-primary",
                         "provider_driver": "plugin-provider",
                         "provider_config": {
-                            "base_url": "http://plugin-upstream.default.svc",
+                            "base_url": "http://127.0.0.1:8188",
                             "network_scope": "private"
                         }
                     })
