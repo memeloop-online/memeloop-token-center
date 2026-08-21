@@ -97,6 +97,7 @@ pub(in crate::api) async fn create_generation(
             StartGenerationJobInput {
                 job_id,
                 key,
+                model_route_id: route.route_id,
                 upstream_account_id: route.account_id,
                 reservation_price,
                 public_model: body.model,

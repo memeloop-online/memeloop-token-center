@@ -238,6 +238,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
             include_str!("../../../migrations/common/0043_routing_groups.sql")
         ),
     },
+    Migration {
+        version: 47,
+        name: "immutable generation route snapshots",
+        sql: include_str!("../../../migrations/common/0047_generation_route_snapshot.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -461,6 +466,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
             include_str!("../../../migrations/postgres/0043_drop_model_route_legacy_unique.sql"),
             include_str!("../../../migrations/common/0043_routing_groups.sql")
         ),
+    },
+    Migration {
+        version: 47,
+        name: "immutable generation route snapshots",
+        sql: include_str!("../../../migrations/common/0047_generation_route_snapshot.sql"),
     },
 ];
 

@@ -360,20 +360,9 @@ async fn process_claimed(
     }
     let route = state
         .db
-        .resolve_upstream_with_hint(
-            job.tenant_id,
-            &job.public_model,
-            "generation",
-            Some(job.upstream_account_id),
-            state.config.key_pepper.as_bytes(),
-        )
+        .load_generation_upstream_snapshot(job, state.config.key_pepper.as_bytes())
         .await?
-        .ok_or_else(|| AppError::Upstream("generation route was removed".into()))?;
-    if route.driver != job.driver {
-        return Err(AppError::Upstream(
-            "generation route driver changed while job was queued".into(),
-        ));
-    }
+        .ok_or_else(|| AppError::Upstream("generation upstream snapshot is unavailable".into()))?;
     if job.status == "cancelling" {
         let upstream_job_id = job.upstream_job_id.as_deref().ok_or(AppError::Internal)?;
         return cancel_upstream_generation(state, worker_id, job, &route, upstream_job_id).await;

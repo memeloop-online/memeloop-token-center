@@ -6,8 +6,9 @@ use memeloop_token_center::{
     },
     db::{
         AttachGenerationJobResult, CreateGenerationJobInput, CreateGenerationJobResult,
-        CreateKeyInput, CreateUpstreamAccountInput, Database, FinishGenerationJobInput,
-        GenerationJobIdempotency, StartGenerationJobInput, StatsFilter, unix_millis,
+        CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput, Database,
+        FinishGenerationJobInput, GenerationJobIdempotency, StartGenerationJobInput, StatsFilter,
+        unix_millis,
     },
     error::AppError,
     generation::generation_request_hash,
@@ -106,11 +107,12 @@ async fn generation_terminal_settlement_preserves_the_keys_non_usd_currency() {
         .create_generation_job(input(&key, upstream_id, reservation.clone(), &price))
         .await
         .unwrap();
-    database
+    let claimed = database
         .claim_generation_job("generation-cny-worker")
         .await
         .unwrap()
         .expect("queued CNY generation");
+    assert_eq!(claimed.model_route_id, None);
     let asset = archived_asset(job.job_id, 0);
     assert_eq!(
         database
@@ -190,6 +192,7 @@ fn start_input(
     StartGenerationJobInput {
         job_id,
         key: key.clone(),
+        model_route_id: Uuid::now_v7(),
         upstream_account_id,
         reservation_price: price.reservation_price().unwrap(),
         public_model: model.to_owned(),
@@ -211,6 +214,146 @@ fn archived_asset(job_id: Uuid, index: i64) -> ArchivedGenerationAsset {
         size_bytes: 17,
         filename: format!("result-{index}.png"),
     }
+}
+
+#[tokio::test]
+async fn accepted_generation_job_keeps_its_route_candidate_snapshot() {
+    let (directory, database, key, upstream_id, price) = fixture().await;
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("generation.db").display()
+    );
+    let inspection = AnyPool::connect(&database_url).await.unwrap();
+    let tenant_external_id: String = sqlx::query("SELECT external_id FROM tenants WHERE id = $1")
+        .bind(key.tenant_id.to_string())
+        .fetch_one(&inspection)
+        .await
+        .unwrap()
+        .get("external_id");
+    let selected_route = database
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id,
+            public_model: "image-test".to_owned(),
+            upstream_account_id: upstream_id,
+            upstream_model: "workflow-frozen".to_owned(),
+            protocol: "generation".to_owned(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    let request_hash = generation_request_hash("image-test", &json!({"prompt": "snapshot"}));
+    let mut input = start_input(
+        &key,
+        upstream_id,
+        &price,
+        Uuid::now_v7(),
+        "image-test",
+        &request_hash,
+    );
+    input.model_route_id = selected_route.id;
+    input.upstream_model = "workflow-frozen".to_owned();
+    let CreateGenerationJobResult::Created(preparing) =
+        database.start_generation_job(input, None).await.unwrap()
+    else {
+        panic!("a new generation request must be admitted");
+    };
+    let persisted = sqlx::query(
+        "SELECT model_route_id, upstream_account_id, upstream_model, driver FROM generation_jobs WHERE id = $1",
+    )
+    .bind(preparing.job_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted.get::<String, _>("model_route_id"),
+        selected_route.id.to_string()
+    );
+    assert_eq!(
+        persisted.get::<String, _>("upstream_account_id"),
+        upstream_id.to_string()
+    );
+    assert_eq!(
+        persisted.get::<String, _>("upstream_model"),
+        "workflow-frozen"
+    );
+    assert_eq!(persisted.get::<String, _>("driver"), "comfyui");
+
+    let AttachGenerationJobResult::Attached(_) = database
+        .attach_generation_job_request(
+            key.key_id,
+            preparing.job_id,
+            &request_hash,
+            "objects/blake3/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the request archive attach must be acknowledged");
+    };
+    let work = database
+        .claim_generation_job("generation-snapshot-worker")
+        .await
+        .unwrap()
+        .expect("queued snapshot job");
+    assert_eq!(work.model_route_id, Some(selected_route.id));
+    assert_eq!(work.upstream_account_id, upstream_id);
+    assert_eq!(work.upstream_model, "workflow-frozen");
+    assert_eq!(work.driver, "comfyui");
+
+    // Operator changes apply only to future admissions. The accepted job does
+    // not re-run route, group, priority, or public-model selection.
+    sqlx::query(
+        "UPDATE model_routes SET upstream_model = 'workflow-edited', enabled = 0 WHERE id = $1",
+    )
+    .bind(selected_route.id.to_string())
+    .execute(&inspection)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE model_route_upstream_accounts SET upstream_model = 'workflow-edited' WHERE model_route_id = $1 AND upstream_account_id = $2",
+    )
+    .bind(selected_route.id.to_string())
+    .bind(upstream_id.to_string())
+    .execute(&inspection)
+    .await
+    .unwrap();
+    let resolved = database
+        .load_generation_upstream_snapshot(&work, PEPPER)
+        .await
+        .unwrap()
+        .expect("route edits must not invalidate accepted work");
+    assert_eq!(resolved.route_id, selected_route.id);
+    assert_eq!(resolved.account_id, upstream_id);
+    assert_eq!(resolved.upstream_model, "workflow-frozen");
+    assert_eq!(resolved.driver, "comfyui");
+    sqlx::query("DELETE FROM model_routes WHERE id = $1")
+        .bind(selected_route.id.to_string())
+        .execute(&inspection)
+        .await
+        .unwrap();
+    assert_eq!(
+        database
+            .load_generation_upstream_snapshot(&work, PEPPER)
+            .await
+            .unwrap()
+            .expect("route deletion must not invalidate accepted work")
+            .upstream_model,
+        "workflow-frozen"
+    );
+
+    // An unavailable account is never replaced by another provider candidate.
+    sqlx::query("UPDATE upstream_accounts SET status = 'disabled' WHERE id = $1")
+        .bind(upstream_id.to_string())
+        .execute(&inspection)
+        .await
+        .unwrap();
+    assert!(
+        database
+            .load_generation_upstream_snapshot(&work, PEPPER)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 async fn generation_staging_lease(

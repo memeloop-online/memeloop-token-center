@@ -20,6 +20,7 @@ pub struct CreateGenerationJobInput {
 pub struct StartGenerationJobInput {
     pub job_id: Uuid,
     pub key: AuthenticatedKey,
+    pub model_route_id: Uuid,
     pub upstream_account_id: Uuid,
     pub reservation_price: ModelPrice,
     pub public_model: String,
@@ -115,6 +116,11 @@ impl Database {
         input: StartGenerationJobInput,
         idempotency: Option<&GenerationJobIdempotency>,
     ) -> Result<CreateGenerationJobResult, AppError> {
+        if input.model_route_id.is_nil() {
+            return Err(AppError::BadRequest(
+                "generation model route snapshot is required".into(),
+            ));
+        }
         if input.estimated_units <= 0 {
             return Err(AppError::BadRequest(
                 "generation estimated units must be positive".into(),
@@ -220,11 +226,12 @@ impl Database {
         )
         .await?;
         let inserted = sqlx::query(
-            "INSERT INTO generation_jobs (id, tenant_id, key_id, upstream_account_id, reservation_id, public_model, upstream_model, driver, status, request_object, estimated_units, billing_unit_snapshot, micros_per_unit_snapshot, client_idempotency_key, request_hash, next_attempt_at, lease_expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'preparing', '', $9, $10, $11, $12, $13, $14, $15, $16, $17) ON CONFLICT(key_id, client_idempotency_key) DO NOTHING",
+            "INSERT INTO generation_jobs (id, tenant_id, key_id, model_route_id, upstream_account_id, reservation_id, public_model, upstream_model, driver, status, request_object, estimated_units, billing_unit_snapshot, micros_per_unit_snapshot, client_idempotency_key, request_hash, next_attempt_at, lease_expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'preparing', '', $10, $11, $12, $13, $14, $15, $16, $17, $18) ON CONFLICT(key_id, client_idempotency_key) DO NOTHING",
         )
         .bind(input.job_id.to_string())
         .bind(input.key.tenant_id.to_string())
         .bind(input.key.key_id.to_string())
+        .bind(input.model_route_id.to_string())
         .bind(input.upstream_account_id.to_string())
         .bind(reservation.id.to_string())
         .bind(&input.public_model)
@@ -1049,7 +1056,7 @@ impl Database {
             return Ok(None);
         }
         let row = sqlx::query(
-            "SELECT j.id, j.created_at, j.tenant_id, j.key_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.submission_nonce, j.staged_assets_json, j.billing_unit_snapshot, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, j.micros_per_unit_snapshot FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
+            "SELECT j.id, j.created_at, j.tenant_id, j.key_id, j.model_route_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.submission_nonce, j.staged_assets_json, j.billing_unit_snapshot, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, j.micros_per_unit_snapshot FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
         )
         .bind(&job_id)
         .fetch_one(&mut *transaction)
@@ -1071,6 +1078,10 @@ impl Database {
             created_at: row.try_get("created_at")?,
             tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
             key_id,
+            model_route_id: row
+                .try_get::<Option<String>, _>("model_route_id")?
+                .map(parse_uuid)
+                .transpose()?,
             upstream_account_id: parse_uuid(row.try_get("upstream_account_id")?)?,
             reservation: UsageReservation {
                 id: parse_uuid(row.try_get("reservation_id")?)?,
@@ -1101,6 +1112,54 @@ impl Database {
             estimated_units: row.try_get("estimated_units")?,
             attempt_count: row.try_get("attempt_count")?,
             failure_count: row.try_get("failure_count")?,
+        }))
+    }
+
+    /// Loads the exact upstream candidate frozen at generation admission.
+    ///
+    /// Route membership, priority, enablement, and model mappings are
+    /// deliberately not consulted here: changing them must affect only new
+    /// admissions. The account itself must still be active and have a current,
+    /// non-revoked credential, which makes disabled/deleted accounts and broken
+    /// rotations fail closed without silently selecting another candidate.
+    pub async fn load_generation_upstream_snapshot(
+        &self,
+        job: &GenerationJobWork,
+        key_material: &[u8],
+    ) -> Result<Option<ResolvedUpstream>, AppError> {
+        let row = sqlx::query(
+            "SELECT a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext
+             FROM upstream_accounts a
+             JOIN upstream_credentials c
+               ON c.upstream_account_id = a.id
+              AND c.generation = a.credential_generation
+              AND c.revoked_at IS NULL
+             WHERE a.id = $1 AND a.tenant_id = $2 AND a.status = 'active'",
+        )
+        .bind(job.upstream_account_id.to_string())
+        .bind(job.tenant_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let current_driver: String = row.try_get("driver")?;
+        if current_driver != job.driver {
+            return Ok(None);
+        }
+        let config_json: String = row.try_get("config_json")?;
+        let config: serde_json::Value =
+            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+        let base_url = validate_config(&config)?;
+        let ciphertext: String = row.try_get("credential_ciphertext")?;
+        Ok(Some(ResolvedUpstream {
+            route_id: job.model_route_id.unwrap_or_else(Uuid::nil),
+            account_id: parse_uuid(row.try_get("account_id")?)?,
+            driver: job.driver.clone(),
+            base_url,
+            config,
+            upstream_model: job.upstream_model.clone(),
+            credential: open_credential(&ciphertext, key_material)?,
         }))
     }
 

@@ -637,6 +637,9 @@ pub struct GenerationJobWork {
     pub created_at: i64,
     pub tenant_id: Uuid,
     pub key_id: Uuid,
+    /// Immutable route selected at admission. Historical jobs created before
+    /// the snapshot migration may not have an unambiguous route id.
+    pub model_route_id: Option<Uuid>,
     pub upstream_account_id: Uuid,
     pub reservation: UsageReservation,
     pub public_model: String,
