@@ -76,6 +76,56 @@ pub enum FinishSynchronousImageResult {
 }
 
 impl Database {
+    /// Cheap read-only gate used before replaying plugin transformations. It
+    /// never creates or renews an idempotency owner.
+    pub async fn has_synchronous_image_idempotency(
+        &self,
+        key_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<bool, AppError> {
+        validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
+        Ok(sqlx::query(
+            "SELECT 1 FROM synchronous_image_idempotency WHERE key_id = $1 AND idempotency_key = $2",
+        )
+        .bind(key_id.to_string())
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some())
+    }
+
+    /// Reads an existing claim without creating, renewing, recovering, or
+    /// taking it over. `Claimed` means an expired pending owner still requires
+    /// normal route authorization before the mutating claim/start path runs.
+    pub async fn lookup_synchronous_image_idempotency(
+        &self,
+        key_id: Uuid,
+        idempotency: &GenerationJobIdempotency,
+    ) -> Result<Option<SynchronousImageIdempotencyClaim>, AppError> {
+        validate_generation_job_idempotency(idempotency)?;
+        let row = sqlx::query(
+            "SELECT request_hash, request_id, status, response_status, response_object, error_code, lease_expires_at FROM synchronous_image_idempotency WHERE key_id = $1 AND idempotency_key = $2",
+        )
+        .bind(key_id.to_string())
+        .bind(&idempotency.key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if row.try_get::<String, _>("request_hash")? != idempotency.request_hash {
+            return Err(AppError::BadRequest(
+                "Idempotency-Key was already used for a different image request".into(),
+            ));
+        }
+        if row.try_get::<String, _>("status")? == "pending"
+            && row.try_get::<i64, _>("lease_expires_at")? <= unix_millis()
+        {
+            return Ok(Some(SynchronousImageIdempotencyClaim::Claimed));
+        }
+        synchronous_image_claim_from_row(row).map(Some)
+    }
+
     pub async fn claim_synchronous_image_idempotency(
         &self,
         key_id: Uuid,

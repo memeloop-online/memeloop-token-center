@@ -33,44 +33,55 @@ async fn proxy_openai_image_generation(
     request_json: Value,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    let applied = apply_openai_image_traffic_policy(&state, &key, request_json).await?;
-    let mut request_json = applied.request_json;
-    let model = applied.model;
-    let prompt = request_json
-        .get("prompt")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty() && value.len() <= 32_000)
-        .ok_or_else(|| AppError::BadRequest("prompt is required".into()))?;
-    if prompt.contains('\0') {
-        return Err(AppError::BadRequest("prompt contains invalid data".into()));
-    }
-    let image_count = match request_json.get("n") {
-        None => 1,
-        Some(Value::Number(value)) if value.is_i64() => value
-            .as_i64()
-            .ok_or_else(|| AppError::BadRequest("n must be an integer between 1 and 10".into()))?,
-        Some(_) => {
-            return Err(AppError::BadRequest(
-                "n must be an integer between 1 and 10".into(),
-            ));
+    let downstream_idempotency_key = image_idempotency_key(&headers)?;
+    let existing_idempotency = match downstream_idempotency_key.as_deref() {
+        Some(idempotency_key) => {
+            state
+                .db
+                .has_synchronous_image_idempotency(key.key_id, idempotency_key)
+                .await?
         }
+        None => false,
     };
-    if !(1..=10).contains(&image_count) {
-        return Err(AppError::BadRequest("n must be between 1 and 10".into()));
+    let mut applied = if existing_idempotency {
+        apply_traffic_plugin_for_existing_idempotency(&state, &key, "openai-image", request_json)
+            .await?
+    } else {
+        apply_openai_image_traffic_policy(&state, &key, request_json).await?
+    };
+    let image_count = normalize_openai_image_request(&mut applied.request_json)?;
+    let image_idempotency = downstream_idempotency_key.map(|key| GenerationJobIdempotency {
+        key,
+        request_hash: crate::generation::generation_request_hash(
+            &applied.model,
+            &applied.request_json,
+        ),
+    });
+    if existing_idempotency {
+        match state
+            .db
+            .lookup_synchronous_image_idempotency(
+                key.key_id,
+                image_idempotency.as_ref().ok_or(AppError::Internal)?,
+            )
+            .await?
+        {
+            Some(SynchronousImageIdempotencyClaim::Claimed) | None => {
+                // An expired owner needs takeover, or the row disappeared
+                // between the two read-only probes. Both paths must regain
+                // normal requested/effective route authorization before any
+                // claim can be created or mutated.
+                authorize_applied_traffic_policy(&state, &key, "generation", &applied).await?;
+            }
+            Some(replay) => return image_idempotency_replay_response(&state, replay).await,
+        }
     }
-    request_json["n"] = json!(image_count);
-    let image_idempotency = headers
-        .get("idempotency-key")
-        .map(|value| {
-            let value = value
-                .to_str()
-                .map_err(|_| AppError::BadRequest("Idempotency-Key must be valid ASCII".into()))?;
-            Ok::<_, AppError>(GenerationJobIdempotency {
-                key: value.to_owned(),
-                request_hash: crate::generation::generation_request_hash(&model, &request_json),
-            })
-        })
-        .transpose()?;
+    let AppliedTraffic {
+        request_json,
+        model,
+        upstream_account_hint,
+        ..
+    } = applied;
     let request_id = Uuid::now_v7();
     if let Some(idempotency) = image_idempotency.as_ref() {
         match state
@@ -91,7 +102,7 @@ async fn proxy_openai_image_generation(
                 &model,
                 "generation",
                 RouteSelectionOptions {
-                    upstream_account_hint: applied.upstream_account_hint,
+                    upstream_account_hint,
                     selection_seed: request_id,
                 },
                 state.config.key_pepper.as_bytes(),
@@ -276,6 +287,45 @@ async fn apply_openai_image_traffic_policy(
     .await
 }
 
+fn image_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, AppError> {
+    headers
+        .get("idempotency-key")
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| AppError::BadRequest("Idempotency-Key must be valid ASCII".into()))
+        })
+        .transpose()
+}
+
+fn normalize_openai_image_request(request_json: &mut Value) -> Result<i64, AppError> {
+    let prompt = request_json
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 32_000)
+        .ok_or_else(|| AppError::BadRequest("prompt is required".into()))?;
+    if prompt.contains('\0') {
+        return Err(AppError::BadRequest("prompt contains invalid data".into()));
+    }
+    let image_count = match request_json.get("n") {
+        None => 1,
+        Some(Value::Number(value)) if value.is_i64() => value
+            .as_i64()
+            .ok_or_else(|| AppError::BadRequest("n must be an integer between 1 and 10".into()))?,
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "n must be an integer between 1 and 10".into(),
+            ));
+        }
+    };
+    if !(1..=10).contains(&image_count) {
+        return Err(AppError::BadRequest("n must be between 1 and 10".into()));
+    }
+    request_json["n"] = json!(image_count);
+    Ok(image_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +333,39 @@ mod tests {
         config::Config,
         db::{CreateGroupInput, GroupKind, ReplaceGroupMembersInput},
     };
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    async fn post_openai_image(
+        state: &AppState,
+        credential: &str,
+        idempotency_key: &str,
+        prompt: &str,
+    ) -> Response {
+        router_for_role(state.clone(), RuntimeRole::Gateway)
+            .oneshot(
+                Request::post("/v1/images/generations")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                    .header("idempotency-key", idempotency_key)
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "model": "image-replay-model",
+                            "prompt": prompt,
+                            "n": 1,
+                            "size": "1024x1024"
+                        }))
+                        .expect("image request JSON"),
+                    ))
+                    .expect("image request"),
+            )
+            .await
+            .expect("image response")
+    }
 
     #[tokio::test]
     async fn openai_images_use_generation_grants_and_ignore_credential_groups() {
@@ -413,5 +496,158 @@ mod tests {
             .await,
             Err(AppError::Forbidden)
         ));
+    }
+
+    #[tokio::test]
+    async fn completed_image_replay_precedes_route_state_but_not_key_authentication() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "created": 1,
+                "data": [{"b64_json": "bW9jay1wbmc="}]
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("image-replay-order.db").display()
+        );
+        let state = AppState::initialize(Config::for_test(database_url))
+            .await
+            .expect("test state");
+        let tenant = "image-replay-order";
+        let upstream_account = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.to_owned(),
+                    name: "image replay upstream".to_owned(),
+                    driver: "http-json".to_owned(),
+                    config: json!({
+                        "base_url": upstream.uri(),
+                        "network_scope": "private"
+                    }),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .expect("upstream account");
+        let route = state
+            .db
+            .create_model_route(CreateModelRouteInput {
+                tenant_external_id: tenant.to_owned(),
+                public_model: "image-replay-model".to_owned(),
+                upstream_account_id: upstream_account.id,
+                upstream_model: "image-replay-upstream".to_owned(),
+                protocol: "generation".to_owned(),
+                priority: 0,
+            })
+            .await
+            .expect("generation route");
+        state
+            .db
+            .upsert_generation_price("image-replay-model", "USD", "image", Decimal::new(3, 1))
+            .await
+            .expect("generation price");
+        let key_input = |alias: &str| CreateKeyInput {
+            tenant_external_id: tenant.to_owned(),
+            principal_external_id: alias.to_owned(),
+            alias: alias.to_owned(),
+            currency: "USD".to_owned(),
+            policy: KeyPolicy::default(),
+            initial_balance: Decimal::ONE,
+            idempotency_key: None,
+        };
+        let granted = state
+            .db
+            .create_key_with_routing(
+                key_input("replay-granted"),
+                &[route.id],
+                &[],
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .expect("granted credential");
+        let ungranted = state
+            .db
+            .create_key_with_routing(
+                key_input("replay-ungranted"),
+                &[],
+                &[],
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .expect("ungranted credential");
+
+        let first = post_openai_image(
+            &state,
+            &granted.key,
+            "stable-image-replay",
+            "draw a compact fox",
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .expect("first image response");
+
+        state
+            .db
+            .set_model_route_enabled(route.id, tenant, false, route.updated_at)
+            .await
+            .expect("disable completed route");
+        let replay = post_openai_image(
+            &state,
+            &granted.key,
+            "stable-image-replay",
+            "draw a compact fox",
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(replay.into_body(), 64 * 1024)
+                .await
+                .expect("replayed image response"),
+            first_body
+        );
+
+        let mismatch = post_openai_image(
+            &state,
+            &granted.key,
+            "stable-image-replay",
+            "draw a different fox",
+        )
+        .await;
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+
+        let new_ungranted = post_openai_image(
+            &state,
+            &ungranted.key,
+            "new-disabled-image",
+            "draw a compact fox",
+        )
+        .await;
+        assert_eq!(new_ungranted.status(), StatusCode::FORBIDDEN);
+
+        state
+            .db
+            .set_key_status(granted.key_id, "suspended")
+            .await
+            .expect("suspend credential");
+        let suspended = post_openai_image(
+            &state,
+            &granted.key,
+            "stable-image-replay",
+            "draw a compact fox",
+        )
+        .await;
+        assert_eq!(suspended.status(), StatusCode::UNAUTHORIZED);
     }
 }

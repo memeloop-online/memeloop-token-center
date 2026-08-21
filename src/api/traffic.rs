@@ -132,6 +132,7 @@ pub(super) fn inject_controlled_output_ceiling(
 
 pub(super) struct AppliedTraffic {
     pub(super) request_json: Value,
+    pub(super) requested_model: String,
     pub(super) model: String,
     pub(super) upstream_account_hint: Option<Uuid>,
 }
@@ -163,29 +164,92 @@ pub(super) async fn apply_traffic_policy(
     protocols: TrafficPolicyProtocols<'_>,
     original_request_json: Value,
 ) -> Result<AppliedTraffic, AppError> {
-    if !original_request_json.is_object() {
+    let requested_model = requested_traffic_model(&original_request_json)?;
+    authorize_traffic_model(state, key, protocols.routing, &requested_model).await?;
+    let applied = apply_traffic_plugin(
+        state,
+        key,
+        protocols.client,
+        original_request_json,
+        requested_model,
+    )
+    .await?;
+    authorize_traffic_model(state, key, protocols.routing, &applied.model).await?;
+    Ok(applied)
+}
+
+/// Replays must reproduce the same plugin rewrite before comparing the
+/// effective request hash. This entry point is only used after the database
+/// has confirmed that this key already owns the supplied Idempotency-Key; it
+/// deliberately performs no route authorization itself.
+pub(super) async fn apply_traffic_plugin_for_existing_idempotency(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    client_protocol: &str,
+    original_request_json: Value,
+) -> Result<AppliedTraffic, AppError> {
+    let requested_model = requested_traffic_model(&original_request_json)?;
+    apply_traffic_plugin(
+        state,
+        key,
+        client_protocol,
+        original_request_json,
+        requested_model,
+    )
+    .await
+}
+
+pub(super) async fn authorize_applied_traffic_policy(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    routing_protocol: &str,
+    applied: &AppliedTraffic,
+) -> Result<(), AppError> {
+    authorize_traffic_model(state, key, routing_protocol, &applied.requested_model).await?;
+    if applied.model != applied.requested_model {
+        authorize_traffic_model(state, key, routing_protocol, &applied.model).await?;
+    }
+    Ok(())
+}
+
+async fn authorize_traffic_model(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    routing_protocol: &str,
+    model: &str,
+) -> Result<(), AppError> {
+    if state
+        .db
+        .credential_has_available_route(key.key_id, key.tenant_id, model, routing_protocol)
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden)
+    }
+}
+
+fn requested_traffic_model(request_json: &Value) -> Result<String, AppError> {
+    if !request_json.is_object() {
         return Err(AppError::BadRequest(
             "request body must be a JSON object".into(),
         ));
     }
-    let requested_model = original_request_json
+    request_json
         .get("model")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty() && value.len() <= 200)
-        .ok_or_else(|| AppError::BadRequest("model is required".into()))?
-        .to_owned();
-    if !state
-        .db
-        .credential_has_available_route(
-            key.key_id,
-            key.tenant_id,
-            &requested_model,
-            protocols.routing,
-        )
-        .await?
-    {
-        return Err(AppError::Forbidden);
-    }
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::BadRequest("model is required".into()))
+}
+
+async fn apply_traffic_plugin(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    client_protocol: &str,
+    original_request_json: Value,
+    requested_model: String,
+) -> Result<AppliedTraffic, AppError> {
     let plugins = state.plugins.clone();
     let plugin_configurations = plugins
         .resolved_traffic_configurations(key.tenant_id)
@@ -195,7 +259,7 @@ pub(super) async fn apply_traffic_policy(
         tenant_id: key.tenant_id.to_string(),
         principal_id: key.principal_id.to_string(),
         key_id: key.key_id.to_string(),
-        protocol: protocols.client.to_owned(),
+        protocol: client_protocol.to_owned(),
         model: requested_model.clone(),
         config_json: "{}".to_owned(),
     };
@@ -232,18 +296,11 @@ pub(super) async fn apply_traffic_policy(
     let model = plugin_decision
         .model
         .or(rewritten_model)
-        .unwrap_or(requested_model);
+        .unwrap_or_else(|| requested_model.clone());
     if model.trim().is_empty() || model.len() > 200 {
         return Err(AppError::Upstream(
             "plugin returned an invalid model".into(),
         ));
-    }
-    if !state
-        .db
-        .credential_has_available_route(key.key_id, key.tenant_id, &model, protocols.routing)
-        .await?
-    {
-        return Err(AppError::Forbidden);
     }
     request_json["model"] = Value::String(model.clone());
     if serde_json::to_vec(&request_json)
@@ -265,6 +322,7 @@ pub(super) async fn apply_traffic_policy(
         .transpose()?;
     Ok(AppliedTraffic {
         request_json,
+        requested_model,
         model,
         upstream_account_hint,
     })
