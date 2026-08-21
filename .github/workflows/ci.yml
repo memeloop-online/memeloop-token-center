@@ -590,6 +590,8 @@ jobs:
         run: tests/ops/helm-packaging-contract.sh
       - name: Validate release workflow and Docker build contracts
         run: tests/ops/release-packaging-contract.sh
+      - name: Enforce focused source-module boundaries
+        run: tests/ops/source-module-size-contract.sh
       - name: Build and exercise the hardened importer image
         run: tests/ops/importer-image-contract.sh
       - name: Build and exercise the hardened plugin installer image
