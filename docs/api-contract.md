@@ -81,8 +81,8 @@ Use `GET /internal/v1/accounts/{account_id}/ledger` to reconcile grant, reversal
 
 Policy replacement is whole-resource `PUT`, not a merge patch. Send every field that must be retained.
 
-- `allowed_models: []` denies every model.
-- `allowed_models: ["*"]` permits every priced and routed model.
+- Model access is granted only through stable `route_ids` and `route_group_ids`.
+  Empty grant arrays deny every model; later routes are never authorized implicitly.
 - RPM, TPM and maximum concurrency must be positive.
 - Daily, rolling-weekly and lifetime budgets are non-negative decimal strings in the credential currency, or `null` for no limit.
 

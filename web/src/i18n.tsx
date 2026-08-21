@@ -548,7 +548,7 @@ export const translationCatalogs: Readonly<Record<Locale, Readonly<Record<string
 const schemaFields: Record<string, [string, string]> = {
   tenant_external_id: ['租户', 'Tenant'], principal_external_id: ['用户主体', 'Principal'], alias: ['凭据别名', 'Credential alias'],
   currency: ['币种', 'Currency'], initial_balance: ['初始额度', 'Initial credit'], policy: ['权限与限流策略', 'Policy and rate limits'],
-  allowed_models: ['允许模型', 'Allowed models'], requests_per_minute: ['每分钟请求数', 'Requests per minute'],
+  requests_per_minute: ['每分钟请求数', 'Requests per minute'],
   tokens_per_minute: ['每分钟 Token 数', 'Tokens per minute'], max_concurrency: ['最大并发数', 'Maximum concurrency'],
   daily_budget: ['每日额度', 'Daily budget'], weekly_budget: ['每周额度', 'Weekly budget'], lifetime_budget: ['总可用额度', 'Lifetime budget'],
   base_url: ['基础 URL', 'Base URL'], image_api_mode: ['图片生成接口', 'Image generation API'], image_main_model: ['图片生成模型', 'Image generation model'],

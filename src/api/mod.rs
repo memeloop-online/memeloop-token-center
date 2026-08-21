@@ -122,7 +122,7 @@ use crate::{
         SynchronousImageIdempotencyClaim, UpdateUpstreamAccountInput, unix_millis,
     },
     error::AppError,
-    model::{AuthenticatedKey, AuthenticatedService, KeyPolicy, TokenUsage},
+    model::{AuthenticatedKey, AuthenticatedService, KeyPolicy, KeyPolicyInput, TokenUsage},
     network::{self, OutboundScope},
     oauth::{
         CursorOAuthEndpoints, CursorPollResult, OAuthReauthorizationTarget, StartCursorLogin,

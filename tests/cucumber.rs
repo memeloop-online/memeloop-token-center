@@ -6240,9 +6240,9 @@ async fn assert_cpamp_import_state(
     assert_eq!(identity.get::<String, _>("alias"), "Fixture Linux Codex");
     assert_eq!(identity.get::<i64, _>("credential_generation"), 0);
     assert!(
-        identity
+        !identity
             .get::<String, _>("policy_json")
-            .contains("\"allowed_models\":[\"*\"]")
+            .contains("allowed_models")
     );
     let price = sqlx::query(
         "SELECT input_micros_per_million, output_micros_per_million, source FROM model_prices WHERE model = 'fixture-model' AND currency = 'USD'",

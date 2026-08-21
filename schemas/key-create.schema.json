@@ -16,18 +16,29 @@
       "default": "0",
       "title": "Initial credit"
     },
+    "route_ids": {
+      "title": "Model routes",
+      "description": "Exact model routes granted to this credential. An empty array grants no routes.",
+      "type": "array",
+      "maxItems": 500,
+      "uniqueItems": true,
+      "items": { "type": "string", "format": "uuid" },
+      "default": []
+    },
+    "route_group_ids": {
+      "title": "Route groups",
+      "description": "Route groups granted to this credential. An empty array grants no route groups.",
+      "type": "array",
+      "maxItems": 500,
+      "uniqueItems": true,
+      "items": { "type": "string", "format": "uuid" },
+      "default": []
+    },
     "policy": {
       "title": "Policy",
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "allowed_models": {
-          "title": "Allowed models",
-          "type": "array",
-          "maxItems": 500,
-          "items": { "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\u0000-\\u001F\\u007F]+$" },
-          "default": []
-        },
         "requests_per_minute": { "type": "integer", "minimum": 1, "maximum": 4294967295, "default": 60 },
         "tokens_per_minute": { "type": "integer", "minimum": 1, "maximum": 9007199254740991, "default": 100000 },
         "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 4294967295, "default": 4 },

@@ -1067,7 +1067,7 @@ async fn sqlite_routing_groups_are_tenant_safe_and_backfill_legacy_route_candida
         "CREATE TABLE tenants (id TEXT PRIMARY KEY)",
         "CREATE TABLE upstream_accounts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
         "CREATE TABLE model_routes (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, public_model TEXT NOT NULL, upstream_account_id TEXT NOT NULL, upstream_model TEXT NOT NULL, protocol TEXT NOT NULL, priority BIGINT NOT NULL, enabled BIGINT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, UNIQUE(tenant_id, public_model, protocol, priority))",
-        "CREATE TABLE key_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL)",
+        "CREATE TABLE key_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, policy_json TEXT NOT NULL, created_at BIGINT NOT NULL)",
         "CREATE TABLE request_records (id TEXT PRIMARY KEY, model_route_id TEXT)",
     ] {
         sqlx::query(statement)
@@ -1091,6 +1091,7 @@ async fn sqlite_routing_groups_are_tenant_safe_and_backfill_legacy_route_candida
         .unwrap();
     sqlx::query(
         "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ('route-a', 'tenant-a', 'public-model', 'account-a', 'upstream-model-a', 'openai-responses', 10, 1, 100, 100)",
+        "INSERT INTO key_records (id, tenant_id, policy_json, created_at) VALUES ('key-a', 'tenant-a', '{\"allowed_models\":[\"public-model\"]}', 100)",
     )
     .execute(&database.pool)
     .await
@@ -1291,6 +1292,9 @@ async fn postgres_routing_groups_drop_legacy_route_uniqueness_and_backfill_candi
     apply_migration_range(&mut transaction, POSTGRES_MIGRATIONS, 43, 43)
         .await
         .unwrap();
+    super::super::migrations::backfill_routing_grants_from_legacy_policy(&mut transaction)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ('route-b', 'tenant-a', 'public-model', 'account-a', 'upstream-model-b', 'openai-responses', 10, 1, 101, 101)",
     )
@@ -1307,6 +1311,22 @@ async fn postgres_routing_groups_drop_legacy_route_uniqueness_and_backfill_candi
         candidate,
         ("account-a".into(), "upstream-model-a".into(), 100)
     );
+    apply_migration_range(&mut transaction, POSTGRES_MIGRATIONS, 52, 52)
+        .await
+        .unwrap();
+    let policy_json: String =
+        sqlx::query_scalar("SELECT policy_json FROM key_records WHERE id = 'key-a'")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+    assert_eq!(policy_json, "{}");
+    let frozen_grant: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM routing_grants WHERE key_id = 'key-a' AND model_route_id = 'route-a'",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(frozen_grant, 1);
     transaction.rollback().await.unwrap();
 }
 
@@ -1412,4 +1432,56 @@ async fn sqlite_legacy_model_policy_backfill_is_exact_bounded_and_fail_closed() 
             .await
             .unwrap();
     assert_eq!(bad_grants, 0);
+
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 52, 52)
+        .await
+        .expect_err("malformed historical policy must abort v52");
+    transaction.rollback().await.unwrap();
+    let prematurely_applied: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 52")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(prematurely_applied, 0);
+
+    sqlx::query("DELETE FROM key_records WHERE id = 'key-z-bad'")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 52, 52)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    for key_id in ["key-empty", "key-exact", "key-wildcard"] {
+        let policy_json: String =
+            sqlx::query_scalar("SELECT policy_json FROM key_records WHERE id = $1")
+                .bind(key_id)
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            policy_json, "{}",
+            "v52 must retire the legacy policy source"
+        );
+    }
+    let exact_routes_after_v52: Vec<String> = sqlx::query_scalar(
+        "SELECT model_route_id FROM routing_grants WHERE key_id = 'key-exact' ORDER BY model_route_id",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(exact_routes_after_v52, ["route-a"]);
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 52, 52)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    let applied: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 52")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(applied, 1, "v52 must be idempotent");
 }

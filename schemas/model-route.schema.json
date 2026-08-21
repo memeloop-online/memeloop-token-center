@@ -2,15 +2,121 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://memeloop.dev/token-center/schemas/model-route.schema.json",
   "title": "Model route",
+  "description": "Maps one public model to eligible upstream accounts. Explicit exclusions always win over direct accounts and included provider groups.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["public_model", "upstream_account_id", "upstream_model", "protocol"],
+  "required": ["public_model", "upstream_model", "protocol"],
+  "anyOf": [
+    { "required": ["upstream_account_id"] },
+    {
+      "required": ["upstream_account_ids"],
+      "properties": { "upstream_account_ids": { "minItems": 1 } }
+    },
+    {
+      "required": ["included_provider_group_ids"],
+      "properties": { "included_provider_group_ids": { "minItems": 1 } }
+    }
+  ],
   "properties": {
-    "tenant_external_id": { "type": "string", "default": "default" },
-    "public_model": { "type": "string", "minLength": 1 },
-    "upstream_account_id": { "type": "string", "format": "uuid" },
-    "upstream_model": { "type": "string", "minLength": 1 },
-    "protocol": { "enum": ["openai", "anthropic", "generation"] },
-    "priority": { "type": "integer", "default": 0 }
+    "tenant_external_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$",
+      "default": "default",
+      "title": "Tenant"
+    },
+    "public_model": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$",
+      "title": "Public model"
+    },
+    "upstream_account_id": {
+      "type": "string",
+      "format": "uuid",
+      "deprecated": true,
+      "description": "Legacy single-account input. New clients use upstream_account_ids."
+    },
+    "upstream_account_ids": {
+      "type": "array",
+      "maxItems": 500,
+      "uniqueItems": true,
+      "items": { "type": "string", "format": "uuid" },
+      "default": [],
+      "title": "Upstream accounts"
+    },
+    "upstream_model": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$",
+      "title": "Upstream model",
+      "description": "Autocomplete from the selected accounts' current model catalogs. A value absent from every selected catalog requires custom_model_confirmed=true."
+    },
+    "protocol": {
+      "enum": ["openai", "anthropic", "generation"],
+      "title": "Protocol"
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": -1000000,
+      "maximum": 1000000,
+      "default": 0
+    },
+    "included_provider_group_ids": {
+      "type": "array",
+      "maxItems": 500,
+      "uniqueItems": true,
+      "items": { "type": "string", "format": "uuid" },
+      "default": [],
+      "title": "Included provider groups"
+    },
+    "excluded_provider_group_ids": {
+      "type": "array",
+      "maxItems": 500,
+      "uniqueItems": true,
+      "items": { "type": "string", "format": "uuid" },
+      "default": [],
+      "title": "Excluded provider groups",
+      "description": "Exclusions take precedence over direct accounts and included provider groups."
+    },
+    "route_group_ids": {
+      "type": "array",
+      "maxItems": 500,
+      "uniqueItems": true,
+      "items": { "type": "string", "format": "uuid" },
+      "default": [],
+      "title": "Existing route groups"
+    },
+    "route_group_names": {
+      "type": "array",
+      "maxItems": 500,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100,
+        "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+      },
+      "default": [],
+      "title": "New route groups",
+      "description": "Unknown normalized names are created atomically with the route."
+    },
+    "granted_credential_ids": {
+      "type": "array",
+      "maxItems": 500,
+      "uniqueItems": true,
+      "items": { "type": "string", "format": "uuid" },
+      "default": [],
+      "title": "Granted credentials"
+    },
+    "custom_model_confirmed": {
+      "type": "boolean",
+      "default": false,
+      "title": "Confirm custom upstream model",
+      "description": "Required when upstream_model is not present in the selected accounts' current catalogs."
+    }
   }
 }

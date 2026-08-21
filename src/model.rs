@@ -7,7 +7,11 @@ pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyPolicy {
-    #[serde(default)]
+    /// Migration-only source retained so old in-tree fixtures keep compiling.
+    /// It is deliberately absent from every serialized or deserialized public
+    /// policy contract; normalized routing grants are the sole authority.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
     pub allowed_models: Vec<String>,
     #[serde(default = "default_rpm")]
     pub requests_per_minute: u32,
@@ -18,6 +22,55 @@ pub struct KeyPolicy {
     pub daily_budget: Option<String>,
     pub weekly_budget: Option<String>,
     pub lifetime_budget: Option<String>,
+}
+
+/// Strict public policy input. Routing authorization is intentionally absent:
+/// callers grant stable route or route-group IDs alongside the credential.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyPolicyInput {
+    #[serde(default = "default_rpm")]
+    pub requests_per_minute: u32,
+    #[serde(default = "default_tpm")]
+    pub tokens_per_minute: u64,
+    #[serde(default = "default_concurrency")]
+    pub max_concurrency: u32,
+    pub daily_budget: Option<String>,
+    pub weekly_budget: Option<String>,
+    pub lifetime_budget: Option<String>,
+}
+
+impl Default for KeyPolicyInput {
+    fn default() -> Self {
+        KeyPolicy::default().into()
+    }
+}
+
+impl From<KeyPolicyInput> for KeyPolicy {
+    fn from(value: KeyPolicyInput) -> Self {
+        Self {
+            allowed_models: Vec::new(),
+            requests_per_minute: value.requests_per_minute,
+            tokens_per_minute: value.tokens_per_minute,
+            max_concurrency: value.max_concurrency,
+            daily_budget: value.daily_budget,
+            weekly_budget: value.weekly_budget,
+            lifetime_budget: value.lifetime_budget,
+        }
+    }
+}
+
+impl From<KeyPolicy> for KeyPolicyInput {
+    fn from(value: KeyPolicy) -> Self {
+        Self {
+            requests_per_minute: value.requests_per_minute,
+            tokens_per_minute: value.tokens_per_minute,
+            max_concurrency: value.max_concurrency,
+            daily_budget: value.daily_budget,
+            weekly_budget: value.weekly_budget,
+            lifetime_budget: value.lifetime_budget,
+        }
+    }
 }
 
 impl Default for KeyPolicy {
@@ -31,14 +84,6 @@ impl Default for KeyPolicy {
             weekly_budget: None,
             lifetime_budget: None,
         }
-    }
-}
-
-impl KeyPolicy {
-    pub fn allows_model(&self, model: &str) -> bool {
-        self.allowed_models
-            .iter()
-            .any(|allowed| allowed == "*" || allowed == model)
     }
 }
 

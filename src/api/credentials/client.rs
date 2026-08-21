@@ -10,7 +10,7 @@ pub(in crate::api) struct CreateKeyRequest {
     #[serde(default = "default_currency")]
     currency: String,
     #[serde(default)]
-    policy: KeyPolicy,
+    policy: KeyPolicyInput,
     #[serde(default = "zero_amount")]
     initial_balance: String,
     #[serde(default)]
@@ -57,7 +57,7 @@ pub(in crate::api) async fn create_key(
                 principal_external_id: body.principal_external_id,
                 alias: body.alias,
                 currency: body.currency,
-                policy: body.policy,
+                policy: body.policy.into(),
                 initial_balance,
                 idempotency_key,
             },
@@ -196,13 +196,15 @@ pub(in crate::api) async fn update_key_policy(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(key_id): Path<Uuid>,
-    Json(policy): Json<KeyPolicy>,
+    Json(policy): Json<KeyPolicyInput>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "keys:write").await?;
     if let Some(tenant) = service.tenant_external_id.as_deref() {
         state.db.require_key_tenant(key_id, tenant).await?;
     }
-    Ok(Json(state.db.update_key_policy(key_id, policy).await?))
+    Ok(Json(
+        state.db.update_key_policy(key_id, policy.into()).await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]

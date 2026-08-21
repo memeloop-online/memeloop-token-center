@@ -487,6 +487,9 @@ impl Database {
         .execute(&mut *tx)
         .await?;
 
+        // Only migration/import callers can populate this hidden field. The
+        // public DTO has no model-name allowlist, so all new public credentials
+        // reach this branch with an empty compatibility snapshot.
         let legacy_allowed_models = (route_ids.is_empty() && route_group_ids.is_empty())
             .then_some(input.policy.allowed_models.as_slice());
         replace_key_routing_grants_in_transaction(
@@ -1117,17 +1120,6 @@ pub(crate) fn validate_key_policy(policy: &KeyPolicy) -> Result<(), AppError> {
             "RPM, TPM, and maximum concurrency must be positive".into(),
         ));
     }
-    if policy.allowed_models.len() > 500
-        || policy.allowed_models.iter().any(|model| {
-            model.trim().is_empty()
-                || model.chars().count() > 200
-                || model.chars().any(char::is_control)
-        })
-    {
-        return Err(AppError::BadRequest(
-            "allowed models must contain at most 500 non-empty model names".into(),
-        ));
-    }
     if policy.tokens_per_minute > JSON_SAFE_INTEGER_MAX {
         return Err(AppError::BadRequest(format!(
             "TPM must not exceed the JSON safe integer maximum {JSON_SAFE_INTEGER_MAX}"
@@ -1272,7 +1264,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authenticated.account_id, issued.account_id);
-        assert!(authenticated.policy.allows_model("codex-test"));
+        assert_eq!(authenticated.policy.requests_per_minute, 60);
 
         let service = database
             .create_service_token(

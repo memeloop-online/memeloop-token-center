@@ -25,14 +25,11 @@ struct CloudSubscriptionWebhook {
     desired: Option<String>,
     version: i64,
     status: CloudSubscriptionStatus,
-    policy: KeyPolicy,
-    /// Normalized route grants. Presence (including an empty array) opts in to
-    /// the grants contract; only older senders that omit both fields use the
-    /// one-time `allowed_models` compatibility snapshot.
+    policy: KeyPolicyInput,
     #[serde(default)]
-    route_ids: Option<Vec<Uuid>>,
+    route_ids: Vec<Uuid>,
     #[serde(default)]
-    route_group_ids: Option<Vec<Uuid>>,
+    route_group_ids: Vec<Uuid>,
     #[serde(default)]
     proration: Option<Value>,
 }
@@ -235,7 +232,8 @@ pub(in crate::api) async fn sync_memeloop_cloud_subscription(
         .map_err(|_| AppError::BadRequest("request body must match the webhook schema".into()))?;
     let canonical = serde_json::to_vec(&payload).map_err(|_| AppError::Internal)?;
     let event_digest = digest(&[canonical.as_slice()]);
-    crate::db::validate_key_policy(&payload.policy)?;
+    let policy: KeyPolicy = payload.policy.clone().into();
+    crate::db::validate_key_policy(&policy)?;
     // Validate every entitlement field before creating durable identity rows.
     // The placeholder account is replaced only after the stable principal has
     // been resolved.
@@ -255,33 +253,17 @@ pub(in crate::api) async fn sync_memeloop_cloud_subscription(
     let reconciliation_key = format!("memeloop-cloud-event:{event_key_hash}");
     let routing = match payload.status {
         CloudSubscriptionStatus::Cancelled => {
-            if payload
-                .route_ids
-                .as_ref()
-                .is_some_and(|ids| !ids.is_empty())
-                || payload
-                    .route_group_ids
-                    .as_ref()
-                    .is_some_and(|ids| !ids.is_empty())
-            {
+            if !payload.route_ids.is_empty() || !payload.route_group_ids.is_empty() {
                 return Err(AppError::BadRequest(
                     "cancelled subscription cannot grant model routes".into(),
                 ));
             }
             CloudRoutingGrantSnapshot::DenyAll
         }
-        CloudSubscriptionStatus::Active => {
-            if payload.route_ids.is_some() || payload.route_group_ids.is_some() {
-                CloudRoutingGrantSnapshot::Explicit {
-                    route_ids: payload.route_ids.clone().unwrap_or_default(),
-                    route_group_ids: payload.route_group_ids.clone().unwrap_or_default(),
-                }
-            } else {
-                CloudRoutingGrantSnapshot::LegacyAllowedModels(
-                    payload.policy.allowed_models.clone(),
-                )
-            }
-        }
+        CloudSubscriptionStatus::Active => CloudRoutingGrantSnapshot::Explicit {
+            route_ids: payload.route_ids.clone(),
+            route_group_ids: payload.route_group_ids.clone(),
+        },
     };
     let result = state
         .db
@@ -295,7 +277,7 @@ pub(in crate::api) async fn sync_memeloop_cloud_subscription(
                 provisioning_idempotency_key: provisioning_key,
                 reconciliation_idempotency_key: reconciliation_key,
                 operation,
-                policy: payload.policy,
+                policy,
                 routing,
                 audit: CloudSubscriptionEventInput {
                     tenant_external_id: payload.tenant_external_id.clone(),

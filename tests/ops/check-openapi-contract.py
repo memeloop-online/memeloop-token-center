@@ -579,8 +579,8 @@ def validate_product_contracts(document: dict[str, Any]) -> None:
     policy_properties = policy.get("properties", {})
     if policy_properties.get("tokens_per_minute", {}).get("maximum") != 9_007_199_254_740_991:
         raise ContractFailure("credential TPM must remain JSON-safe")
-    if policy_properties.get("allowed_models", {}).get("maxItems") != 500:
-        raise ContractFailure("credential model allowlist bound changed")
+    if "allowed_models" in policy_properties:
+        raise ContractFailure("legacy allowed_models leaked into the public credential policy")
 
     usage_rejected = document.get("components", {}).get("responses", {}).get("UsageRejected", {})
     if "Retry-After" not in usage_rejected.get("headers", {}):

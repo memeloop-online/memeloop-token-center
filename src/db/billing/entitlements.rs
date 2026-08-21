@@ -53,9 +53,6 @@ pub enum CloudRoutingGrantSnapshot {
         route_ids: Vec<Uuid>,
         route_group_ids: Vec<Uuid>,
     },
-    /// Compatibility for older Cloud senders. Models are resolved to the
-    /// tenant's routes once, while this transaction is committed.
-    LegacyAllowedModels(Vec<String>),
     /// Cancellation always removes authorization regardless of payload data.
     DenyAll,
 }
@@ -346,10 +343,6 @@ impl Database {
         }
 
         if active_snapshot {
-            // `allowed_models` remains accepted only as an input compatibility
-            // source. Clearing it before persistence prevents it becoming a
-            // second runtime authority beside normalized grants.
-            input.policy.allowed_models.clear();
             let policy_json =
                 serde_json::to_string(&input.policy).map_err(|_| AppError::Internal)?;
             let updated = sqlx::query(
@@ -369,19 +362,16 @@ impl Database {
             effective_policy = input.policy;
         }
 
-        let (route_ids, route_group_ids, legacy_models) = if active_snapshot {
+        let (route_ids, route_group_ids) = if active_snapshot {
             match &input.routing {
                 CloudRoutingGrantSnapshot::Explicit {
                     route_ids,
                     route_group_ids,
-                } => (route_ids.as_slice(), route_group_ids.as_slice(), None),
-                CloudRoutingGrantSnapshot::LegacyAllowedModels(models) => {
-                    (&[][..], &[][..], Some(models.as_slice()))
-                }
-                CloudRoutingGrantSnapshot::DenyAll => (&[][..], &[][..], None),
+                } => (route_ids.as_slice(), route_group_ids.as_slice()),
+                CloudRoutingGrantSnapshot::DenyAll => (&[][..], &[][..]),
             }
         } else {
-            (&[][..], &[][..], None)
+            (&[][..], &[][..])
         };
         replace_key_routing_grants_in_transaction(
             &mut tx,
@@ -389,7 +379,7 @@ impl Database {
             credential.key_id,
             route_ids,
             route_group_ids,
-            legacy_models,
+            None,
             now,
         )
         .await?;

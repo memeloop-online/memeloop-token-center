@@ -278,6 +278,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "logical session usage rollups",
         sql: include_str!("../../../migrations/common/0051_session_usage_rollups.sql"),
     },
+    Migration {
+        version: 52,
+        name: "retire legacy allowed model policies",
+        sql: include_str!("../../../migrations/sqlite/0052_retire_allowed_models.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -542,6 +547,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         name: "logical session usage rollups",
         sql: include_str!("../../../migrations/common/0051_session_usage_rollups.sql"),
     },
+    Migration {
+        version: 52,
+        name: "retire legacy allowed model policies",
+        sql: include_str!("../../../migrations/postgres/0052_retire_allowed_models.sql"),
+    },
 ];
 
 impl Database {
@@ -625,10 +635,13 @@ impl Database {
         )
         .execute(&mut *transaction)
         .await?;
-        apply_migration_range(&mut transaction, migrations, 2, i64::MAX).await?;
+        // v43 freezes the legacy model-name policy into exact route IDs. It
+        // must complete before v52 removes that legacy field from policy JSON.
+        apply_migration_range(&mut transaction, migrations, 2, 43).await?;
         if routing_groups_need_backfill {
             backfill_routing_grants_from_legacy_policy(&mut transaction).await?;
         }
+        apply_migration_range(&mut transaction, migrations, 44, i64::MAX).await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             maintain_postgres_partitions(&mut transaction).await?;
         }

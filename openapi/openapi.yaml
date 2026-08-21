@@ -3849,12 +3849,6 @@ components:
       type: object
       additionalProperties: false
       properties:
-        allowed_models:
-          type: array
-          maxItems: 500
-          description: Empty denies every model. Use `*` to permit all priced/routed models.
-          items: { type: string, minLength: 1, maxLength: 200, pattern: '^[^\x00-\x1F\x7F]+$' }
-          default: []
         requests_per_minute: { type: integer, format: int64, minimum: 1, maximum: 4294967295, default: 60 }
         tokens_per_minute: { type: integer, format: int64, minimum: 1, maximum: 9007199254740991, default: 100000 }
         max_concurrency: { type: integer, format: int64, minimum: 1, maximum: 4294967295, default: 4 }
@@ -5171,13 +5165,15 @@ components:
           maxItems: 500
           uniqueItems: true
           items: { type: string, format: uuid }
-          description: Exact model-route grants. Presence, including an empty array, selects the normalized grants contract.
+          default: []
+          description: Exact model-route grants. Empty or omitted denies exact-route access.
         route_group_ids:
           type: array
           maxItems: 500
           uniqueItems: true
           items: { type: string, format: uuid }
-          description: Route-group grants. Presence, including an empty array, selects the normalized grants contract.
+          default: []
+          description: Route-group grants. Empty or omitted denies route-group access.
         proration:
           description: Optional active-plan evidence; canonical serialized size, including the event digest, is limited to 4 KiB.
     ProvisionedCloudCredential:

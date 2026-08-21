@@ -468,7 +468,7 @@ INSERT INTO key_records
   (id, tenant_id, principal_id, account_id, alias, currency, policy_json,
    status, credential_generation, created_at, updated_at)
 SELECT i.key_id, t.id, p.id, i.account_id, i.alias, 'USD',
-       '{"allowed_models":["*"],"requests_per_minute":60,"tokens_per_minute":1000000,"max_concurrency":4,"daily_budget":null,"weekly_budget":null,"lifetime_budget":null}',
+       '{"requests_per_minute":60,"tokens_per_minute":1000000,"max_concurrency":4,"daily_budget":null,"weekly_budget":null,"lifetime_budget":null}',
        'active', 0,
        (extract(epoch from clock_timestamp()) * 1000)::bigint,
        (extract(epoch from clock_timestamp()) * 1000)::bigint

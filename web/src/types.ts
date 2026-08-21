@@ -193,7 +193,6 @@ export interface KeyView {
   credential_generation: number;
   created_at: number;
   policy: {
-    allowed_models: string[];
     requests_per_minute: number;
     tokens_per_minute: number;
     max_concurrency: number;

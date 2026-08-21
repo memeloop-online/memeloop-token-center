@@ -62,17 +62,6 @@ function Form(props: FormProps) {
   return <RjsfForm {...props} noHtml5Validate onError={() => { /* Validation is rendered inline. */ }} />;
 }
 
-function withoutAllowedModels(schema: Record<string, unknown> | undefined, nested: boolean) {
-  if (!schema) return undefined;
-  const copy = structuredClone(schema) as { properties?: Record<string, { properties?: Record<string, unknown>; required?: string[] } | unknown>; required?: string[] };
-  const target = nested
-    ? copy.properties?.policy as { properties?: Record<string, unknown>; required?: string[] } | undefined
-    : copy;
-  if (target?.properties) delete target.properties.allowed_models;
-  if (target?.required) target.required = target.required.filter((name) => name !== 'allowed_models');
-  return copy as Record<string, unknown>;
-}
-
 function queryForTenant(tenant: string, existing = '') {
   const params = new URLSearchParams(existing);
   if (tenant) params.set('tenant_external_id', tenant);
@@ -881,8 +870,8 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
   const [error, setError] = useState('');
   const credentialGroups = useGroups('credential', token, tenant);
   const routeGroups = useGroups('route', token, tenant);
-  const createFormSchema = useMemo(() => withoutAllowedModels(createSchema, true), [createSchema]);
-  const policyFormSchema = useMemo(() => withoutAllowedModels(policySchema, false), [policySchema]);
+  const createFormSchema = createSchema;
+  const policyFormSchema = policySchema;
   const load = async () => {
     if (!token || !tenant) { setValues([]); setRoutes([]); return; }
     try {
@@ -946,8 +935,7 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
       <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(newRouteIds, routeOptions)} onChange={(selected) => setNewRouteIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
       <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(newRouteGroupIds, routeGroupOptions)} onChange={(selected) => setNewRouteGroupIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
       {createFormSchema ? <Form key={`${tenant}-${locale}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try {
-        const policy = typeof formData?.policy === 'object' && formData.policy ? { ...formData.policy, allowed_models: [] } : formData?.policy;
-        const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', token, { method: 'POST', body: JSON.stringify({ ...formData, policy, tenant_external_id: tenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }) });
+        const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }) });
         setNewRouteIds([]); setNewRouteGroupIds([]); setSecret(created.key); setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
       } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant}>{t('credentials.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
     </article>
