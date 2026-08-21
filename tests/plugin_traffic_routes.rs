@@ -12,7 +12,8 @@ use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
     db::{
-        CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput, StatsFilter, unix_millis,
+        CreateKeyInput, CreateRoutedModelRouteInput, CreateUpstreamAccountInput,
+        ReplaceCredentialRoutingInput, StatsFilter, unix_millis,
     },
     model::{IssuedKey, KeyPolicy},
     provider::UpstreamCredential,
@@ -235,6 +236,18 @@ async fn deny_policy_covers_text_images_seedance_and_comfyui_before_any_upstream
         vec!["requested-model".into(), "example-rewritten".into()],
     )
     .await;
+    create_account_and_routes(
+        &state,
+        "policy-deny",
+        &issued,
+        "http-json",
+        json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
+        UpstreamCredential::None,
+        "denied-upstream",
+        &["openai", "generation"],
+        &["requested-model", "example-rewritten"],
+    )
+    .await;
     for (path, body) in [
         (
             "/v1/chat/completions",
@@ -287,6 +300,18 @@ async fn malicious_denial_reason_is_absent_from_logs_and_http_response() {
     let body = deny_body_with_reason(&reason);
     let (_directory, state, issued) =
         policy_state(&body, "malicious-reason", vec!["requested-model".into()]).await;
+    create_account_and_routes(
+        &state,
+        "policy-malicious-reason",
+        &issued,
+        "http-json",
+        json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
+        UpstreamCredential::None,
+        "denied-upstream",
+        &["openai"],
+        &["requested-model", "example-rewritten"],
+    )
+    .await;
     let capture = LogCapture::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -323,6 +348,18 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
         "malicious-log",
         vec!["requested-model".into()],
         json!([{"kind": "log"}]),
+    )
+    .await;
+    create_account_and_routes(
+        &state,
+        "policy-malicious-log",
+        &issued,
+        "http-json",
+        json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
+        UpstreamCredential::None,
+        "denied-upstream",
+        &["openai"],
+        &["requested-model", "example-rewritten"],
     )
     .await;
     let capture = LogCapture::default();
@@ -390,9 +427,10 @@ async fn image_rewrite_rechecks_effective_permission_route_price_and_archives_ch
         vec!["requested-model".into(), "example-rewritten".into()],
     )
     .await;
-    let account = create_account_and_route(
+    let account = create_account_and_routes(
         &state,
         "policy-image-rewrite",
+        &issued,
         "http-json",
         json!({"base_url": mock.uri(), "network_scope": "public"}),
         UpstreamCredential::ApiKey {
@@ -401,6 +439,8 @@ async fn image_rewrite_rechecks_effective_permission_route_price_and_archives_ch
             prefix: "Bearer ".into(),
         },
         "image-upstream",
+        &["generation"],
+        &["requested-model", "example-rewritten"],
     )
     .await;
     state
@@ -476,13 +516,16 @@ async fn async_rewrite_rechecks_seedance_and_comfyui_routes_and_billing_units() 
             vec!["requested-model".into(), "example-rewritten".into()],
         )
         .await;
-        create_account_and_route(
+        create_account_and_routes(
             &state,
             &format!("policy-{label}"),
+            &issued,
             driver,
             config,
             UpstreamCredential::None,
             "provider-model",
+            &["generation"],
+            &["requested-model", "example-rewritten"],
         )
         .await;
         state
@@ -511,6 +554,18 @@ async fn rewritten_model_is_checked_again_against_the_stable_key_policy() {
         vec!["requested-model".into()],
     )
     .await;
+    create_account_and_routes(
+        &state,
+        "policy-permission",
+        &issued,
+        "http-json",
+        json!({"base_url": "https://denied.example.test", "network_scope": "public"}),
+        UpstreamCredential::None,
+        "denied-upstream",
+        &["generation"],
+        &["requested-model"],
+    )
+    .await;
     let response = call(
         &state,
         &issued.key,
@@ -521,13 +576,16 @@ async fn rewritten_model_is_checked_again_against_the_stable_key_policy() {
     assert_eq!(response.0, StatusCode::FORBIDDEN);
 }
 
-async fn create_account_and_route(
+async fn create_account_and_routes(
     state: &AppState,
     tenant: &str,
+    issued: &IssuedKey,
     driver: &str,
     config: Value,
     credential: UpstreamCredential,
     upstream_model: &str,
+    protocols: &[&str],
+    granted_public_models: &[&str],
 ) -> memeloop_token_center::provider::UpstreamAccountView {
     let account = state
         .db
@@ -546,16 +604,52 @@ async fn create_account_and_route(
         )
         .await
         .unwrap();
+    let mut new_route_ids = Vec::new();
+    for protocol in protocols {
+        for public_model in ["requested-model", "example-rewritten"] {
+            let (route, _) = state
+                .db
+                .create_routed_model_route(CreateRoutedModelRouteInput {
+                    tenant_external_id: tenant.into(),
+                    public_model: public_model.into(),
+                    upstream_model: upstream_model.into(),
+                    protocol: (*protocol).into(),
+                    priority: 0,
+                    upstream_account_ids: vec![account.id],
+                    included_provider_group_ids: Vec::new(),
+                    excluded_provider_group_ids: Vec::new(),
+                    route_group_ids: Vec::new(),
+                    route_group_names: Vec::new(),
+                    granted_credential_ids: Vec::new(),
+                    custom_model_confirmed: true,
+                })
+                .await
+                .unwrap();
+            if granted_public_models.contains(&public_model) {
+                new_route_ids.push(route.id);
+            }
+        }
+    }
+    let current = state
+        .db
+        .credential_routing(issued.key_id, tenant)
+        .await
+        .unwrap();
+    let mut route_ids = current.route_ids;
+    route_ids.extend(new_route_ids);
+    route_ids.sort_unstable();
+    route_ids.dedup();
     state
         .db
-        .create_model_route(CreateModelRouteInput {
-            tenant_external_id: tenant.into(),
-            public_model: "example-rewritten".into(),
-            upstream_account_id: account.id,
-            upstream_model: upstream_model.into(),
-            protocol: "generation".into(),
-            priority: 0,
-        })
+        .replace_credential_routing(
+            issued.key_id,
+            ReplaceCredentialRoutingInput {
+                tenant_external_id: tenant.into(),
+                route_ids,
+                route_group_ids: current.route_group_ids,
+                expected_grant_revision: current.grant_revision,
+            },
+        )
         .await
         .unwrap();
     account
