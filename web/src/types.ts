@@ -401,6 +401,13 @@ export interface GenerationJob {
   assets: GenerationAsset[];
 }
 
+export interface OperatorGenerationJob extends GenerationJob {
+  tenant_external_id: string;
+  key_id: string;
+  key_alias: string;
+  currency: string;
+}
+
 export interface GenerationAsset {
   asset_id: string;
   index: number;

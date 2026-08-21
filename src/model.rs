@@ -711,6 +711,16 @@ pub struct GenerationJobView {
     pub assets: Vec<GenerationAssetView>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct OperatorGenerationJobView {
+    #[serde(flatten)]
+    pub job: GenerationJobView,
+    pub tenant_external_id: String,
+    pub key_id: Uuid,
+    pub key_alias: String,
+    pub currency: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct GenerationJobWork {
     pub job_id: Uuid,

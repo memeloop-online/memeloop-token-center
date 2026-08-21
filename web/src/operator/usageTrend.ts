@@ -1,9 +1,9 @@
 import type { UsageAnalysisTimeBucket } from '../types.js';
 
-export type TrendMetric = 'requests' | 'tokens' | 'cost' | 'avg_latency' | 'p95_latency';
+export type TrendMetric = 'requests' | 'tokens' | 'generation_units' | 'cost' | 'avg_latency' | 'p95_latency';
 
 export const trendMetrics: readonly TrendMetric[] = [
-  'requests', 'tokens', 'cost', 'avg_latency', 'p95_latency',
+  'requests', 'tokens', 'generation_units', 'cost', 'avg_latency', 'p95_latency',
 ];
 
 export function trendCurrencies(points: UsageAnalysisTimeBucket[]) {
@@ -15,6 +15,7 @@ export function trendValue(point: UsageAnalysisTimeBucket, metric: TrendMetric, 
   if (metric === 'tokens') {
     return point.input_tokens + point.output_tokens + point.cached_input_tokens + point.cache_write_tokens;
   }
+  if (metric === 'generation_units') return point.generation_units;
   if (metric === 'cost') {
     const cost = point.costs.find((candidate) => candidate.currency === currency)?.cost;
     if (cost === undefined) return 0;

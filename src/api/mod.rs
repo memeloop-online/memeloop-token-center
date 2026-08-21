@@ -68,9 +68,10 @@ use cloud_entitlements::{
     sync_memeloop_cloud_subscription,
 };
 use control_requests::{
-    ManagementTenantQuery, configuration_schemas, internal_generation_asset,
-    internal_request_asset, internal_request_detail, internal_request_events, internal_requests,
-    internal_stats, list_tenants, plugin_manifests, provider_types,
+    ManagementTenantQuery, cancel_internal_generation, configuration_schemas, internal_generation,
+    internal_generation_asset, internal_generations, internal_request_asset,
+    internal_request_detail, internal_request_events, internal_requests, internal_stats,
+    list_tenants, plugin_manifests, provider_types,
 };
 use credentials::*;
 use generation::*;

@@ -16,6 +16,7 @@ import type {
 } from '../types';
 import './operator.css';
 import { GroupManager, useGroups } from './GroupManager';
+import { GenerationWorkspace } from './GenerationWorkspace';
 import { MultiCombobox, type ComboboxOption } from './MultiCombobox';
 import { UpstreamModelCombobox } from './UpstreamModelCombobox';
 import { Plugins } from './Plugins';
@@ -23,7 +24,7 @@ import { SessionMonitor, type SessionFocus, type SessionStreamState } from './Se
 import { enqueueSessionEventKey } from './sessionRefresh';
 import { UsageAnalysis } from './UsageAnalysis';
 
-type Tab = 'traffic' | 'usage' | 'providers' | 'routes' | 'pricing' | 'credentials' | 'services' | 'plugins';
+type Tab = 'traffic' | 'usage' | 'generations' | 'providers' | 'routes' | 'pricing' | 'credentials' | 'services' | 'plugins';
 type Translate = (key: string, variables?: Record<string, string | number>) => string;
 interface RequestFilters {
   from: string;
@@ -51,7 +52,7 @@ interface RequestEventScope {
   tenant: string;
   filters: RequestFilters;
 }
-const tabIds: Tab[] = ['traffic', 'usage', 'providers', 'routes', 'pricing', 'credentials', 'services', 'plugins'];
+const tabIds: Tab[] = ['traffic', 'usage', 'generations', 'providers', 'routes', 'pricing', 'credentials', 'services', 'plugins'];
 const emptyRequestFilters: RequestFilters = {
   from: '', to: '', keyId: '', model: '', protocol: '', status: '', errorCode: '', upstreamAccountId: '',
   routeId: '', minDurationMs: '', maxDurationMs: '', minCost: '', maxCost: '', keyAlias: '', principal: '',
@@ -391,6 +392,7 @@ export function Operator() {
     <section id={`operator-panel-${tab}`} role="tabpanel" aria-labelledby={`operator-tab-${tab}`} tabIndex={0}>
       {tab === 'traffic' && <Traffic token={token} tenant={tenant} mode={trafficMode} onModeChange={setTrafficMode} sessionRevision={sessionRevision} sessionEventKeyIds={sessionEventKeyIds} sessionFocus={sessionFocus} streamState={streamState} requests={requests} upstreams={upstreams} filters={requestFilters} loading={requestsLoading} hasOlder={hasOlderRequests} onApply={(filters) => { setRequestFilters(filters); void loadRequests(filters); }} onClear={() => { setRequestFilters(emptyRequestFilters); void loadRequests(emptyRequestFilters); }} onLoadOlder={() => void loadRequests(requestFilters, true)} onSelect={selectRequest} />}
       {tab === 'usage' && <UsageAnalysis token={token} tenant={tenant} upstreams={upstreams} onOpenSession={(session: UsageAnalysisSessionBucket) => { setSessionFocus({ sessionId: session.id, keyId: session.key_id, revision: Date.now() }); setTrafficMode('sessions'); setTab('traffic'); }} />}
+      {tab === 'generations' && <GenerationWorkspace token={token} tenant={tenant} />}
       {tab === 'providers' && <UpstreamProviders token={token} tenant={tenant} providers={providers} values={upstreams} onChanged={refresh} />}
       {tab === 'routes' && <RouteWorkspace token={token} tenant={tenant} upstreams={upstreams} providers={providers} />}
       {tab === 'pricing' && <Pricing token={token} tenant={tenant} schemas={schemas} />}

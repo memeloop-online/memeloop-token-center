@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { UsageAnalysisTimeBucket } from '../src/types.js';
-import { trendCurrencies, trendValue } from '../src/operator/usageTrend.js';
+import { trendCurrencies, trendMetrics, trendValue } from '../src/operator/usageTrend.js';
 
 const point: UsageAnalysisTimeBucket = {
   bucket_start: 0,
@@ -22,8 +22,10 @@ const point: UsageAnalysisTimeBucket = {
 };
 
 test('trend metrics expose requests, complete token totals, and both latency projections', () => {
+  assert.deepEqual(trendMetrics, ['requests', 'tokens', 'generation_units', 'cost', 'avg_latency', 'p95_latency']);
   assert.equal(trendValue(point, 'requests', ''), 3);
   assert.equal(trendValue(point, 'tokens', ''), 19);
+  assert.equal(trendValue({ ...point, generation_units: 7 }, 'generation_units', ''), 7);
   assert.equal(trendValue(point, 'avg_latency', ''), 12.5);
   assert.equal(trendValue(point, 'p95_latency', ''), 50);
 });

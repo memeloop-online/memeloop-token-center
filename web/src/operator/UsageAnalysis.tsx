@@ -128,12 +128,13 @@ function DimensionTable<T extends UsageAnalysisBucket>({ title, values, onSelect
 }) {
   const { locale, t } = useI18n();
   return <article className="panel usage-dimension"><div className="panel-title"><h2>{title}</h2><span>{formatNumber(values.length, locale)}</span></div>
-    {values.length === 0 ? <div className="empty">{t('usage.noDimensionData')}</div> : <div className="table-scroll"><table><thead><tr><th>{title}</th><th>{t('usage.requests')}</th><th>{t('usage.tokens')}</th><th>{t('usage.cost')}</th><th>{t('usage.successRate')}</th></tr></thead><tbody>{values.map((value) => {
+    {values.length === 0 ? <div className="empty">{t('usage.noDimensionData')}</div> : <div className="table-scroll"><table><thead><tr><th>{title}</th><th>{t('usage.requests')}</th><th>{t('usage.tokens')}</th><th>{t('usage.generationUnits')}</th><th>{t('usage.cost')}</th><th>{t('usage.successRate')}</th></tr></thead><tbody>{values.map((value) => {
       const label = labelForValue?.(value) || value.label || t('common.none');
       return <tr key={value.id}>
       <td>{onSelect ? <button type="button" className="table-link usage-filter-link" onClick={() => onSelect(value)} aria-label={t('usage.filterByDimension', { name: label })}>{label}</button> : label}</td>
       <td title={String(value.requests)}>{formatNumber(value.requests, locale)}</td>
       <td title={String(value.input_tokens + value.output_tokens + value.cached_input_tokens + value.cache_write_tokens)}>{formatNumber(value.input_tokens + value.output_tokens + value.cached_input_tokens + value.cache_write_tokens, locale)}</td>
+      <td title={String(value.generation_units)}>{formatNumber(value.generation_units, locale)}</td>
       <td><CostValue costs={value.costs} /></td>
       <td>{formatPercent(successRate(value), locale)}</td>
     </tr>;
@@ -296,6 +297,7 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
           <NumericMetric label={t('usage.failures')} value={stats.summary.failed} tone="negative" />
           <Metric label={t('usage.cost')} value={<CostValue costs={stats.summary.costs} />} />
           <NumericMetric label={t('usage.totalTokens')} value={stats.summary.input_tokens + stats.summary.output_tokens + stats.summary.cached_input_tokens + stats.summary.cache_write_tokens} />
+          <NumericMetric label={t('usage.generationUnits')} value={stats.summary.generation_units} />
           <NumericMetric label={t('usage.inputTokens')} value={stats.summary.input_tokens} />
           <NumericMetric label={t('usage.outputTokens')} value={stats.summary.output_tokens} />
           <NumericMetric label={t('usage.cachedTokens')} value={stats.summary.cached_input_tokens} />

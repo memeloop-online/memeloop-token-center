@@ -156,6 +156,71 @@ pub(super) async fn internal_generation_asset(
     generation_asset_response(&state, &headers, asset).await
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct GenerationJobsQuery {
+    tenant_external_id: Option<String>,
+    #[serde(default = "default_control_list_limit")]
+    limit: i64,
+}
+
+pub(super) async fn internal_generations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GenerationJobsQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    Ok(Json(
+        state
+            .db
+            .operator_generation_jobs(tenant.as_deref(), query.limit)
+            .await?,
+    ))
+}
+
+pub(super) async fn internal_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<Uuid>,
+    Query(query): Query<ManagementTenantQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    Ok(Json(
+        state
+            .db
+            .operator_generation_job(tenant.as_deref(), job_id)
+            .await?,
+    ))
+}
+
+pub(super) async fn cancel_internal_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(job_id): Path<Uuid>,
+    Query(query): Query<ManagementTenantQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "generations:write").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?.ok_or_else(|| {
+        AppError::BadRequest("tenant_external_id is required when cancelling a generation".into())
+    })?;
+    let scoped = state
+        .db
+        .operator_generation_job(Some(&tenant), job_id)
+        .await?;
+    let job = state
+        .db
+        .cancel_generation_job(scoped.key_id, job_id)
+        .await?;
+    Ok(Json(crate::model::OperatorGenerationJobView {
+        job,
+        tenant_external_id: scoped.tenant_external_id,
+        key_id: scoped.key_id,
+        key_alias: scoped.key_alias,
+        currency: scoped.currency,
+    }))
+}
+
 pub(super) async fn internal_request_asset(
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -21,7 +21,8 @@ pub(in crate::api) async fn create_image_generation(
     if value.get("input").is_some() {
         let request = serde_json::from_value(value)
             .map_err(|_| AppError::BadRequest("model and generation input are required".into()))?;
-        return create_generation(State(state), headers, Json(request)).await;
+        return super::jobs::create_generation_for_modality(state, headers, request, Some("image"))
+            .await;
     }
     proxy_openai_image_generation(state, headers, body, value).await
 }

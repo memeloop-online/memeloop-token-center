@@ -3934,6 +3934,7 @@ components:
         - credits:write
         - entitlements:read
         - entitlements:write
+        - generations:write
         - requests:read
         - providers:read
         - providers:write

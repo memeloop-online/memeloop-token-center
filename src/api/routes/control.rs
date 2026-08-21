@@ -82,6 +82,11 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             "/internal/v1/requests/{request_id}/assets/{asset_id}",
             get(internal_request_asset),
         )
+        .route("/internal/v1/generations", get(internal_generations))
+        .route(
+            "/internal/v1/generations/{job_id}",
+            get(internal_generation).delete(cancel_internal_generation),
+        )
         .route(
             "/internal/v1/generations/{job_id}/assets/{asset_id}",
             get(internal_generation_asset),

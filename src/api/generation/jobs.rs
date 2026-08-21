@@ -5,6 +5,23 @@ pub(in crate::api) async fn create_generation(
     headers: HeaderMap,
     Json(body): Json<CreateGenerationRequest>,
 ) -> Result<Response, AppError> {
+    create_generation_for_modality(state, headers, body, None).await
+}
+
+pub(in crate::api) async fn create_video_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateGenerationRequest>,
+) -> Result<Response, AppError> {
+    create_generation_for_modality(state, headers, body, Some("video")).await
+}
+
+pub(in crate::api) async fn create_generation_for_modality(
+    state: AppState,
+    headers: HeaderMap,
+    body: CreateGenerationRequest,
+    requested_modality: Option<&'static str>,
+) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
     let routing_selection_seed = Uuid::now_v7();
     let applied = apply_traffic_policy(
@@ -43,6 +60,23 @@ pub(in crate::api) async fn create_generation(
             "generation driver {} cannot execute asynchronous jobs",
             route.driver
         )));
+    }
+    if let Some(modality) = requested_modality {
+        let driver_supports_modality = match modality {
+            "image" => route.driver == "comfyui",
+            "video" => matches!(route.driver.as_str(), "volcengine-seedance" | "comfyui"),
+            _ => false,
+        };
+        let provider_supports_modality = state
+            .providers
+            .get(&route.driver)
+            .is_some_and(|provider| provider.modalities.iter().any(|value| value == modality));
+        if !driver_supports_modality || !provider_supports_modality {
+            return Err(AppError::Upstream(format!(
+                "generation route for {} does not support {} generation",
+                body.model, modality
+            )));
+        }
     }
     if route.driver == "volcengine-seedance" {
         normalize_seedance_duration(&mut body.input)?;

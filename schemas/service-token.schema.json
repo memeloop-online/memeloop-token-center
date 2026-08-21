@@ -23,6 +23,7 @@
           "credits:write",
           "credits:read",
           "requests:read",
+          "generations:write",
           "providers:read",
           "providers:write",
           "plugins:read",

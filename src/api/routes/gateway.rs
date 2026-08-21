@@ -36,7 +36,7 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
         .route("/v1/chat/completions", post(proxy_openai_chat))
         .route("/v1/embeddings", post(proxy_openai_embeddings))
         .route("/v1/generations", post(create_generation))
-        .route("/v1/videos/generations", post(create_generation))
+        .route("/v1/videos/generations", post(create_video_generation))
         .route(
             "/v1/images/generations",
             post(create_image_generation).layer(DefaultBodyLimit::max(MAX_IMAGE_REQUEST_BODY)),
