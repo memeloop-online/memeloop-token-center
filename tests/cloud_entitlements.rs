@@ -11,6 +11,8 @@ use memeloop_token_center::{
 };
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use sqlx::Row;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -19,6 +21,7 @@ const WEBHOOK_SECRET: &str = "test-memeloop-cloud-webhook-secret-long-enough";
 
 struct Fixture {
     _directory: TempDir,
+    database_url: String,
     client: Client,
     base_url: String,
     state: AppState,
@@ -32,7 +35,7 @@ impl Fixture {
             "sqlite://{}?mode=rwc",
             directory.path().join("cloud-entitlements.db").display()
         );
-        let mut config = Config::for_test(database_url);
+        let mut config = Config::for_test(database_url.clone());
         config.memeloop_cloud_webhook_secret = Some(WEBHOOK_SECRET.to_owned());
         let state = AppState::initialize(config).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -45,6 +48,7 @@ impl Fixture {
         });
         Self {
             _directory: directory,
+            database_url,
             client: Client::new(),
             base_url: format!("http://{address}"),
             state,
@@ -79,6 +83,15 @@ impl Fixture {
             .await
             .unwrap()
     }
+}
+
+fn framed_digest(parts: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((*part).len().to_be_bytes());
+        digest.update(part);
+    }
+    format!("{:x}", digest.finalize())
 }
 
 impl Drop for Fixture {
@@ -823,6 +836,112 @@ async fn concurrent_first_cloud_events_cannot_leave_a_losing_principal_key() {
 }
 
 #[tokio::test]
+async fn late_audit_conflict_rolls_back_entitlement_policy_routing_and_replay_state() {
+    let fixture = Fixture::new().await;
+    let tenant = "cloud-atomic-rollback";
+    let principal = "atomic-member";
+    let subscription = "atomic-subscription";
+    let original_route = seed_route(&fixture.state, tenant, "gpt-5", 11).await;
+    let replacement_route = seed_route(&fixture.state, tenant, "gpt-5", 12).await;
+
+    let mut initial = active(tenant, principal, subscription, "cycle", "10", 1, 10);
+    initial["route_ids"] = json!([original_route]);
+    let initial: Value = fixture
+        .send("cloud-atomic-initial", &initial)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let key_id = Uuid::parse_str(initial["credential"]["key_id"].as_str().unwrap()).unwrap();
+
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let original_audit = sqlx::query(
+        "SELECT event_key_hash, request_hash FROM memeloop_cloud_subscription_events WHERE key_id = $1",
+    )
+    .bind(key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let original_event_hash: String = original_audit.try_get("event_key_hash").unwrap();
+    let original_request_hash: String = original_audit.try_get("request_hash").unwrap();
+
+    // Reserve the next webhook audit identity with conflicting metadata. The
+    // collision is detected only after entitlement, policy, and routing work,
+    // so a 409 proves that every earlier mutation shares the same transaction.
+    let retry_event_id = "cloud-atomic-late-audit-conflict";
+    let conflicting_event_hash = framed_digest(&[tenant.as_bytes(), retry_event_id.as_bytes()]);
+    let changed = sqlx::query(
+        "UPDATE memeloop_cloud_subscription_events SET event_key_hash = $1, request_hash = $2 WHERE key_id = $3",
+    )
+    .bind(&conflicting_event_hash)
+    .bind("f".repeat(64))
+    .bind(key_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+
+    let mut update = active(tenant, principal, subscription, "cycle", "20", 2, 20);
+    update["route_ids"] = json!([replacement_route]);
+    assert_eq!(
+        fixture.send(retry_event_id, &update).await.status(),
+        StatusCode::CONFLICT
+    );
+
+    let keys = fixture
+        .state
+        .db
+        .list_managed_keys(Some(tenant), Some(principal))
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].available_balance, "10");
+    assert_eq!(keys[0].policy.requests_per_minute, 10);
+    let entitlement = fixture
+        .state
+        .db
+        .list_entitlements(Some(tenant), Some("memeloop-cloud"), Some(subscription))
+        .await
+        .unwrap();
+    assert_eq!(entitlement[0].version, 1);
+    assert_eq!(entitlement[0].remaining, "10");
+    let routing = fixture
+        .state
+        .db
+        .credential_routing(key_id, tenant)
+        .await
+        .unwrap();
+    assert_eq!(routing.effective_route_ids, vec![original_route]);
+
+    // Restore the pre-existing audit row and retry the exact failed event. It
+    // must execute as a fresh version-2 snapshot, proving the reconciliation
+    // replay row was rolled back with the rest of the transaction.
+    sqlx::query(
+        "UPDATE memeloop_cloud_subscription_events SET event_key_hash = $1, request_hash = $2 WHERE key_id = $3",
+    )
+    .bind(original_event_hash)
+    .bind(original_request_hash)
+    .bind(key_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let retried = fixture.send(retry_event_id, &update).await;
+    assert_eq!(retried.status(), StatusCode::CREATED);
+    let retried: Value = retried.json().await.unwrap();
+    assert_eq!(retried["entitlement"]["version"], 2);
+    assert_eq!(retried["entitlement"]["remaining"], "20");
+    assert_eq!(retried["policy"]["requests_per_minute"], 20);
+    let routing = fixture
+        .state
+        .db
+        .credential_routing(key_id, tenant)
+        .await
+        .unwrap();
+    assert_eq!(routing.effective_route_ids, vec![replacement_route]);
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn entitlement_and_event_queries_are_bound_to_service_tenant_or_authenticated_key() {
     let fixture = Fixture::new().await;
     let first_tenant = "cloud-query-a";
@@ -876,7 +995,7 @@ async fn entitlement_and_event_queries_are_bound_to_service_tenant_or_authentica
         .await
         .unwrap();
     assert_eq!(self_view.status(), StatusCode::OK);
-    assert_eq!(self_view.headers()["cache-control"], "private, no-store");
+    assert_eq!(self_view.headers()["cache-control"], "no-store");
     let self_view: Value = self_view.json().await.unwrap();
     assert_eq!(self_view["entitlements"].as_array().unwrap().len(), 1);
     assert_eq!(
