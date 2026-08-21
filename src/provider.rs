@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 
-const ENVELOPE_VERSION: &str = "v1";
+const CURRENT_ENVELOPE_VERSION: &str = "v2";
+const LEGACY_ENVELOPE_VERSION: &str = "v1";
 const ENVELOPE_AAD: &[u8] = b"memeloop-token-center/upstream-credential/v1";
 
 const MAX_ADAPTER_STATE_BYTES: usize = 16 * 1024;
@@ -1073,7 +1074,7 @@ pub(crate) fn seal_private_json<T: Serialize>(
     aad: &[u8],
 ) -> Result<String, AppError> {
     let plaintext = serde_json::to_vec(value).map_err(|_| AppError::Internal)?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&encryption_key(key_material))
+    let cipher = ChaCha20Poly1305::new_from_slice(&current_encryption_key(key_material)?)
         .map_err(|_| AppError::Internal)?;
     let mut nonce = [0_u8; 12];
     fill(&mut nonce).map_err(|_| AppError::Internal)?;
@@ -1087,7 +1088,7 @@ pub(crate) fn seal_private_json<T: Serialize>(
         )
         .map_err(|_| AppError::Internal)?;
     Ok(format!(
-        "{ENVELOPE_VERSION}.{}.{}",
+        "{CURRENT_ENVELOPE_VERSION}.{}.{}",
         URL_SAFE_NO_PAD.encode(nonce),
         URL_SAFE_NO_PAD.encode(ciphertext)
     ))
@@ -1117,7 +1118,15 @@ pub(crate) fn open_private_json<T: for<'de> Deserialize<'de>>(
     let version = parts.next();
     let nonce = parts.next();
     let ciphertext = parts.next();
-    if version != Some(ENVELOPE_VERSION) || parts.next().is_some() {
+    let key = match version {
+        Some(CURRENT_ENVELOPE_VERSION) => current_encryption_key(key_material)?,
+        // Existing deployments wrote v1 envelopes with the historical
+        // SHA-256 derivation. Keep that format read-only so an upgrade never
+        // strands credentials; every new write uses RustCrypto HKDF below.
+        Some(LEGACY_ENVELOPE_VERSION) => legacy_encryption_key(key_material),
+        _ => return Err(AppError::Internal),
+    };
+    if parts.next().is_some() {
         return Err(AppError::Internal);
     }
     let nonce = URL_SAFE_NO_PAD
@@ -1127,8 +1136,7 @@ pub(crate) fn open_private_json<T: for<'de> Deserialize<'de>>(
     let ciphertext = URL_SAFE_NO_PAD
         .decode(ciphertext.ok_or(AppError::Internal)?)
         .map_err(|_| AppError::Internal)?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&encryption_key(key_material))
-        .map_err(|_| AppError::Internal)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| AppError::Internal)?;
     let plaintext = cipher
         .decrypt(
             (&nonce).into(),
@@ -1141,7 +1149,18 @@ pub(crate) fn open_private_json<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(&plaintext).map_err(|_| AppError::Internal)
 }
 
-fn encryption_key(key_material: &[u8]) -> [u8; 32] {
+fn current_encryption_key(key_material: &[u8]) -> Result<[u8; 32], AppError> {
+    let hkdf = hkdf::Hkdf::<Sha256>::new(
+        Some(b"memeloop-token-center/private-envelope/hkdf-sha256/v2"),
+        key_material,
+    );
+    let mut key = [0_u8; 32];
+    hkdf.expand(b"chacha20poly1305-key", &mut key)
+        .map_err(|_| AppError::Internal)?;
+    Ok(key)
+}
+
+fn legacy_encryption_key(key_material: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"memeloop-token-center/upstream-encryption-key/v1\0");
     hash.update(key_material);
@@ -1164,10 +1183,44 @@ mod tests {
         };
         let envelope =
             seal_credential(&credential, b"a key material with at least 32 bytes").unwrap();
+        assert!(envelope.starts_with("v2."));
         assert!(!envelope.contains("secret"));
         let opened = open_credential(&envelope, b"a key material with at least 32 bytes").unwrap();
         assert_eq!(opened.auth_kind(), "oauth");
         assert_eq!(opened.expires_at(), Some(42));
+    }
+
+    #[test]
+    fn legacy_v1_envelopes_remain_readable_but_are_never_written() {
+        let key_material = b"a key material with at least 32 bytes";
+        let credential = UpstreamCredential::ApiKey {
+            value: "legacy-secret".to_owned(),
+            header: "authorization".to_owned(),
+            prefix: "Bearer ".to_owned(),
+        };
+        let plaintext = serde_json::to_vec(&credential).unwrap();
+        let cipher =
+            ChaCha20Poly1305::new_from_slice(&legacy_encryption_key(key_material)).unwrap();
+        let nonce = [7_u8; 12];
+        let ciphertext = cipher
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: &plaintext,
+                    aad: ENVELOPE_AAD,
+                },
+            )
+            .unwrap();
+        let envelope = format!(
+            "{LEGACY_ENVELOPE_VERSION}.{}.{}",
+            URL_SAFE_NO_PAD.encode(nonce),
+            URL_SAFE_NO_PAD.encode(ciphertext)
+        );
+
+        let opened = open_credential(&envelope, key_material).unwrap();
+        assert_eq!(opened.auth_kind(), "api_key");
+        let rewritten = seal_credential(&opened, key_material).unwrap();
+        assert!(rewritten.starts_with("v2."));
     }
 
     #[test]
