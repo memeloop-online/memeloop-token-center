@@ -387,8 +387,153 @@ def parameter_references(operation: dict[str, Any]) -> set[str]:
     }
 
 
+def validate_group_contracts(document: dict[str, Any]) -> None:
+    """Pin group terminology, tenant isolation, relation CAS, and enriched routes."""
+    group_families = {
+        "provider": ("routes:read", "routes:write"),
+        "route": ("routes:read", "routes:write"),
+        "credential": ("keys:read", "keys:write"),
+    }
+    for family, (read_scope, write_scope) in group_families.items():
+        collection = f"/internal/v1/{family}-groups"
+        resource = f"{collection}/{{group_id}}"
+        members = f"{resource}/members"
+        operations = {
+            ("get", collection): read_scope,
+            ("post", collection): write_scope,
+            ("put", resource): write_scope,
+            ("delete", resource): write_scope,
+            ("put", members): write_scope,
+        }
+        for (method, path), expected_scope in operations.items():
+            operation = operation_at(document, method, path)
+            if operation.get("security") != [{"serviceBearer": []}]:
+                raise ContractFailure(f"{method.upper()} {path} group security changed")
+            if operation.get("x-required-scope") != expected_scope:
+                raise ContractFailure(f"{method.upper()} {path} group scope changed")
+            if method in {"put", "delete"} and "409" not in operation.get("responses", {}):
+                raise ContractFailure(f"{method.upper()} {path} lost optimistic-concurrency 409")
+            if family == "credential" and operation.get("x-routing-effect") != "none":
+                raise ContractFailure(
+                    f"{method.upper()} {path} must declare credential groups presentation-only"
+                )
+
+        if parameter_references(operation_at(document, "get", collection)) != {
+            "#/components/parameters/RequiredTenant"
+        }:
+            raise ContractFailure(f"GET {collection} must require an explicit tenant")
+        if parameter_references(operation_at(document, "delete", resource)) != {
+            "#/components/parameters/GroupId",
+            "#/components/parameters/RequiredTenant",
+            "#/components/parameters/ExpectedUpdatedAt",
+        }:
+            raise ContractFailure(f"DELETE {resource} tenant/CAS parameters changed")
+
+    schemas = document.get("components", {}).get("schemas", {})
+    route = schemas.get("ModelRoute", {})
+    route_required = set(route.get("required", []))
+    enriched_fields = {
+        "upstream_account_ids",
+        "included_provider_group_ids",
+        "excluded_provider_group_ids",
+        "route_group_ids",
+        "granted_credential_ids",
+        "candidate_upstream_account_ids",
+        "custom_model_confirmed",
+        "grant_revision",
+    }
+    if not enriched_fields.issubset(route_required):
+        raise ContractFailure("model-route lists must return enriched associations and CAS")
+    if "allow_unverified_custom_model" in route.get("properties", {}):
+        raise ContractFailure("model route exposed the retired custom-model field name")
+
+    create_route = schemas.get("CreateModelRouteRequest", {})
+    replace_route = schemas.get("ReplaceModelRouteRequest", {})
+    replace_route_routing = schemas.get("ReplaceModelRouteRoutingRequest", {})
+    for name, schema in (
+        ("CreateModelRouteRequest", create_route),
+        ("ReplaceModelRouteRequest", replace_route),
+        ("ReplaceModelRouteRoutingRequest", replace_route_routing),
+    ):
+        properties = schema.get("properties", {})
+        if "custom_model_confirmed" not in properties:
+            raise ContractFailure(f"{name} lost explicit custom-model acknowledgement")
+        if "credential_group_ids" in properties:
+            raise ContractFailure(f"{name} must not accept credential groups as grants")
+    for name, schema in (
+        ("ReplaceModelRouteRequest", replace_route),
+        ("ReplaceModelRouteRoutingRequest", replace_route_routing),
+    ):
+        required = set(schema.get("required", []))
+        if not {"expected_updated_at", "expected_grant_revision"}.issubset(required):
+            raise ContractFailure(f"{name} lost base/relation compare-and-set tokens")
+
+    credential_routing = schemas.get("ClientCredentialRouting", {})
+    credential_replace = schemas.get("ReplaceClientCredentialRoutingRequest", {})
+    if "grant_revision" not in credential_routing.get("required", []):
+        raise ContractFailure("credential routing response lost direct-grant revision")
+    if set(credential_replace.get("required", [])) != {
+        "tenant_external_id",
+        "route_ids",
+        "route_group_ids",
+        "expected_grant_revision",
+    }:
+        raise ContractFailure("credential routing replacement must use only direct-grant CAS")
+    if "expected_updated_at" in credential_replace.get("properties", {}):
+        raise ContractFailure("credential grant writes must not couple to key metadata CAS")
+    if "credential_group_ids" in credential_replace.get("properties", {}):
+        raise ContractFailure("credential groups must never be accepted by routing grants")
+
+    key_create = schemas.get("CreateClientCredentialRequest", {}).get("properties", {})
+    if not {"route_ids", "route_group_ids"}.issubset(key_create):
+        raise ContractFailure("credential creation lost atomic initial route grants")
+    if "credential_group_ids" in key_create:
+        raise ContractFailure("credential creation must not treat credential groups as grants")
+
+    route_operation = operation_at(
+        document, "get", "/internal/v1/model-routes/{route_id}/routing"
+    )
+    routing_contract = route_operation.get("x-routing-contract", {})
+    if routing_contract != {
+        "provider-candidates": "explicit-accounts-union-included-provider-groups-minus-excluded-provider-groups",
+        "provider-group-exclusion-wins": True,
+        "route-groups-authorize-credentials": True,
+        "credential-groups-affect-routing": False,
+    }:
+        raise ContractFailure("model route provider/group semantics changed")
+
+    relevant_contract = json.dumps(
+        {
+            "paths": {
+                path: item
+                for path, item in document.get("paths", {}).items()
+                if "-groups" in path or path.endswith("/routing")
+            },
+            "schemas": {
+                name: schema
+                for name, schema in schemas.items()
+                if "Group" in name or "Routing" in name or name == "ModelRoute"
+            },
+        },
+        ensure_ascii=False,
+    ).lower()
+    for retired_term in (
+        "provider tag",
+        "route tag",
+        "credential tag",
+        "provider pool",
+        "route pool",
+        "credential pool",
+        "rule group",
+        "allow_unverified_custom_model",
+    ):
+        if retired_term in relevant_contract:
+            raise ContractFailure(f"group contract contains retired term: {retired_term}")
+
+
 def validate_product_contracts(document: dict[str, Any]) -> None:
     """Pin security-critical credential, asset, and synchronous-image semantics in CI."""
+    validate_group_contracts(document)
     credential_operations = (
         ("patch", "/internal/v1/keys/{key_id}/alias", [{"serviceBearer": []}], "keys:write"),
         ("get", "/internal/v1/keys/{key_id}/limits", [{"serviceBearer": []}], "keys:read"),
@@ -578,6 +723,8 @@ def validate_product_contracts(document: dict[str, Any]) -> None:
         "stale-version-status": 409,
         "quota-version-source": "durable-subscription-entitlement",
         "policy-update": "compare-and-set-on-current-entitlement-version",
+        "routing-update": "same-transaction-normalized-grants",
+        "legacy-allowed-models": "current-route-snapshot-only",
         "stable-history-owner": "key-id-and-account-id",
         "raw-event-id-persisted": False,
     }:

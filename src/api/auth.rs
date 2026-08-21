@@ -48,7 +48,6 @@ pub(super) async fn authenticate_control_before_body(
         };
         let maximum = match request.uri().path() {
             "/internal/v1/imports/cpa/managed-oauth" => super::MAX_MANAGED_OAUTH_IMPORT_REQUEST,
-            "/internal/v1/imports/cpa/subscription-accounts" => super::MAX_CPA_IMPORT_BODY,
             _ => super::MAX_DEFAULT_REQUEST_BODY,
         };
         request = match crate::gateway_body::admit_request_body(
@@ -77,9 +76,34 @@ pub(super) async fn authenticate_control_before_body(
         // Keep the permit through parsing and handler execution. Releasing it
         // immediately after buffering would still allow many maximum-sized
         // JSON values to be parsed and retained concurrently.
-        return Ok(next.run(request).await);
+        return Ok(normalize_control_extractor_rejection(
+            next.run(request).await,
+        ));
     }
-    Ok(next.run(request).await)
+    Ok(normalize_control_extractor_rejection(
+        next.run(request).await,
+    ))
+}
+
+fn normalize_control_extractor_rejection(response: Response) -> Response {
+    if matches!(
+        response.status(),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+    ) && response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| {
+            let media_type = value.split(';').next().unwrap_or_default().trim();
+            !(media_type == "application/json" || media_type.ends_with("+json"))
+        })
+    {
+        return AppError::BadRequest(
+            "request parameters or body do not match the API schema".to_owned(),
+        )
+        .into_response();
+    }
+    response
 }
 
 fn control_body_rejection(

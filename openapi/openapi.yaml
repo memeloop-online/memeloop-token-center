@@ -37,6 +37,12 @@ tags:
     description: Unified upstream identities independent of their authentication method.
   - name: Routes and pricing
     description: Public-model routing and token/multimodal price configuration.
+  - name: Groups
+    description: |
+      Tenant-scoped provider groups, route groups, and credential groups. Provider
+      groups participate in route candidate selection and route groups participate
+      in credential authorization. Credential groups are presentation-only
+      classification and never grant a route, model, provider, or permission.
   - name: Credits
     description: Idempotent account grants, reversals, and ledger inspection.
   - name: Entitlements
@@ -328,6 +334,67 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/keys/{key_id}/routing:
+    get:
+      tags: [Groups]
+      operationId: getClientCredentialRouting
+      summary: Read exact-route and route-group grants for one stable credential
+      description: |
+        Returns direct route grants, route-group grants, and the deduplicated effective
+        route set. Credential groups are intentionally absent because they only
+        organize credentials in the operator UI and never grant access. Route-group
+        membership changes are reflected in `effective_route_ids` immediately without
+        changing the credential's direct-grant revision.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:read
+      x-authorization-contract:
+        tenant-source: stable-key-id
+        credential-groups-grant-permission: false
+      parameters:
+        - $ref: '#/components/parameters/KeyId'
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Current normalized grants and their relation revision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClientCredentialRouting' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Groups]
+      operationId: replaceClientCredentialRouting
+      summary: Atomically replace exact-route and route-group grants
+      description: |
+        `expected_grant_revision` is a compare-and-set token read from the routing
+        representation. The replacement is all-or-nothing and may only reference
+        existing routes and route groups in the credential tenant. Credential-group
+        IDs are not accepted. A stale revision returns 409 and changes nothing.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      x-authorization-contract:
+        tenant-source: stable-key-id
+        credential-groups-grant-permission: false
+      parameters: [{ $ref: '#/components/parameters/KeyId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceClientCredentialRoutingRequest' }
+      responses:
+        '200':
+          description: Atomically replaced grants with a new relation revision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClientCredentialRouting' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /internal/v1/keys/{key_id}/status:
     patch:
@@ -629,7 +696,7 @@ paths:
       tags: [Upstream providers]
       operationId: listUpstreamProviders
       summary: List unified upstream provider accounts
-      description: API credentials, OAuth, subscription bridges, and no-auth connections are authentication methods of the same upstream account resource.
+      description: API credentials, native OAuth, plugin-provided authorization, and no-auth connections are authentication methods of the same upstream account resource.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:read
       parameters:
@@ -981,6 +1048,62 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
+  /internal/v1/oauth/codex/start:
+    post:
+      tags: [Upstream providers]
+      operationId: startOpenAiCodexOAuth
+      summary: Start native OpenAI Codex device authorization
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartCodexOAuthRequest' }
+      responses:
+        '200':
+          description: Expiring device authorization details and opaque session state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexDeviceLoginStart' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/oauth/codex/poll:
+    post:
+      tags: [Upstream providers]
+      operationId: pollOpenAiCodexOAuth
+      summary: Poll native OpenAI Codex authorization and create the upstream when ready
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OAuthPollRequest' }
+      responses:
+        '200':
+          description: Existing stable upstream reauthorized or a completed session replayed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '201':
+          description: Authorization completed and stable upstream created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '202':
+          description: Authorization is still pending.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthPending' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
   /internal/v1/oauth/provider-adapter/start:
     post:
       tags: [Upstream providers]
@@ -1035,85 +1158,6 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '502': { $ref: '#/components/responses/UpstreamError' }
-
-  /internal/v1/oauth/subscription-bridge/start:
-    post:
-      tags: [Upstream providers]
-      operationId: startSubscriptionBridgeOAuth
-      summary: Start Copilot or Cursor authorization through CPA Subscription Bridge
-      security: [{ serviceBearer: [] }]
-      x-required-scope: oauth:write
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/StartSubscriptionBridgeRequest' }
-      responses:
-        '200':
-          description: Opaque, expiring login state and authorization URL.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/OAuthLoginStart' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
-
-  /internal/v1/oauth/subscription-bridge/poll:
-    post:
-      tags: [Upstream providers]
-      operationId: pollSubscriptionBridgeOAuth
-      summary: Poll subscription authorization and create the upstream when ready
-      security: [{ serviceBearer: [] }]
-      x-required-scope: oauth:write
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/OAuthPollRequest' }
-      responses:
-        '200':
-          description: Existing stable upstream reauthorized; routes and history remain attached.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/UpstreamProvider' }
-        '201':
-          description: Authorization completed and stable upstream created.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/UpstreamProvider' }
-        '202':
-          description: Authorization is still pending.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/OAuthPending' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '502': { $ref: '#/components/responses/UpstreamError' }
-
-  /internal/v1/imports/cpa/subscription-accounts:
-    post:
-      tags: [Upstream providers]
-      operationId: importCpaSubscriptionAccounts
-      summary: Import supported CPA subscription account documents
-      description: Accepts 1–32 documents, each at most 1 MiB. Unsupported private OAuth formats are reported as skipped and their contents are not echoed.
-      security: [{ serviceBearer: [] }]
-      x-required-scope: providers:write
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/CpaSubscriptionImportRequest' }
-      responses:
-        '201':
-          description: Imported and skipped records.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/CpaSubscriptionImportResult' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
 
   /internal/v1/imports/cpa/managed-oauth/capabilities:
     get:
@@ -1283,6 +1327,7 @@ paths:
       tags: [Routes and pricing]
       operationId: listModelRoutes
       summary: List model routes visible to the caller
+      description: Each item is enriched with provider associations, route groups, reverse exact credential grants, effective candidate accounts, and the direct-grant relation revision.
       security: [{ serviceBearer: [] }]
       x-required-scope: routes:read
       parameters:
@@ -1304,7 +1349,12 @@ paths:
     post:
       tags: [Routes and pricing]
       operationId: createModelRoute
-      summary: Route a public model to a unified upstream provider
+      summary: Route a public model to explicit providers or provider groups
+      description: |
+        Explicit accounts and included provider groups are unioned, then excluded
+        provider groups are removed. Exclusion wins. Missing `route_group_names` are
+        created atomically. `custom_model_confirmed` is required by policy when the
+        selected upstream model is not in a complete synchronized catalog.
       security: [{ serviceBearer: [] }]
       x-required-scope: routes:write
       requestBody:
@@ -1396,6 +1446,347 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/model-routes/{route_id}/routing:
+    get:
+      tags: [Groups]
+      operationId: getModelRouteRouting
+      summary: Read provider selection, route groups, and reverse credential grants
+      description: |
+        Candidate providers are the union of explicit upstream accounts and included
+        provider groups, minus excluded provider groups; exclusion wins. Route groups
+        make this route available to credentials granted those groups. Credential
+        groups do not participate in either calculation.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:read
+      x-routing-contract:
+        provider-candidates: explicit-accounts-union-included-provider-groups-minus-excluded-provider-groups
+        provider-group-exclusion-wins: true
+        route-groups-authorize-credentials: true
+        credential-groups-affect-routing: false
+      parameters:
+        - $ref: '#/components/parameters/RouteId'
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Current normalized route associations and revisions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelRouteRouting' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Groups]
+      operationId: replaceModelRouteRouting
+      summary: Atomically replace all route associations
+      description: |
+        `expected_updated_at` protects provider and group associations while
+        `expected_grant_revision` protects reverse exact credential grants. Both
+        compare-and-set tokens must match. Every referenced resource must belong to
+        the selected tenant. Missing route-group names are created atomically;
+        credential groups are not accepted. A stale token returns 409 and changes
+        neither associations nor grants.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/RouteId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceModelRouteRoutingRequest' }
+      responses:
+        '200':
+          description: Atomically replaced route associations and revisions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelRouteRouting' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/provider-groups:
+    get:
+      tags: [Groups]
+      operationId: listProviderGroups
+      summary: List provider groups in one tenant
+      description: Provider groups select upstream candidates inside model routes.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:read
+      parameters: [{ $ref: '#/components/parameters/RequiredTenant' }]
+      responses:
+        '200': { $ref: '#/components/responses/RoutingGroupList' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Groups]
+      operationId: createProviderGroup
+      summary: Create or return a normalized provider group in one tenant
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRoutingGroupRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/RoutingGroupCreated' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/provider-groups/{group_id}:
+    put:
+      tags: [Groups]
+      operationId: replaceProviderGroup
+      summary: Rename a provider group using optimistic concurrency
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/GroupId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Groups]
+      operationId: deleteProviderGroup
+      summary: Delete an unreferenced provider group using optimistic concurrency
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+        - $ref: '#/components/parameters/RequiredTenant'
+        - $ref: '#/components/parameters/ExpectedUpdatedAt'
+      responses:
+        '204': { description: Group deleted. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/provider-groups/{group_id}/members:
+    put:
+      tags: [Groups]
+      operationId: replaceProviderGroupMembers
+      summary: Atomically replace upstream accounts in a provider group
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/GroupId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupMembersRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/route-groups:
+    get:
+      tags: [Groups]
+      operationId: listRouteGroups
+      summary: List route groups in one tenant
+      description: Route groups authorize credentials for all current member routes.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:read
+      parameters: [{ $ref: '#/components/parameters/RequiredTenant' }]
+      responses:
+        '200': { $ref: '#/components/responses/RoutingGroupList' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Groups]
+      operationId: createRouteGroup
+      summary: Create or return a normalized route group in one tenant
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRoutingGroupRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/RoutingGroupCreated' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/route-groups/{group_id}:
+    put:
+      tags: [Groups]
+      operationId: replaceRouteGroup
+      summary: Rename a route group using optimistic concurrency
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/GroupId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Groups]
+      operationId: deleteRouteGroup
+      summary: Delete an unreferenced route group using optimistic concurrency
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+        - $ref: '#/components/parameters/RequiredTenant'
+        - $ref: '#/components/parameters/ExpectedUpdatedAt'
+      responses:
+        '204': { description: Group deleted. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/route-groups/{group_id}/members:
+    put:
+      tags: [Groups]
+      operationId: replaceRouteGroupMembers
+      summary: Atomically replace model routes in a route group
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      parameters: [{ $ref: '#/components/parameters/GroupId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupMembersRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/credential-groups:
+    get:
+      tags: [Groups]
+      operationId: listCredentialGroups
+      summary: List presentation-only credential groups in one tenant
+      description: Credential groups classify credentials for operator UI browsing only.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:read
+      x-routing-effect: none
+      parameters: [{ $ref: '#/components/parameters/RequiredTenant' }]
+      responses:
+        '200': { $ref: '#/components/responses/RoutingGroupList' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Groups]
+      operationId: createCredentialGroup
+      summary: Create or return a presentation-only credential group
+      description: Creating a credential group never changes permissions or model visibility.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      x-routing-effect: none
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRoutingGroupRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/RoutingGroupCreated' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/credential-groups/{group_id}:
+    put:
+      tags: [Groups]
+      operationId: replaceCredentialGroup
+      summary: Rename a presentation-only credential group
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      x-routing-effect: none
+      parameters: [{ $ref: '#/components/parameters/GroupId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Groups]
+      operationId: deleteCredentialGroup
+      summary: Delete a presentation-only credential group
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      x-routing-effect: none
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+        - $ref: '#/components/parameters/RequiredTenant'
+        - $ref: '#/components/parameters/ExpectedUpdatedAt'
+      responses:
+        '204': { description: Group deleted. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/credential-groups/{group_id}/members:
+    put:
+      tags: [Groups]
+      operationId: replaceCredentialGroupMembers
+      summary: Atomically replace credentials in a presentation-only group
+      description: Membership changes never grant a route, model, provider, or permission.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      x-routing-effect: none
+      parameters: [{ $ref: '#/components/parameters/GroupId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReplaceRoutingGroupMembersRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/RoutingGroupUpdated' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
   /internal/v1/model-prices:
@@ -1752,6 +2143,8 @@ paths:
         stale-version-status: 409
         quota-version-source: durable-subscription-entitlement
         policy-update: compare-and-set-on-current-entitlement-version
+        routing-update: same-transaction-normalized-grants
+        legacy-allowed-models: current-route-snapshot-only
         stable-history-owner: key-id-and-account-id
         raw-event-id-persisted: false
       security: [{ memeloopCloudHmac: [] }]
@@ -2722,6 +3115,11 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    GroupId:
+      name: group_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
     RequiredTenant:
       name: tenant_external_id
       in: query
@@ -2896,6 +3294,24 @@ components:
       schema: { type: integer, format: int64, minimum: 1, maximum: 500, default: 500 }
 
   responses:
+    RoutingGroupList:
+      description: Tenant-scoped groups including bounded member identifiers.
+      content:
+        application/json:
+          schema:
+            type: array
+            maxItems: 10000
+            items: { $ref: '#/components/schemas/Group' }
+    RoutingGroupCreated:
+      description: Created group, or an idempotent normalized-name replay.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Group' }
+    RoutingGroupUpdated:
+      description: Updated group and optimistic-concurrency version.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Group' }
     InvalidRequest:
       description: Invalid JSON, field, state transition, idempotency reuse, or unsupported operation.
       headers:
@@ -3179,6 +3595,20 @@ components:
         currency: { $ref: '#/components/schemas/Currency' }
         policy: { $ref: '#/components/schemas/CredentialPolicy' }
         initial_balance: { $ref: '#/components/schemas/NonNegativeMoney' }
+        route_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Exact model routes granted at creation. Every route must already exist in the selected tenant.
+          items: { type: string, format: uuid }
+          default: []
+        route_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Existing route groups granted at creation. Credential groups are not accepted here.
+          items: { type: string, format: uuid }
+          default: []
     IssuedClientCredential:
       type: object
       additionalProperties: false
@@ -3428,27 +3858,17 @@ components:
       required: [type]
       properties:
         type: { const: none }
-    SubscriptionBridgeCredential:
-      type: object
-      additionalProperties: false
-      required: [type, handle]
-      properties:
-        type: { const: subscription_bridge }
-        handle: { type: string, pattern: '^[A-Za-z0-9]{1,80}$', writeOnly: true }
-        secret: { type: [string, 'null'], writeOnly: true }
     UpstreamCredential:
       oneOf:
         - $ref: '#/components/schemas/NoAuthCredential'
         - $ref: '#/components/schemas/ApiKeyCredential'
         - $ref: '#/components/schemas/OAuthCredential'
-        - $ref: '#/components/schemas/SubscriptionBridgeCredential'
       discriminator:
         propertyName: type
         mapping:
           none: '#/components/schemas/NoAuthCredential'
           api_key: '#/components/schemas/ApiKeyCredential'
           oauth: '#/components/schemas/OAuthCredential'
-          subscription_bridge: '#/components/schemas/SubscriptionBridgeCredential'
     CreateUpstreamProviderRequest:
       type: object
       additionalProperties: false
@@ -3494,8 +3914,8 @@ components:
         tenant_external_id: { type: [string, 'null'] }
         name: { type: string }
         driver: { type: string }
-        auth_kind: { type: string, enum: [none, api_key, oauth], description: Stored authentication family. Subscription bridges use the OAuth family internally. }
-        connection_method: { type: string, enum: [none, api_key, oauth, subscription_bridge], description: Presentation/discovery metadata; every value remains the same unified upstream resource. }
+        auth_kind: { type: string, enum: [none, api_key, oauth], description: Stored authentication family. }
+        connection_method: { type: string, enum: [none, api_key, oauth, legacy], description: Presentation metadata for the unified upstream resource; legacy is read-only historical data. }
         credential_generation: { type: integer, format: int64, minimum: 1 }
         status: { type: string, enum: [active, disabled] }
         config: { type: object, additionalProperties: true }
@@ -3548,17 +3968,26 @@ components:
         provider_driver: { type: string, minLength: 1 }
         provider_config: { type: object, additionalProperties: true }
         upstream_account_id: { type: string, format: uuid, description: Existing stable upstream identity to reauthorize. Its tenant, name, driver, and configuration must match this request. }
-    StartSubscriptionBridgeRequest:
+    StartCodexOAuthRequest:
       type: object
       additionalProperties: false
-      required: [account_name, provider, base_url]
+      required: [account_name]
       properties:
         tenant_external_id: { type: string, default: default }
         account_name: { type: string, minLength: 1 }
-        provider: { type: string, enum: [copilot, cursor] }
-        base_url: { type: string, format: uri }
-        upstream_account_id: { type: string, format: uuid, description: Existing stable upstream identity to reauthorize. Its tenant, name, provider, and bridge URL must match this request. }
-        bridge_secret: { type: [string, 'null'], writeOnly: true }
+        upstream_account_id: { type: string, format: uuid, description: Existing stable OpenAI Codex upstream identity to reauthorize. }
+    CodexDeviceLoginStart:
+      type: object
+      additionalProperties: false
+      required: [driver, verification_url, user_code, session_token, expires_at, poll_after_seconds, security_notice]
+      properties:
+        driver: { const: openai-codex }
+        verification_url: { type: string, format: uri }
+        user_code: { type: string, minLength: 1 }
+        session_token: { type: string, writeOnly: true, description: Authenticated, encrypted login state bound to the tenant and operator credential. }
+        expires_at: { type: integer, format: int64 }
+        poll_after_seconds: { type: integer, format: int64, minimum: 1, maximum: 60 }
+        security_notice: { const: only_continue_if_you_started_this_login }
     OAuthLoginStart:
       type: object
       additionalProperties: false
@@ -3581,45 +4010,6 @@ components:
         status: { const: pending }
         retry_after_seconds: { type: integer, format: int64, minimum: 0 }
         message: { type: [string, 'null'] }
-    CpaSubscriptionImportRequest:
-      type: object
-      required: [bridge_base_url, auth_files]
-      properties:
-        tenant_external_id: { type: string, default: default }
-        bridge_base_url: { type: string, format: uri }
-        bridge_secret: { type: [string, 'null'], writeOnly: true }
-        auth_files:
-          type: array
-          minItems: 1
-          maxItems: 32
-          items:
-            type: object
-            required: [filename, document]
-            properties:
-              filename: { type: string, pattern: '^[^/\\]{1,200}\.json$' }
-              document: { type: object, additionalProperties: true, writeOnly: true }
-    CpaSubscriptionImportResult:
-      type: object
-      required: [imported, skipped]
-      properties:
-        imported:
-          type: array
-          items:
-            type: object
-            required: [source_fingerprint, provider, account]
-            properties:
-              source_fingerprint: { type: string }
-              provider: { type: string, enum: [copilot, cursor] }
-              label: { type: [string, 'null'] }
-              account: { $ref: '#/components/schemas/UpstreamProvider' }
-        skipped:
-          type: array
-          items:
-            type: object
-            required: [source_fingerprint, reason]
-            properties:
-              source_fingerprint: { type: string }
-              reason: { const: requires_provider_adapter }
     CpaManagedOAuthImportCapabilities:
       type: object
       additionalProperties: false
@@ -3833,29 +4223,325 @@ components:
         eligible_account_count: { type: integer, format: int64, minimum: 0 }
         unknown_account_count: { type: integer, format: int64, minimum: 0 }
         stale_account_count: { type: integer, format: int64, minimum: 0 }
+    Group:
+      type: object
+      additionalProperties: false
+      required: [id, tenant_id, tenant_external_id, name, member_ids, member_count, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        name: { type: string, minLength: 1, maxLength: 100, pattern: '^[^\x00-\x1F\x7F]+$' }
+        member_ids:
+          type: array
+          maxItems: 10000
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        member_count: { type: integer, format: int64, minimum: 0, maximum: 10000 }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+    CreateRoutingGroupRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, name]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        name: { type: string, minLength: 1, maxLength: 100, pattern: '^[^\x00-\x1F\x7F]+$' }
+    ReplaceRoutingGroupRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, name, expected_updated_at]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        name: { type: string, minLength: 1, maxLength: 100, pattern: '^[^\x00-\x1F\x7F]+$' }
+        expected_updated_at: { type: integer, format: int64 }
+    ReplaceRoutingGroupMembersRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, member_ids, expected_updated_at]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        member_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        expected_updated_at: { type: integer, format: int64 }
     CreateModelRouteRequest:
       type: object
       additionalProperties: false
-      required: [public_model, upstream_account_id, upstream_model, protocol]
+      required: [public_model, upstream_model, protocol]
+      anyOf:
+        - required: [upstream_account_id]
+        - required: [upstream_account_ids]
+          properties:
+            upstream_account_ids:
+              minItems: 1
+        - required: [included_provider_group_ids]
+          properties:
+            included_provider_group_ids:
+              minItems: 1
       properties:
-        tenant_external_id: { type: string, default: default }
-        public_model: { type: string, minLength: 1 }
-        upstream_account_id: { type: string, format: uuid }
-        upstream_model: { type: string, minLength: 1 }
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200, default: default }
+        public_model: { type: string, minLength: 1, maxLength: 200 }
+        upstream_account_id:
+          type: string
+          format: uuid
+          deprecated: true
+          description: Legacy single-account input; new callers use `upstream_account_ids`.
+        upstream_account_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+          default: []
+        upstream_model: { type: string, minLength: 1, maxLength: 500 }
         protocol: { type: string, enum: [openai, anthropic, generation] }
         priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000, default: 0 }
+        included_provider_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+          default: []
+        excluded_provider_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Exclusion wins over explicit accounts and included provider groups.
+          items: { type: string, format: uuid }
+          default: []
+        route_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+          default: []
+        route_group_names:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Existing normalized names are reused and missing route groups are created in the same transaction.
+          items: { type: string, minLength: 1, maxLength: 100, pattern: '^[^\x00-\x1F\x7F]+$' }
+          default: []
+        granted_credential_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Stable credential IDs granted this exact route. Credential-group IDs are never accepted.
+          items: { type: string, format: uuid }
+          default: []
+        custom_model_confirmed:
+          type: boolean
+          default: false
+          description: Explicit operator acknowledgement required when the upstream model is absent from a complete synchronized catalog.
     ReplaceModelRouteRequest:
       type: object
       additionalProperties: false
-      required: [tenant_external_id, public_model, upstream_account_id, upstream_model, protocol, priority, expected_updated_at]
+      required: [tenant_external_id, public_model, upstream_model, protocol, priority, expected_updated_at, expected_grant_revision]
+      anyOf:
+        - required: [upstream_account_id]
+        - required: [upstream_account_ids]
+          properties:
+            upstream_account_ids:
+              minItems: 1
+        - required: [included_provider_group_ids]
+          properties:
+            included_provider_group_ids:
+              minItems: 1
       properties:
         tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
         public_model: { type: string, minLength: 1, maxLength: 200 }
-        upstream_account_id: { type: string, format: uuid }
-        upstream_model: { type: string, minLength: 1, maxLength: 200 }
+        upstream_account_id:
+          type: string
+          format: uuid
+          deprecated: true
+          description: Legacy single-account input; new callers use `upstream_account_ids`.
+        upstream_account_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        upstream_model: { type: string, minLength: 1, maxLength: 500 }
         protocol: { type: string, enum: [openai, anthropic, generation] }
         priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000 }
+        included_provider_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        excluded_provider_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Exclusion wins over explicit accounts and included provider groups.
+          items: { type: string, format: uuid }
+        route_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        route_group_names:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Existing normalized names are reused and missing route groups are created atomically.
+          items: { type: string, minLength: 1, maxLength: 100, pattern: '^[^\x00-\x1F\x7F]+$' }
+        granted_credential_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Stable credential IDs granted this exact route. Credential-group IDs are never accepted.
+          items: { type: string, format: uuid }
+        custom_model_confirmed:
+          type: boolean
+          default: false
+          description: Explicit operator acknowledgement for a model absent from a complete synchronized catalog.
         expected_updated_at: { type: integer, format: int64 }
+        expected_grant_revision: { type: integer, format: int64, minimum: 0 }
+    ReplaceModelRouteRoutingRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, upstream_account_ids, included_provider_group_ids, excluded_provider_group_ids, route_group_ids, route_group_names, granted_credential_ids, custom_model_confirmed, expected_updated_at, expected_grant_revision]
+      anyOf:
+        - required: [upstream_account_ids]
+          properties:
+            upstream_account_ids:
+              minItems: 1
+        - required: [included_provider_group_ids]
+          properties:
+            included_provider_group_ids:
+              minItems: 1
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        upstream_account_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        included_provider_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        excluded_provider_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Exclusion wins over explicit accounts and included provider groups.
+          items: { type: string, format: uuid }
+        route_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        route_group_names:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Existing normalized names are reused and missing route groups are created atomically.
+          items: { type: string, minLength: 1, maxLength: 100, pattern: '^[^\x00-\x1F\x7F]+$' }
+        granted_credential_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Stable credential IDs granted this exact route. Credential-group IDs are never accepted.
+          items: { type: string, format: uuid }
+        custom_model_confirmed:
+          type: boolean
+          description: Explicit operator acknowledgement for a model absent from a complete synchronized catalog.
+        expected_updated_at: { type: integer, format: int64 }
+        expected_grant_revision: { type: integer, format: int64, minimum: 0 }
+    ModelRouteRouting:
+      type: object
+      additionalProperties: false
+      required: [route_id, upstream_account_ids, included_provider_group_ids, excluded_provider_group_ids, route_group_ids, granted_credential_ids, candidate_upstream_account_ids, custom_model_confirmed, updated_at, grant_revision]
+      properties:
+        route_id: { type: string, format: uuid }
+        upstream_account_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        included_provider_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        excluded_provider_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        route_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        granted_credential_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        candidate_upstream_account_ids:
+          type: array
+          maxItems: 1000
+          uniqueItems: true
+          description: Active candidate accounts after provider-group inclusion and exclusion.
+          items: { type: string, format: uuid }
+        custom_model_confirmed: { type: boolean }
+        updated_at: { type: integer, format: int64 }
+        grant_revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Version of `granted_credential_ids` only; provider and group associations use `updated_at`.
+    ReplaceClientCredentialRoutingRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, route_ids, route_group_ids, expected_grant_revision]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        route_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        route_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Existing route groups only; this operation never creates a group.
+          items: { type: string, format: uuid }
+        expected_grant_revision: { type: integer, format: int64, minimum: 0 }
+    ClientCredentialRouting:
+      type: object
+      additionalProperties: false
+      required: [key_id, route_ids, route_group_ids, effective_route_ids, updated_at, grant_revision]
+      properties:
+        key_id: { type: string, format: uuid }
+        route_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        route_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        effective_route_ids:
+          type: array
+          maxItems: 10000
+          uniqueItems: true
+          description: Deduplicated union of exact routes and current members of granted route groups.
+          items: { type: string, format: uuid }
+        updated_at: { type: integer, format: int64 }
+        grant_revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Version of direct `route_ids` and `route_group_ids`; derived effective routes do not change this revision.
     SetModelRouteEnabledRequest:
       type: object
       additionalProperties: false
@@ -3867,17 +4553,57 @@ components:
     ModelRoute:
       type: object
       additionalProperties: false
-      required: [id, tenant_id, tenant_external_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at]
+      required: [id, tenant_id, tenant_external_id, public_model, upstream_account_id, upstream_account_ids, upstream_model, protocol, priority, enabled, included_provider_group_ids, excluded_provider_group_ids, route_group_ids, granted_credential_ids, candidate_upstream_account_ids, custom_model_confirmed, grant_revision, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
         tenant_external_id: { type: [string, 'null'] }
         public_model: { type: string }
-        upstream_account_id: { type: string, format: uuid }
+        upstream_account_id:
+          type: string
+          format: uuid
+          deprecated: true
+          description: Legacy first explicit account, or the nil UUID for a provider-group-only route.
+        upstream_account_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
         upstream_model: { type: string }
         protocol: { type: string, enum: [openai, anthropic, generation] }
         priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000 }
         enabled: { type: boolean }
+        included_provider_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        excluded_provider_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        route_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        granted_credential_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        candidate_upstream_account_ids:
+          type: array
+          maxItems: 1000
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        custom_model_confirmed: { type: boolean }
+        grant_revision:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Version of reverse exact credential grants only.
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
     TokenPriceRequest:
@@ -4162,6 +4888,18 @@ components:
         version: { type: integer, format: int64, minimum: 1 }
         status: { type: string, enum: [active, cancelled] }
         policy: { $ref: '#/components/schemas/CredentialPolicy' }
+        route_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+          description: Exact model-route grants. Presence, including an empty array, selects the normalized grants contract.
+        route_group_ids:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items: { type: string, format: uuid }
+          description: Route-group grants. Presence, including an empty array, selects the normalized grants contract.
         proration:
           description: Optional active-plan evidence; canonical serialized size, including the event digest, is limited to 4 KiB.
     ProvisionedCloudCredential:
