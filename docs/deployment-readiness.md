@@ -133,18 +133,48 @@ fresh put/read before production dogfood rollout.
 
 ## Gate 1: identify immutable images
 
-The GitHub `ci` workflow validates every `master` push first, then its
-`publish-ghcr` matrix builds the service and importer and publishes both to
-GHCR as `sha-<full commit>` plus the moving `master` tag. The publish job uses
-the repository-scoped `GITHUB_TOKEN`, emits an SBOM and provenance, and records
-the registry digest. A private repository can publish these packages; private
-packages require an image pull credential, while public GHCR container packages
-allow anonymous pulls.
+The GitHub `ci` workflow validates pull requests and every `master` push.
+It defaults to read-only repository permissions and makes `packages: write`
+available only to the master publication matrix. Publication cannot start until
+all of these current-SHA gates succeed:
 
-There is no repository-managed Forgejo/Harbor fallback. GitHub CI and the two
+- repository secret and infrastructure-misconfiguration scan;
+- `cargo-deny`, RustSec with no ignored advisory, and forbidden-dependency
+  re-entry checks;
+- Rust fmt, all-target/all-feature clippy with warnings denied, and the complete
+  Rust suite against SQLite, PostgreSQL and the mock S3 service;
+- TypeScript type checking, localization contracts, production web build and
+  Cucumber.js/Playwright dogfooding;
+- replay-safe SQLite and PostgreSQL migrations, CPA archive-delta tests, and the
+  CPAMP initial/overlap/incremental/replay acceptance;
+- OpenAPI/source-route/role contracts, Helm/Kubernetes packaging, and hardened
+  importer/plugin-installer image contracts;
+- the full 15-minute memory profile, including the 500 MiB asset stream.
+
+The `publish-ghcr` matrix then builds the service, importer and plugin installer
+exactly once for `linux/amd64`. Each image receives only the immutable
+`sha-<full commit>` tag; no `latest` or moving `master` tag is release
+evidence. BuildKit emits an OCI SBOM and maximum-mode provenance. CI scans the
+exact published digest for high and critical OS/library vulnerabilities, proves
+that the SHA tag resolves to the build output digest, checks the OCI revision
+label and both attestations, and publishes a final three-image digest manifest
+only after all matrix entries pass.
+
+This describes the required gate, not a successful run. On 2026-08-21, run
+`32472653829` for `2437415a30ef488cf84d4fd0ecdca58eee804414` failed before
+any step started: every scheduled job had an empty step list, and GitHub's check
+annotation said the account payment or spending limit prevented startup.
+Therefore there is currently no acceptable GitHub CI, GHCR digest, SBOM,
+provenance or scan evidence for this revision. Do not substitute a Coder,
+Westlake, Forgejo or Harbor build. After billing is restored, push or rerun the
+exact reviewed `master` SHA, require every job including
+`verify-ghcr-release` to succeed, and retain the `ghcr-release-<sha>` artifact.
+
+There is no repository-managed Forgejo/Harbor fallback. GitHub CI and the three
 GHCR packages are the release authority. Select the `sha-<full commit>` images,
-obtain each digest from the successful `publish-ghcr` matrix job, and deploy the
-service and importer as independent `repository:tag@sha256:digest` references:
+obtain their digests from the successful final release manifest, and deploy
+service, importer and plugin installer only as
+`repository:tag@sha256:digest` references:
 
 ```bash
 : "${MTC_REPO:?Set MTC_REPO to the repository's absolute path}"
@@ -153,19 +183,26 @@ export OPS_HOST=main.admin-test.lindongwu11.coder
 MTC_SHA=$(git -C "$MTC_REPO" rev-parse HEAD)
 MTC_SERVICE_IMAGE="ghcr.io/linonetwo/memeloop-token-center:sha-${MTC_SHA}"
 MTC_IMPORTER_IMAGE="ghcr.io/linonetwo/memeloop-token-center-importer:sha-${MTC_SHA}"
+MTC_PLUGIN_INSTALLER_IMAGE="ghcr.io/linonetwo/memeloop-token-center-plugin-installer:sha-${MTC_SHA}"
 
-# Authenticate to private GHCR packages without shell tracing, then inspect both.
+# Authenticate to private GHCR packages without shell tracing, then inspect all three.
 docker buildx imagetools inspect "$MTC_SERVICE_IMAGE"
 docker buildx imagetools inspect "$MTC_IMPORTER_IMAGE"
+docker buildx imagetools inspect "$MTC_PLUGIN_INSTALLER_IMAGE"
 
-: "${MTC_SERVICE_DIGEST:?Set from the service publish-ghcr job (sha256:...)}"
-: "${MTC_IMPORTER_DIGEST:?Set from the importer publish-ghcr job (sha256:...)}"
-case "$MTC_SERVICE_DIGEST:$MTC_IMPORTER_DIGEST" in
-  sha256:*:sha256:*) ;;
-  *) echo 'Both image digests must be sha256 values' >&2; exit 1;;
-esac
+: "${MTC_SERVICE_DIGEST:?Set from the final release manifest (sha256:...)}"
+: "${MTC_IMPORTER_DIGEST:?Set from the final release manifest (sha256:...)}"
+: "${MTC_PLUGIN_INSTALLER_DIGEST:?Set from the final release manifest (sha256:...)}"
+for digest in "$MTC_SERVICE_DIGEST" "$MTC_IMPORTER_DIGEST" \
+  "$MTC_PLUGIN_INSTALLER_DIGEST"; do
+  case "$digest" in
+    sha256:[0-9a-f][0-9a-f][0-9a-f]*) ;;
+    *) echo 'Every image digest must be a sha256 value' >&2; exit 1;;
+  esac
+done
 MTC_SERVICE_IMAGE_PIN="${MTC_SERVICE_IMAGE}@${MTC_SERVICE_DIGEST}"
 MTC_IMPORTER_IMAGE_PIN="${MTC_IMPORTER_IMAGE}@${MTC_IMPORTER_DIGEST}"
+MTC_PLUGIN_INSTALLER_IMAGE_PIN="${MTC_PLUGIN_INSTALLER_IMAGE}@${MTC_PLUGIN_INSTALLER_DIGEST}"
 ```
 
 For Helm releases, set `image.repository` and the strict `image.digest`
@@ -173,8 +210,8 @@ For Helm releases, set `image.repository` and the strict `image.digest`
 precedence over `image.tag` for both application Deployments and the migration
 Job, so the rendered workload uses `repository@digest`.
 
-Both artifacts must exist and carry `org.opencontainers.image.revision` equal
-to `MTC_SHA`. Record their separate digests in the release evidence. A moving
+All three artifacts must exist and carry `org.opencontainers.image.revision`
+equal to `MTC_SHA`. Record their separate digests in the release evidence. A moving
 `master` tag is never a deployment input.
 
 If the cluster must pull from Harbor, use only an independently approved and

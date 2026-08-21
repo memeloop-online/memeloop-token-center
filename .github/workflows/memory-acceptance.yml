@@ -1,6 +1,12 @@
 name: memory-acceptance
 
 on:
+  workflow_call:
+    inputs:
+      revision:
+        description: Exact 40-hex commit SHA to test
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       revision:

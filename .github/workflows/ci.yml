@@ -5,7 +5,76 @@ on:
     branches: [master]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  repository-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Reject committed secrets and high-risk infrastructure misconfiguration
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: 1
+          format: table
+          skip-dirs: target,web/node_modules
+
+  dependency-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.95.0
+      - name: Enforce license, source, duplicate, ban, and advisory policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: 1.95.0
+          command: check advisories bans licenses sources
+          arguments: --all-features
+      - name: Enforce the current RustSec advisory database with no exceptions
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ github.token }}
+      - name: Reject forbidden dependency re-entry and verify vendored provenance
+        run: |
+          tests/ops/rust-decimal-vendor-contract.sh
+          default_tree="$(cargo tree --locked --target all --prefix none)"
+          all_features_tree="$(cargo tree --locked --all-features --target all --prefix none)"
+          for crate in rsa rkyv rkyv_derive sqlx-mysql sigstore; do
+            if printf '%s\n' "$default_tree" | grep -E "^${crate} v"; then
+              echo "$crate entered the default dependency tree" >&2
+              exit 1
+            fi
+            if printf '%s\n' "$all_features_tree" | grep -E "^${crate} v"; then
+              echo "$crate entered the all-features dependency tree" >&2
+              exit 1
+            fi
+          done
+          for crate in rsa rkyv rkyv_derive sigstore; do
+            if grep -Fq "name = \"${crate}\"" Cargo.lock; then
+              echo "$crate remains in Cargo.lock" >&2
+              exit 1
+            fi
+          done
+
   web:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -14,6 +83,8 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.18.0
@@ -24,6 +95,8 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: npm ci
+      - name: Reject high and critical Node dependency vulnerabilities
+        run: npm audit --audit-level=high
       - run: npm run typecheck
       - run: npm run test:localization
       - run: npm run build
@@ -59,35 +132,13 @@ jobs:
           --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install dependency vulnerability scanner
-        run: cargo install cargo-audit --locked
-      - name: Verify zero-exception dependency and advisory surface
-        run: |
-          tests/ops/rust-decimal-vendor-contract.sh
-          default_tree="$(cargo tree --locked --target all --prefix none)"
-          all_features_tree="$(cargo tree --locked --all-features --target all --prefix none)"
-          for crate in rsa rkyv rkyv_derive sqlx-mysql sigstore; do
-            if printf '%s\n' "$default_tree" | grep -E "^${crate} v"; then
-              echo "$crate entered the default dependency tree" >&2
-              exit 1
-            fi
-            if printf '%s\n' "$all_features_tree" | grep -E "^${crate} v"; then
-              echo "$crate entered the all-features dependency tree" >&2
-              exit 1
-            fi
-          done
-          for crate in rsa rkyv rkyv_derive sigstore; do
-            if grep -Fq "name = \"${crate}\"" Cargo.lock; then
-              echo "$crate remains in Cargo.lock" >&2
-              exit 1
-            fi
-          done
-          cargo audit
       - name: Install PostgreSQL and SQLite migration clients
         timeout-minutes: 15
         env:
@@ -199,26 +250,51 @@ jobs:
           --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install PostgreSQL client for scale-plan acceptance
+      - name: Install PostgreSQL and SQLite clients for migration acceptance
         timeout-minutes: 15
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=60 update
           sudo apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=60 \
-            install --yes --no-install-recommends postgresql-client
-      - name: PostgreSQL migration smoke test
+            install --yes --no-install-recommends postgresql-client sqlite3
+      - name: SQLite migration and replay smoke test
+        env:
+          MTC_KEY_PEPPER: ci-key-pepper-with-more-than-thirty-two-bytes
+          MTC_SERVICE_TOKEN: ci-bootstrap-token-not-for-production
+          MTC_ARCHIVE_BACKEND: filesystem
+          MTC_ARCHIVE_PATH: /tmp/mtc-sqlite-migration-smoke-archive
+        run: |
+          database="$RUNNER_TEMP/migration-smoke.sqlite"
+          export MTC_DATABASE_URL="sqlite://$database?mode=rwc"
+          cargo run --locked --bin memeloop-token-center -- migrate
+          first_count="$(sqlite3 "$database" 'SELECT count(*) FROM _sqlx_migrations WHERE success = 1')"
+          cargo run --locked --bin memeloop-token-center -- migrate
+          second_count="$(sqlite3 "$database" 'SELECT count(*) FROM _sqlx_migrations WHERE success = 1')"
+          test "$first_count" -gt 0
+          test "$second_count" = "$first_count"
+      - name: PostgreSQL migration and replay smoke test
         env:
           MTC_DATABASE_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
           MTC_KEY_PEPPER: ci-key-pepper-with-more-than-thirty-two-bytes
           MTC_SERVICE_TOKEN: ci-bootstrap-token-not-for-production
           MTC_ARCHIVE_BACKEND: filesystem
           MTC_ARCHIVE_PATH: /tmp/mtc-migration-smoke-archive
-        run: cargo run --locked --bin memeloop-token-center -- migrate
+        run: |
+          cargo run --locked --bin memeloop-token-center -- migrate
+          first_count="$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
+            -c 'SELECT count(*) FROM _sqlx_migrations WHERE success = true')"
+          cargo run --locked --bin memeloop-token-center -- migrate
+          second_count="$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
+            -c 'SELECT count(*) FROM _sqlx_migrations WHERE success = true')"
+          test "$first_count" -gt 0
+          test "$second_count" = "$first_count"
       - name: Seed 100k-row observability scale fixture
         env:
           PGHOST: 127.0.0.1
@@ -242,11 +318,43 @@ jobs:
           retention-days: 30
       - name: Validate resumable CPA session-archive delta export
         run: python3 tests/ops/test-session-archive-delta-export.py
+      - name: Exercise CPAMP initial, overlap, incremental, and replay imports
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGDATABASE: memeloop_token_center_test
+          PGUSER: token_center
+          PGPASSWORD: token_center
+        run: |
+          schema="mig_${GITHUB_SHA:0:24}"
+          run_id="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          image="memeloop-token-center-importer:ci-${GITHUB_SHA}"
+          cleanup() {
+            psql -X --no-psqlrc -v ON_ERROR_STOP=1 -v schema="$schema" \
+              -c 'DROP SCHEMA IF EXISTS :"schema" CASCADE' >/dev/null
+            docker image rm "$image" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT HUP INT TERM
+          psql -X --no-psqlrc -v ON_ERROR_STOP=1 -v schema="$schema" \
+            -c 'CREATE SCHEMA :"schema"'
+          docker build --file Dockerfile.importer --tag "$image" .
+          docker run --rm --network host --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --security-opt no-new-privileges --cap-drop ALL \
+            --env ACCEPTANCE_SCHEMA="$schema" \
+            --env ACCEPTANCE_RUN_ID="$run_id" \
+            --env PGHOST=127.0.0.1 --env PGPORT=5432 \
+            --env PGDATABASE="$PGDATABASE" --env PGUSER="$PGUSER" \
+            --env PGPASSWORD="$PGPASSWORD" \
+            --volume "$PWD/tests/ops/cpamp-import-postgres-acceptance.sh:/acceptance.sh:ro" \
+            --entrypoint /bin/sh "$image" /acceptance.sh
 
   api-contract:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install pinned OpenAPI validation dependencies
         run: python3 -m pip install --requirement tests/ops/requirements-openapi.txt
       - name: Compare Axum source routes, role boundaries, and OpenAPI
@@ -261,9 +369,25 @@ jobs:
           path: /tmp/memeloop-token-center-route-contract.json
           retention-days: 14
 
+  memory-acceptance:
+    needs: [rust]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/memory-acceptance.yml
+    with:
+      revision: ${{ github.sha }}
+
   publish-ghcr:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    needs: [web, rust, migration-smoke, api-contract, packaging]
+    needs:
+      - repository-security
+      - dependency-security
+      - web
+      - rust
+      - migration-smoke
+      - api-contract
+      - packaging
+      - memory-acceptance
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -284,6 +408,8 @@ jobs:
             cache_scope: plugin-installer
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -298,9 +424,7 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: true
-          tags: |
-            ${{ matrix.image }}:sha-${{ github.sha }}
-            ${{ matrix.image }}:master
+          tags: ${{ matrix.image }}:sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -312,6 +436,56 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
           provenance: mode=max
           sbom: true
+      - name: Scan the exact published digest for high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: 1
+          format: table
+          timeout: 15m0s
+      - name: Verify tag resolution, OCI revision, SBOM, and provenance
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          CACHE_SCOPE: ${{ matrix.cache_scope }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "build returned an invalid image digest: $DIGEST" >&2
+            exit 1
+          fi
+          tagged_reference="${IMAGE}:sha-${GITHUB_SHA}"
+          digest_reference="${IMAGE}@${DIGEST}"
+          resolved_digest="$(docker buildx imagetools inspect "$tagged_reference" \
+            --format '{{json .Manifest}}' | jq -r '.digest // empty')"
+          if [ "$resolved_digest" != "$DIGEST" ]; then
+            echo "immutable tag resolved to $resolved_digest instead of the build digest" >&2
+            exit 1
+          fi
+          docker buildx imagetools inspect "$digest_reference" >/dev/null
+          docker buildx imagetools inspect "$digest_reference" \
+            --format '{{json .Image}}' >"$RUNNER_TEMP/${CACHE_SCOPE}-image.json"
+          docker buildx imagetools inspect "$digest_reference" \
+            --format '{{json .SBOM}}' >"$RUNNER_TEMP/${CACHE_SCOPE}-sbom.json"
+          docker buildx imagetools inspect "$digest_reference" \
+            --format '{{json .Provenance}}' >"$RUNNER_TEMP/${CACHE_SCOPE}-provenance.json"
+          jq -e --arg revision "$GITHUB_SHA" \
+            '[.. | objects | .config?.Labels? // empty |
+              .["org.opencontainers.image.revision"]? // empty] |
+             index($revision) != null' \
+            "$RUNNER_TEMP/${CACHE_SCOPE}-image.json" >/dev/null
+          jq -e \
+            '[.. | objects | .SPDXID? // empty] |
+             index("SPDXRef-DOCUMENT") != null' \
+            "$RUNNER_TEMP/${CACHE_SCOPE}-sbom.json" >/dev/null
+          jq -e \
+            '[.. | objects | .buildType? // empty] |
+             index("https://mobyproject.org/buildkit@v1") != null' \
+            "$RUNNER_TEMP/${CACHE_SCOPE}-provenance.json" >/dev/null
       - name: Record immutable image digest manifest
         shell: bash
         env:
@@ -335,14 +509,72 @@ jobs:
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
           name: image-digest-${{ matrix.cache_scope }}-${{ github.sha }}
-          path: ${{ runner.temp }}/${{ matrix.cache_scope }}-image-digest.json
+          path: |
+            ${{ runner.temp }}/${{ matrix.cache_scope }}-image-digest.json
+            ${{ runner.temp }}/${{ matrix.cache_scope }}-image.json
+            ${{ runner.temp }}/${{ matrix.cache_scope }}-sbom.json
+            ${{ runner.temp }}/${{ matrix.cache_scope }}-provenance.json
           if-no-files-found: error
           retention-days: 30
+
+  verify-ghcr-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [publish-ghcr]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: image-digest-*-${{ github.sha }}
+          path: ${{ runner.temp }}/release-evidence
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify the complete release set by immutable digest
+        shell: bash
+        run: |
+          set -eu
+          evidence="$RUNNER_TEMP/release-evidence"
+          expected='importer plugin-installer service'
+          actual="$(find "$evidence" -maxdepth 1 -name '*-image-digest.json' -printf '%f\n' |
+            sed 's/-image-digest\.json$//' | sort | tr '\n' ' ' | sed 's/ $//')"
+          if [ "$actual" != "$expected" ]; then
+            echo "incomplete release evidence: expected '$expected', got '$actual'" >&2
+            exit 1
+          fi
+          jq -s -e --arg revision "$GITHUB_SHA" '
+            select(
+              length == 3 and
+              (map(.revision == $revision) | all) and
+              (map(.digest | test("^sha256:[0-9a-f]{64}$")) | all) and
+              (map(.reference == (.image + "@" + .digest)) | all) and
+              (map(.image) | unique | length == 3)
+            )
+          ' "$evidence"/*-image-digest.json >"$RUNNER_TEMP/release-manifest.json"
+          while IFS= read -r reference; do
+            docker buildx imagetools inspect "$reference" >/dev/null
+          done < <(jq -r '.[].reference' "$RUNNER_TEMP/release-manifest.json")
+      - name: Upload the complete immutable release manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghcr-release-${{ github.sha }}
+          path: ${{ runner.temp }}/release-manifest.json
+          if-no-files-found: error
+          retention-days: 90
 
   packaging:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
       - name: Install pinned Kubernetes schema validator
         run: |

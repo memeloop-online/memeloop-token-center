@@ -52,16 +52,48 @@ if [ -z "$uses_lines" ]; then
   echo 'No GitHub Actions uses entries were found' >&2
   exit 1
 fi
-if printf '%s\n' "$uses_lines" \
-  | grep -Ev 'uses:[[:space:]]+[^[:space:]#]+@[0-9a-fA-F]{40}[[:space:]]+#[[:space:]]+[^[:space:]]+' >/dev/null; then
-  echo 'Every action in every GitHub workflow must use a full 40-hex commit SHA and retain a version comment' >&2
-  printf '%s\n' "$uses_lines" \
-    | grep -Ev 'uses:[[:space:]]+[^[:space:]#]+@[0-9a-fA-F]{40}[[:space:]]+#[[:space:]]+[^[:space:]]+' >&2
+if printf '%s\n' "$uses_lines" |
+  grep -Ev 'uses:[[:space:]]+(\./[^[:space:]#]+|[^[:space:]#]+@[0-9a-fA-F]{40}[[:space:]]+#[[:space:]]+[^[:space:]]+)' \
+    >/dev/null; then
+  echo 'Every external action must use a full 40-hex commit SHA and retain a version comment' >&2
+  printf '%s\n' "$uses_lines" |
+    grep -Ev 'uses:[[:space:]]+(\./[^[:space:]#]+|[^[:space:]#]+@[0-9a-fA-F]{40}[[:space:]]+#[[:space:]]+[^[:space:]]+)' \
+      >&2
   exit 1
 fi
 
 grep -Fq 'node-version: 24.18.0' "$workflow"
-test "$(grep -c 'toolchain: 1.95.0' "$workflow")" -eq 3
+test "$(grep -c 'toolchain: 1.95.0' "$workflow")" -eq 4
+
+# Default to read-only and grant package publication only to the master release job.
+test "$(grep -c '^[[:space:]]*contents: read$' "$workflow")" -ge 2
+test "$(grep -c '^[[:space:]]*packages: write$' "$workflow")" -eq 1
+test "$(grep -c '^[[:space:]]*packages: read$' "$workflow")" -eq 1
+test "$(grep -c '^[[:space:]]*contents: write$' "$workflow" || true)" -eq 0
+test "$(grep -c '^[[:space:]]*id-token: write$' "$workflow" || true)" -eq 0
+
+checkout_count=$(printf '%s\n' "$uses_lines" | grep -c 'actions/checkout@')
+persist_false_count=$(grep -Rhc 'persist-credentials: false' "$workflow_directory"/* |
+  awk '{ total += $1 } END { print total + 0 }')
+if [ "$checkout_count" -ne "$persist_false_count" ]; then
+  echo 'Every checkout must disable persisted GitHub credentials' >&2
+  exit 1
+fi
+
+grep -Fq 'repository-security:' "$workflow"
+grep -Fq 'dependency-security:' "$workflow"
+grep -Fq 'scanners: secret,misconfig' "$workflow"
+grep -Fq 'command: check advisories bans licenses sources' "$workflow"
+grep -Fq 'uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0' "$workflow"
+if grep -A4 -F 'uses: rustsec/audit-check@' "$workflow" | grep -Eq 'ignore:|--ignore'; then
+  echo 'RustSec CI must not suppress any advisory' >&2
+  exit 1
+fi
+grep -Fq 'memory-acceptance:' "$workflow"
+grep -Fq 'uses: ./.github/workflows/memory-acceptance.yml' "$workflow"
+grep -Fq 'workflow_call:' "$workflow_directory/memory-acceptance.yml"
+grep -Fq -- '--profile acceptance' "$workflow_directory/memory-acceptance.yml"
+grep -Fq -- '--gateway-limit-mib 256' "$workflow_directory/memory-acceptance.yml"
 
 cargo_resolution_lines=$(grep -E \
   'cargo (build|clippy|test|run|tree)([[:space:]]|$)' "$workflow")
@@ -73,10 +105,33 @@ fi
 
 grep -Fq 'ghcr.io/linonetwo/memeloop-token-center' "$workflow"
 grep -Fq 'ghcr.io/linonetwo/memeloop-token-center-importer' "$workflow"
+grep -Fq 'ghcr.io/linonetwo/memeloop-token-center-plugin-installer' "$workflow"
 grep -Fq 'dockerfile: Dockerfile' "$workflow"
 grep -Fq 'dockerfile: Dockerfile.importer' "$workflow"
+grep -Fq 'dockerfile: Dockerfile.plugin-installer' "$workflow"
+grep -Fq "if: github.event_name == 'push' && github.ref == 'refs/heads/master'" "$workflow"
 grep -Fq 'MTC_BUILD_GIT_SHA_INPUT=${{ github.sha }}' "$workflow"
 grep -Fq 'ARG MTC_BUILD_GIT_SHA_INPUT=unknown' "$dockerfile"
+grep -Fq 'tags: ${{ matrix.image }}:sha-${{ github.sha }}' "$workflow"
+if grep -Eq 'tags:.*:master|tags:.*:latest|^[[:space:]]+\$\{\{ matrix.image \}\}:(master|latest)$' "$workflow"; then
+  echo 'Moving master/latest tags must not be release or deployment evidence' >&2
+  exit 1
+fi
+grep -Fq 'needs:' "$workflow"
+for required_gate in repository-security dependency-security web rust migration-smoke \
+  api-contract packaging memory-acceptance; do
+  grep -Fq -- "- $required_gate" "$workflow"
+done
+grep -Fq 'scanners: vuln' "$workflow"
+grep -Fq 'image-ref: ${{ matrix.image }}@${{ steps.build.outputs.digest }}' "$workflow"
+grep -Fq 'severity: HIGH,CRITICAL' "$workflow"
+grep -Fq 'provenance: mode=max' "$workflow"
+grep -Fq 'sbom: true' "$workflow"
+grep -Fq -- '--format '"'"'{{json .SBOM}}'"'"'' "$workflow"
+grep -Fq -- '--format '"'"'{{json .Provenance}}'"'"'' "$workflow"
+grep -Fq 'verify-ghcr-release:' "$workflow"
+grep -Fq 'name: ghcr-release-${{ github.sha }}' "$workflow"
+grep -Fq 'length == 3 and' "$workflow"
 # These are intentionally literal GitHub/JQ expressions in the audited workflow.
 # shellcheck disable=SC2016
 grep -Fq 'DIGEST: ${{ steps.build.outputs.digest }}' "$workflow"
@@ -85,5 +140,15 @@ grep -Fq 'name: image-digest-${{ matrix.cache_scope }}-${{ github.sha }}' "$work
 # shellcheck disable=SC2016
 grep -Fq 'reference: ($image + "@" + $digest)' "$workflow"
 grep -Fq 'if-no-files-found: error' "$workflow"
+
+grep -Fq 'SQLite migration and replay smoke test' "$workflow"
+grep -Fq 'PostgreSQL migration and replay smoke test' "$workflow"
+grep -Fq 'Exercise CPAMP initial, overlap, incremental, and replay imports' "$workflow"
+grep -Fq 'tests/ops/cpamp-import-postgres-acceptance.sh:/acceptance.sh:ro' "$workflow"
+grep -Fq 'cargo fmt --all -- --check' "$workflow"
+grep -Fq 'cargo clippy --locked --all-targets --all-features -- -D warnings' "$workflow"
+grep -Fq 'cargo test --locked --all-targets --all-features' "$workflow"
+grep -Fq 'npm audit --audit-level=high' "$workflow"
+grep -Fq 'npm run test:e2e' "$workflow"
 
 echo 'Release workflow and Docker packaging contract OK'
