@@ -8,6 +8,7 @@ export interface RequestView {
   input_tokens: number;
   output_tokens: number;
   cost: string;
+  currency?: string | null;
   error_code: string | null;
 }
 
@@ -83,6 +84,15 @@ export interface UsageAnalysisMetrics {
 export interface UsageAnalysisBucket extends UsageAnalysisMetrics {
   id: string;
   label: string;
+  key_id?: string;
+  key_alias?: string;
+  unlinked?: boolean;
+}
+
+export interface UsageAnalysisSessionBucket extends UsageAnalysisBucket {
+  key_id: string;
+  key_alias: string;
+  unlinked: boolean;
 }
 
 export interface UsageAnalysisTimeBucket extends UsageAnalysisMetrics {
@@ -130,6 +140,7 @@ export interface OperatorUsageAnalysis {
   time_series: UsageAnalysisTimeBucket[];
   by_model: UsageAnalysisBucket[];
   by_key: UsageAnalysisBucket[];
+  by_session?: UsageAnalysisSessionBucket[];
   by_upstream: UsageAnalysisBucket[];
   by_protocol: UsageAnalysisBucket[];
   by_status: UsageAnalysisBucket[];
@@ -322,6 +333,52 @@ export interface ConversationRequest extends RequestView {
 
 export interface ConversationDetail {
   cluster: ConversationCluster;
+  requests: ConversationRequest[];
+  edges: ConversationEdge[];
+  has_more: boolean;
+  next_cursor: { before_created_at: number; before_request_id: string } | null;
+  edges_truncated: boolean;
+}
+
+export interface LogicalSessionSummary {
+  session_id: string;
+  cluster_id: string | null;
+  unlinked: boolean;
+  key_id: string;
+  key_alias: string;
+  model: string;
+  protocol: string;
+  last_status: 'active' | 'success' | 'error' | 'unknown';
+  last_activity_at: number;
+  active_requests: number;
+  requests: number;
+  archived_only_requests: number;
+  archived_only_errors: number;
+  archived_only_input_tokens: number;
+  archived_only_output_tokens: number;
+  archived_only_avg_duration_ms: number | null;
+  errors: number;
+  input_tokens: number;
+  output_tokens: number;
+  avg_duration_ms: number | null;
+  costs: UsageAnalysisCost[];
+}
+
+export interface LogicalSessionCursor {
+  before_last_activity_at: number;
+  before_session_id: string;
+}
+
+export interface LogicalSessionListResponse {
+  generated_at: number;
+  sessions: LogicalSessionSummary[];
+  next_cursor: LogicalSessionCursor | null;
+}
+
+export interface LogicalSessionDetail {
+  session_id: string;
+  cluster_id: string | null;
+  unlinked: boolean;
   requests: ConversationRequest[];
   edges: ConversationEdge[];
   has_more: boolean;

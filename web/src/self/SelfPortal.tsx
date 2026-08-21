@@ -1,18 +1,19 @@
 import RjsfForm from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { ApiError, api } from '../api';
 import { Buckets, DrawerFrame, Metric, RequestTable, Shell } from '../components';
-import { formatCurrency, formatMetricNumber, formatMilliseconds, formatNumber, formatPercent } from '../format';
+import { formatCurrency, formatMetricNumber, formatMilliseconds, formatNumber } from '../format';
 import { localizeSchema, useI18n } from '../i18n';
 import { LimitSnapshot } from '../LimitSnapshot';
 import { schemaFormTemplates } from '../SchemaTemplates';
 import { safeValidator as validator } from '../safeValidator';
-import type { ConversationCluster, ConversationDetail, GenerationAsset, GenerationJob, KeyLimitSnapshot, KeyView, ModelCatalogItem, ModelCatalogResponse, RequestDetail, RequestView, SelfStats } from '../types';
+import { SessionDrawer, SessionList } from '../SessionViews';
+import type { GenerationAsset, GenerationJob, KeyLimitSnapshot, KeyView, LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, ModelCatalogItem, ModelCatalogResponse, RequestDetail, RequestView, SelfStats } from '../types';
 
 const requestPageSize = 50;
-const conversationPageSize = 50;
-const conversationDetailPageSize = 100;
+const sessionPageSize = 50;
+const sessionDetailPageSize = 100;
 
 interface RequestFilters {
   from: string;
@@ -78,22 +79,22 @@ function statsPath(filters: RequestFilters) {
   return `/self/v1/stats?${query}`;
 }
 
-function conversationsPath(before?: ConversationCluster) {
-  const query = new URLSearchParams({ limit: String(conversationPageSize) });
+function sessionsPath(before?: LogicalSessionCursor) {
+  const query = new URLSearchParams({ limit: String(sessionPageSize) });
   if (before) {
-    query.set('before_updated_at', String(before.updated_at));
-    query.set('before_cluster_id', before.cluster_id);
+    query.set('before_last_activity_at', String(before.before_last_activity_at));
+    query.set('before_session_id', before.before_session_id);
   }
-  return `/self/v1/conversations?${query}`;
+  return `/self/v1/sessions?${query}`;
 }
 
-function conversationDetailPath(clusterId: string, cursor?: ConversationDetail['next_cursor']) {
-  const query = new URLSearchParams({ limit: String(conversationDetailPageSize) });
+function sessionDetailPath(sessionId: string, cursor?: LogicalSessionDetail['next_cursor']) {
+  const query = new URLSearchParams({ limit: String(sessionDetailPageSize) });
   if (cursor) {
     query.set('before_created_at', String(cursor.before_created_at));
     query.set('before_request_id', cursor.before_request_id);
   }
-  return `/self/v1/conversations/${clusterId}?${query}`;
+  return `/self/v1/sessions/${encodeURIComponent(sessionId)}?${query}`;
 }
 
 function selfErrorMessage(reason: unknown, t: (key: string) => string, fallback: string) {
@@ -136,16 +137,25 @@ export function SelfPortal() {
   const [generationParameters, setGenerationParameters] = useState<Record<string, unknown>>({});
   const [generationSubmitting, setGenerationSubmitting] = useState(false);
   const [generationMessage, setGenerationMessage] = useState('');
-  const [conversations, setConversations] = useState<ConversationCluster[]>([]);
-  const [hasOlderConversations, setHasOlderConversations] = useState(false);
-  const [conversationLoading, setConversationLoading] = useState(false);
+  const [sessions, setSessions] = useState<LogicalSessionSummary[]>([]);
+  const [hasOlderSessions, setHasOlderSessions] = useState(false);
+  const [sessionNextCursor, setSessionNextCursor] = useState<LogicalSessionCursor | null>(null);
+  const [sessionsGeneratedAt, setSessionsGeneratedAt] = useState(0);
+  const [sessionLoading, setSessionLoading] = useState(false);
   const [detail, setDetail] = useState<RequestDetail>();
   const [generationDetail, setGenerationDetail] = useState<GenerationJob>();
-  const [conversationDetail, setConversationDetail] = useState<ConversationDetail>();
+  const [sessionDetail, setSessionDetail] = useState<LogicalSessionDetail>();
+  const [selectedSession, setSelectedSession] = useState<LogicalSessionSummary>();
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const loadSequence = useRef(0);
+  const sessionListSequence = useRef(0);
+  const sessionDetailSequence = useRef(0);
 
   async function load() {
+    const sequence = ++loadSequence.current;
+    sessionListSequence.current += 1;
+    sessionDetailSequence.current += 1;
     const value = credential.trim();
     if (!value) return;
     setError(''); setLoading(true);
@@ -154,12 +164,13 @@ export function SelfPortal() {
         api<KeyView>('/self/v1/key', value), api<KeyLimitSnapshot>('/self/v1/key/limits', value), api<SelfStats>(statsPath(requestFilters), value),
         api<RequestView[]>(requestsPath(requestFilters), value),
         api<GenerationJob[]>('/self/v1/generations?limit=100', value),
-        api<ConversationCluster[]>(conversationsPath(), value),
+        api<LogicalSessionListResponse>(sessionsPath(), value),
         api<ModelCatalogResponse>('/v1/models', value),
       ]);
+      if (sequence !== loadSequence.current) return;
       const failures = results.filter((result) => result.status === 'rejected');
       if (failures.length === results.length) throw failures[0].reason;
-      const [nextCredential, nextLimits, nextStats, nextRequests, nextGenerations, nextConversations, nextModels] = results;
+      const [nextCredential, nextLimits, nextStats, nextRequests, nextGenerations, nextSessions, nextModels] = results;
       setCredentialView(nextCredential.status === 'fulfilled' ? nextCredential.value : undefined);
       setLimitSnapshot(nextLimits.status === 'fulfilled' ? nextLimits.value : undefined);
       setStats(nextStats.status === 'fulfilled' ? nextStats.value : undefined);
@@ -168,61 +179,77 @@ export function SelfPortal() {
       setAppliedFilters(requestFilters);
       setHasOlderRequests(nextRequests.status === 'fulfilled' && requestPage.length === requestPageSize);
       setGenerations(nextGenerations.status === 'fulfilled' ? nextGenerations.value : []);
-      const conversationPage = nextConversations.status === 'fulfilled' ? nextConversations.value : [];
-      setConversations(conversationPage);
+      const sessionResponse = nextSessions.status === 'fulfilled' ? nextSessions.value : undefined;
+      const sessionPage = sessionResponse?.sessions ?? [];
+      setSessions(sessionPage);
+      setSessionNextCursor(sessionResponse?.next_cursor ?? null);
+      setSessionsGeneratedAt(sessionResponse?.generated_at ?? 0);
       setAvailableModels(nextModels.status === 'fulfilled' ? nextModels.value.data : []);
       setGenerationModel('');
       setGenerationParameters({});
-      setHasOlderConversations(nextConversations.status === 'fulfilled' && conversationPage.length === conversationPageSize);
+      setHasOlderSessions(sessionResponse?.next_cursor !== null && sessionResponse?.next_cursor !== undefined);
       if (failures.length) setError(t('self.partialLoad', { count: formatNumber(failures.length, locale) }));
     } catch (reason) {
-      setCredentialView(undefined); setAvailableModels([]); setLimitSnapshot(undefined); setStats(undefined); setRequests([]); setGenerations([]); setConversations([]);
-      setDetail(undefined); setGenerationDetail(undefined); setConversationDetail(undefined);
+      if (sequence !== loadSequence.current) return;
+      setCredentialView(undefined); setAvailableModels([]); setLimitSnapshot(undefined); setStats(undefined); setRequests([]); setGenerations([]); setSessions([]);
+      setDetail(undefined); setGenerationDetail(undefined); setSessionDetail(undefined); setSelectedSession(undefined);
       setHasOlderRequests(false);
-      setHasOlderConversations(false);
+      setHasOlderSessions(false);
+      setSessionNextCursor(null);
+      setSessionsGeneratedAt(0);
       setError(selfErrorMessage(reason, t, t('common.requestFailed')));
     }
-    finally { setLoading(false); }
+    finally { if (sequence === loadSequence.current) setLoading(false); }
   }
 
-  async function fetchOlderConversations() {
-    const before = conversations.at(-1);
+  async function fetchOlderSessions() {
+    const sequence = ++sessionListSequence.current;
+    const before = sessionNextCursor;
     const value = credential.trim();
     if (!before || !value) return;
-    setConversationLoading(true); setError('');
+    setSessionLoading(true); setError('');
     try {
-      const page = await api<ConversationCluster[]>(conversationsPath(before), value);
-      setConversations((current) => {
-        const known = new Set(current.map((conversation) => conversation.cluster_id));
-        return [...current, ...page.filter((conversation) => !known.has(conversation.cluster_id))];
+      const response = await api<LogicalSessionListResponse>(sessionsPath(before), value);
+      if (sequence !== sessionListSequence.current) return;
+      const page = response.sessions;
+      setSessions((current) => {
+        const known = new Set(current.map((session) => session.session_id));
+        return [...current, ...page.filter((session) => !known.has(session.session_id))];
       });
-      setHasOlderConversations(page.length === conversationPageSize);
+      setSessionNextCursor(response.next_cursor);
+      setSessionsGeneratedAt(response.generated_at);
+      setHasOlderSessions(response.next_cursor !== null);
     } catch (reason) {
-      setError(selfErrorMessage(reason, t, t('common.requestFailed')));
+      if (sequence === sessionListSequence.current) setError(selfErrorMessage(reason, t, t('common.requestFailed')));
     } finally {
-      setConversationLoading(false);
+      if (sequence === sessionListSequence.current) setSessionLoading(false);
     }
   }
 
-  async function selectConversation(conversation: ConversationCluster) {
-    setConversationLoading(true); setError('');
+  async function selectSession(session: LogicalSessionSummary) {
+    const sequence = ++sessionDetailSequence.current;
+    setSelectedSession(session); setSessionLoading(true); setError('');
     try {
-      setConversationDetail(await api<ConversationDetail>(conversationDetailPath(conversation.cluster_id), credential.trim()));
+      const next = await api<LogicalSessionDetail>(sessionDetailPath(session.session_id), credential.trim());
+      if (sequence === sessionDetailSequence.current) setSessionDetail(next);
     } catch (reason) {
-      setError(selfErrorMessage(reason, t, t('common.requestFailed')));
+      if (sequence === sessionDetailSequence.current) setError(selfErrorMessage(reason, t, t('common.requestFailed')));
     } finally {
-      setConversationLoading(false);
+      if (sequence === sessionDetailSequence.current) setSessionLoading(false);
     }
   }
 
-  async function fetchOlderConversationDetail() {
-    const current = conversationDetail;
-    if (!current?.next_cursor) return;
-    setConversationLoading(true); setError('');
+  async function fetchOlderSessionDetail() {
+    const current = sessionDetail;
+    const session = selectedSession;
+    if (!current?.next_cursor || !session) return;
+    const sequence = ++sessionDetailSequence.current;
+    setSessionLoading(true); setError('');
     try {
-      const page = await api<ConversationDetail>(conversationDetailPath(current.cluster.cluster_id, current.next_cursor), credential.trim());
-      setConversationDetail((latest) => {
-        if (!latest || latest.cluster.cluster_id !== page.cluster.cluster_id) return latest;
+      const page = await api<LogicalSessionDetail>(sessionDetailPath(session.session_id, current.next_cursor), credential.trim());
+      if (sequence !== sessionDetailSequence.current) return;
+      setSessionDetail((latest) => {
+        if (!latest || latest.session_id !== page.session_id) return latest;
         const requestIds = new Set(page.requests.map((request) => request.request_id));
         const edgeKeys = new Set(page.edges.map((edge) => `${edge.from_request_id ?? ''}:${edge.to_request_id}:${edge.relation}`));
         return {
@@ -233,9 +260,9 @@ export function SelfPortal() {
         };
       });
     } catch (reason) {
-      setError(selfErrorMessage(reason, t, t('common.requestFailed')));
+      if (sequence === sessionDetailSequence.current) setError(selfErrorMessage(reason, t, t('common.requestFailed')));
     } finally {
-      setConversationLoading(false);
+      if (sequence === sessionDetailSequence.current) setSessionLoading(false);
     }
   }
 
@@ -427,7 +454,7 @@ export function SelfPortal() {
         <RequestTable requests={requests} currency={credentialView?.currency} onSelect={(request) => void select(request)} />
         {hasOlderRequests && <div className="load-more"><button type="button" className="secondary" disabled={requestLoading} onClick={() => void fetchRequestPage(appliedFilters, true)}>{requestLoading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
       </article>
-      <article className="panel"><div className="panel-title"><h2>{t('self.conversations')}</h2><span>{t('self.conversationHint')}</span></div><div className="conversation-list">{conversations.map((conversation) => <button type="button" className="conversation" key={conversation.cluster_id} disabled={conversationLoading} onClick={() => void selectConversation(conversation)}><span><b>{conversation.explicit_session_id ?? conversation.cluster_id.slice(0, 13)}</b><small>{new Date(conversation.updated_at).toLocaleString(locale)}</small></span><span><strong>{t('request.count', { count: formatNumber(conversation.request_count, locale) })}</strong>{conversation.candidate_edge_count > 0 && <em>{t('self.candidateEdges', { count: formatNumber(conversation.candidate_edge_count, locale) })}</em>}</span></button>)}{conversations.length === 0 && <div className="empty">{t('self.noConversations')}</div>}</div>{hasOlderConversations && <div className="load-more"><button type="button" className="secondary" disabled={conversationLoading} onClick={() => void fetchOlderConversations()}>{conversationLoading ? t('common.loading') : t('self.loadOlderConversations')}</button></div>}</article>
+      <article className="panel self-sessions"><div className="panel-title"><div><h2>{t('sessions.selfTitle')}</h2><p className="muted">{t('sessions.selfHint')}</p><p className="field-description">{t('sessions.rotationContinuity')}</p></div><span>{t('sessions.loaded', { count: formatNumber(sessions.length, locale) })}{sessionsGeneratedAt > 0 && ` · ${t('sessions.generatedAt', { time: new Date(sessionsGeneratedAt).toLocaleString(locale) })}`}</span></div><SessionList values={sessions} loading={sessionLoading} showCredential={false} onSelect={(session) => void selectSession(session)} />{hasOlderSessions && <div className="load-more"><button type="button" className="secondary" disabled={sessionLoading} onClick={() => void fetchOlderSessions()}>{sessionLoading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}</article>
       <article className="panel form-panel generation-create"><div className="panel-title"><div><h2>{t('self.createGeneration')}</h2><p className="muted">{t('self.generationDrivers')}</p></div><button type="button" className="secondary" disabled={loading} onClick={() => void refreshGenerations()}>{t('self.refreshGenerations')}</button></div>
         {generationMessage && <div className="notice success" role="status">{generationMessage}</div>}
         <label>{t('self.generationKind')}<select value={generationKind} onChange={(event) => { setGenerationKind(event.target.value as 'image' | 'video'); setGenerationModel(''); setGenerationParameters({}); }}><option value="image" disabled={catalogHasCapabilities && !availableModels.some((item) => item.modalities?.includes('image'))}>{t('self.image')}</option><option value="video" disabled={catalogHasCapabilities && !availableModels.some((item) => item.modalities?.includes('video'))}>{t('self.video')}</option></select></label>
@@ -444,7 +471,7 @@ export function SelfPortal() {
     </>}
     {detail && <RequestDetailDrawer detail={detail} currency={credentialView?.currency} onClose={() => setDetail(undefined)} />}
     {generationDetail && <GenerationDrawer job={generationDetail} currency={credentialView?.currency} onDownload={(asset) => void downloadGenerationAsset(generationDetail, asset)} onCancel={() => void cancelGeneration(generationDetail)} onClose={() => setGenerationDetail(undefined)} />}
-    {conversationDetail && <ConversationDrawer detail={conversationDetail} currency={credentialView?.currency} loading={conversationLoading} onLoadOlder={() => void fetchOlderConversationDetail()} onSelect={(request) => void select(request)} onClose={() => setConversationDetail(undefined)} />}
+    {sessionDetail && <SessionDrawer detail={sessionDetail} summary={selectedSession} currency={credentialView?.currency} loading={sessionLoading} onLoadOlder={() => void fetchOlderSessionDetail()} onSelect={(request) => { setSessionDetail(undefined); setSelectedSession(undefined); void select(request); }} onClose={() => { setSessionDetail(undefined); setSelectedSession(undefined); }} />}
   </Shell>;
 }
 
@@ -476,9 +503,4 @@ function RequestDetailDrawer({ detail, currency, onClose }: { detail: RequestDet
 function GenerationDrawer({ job, currency, onDownload, onCancel, onClose }: { job: GenerationJob; currency?: string; onDownload: (asset: GenerationAsset) => void; onCancel: () => void; onClose: () => void }) {
   const { locale, t } = useI18n();
   return <DrawerFrame title={job.model} eyebrow={t('self.generationDetail')} onClose={onClose}><p className="muted break-anywhere">{job.job_id} · {job.driver} · {t(`generationStatus.${job.status}`)}</p>{(job.status === 'queued' || job.status === 'running') && <button type="button" className="danger" onClick={onCancel}>{t('self.cancelGeneration')}</button>}<h3>{t('self.billing')}</h3><pre>{JSON.stringify({ estimated_units: formatNumber(job.estimated_units, locale), billed_units: job.billed_units === null ? null : formatNumber(job.billed_units, locale), cost: currency ? formatCurrency(job.cost, currency, locale) : '—' }, null, 2)}</pre><h3>{t('self.resultArchive')}</h3>{job.assets.length > 0 ? <div className="account-list">{job.assets.map((asset) => <div className="account" key={asset.asset_id}><div className="account-main"><b>{asset.filename}</b><span>{asset.mime_type} · {formatNumber(asset.size_bytes, locale)} {t('self.bytes')}</span></div><button type="button" className="secondary" onClick={() => onDownload(asset)}>{t('self.downloadAsset')}</button></div>)}</div> : <div className="empty">{t('self.noAssets')}</div>}<pre>{JSON.stringify(job.result, null, 2)}</pre>{job.error_code && <><h3>{t('request.error')}</h3><pre>{job.error_code}</pre></>}</DrawerFrame>;
-}
-
-function ConversationDrawer({ detail, currency, loading, onLoadOlder, onSelect, onClose }: { detail: ConversationDetail; currency?: string; loading: boolean; onLoadOlder: () => void; onSelect: (request: RequestView) => void; onClose: () => void }) {
-  const { locale, t } = useI18n();
-  return <DrawerFrame title={detail.cluster.explicit_session_id ?? t('self.inferred')} eyebrow={t('self.logicalConversation')} onClose={onClose}><p className="muted break-anywhere">{detail.cluster.cluster_id}</p><h3>{t('self.sequence')}</h3>{detail.has_more && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('self.loadEarlierConversation')}</button></div>}<RequestTable requests={detail.requests} currency={currency} onSelect={onSelect} /><h3>{t('self.edges')}</h3>{detail.edges_truncated && <div className="notice warning">{t('self.edgesTruncated')}</div>}<div className="edge-list">{detail.edges.map((edge) => <div className="edge" key={`${edge.from_request_id ?? 'root'}-${edge.to_request_id}-${edge.relation}`}><span className={`status ${edge.relation === 'candidate' ? 'pending' : 'ok'}`}>{t(`conversationRelation.${edge.relation}`)}</span><code>{edge.from_request_id?.slice(0, 8) ?? t('self.root')} → {edge.to_request_id.slice(0, 8)}</code><b>{formatPercent(edge.confidence, locale)}</b></div>)}{detail.edges.length === 0 && <div className="empty">{t('self.singleObservation')}</div>}</div></DrawerFrame>;
 }

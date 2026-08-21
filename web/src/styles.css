@@ -242,3 +242,197 @@ button.bucket-heading:hover b {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.session-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.session-card {
+  background: #0b171b;
+  border: 1px solid #263a40;
+  color: #dce8ec;
+  min-width: 0;
+  padding: 16px;
+}
+
+.session-card-heading,
+.session-card-context,
+.session-card-metrics {
+  display: grid;
+  gap: 10px;
+}
+
+.session-card-heading {
+  align-items: center;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.session-card-heading b,
+.session-card-context b,
+.session-card-context code,
+.session-card-metrics b {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.session-card-context {
+  border-top: 1px solid #1d2c31;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.session-card-metrics {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  margin-top: 12px;
+}
+
+.session-card-context small,
+.session-card-metrics small {
+  color: #70858d;
+  display: block;
+  font-size: 10px;
+  letter-spacing: .06em;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+
+.session-card-context code {
+  color: #789098;
+  font-size: 11px;
+  margin-top: 3px;
+}
+
+.session-unlinked-label {
+  color: #d9bc78;
+  display: block;
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+.session-costs {
+  display: grid;
+  gap: 2px;
+}
+
+.session-archive-metrics {
+  background: #171a16;
+  border: 1px solid #4e4a31;
+  color: #cfc18f;
+  display: grid;
+  font-size: 12px;
+  gap: 4px;
+  margin-top: 12px;
+  padding: 10px;
+}
+
+.session-card-actions {
+  align-items: start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.session-card-actions details,
+.session-diagnostics,
+.candidate-edges {
+  min-width: 0;
+}
+
+.session-card-actions summary,
+.session-diagnostics summary,
+.candidate-edges summary {
+  color: #8bd7cc;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.session-card-actions code,
+.session-diagnostics code {
+  display: block;
+  margin: 8px 0;
+  max-width: min(560px, 80vw);
+  overflow-wrap: anywhere;
+}
+
+.session-copy {
+  padding: 5px 8px;
+  font-size: 11px;
+  margin: 0 8px 6px 0;
+}
+
+.session-controls {
+  align-items: end;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(120px, 1fr)) auto;
+  margin: 14px 0;
+}
+
+.session-controls label {
+  color: #91a5ac;
+  font-size: 12px;
+}
+
+.session-live-state {
+  align-items: center;
+  display: flex;
+  font-size: 12px;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.session-live-state.live { color: #65d7b6; }
+.session-live-state.refreshing { color: #e7c277; }
+.session-live-state.disconnected { color: #f29292; }
+.session-result-count { font-size: 12px; }
+.candidate-edges { margin-top: 18px; }
+.candidate-edges > .muted { margin: 8px 0; }
+
+:root[data-theme='light'] .session-card {
+  background: #fff;
+  border-color: #c8d6d3;
+  color: #17302d;
+}
+
+:root[data-theme='light'] .session-card-context {
+  border-color: #dce7e4;
+}
+
+:root[data-theme='light'] .session-card-context small,
+:root[data-theme='light'] .session-card-metrics small,
+:root[data-theme='light'] .session-card-context code {
+  color: #58716d;
+}
+
+:root[data-theme='light'] .session-card-actions summary,
+:root[data-theme='light'] .session-diagnostics summary,
+:root[data-theme='light'] .candidate-edges summary {
+  color: #176f64;
+}
+
+:root[data-theme='light'] .session-archive-metrics {
+  background: #fff9e9;
+  border-color: #d9c68d;
+  color: #6f5a20;
+}
+
+@media (width <= 900px) {
+  .session-card-context { grid-template-columns: minmax(0, 1fr); }
+  .session-card-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .session-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (width <= 480px) {
+  .session-card { padding: 12px; }
+  .session-card-metrics,
+  .session-controls { grid-template-columns: minmax(0, 1fr); }
+  .session-card-actions { align-items: stretch; flex-direction: column; }
+  .session-card-actions > button { width: 100%; }
+  .edge { grid-template-columns: minmax(0, 1fr); }
+  .edge .status { justify-self: start; }
+}

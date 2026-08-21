@@ -5,11 +5,11 @@ import { Metric } from '../components';
 import { useI18n } from '../i18n';
 import type {
   OperatorUsageAnalysis, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisHeatmapBucket,
-  UsageAnalysisMetrics, UsageAnalysisTimeBucket, UpstreamAccount,
+  UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount,
 } from '../types';
 import { trendCurrencies, trendMetrics, trendValue, type TrendMetric } from './usageTrend';
 
-type UsageTab = 'overview' | 'trend' | 'models' | 'keys' | 'upstreams' | 'heatmap';
+type UsageTab = 'overview' | 'trend' | 'models' | 'keys' | 'sessions' | 'upstreams' | 'heatmap';
 type Preset = '24h' | 'today' | 'yesterday' | '7d' | '30d' | 'custom';
 type Granularity = 'auto' | 'hour' | 'day';
 
@@ -30,7 +30,7 @@ interface UsageSelection {
   filters: UsageFilters;
 }
 
-const usageTabs: UsageTab[] = ['overview', 'trend', 'models', 'keys', 'upstreams', 'heatmap'];
+const usageTabs: UsageTab[] = ['overview', 'trend', 'models', 'keys', 'sessions', 'upstreams', 'heatmap'];
 const presets: Preset[] = ['24h', 'today', 'yesterday', '7d', '30d', 'custom'];
 const emptyFilters: UsageFilters = {
   model: '', keyId: '', upstreamId: '', protocol: '', status: '', errorCode: '',
@@ -218,7 +218,7 @@ function Heatmap({ values }: { values: UsageAnalysisHeatmapBucket[] }) {
   </div></div>;
 }
 
-export function UsageAnalysis({ token, tenant, upstreams }: { token: string; tenant: string; upstreams: UpstreamAccount[] }) {
+export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { token: string; tenant: string; upstreams: UpstreamAccount[]; onOpenSession: (session: UsageAnalysisSessionBucket) => void }) {
   const { locale, t } = useI18n();
   const now = Date.now();
   const [tab, setTab] = useState<UsageTab>('overview');
@@ -316,6 +316,7 @@ export function UsageAnalysis({ token, tenant, upstreams }: { token: string; ten
       </div></div><TrendChart points={stats.time_series} granularity={stats.granularity} metric={trendMetric} currency={effectiveTrendCurrency} onSelectBucket={selectUtcBucket} /></article>}
       {tab === 'models' && <DimensionTable title={t('usage.models')} values={stats.by_model} onSelect={(bucket) => applyDimension('model', bucket)} />}
       {tab === 'keys' && <DimensionTable title={t('usage.keys')} values={stats.by_key} onSelect={(bucket) => applyDimension('keyId', bucket)} />}
+      {tab === 'sessions' && <><p className="usage-dimension-contract">{t('usage.sessionGrouping')}</p><DimensionTable title={t('usage.sessions')} values={stats.by_session ?? []} labelForValue={(bucket) => bucket.unlinked || bucket.id.startsWith('unlinked:') ? t('sessions.unlinkedRequests') : bucket.label} onSelect={(bucket) => onOpenSession(bucket as UsageAnalysisSessionBucket)} /></>}
       {tab === 'upstreams' && <><p className="usage-dimension-contract">{t(`usage.upstreamGrouping.${stats.upstream_grouping}`)}</p><DimensionTable title={t('usage.upstreams')} values={stats.by_upstream} labelForValue={(bucket) => bucket.id === 'unassigned' ? t('usage.unassigned') : bucket.label} onSelect={(bucket) => applyDimension('upstreamId', bucket)} /></>}
       {tab === 'heatmap' && <article className="panel"><div className="panel-title"><h2>{t('usage.heatmap')}</h2><span>{stats.time_zone}</span></div><Heatmap values={stats.heatmap} /></article>}
     </section>}

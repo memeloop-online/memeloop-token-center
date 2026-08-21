@@ -94,7 +94,7 @@ export function RequestTable({
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
               <td>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</td>
               <td>{formatNumber(request.input_tokens + request.output_tokens, locale)}</td>
-              <td>{currency ? formatCurrency(request.cost, currency, locale) : request.cost}</td>
+              <td>{request.currency || currency ? formatCurrency(request.cost, request.currency ?? currency ?? '', locale) : '—'}</td>
               <td>{request.error_code ? <code className="error-code">{request.error_code}</code> : '—'}</td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>
