@@ -982,8 +982,12 @@ async fn refresh_at(
         }
         Err(_) => return Err(upstream_error()),
     };
+    if copilot.api_endpoint != state.copilot_api_endpoint {
+        return Err(AppError::Conflict(
+            "GitHub Copilot API endpoint changed; reauthorization is required".into(),
+        ));
+    }
     state.refresh_in = copilot.refresh_in;
-    state.copilot_api_endpoint = copilot.api_endpoint;
     Ok(UpstreamCredential::OAuth {
         access_token: copilot.access_token,
         refresh_token: next_refresh_token,
@@ -1940,7 +1944,7 @@ mod tests {
                 "token": "new-short-token",
                 "expires_at": 1_700_001_800,
                 "refresh_in": 1234,
-                "endpoints": {"api": "https://new-api.example"}
+                "endpoints": {"api": DEFAULT_COPILOT_API_ENDPOINT}
             })))
             .expect(1)
             .mount(&server)
@@ -1967,7 +1971,47 @@ mod tests {
         assert!(refresh_token.is_none());
         assert_eq!(state["github_token"], "github-raw-secret");
         assert_eq!(state["refresh_in"], 1234);
-        assert_eq!(state["copilot_api_endpoint"], "https://new-api.example");
+        assert_eq!(state["copilot_api_endpoint"], DEFAULT_COPILOT_API_ENDPOINT);
+    }
+
+    #[tokio::test]
+    async fn refresh_fails_closed_when_authoritative_api_endpoint_changes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .and(header("authorization", "Bearer github-raw-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "new-short-secret",
+                "expires_at": 1_700_001_800,
+                "refresh_in": 900,
+                "endpoints": {"api": "https://rotated-api.example"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let original = credential(oauth_state("github.com:12345"));
+        let error = refresh_at(
+            &reqwest::Client::new(),
+            &original,
+            NOW,
+            true,
+            &Endpoints::test(&server.uri()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(&error, AppError::Conflict(_)));
+        let message = error.to_string();
+        assert!(message.contains("reauthorization is required"));
+        assert!(!message.contains("rotated-api.example"));
+        assert!(!message.contains("new-short-secret"));
+        let UpstreamCredential::OAuth {
+            adapter_state: Some(state),
+            ..
+        } = original
+        else {
+            panic!("expected original OAuth credential")
+        };
+        assert_eq!(state["copilot_api_endpoint"], DEFAULT_COPILOT_API_ENDPOINT);
     }
 
     #[tokio::test]
