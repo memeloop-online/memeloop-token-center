@@ -48,11 +48,20 @@ pub(crate) fn validate_oauth_adapter_endpoint(value: &str, field: &str) -> Resul
     Ok(url)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_managed_oauth_adapter_endpoint(
     value: &str,
     field: &str,
 ) -> Result<Url, AppError> {
     validate_managed_oauth_adapter_endpoint_inner(value, field, false)
+}
+
+pub(crate) fn validate_managed_oauth_adapter_endpoint_with_policy(
+    value: &str,
+    field: &str,
+    allow_test_loopback: bool,
+) -> Result<Url, AppError> {
+    validate_managed_oauth_adapter_endpoint_inner(value, field, allow_test_loopback)
 }
 
 fn validate_managed_oauth_adapter_endpoint_inner(

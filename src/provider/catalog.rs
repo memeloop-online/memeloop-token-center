@@ -375,20 +375,24 @@ impl ProviderCatalog {
             "Anthropic Claude",
             vec!["anthropic"],
             "https://api.anthropic.com",
-            OAuthFlowKind::ClaudeManualPkce,
-            "https://claude.com/cai/oauth/authorize",
-            "https://platform.claude.com/v1/oauth/token",
-            "https://platform.claude.com/v1/oauth/token",
+            InteractiveOAuthDefinition {
+                flow_kind: OAuthFlowKind::ClaudeManualPkce,
+                login_url: "https://claude.com/cai/oauth/authorize",
+                poll_url: "https://platform.claude.com/v1/oauth/token",
+                refresh_url: "https://platform.claude.com/v1/oauth/token",
+            },
         ));
         let mut copilot = builtin_interactive_oauth_provider(
             "github-copilot",
             "GitHub Copilot",
             vec!["openai"],
             "https://api.githubcopilot.com",
-            OAuthFlowKind::GithubDeviceCopilot,
-            "https://github.com/login/device/code",
-            "https://github.com/login/oauth/access_token",
-            "https://api.github.com/copilot_internal/v2/token",
+            InteractiveOAuthDefinition {
+                flow_kind: OAuthFlowKind::GithubDeviceCopilot,
+                login_url: "https://github.com/login/device/code",
+                poll_url: "https://github.com/login/oauth/access_token",
+                refresh_url: "https://api.github.com/copilot_internal/v2/token",
+            },
         );
         copilot.config_schema["properties"]["base_url"] = json!({
             "type": "string",
@@ -401,10 +405,12 @@ impl ProviderCatalog {
             "Cursor",
             vec!["openai"],
             "https://api2.cursor.sh",
-            OAuthFlowKind::CursorPkce,
-            crate::oauth::DEFAULT_CURSOR_LOGIN_URL,
-            crate::oauth::DEFAULT_CURSOR_POLL_URL,
-            crate::oauth::DEFAULT_CURSOR_REFRESH_URL,
+            InteractiveOAuthDefinition {
+                flow_kind: OAuthFlowKind::CursorPkce,
+                login_url: crate::oauth::DEFAULT_CURSOR_LOGIN_URL,
+                poll_url: crate::oauth::DEFAULT_CURSOR_POLL_URL,
+                refresh_url: crate::oauth::DEFAULT_CURSOR_REFRESH_URL,
+            },
         ));
         let legacy_types = vec![
             builtin_managed_oauth_provider(
@@ -477,6 +483,26 @@ impl ProviderCatalog {
         &mut self,
         contributions: impl IntoIterator<Item = ProviderType>,
     ) -> Result<(), AppError> {
+        self.extend_with_endpoint_policy(contributions, false)
+    }
+
+    /// Integration-test hook for mock adapters bound to loopback. Release
+    /// builds do not expose this method, and normal catalog extension remains
+    /// fail-closed.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn extend_for_test(
+        &mut self,
+        contributions: impl IntoIterator<Item = ProviderType>,
+    ) -> Result<(), AppError> {
+        self.extend_with_endpoint_policy(contributions, true)
+    }
+
+    fn extend_with_endpoint_policy(
+        &mut self,
+        contributions: impl IntoIterator<Item = ProviderType>,
+        allow_test_loopback: bool,
+    ) -> Result<(), AppError> {
         for contribution in contributions {
             if contribution.id.trim().is_empty()
                 || self
@@ -496,7 +522,10 @@ impl ProviderCatalog {
             crate::schema::validate_definition(&contribution.config_schema)?;
             crate::schema::validate_definition(&contribution.credential_schema)?;
             if let Some(adapter) = &contribution.managed_oauth_adapter {
-                validate_managed_oauth_adapter_contribution(adapter)?;
+                validate_managed_oauth_adapter_contribution_with_policy(
+                    adapter,
+                    allow_test_loopback,
+                )?;
                 for source_type in &adapter.source_types {
                     if self
                         .managed_oauth_source_types()
@@ -606,7 +635,6 @@ impl ProviderCatalog {
         let adapter = provider.managed_oauth_adapter.as_ref().ok_or_else(|| {
             AppError::BadRequest("managed OAuth provider adapter is unavailable".into())
         })?;
-        validate_managed_oauth_adapter_contribution(adapter)?;
         Ok(ResolvedManagedOAuthAdapter {
             provider_driver: provider.id.clone(),
             source_type: adapter.source_types[0].clone(),
@@ -684,15 +712,19 @@ fn builtin_managed_oauth_provider(
     }
 }
 
+struct InteractiveOAuthDefinition<'a> {
+    flow_kind: OAuthFlowKind,
+    login_url: &'a str,
+    poll_url: &'a str,
+    refresh_url: &'a str,
+}
+
 fn builtin_interactive_oauth_provider(
     id: &str,
     display_name: &str,
     protocols: Vec<&str>,
     base_url: &str,
-    flow_kind: OAuthFlowKind,
-    login_url: &str,
-    poll_url: &str,
-    refresh_url: &str,
+    oauth: InteractiveOAuthDefinition<'_>,
 ) -> ProviderType {
     ProviderType {
         id: id.to_owned(),
@@ -726,10 +758,10 @@ fn builtin_interactive_oauth_provider(
         }),
         oauth_adapter: Some(OAuthAdapterContribution {
             api_version: "oauth-adapter-v1".to_owned(),
-            flow_kind,
-            login_url: login_url.to_owned(),
-            poll_url: poll_url.to_owned(),
-            refresh_url: refresh_url.to_owned(),
+            flow_kind: oauth.flow_kind,
+            login_url: oauth.login_url.to_owned(),
+            poll_url: oauth.poll_url.to_owned(),
+            refresh_url: oauth.refresh_url.to_owned(),
         }),
         managed_oauth_adapter: None,
         component_adapter: None,
@@ -739,6 +771,13 @@ fn builtin_interactive_oauth_provider(
 
 pub(crate) fn validate_managed_oauth_adapter_contribution(
     adapter: &ManagedOAuthAdapterContribution,
+) -> Result<(), AppError> {
+    validate_managed_oauth_adapter_contribution_with_policy(adapter, false)
+}
+
+fn validate_managed_oauth_adapter_contribution_with_policy(
+    adapter: &ManagedOAuthAdapterContribution,
+    allow_test_loopback: bool,
 ) -> Result<(), AppError> {
     if adapter.api_version != MANAGED_OAUTH_ADAPTER_API_VERSION
         || adapter.source_types.is_empty()
@@ -757,8 +796,16 @@ pub(crate) fn validate_managed_oauth_adapter_contribution(
             ));
         }
     }
-    crate::oauth::validate_managed_oauth_adapter_endpoint(&adapter.normalize_url, "normalize_url")?;
-    crate::oauth::validate_managed_oauth_adapter_endpoint(&adapter.refresh_url, "refresh_url")?;
+    crate::oauth::validate_managed_oauth_adapter_endpoint_with_policy(
+        &adapter.normalize_url,
+        "normalize_url",
+        allow_test_loopback,
+    )?;
+    crate::oauth::validate_managed_oauth_adapter_endpoint_with_policy(
+        &adapter.refresh_url,
+        "refresh_url",
+        allow_test_loopback,
+    )?;
     Ok(())
 }
 

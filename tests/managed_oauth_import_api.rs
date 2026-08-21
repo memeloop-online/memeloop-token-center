@@ -39,7 +39,7 @@ async fn test_state() -> (tempfile::TempDir, AppState, MockServer) {
         .unwrap();
     state
         .providers
-        .extend([ProviderType {
+        .extend_for_test([ProviderType {
             id: "managed-api-test".into(),
             display_name: "Managed API test".into(),
             protocols: vec!["openai".into()],

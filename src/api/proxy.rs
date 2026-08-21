@@ -468,27 +468,26 @@ pub(super) async fn proxy(
     if !status.is_success() {
         if route_driver.as_deref() == Some(crate::oauth::copilot::PROVIDER_DRIVER)
             && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+            && let Some(account_id) = upstream_account_id
         {
-            if let Some(account_id) = upstream_account_id {
-                let refresh_state = state.clone();
-                let idempotency_key = format!("copilot-capi-{request_id}");
-                tokio::spawn(async move {
-                    if let Err(error) = crate::api::refresh_managed_upstream_oauth(
-                        &refresh_state,
-                        account_id,
-                        &idempotency_key,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            %account_id,
-                            status = %status,
-                            error = %error,
-                            "Copilot short-token remint failed"
-                        );
-                    }
-                });
-            }
+            let refresh_state = state.clone();
+            let idempotency_key = format!("copilot-capi-{request_id}");
+            tokio::spawn(async move {
+                if let Err(error) = crate::api::refresh_managed_upstream_oauth(
+                    &refresh_state,
+                    account_id,
+                    &idempotency_key,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        %account_id,
+                        status = %status,
+                        error = %error,
+                        "Copilot short-token remint failed"
+                    );
+                }
+            });
         }
         drop(upstream);
         return finish_buffered_request(

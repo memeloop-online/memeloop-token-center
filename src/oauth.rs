@@ -17,15 +17,15 @@ pub use adapter::{
 pub use cursor::{
     CursorOAuthEndpoints, CursorPollAuthority, CursorPollResult, DEFAULT_CURSOR_LOGIN_URL,
     DEFAULT_CURSOR_POLL_URL, DEFAULT_CURSOR_REFRESH_URL, OAuthLoginStart,
-    OAuthReauthorizationTarget, ReadyCursorLogin, StartCursorLogin, poll_cursor_login,
-    cursor_account_id, refresh_cursor_credential, start_cursor_login,
+    OAuthReauthorizationTarget, ReadyCursorLogin, StartCursorLogin, cursor_account_id,
+    poll_cursor_login, refresh_cursor_credential, start_cursor_login,
 };
-#[cfg(test)]
-pub(crate) use endpoint::validate_oauth_endpoint;
 pub(crate) use endpoint::{
-    oauth_adapter_endpoint_scope, validate_managed_oauth_adapter_endpoint,
+    oauth_adapter_endpoint_scope, validate_managed_oauth_adapter_endpoint_with_policy,
     validate_oauth_adapter_endpoint,
 };
+#[cfg(test)]
+pub(crate) use endpoint::{validate_managed_oauth_adapter_endpoint, validate_oauth_endpoint};
 
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 
