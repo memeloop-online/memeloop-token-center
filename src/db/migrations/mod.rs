@@ -283,6 +283,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "retire legacy allowed model policies",
         sql: include_str!("../../../migrations/sqlite/0052_retire_allowed_models.sql"),
     },
+    Migration {
+        version: 53,
+        name: "distinct durable OAuth flow kinds",
+        sql: include_str!("../../../migrations/sqlite/0053_oauth_flow_kinds.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -551,6 +556,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 52,
         name: "retire legacy allowed model policies",
         sql: include_str!("../../../migrations/postgres/0052_retire_allowed_models.sql"),
+    },
+    Migration {
+        version: 53,
+        name: "distinct durable OAuth flow kinds",
+        sql: include_str!("../../../migrations/postgres/0053_oauth_flow_kinds.sql"),
     },
 ];
 

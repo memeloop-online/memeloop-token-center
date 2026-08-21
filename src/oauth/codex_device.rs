@@ -290,6 +290,7 @@ async fn start_codex_device_login_at(
     };
     db.begin_oauth_login_session(BeginOAuthLoginSession {
         session_id,
+        flow_kind: "openai_codex_device".to_owned(),
         tenant_external_id: state.tenant_external_id.clone(),
         operator_service_id: state.operator_service_id,
         state_ciphertext: seal_private_json(&state, key_material, STATE_AAD)?,
@@ -361,6 +362,7 @@ async fn poll_codex_device_login_at(
     }
     let reference = OAuthLoginSessionReference {
         session_id: session.session_id,
+        flow_kind: "openai_codex_device".to_owned(),
         tenant_external_id: session.tenant_external_id.clone(),
         operator_service_id: session.operator_service_id,
         expires_at: session.expires_at,

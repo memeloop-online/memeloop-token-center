@@ -23,6 +23,7 @@ async fn two_postgres_pools_share_single_poll_and_finalize_owners() {
     first
         .begin_oauth_login_session(BeginOAuthLoginSession {
             session_id,
+            flow_kind: "openai_codex_device".to_owned(),
             tenant_external_id: tenant.clone(),
             operator_service_id: None,
             state_ciphertext: "encrypted-state".to_owned(),
@@ -33,6 +34,7 @@ async fn two_postgres_pools_share_single_poll_and_finalize_owners() {
         .unwrap();
     let reference = OAuthLoginSessionReference {
         session_id,
+        flow_kind: "openai_codex_device".to_owned(),
         tenant_external_id: tenant.clone(),
         operator_service_id: None,
         expires_at,

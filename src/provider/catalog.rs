@@ -118,6 +118,12 @@ impl ResolvedManagedOAuthAdapter {
 pub enum OAuthFlowKind {
     /// Cursor-compatible redirect/PKCE login and polling contract.
     CursorPkce,
+    /// OpenAI's server-owned Codex device authorization flow.
+    OpenaiDevice,
+    /// Claude Code's browser PKCE flow completed by pasting code#state.
+    ClaudeManualPkce,
+    /// GitHub device authorization followed by a Copilot token exchange.
+    GithubDeviceCopilot,
 }
 
 /// Explicit opt-in to the executable provider ABI. Component providers are
@@ -354,6 +360,46 @@ impl ProviderCatalog {
             crate::oauth::codex_device::BASE_URL,
             true,
         ));
+        let codex = types
+            .last_mut()
+            .expect("OpenAI Codex provider was just inserted");
+        codex.oauth_adapter = Some(OAuthAdapterContribution {
+            api_version: "oauth-adapter-v1".to_owned(),
+            flow_kind: OAuthFlowKind::OpenaiDevice,
+            login_url: "https://auth.openai.com/codex/device".to_owned(),
+            poll_url: "https://auth.openai.com/api/accounts/deviceauth/token".to_owned(),
+            refresh_url: crate::oauth::codex_device::TOKEN_ENDPOINT.to_owned(),
+        });
+        types.push(builtin_interactive_oauth_provider(
+            "anthropic-claude",
+            "Anthropic Claude",
+            vec!["anthropic"],
+            "https://api.anthropic.com",
+            OAuthFlowKind::ClaudeManualPkce,
+            "https://claude.com/cai/oauth/authorize",
+            "https://platform.claude.com/v1/oauth/token",
+            "https://platform.claude.com/v1/oauth/token",
+        ));
+        types.push(builtin_interactive_oauth_provider(
+            "github-copilot",
+            "GitHub Copilot",
+            vec!["openai"],
+            "https://api.githubcopilot.com",
+            OAuthFlowKind::GithubDeviceCopilot,
+            "https://github.com/login/device/code",
+            "https://github.com/login/oauth/access_token",
+            "https://api.github.com/copilot_internal/v2/token",
+        ));
+        types.push(builtin_interactive_oauth_provider(
+            "cursor",
+            "Cursor",
+            vec!["openai"],
+            "https://api2.cursor.sh",
+            OAuthFlowKind::CursorPkce,
+            crate::oauth::DEFAULT_CURSOR_LOGIN_URL,
+            crate::oauth::DEFAULT_CURSOR_POLL_URL,
+            crate::oauth::DEFAULT_CURSOR_REFRESH_URL,
+        ));
         let legacy_types = vec![
             builtin_managed_oauth_provider(
                 "cpa-codex-oauth",
@@ -400,7 +446,8 @@ impl ProviderCatalog {
     /// Interactive-only builtins must be provisioned through their server-owned
     /// authorization flow so callers cannot inject raw OAuth material.
     pub fn supports_direct_creation(&self, driver: &str) -> bool {
-        self.is_public(driver) && driver != crate::oauth::codex_device::PROVIDER_DRIVER
+        self.get(driver)
+            .is_some_and(|provider| self.is_public(driver) && provider.oauth_adapter.is_none())
     }
 
     /// Return only the controlled source identifiers accepted by the current
@@ -625,6 +672,59 @@ fn builtin_managed_oauth_provider(
             }
         }),
         oauth_adapter: None,
+        managed_oauth_adapter: None,
+        component_adapter: None,
+        source: "builtin".to_owned(),
+    }
+}
+
+fn builtin_interactive_oauth_provider(
+    id: &str,
+    display_name: &str,
+    protocols: Vec<&str>,
+    base_url: &str,
+    flow_kind: OAuthFlowKind,
+    login_url: &str,
+    poll_url: &str,
+    refresh_url: &str,
+) -> ProviderType {
+    ProviderType {
+        id: id.to_owned(),
+        display_name: display_name.to_owned(),
+        protocols: protocols.into_iter().map(str::to_owned).collect(),
+        modalities: vec!["text".to_owned()],
+        config_schema: json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["base_url", "network_scope"],
+            "properties": {
+                "base_url": {"const": base_url, "readOnly": true},
+                "network_scope": {"const": "public", "readOnly": true}
+            }
+        }),
+        credential_schema: json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "access_token", "expires_at", "adapter_state"],
+            "properties": {
+                "type": {"const": "oauth"},
+                "access_token": {"type": "string", "minLength": 1, "writeOnly": true},
+                "refresh_token": {"type": "string", "writeOnly": true},
+                "expires_at": {"type": "integer", "description": "Unix milliseconds"},
+                "header": {"const": "authorization"},
+                "prefix": {"const": "Bearer "},
+                "adapter_state": {"type": "object", "writeOnly": true}
+            }
+        }),
+        oauth_adapter: Some(OAuthAdapterContribution {
+            api_version: "oauth-adapter-v1".to_owned(),
+            flow_kind,
+            login_url: login_url.to_owned(),
+            poll_url: poll_url.to_owned(),
+            refresh_url: refresh_url.to_owned(),
+        }),
         managed_oauth_adapter: None,
         component_adapter: None,
         source: "builtin".to_owned(),

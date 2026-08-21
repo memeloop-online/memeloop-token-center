@@ -3,12 +3,12 @@ use uuid::Uuid;
 
 use super::*;
 
-const FLOW_KIND: &str = "openai_codex_device";
 const CLAIM_LEASE_MILLIS: i64 = 30_000;
 
 #[derive(Clone, Debug)]
 pub struct BeginOAuthLoginSession {
     pub session_id: Uuid,
+    pub flow_kind: String,
     pub tenant_external_id: String,
     pub operator_service_id: Option<Uuid>,
     pub state_ciphertext: String,
@@ -19,6 +19,7 @@ pub struct BeginOAuthLoginSession {
 #[derive(Clone, Debug)]
 pub struct OAuthLoginSessionReference {
     pub session_id: Uuid,
+    pub flow_kind: String,
     pub tenant_external_id: String,
     pub operator_service_id: Option<Uuid>,
     pub expires_at: i64,
@@ -48,6 +49,7 @@ impl Database {
         input: BeginOAuthLoginSession,
     ) -> Result<(), AppError> {
         validate_session_scope(
+            &input.flow_kind,
             &input.tenant_external_id,
             input.next_poll_at,
             input.expires_at,
@@ -58,7 +60,7 @@ impl Database {
             "INSERT INTO oauth_login_sessions (id, flow_kind, tenant_external_id, operator_service_id, operator_is_bootstrap, state_ciphertext, ready_ciphertext, next_poll_at, expires_at, status, lease_owner, lease_expires_at, result_account_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, 'pending', NULL, NULL, NULL, $9, $9)",
         )
         .bind(input.session_id.to_string())
-        .bind(FLOW_KIND)
+        .bind(input.flow_kind)
         .bind(input.tenant_external_id)
         .bind(input.operator_service_id.map(|id| id.to_string()))
         .bind(input.operator_service_id.is_none())
@@ -92,7 +94,7 @@ impl Database {
         .bind(next_poll_at)
         .bind(now)
         .bind(reference.session_id.to_string())
-        .bind(FLOW_KIND)
+        .bind(&reference.flow_kind)
         .bind(&reference.tenant_external_id)
         .bind(reference.operator_service_id.is_none())
         .bind(&operator_id)
@@ -117,7 +119,7 @@ impl Database {
             "SELECT s.tenant_external_id, s.operator_service_id, CASE WHEN s.operator_is_bootstrap THEN 1 ELSE 0 END AS operator_is_bootstrap_int, s.expires_at, s.status, s.next_poll_at, s.lease_expires_at, s.ready_ciphertext, s.result_account_id, (SELECT a.id FROM upstream_accounts a WHERE a.oauth_session_id = s.id) AS recovered_account_id FROM oauth_login_sessions s WHERE s.id = $1 AND s.flow_kind = $2",
         )
         .bind(reference.session_id.to_string())
-        .bind(FLOW_KIND)
+        .bind(&reference.flow_kind)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::Forbidden)?;
@@ -294,12 +296,20 @@ impl Database {
 }
 
 fn validate_session_scope(
+    flow_kind: &str,
     tenant: &str,
     next_poll_at: i64,
     expires_at: i64,
     ciphertext: &str,
 ) -> Result<(), AppError> {
-    if tenant.is_empty()
+    if !matches!(
+        flow_kind,
+        "openai_codex_device"
+            | "cursor_pkce"
+            | "provider_adapter_cursor_pkce"
+            | "claude_manual_pkce"
+            | "github_copilot_device"
+    ) || tenant.is_empty()
         || tenant.len() > 200
         || tenant.trim() != tenant
         || tenant.chars().any(char::is_control)
@@ -364,6 +374,7 @@ mod tests {
     fn reference(session_id: Uuid, expires_at: i64) -> OAuthLoginSessionReference {
         OAuthLoginSessionReference {
             session_id,
+            flow_kind: "openai_codex_device".to_owned(),
             tenant_external_id: "oauth-session-test".to_owned(),
             operator_service_id: None,
             expires_at,
@@ -379,6 +390,7 @@ mod tests {
         database
             .begin_oauth_login_session(BeginOAuthLoginSession {
                 session_id,
+                flow_kind: "openai_codex_device".to_owned(),
                 tenant_external_id: "oauth-session-test".to_owned(),
                 operator_service_id: None,
                 state_ciphertext: "encrypted-state".to_owned(),
@@ -531,6 +543,7 @@ mod tests {
         database
             .begin_oauth_login_session(BeginOAuthLoginSession {
                 session_id,
+                flow_kind: "openai_codex_device".to_owned(),
                 tenant_external_id: "oauth-session-test".to_owned(),
                 operator_service_id: None,
                 state_ciphertext: "encrypted-state".to_owned(),

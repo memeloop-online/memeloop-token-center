@@ -105,6 +105,7 @@ struct CursorLoginState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CursorLoginSessionToken {
     session_id: Uuid,
+    flow_kind: String,
     tenant_external_id: String,
     operator_service_id: Option<Uuid>,
     expires_at: i64,
@@ -218,12 +219,24 @@ pub async fn start_cursor_login(
     };
     let session = CursorLoginSessionToken {
         session_id,
+        flow_kind: if oauth_driver == "cursor" {
+            "cursor_pkce"
+        } else {
+            "provider_adapter_cursor_pkce"
+        }
+        .to_owned(),
         tenant_external_id: state.tenant_external_id.clone(),
         operator_service_id,
         expires_at,
     };
     db.begin_oauth_login_session(BeginOAuthLoginSession {
         session_id,
+        flow_kind: if oauth_driver == "cursor" {
+            "cursor_pkce"
+        } else {
+            "provider_adapter_cursor_pkce"
+        }
+        .to_owned(),
         tenant_external_id: state.tenant_external_id.clone(),
         operator_service_id,
         state_ciphertext: seal_private_json(&state, key_material, CURSOR_STATE_AAD)?,
@@ -274,6 +287,7 @@ pub async fn poll_cursor_login(
     }
     let reference = OAuthLoginSessionReference {
         session_id: session.session_id,
+        flow_kind: session.flow_kind.clone(),
         tenant_external_id: session.tenant_external_id.clone(),
         operator_service_id: session.operator_service_id,
         expires_at: session.expires_at,
