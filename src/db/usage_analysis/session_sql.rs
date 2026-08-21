@@ -100,7 +100,8 @@ pub(super) fn session_usage_dimension_sql(
            ),
            with_session_totals AS (
                SELECT grouped_sessions.*,
-                      SUM(requests) OVER (PARTITION BY key_id, session_id) AS session_requests
+                      SUM(requests) OVER (PARTITION BY key_id, session_id) AS session_requests,
+                      MIN(primary_model) OVER (PARTITION BY key_id, session_id) AS session_model
                  FROM grouped_sessions
            ),
            ranked_sessions AS (
@@ -111,8 +112,8 @@ pub(super) fn session_usage_dimension_sql(
                  FROM with_session_totals
            )
            SELECT 'session' AS bucket_kind, session_id AS bucket_id,
-                  CASE WHEN session_id LIKE 'unlinked:%' OR primary_model = ''
-                       THEN key_alias ELSE key_alias || ' · ' || primary_model END
+                  CASE WHEN session_id LIKE 'unlinked:%' OR session_model = ''
+                       THEN key_alias ELSE key_alias || ' · ' || session_model END
                       AS bucket_label,
                   key_id, key_alias, currency,
                   CAST(requests AS BIGINT) AS requests,
