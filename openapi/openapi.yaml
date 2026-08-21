@@ -2368,14 +2368,25 @@ paths:
           in: query
           description: Exclusive descending cursor; must be paired with `before_last_activity_at`.
           schema: { type: string, minLength: 1, maxLength: 80 }
+        - name: key_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: state
+          in: query
+          schema: { type: string, enum: [all, active, has_errors], default: all }
+        - name: model
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 512 }
+        - name: q
+          in: query
+          description: Case-insensitive prefix of a session ID or credential alias.
+          schema: { type: string, minLength: 1, maxLength: 128 }
       responses:
         '200':
           description: Sessions ordered by latest activity descending.
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/LogicalSessionSummary' }
+              schema: { $ref: '#/components/schemas/LogicalSessionListResponse' }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -2944,14 +2955,22 @@ paths:
           in: query
           description: Exclusive descending cursor; must be paired with `before_last_activity_at`.
           schema: { type: string, minLength: 1, maxLength: 80 }
+        - name: state
+          in: query
+          schema: { type: string, enum: [all, active, has_errors], default: all }
+        - name: model
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 512 }
+        - name: q
+          in: query
+          description: Case-insensitive prefix of a session ID or this credential's alias.
+          schema: { type: string, minLength: 1, maxLength: 128 }
       responses:
         '200':
           description: Sessions visible only to the authenticated stable key.
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/LogicalSessionSummary' }
+              schema: { $ref: '#/components/schemas/LogicalSessionListResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /self/v1/sessions/{session_id}:
@@ -5296,6 +5315,18 @@ components:
             id: { type: string, minLength: 1 }
             label: { type: string, minLength: 1 }
         - $ref: '#/components/schemas/UsageAnalysisMetrics'
+    UsageAnalysisSessionBucket:
+      unevaluatedProperties: false
+      allOf:
+        - type: object
+          required: [id, label, key_id, key_alias, unlinked]
+          properties:
+            id: { type: string, minLength: 1 }
+            label: { type: string, minLength: 1 }
+            key_id: { type: string, format: uuid }
+            key_alias: { type: string }
+            unlinked: { type: boolean }
+        - $ref: '#/components/schemas/UsageAnalysisMetrics'
     UsageAnalysisTimeBucket:
       unevaluatedProperties: false
       allOf:
@@ -5373,7 +5404,7 @@ components:
             Unlinked requests are never guessed into another conversation.
             Session p95 is null because the compact session rollup preserves
             exact average latency but not a latency histogram.
-          items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
+          items: { $ref: '#/components/schemas/UsageAnalysisSessionBucket' }
         by_upstream:
           type: array
           maxItems: 100
@@ -5467,11 +5498,12 @@ components:
       allOf:
         - $ref: '#/components/schemas/RequestSummary'
         - type: object
-          required: [source, provenance, unlinked]
+          required: [source, provenance, unlinked, currency]
           properties:
             source: { type: string, enum: [live, session_archive] }
             provenance: { type: string, enum: [native, archive_unlinked] }
             unlinked: { type: boolean }
+            currency: { type: [string, 'null'], description: Billing currency for live requests; null for non-billable archive-only records. }
             archive_source: { type: string }
             external_request_id: { type: string, maxLength: 512 }
     ConversationDetail:
@@ -5498,7 +5530,7 @@ components:
     LogicalSessionSummary:
       type: object
       additionalProperties: false
-      required: [session_id, cluster_id, unlinked, key_id, key_alias, model, protocol, last_status, last_activity_at, active_requests, requests, errors, input_tokens, output_tokens, avg_duration_ms, costs]
+      required: [session_id, cluster_id, unlinked, key_id, key_alias, model, protocol, last_status, last_activity_at, active_requests, requests, errors, input_tokens, output_tokens, avg_duration_ms, costs, archived_only_requests, archived_only_errors, archived_only_input_tokens, archived_only_output_tokens, archived_only_avg_duration_ms]
       properties:
         session_id: { type: string, minLength: 1, maxLength: 80 }
         cluster_id: { type: [string, 'null'], format: uuid }
@@ -5518,6 +5550,38 @@ components:
         costs:
           type: array
           items: { $ref: '#/components/schemas/UsageAnalysisCost' }
+        archived_only_requests:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Imported diagnostic records without authoritative usage facts.
+        archived_only_errors: { type: integer, format: int64, minimum: 0 }
+        archived_only_input_tokens: { type: integer, format: int64, minimum: 0 }
+        archived_only_output_tokens: { type: integer, format: int64, minimum: 0 }
+        archived_only_avg_duration_ms:
+          type: [number, 'null']
+          minimum: 0
+          description: Non-billable archive-only average; null when no duration was imported.
+    LogicalSessionListCursor:
+      type: object
+      additionalProperties: false
+      required: [before_last_activity_at, before_session_id]
+      properties:
+        before_last_activity_at: { type: integer, format: int64 }
+        before_session_id: { type: string, minLength: 1, maxLength: 80 }
+    LogicalSessionListResponse:
+      type: object
+      additionalProperties: false
+      required: [generated_at, sessions, next_cursor]
+      properties:
+        generated_at: { type: integer, format: int64, description: Unix epoch milliseconds. }
+        sessions:
+          type: array
+          items: { $ref: '#/components/schemas/LogicalSessionSummary' }
+        next_cursor:
+          oneOf:
+            - $ref: '#/components/schemas/LogicalSessionListCursor'
+            - type: 'null'
     LogicalSessionDetail:
       type: object
       additionalProperties: false
@@ -5566,7 +5630,7 @@ components:
                   enum: [text, image, video, embedding]
               generation_schema:
                 type: object
-                description: JSON Schema for downstream input.parameters only. Omitted unless every effective generation candidate has the same safe schema.
+                description: Sanitized closed scalar JSON Schema for downstream input.parameters only. It never contains workflow internals, references, remote schemas, or recursive/complex constructs, and is omitted unless every effective generation candidate has the same schema.
     OpenAIChatRequest:
       type: object
       required: [model, messages]
