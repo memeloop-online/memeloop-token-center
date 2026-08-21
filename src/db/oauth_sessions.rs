@@ -679,6 +679,7 @@ mod tests {
                     oauth_session_id: second_session,
                     oauth_driver: "openai_codex_device".to_owned(),
                     oauth_refresh_url: Some("https://auth.openai.com/oauth/token".to_owned()),
+                    provider_config: None,
                     credential: oauth_credential("access-v2", "refresh-v2", 4_102_444_800_000),
                 },
                 pepper,
@@ -697,6 +698,7 @@ mod tests {
                     oauth_session_id: second_session,
                     oauth_driver: "openai_codex_device".to_owned(),
                     oauth_refresh_url: Some("https://auth.openai.com/oauth/token".to_owned()),
+                    provider_config: None,
                     credential: oauth_credential(
                         "must-not-install",
                         "must-not-install",

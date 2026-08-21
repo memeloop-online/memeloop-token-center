@@ -195,6 +195,7 @@ pub(in crate::api) async fn poll_codex_oauth(
                                 oauth_refresh_url: Some(
                                     crate::oauth::codex_device::TOKEN_ENDPOINT.to_owned(),
                                 ),
+                                provider_config: None,
                                 credential: ready.credential,
                             },
                             state.config.key_pepper.as_bytes(),
@@ -472,6 +473,7 @@ pub(in crate::api) async fn poll_cursor_oauth(
                                 oauth_session_id: ready.session_id,
                                 oauth_driver: ready.oauth_driver,
                                 oauth_refresh_url: Some(ready.refresh_url),
+                                provider_config: None,
                                 credential: ready.credential,
                             },
                             state.config.key_pepper.as_bytes(),

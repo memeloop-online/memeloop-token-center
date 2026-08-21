@@ -122,26 +122,9 @@ async fn finish_copilot_login(
     state: &AppState,
     service: &AuthenticatedService,
     lease_owner: Uuid,
-    mut ready: copilot::ReadyCopilotDeviceLogin,
+    ready: copilot::ReadyCopilotDeviceLogin,
 ) -> Result<Response, AppError> {
     require_service_tenant(service, &ready.tenant_external_id)?;
-    if let Some(target) = ready.reauthorize.as_ref() {
-        let existing = state
-            .db
-            .upstream_account_for_reauthorization(target.account_id, &ready.tenant_external_id)
-            .await?;
-        if existing.config.get("base_url").and_then(Value::as_str)
-            != Some(ready.api_endpoint.as_str())
-        {
-            return Err(AppError::Conflict(
-                "GitHub Copilot reauthorization returned a different API endpoint".into(),
-            ));
-        }
-    } else if let Some(config) = ready.provider_config.as_object_mut() {
-        config.insert("base_url".into(), Value::String(ready.api_endpoint.clone()));
-    } else {
-        return Err(AppError::Internal);
-    }
     validate_provider_schema(
         state,
         copilot::PROVIDER_DRIVER,
@@ -181,6 +164,7 @@ async fn finish_copilot_login(
                         oauth_session_id: ready.session_id,
                         oauth_driver: copilot::OAUTH_DRIVER.to_owned(),
                         oauth_refresh_url: Some(copilot::TOKEN_ENDPOINT.to_owned()),
+                        provider_config: Some(ready.provider_config),
                         credential: ready.credential,
                     },
                     state.config.key_pepper.as_bytes(),

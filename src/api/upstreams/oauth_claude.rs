@@ -165,6 +165,7 @@ async fn finish_claude_login(
                         oauth_session_id: ready.session_id,
                         oauth_driver: ready.oauth_driver,
                         oauth_refresh_url: Some(ready.refresh_url),
+                        provider_config: None,
                         credential: ready.credential,
                     },
                     state.config.key_pepper.as_bytes(),

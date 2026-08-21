@@ -300,7 +300,8 @@ mod tests {
             .and(path("/auth/poll"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "accessToken": "cursor-access-token",
-                "refreshToken": "cursor-refresh-token"
+                "refreshToken": "cursor-refresh-token",
+                "accountId": "cursor-account-replay"
             })))
             .expect(1)
             .mount(&server)

@@ -425,6 +425,15 @@ pub(super) async fn proxy(
         };
     }
     if !is_codex_route {
+        if route_driver.as_deref() == Some(crate::oauth::copilot::PROVIDER_DRIVER) {
+            let product = format!("memeloop-token-center/{}", env!("CARGO_PKG_VERSION"));
+            request = request
+                .header(header::USER_AGENT, &product)
+                .header("X-GitHub-Api-Version", "2026-06-01")
+                .header("X-Request-Id", request_id.to_string())
+                .header("Editor-Version", &product)
+                .header("Editor-Plugin-Version", &product);
+        }
         if let Some(version) = headers.get("anthropic-version") {
             request = request.header("anthropic-version", version);
         }
@@ -457,6 +466,30 @@ pub(super) async fn proxy(
     };
     let status = upstream.status();
     if !status.is_success() {
+        if route_driver.as_deref() == Some(crate::oauth::copilot::PROVIDER_DRIVER)
+            && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        {
+            if let Some(account_id) = upstream_account_id {
+                let refresh_state = state.clone();
+                let idempotency_key = format!("copilot-capi-{request_id}");
+                tokio::spawn(async move {
+                    if let Err(error) = crate::api::refresh_managed_upstream_oauth(
+                        &refresh_state,
+                        account_id,
+                        &idempotency_key,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %account_id,
+                            status = %status,
+                            error = %error,
+                            "Copilot short-token remint failed"
+                        );
+                    }
+                });
+            }
+        }
         drop(upstream);
         return finish_buffered_request(
             &buffered_request,

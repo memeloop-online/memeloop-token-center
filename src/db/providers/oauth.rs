@@ -9,6 +9,7 @@ pub struct ReauthorizeUpstreamAccountInput {
     pub oauth_session_id: Uuid,
     pub oauth_driver: String,
     pub oauth_refresh_url: Option<String>,
+    pub provider_config: Option<Value>,
     pub credential: UpstreamCredential,
 }
 
@@ -45,6 +46,18 @@ impl Database {
                 "OAuth reauthorization refresh endpoint is required".into(),
             ));
         }
+        let provider_config_json = input
+            .provider_config
+            .as_ref()
+            .map(|config| {
+                if !config.is_object() {
+                    return Err(AppError::BadRequest(
+                        "upstream provider configuration must be an object".into(),
+                    ));
+                }
+                serde_json::to_string(config).map_err(|_| AppError::BadRequest("config".into()))
+            })
+            .transpose()?;
         let now = unix_millis();
         let mut tx = self.pool.begin().await?;
         let select = match self.backend {
@@ -121,12 +134,13 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let changed = sqlx::query(
-            "UPDATE upstream_accounts SET auth_kind = 'oauth', credential_generation = $1, oauth_session_id = $2, oauth_driver = $3, oauth_refresh_url = $4, updated_at = $5 WHERE id = $6 AND updated_at = $7",
+            "UPDATE upstream_accounts SET auth_kind = 'oauth', credential_generation = $1, oauth_session_id = $2, oauth_driver = $3, oauth_refresh_url = $4, config_json = COALESCE($5, config_json), updated_at = $6 WHERE id = $7 AND updated_at = $8",
         )
         .bind(generation)
         .bind(input.oauth_session_id.to_string())
         .bind(&input.oauth_driver)
         .bind(&input.oauth_refresh_url)
+        .bind(provider_config_json)
         .bind(updated_at)
         .bind(account_id.to_string())
         .bind(input.expected_updated_at)

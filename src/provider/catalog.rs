@@ -380,7 +380,7 @@ impl ProviderCatalog {
             "https://platform.claude.com/v1/oauth/token",
             "https://platform.claude.com/v1/oauth/token",
         ));
-        types.push(builtin_interactive_oauth_provider(
+        let mut copilot = builtin_interactive_oauth_provider(
             "github-copilot",
             "GitHub Copilot",
             vec!["openai"],
@@ -389,7 +389,13 @@ impl ProviderCatalog {
             "https://github.com/login/device/code",
             "https://github.com/login/oauth/access_token",
             "https://api.github.com/copilot_internal/v2/token",
-        ));
+        );
+        copilot.config_schema["properties"]["base_url"] = json!({
+            "type": "string",
+            "format": "uri",
+            "readOnly": true
+        });
+        types.push(copilot);
         types.push(builtin_interactive_oauth_provider(
             "cursor",
             "Cursor",
