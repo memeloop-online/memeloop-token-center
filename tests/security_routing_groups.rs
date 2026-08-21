@@ -300,13 +300,13 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
         })
         .await
         .expect("exact-credential generation route");
-    let bridge = state
+    let retired = state
         .db
         .create_upstream_account(
             CreateUpstreamAccountInput {
                 tenant_external_id: "routing-a".to_owned(),
-                name: "retired CPA bridge".to_owned(),
-                driver: "cpa-subscription-bridge".to_owned(),
+                name: "retired historical provider".to_owned(),
+                driver: "retired-historical".to_owned(),
                 config: json!({
                     "base_url": "http://127.0.0.1:18083",
                     "network_scope": "private"
@@ -319,12 +319,12 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             pepper,
         )
         .await
-        .expect("legacy bridge fixture");
+        .expect("retired provider fixture");
     state
         .db
-        .set_upstream_account_status(bridge.id, "routing-a", "disabled", bridge.updated_at)
+        .set_upstream_account_status(retired.id, "routing-a", "disabled", retired.updated_at)
         .await
-        .expect("disable legacy bridge fixture");
+        .expect("disable retired provider fixture");
     let (bridge_fallback_route, _) = state
         .db
         .create_routed_model_route(CreateRoutedModelRouteInput {
@@ -333,7 +333,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             upstream_model: "secure-upstream-model".to_owned(),
             protocol: "openai".to_owned(),
             priority: 0,
-            upstream_account_ids: vec![bridge.id],
+            upstream_account_ids: vec![retired.id],
             included_provider_group_ids: vec![provider_group.id],
             excluded_provider_group_ids: Vec::new(),
             route_group_ids: vec![route_group.id],
@@ -1161,13 +1161,13 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
         .fetch_one(&inspection)
         .await
         .expect("routing A tenant id");
-    let legacy_bridge_account: String =
+    let retired_provider_account: String =
         sqlx::query_scalar("SELECT upstream_account_id FROM model_routes WHERE id = $1")
             .bind(bridge_fallback_route.id.to_string())
             .fetch_one(&inspection)
             .await
-            .expect("legacy bridge compatibility account");
-    assert_eq!(legacy_bridge_account, bridge.id.to_string());
+            .expect("retired provider compatibility account");
+    assert_eq!(retired_provider_account, retired.id.to_string());
     let history = sqlx::query(
         "SELECT model_route_id, upstream_account_id FROM request_records WHERE id = $1",
     )

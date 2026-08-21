@@ -101,42 +101,14 @@ fn unauthenticated_credential_is_valid() {
 }
 
 #[test]
-fn subscription_bridge_credential_round_trips_without_exposing_handle_or_secret() {
-    let credential = UpstreamCredential::LegacySubscriptionBridge {
-        handle: "OpaqueHandle123".to_owned(),
-        secret: Some("bridge-secret".to_owned()),
-    };
-    credential.validate(42).unwrap();
-    let envelope = seal_credential(&credential, b"a key material with at least 32 bytes").unwrap();
-    assert!(!envelope.contains("OpaqueHandle123"));
-    assert!(!envelope.contains("bridge-secret"));
-    let opened = open_credential(&envelope, b"a key material with at least 32 bytes").unwrap();
-    assert_eq!(opened.auth_kind(), "oauth");
-    match opened {
-        UpstreamCredential::LegacySubscriptionBridge { handle, secret } => {
-            assert_eq!(handle, "OpaqueHandle123");
-            assert_eq!(secret.as_deref(), Some("bridge-secret"));
-            let request = reqwest::Client::new().get("https://example.test");
-            assert!(
-                UpstreamCredential::LegacySubscriptionBridge { handle, secret }
-                    .apply(request, 42)
-                    .is_err(),
-                "historical credentials must remain decryptable but unusable"
-            );
-        }
-        other => panic!("unexpected credential: {other:?}"),
-    }
-}
-
-#[test]
-fn subscription_bridge_rejects_unsafe_handles() {
-    for handle in ["", "../account", "contains space", "handle_with_symbol"] {
-        let credential = UpstreamCredential::LegacySubscriptionBridge {
-            handle: handle.to_owned(),
-            secret: None,
-        };
-        assert!(credential.validate(42).is_err(), "accepted {handle:?}");
-    }
+fn retired_credential_shapes_are_not_part_of_the_runtime_type() {
+    assert!(
+        serde_json::from_value::<UpstreamCredential>(json!({
+            "type": "subscription_bridge",
+            "handle": "historical"
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -252,8 +224,8 @@ fn managed_provider(id: &str, source_types: Vec<&str>) -> ProviderType {
         managed_oauth_adapter: Some(ManagedOAuthAdapterContribution {
             api_version: MANAGED_OAUTH_ADAPTER_API_VERSION.into(),
             source_types: source_types.into_iter().map(str::to_owned).collect(),
-            normalize_url: "http://adapter.default.svc/normalize".into(),
-            refresh_url: "http://adapter.default.svc/refresh".into(),
+            normalize_url: "https://adapter.example.test/normalize".into(),
+            refresh_url: "https://adapter.example.test/refresh".into(),
         }),
         component_adapter: None,
         source: "test".into(),
@@ -359,9 +331,8 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
     assert!(public_ids.contains(&"openai-codex"));
     assert!(!public_ids.iter().any(|driver| driver.starts_with("cpa-")));
     assert!(catalog.get("cpa-codex-oauth").is_some());
-    assert!(catalog.get("cpa-subscription-bridge").is_some());
     assert!(!catalog.is_public("cpa-codex-oauth"));
-    assert!(!catalog.is_public("cpa-subscription-bridge"));
+    assert!(catalog.get("cpa-subscription-bridge").is_none());
     assert!(!catalog.supports_direct_creation("openai-codex"));
 
     assert!(

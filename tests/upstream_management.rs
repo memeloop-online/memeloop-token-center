@@ -250,7 +250,7 @@ async fn interactive_reauthorization_preserves_stable_identity_routes_and_replay
 }
 
 #[tokio::test]
-async fn retired_subscription_accounts_remain_readable_but_cannot_be_reactivated() {
+async fn retired_provider_rows_cannot_be_reactivated_through_the_api() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
@@ -268,19 +268,15 @@ async fn retired_subscription_accounts_remain_readable_but_cannot_be_reactivated
         .create_upstream_account(
             CreateUpstreamAccountInput {
                 tenant_external_id: "subscription-tenant".into(),
-                name: "copilot-primary".into(),
-                driver: "cpa-subscription-bridge".into(),
+                name: "historical-primary".into(),
+                driver: "retired-historical".into(),
                 config: json!({
-                    "base_url": "http://subscription.default.svc",
-                    "provider": "copilot",
+                    "base_url": "http://historical.default.svc",
                     "network_scope": "private"
                 }),
-                credential: UpstreamCredential::LegacySubscriptionBridge {
-                    handle: "oldhandle".into(),
-                    secret: Some("encrypted-bridge-secret".into()),
-                },
+                credential: UpstreamCredential::None,
                 oauth_session_id: Some(Uuid::now_v7()),
-                oauth_driver: Some("subscription_bridge".into()),
+                oauth_driver: None,
                 oauth_refresh_url: None,
             },
             pepper,
@@ -297,13 +293,17 @@ async fn retired_subscription_accounts_remain_readable_but_cannot_be_reactivated
                 ReauthorizeUpstreamAccountInput {
                     tenant_external_id: "subscription-tenant".into(),
                     expected_updated_at: account.updated_at,
-                    driver: "cpa-subscription-bridge".into(),
+                    driver: "retired-historical".into(),
                     oauth_session_id: Uuid::now_v7(),
-                    oauth_driver: "subscription_bridge".into(),
-                    oauth_refresh_url: None,
-                    credential: UpstreamCredential::LegacySubscriptionBridge {
-                        handle: "newhandle".into(),
-                        secret: None,
+                    oauth_driver: "provider_adapter".into(),
+                    oauth_refresh_url: Some("https://historical.invalid/refresh".into()),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "replacement".into(),
+                        refresh_token: Some("refresh".into()),
+                        expires_at: None,
+                        header: "authorization".into(),
+                        prefix: "Bearer ".into(),
+                        adapter_state: None,
                     },
                 },
                 pepper,
@@ -316,13 +316,7 @@ async fn retired_subscription_accounts_remain_readable_but_cannot_be_reactivated
         .upstream_account_with_credential(account.id, pepper)
         .await
         .unwrap();
-    match credential {
-        UpstreamCredential::LegacySubscriptionBridge { handle, secret } => {
-            assert_eq!(handle, "oldhandle");
-            assert_eq!(secret.as_deref(), Some("encrypted-bridge-secret"));
-        }
-        _ => panic!("expected subscription bridge credential"),
-    }
+    assert!(matches!(credential, UpstreamCredential::None));
     let disabled = state
         .db
         .set_upstream_account_status(
@@ -333,31 +327,21 @@ async fn retired_subscription_accounts_remain_readable_but_cannot_be_reactivated
         )
         .await
         .unwrap();
-    assert!(matches!(
-        state
-            .db
-            .set_upstream_account_status(
-                account.id,
-                "subscription-tenant",
-                "active",
-                disabled.updated_at,
-            )
-            .await,
-        Err(memeloop_token_center::error::AppError::BadRequest(_))
-    ));
+    let (status, _) = json_request(
+        &state,
+        "PATCH",
+        &format!("/internal/v1/upstreams/{}", account.id),
+        &state.config.service_token,
+        None,
+        Some(json!({
+            "tenant_external_id": "subscription-tenant",
+            "status": "active",
+            "expected_updated_at": disabled.updated_at
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(state.db.upstream_oauth_lifecycle(account.id).await.is_err());
-    assert!(
-        state
-            .db
-            .rotate_upstream_credential(
-                account.id,
-                UpstreamCredential::None,
-                "retired-account-rotation",
-                pepper,
-            )
-            .await
-            .is_err()
-    );
     let (status, _) = json_request(
         &state,
         "PUT",
@@ -366,9 +350,8 @@ async fn retired_subscription_accounts_remain_readable_but_cannot_be_reactivated
         Some("retired-account-api-rotation"),
         Some(json!({
             "credential": {
-                "type": "subscription_bridge",
-                "handle": "replacement",
-                "secret": "must-not-install"
+                "type": "api_key",
+                "value": "must-not-install"
             }
         })),
     )

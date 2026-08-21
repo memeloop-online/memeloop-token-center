@@ -65,11 +65,6 @@ pub(super) async fn proxy(
                 route.driver
             )));
         }
-        if route.driver == "cpa-subscription-bridge" {
-            return Err(AppError::BadRequest(
-                "this legacy upstream type is retired".into(),
-            ));
-        }
         route.credential.validate(unix_millis())?;
         (
             route.base_url,

@@ -21,13 +21,6 @@ pub(super) const MAX_ADAPTER_STATE_NODES: usize = 256;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UpstreamCredential {
     None,
-    /// Historical CPA bridge payload. It remains decryptable for audit and
-    /// migration only; every runtime operation rejects it.
-    #[serde(rename = "subscription_bridge")]
-    LegacySubscriptionBridge {
-        handle: String,
-        secret: Option<String>,
-    },
     ApiKey {
         value: String,
         #[serde(default = "authorization_header")]
@@ -56,10 +49,6 @@ impl std::fmt::Debug for UpstreamCredential {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::None => formatter.write_str("UpstreamCredential::None"),
-            Self::LegacySubscriptionBridge { secret, .. } => formatter
-                .debug_struct("UpstreamCredential::LegacySubscriptionBridge")
-                .field("has_secret", &secret.is_some())
-                .finish(),
             Self::ApiKey { .. } => formatter
                 .debug_struct("UpstreamCredential::ApiKey")
                 .field("credential_material", &"[redacted]")
@@ -84,14 +73,14 @@ impl UpstreamCredential {
     pub fn auth_kind(&self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::LegacySubscriptionBridge { .. } | Self::OAuth { .. } => "oauth",
+            Self::OAuth { .. } => "oauth",
             Self::ApiKey { .. } => "api_key",
         }
     }
 
     pub fn expires_at(&self) -> Option<i64> {
         match self {
-            Self::None | Self::LegacySubscriptionBridge { .. } | Self::ApiKey { .. } => None,
+            Self::None | Self::ApiKey { .. } => None,
             Self::OAuth { expires_at, .. } => *expires_at,
         }
     }
@@ -104,11 +93,6 @@ impl UpstreamCredential {
         self.validate(now)?;
         let (secret, header, prefix) = match self {
             Self::None => return Ok(request),
-            Self::LegacySubscriptionBridge { .. } => {
-                return Err(AppError::BadRequest(
-                    "this legacy upstream credential cannot be used for requests".into(),
-                ));
-            }
             Self::ApiKey {
                 value,
                 header,
@@ -131,21 +115,6 @@ impl UpstreamCredential {
     pub fn validate(&self, now: i64) -> Result<(), AppError> {
         let (secret, header, prefix) = match self {
             Self::None => return Ok(()),
-            Self::LegacySubscriptionBridge { handle, secret } => {
-                validate_bridge_handle(handle)?;
-                let Some(secret) = secret.as_ref() else {
-                    return Ok(());
-                };
-                if secret.is_empty() {
-                    return Err(AppError::BadRequest(
-                        "legacy upstream credential secret cannot be empty".into(),
-                    ));
-                }
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}")).map_err(
-                    |_| AppError::BadRequest("invalid legacy upstream credential secret".into()),
-                )?;
-                return Ok(());
-            }
             Self::ApiKey {
                 value,
                 header,
@@ -243,20 +212,6 @@ pub fn validate_adapter_state(state: &Value) -> Result<(), AppError> {
     if !visit(state, 0, &mut nodes) {
         return Err(AppError::BadRequest(
             "managed OAuth adapter state exceeds its structural limit".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_bridge_handle(handle: &str) -> Result<(), AppError> {
-    if handle.is_empty()
-        || handle.len() > 80
-        || !handle
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric())
-    {
-        return Err(AppError::BadRequest(
-            "legacy upstream credential handle must be 1-80 ASCII alphanumeric characters".into(),
         ));
     }
     Ok(())

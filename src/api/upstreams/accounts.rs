@@ -299,6 +299,12 @@ pub(in crate::api) async fn set_upstream_status(
         .require_upstream_tenant(account_id, &body.tenant_external_id)
         .await?;
     if body.status == "active" {
+        let driver = state.db.upstream_driver(account_id).await?;
+        if !state.providers.is_public(&driver) {
+            return Err(AppError::BadRequest(
+                "retired upstream providers cannot be enabled".into(),
+            ));
+        }
         let (_, credential) = state
             .db
             .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
@@ -367,11 +373,6 @@ pub(in crate::api) async fn rotate_upstream_credential(
         state.db.require_upstream_tenant(account_id, tenant).await?;
     }
     let driver = state.db.upstream_driver(account_id).await?;
-    if driver == "cpa-subscription-bridge" {
-        return Err(AppError::BadRequest(
-            "this legacy upstream type is retired".into(),
-        ));
-    }
     let provider = state
         .providers
         .get(&driver)

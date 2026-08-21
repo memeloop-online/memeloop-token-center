@@ -39,18 +39,19 @@ pub(in crate::api) async fn probe_upstream_health(
         require_service_tenant(&service, tenant)?;
         state.db.require_upstream_tenant(account_id, tenant).await?;
     }
+    let account_driver = state.db.upstream_driver(account_id).await?;
+    if !state.providers.is_public(&account_driver) {
+        return Ok(Json(json!({
+            "account_id": account_id,
+            "status": "unhealthy",
+            "error_code": "provider_retired",
+            "checked_at": unix_millis()
+        })));
+    }
     let (account, credential) = state
         .db
         .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
-    if account.driver == "cpa-subscription-bridge" {
-        return Ok(Json(json!({
-            "account_id": account_id,
-            "status": "unhealthy",
-            "error_code": "legacy_provider_retired",
-            "checked_at": unix_millis()
-        })));
-    }
     if credential.validate(unix_millis()).is_err() {
         return Ok(Json(json!({
             "account_id": account_id,

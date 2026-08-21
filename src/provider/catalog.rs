@@ -311,38 +311,6 @@ impl ProviderCatalog {
             component_adapter: None,
             source: "builtin".to_owned(),
         });
-        let legacy_subscription_bridge = ProviderType {
-            id: "cpa-subscription-bridge".to_owned(),
-            display_name: "Retired legacy connection".to_owned(),
-            protocols: vec!["openai".to_owned()],
-            modalities: vec!["text".to_owned()],
-            config_schema: json!({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["base_url", "provider"],
-                "properties": {
-                    "base_url": {"type": "string", "format": "uri"},
-                    "provider": {"type": "string", "enum": ["copilot", "cursor"]},
-                    "network_scope": {"const": "private", "readOnly": true}
-                }
-            }),
-            credential_schema: json!({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["type", "handle"],
-                "properties": {
-                    "type": {"const": "subscription_bridge"},
-                    "handle": {"type": "string", "pattern": "^[A-Za-z0-9]{1,80}$", "writeOnly": true},
-                    "secret": {"type": "string", "minLength": 1, "writeOnly": true}
-                }
-            }),
-            oauth_adapter: None,
-            managed_oauth_adapter: None,
-            component_adapter: None,
-            source: "builtin".to_owned(),
-        };
         types.push(ProviderType {
             id: "comfyui".to_owned(),
             display_name: "ComfyUI".to_owned(),
@@ -399,7 +367,6 @@ impl ProviderCatalog {
                 "https://cloudcode-pa.googleapis.com",
                 false,
             ),
-            legacy_subscription_bridge,
         ];
         Self {
             types: Arc::new(types),

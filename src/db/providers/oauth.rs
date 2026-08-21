@@ -36,11 +36,6 @@ impl Database {
                 "unsupported OAuth reauthorization lifecycle".into(),
             ));
         }
-        if input.driver == "cpa-subscription-bridge" {
-            return Err(AppError::BadRequest(
-                "this legacy upstream type is retired".into(),
-            ));
-        }
         if input.oauth_refresh_url.is_none() {
             return Err(AppError::BadRequest(
                 "OAuth reauthorization refresh endpoint is required".into(),
@@ -581,11 +576,6 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
-        if row.try_get::<String, _>("driver")? == "cpa-subscription-bridge" {
-            return Err(AppError::BadRequest(
-                "this legacy upstream type is retired".into(),
-            ));
-        }
         if row.try_get::<String, _>("auth_kind")? != "oauth"
             || row
                 .try_get::<Option<String>, _>("oauth_session_id")?
@@ -619,7 +609,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<(Uuid, i64)>, AppError> {
         let rows = sqlx::query(
-            "SELECT a.id, a.credential_generation FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.status = 'active' AND a.auth_kind = 'oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND a.driver NOT IN ('cpa-subscription-bridge', 'cpa-gemini-oauth-legacy') AND c.expires_at IS NOT NULL AND c.expires_at <= $1 ORDER BY c.expires_at, a.id LIMIT $2",
+            "SELECT a.id, a.credential_generation FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.status = 'active' AND a.auth_kind = 'oauth' AND a.oauth_session_id IS NOT NULL AND a.oauth_refresh_url IS NOT NULL AND a.driver <> 'cpa-gemini-oauth-legacy' AND c.expires_at IS NOT NULL AND c.expires_at <= $1 ORDER BY c.expires_at, a.id LIMIT $2",
         )
         .bind(refresh_before)
         .bind(limit.clamp(1, 100))
@@ -666,11 +656,6 @@ impl Database {
             .fetch_optional(&mut **tx)
             .await?
             .ok_or(AppError::NotFound)?;
-        if row.try_get::<String, _>("driver")? == "cpa-subscription-bridge" {
-            return Err(AppError::BadRequest(
-                "this legacy upstream type is retired".into(),
-            ));
-        }
         let status: String = row.try_get("status")?;
         if !matches!(status.as_str(), "active" | "disabled") {
             return Err(AppError::Forbidden);
@@ -737,10 +722,9 @@ impl Database {
                     .is_some()
                 && !matches!(
                     row.try_get::<String, _>("driver")?.as_str(),
-                    "cpa-subscription-bridge" | "cpa-gemini-oauth-legacy"
+                    "cpa-gemini-oauth-legacy"
                 ),
-            can_rotate: auth_kind != "none"
-                && row.try_get::<String, _>("driver")? != "cpa-subscription-bridge",
+            can_rotate: auth_kind != "none",
             can_reauthorize: upstream_can_reauthorize(
                 &row.try_get::<String, _>("driver")?,
                 &auth_kind,
