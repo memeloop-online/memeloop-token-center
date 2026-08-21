@@ -6,6 +6,8 @@ import { baseURL, eventually, model, requestJson, runtime, tenant } from '../sup
 import type { DogfoodWorld } from '../support/world.js';
 import { assertAttribute, assertContains, assertCount, assertExactText, assertGenerationDownload, assertNoCount, assertNoHorizontalOverflow, assertValue, assertVisible, connectOperator, generationTableFor, metric, multimodalObservations, requestEventFixture, realtimeReconnectObservations, requireMultimodalObservation, sseRequestEvent, submitPortalGeneration, uuidPattern, waitForGenerationStatus } from './dogfood.support.js';
 
+const operatorGenerationCancellations = new WeakMap<DogfoodWorld, { status: number; body: { status: string } }>();
+
 When('下游用户以中文亮色主题在手机视口打开自助门户', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
@@ -123,7 +125,7 @@ Then('中英文都显示安全的无效凭据提示且浏览器没有失败', as
 });
 
 When('管理员以中文亮色主题打开模型计费', async function (this: DogfoodWorld) {
-  await connectOperator(this, 'light');
+  await connectOperator(this, 'light', runtime.requireSeed().globalServiceCredential);
   const page = this.requirePage();
   await page.getByRole('tab', { name: '模型计费', exact: true }).click();
   await assertVisible(page.getByRole('heading', { name: '多模态生成价格', exact: true }));
@@ -148,9 +150,9 @@ When('管理员通过可见表单保存 CNY 多模态价格', async function (th
   const modelName = 'browser-cny-image-model';
   const manualPricing = page.locator('details.manual-pricing');
   await manualPricing.locator('summary').click();
+  await manualPricing.locator('.manual-pricing-body > label select').nth(1).selectOption('CNY');
   await manualPricing.getByLabel('类型').selectOption('generation');
   await manualPricing.getByRole('textbox', { name: '模型', exact: true }).fill(modelName);
-  await manualPricing.getByLabel('币种', { exact: true }).selectOption('CNY');
   await manualPricing.getByLabel('计费单位').selectOption('image');
   await manualPricing.getByLabel('单位价格').fill('0.88');
   const responsePromise = page.waitForResponse((response) => response.url().includes(`/internal/v1/generation-prices/CNY/${modelName}`) && response.request().method() === 'POST');
@@ -168,6 +170,69 @@ Then('CNY 价格立即可见且切回 USD 后不会混入', async function (this
   await page.getByLabel('查看币种', { exact: true }).selectOption('USD');
   assert.equal((await usdResponse).status(), 200);
   await assertNoCount(pricingPanel.locator('tbody tr').filter({ hasText: 'browser-cny-image-model' }));
+  this.assertNoBrowserFailures();
+});
+
+When('管理员通过可见生成任务页查看排队任务详情并取消', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const seed = runtime.requireSeed();
+  const jobId = '019f0000-0000-7000-8000-000000000099';
+  const job = {
+    job_id: jobId,
+    created_at: Date.now(),
+    updated_at: Date.now(),
+    completed_at: null,
+    model: 'browser-operator-generation',
+    driver: 'comfyui',
+    billing_unit: 'job',
+    status: 'queued',
+    upstream_job_id: null,
+    estimated_units: 1,
+    billed_units: null,
+    cost: '0',
+    error_code: null,
+    result: null,
+    assets: [],
+    tenant_external_id: tenant,
+    key_id: '019f0000-0000-7000-8000-000000000098',
+    key_alias: 'Browser operator job key',
+    currency: 'USD',
+  };
+  await page.route('**/internal/v1/generations?**', async (route) => {
+    assert.equal(new URL(route.request().url()).searchParams.get('tenant_external_id'), tenant);
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([job]) });
+  });
+  await page.route('**/internal/v1/generations/' + jobId + '?**', async (route) => {
+    const url = new URL(route.request().url());
+    assert.equal(url.searchParams.get('tenant_external_id'), tenant);
+    if (route.request().method() === 'DELETE') {
+      const body = { ...job, status: 'cancelled', completed_at: Date.now() };
+      operatorGenerationCancellations.set(this, { status: 200, body });
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+      return;
+    }
+    assert.equal(route.request().method(), 'GET');
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(job) });
+  });
+  await connectOperator(this, 'light', seed.globalServiceCredential);
+  await page.getByRole('tab', { name: '生成任务', exact: true }).click();
+  const panel = page.locator('article.panel').filter({ has: page.getByRole('heading', { name: '多模态生成任务', exact: true }) });
+  await assertContains(panel, 'browser-operator-generation');
+  await panel.getByRole('button', { name: '详情', exact: true }).click();
+  await assertVisible(page.getByRole('dialog'));
+  await assertContains(page.getByRole('dialog'), jobId);
+  page.once('dialog', (dialog) => void dialog.accept());
+  await page.getByRole('dialog').getByRole('button', { name: '取消', exact: true }).click();
+});
+
+Then('生成任务取消请求包含明确租户且页面显示已取消', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const cancellation = operatorGenerationCancellations.get(this);
+  assert.equal(cancellation?.status, 200);
+  assert.equal(cancellation?.body.status, 'cancelled');
+  await assertContains(page.getByRole('status'), '已提交取消请求');
+  const panel = page.locator('article.panel').filter({ has: page.getByRole('heading', { name: '多模态生成任务', exact: true }) });
+  await assertContains(panel, '已取消');
   this.assertNoBrowserFailures();
 });
 
@@ -285,6 +350,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await manualPricing.getByRole('button', { name: '保存手动价格', exact: true }).click();
   assert.equal((await imagePriceResponsePromise).status(), 200);
   await manualPricing.getByRole('textbox', { name: '模型', exact: true }).fill(videoModel);
+  await manualPricing.locator('.manual-pricing-body > label select').nth(1).selectOption('USD');
   await manualPricing.getByLabel('计费单位').selectOption('second');
   await manualPricing.getByLabel('单位价格').fill('0.1');
   const priceResponsePromise = page.waitForResponse((response) => response.url().includes(`/internal/v1/generation-prices/USD/${videoModel}`) && response.request().method() === 'POST');

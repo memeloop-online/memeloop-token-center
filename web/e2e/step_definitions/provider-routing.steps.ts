@@ -155,7 +155,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await providerAccount.getByRole('button', { name: '启用', exact: true }).click();
   await assertContains(providerAccount, '正常');
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
-  await assertContains(onboarding.getByLabel('服务提供商'), 'Cursor');
+  await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
 
   await page.getByRole('tab', { name: '模型路由', exact: true }).click();
   const routeRow = page.locator('tbody tr').filter({ hasText: model });
@@ -202,7 +202,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await assertContains(onboarding.getByLabel('服务提供商'), 'Anthropic Claude');
   await assertContains(onboarding.getByLabel('服务提供商'), 'GitHub Copilot');
   await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
-  await onboarding.getByLabel('服务提供商').selectOption('provider:openai-codex');
+  await onboarding.getByLabel('服务提供商').selectOption('openai-codex');
   await onboarding.getByLabel('上游名称').fill('codex-primary');
   await onboarding.getByRole('button', { name: '开始登录', exact: true }).click();
   await assertContains(onboarding.getByRole('status'), '仅当这次登录由你刚刚发起时');

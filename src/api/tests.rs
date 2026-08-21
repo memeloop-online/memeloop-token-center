@@ -55,6 +55,7 @@ struct GenerationApiFixture {
     archive_path: std::path::PathBuf,
     key: String,
     key_id: Uuid,
+    tenant: String,
     model: String,
     _directory: tempfile::TempDir,
 }
@@ -115,7 +116,7 @@ async fn generation_api_fixture(
         .db
         .create_key_with_routing(
             CreateKeyInput {
-                tenant_external_id: tenant,
+                tenant_external_id: tenant.clone(),
                 principal_external_id: "member".to_owned(),
                 alias: label.to_owned(),
                 currency: "USD".to_owned(),
@@ -140,6 +141,7 @@ async fn generation_api_fixture(
         archive_path,
         key: issued.key,
         key_id: issued.key_id,
+        tenant,
         model,
         _directory: directory,
     }
@@ -150,7 +152,16 @@ async fn post_generation(
     idempotency_key: Option<&str>,
     input: Value,
 ) -> Response {
-    let mut request = Request::post("/v1/generations")
+    post_generation_path(fixture, "/v1/generations", idempotency_key, input).await
+}
+
+async fn post_generation_path(
+    fixture: &GenerationApiFixture,
+    path: &str,
+    idempotency_key: Option<&str>,
+    input: Value,
+) -> Response {
+    let mut request = Request::post(path)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key));
     if let Some(idempotency_key) = idempotency_key {
@@ -170,6 +181,138 @@ async fn post_generation(
         )
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn generation_endpoints_enforce_route_modality_and_operator_cancel_scope() {
+    let fixture = generation_api_fixture(
+        "operator-scope",
+        "volcengine-seedance",
+        "second",
+        KeyPolicy {
+            allowed_models: vec!["generation-api-model-operator-scope".to_owned()],
+            ..KeyPolicy::default()
+        },
+        Decimal::TEN,
+    )
+    .await;
+    let wrong_modality = post_generation_path(
+        &fixture,
+        "/v1/images/generations",
+        Some("wrong-modality"),
+        json!({"duration": 5, "content": [{"type": "text", "text": "cat"}]}),
+    )
+    .await;
+    assert_eq!(wrong_modality.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        fixture
+            .state
+            .db
+            .list_generation_jobs(fixture.key_id, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let created = post_generation(
+        &fixture,
+        Some("operator-cancel"),
+        json!({"duration": 5, "content": [{"type": "text", "text": "cat"}]}),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created: Value = serde_json::from_slice(
+        &axum::body::to_bytes(created.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let job_id = created["job_id"].as_str().unwrap();
+    let control = router_for_role(fixture.state.clone(), RuntimeRole::Control);
+    let read_only = fixture
+        .state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "generation-read-only".to_owned(),
+                scopes: vec!["requests:read".to_owned()],
+                tenant_external_id: Some(fixture.tenant.clone()),
+            },
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let list = control
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/internal/v1/generations?tenant_external_id={}",
+                fixture.tenant
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {}", read_only.token))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let listed: Value = serde_json::from_slice(
+        &axum::body::to_bytes(list.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(listed[0]["job_id"], job_id);
+    assert_eq!(listed[0]["tenant_external_id"], fixture.tenant);
+    assert_eq!(listed[0]["key_id"], fixture.key_id.to_string());
+
+    let forbidden = control
+        .clone()
+        .oneshot(
+            Request::delete(format!(
+                "/internal/v1/generations/{job_id}?tenant_external_id={}",
+                fixture.tenant
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {}", read_only.token))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let unscoped = control
+        .clone()
+        .oneshot(
+            Request::delete(format!("/internal/v1/generations/{job_id}"))
+                .header(header::AUTHORIZATION, "Bearer test-service-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unscoped.status(), StatusCode::BAD_REQUEST);
+
+    let cancelled = control
+        .oneshot(
+            Request::delete(format!(
+                "/internal/v1/generations/{job_id}?tenant_external_id={}",
+                fixture.tenant
+            ))
+            .header(header::AUTHORIZATION, "Bearer test-service-token")
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    let cancelled: Value = serde_json::from_slice(
+        &axum::body::to_bytes(cancelled.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cancelled["status"], "cancelled");
 }
 
 async fn generation_fixture_balance(fixture: &GenerationApiFixture) -> String {

@@ -77,7 +77,11 @@ export async function submitPortalGeneration(
   await panel.getByLabel('提示词').fill(prompt);
   if (kind === 'video') await panel.getByLabel('时长（秒）').fill(duration);
   if (Object.keys(parameters).length) await assertVisible(panel.getByRole('heading', { name: '工作流参数', exact: true }));
-  for (const [label, value] of Object.entries(parameters)) await panel.getByLabel(label).fill(value);
+  for (const [label, value] of Object.entries(parameters)) {
+    const schemaProperty = label === '宽度' ? 'width' : label === '高度' ? 'height' : '';
+    const field = schemaProperty ? panel.locator('#root_' + schemaProperty) : panel.getByLabel(label, { exact: true });
+    await field.fill(value);
+  }
   const endpoint = kind === 'video' ? '/v1/videos/generations' : '/v1/images/generations';
   const responsePromise = page.waitForResponse((response) => response.url().endsWith(endpoint) && response.request().method() === 'POST');
   await panel.getByRole('button', { name: '开始生成', exact: true }).click();
@@ -266,7 +270,7 @@ export function usageMetrics(overrides: Record<string, unknown> = {}) {
 
 export function localizationUsageFixture() {
   const bucketStart = Date.UTC(2026, 7, 16, 12);
-  const summary = usageMetrics({ cache_write_tokens: 1_000_000_000_000 });
+  const summary = usageMetrics({ cache_write_tokens: 1_000_000_000_000, generation_units: 12_345 });
   return {
     from_created_at: bucketStart,
     to_created_at: bucketStart + 3_600_000 - 1,
@@ -276,6 +280,8 @@ export function localizationUsageFixture() {
     p95_method: 'fixed_histogram_upper_bound_capped_60000ms',
     upstream_grouping: 'stable_account',
     summary,
+    generation_units_by_modality: [{ modality: 'image', currency: 'USD', units: 12_345 }],
+    generation_units_by_billing_unit: [{ billing_unit: 'image', currency: 'USD', units: 12_345 }],
     time_series: [{ bucket_start: bucketStart, ...summary }],
     by_model: [{ id: model, label: model, ...summary }],
     by_key: [{ id: runtime.requireSeed().clientKeyId, label: 'Browser E2E credential', ...summary }],

@@ -771,7 +771,7 @@ impl Database {
     ) -> Result<Vec<OperatorGenerationJobView>, AppError> {
         let rows = match tenant_external_id {
             Some(tenant) => sqlx::query(
-                "SELECT j.id, j.created_at, j.updated_at, j.completed_at, j.public_model, j.driver, j.billing_unit_snapshot, j.status, j.upstream_job_id, j.estimated_units, j.billed_units, j.cost_micros, j.error_code, j.result_json, j.key_id, t.external_id AS tenant_external_id, k.alias AS key_alias, k.currency FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id JOIN client_keys k ON k.id = j.key_id WHERE t.external_id = $1 ORDER BY j.created_at DESC, j.id DESC LIMIT $2",
+                "SELECT j.id, j.created_at, j.updated_at, j.completed_at, j.public_model, j.driver, j.billing_unit_snapshot, j.status, j.upstream_job_id, j.estimated_units, j.billed_units, j.cost_micros, j.error_code, j.result_json, j.key_id, t.external_id AS tenant_external_id, k.alias AS key_alias, k.currency FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id JOIN key_records k ON k.id = j.key_id WHERE t.external_id = $1 ORDER BY j.created_at DESC, j.id DESC LIMIT $2",
             )
             .bind(tenant)
             .bind(limit.clamp(1, 200))
@@ -779,7 +779,7 @@ impl Database {
             .await?,
             None => {
                 sqlx::query(
-                    "SELECT j.id, j.created_at, j.updated_at, j.completed_at, j.public_model, j.driver, j.billing_unit_snapshot, j.status, j.upstream_job_id, j.estimated_units, j.billed_units, j.cost_micros, j.error_code, j.result_json, j.key_id, t.external_id AS tenant_external_id, k.alias AS key_alias, k.currency FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id JOIN client_keys k ON k.id = j.key_id ORDER BY j.created_at DESC, j.id DESC LIMIT $1",
+                    "SELECT j.id, j.created_at, j.updated_at, j.completed_at, j.public_model, j.driver, j.billing_unit_snapshot, j.status, j.upstream_job_id, j.estimated_units, j.billed_units, j.cost_micros, j.error_code, j.result_json, j.key_id, t.external_id AS tenant_external_id, k.alias AS key_alias, k.currency FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id JOIN key_records k ON k.id = j.key_id ORDER BY j.created_at DESC, j.id DESC LIMIT $1",
                 )
                 .bind(limit.clamp(1, 200))
                 .fetch_all(&self.pool)
@@ -797,7 +797,7 @@ impl Database {
         let row = match tenant_external_id {
             Some(tenant) => {
                 sqlx::query(
-                    "SELECT j.id, j.created_at, j.updated_at, j.completed_at, j.public_model, j.driver, j.billing_unit_snapshot, j.status, j.upstream_job_id, j.estimated_units, j.billed_units, j.cost_micros, j.error_code, j.result_json, j.key_id, t.external_id AS tenant_external_id, k.alias AS key_alias, k.currency FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id JOIN client_keys k ON k.id = j.key_id WHERE j.id = $1 AND t.external_id = $2",
+                    "SELECT j.id, j.created_at, j.updated_at, j.completed_at, j.public_model, j.driver, j.billing_unit_snapshot, j.status, j.upstream_job_id, j.estimated_units, j.billed_units, j.cost_micros, j.error_code, j.result_json, j.key_id, t.external_id AS tenant_external_id, k.alias AS key_alias, k.currency FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id JOIN key_records k ON k.id = j.key_id WHERE j.id = $1 AND t.external_id = $2",
                 )
                     .bind(job_id.to_string())
                     .bind(tenant)
@@ -806,7 +806,7 @@ impl Database {
             }
             None => {
                 sqlx::query(
-                    "SELECT j.id, j.created_at, j.updated_at, j.completed_at, j.public_model, j.driver, j.billing_unit_snapshot, j.status, j.upstream_job_id, j.estimated_units, j.billed_units, j.cost_micros, j.error_code, j.result_json, j.key_id, t.external_id AS tenant_external_id, k.alias AS key_alias, k.currency FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id JOIN client_keys k ON k.id = j.key_id WHERE j.id = $1",
+                    "SELECT j.id, j.created_at, j.updated_at, j.completed_at, j.public_model, j.driver, j.billing_unit_snapshot, j.status, j.upstream_job_id, j.estimated_units, j.billed_units, j.cost_micros, j.error_code, j.result_json, j.key_id, t.external_id AS tenant_external_id, k.alias AS key_alias, k.currency FROM generation_jobs j JOIN tenants t ON t.id = j.tenant_id JOIN key_records k ON k.id = j.key_id WHERE j.id = $1",
                 )
                     .bind(job_id.to_string())
                     .fetch_optional(&self.pool)

@@ -2462,6 +2462,71 @@ paths:
         '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
         '500': { $ref: '#/components/responses/InternalError' }
 
+  /internal/v1/generations:
+    get:
+      tags: [Operator traffic]
+      operationId: listOperatorGenerations
+      summary: List generation jobs in the authorized tenant scope
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+      responses:
+        '200':
+          description: Jobs ordered by creation time descending.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/OperatorGenerationJob' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/generations/{job_id}:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorGeneration
+      summary: Read one generation job in the authorized tenant scope
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/JobIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+      responses:
+        '200':
+          description: Generation job details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorGenerationJob' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Operator traffic]
+      operationId: cancelOperatorGeneration
+      summary: Cancel one queued or running generation job
+      description: A global service credential must explicitly select a tenant. Tenant-scoped credentials remain fixed to their tenant.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: generations:write
+      parameters:
+        - $ref: '#/components/parameters/JobIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+      responses:
+        '200':
+          description: Cancelled job or durable cancellation request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorGenerationJob' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/generations/{job_id}/assets/{asset_id}:
     get:
       tags: [Operator traffic]
@@ -5467,6 +5532,16 @@ components:
         assets:
           type: array
           items: { $ref: '#/components/schemas/GenerationAsset' }
+    OperatorGenerationJob:
+      allOf:
+        - $ref: '#/components/schemas/GenerationJob'
+        - type: object
+          required: [tenant_external_id, key_id, key_alias, currency]
+          properties:
+            tenant_external_id: { type: string, minLength: 1 }
+            key_id: { type: string, format: uuid }
+            key_alias: { type: string, minLength: 1 }
+            currency: { type: string, minLength: 3, maxLength: 3 }
     GenerationAsset:
       type: object
       additionalProperties: false
