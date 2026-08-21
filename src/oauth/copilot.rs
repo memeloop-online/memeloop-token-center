@@ -1726,6 +1726,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_completion_failure_reuses_checkpoint_not_consumed_device_code() {
+        let server = MockServer::start().await;
+        mount_start(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "recoverable-github-secret",
+                "token_type": "bearer",
+                "scope": "repo workflow"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .and(header("authorization", "Bearer recoverable-github-secret"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "message": "transient-secret-body"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_directory, _url, database) = sqlite_database().await;
+        let started = start_at(
+            &database,
+            &reqwest::Client::new(),
+            input(),
+            KEY,
+            NOW,
+            true,
+            &Endpoints::test(&server.uri()),
+        )
+        .await
+        .unwrap();
+        let checkpointed = poll_at(
+            &database,
+            &reqwest::Client::new(),
+            &started.session_token,
+            PollRuntime {
+                key_material: KEY,
+                now: NOW + 1_000,
+                scope: CopilotDevicePollScope {
+                    required_tenant: Some("tenant-a"),
+                    operator_service_id: None,
+                },
+                allow_test_loopback: true,
+                endpoints: &Endpoints::test(&server.uri()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            checkpointed,
+            CopilotDevicePollResult::Pending {
+                retry_after_seconds: 1
+            }
+        ));
+        let failure = poll_at(
+            &database,
+            &reqwest::Client::new(),
+            &started.session_token,
+            PollRuntime {
+                key_material: KEY,
+                now: NOW + 2_000,
+                scope: CopilotDevicePollScope {
+                    required_tenant: Some("tenant-a"),
+                    operator_service_id: None,
+                },
+                allow_test_loopback: true,
+                endpoints: &Endpoints::test(&server.uri()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(!failure.to_string().contains("transient-secret-body"));
+        assert!(!failure.to_string().contains("recoverable-github-secret"));
+
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .and(header("authorization", "Bearer recoverable-github-secret"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"id": 12345, "login": "octocat"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .and(header("authorization", "Bearer recoverable-github-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "recovered-short-token",
+                "expires_at": 1_700_001_800,
+                "refresh_in": 900,
+                "endpoints": {"api": DEFAULT_COPILOT_API_ENDPOINT}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let recovered = poll_at(
+            &database,
+            &reqwest::Client::new(),
+            &started.session_token,
+            PollRuntime {
+                key_material: KEY,
+                now: NOW + 3_000,
+                scope: CopilotDevicePollScope {
+                    required_tenant: Some("tenant-a"),
+                    operator_service_id: None,
+                },
+                allow_test_loopback: true,
+                endpoints: &Endpoints::test(&server.uri()),
+            },
+        )
+        .await
+        .unwrap();
+        let CopilotDevicePollResult::Ready { login, .. } = recovered else {
+            panic!("expected recovered ready result")
+        };
+        let UpstreamCredential::OAuth { access_token, .. } = &login.credential else {
+            panic!("expected recovered OAuth credential")
+        };
+        assert_eq!(access_token, "recovered-short-token");
+        let device_polls_after_reset = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/login/oauth/access_token")
+            .count();
+        assert_eq!(device_polls_after_reset, 0);
+    }
+
+    #[tokio::test]
     async fn exchange_accepts_minimal_and_full_responses() {
         for (body, expected_api, expected_refresh) in [
             (
