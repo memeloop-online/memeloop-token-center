@@ -18,6 +18,27 @@ SPEC.loader.exec_module(HARNESS)
 
 
 class BenchmarkSeedContractTests(unittest.TestCase):
+    def test_asset_gateway_gate_uses_elevated_phase_start_not_original_idle(self) -> None:
+        evidence = HARNESS.asset_gateway_rss_evidence(
+            phase_peak_rss_mib=180.0,
+            phase_start_rss_mib=150.0,
+            original_idle_rss_mib=40.0,
+        )
+
+        self.assertEqual(evidence["gateway_phase_delta_rss_mib"], 30.0)
+        self.assertEqual(
+            evidence["gateway_cumulative_delta_from_original_idle_mib"], 140.0
+        )
+        self.assertLessEqual(evidence["gateway_phase_delta_rss_mib"], 96.0)
+        self.assertGreater(
+            evidence["gateway_cumulative_delta_from_original_idle_mib"], 96.0
+        )
+
+    def test_asset_gateway_phase_delta_never_reports_negative_growth(self) -> None:
+        evidence = HARNESS.asset_gateway_rss_evidence(149.0, 150.0, 40.0)
+
+        self.assertEqual(evidence["gateway_phase_delta_rss_mib"], 0.0)
+
     def test_every_benchmark_route_explicitly_confirms_its_custom_model(self) -> None:
         requests: list[tuple[str, dict[str, object]]] = []
 

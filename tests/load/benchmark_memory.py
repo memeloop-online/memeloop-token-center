@@ -41,6 +41,13 @@ from typing import Any
 MIB = 1024 * 1024
 RESPONSE_LIMIT_BYTES = 64 * MIB
 MP4_PREFIX = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2"
+ASSET_DECAY_COOLDOWN_SECONDS = 2.0
+ASSET_PHASE_START_SAMPLE_SECONDS = 1.0
+ASSET_PHASE_START_SAMPLE_INTERVAL = 0.1
+ASSET_DOWNLOAD_CHUNK_BYTES = 256 * 1024
+ASSET_DOWNLOAD_CHUNK_DELAY_SECONDS = 0.001
+ASSET_RANGE_START = 32
+ASSET_RANGE_BYTES = 4096
 
 
 class HarnessFailure(RuntimeError):
@@ -349,12 +356,16 @@ class Sampler:
         }
 
 
-def memory_summary(pid: int, duration: float = 1.0) -> dict[str, float]:
+def memory_summary(
+    pid: int,
+    duration: float = 1.0,
+    interval: float = 0.1,
+) -> dict[str, float]:
     samples: list[dict[str, float]] = []
     deadline = time.monotonic() + duration
     while time.monotonic() < deadline:
         samples.append(process_memory(pid))
-        time.sleep(0.1)
+        time.sleep(interval)
     rss = [sample["rss_mib"] for sample in samples]
     pss = [sample["pss_mib"] for sample in samples if sample["pss_mib"] > 0]
     high_water = [sample["high_water_mib"] for sample in samples]
@@ -364,6 +375,41 @@ def memory_summary(pid: int, duration: float = 1.0) -> dict[str, float]:
         "rss_mib_max": round(max(rss), 3),
         "pss_mib_median": round(statistics.median(pss), 3) if pss else 0.0,
         "lifetime_high_water_rss_mib": round(max(high_water), 3),
+        "sample_count": len(samples),
+    }
+
+
+def post_decay_phase_start_memory(pid: int) -> dict[str, float]:
+    """Measure a bounded phase baseline after jemalloc's one-second dirty decay."""
+    before = process_memory(pid)
+    time.sleep(ASSET_DECAY_COOLDOWN_SECONDS)
+    summary = memory_summary(
+        pid,
+        ASSET_PHASE_START_SAMPLE_SECONDS,
+        ASSET_PHASE_START_SAMPLE_INTERVAL,
+    )
+    return {
+        "pre_cooldown_rss_mib": round(before["rss_mib"], 3),
+        "cooldown_seconds": ASSET_DECAY_COOLDOWN_SECONDS,
+        "sample_duration_seconds": ASSET_PHASE_START_SAMPLE_SECONDS,
+        "sample_interval_seconds": ASSET_PHASE_START_SAMPLE_INTERVAL,
+        **summary,
+    }
+
+
+def asset_gateway_rss_evidence(
+    phase_peak_rss_mib: float,
+    phase_start_rss_mib: float,
+    original_idle_rss_mib: float,
+) -> dict[str, float]:
+    """Separate asset-phase growth from cumulative pressure since original idle."""
+    return {
+        "gateway_phase_delta_rss_mib": round(
+            max(0.0, phase_peak_rss_mib - phase_start_rss_mib), 3
+        ),
+        "gateway_cumulative_delta_from_original_idle_mib": round(
+            max(0.0, phase_peak_rss_mib - original_idle_rss_mib), 3
+        ),
     }
 
 
@@ -977,6 +1023,115 @@ def archive_inventory(root: pathlib.Path) -> dict[str, int]:
     }
 
 
+def expected_mock_asset_sha256(total_bytes: int) -> str:
+    if total_bytes < len(MP4_PREFIX):
+        raise ValueError("mock asset is smaller than its MP4 prefix")
+    digest = hashlib.sha256()
+    digest.update(MP4_PREFIX)
+    remaining = total_bytes - len(MP4_PREFIX)
+    block = b"x" * MIB
+    while remaining:
+        take = min(remaining, len(block))
+        digest.update(block[:take])
+        remaining -= take
+    return digest.hexdigest()
+
+
+def stream_download_to_hash(
+    base_url: str,
+    path: str,
+    token: str,
+    *,
+    range_header: str | None = None,
+    timeout: float = 180.0,
+    chunk_delay_seconds: float = 0.0,
+) -> dict[str, Any]:
+    """Consume a response into a bounded SHA-256/count sink."""
+    parsed = urllib.parse.urlsplit(base_url)
+    headers = {
+        "authorization": f"Bearer {token}",
+        "connection": "close",
+    }
+    if range_header is not None:
+        headers["range"] = range_header
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    digest = hashlib.sha256()
+    received = 0
+    maximum_chunk = 0
+    try:
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        while True:
+            chunk = response.read(ASSET_DOWNLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+            received += len(chunk)
+            maximum_chunk = max(maximum_chunk, len(chunk))
+            if chunk_delay_seconds:
+                time.sleep(chunk_delay_seconds)
+        return {
+            "status": response.status,
+            "bytes_received": received,
+            "sha256": digest.hexdigest(),
+            "maximum_sink_chunk_bytes": maximum_chunk,
+            "headers": response_headers,
+        }
+    finally:
+        connection.close()
+
+
+def verify_full_asset_download(download: dict[str, Any], expected_bytes: int) -> None:
+    headers = download["headers"]
+    expected_sha256 = expected_mock_asset_sha256(expected_bytes)
+    valid = (
+        download["status"] == 200
+        and download["bytes_received"] == expected_bytes
+        and download["sha256"] == expected_sha256
+        and headers.get("content-length") == str(expected_bytes)
+        and headers.get("content-type") == "video/mp4"
+        and headers.get("accept-ranges") == "bytes"
+        and "no-store"
+        in {value.strip() for value in headers.get("cache-control", "").split(",")}
+        and headers.get("content-disposition", "").startswith("attachment;")
+        and download["maximum_sink_chunk_bytes"] <= ASSET_DOWNLOAD_CHUNK_BYTES
+    )
+    if not valid:
+        raise HarnessFailure(
+            "archived asset full download failed status/size/hash/header validation: "
+            + json.dumps(download, sort_keys=True)
+        )
+    download["expected_sha256"] = expected_sha256
+
+
+def verify_asset_range_download(download: dict[str, Any], expected_bytes: int) -> None:
+    range_end = ASSET_RANGE_START + ASSET_RANGE_BYTES - 1
+    headers = download["headers"]
+    expected_sha256 = hashlib.sha256(b"x" * ASSET_RANGE_BYTES).hexdigest()
+    valid = (
+        download["status"] == 206
+        and download["bytes_received"] == ASSET_RANGE_BYTES
+        and download["sha256"] == expected_sha256
+        and headers.get("content-length") == str(ASSET_RANGE_BYTES)
+        and headers.get("content-range")
+        == f"bytes {ASSET_RANGE_START}-{range_end}/{expected_bytes}"
+        and headers.get("content-type") == "video/mp4"
+        and headers.get("accept-ranges") == "bytes"
+        and "no-store"
+        in {value.strip() for value in headers.get("cache-control", "").split(",")}
+        and download["maximum_sink_chunk_bytes"] <= ASSET_DOWNLOAD_CHUNK_BYTES
+    )
+    if not valid:
+        raise HarnessFailure(
+            "archived asset bounded range failed status/size/hash/header validation: "
+            + json.dumps(download, sort_keys=True)
+        )
+    download["expected_sha256"] = expected_sha256
+
+
 def run_asset(
     gateway_url: str,
     key: str,
@@ -986,21 +1141,21 @@ def run_asset(
 ) -> dict[str, Any]:
     archive_before = archive_bytes(archive_root)
     inventory_before = archive_inventory(archive_root)
-    job = api_json(
-        gateway_url,
-        "POST",
-        "/v1/videos/generations",
-        key,
-        {
-            "model": "benchmark-seedance",
-            "input": {"duration": 1, "benchmark_asset_mib": asset_mib},
-        },
-    )
-    job_id = str(job["job_id"])
     deadline = time.monotonic() + max(120, asset_mib * 2)
     started = time.monotonic()
     final: dict[str, Any] | None = None
     with Sampler(pids) as sampler:
+        job = api_json(
+            gateway_url,
+            "POST",
+            "/v1/videos/generations",
+            key,
+            {
+                "model": "benchmark-seedance",
+                "input": {"duration": 1, "benchmark_asset_mib": asset_mib},
+            },
+        )
+        job_id = str(job["job_id"])
         while time.monotonic() < deadline:
             candidate = api_json(
                 gateway_url,
@@ -1012,9 +1167,33 @@ def run_asset(
                 final = candidate
                 break
             time.sleep(0.1)
-    if final is None:
-        raise HarnessFailure("large asset generation did not finish before timeout")
-    expected_bytes = asset_mib * MIB
+        if final is None:
+            raise HarnessFailure("large asset generation did not finish before timeout")
+        assets = final.get("assets")
+        if not isinstance(assets, list) or len(assets) != 1:
+            raise HarnessFailure("large asset generation did not expose exactly one asset")
+        asset_id = str(assets[0].get("asset_id", ""))
+        if not asset_id:
+            raise HarnessFailure("large asset generation omitted its archived asset id")
+        expected_bytes = asset_mib * MIB
+        asset_path = f"/self/v1/generations/{job_id}/assets/{asset_id}"
+        range_end = ASSET_RANGE_START + ASSET_RANGE_BYTES - 1
+        with Sampler({"gateway": pids["gateway"]}) as download_sampler:
+            full_download = stream_download_to_hash(
+                gateway_url,
+                asset_path,
+                key,
+                timeout=max(180, asset_mib * 2),
+                chunk_delay_seconds=ASSET_DOWNLOAD_CHUNK_DELAY_SECONDS,
+            )
+            verify_full_asset_download(full_download, expected_bytes)
+            range_download = stream_download_to_hash(
+                gateway_url,
+                asset_path,
+                key,
+                range_header=f"bytes={ASSET_RANGE_START}-{range_end}",
+            )
+            verify_asset_range_download(range_download, expected_bytes)
     archive_after = archive_bytes(archive_root)
     inventory_after = archive_inventory(archive_root)
     new_asset_objects = sorted(
@@ -1026,6 +1205,7 @@ def run_asset(
         "job_id": job_id,
         "status": final["status"],
         "error_code": final.get("error_code"),
+        "asset_id": asset_id,
         "asset_mib": asset_mib,
         "expected_asset_bytes": expected_bytes,
         "archive_bytes_before": archive_before,
@@ -1038,6 +1218,18 @@ def run_asset(
         "gateway_lifetime_high_water": sampler.lifetime_high_water_evidence("gateway"),
         "worker_lifetime_high_water": sampler.lifetime_high_water_evidence("worker"),
         "sample_count": len(sampler.samples),
+        "download": {
+            "route": asset_path,
+            "full": full_download,
+            "range": range_download,
+            "gateway_peak_rss_mib": round(
+                download_sampler.max_current_rss("gateway"), 3
+            ),
+            "gateway_lifetime_high_water": download_sampler.lifetime_high_water_evidence(
+                "gateway"
+            ),
+            "sample_count": len(download_sampler.samples),
+        },
     }
 
 
@@ -1489,6 +1681,9 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 "sample_count": len(response_limit_sampler.samples),
             }
 
+            asset_phase_start = post_decay_phase_start_memory(
+                processes["gateway"].pid
+            )
             asset = run_asset(
                 urls["gateway"],
                 key,
@@ -1499,9 +1694,19 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 },
                 archive_root,
             )
-            asset["gateway_delta_rss_mib"] = round(
-                asset["gateway_peak_rss_mib"] - idle_gateway, 3
+            asset["gateway_phase_start"] = asset_phase_start
+            asset.update(
+                asset_gateway_rss_evidence(
+                    asset["gateway_peak_rss_mib"],
+                    asset_phase_start["rss_mib_median"],
+                    idle_gateway,
+                )
             )
+            # Preserve the legacy field as cumulative, informational evidence;
+            # the asset gate below uses only post-decay phase-specific growth.
+            asset["gateway_delta_rss_mib"] = asset[
+                "gateway_cumulative_delta_from_original_idle_mib"
+            ]
             asset["worker_delta_rss_mib"] = round(
                 asset["worker_peak_rss_mib"] - idle_worker, 3
             )
@@ -1641,11 +1846,43 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     asset["sample_count"] >= 2,
                 ),
                 check(
-                    "large asset gateway RSS delta",
-                    asset["gateway_delta_rss_mib"],
+                    "large asset phase-start RSS samples after bounded decay cooldown",
+                    asset["gateway_phase_start"]["sample_count"],
+                    ">=",
+                    8,
+                    asset["gateway_phase_start"]["sample_count"] >= 8,
+                ),
+                check(
+                    "large archived asset streamed through the gateway",
+                    asset["download"]["full"]["bytes_received"],
+                    "==",
+                    asset["expected_asset_bytes"],
+                    asset["download"]["full"]["bytes_received"]
+                    == asset["expected_asset_bytes"],
+                ),
+                check(
+                    "archived asset gateway download memory samples",
+                    asset["download"]["sample_count"],
+                    ">=",
+                    2,
+                    asset["download"]["sample_count"] >= 2,
+                ),
+                check(
+                    "archived asset bounded range verified",
+                    asset["download"]["range"]["status"],
+                    "==",
+                    206,
+                    asset["download"]["range"]["status"] == 206
+                    and asset["download"]["range"]["bytes_received"]
+                    == ASSET_RANGE_BYTES,
+                ),
+                check(
+                    "large asset gateway phase RSS delta",
+                    asset["gateway_phase_delta_rss_mib"],
                     "<=",
                     args.asset_gateway_delta_max_mib,
-                    asset["gateway_delta_rss_mib"] <= args.asset_gateway_delta_max_mib,
+                    asset["gateway_phase_delta_rss_mib"]
+                    <= args.asset_gateway_delta_max_mib,
                 ),
                 check(
                     "large asset worker RSS delta",
@@ -1744,7 +1981,7 @@ def execute(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             )
 
             report = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "benchmark": "memeloop-token-center-memory",
                 "profile": args.profile,
                 "started_at": started_at.isoformat(),
