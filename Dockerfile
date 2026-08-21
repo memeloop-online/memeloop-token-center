@@ -25,6 +25,9 @@ RUN mkdir -p /usr/local/cargo \
     && printf '[source.crates-io]\nreplace-with = "build-mirror"\n[source.build-mirror]\nregistry = "%s"\n' "${CARGO_REGISTRY}" \
       > /usr/local/cargo/config.toml
 WORKDIR /build
+# Keep dependency-cache cleanup deterministic even when a trusted mirror base
+# image defines its own global Cargo target directory.
+ENV CARGO_TARGET_DIR=/build/target
 COPY .cargo/config.toml /build/.cargo/config.toml
 COPY Cargo.toml Cargo.lock ./
 COPY vendor ./vendor
