@@ -91,6 +91,31 @@ function CostValue({ costs }: { costs: UsageAnalysisCost[] }) {
   return <span className="usage-cost-lines">{[...costs].sort((left, right) => left.currency.localeCompare(right.currency)).map(({ currency, cost }) => <span key={currency} title={`${cost} ${currency}`}>{formatCurrency(cost, currency, locale)}</span>)}</span>;
 }
 
+function generationUnitLabel(kind: 'modality' | 'billing_unit', value: string, t: (key: string) => string) {
+  return t(kind === 'modality' ? `modality.${value}` : `billingUnit.${value}`);
+}
+
+function GenerationUnitsValue({ modalityValues = [], billingUnitValues = [], legacyUnits = 0, mode = 'both' }: {
+  modalityValues?: NonNullable<OperatorUsageAnalysis['generation_units_by_modality']>;
+  billingUnitValues?: NonNullable<OperatorUsageAnalysis['generation_units_by_billing_unit']>;
+  legacyUnits?: number;
+  mode?: 'modality' | 'billing_unit' | 'both';
+}) {
+  const { locale, t } = useI18n();
+  const rows = [
+    ...(mode !== 'billing_unit' ? modalityValues.map((item) => ({ kind: 'modality' as const, value: item.modality, currency: item.currency, units: item.units })) : []),
+    ...(mode !== 'modality' ? billingUnitValues.map((item) => ({ kind: 'billing_unit' as const, value: item.billing_unit, currency: item.currency, units: item.units })) : []),
+  ].sort((left, right) => `${left.kind}:${left.value}:${left.currency}`.localeCompare(`${right.kind}:${right.value}:${right.currency}`));
+  if (!rows.length) {
+    return legacyUnits > 0
+      ? <span title={String(legacyUnits)}>{formatNumber(legacyUnits, locale)} · {t('usage.legacyGenerationUnits')}</span>
+      : <span>—</span>;
+  }
+  return <span className="usage-unit-lines">{rows.map((row) => <span key={`${row.kind}:${row.value}:${row.currency}`} title={`${row.units} ${row.currency}`}>
+    {generationUnitLabel(row.kind, row.value, t)} · {row.currency} · {formatNumber(row.units, locale)}
+  </span>)}</span>;
+}
+
 function successRate(metrics: UsageAnalysisMetrics) {
   return metrics.requests > 0 ? metrics.success / metrics.requests : undefined;
 }
@@ -262,6 +287,7 @@ export function UsageAnalysis({ token, tenant, upstreams }: { token: string; ten
     {!token.trim() && <div className="notice warning" role="status">{t('usage.connectPrompt')}</div>}
     {error && <div className="notice error" role="alert">{error}</div>}
     <nav className="usage-tabs" role="tablist" aria-label={t('usage.sections')}>{usageTabs.map((id) => <button type="button" role="tab" aria-selected={tab === id} className={tab === id ? 'active' : ''} key={id} onClick={() => setTab(id)}>{t(`usage.tab.${id}`)}</button>)}</nav>
+    {stats && <section className="panel usage-generation-breakdown" aria-label={t('usage.generationBreakdown')}><div><b>{t('usage.generationByModality')}</b><GenerationUnitsValue modalityValues={stats.generation_units_by_modality} legacyUnits={stats.summary.generation_units} mode="modality" /></div><div><b>{t('usage.generationByBillingUnit')}</b><GenerationUnitsValue billingUnitValues={stats.generation_units_by_billing_unit} legacyUnits={stats.summary.generation_units} mode="billing_unit" /></div></section>}
     {stats && <section className="usage-tab-panel" role="tabpanel">
       {tab === 'overview' && <>
         <section className="metrics usage-metrics">

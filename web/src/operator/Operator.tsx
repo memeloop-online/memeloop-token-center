@@ -6,7 +6,7 @@ import { DrawerFrame, RequestTable, Shell } from '../components';
 import { formatCurrency, formatNumber } from '../format';
 import { localizeSchema, useI18n } from '../i18n';
 import { LimitSnapshot } from '../LimitSnapshot';
-import { schemaFormTemplates } from '../SchemaTemplates';
+import { schemaFormFields, schemaFormTemplates } from '../SchemaTemplates';
 import { safeValidator as validator } from '../safeValidator';
 import type {
   ConfigurationSchemas, CredentialRoutingView, GenerationPriceView, GroupView, KeyLimitSnapshot, KeyView, ModelPriceSyncResult,
@@ -450,7 +450,17 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
       config: { ...structuredClone(editProvider.config_schema), title: 'Connection configuration' },
     },
   } as RJSFSchema, locale) : undefined, [editing, editProvider, locale]);
-  const uiSchema = { driver: { 'ui:widget': 'hidden' }, config: { oauth: { 'ui:widget': 'hidden' }, timeout_seconds: { 'ui:widget': 'hidden' } } };
+  const uiSchema = {
+    driver: { 'ui:widget': 'hidden' },
+    config: {
+      oauth: { 'ui:widget': 'hidden' },
+      timeout_seconds: { 'ui:widget': 'hidden' },
+      ...(provider?.id === 'comfyui' ? {
+        workflow_template: { 'ui:field': 'JsonObject' },
+        parameter_schema: { 'ui:field': 'JsonObject' },
+      } : {}),
+    },
+  };
   useEffect(() => { setRotating(undefined); setEditing(undefined); setReauthorizing(undefined); setHealth({}); }, [tenant]);
 
   const canManage = (value: UpstreamAccount) => Boolean(tenant) && (!value.tenant_external_id || value.tenant_external_id === tenant);
@@ -519,7 +529,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
       <div className="segmented" role="group" aria-label={t('providers.method')}><button type="button" aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</button><button type="button" aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</button></div>
       {method === 'direct' ? <>
         <label>{t('providers.provider')}<select value={provider?.id ?? ''} onChange={(event) => setDriver(event.target.value)}>{providers.map((value) => <option key={value.id} value={value.id}>{value.display_name} · {value.source}</option>)}</select></label>
-        {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} uiSchema={uiSchema} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant }) }); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+        {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant }) }); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
       </> : <AuthorizationConnection token={token} tenant={tenant} providers={providers} onChanged={onChanged} />}</>}
     </article>
   </section></>;
@@ -581,14 +591,15 @@ function Pricing({ token, tenant, schemas }: { token: string; tenant: string; sc
   const [kind, setKind] = useState<'token' | 'generation'>('token');
   const [model, setModel] = useState('');
   const [currency, setCurrency] = useState('USD');
+  const [displayCurrency, setDisplayCurrency] = useState('USD');
   const [message, setMessage] = useState('');
   const scope = queryForTenant(tenant);
-  const load = async () => {
+  const load = async (requestedCurrency = displayCurrency) => {
     if (!token) return;
     const results = await Promise.allSettled([
-      api<ModelPriceView[]>('/internal/v1/model-prices?currency=USD', token),
+      api<ModelPriceView[]>(`/internal/v1/model-prices?currency=${encodeURIComponent(requestedCurrency)}`, token),
       api<ModelPriceUsageSummary>(`/internal/v1/model-prices/usage-summary${scope}`, token),
-      api<GenerationPriceView[]>('/internal/v1/generation-prices?currency=USD', token),
+      api<GenerationPriceView[]>(`/internal/v1/generation-prices?currency=${encodeURIComponent(requestedCurrency)}`, token),
     ]);
     const [nextPrices, nextUsage, nextGenerationPrices] = results;
     if (nextPrices.status === 'fulfilled') setPrices(nextPrices.value);
@@ -597,7 +608,7 @@ function Pricing({ token, tenant, schemas }: { token: string; tenant: string; sc
     const failures = results.filter((result) => result.status === 'rejected');
     setError(failures.length ? t('pricing.partialLoad', { count: formatNumber(failures.length, locale) }) : '');
   };
-  useEffect(() => { void load(); }, [token, tenant]);
+  useEffect(() => { void load(displayCurrency); }, [token, tenant, displayCurrency]);
   const usageByModel = new Map(usage.models.map((value) => [value.model, value]));
   const rows = Array.from(new Set([...usage.models.map((value) => value.model), ...prices.map((value) => value.model)])).sort().flatMap((name) => {
     const price = prices.find((value) => value.model === name);
@@ -609,22 +620,22 @@ function Pricing({ token, tenant, schemas }: { token: string; tenant: string; sc
     if (!tenant) return;
     setSyncing(true); setError(''); setMessage('');
     try {
-      const result = await api<ModelPriceSyncResult>('/internal/v1/model-prices/sync', token, { method: 'POST', body: JSON.stringify({ models: usage.models.map((value) => value.model), currency: 'USD', tenant_external_id: tenant }) });
+      const result = await api<ModelPriceSyncResult>('/internal/v1/model-prices/sync', token, { method: 'POST', body: JSON.stringify({ models: usage.models.map((value) => value.model), currency: displayCurrency, tenant_external_id: tenant }) });
       setSyncResult(result); setPrices(result.prices); setMessage(t('pricing.synced', { count: formatNumber(result.imported, locale) }));
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setSyncing(false); }
   };
   return <div className="pricing-page"><WriteScopeNotice tenant={tenant} />
-    <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><button type="button" onClick={() => void sync()} disabled={!tenant || syncing}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</button></div>
+    <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><div className="pricing-heading-actions"><label>{t('pricing.viewCurrency')}<select aria-label={t('pricing.viewCurrency')} value={displayCurrency} onChange={(event) => { const next = event.target.value; setDisplayCurrency(next); setCurrency(next); }}><option value="USD">USD</option><option value="CNY">CNY</option></select></label><button type="button" onClick={() => void sync()} disabled={!tenant || syncing}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</button></div></div>
       <div className="pricing-summary"><span>{t('pricing.usedModels', { count: formatNumber(usage.models.length, locale) })}</span><span>{t('pricing.saved', { count: formatNumber(prices.length, locale) })}</span><span>{t('pricing.sourceOrder')}: models.dev → LiteLLM → OpenRouter</span></div>
       {error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}
       {syncResult && <><div className="source-status">{syncResult.sourceResults.map((source) => <div className={`source-card ${source.error ? 'failed' : 'healthy'}`} key={source.source}><b>{source.source}</b><span>{source.error ? t('pricing.sourceFailed') : t('pricing.sourceHealthy', { count: formatNumber(source.models, locale) })}</span>{source.error && <small>{source.error}</small>}</div>)}</div><div className="notice success"><b>{t('pricing.result')}</b> · {t('pricing.imported', { count: formatNumber(syncResult.imported, locale) })} · {t('pricing.candidates', { count: formatNumber(syncResult.candidates.length, locale) })} · {t('pricing.unmatched', { count: formatNumber(syncResult.unmatched.length, locale) })} · {t('pricing.preserved', { count: formatNumber(syncResult.preserved.length, locale) })}</div>
-        {(syncResult.candidates.length > 0 || syncResult.unmatched.length > 0) && <div className="sync-details"><h3>{t('pricing.candidateDetails')}</h3>{syncResult.candidates.map((candidate) => <details key={candidate.model}><summary><code>{candidate.model}</code><span>{t('pricing.candidateCount', { count: formatNumber(candidate.candidates.length, locale) })}</span></summary><div className="candidate-list">{candidate.candidates.map((match) => <div key={`${match.source}-${match.sourceModelId}-${match.serviceTier}`}><b>{match.sourceModelId}</b><span>{match.source} · {match.serviceTier} · {match.reason}</span><code>{t('pricing.input')}: {formatCurrency(match.inputPerMillion, 'USD', locale)} · {t('pricing.output')}: {formatCurrency(match.outputPerMillion, 'USD', locale)}</code></div>)}</div></details>)}{syncResult.unmatched.length > 0 && <details><summary>{t('pricing.unmatchedModels')}</summary><div className="model-name-list">{syncResult.unmatched.map((name) => <code key={name}>{name}</code>)}</div></details>}</div>}
+        {(syncResult.candidates.length > 0 || syncResult.unmatched.length > 0) && <div className="sync-details"><h3>{t('pricing.candidateDetails')}</h3>{syncResult.candidates.map((candidate) => <details key={candidate.model}><summary><code>{candidate.model}</code><span>{t('pricing.candidateCount', { count: formatNumber(candidate.candidates.length, locale) })}</span></summary><div className="candidate-list">{candidate.candidates.map((match) => <div key={`${match.source}-${match.sourceModelId}-${match.serviceTier}`}><b>{match.sourceModelId}</b><span>{match.source} · {match.serviceTier} · {match.reason}</span><code>{t('pricing.input')}: {formatCurrency(match.inputPerMillion, displayCurrency, locale)} · {t('pricing.output')}: {formatCurrency(match.outputPerMillion, displayCurrency, locale)}</code></div>)}</div></details>)}{syncResult.unmatched.length > 0 && <details><summary>{t('pricing.unmatchedModels')}</summary><div className="model-name-list">{syncResult.unmatched.map((name) => <code key={name}>{name}</code>)}</div></details>}</div>}
       </>}
-      <div className="table-scroll"><table><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.calls')}</th><th>{t('pricing.serviceTier')}</th><th>{t('pricing.input')}</th><th>{t('pricing.cachedInput')}</th><th>{t('pricing.cacheWrite')}</th><th>{t('pricing.output')}</th><th>{t('pricing.source')}</th><th>{t('pricing.updated')}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.model}-${row.tier?.service_tier ?? 'missing'}`}><td><code>{row.model}</code></td><td>{row.usage ? formatNumber(row.usage.calls, locale) : ''}</td><td>{row.tier?.service_tier ?? '—'}</td><td>{row.tier ? formatCurrency(row.tier.input_per_million, 'USD', locale) : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cached_input_per_million, 'USD', locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cache_write_per_million, 'USD', locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? formatCurrency(row.tier.output_per_million, 'USD', locale) : '—'}</td><td>{row.tier ? <span className={`pill source-${row.tier.source.replace('.', '-')}`}>{row.tier.source}</span> : <span className="status pending">{t('pricing.missing')}</span>}</td><td>{row.tier ? new Date(row.tier.updated_at).toLocaleString(locale) : '—'}</td></tr>)}</tbody></table>{rows.length === 0 && <div className="empty">{t('pricing.noPrices')}</div>}</div>
+      <div className="table-scroll"><table><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.calls')}</th><th>{t('pricing.serviceTier')}</th><th>{t('pricing.input')}</th><th>{t('pricing.cachedInput')}</th><th>{t('pricing.cacheWrite')}</th><th>{t('pricing.output')}</th><th>{t('pricing.source')}</th><th>{t('pricing.updated')}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.model}-${row.tier?.service_tier ?? 'missing'}`}><td><code>{row.model}</code></td><td>{row.usage ? formatNumber(row.usage.calls, locale) : ''}</td><td>{row.tier?.service_tier ?? '—'}</td><td>{row.tier ? formatCurrency(row.tier.input_per_million, displayCurrency, locale) : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cached_input_per_million, displayCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cache_write_per_million, displayCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? formatCurrency(row.tier.output_per_million, displayCurrency, locale) : '—'}</td><td>{row.tier ? <span className={`pill source-${row.tier.source.replace('.', '-')}`}>{row.tier.source}</span> : <span className="status pending">{t('pricing.missing')}</span>}</td><td>{row.tier ? new Date(row.tier.updated_at).toLocaleString(locale) : '—'}</td></tr>)}</tbody></table>{rows.length === 0 && <div className="empty">{t('pricing.noPricesForCurrency', { currency: displayCurrency })}</div>}</div>
     </article>
     <article className="panel"><div className="panel-title"><h2>{t('pricing.generationPrices')}</h2><span>{formatNumber(generationPrices.length, locale)}</span></div><div className="table-scroll"><table><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.currency')}</th><th>{t('self.units')}</th><th>{t('pricing.unitPrice')}</th></tr></thead><tbody>{generationPrices.map((price) => <tr key={`${price.currency}-${price.model}`}><td><code>{price.model}</code></td><td>{price.currency}</td><td>{enumLabel(t, 'billingUnit', price.billing_unit)}</td><td>{formatCurrency(price.price_per_unit, price.currency, locale)}</td></tr>)}</tbody></table>{generationPrices.length === 0 && <div className="empty">{t('pricing.noGenerationPrices')}</div>}</div></article>
-    <details className="panel manual-pricing"><summary><span><b>{t('pricing.manual')}</b><small>{t('pricing.manualHint')}</small></span><span>＋</span></summary><div className="manual-pricing-body form-panel"><label>{t('pricing.type')}<select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}><option value="token">{t('pricing.tokenModel')}</option><option value="generation">{t('pricing.generationModel')}</option></select></label><label>{t('pricing.model')}<input value={model} onChange={(event) => setModel(event.target.value)} /></label><label>{t('pricing.currency')}<input value={currency} onChange={(event) => setCurrency(event.target.value.toUpperCase())} maxLength={3} /></label>{schema ? <Form key={`${kind}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { const prefix = kind === 'generation' ? 'generation-prices' : 'prices'; await api(`/internal/v1/${prefix}/${encodeURIComponent(currency)}/${encodeURIComponent(model)}`, token, { method: 'POST', body: JSON.stringify(formData) }); setMessage(t('pricing.savedMessage')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant || !model.trim()}>{t('pricing.save')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
+    <details className="panel manual-pricing"><summary><span><b>{t('pricing.manual')}</b><small>{t('pricing.manualHint')}</small></span><span>＋</span></summary><div className="manual-pricing-body form-panel"><label>{t('pricing.type')}<select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}><option value="token">{t('pricing.tokenModel')}</option><option value="generation">{t('pricing.generationModel')}</option></select></label><label>{t('pricing.model')}<input value={model} onChange={(event) => setModel(event.target.value)} /></label><label>{t('pricing.currency')}<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option value="USD">USD</option><option value="CNY">CNY</option></select></label>{schema ? <Form key={`${kind}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { const prefix = kind === 'generation' ? 'generation-prices' : 'prices'; await api(`/internal/v1/${prefix}/${encodeURIComponent(currency)}/${encodeURIComponent(model)}`, token, { method: 'POST', body: JSON.stringify(formData) }); setMessage(t('pricing.savedMessage')); setDisplayCurrency(currency); await load(currency); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant || !model.trim()}>{t('pricing.save')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
   </div>;
 }
 

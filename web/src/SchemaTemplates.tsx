@@ -1,4 +1,5 @@
-import type { ArrayFieldItemTemplateProps, ArrayFieldTemplateProps, ErrorListProps, FieldErrorProps, RJSFValidationError } from '@rjsf/utils';
+import type { ArrayFieldItemTemplateProps, ArrayFieldTemplateProps, ErrorListProps, FieldErrorProps, FieldProps, RJSFValidationError } from '@rjsf/utils';
+import { useEffect, useState } from 'react';
 import { useI18n } from './i18n';
 
 function validationMessage(error: RJSFValidationError, t: (key: string, variables?: Record<string, string | number>) => string) {
@@ -82,9 +83,47 @@ export function SchemaFieldErrorTemplate({ errors, fieldPathId }: FieldErrorProp
   return <div className="schema-field-error" id={`${fieldPathId.$id}__error`} role="status">{t('schemaError.invalidField')}</div>;
 }
 
+export function SchemaJsonObjectField({
+  autofocus,
+  disabled,
+  fieldPathId,
+  formData,
+  onBlur,
+  onChange,
+  onFocus,
+  readonly,
+  schema,
+}: FieldProps<Record<string, unknown>>) {
+  const { t } = useI18n();
+  const formatted = JSON.stringify(formData ?? {}, null, 2);
+  const [text, setText] = useState(formatted);
+  const [error, setError] = useState('');
+  useEffect(() => { setText(formatted); }, [formatted]);
+  const update = (value: string) => {
+    setText(value);
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('object required');
+      setError('');
+      onChange(parsed as Record<string, unknown>, fieldPathId.path, undefined, fieldPathId.$id);
+    } catch {
+      setError(t('schemaError.jsonObject'));
+      onChange(undefined, fieldPathId.path, undefined, fieldPathId.$id);
+    }
+  };
+  return <div className="schema-json-object">
+    <textarea id={fieldPathId.$id} aria-label={typeof schema.title === 'string' ? schema.title : t('schemaError.jsonDocument')} rows={12} spellCheck={false} autoFocus={autofocus} disabled={disabled} readOnly={readonly} value={text} onChange={(event) => update(event.target.value)} onBlur={() => onBlur(fieldPathId.$id, text)} onFocus={() => onFocus(fieldPathId.$id, text)} />
+    {error && <div className="schema-field-error" role="alert">{error}</div>}
+  </div>;
+}
+
 export const schemaFormTemplates = {
   ArrayFieldTemplate: SchemaArrayFieldTemplate,
   ArrayFieldItemTemplate: SchemaArrayItemTemplate,
   ErrorListTemplate: SchemaErrorListTemplate,
   FieldErrorTemplate: SchemaFieldErrorTemplate,
+};
+
+export const schemaFormFields = {
+  JsonObject: SchemaJsonObjectField,
 };

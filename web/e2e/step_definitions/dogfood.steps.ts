@@ -1115,6 +1115,34 @@ Then('多模态模型 {string} 以 {string} 计费并显示价格 {string}', asy
   this.assertNoBrowserFailures();
 });
 
+When('管理员通过可见表单保存 CNY 多模态价格', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const modelName = 'browser-cny-image-model';
+  const manualPricing = page.locator('details.manual-pricing');
+  await manualPricing.locator('summary').click();
+  await manualPricing.getByLabel('类型').selectOption('generation');
+  await manualPricing.getByRole('textbox', { name: '模型', exact: true }).fill(modelName);
+  await manualPricing.getByLabel('币种', { exact: true }).selectOption('CNY');
+  await manualPricing.getByLabel('计费单位').selectOption('image');
+  await manualPricing.getByLabel('单位价格').fill('0.88');
+  const responsePromise = page.waitForResponse((response) => response.url().includes(`/internal/v1/generation-prices/CNY/${modelName}`) && response.request().method() === 'POST');
+  await manualPricing.getByRole('button', { name: '保存手动价格', exact: true }).click();
+  assert.equal((await responsePromise).status(), 200);
+  await assertValue(page.getByLabel('查看币种', { exact: true }), 'CNY');
+});
+
+Then('CNY 价格立即可见且切回 USD 后不会混入', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const pricingPanel = page.locator('article.panel').filter({ has: page.getByRole('heading', { name: '多模态生成价格', exact: true }) });
+  const cnyRow = pricingPanel.locator('tbody tr').filter({ hasText: 'browser-cny-image-model' });
+  await assertContains(cnyRow, '¥0.88');
+  const usdResponse = page.waitForResponse((response) => response.url().includes('/internal/v1/generation-prices?currency=USD'));
+  await page.getByLabel('查看币种', { exact: true }).selectOption('USD');
+  assert.equal((await usdResponse).status(), 200);
+  await assertNoCount(pricingPanel.locator('tbody tr').filter({ hasText: 'browser-cny-image-model' }));
+  this.assertNoBrowserFailures();
+});
+
 When('管理员通过真实控件创建多模态上游、价格、路由和凭据', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
@@ -1122,49 +1150,39 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const imageModel = 'browser-ui-comfy-image';
   const videoModel = 'browser-ui-seedance-video';
 
-  // The ComfyUI graph is an administrator-owned JSON fixture; the resources named in
-  // the acceptance sentence below are deliberately created with the visible console.
-  const comfyUpstream = await requestJson<{ id: string }>('/internal/v1/upstreams', {
-    method: 'POST', credential: seed.globalServiceCredential,
-    body: {
-      tenant_external_id: tenant,
-      name: 'Browser UI ComfyUI fixture',
-      driver: 'comfyui',
-      config: {
-        base_url: mockBaseUrl,
-        network_scope: 'public',
-        api_prefix: '',
-        workflow_id: 'browser-workflow-v1',
-        workflow_template: {
-          '9': { class_type: 'SaveImage', inputs: { filename_prefix: { $mtc_param: 'prompt' } } },
-        },
-      },
-      credential: { type: 'none' },
-    },
-  });
-  await requestJson(`/internal/v1/upstreams/${comfyUpstream.id}/models/sync?tenant_external_id=${encodeURIComponent(tenant)}`, {
-    method: 'POST', credential: seed.globalServiceCredential,
-  });
-  const imageRoute = await requestJson<{ id: string }>('/internal/v1/model-routes', {
-    method: 'POST', credential: seed.globalServiceCredential,
-    body: {
-      tenant_external_id: tenant,
-      public_model: imageModel,
-      upstream_account_id: comfyUpstream.id,
-      upstream_model: 'browser-workflow-v1',
-      protocol: 'generation',
-      priority: 0,
-      custom_model_confirmed: true,
-    },
-  });
-  await requestJson(`/internal/v1/generation-prices/USD/${imageModel}`, {
-    method: 'POST', credential: seed.globalServiceCredential,
-    body: { billing_unit: 'job', price_per_unit: '0.2' },
-  });
-
   await connectOperator(this, 'light', seed.globalServiceCredential);
   await page.getByRole('tab', { name: '上游提供商', exact: true }).click();
   const onboarding = page.locator('.provider-onboarding');
+  await onboarding.getByLabel('服务提供商').selectOption('comfyui');
+  const comfyForm = onboarding.locator('form');
+  await comfyForm.locator('#root_name').fill('Browser UI ComfyUI');
+  await comfyForm.locator('#root_config_base_url').fill(mockBaseUrl);
+  await comfyForm.locator('#root_config_network_scope').selectOption('public');
+  await comfyForm.locator('#root_config_workflow_id').fill('browser-workflow-v1');
+  const workflowEditor = comfyForm.getByLabel('工作流模板', { exact: true });
+  await assertVisible(workflowEditor);
+  await workflowEditor.fill(JSON.stringify({
+    '5': { class_type: 'EmptyLatentImage', inputs: { width: { $mtc_param: 'width' }, height: { $mtc_param: 'height' }, batch_size: 1 } },
+    '9': { class_type: 'SaveImage', inputs: { filename_prefix: { $mtc_param: 'prompt' }, images: ['5', 0] } },
+  }, null, 2));
+  await comfyForm.getByLabel('下游参数 Schema', { exact: true }).fill(JSON.stringify({
+    type: 'object',
+    additionalProperties: false,
+    required: ['prompt', 'width', 'height'],
+    properties: {
+      prompt: { type: 'string', minLength: 1, maxLength: 2000 },
+      width: { type: 'integer', minimum: 64, maximum: 2048, multipleOf: 64, default: 512 },
+      height: { type: 'integer', minimum: 64, maximum: 2048, multipleOf: 64, default: 512 },
+    },
+  }, null, 2));
+  const comfyResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/upstreams') && response.request().method() === 'POST');
+  await comfyForm.getByRole('button', { name: '添加上游', exact: true }).click();
+  const comfyResponse = await comfyResponsePromise;
+  assert.equal(comfyResponse.status(), 201, await comfyResponse.text());
+  const comfyUpstream = await comfyResponse.json() as { id: string };
+  assert.match(comfyUpstream.id, uuidPattern);
+  await assertContains(page.getByRole('status'), '上游服务已添加');
+
   await onboarding.getByLabel('提供商').selectOption('volcengine-seedance');
   const providerForm = onboarding.locator('form');
   await providerForm.locator('#root_name').fill('Browser UI Seedance');
@@ -1197,6 +1215,21 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
 
   await page.getByRole('tab', { name: '模型路由', exact: true }).click();
   const routeForm = page.locator('article.form-panel').filter({ has: page.getByRole('heading', { name: '创建模型路由', exact: true }) });
+  await routeForm.getByLabel('公开模型').fill(imageModel);
+  const imageUpstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
+  await imageUpstreamPicker.fill('Browser UI ComfyUI');
+  await imageUpstreamPicker.press('Enter');
+  await routeForm.getByLabel('协议').selectOption('generation');
+  await routeForm.getByLabel('上游模型').fill('browser-workflow-v1');
+  await routeForm.getByLabel(/未验证的自定义模型/).check();
+  const imageRouteResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
+  await routeForm.getByRole('button', { name: '创建路由', exact: true }).click();
+  const imageRouteResponse = await imageRouteResponsePromise;
+  assert.equal(imageRouteResponse.status(), 201, await imageRouteResponse.text());
+  const imageRoute = await imageRouteResponse.json() as { id: string };
+  assert.match(imageRoute.id, uuidPattern);
+  await assertContains(page.getByRole('status'), '路由已创建');
+
   await routeForm.getByLabel('公开模型').fill(videoModel);
   const upstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
   await upstreamPicker.fill('Browser UI Seedance');
@@ -1217,8 +1250,14 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const manualPricing = page.locator('details.manual-pricing');
   await manualPricing.locator('summary').click();
   await manualPricing.getByLabel('类型').selectOption('generation');
+  await manualPricing.getByRole('textbox', { name: '模型', exact: true }).fill(imageModel);
+  await manualPricing.getByLabel('计费单位').selectOption('job');
+  await manualPricing.getByLabel('单位价格').fill('0.2');
+  const imagePriceResponsePromise = page.waitForResponse((response) => response.url().includes(`/internal/v1/generation-prices/USD/${imageModel}`) && response.request().method() === 'POST');
+  await manualPricing.getByRole('button', { name: '保存手动价格', exact: true }).click();
+  assert.equal((await imagePriceResponsePromise).status(), 200);
   await manualPricing.getByRole('textbox', { name: '模型', exact: true }).fill(videoModel);
-  await manualPricing.getByRole('textbox', { name: '币种', exact: true }).fill('USD');
+  await manualPricing.getByLabel('币种', { exact: true }).selectOption('USD');
   await manualPricing.getByLabel('计费单位').selectOption('second');
   await manualPricing.getByLabel('单位价格').fill('0.1');
   const priceResponsePromise = page.waitForResponse((response) => response.url().includes(`/internal/v1/generation-prices/USD/${videoModel}`) && response.request().method() === 'POST');
@@ -1277,7 +1316,7 @@ When('普通凭据用户通过中文亮色门户创建图片和视频任务', as
   await page.locator('input[type="password"]').fill(observation.clientCredential);
   await page.getByRole('button', { name: '载入', exact: true }).click();
   await assertVisible(page.getByRole('heading', { name: '创建多模态任务', exact: true }));
-  await submitPortalGeneration(page, 'image', observation.imageModel, '画一个明亮的橙色圆形');
+  await submitPortalGeneration(page, 'image', observation.imageModel, '画一个明亮的橙色圆形', '5', { 宽度: '512', 高度: '512' });
   await waitForGenerationStatus(page, observation.imageModel, '已成功');
   await submitPortalGeneration(page, 'video', observation.videoModel, '一只狐狸跑过草地', '5');
 });
@@ -1318,7 +1357,7 @@ When('用户通过门户创建并取消排队中的图片任务', async function
     assert.equal(response.status, 200);
     assert.equal((await response.json() as { active: boolean }).active, true);
   }, 10_000, 'the deterministic fixture did not occupy the single generation worker');
-  await submitPortalGeneration(page, 'image', observation.imageModel, '这个任务将在排队时取消');
+  await submitPortalGeneration(page, 'image', observation.imageModel, '这个任务将在排队时取消', '5', { 宽度: '512', 高度: '512' });
   const generationTable = generationTableFor(page);
   const row = generationTable.locator('tbody tr').filter({ hasText: observation.imageModel }).first();
   const cancellationResponse = page.waitForResponse((response) => response.url().includes('/self/v1/generations/') && response.request().method() === 'DELETE');
@@ -1545,12 +1584,15 @@ async function submitPortalGeneration(
   generationModel: string,
   prompt: string,
   duration = '5',
+  parameters: Record<string, string> = {},
 ): Promise<void> {
   const panel = page.locator('.generation-create');
   await panel.getByLabel('生成类型').selectOption(kind);
   await panel.getByLabel('模型').fill(generationModel);
   await panel.getByLabel('提示词').fill(prompt);
   if (kind === 'video') await panel.getByLabel('时长（秒）').fill(duration);
+  if (Object.keys(parameters).length) await assertVisible(panel.getByRole('heading', { name: '工作流参数', exact: true }));
+  for (const [label, value] of Object.entries(parameters)) await panel.getByLabel(label, { exact: true }).fill(value);
   const endpoint = kind === 'video' ? '/v1/videos/generations' : '/v1/images/generations';
   const responsePromise = page.waitForResponse((response) => response.url().endsWith(endpoint) && response.request().method() === 'POST');
   await panel.getByRole('button', { name: '开始生成', exact: true }).click();

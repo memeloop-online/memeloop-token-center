@@ -204,6 +204,28 @@ button.bucket-heading:hover b {
   }
 }
 
+.generation-parameters {
+  border-top: 1px solid #293c42;
+  margin-top: 18px;
+  padding-top: 16px;
+}
+
+.generation-parameters h3 {
+  margin: 0 0 6px;
+}
+
+.schema-json-object textarea {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  line-height: 1.5;
+  min-height: 220px;
+  resize: vertical;
+  tab-size: 2;
+}
+
+:root[data-theme='light'] .generation-parameters {
+  border-color: #c5d6d2;
+}
+
 @media (width <= 480px) {
   .table-scroll {
     max-width: calc(100vw - 48px);

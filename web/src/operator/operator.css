@@ -657,6 +657,22 @@
   width: 100%;
 }
 
+.pricing-heading-actions {
+  align-items: flex-end;
+  display: flex;
+  gap: 8px;
+}
+
+.pricing-heading-actions label {
+  color: #71858d;
+  font-size: 11px;
+}
+
+.pricing-heading-actions select {
+  margin-top: 5px;
+  min-width: 110px;
+}
+
 [role='tabpanel'] {
   max-width: 100%;
   min-width: 0;
@@ -855,9 +871,32 @@
   font-size: 26px;
 }
 
-.usage-cost-lines {
+.usage-cost-lines,
+.usage-unit-lines {
   display: grid;
   gap: 2px;
+}
+
+.usage-generation-breakdown {
+  display: grid;
+  gap: 1px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 0;
+}
+
+.usage-generation-breakdown > div {
+  background: #0b171b;
+  min-width: 0;
+  padding: 14px 16px;
+}
+
+.usage-generation-breakdown b {
+  color: #71858d;
+  display: block;
+  font-size: 10px;
+  letter-spacing: .08em;
+  margin-bottom: 8px;
+  text-transform: uppercase;
 }
 
 .usage-dimension h2 {
@@ -1122,6 +1161,16 @@
   .usage-custom-range,
   .usage-filter-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pricing-heading-actions,
+  .usage-generation-breakdown {
+    align-items: stretch;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pricing-heading-actions {
+    flex-direction: column;
   }
 
   .managed-resource-header,

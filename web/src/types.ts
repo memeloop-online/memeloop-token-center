@@ -54,6 +54,18 @@ export interface UsageAnalysisCost {
   cost: string;
 }
 
+export interface UsageAnalysisGenerationUnitByModality {
+  modality: 'image' | 'video' | string;
+  currency: string;
+  units: number;
+}
+
+export interface UsageAnalysisGenerationUnitByBillingUnit {
+  billing_unit: 'job' | 'second' | 'image' | 'megapixel' | string;
+  currency: string;
+  units: number;
+}
+
 export interface UsageAnalysisMetrics {
   requests: number;
   success: number;
@@ -113,6 +125,8 @@ export interface OperatorUsageAnalysis {
   p95_method: string;
   upstream_grouping: 'stable_account';
   summary: UsageAnalysisMetrics;
+  generation_units_by_modality?: UsageAnalysisGenerationUnitByModality[];
+  generation_units_by_billing_unit?: UsageAnalysisGenerationUnitByBillingUnit[];
   time_series: UsageAnalysisTimeBucket[];
   by_model: UsageAnalysisBucket[];
   by_key: UsageAnalysisBucket[];
@@ -183,6 +197,19 @@ export interface KeyView {
   reserved_balance?: string;
   updated_at?: number;
   fingerprint?: string | null;
+}
+
+export interface ModelCatalogItem {
+  id: string;
+  object: 'model';
+  owned_by: string;
+  modalities?: Array<'text' | 'image' | 'video' | 'embedding' | string>;
+  generation_schema?: Record<string, unknown>;
+}
+
+export interface ModelCatalogResponse {
+  object: 'list';
+  data: ModelCatalogItem[];
 }
 
 export type GroupKind = 'provider' | 'route' | 'credential';

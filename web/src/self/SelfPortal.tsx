@@ -1,10 +1,14 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import RjsfForm from '@rjsf/core/lib/components/Form.js';
+import type { RJSFSchema } from '@rjsf/utils';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { ApiError, api } from '../api';
 import { Buckets, DrawerFrame, Metric, RequestTable, Shell } from '../components';
 import { formatCurrency, formatMetricNumber, formatMilliseconds, formatNumber, formatPercent } from '../format';
-import { useI18n } from '../i18n';
+import { localizeSchema, useI18n } from '../i18n';
 import { LimitSnapshot } from '../LimitSnapshot';
-import type { ConversationCluster, ConversationDetail, GenerationAsset, GenerationJob, KeyLimitSnapshot, KeyView, RequestDetail, RequestView, SelfStats } from '../types';
+import { schemaFormTemplates } from '../SchemaTemplates';
+import { safeValidator as validator } from '../safeValidator';
+import type { ConversationCluster, ConversationDetail, GenerationAsset, GenerationJob, KeyLimitSnapshot, KeyView, ModelCatalogItem, ModelCatalogResponse, RequestDetail, RequestView, SelfStats } from '../types';
 
 const requestPageSize = 50;
 const conversationPageSize = 50;
@@ -117,7 +121,7 @@ export function SelfPortal() {
   const [credential, setCredential] = useState('');
   const [stats, setStats] = useState<SelfStats>();
   const [credentialView, setCredentialView] = useState<KeyView>();
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [availableModels, setAvailableModels] = useState<ModelCatalogItem[]>([]);
   const [limitSnapshot, setLimitSnapshot] = useState<KeyLimitSnapshot>();
   const [requests, setRequests] = useState<RequestView[]>([]);
   const [requestFilters, setRequestFilters] = useState<RequestFilters>(emptyRequestFilters);
@@ -129,6 +133,7 @@ export function SelfPortal() {
   const [generationModel, setGenerationModel] = useState('');
   const [generationPrompt, setGenerationPrompt] = useState('');
   const [generationDuration, setGenerationDuration] = useState('5');
+  const [generationParameters, setGenerationParameters] = useState<Record<string, unknown>>({});
   const [generationSubmitting, setGenerationSubmitting] = useState(false);
   const [generationMessage, setGenerationMessage] = useState('');
   const [conversations, setConversations] = useState<ConversationCluster[]>([]);
@@ -150,7 +155,7 @@ export function SelfPortal() {
         api<RequestView[]>(requestsPath(requestFilters), value),
         api<GenerationJob[]>('/self/v1/generations?limit=100', value),
         api<ConversationCluster[]>(conversationsPath(), value),
-        api<{ data: Array<{ id: string }> }>('/v1/models', value),
+        api<ModelCatalogResponse>('/v1/models', value),
       ]);
       const failures = results.filter((result) => result.status === 'rejected');
       if (failures.length === results.length) throw failures[0].reason;
@@ -165,7 +170,9 @@ export function SelfPortal() {
       setGenerations(nextGenerations.status === 'fulfilled' ? nextGenerations.value : []);
       const conversationPage = nextConversations.status === 'fulfilled' ? nextConversations.value : [];
       setConversations(conversationPage);
-      setAvailableModels(nextModels.status === 'fulfilled' ? nextModels.value.data.map((item) => item.id) : []);
+      setAvailableModels(nextModels.status === 'fulfilled' ? nextModels.value.data : []);
+      setGenerationModel('');
+      setGenerationParameters({});
       setHasOlderConversations(nextConversations.status === 'fulfilled' && conversationPage.length === conversationPageSize);
       if (failures.length) setError(t('self.partialLoad', { count: formatNumber(failures.length, locale) }));
     } catch (reason) {
@@ -306,13 +313,22 @@ export function SelfPortal() {
     const value = credential.trim();
     const selectedModel = generationModel.trim();
     const prompt = generationPrompt.trim();
-    if (!value || !selectedModel || !prompt) return;
+    const selectedCatalogModel = availableModels.find((item) => item.id === selectedModel);
+    if (!value || !selectedModel || !prompt || (selectedCatalogModel?.modalities && !selectedCatalogModel.modalities.includes(generationKind))) {
+      setError(t('self.modelModalityMismatch'));
+      return;
+    }
+    const parameterPayload = { ...generationParameters, prompt };
+    if (selectedCatalogModel?.generation_schema && validator.validateFormData(parameterPayload, selectedCatalogModel.generation_schema as RJSFSchema).errors.length) {
+      setError(t('self.generationParametersInvalid'));
+      return;
+    }
     setGenerationSubmitting(true); setGenerationMessage(''); setError('');
     try {
       const path = generationKind === 'video' ? '/v1/videos/generations' : '/v1/images/generations';
       const input = generationKind === 'video'
-        ? { duration: Number(generationDuration), content: [{ type: 'text', text: prompt }] }
-        : { parameters: { prompt } };
+        ? { duration: Number(generationDuration), content: [{ type: 'text', text: prompt }], ...((selectedCatalogModel?.generation_schema || Object.keys(generationParameters).length) ? { parameters: parameterPayload } : {}) }
+        : { parameters: parameterPayload };
       const job = await api<GenerationJob>(path, value, {
         method: 'POST',
         headers: { 'Idempotency-Key': crypto.randomUUID() },
@@ -356,6 +372,22 @@ export function SelfPortal() {
   }
 
   const hasPendingGenerations = generations.some((job) => job.status === 'queued' || job.status === 'running' || job.status === 'cancelling');
+  const catalogHasCapabilities = availableModels.some((item) => Array.isArray(item.modalities));
+  const generationModels = useMemo(() => catalogHasCapabilities
+    ? availableModels.filter((item) => item.modalities?.includes(generationKind))
+    : availableModels, [availableModels, catalogHasCapabilities, generationKind]);
+  const selectedGenerationModel = generationModels.find((item) => item.id === generationModel);
+  const selectedGenerationSchema = selectedGenerationModel?.generation_schema as RJSFSchema | undefined;
+  const visibleGenerationSchema = useMemo<RJSFSchema | undefined>(() => {
+    if (!selectedGenerationSchema) return undefined;
+    const schema = structuredClone(selectedGenerationSchema);
+    if (schema.properties) delete schema.properties.prompt;
+    if (Array.isArray(schema.required)) schema.required = schema.required.filter((name) => name !== 'prompt');
+    return schema;
+  }, [selectedGenerationSchema]);
+  const generationParameterErrors = selectedGenerationSchema
+    ? validator.validateFormData({ ...generationParameters, prompt: generationPrompt.trim() }, selectedGenerationSchema).errors
+    : [];
   useEffect(() => { if (credential) void load(); }, []);
   useEffect(() => {
     if (!credential.trim() || !hasPendingGenerations) return;
@@ -372,7 +404,7 @@ export function SelfPortal() {
     {error && <div className="notice error" role="alert">{error}</div>}
     {stats && <>
       <section className="metrics"><Metric label={t('self.balance', { currency: credentialView?.currency ?? '' })} value={credentialView ? <span title={`${credentialView.available_balance} ${credentialView.currency}`}>{formatCurrency(credentialView.available_balance, credentialView.currency, locale)}</span> : '—'} tone="positive" /><SelfNumberMetric label={t('traffic.total')} value={stats.summary.total_requests} /><SelfNumberMetric label={t('traffic.success')} value={stats.summary.successful_requests} tone="positive" /><SelfNumberMetric label={t('traffic.failure')} value={stats.summary.failed_requests} tone="negative" /><SelfNumberMetric label={t('request.tokens')} value={stats.summary.input_tokens + stats.summary.output_tokens} /><Metric label={t('traffic.cost')} value={credentialView ? <span title={`${stats.summary.total_cost} ${credentialView.currency}`}>{formatCurrency(stats.summary.total_cost, credentialView.currency, locale)}</span> : '—'} /></section>
-      {credentialView && <article className="panel key-summary"><div><span className="eyebrow">{t('self.stableCredential')}</span><h2>{credentialView.alias}</h2><code>{credentialView.key_id}</code></div><div className="policy-grid"><span><b>{t('self.credentialGeneration')}</b>{formatNumber(credentialView.credential_generation, locale)}</span><span><b>RPM</b>{formatNumber(credentialView.policy.requests_per_minute, locale)}</span><span><b>TPM</b>{formatNumber(credentialView.policy.tokens_per_minute, locale)}</span><span><b>{t('self.concurrency')}</b>{formatNumber(credentialView.policy.max_concurrency, locale)}</span><span><b>{t('budget.daily')}</b>{credentialView.policy.daily_budget === null ? '—' : formatCurrency(credentialView.policy.daily_budget, credentialView.currency, locale)}</span><span><b>{t('budget.weekly')}</b>{credentialView.policy.weekly_budget === null ? '—' : formatCurrency(credentialView.policy.weekly_budget, credentialView.currency, locale)}</span><span><b>{t('budget.lifetime')}</b>{credentialView.policy.lifetime_budget === null ? '—' : formatCurrency(credentialView.policy.lifetime_budget, credentialView.currency, locale)}</span><span><b>{t('self.allowedModels')}</b>{availableModels.length ? availableModels.join(', ') : t('credentials.noModelsAllowed')}</span></div></article>}
+      {credentialView && <article className="panel key-summary"><div><span className="eyebrow">{t('self.stableCredential')}</span><h2>{credentialView.alias}</h2><code>{credentialView.key_id}</code></div><div className="policy-grid"><span><b>{t('self.credentialGeneration')}</b>{formatNumber(credentialView.credential_generation, locale)}</span><span><b>RPM</b>{formatNumber(credentialView.policy.requests_per_minute, locale)}</span><span><b>TPM</b>{formatNumber(credentialView.policy.tokens_per_minute, locale)}</span><span><b>{t('self.concurrency')}</b>{formatNumber(credentialView.policy.max_concurrency, locale)}</span><span><b>{t('budget.daily')}</b>{credentialView.policy.daily_budget === null ? '—' : formatCurrency(credentialView.policy.daily_budget, credentialView.currency, locale)}</span><span><b>{t('budget.weekly')}</b>{credentialView.policy.weekly_budget === null ? '—' : formatCurrency(credentialView.policy.weekly_budget, credentialView.currency, locale)}</span><span><b>{t('budget.lifetime')}</b>{credentialView.policy.lifetime_budget === null ? '—' : formatCurrency(credentialView.policy.lifetime_budget, credentialView.currency, locale)}</span><span><b>{t('self.allowedModels')}</b>{availableModels.length ? availableModels.map((item) => item.id).join(', ') : t('credentials.noModelsAllowed')}</span></div></article>}
       {limitSnapshot && <article className="panel"><LimitSnapshot value={limitSnapshot} /></article>}
       <section className="two-column"><article className="panel"><h2>{t('traffic.models')}</h2><Buckets values={stats.by_model} onSelect={(bucket) => filterRequests({ model: bucket.name })} /></article><article className="panel"><h2>{t('traffic.days')}</h2><Buckets values={stats.by_day} onSelect={(bucket) => { if (/^\d{4}-\d{2}-\d{2}$/.test(bucket.name)) filterRequests({ from: `${bucket.name}T00:00`, to: `${bucket.name}T23:59` }); }} /></article></section>
       {stats.errors.length > 0 && <article className="panel"><h2>{t('traffic.errors')}</h2><Buckets values={stats.errors} onSelect={(bucket) => filterRequests({ status: 'error', errorCode: bucket.name })} /></article>}
@@ -398,13 +430,15 @@ export function SelfPortal() {
       <article className="panel"><div className="panel-title"><h2>{t('self.conversations')}</h2><span>{t('self.conversationHint')}</span></div><div className="conversation-list">{conversations.map((conversation) => <button type="button" className="conversation" key={conversation.cluster_id} disabled={conversationLoading} onClick={() => void selectConversation(conversation)}><span><b>{conversation.explicit_session_id ?? conversation.cluster_id.slice(0, 13)}</b><small>{new Date(conversation.updated_at).toLocaleString(locale)}</small></span><span><strong>{t('request.count', { count: formatNumber(conversation.request_count, locale) })}</strong>{conversation.candidate_edge_count > 0 && <em>{t('self.candidateEdges', { count: formatNumber(conversation.candidate_edge_count, locale) })}</em>}</span></button>)}{conversations.length === 0 && <div className="empty">{t('self.noConversations')}</div>}</div>{hasOlderConversations && <div className="load-more"><button type="button" className="secondary" disabled={conversationLoading} onClick={() => void fetchOlderConversations()}>{conversationLoading ? t('common.loading') : t('self.loadOlderConversations')}</button></div>}</article>
       <article className="panel form-panel generation-create"><div className="panel-title"><div><h2>{t('self.createGeneration')}</h2><p className="muted">{t('self.generationDrivers')}</p></div><button type="button" className="secondary" disabled={loading} onClick={() => void refreshGenerations()}>{t('self.refreshGenerations')}</button></div>
         {generationMessage && <div className="notice success" role="status">{generationMessage}</div>}
-        <form onSubmit={createGeneration}>
-          <label>{t('self.generationKind')}<select value={generationKind} onChange={(event) => setGenerationKind(event.target.value as 'image' | 'video')}><option value="image">{t('self.image')}</option><option value="video">{t('self.video')}</option></select></label>
-          <label>{t('self.generationModel')}<input list="self-generation-models" value={generationModel} onChange={(event) => setGenerationModel(event.target.value)} /><datalist id="self-generation-models">{availableModels.map((allowedModel) => <option value={allowedModel} key={allowedModel} />)}</datalist></label>
+        <label>{t('self.generationKind')}<select value={generationKind} onChange={(event) => { setGenerationKind(event.target.value as 'image' | 'video'); setGenerationModel(''); setGenerationParameters({}); }}><option value="image" disabled={catalogHasCapabilities && !availableModels.some((item) => item.modalities?.includes('image'))}>{t('self.image')}</option><option value="video" disabled={catalogHasCapabilities && !availableModels.some((item) => item.modalities?.includes('video'))}>{t('self.video')}</option></select></label>
+        {generationModels.length === 0 ? <div className="notice warning" role="status">{t('self.noModelsForModality', { modality: t(`self.${generationKind}`) })}</div> : <form onSubmit={createGeneration}>
+          <label>{t('self.generationModel')}<input list={`self-generation-models-${generationKind}`} value={generationModel} onChange={(event) => { setGenerationModel(event.target.value); setGenerationParameters({}); }} aria-describedby="self-generation-model-hint" /><datalist id={`self-generation-models-${generationKind}`}>{generationModels.map((allowedModel) => <option value={allowedModel.id} key={allowedModel.id} />)}</datalist><small id="self-generation-model-hint" className="field-description">{t('self.modelCapabilityHint', { modality: t(`self.${generationKind}`) })}</small></label>
           <label>{t('self.generationPrompt')}<textarea value={generationPrompt} onChange={(event) => setGenerationPrompt(event.target.value)} /></label>
           {generationKind === 'video' && <label>{t('self.generationDuration')}<input type="number" min="1" max="60" step="1" value={generationDuration} onChange={(event) => setGenerationDuration(event.target.value)} /></label>}
-          <button type="submit" disabled={generationSubmitting || !generationModel.trim() || !generationPrompt.trim()}>{generationSubmitting ? t('common.loading') : t('self.submitGeneration')}</button>
-        </form>
+          {!catalogHasCapabilities && <div className="notice warning" role="status">{t('self.legacyModelCatalog')}</div>}
+          {visibleGenerationSchema && <div className="generation-parameters"><h3>{t('self.workflowParameters')}</h3><p className="muted">{t('self.workflowParametersHint')}</p><RjsfForm key={`${generationKind}-${generationModel}-${locale}`} schema={localizeSchema(visibleGenerationSchema, locale)} formData={generationParameters} validator={validator} templates={schemaFormTemplates} tagName="div" noHtml5Validate onChange={({ formData }) => setGenerationParameters((formData ?? {}) as Record<string, unknown>)}><></></RjsfForm></div>}
+          <button type="submit" disabled={generationSubmitting || !generationModel.trim() || !generationPrompt.trim() || generationParameterErrors.length > 0}>{generationSubmitting ? t('common.loading') : t('self.submitGeneration')}</button>
+        </form>}
       </article>
       <GenerationTable jobs={generations} currency={credentialView?.currency} onSelect={setGenerationDetail} onCancel={(job) => void cancelGeneration(job)} />
     </>}
