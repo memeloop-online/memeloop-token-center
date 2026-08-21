@@ -136,6 +136,23 @@ pub(super) struct AppliedTraffic {
     pub(super) upstream_account_hint: Option<Uuid>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct TrafficPolicyProtocols<'a> {
+    /// The client-facing protocol exposed to traffic-policy plugins.
+    pub(super) client: &'a str,
+    /// The model-route protocol used for both pre- and post-rewrite grants.
+    pub(super) routing: &'a str,
+}
+
+impl<'a> TrafficPolicyProtocols<'a> {
+    pub(super) const fn same(protocol: &'a str) -> Self {
+        Self {
+            client: protocol,
+            routing: protocol,
+        }
+    }
+}
+
 /// Traffic plugins run only after core key authentication. Both the client
 /// model and the effective rewritten model must resolve through normalized
 /// exact-route or route-group grants. A plugin may narrow the resulting
@@ -143,7 +160,7 @@ pub(super) struct AppliedTraffic {
 pub(super) async fn apply_traffic_policy(
     state: &AppState,
     key: &AuthenticatedKey,
-    protocol: &str,
+    protocols: TrafficPolicyProtocols<'_>,
     original_request_json: Value,
 ) -> Result<AppliedTraffic, AppError> {
     if !original_request_json.is_object() {
@@ -159,7 +176,12 @@ pub(super) async fn apply_traffic_policy(
         .to_owned();
     if !state
         .db
-        .credential_has_available_route(key.key_id, key.tenant_id, &requested_model, protocol)
+        .credential_has_available_route(
+            key.key_id,
+            key.tenant_id,
+            &requested_model,
+            protocols.routing,
+        )
         .await?
     {
         return Err(AppError::Forbidden);
@@ -173,7 +195,7 @@ pub(super) async fn apply_traffic_policy(
         tenant_id: key.tenant_id.to_string(),
         principal_id: key.principal_id.to_string(),
         key_id: key.key_id.to_string(),
-        protocol: protocol.to_owned(),
+        protocol: protocols.client.to_owned(),
         model: requested_model.clone(),
         config_json: "{}".to_owned(),
     };
@@ -218,7 +240,7 @@ pub(super) async fn apply_traffic_policy(
     }
     if !state
         .db
-        .credential_has_available_route(key.key_id, key.tenant_id, &model, protocol)
+        .credential_has_available_route(key.key_id, key.tenant_id, &model, protocols.routing)
         .await?
     {
         return Err(AppError::Forbidden);

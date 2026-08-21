@@ -10,7 +10,7 @@ pub(in crate::api) async fn create_generation(
     let applied = apply_traffic_policy(
         &state,
         &key,
-        "generation",
+        TrafficPolicyProtocols::same("generation"),
         json!({"model": body.model, "input": body.input}),
     )
     .await?;

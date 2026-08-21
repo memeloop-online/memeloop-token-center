@@ -85,9 +85,10 @@ use routes::{control_router, gateway_router};
 use routing::*;
 use self_service::*;
 use traffic::{
-    Protocol, apply_traffic_policy, component_provider_timeout, component_provider_url,
-    inject_controlled_output_ceiling, normalize_component_provider, prepare_component_provider,
-    proxy_anthropic, proxy_anthropic_count_tokens, proxy_openai_chat, proxy_openai_embeddings,
+    AppliedTraffic, Protocol, TrafficPolicyProtocols, apply_traffic_policy,
+    component_provider_timeout, component_provider_url, inject_controlled_output_ceiling,
+    normalize_component_provider, prepare_component_provider, proxy_anthropic,
+    proxy_anthropic_count_tokens, proxy_openai_chat, proxy_openai_embeddings,
     proxy_openai_responses,
 };
 use upstreams::*;

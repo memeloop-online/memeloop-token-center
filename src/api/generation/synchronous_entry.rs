@@ -33,7 +33,7 @@ async fn proxy_openai_image_generation(
     request_json: Value,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    let applied = apply_traffic_policy(&state, &key, "openai-image", request_json).await?;
+    let applied = apply_openai_image_traffic_policy(&state, &key, request_json).await?;
     let mut request_json = applied.request_json;
     let model = applied.model;
     let prompt = request_json
@@ -256,5 +256,162 @@ async fn proxy_openai_image_generation(
     {
         Ok(result) => result,
         Err(_) => fail_image_request(&context, "image_deadline_exceeded").await,
+    }
+}
+
+async fn apply_openai_image_traffic_policy(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    request_json: Value,
+) -> Result<AppliedTraffic, AppError> {
+    apply_traffic_policy(
+        state,
+        key,
+        TrafficPolicyProtocols {
+            client: "openai-image",
+            routing: "generation",
+        },
+        request_json,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::Config,
+        db::{CreateGroupInput, GroupKind, ReplaceGroupMembersInput},
+    };
+
+    #[tokio::test]
+    async fn openai_images_use_generation_grants_and_ignore_credential_groups() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("image-routing.db").display()
+        );
+        let state = AppState::initialize(Config::for_test(database_url))
+            .await
+            .expect("test state");
+        let tenant = "image-routing-protocol";
+        let model = "image-routing-model";
+        let upstream = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.to_owned(),
+                    name: "image upstream".to_owned(),
+                    driver: "http-json".to_owned(),
+                    config: json!({
+                        "base_url": "https://images.example.invalid",
+                        "network_scope": "public"
+                    }),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .expect("upstream account");
+        let route = state
+            .db
+            .create_model_route(CreateModelRouteInput {
+                tenant_external_id: tenant.to_owned(),
+                public_model: model.to_owned(),
+                upstream_account_id: upstream.id,
+                upstream_model: model.to_owned(),
+                protocol: "generation".to_owned(),
+                priority: 0,
+            })
+            .await
+            .expect("generation route");
+        let key_input = |alias: &str| CreateKeyInput {
+            tenant_external_id: tenant.to_owned(),
+            principal_external_id: alias.to_owned(),
+            alias: alias.to_owned(),
+            currency: "USD".to_owned(),
+            policy: KeyPolicy::default(),
+            initial_balance: Decimal::ONE,
+            idempotency_key: None,
+        };
+        let granted = state
+            .db
+            .create_key_with_routing(
+                key_input("granted"),
+                &[route.id],
+                &[],
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .expect("granted credential");
+        let ungranted = state
+            .db
+            .create_key_with_routing(
+                key_input("ungranted"),
+                &[],
+                &[],
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .expect("ungranted credential");
+
+        // Both credentials deliberately share the same presentation-only
+        // group. Only the explicit generation-route grant may authorize one.
+        let credential_group = state
+            .db
+            .create_group(
+                GroupKind::Credential,
+                CreateGroupInput {
+                    tenant_external_id: tenant.to_owned(),
+                    name: "Image testers".to_owned(),
+                },
+            )
+            .await
+            .expect("credential group");
+        state
+            .db
+            .replace_group_members(
+                GroupKind::Credential,
+                credential_group.id,
+                ReplaceGroupMembersInput {
+                    tenant_external_id: tenant.to_owned(),
+                    member_ids: vec![granted.key_id, ungranted.key_id],
+                    expected_updated_at: credential_group.updated_at,
+                },
+            )
+            .await
+            .expect("credential group members");
+
+        let granted_key = state
+            .db
+            .authenticate_key(&granted.key, state.config.key_pepper.as_bytes())
+            .await
+            .expect("authenticate granted credential");
+        let applied = apply_openai_image_traffic_policy(
+            &state,
+            &granted_key,
+            json!({"model": model, "prompt": "draw a fox"}),
+        )
+        .await
+        .expect("generation grant authorizes OpenAI image admission");
+        assert_eq!(applied.model, model);
+
+        let ungranted_key = state
+            .db
+            .authenticate_key(&ungranted.key, state.config.key_pepper.as_bytes())
+            .await
+            .expect("authenticate ungranted credential");
+        assert!(matches!(
+            apply_openai_image_traffic_policy(
+                &state,
+                &ungranted_key,
+                json!({"model": model, "prompt": "draw a fox"}),
+            )
+            .await,
+            Err(AppError::Forbidden)
+        ));
     }
 }

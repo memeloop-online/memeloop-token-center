@@ -19,8 +19,13 @@ pub(super) async fn proxy(
     let request_id = Uuid::now_v7();
     let original_request_json: Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
-    let applied =
-        apply_traffic_policy(&state, &key, protocol.name(), original_request_json.clone()).await?;
+    let applied = apply_traffic_policy(
+        &state,
+        &key,
+        TrafficPolicyProtocols::same(protocol.name()),
+        original_request_json.clone(),
+    )
+    .await?;
     let request_json = applied.request_json;
     let model = applied.model;
     let resolved_route = state
