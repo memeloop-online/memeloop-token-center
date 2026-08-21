@@ -3,7 +3,7 @@ import type { RJSFSchema } from '@rjsf/utils';
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { ApiError, api } from '../api';
 import { Buckets, DrawerFrame, Metric, RequestTable, Shell } from '../components';
-import { formatCurrency, formatMetricNumber, formatMilliseconds, formatNumber } from '../format';
+import { formatCurrency, formatMetricNumber, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { localizeSchema, useI18n } from '../i18n';
 import { LimitSnapshot } from '../LimitSnapshot';
 import { schemaFormTemplates } from '../SchemaTemplates';
