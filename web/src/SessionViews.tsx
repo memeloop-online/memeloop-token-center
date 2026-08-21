@@ -52,7 +52,7 @@ export function SessionList({ values, loading, showCredential, onSelect }: {
         <span><small>{t('sessions.requests')}</small><b><SessionMetricNumber value={session.requests} /></b></span>
         <span><small>{t('sessions.archivedOnly')}</small><b><SessionMetricNumber value={session.archived_only_requests} /></b></span>
         <span><small>{t('sessions.activeRequests')}</small><b><SessionMetricNumber value={session.active_requests} /></b></span>
-        <span><small>{t('sessions.errors')}</small><b><SessionMetricNumber value={session.errors} /></b></span>
+        <span className={session.errors > 0 ? 'session-metric-negative' : undefined}><small>{t('sessions.errors')}</small><b><SessionMetricNumber value={session.errors} /></b></span>
         <span><small>{t('sessions.tokens')}</small><b><SessionMetricNumber value={session.input_tokens + session.output_tokens} /></b></span>
         <span><small>{t('sessions.averageLatency')}</small><b>{formatMilliseconds(session.avg_duration_ms, locale)}</b></span>
         <span><small>{t('sessions.cost')}</small><b><SessionCosts values={session.costs} /></b></span>

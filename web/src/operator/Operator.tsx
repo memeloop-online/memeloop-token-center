@@ -8,11 +8,10 @@ import { localizeSchema, useI18n } from '../i18n';
 import { LimitSnapshot } from '../LimitSnapshot';
 import { schemaFormFields, schemaFormTemplates } from '../SchemaTemplates';
 import { safeValidator as validator } from '../safeValidator';
-import { SessionDrawer, SessionList } from '../SessionViews';
 import type {
   ConfigurationSchemas, CredentialRoutingView, GenerationPriceView, GroupView, KeyLimitSnapshot, KeyView, ModelPriceSyncResult,
   ModelPriceUsageSummary, ModelPriceView, ModelRouteView,
-  LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, PluginManifest, ProviderType, RequestDetail, RequestEvent, RequestView,
+  PluginManifest, ProviderType, RequestDetail, RequestEvent, RequestView,
   ServiceTokenView, TenantView, UpstreamAccount, UpstreamHealth, UsageAnalysisSessionBucket,
 } from '../types';
 import './operator.css';
@@ -20,6 +19,7 @@ import { GroupManager, useGroups } from './GroupManager';
 import { MultiCombobox, type ComboboxOption } from './MultiCombobox';
 import { UpstreamModelCombobox } from './UpstreamModelCombobox';
 import { Plugins } from './Plugins';
+import { SessionMonitor, type SessionFocus, type SessionStreamState } from './SessionMonitor';
 import { UsageAnalysis } from './UsageAnalysis';
 
 type Tab = 'traffic' | 'usage' | 'providers' | 'routes' | 'pricing' | 'credentials' | 'services' | 'plugins';
@@ -50,23 +50,11 @@ interface RequestEventScope {
   tenant: string;
   filters: RequestFilters;
 }
-interface SessionFilters {
-  q: string;
-  keyId: string;
-  model: string;
-  state: '' | 'active' | 'has_errors';
-}
-interface SessionFocus {
-  sessionId: string;
-  keyId: string;
-  revision: number;
-}
 const tabIds: Tab[] = ['traffic', 'usage', 'providers', 'routes', 'pricing', 'credentials', 'services', 'plugins'];
 const emptyRequestFilters: RequestFilters = {
   from: '', to: '', keyId: '', model: '', protocol: '', status: '', errorCode: '', upstreamAccountId: '',
   routeId: '', minDurationMs: '', maxDurationMs: '', minCost: '', maxCost: '', keyAlias: '', principal: '',
 };
-const emptySessionFilters: SessionFilters = { q: '', keyId: '', model: '', state: '' };
 
 function Form(props: FormProps) {
   return <RjsfForm {...props} noHtml5Validate onError={() => { /* Validation is rendered inline. */ }} />;
@@ -176,32 +164,6 @@ function filtersActive(filters: RequestFilters) {
   return Object.values(filters).some(Boolean);
 }
 
-function operatorSessionsPath(tenant: string, filters: SessionFilters, before?: LogicalSessionCursor) {
-  const params = new URLSearchParams({ tenant_external_id: tenant, limit: '50' });
-  if (filters.q.trim()) params.set('q', filters.q.trim());
-  if (filters.keyId.trim()) params.set('key_id', filters.keyId.trim());
-  if (filters.model.trim()) params.set('model', filters.model.trim());
-  if (filters.state) params.set('state', filters.state);
-  if (before) {
-    params.set('before_last_activity_at', String(before.before_last_activity_at));
-    params.set('before_session_id', before.before_session_id);
-  }
-  return `/internal/v1/sessions?${params}`;
-}
-
-function operatorSessionDetailPath(tenant: string, session: LogicalSessionSummary, cursor?: LogicalSessionDetail['next_cursor']) {
-  const params = new URLSearchParams({
-    tenant_external_id: tenant,
-    key_id: session.key_id,
-    limit: '100',
-  });
-  if (cursor) {
-    params.set('before_created_at', String(cursor.before_created_at));
-    params.set('before_request_id', cursor.before_request_id);
-  }
-  return `/internal/v1/sessions/${encodeURIComponent(session.session_id)}?${params}`;
-}
-
 function messageOf(reason: unknown, fallback: string) {
   return reason instanceof Error ? reason.message : fallback;
 }
@@ -251,6 +213,7 @@ export function Operator() {
   const [schemas, setSchemas] = useState<ConfigurationSchemas>();
   const [error, setError] = useState('');
   const [streamError, setStreamError] = useState('');
+  const [streamState, setStreamState] = useState<SessionStreamState>('idle');
   const requestEventCursor = useRef<RequestEventCursor | undefined>(undefined);
   const requestEventScope = useRef<RequestEventScope | undefined>(undefined);
   const liveRequestEvents = useRef(new Map<string, RequestEvent>());
@@ -336,12 +299,15 @@ export function Operator() {
     }
     if (!token || tab !== 'traffic' || (trafficMode === 'requests' && filtersActive(requestFilters))) {
       setStreamError('');
+      setStreamState('idle');
       return;
     }
     const activeScope = requestEventScope.current;
     const controller = new AbortController();
+    let connectedOnce = false;
     const connect = async () => {
       while (!controller.signal.aborted) {
+        setStreamState(connectedOnce ? 'reconnecting' : 'connecting');
         try {
           await streamSse<RequestEvent>(
             `/internal/v1/request-events${requestEventQuery(tenant, requestEventCursor.current)}`,
@@ -361,6 +327,7 @@ export function Operator() {
                 liveRequestEvents.current.delete(oldestRequestId);
               }
               setStreamError('');
+              setStreamState('live');
               setSessionRevision((revision) => revision + 1);
               setSessionEventKeyId(event.key_id);
               setRequests((current) => {
@@ -370,9 +337,22 @@ export function Operator() {
                   .sort((left, right) => right.created_at - left.created_at).slice(0, 100);
               });
             },
+            () => {
+              if (controller.signal.aborted || requestEventScope.current !== activeScope) return;
+              connectedOnce = true;
+              setStreamError('');
+              setStreamState('live');
+            },
           );
+          if (!controller.signal.aborted) {
+            setStreamError(t('traffic.streamDisconnected'));
+            setStreamState('reconnecting');
+          }
         } catch (reason) {
-          if (!controller.signal.aborted) setStreamError(messageOf(reason, t('traffic.streamDisconnected')));
+          if (!controller.signal.aborted) {
+            setStreamError(messageOf(reason, t('traffic.streamDisconnected')));
+            setStreamState('reconnecting');
+          }
         }
         await waitForReconnect(controller.signal, 1000);
       }
@@ -407,7 +387,7 @@ export function Operator() {
     {error && <div className="notice error" role="alert">{error}</div>}
     {streamError && <div className="notice error" role="alert">{streamError}</div>}
     <section id={`operator-panel-${tab}`} role="tabpanel" aria-labelledby={`operator-tab-${tab}`} tabIndex={0}>
-      {tab === 'traffic' && <Traffic token={token} tenant={tenant} mode={trafficMode} onModeChange={setTrafficMode} sessionRevision={sessionRevision} sessionEventKeyId={sessionEventKeyId} sessionFocus={sessionFocus} streamError={streamError} requests={requests} upstreams={upstreams} filters={requestFilters} loading={requestsLoading} hasOlder={hasOlderRequests} onApply={(filters) => { setRequestFilters(filters); void loadRequests(filters); }} onClear={() => { setRequestFilters(emptyRequestFilters); void loadRequests(emptyRequestFilters); }} onLoadOlder={() => void loadRequests(requestFilters, true)} onSelect={selectRequest} />}
+      {tab === 'traffic' && <Traffic token={token} tenant={tenant} mode={trafficMode} onModeChange={setTrafficMode} sessionRevision={sessionRevision} sessionEventKeyId={sessionEventKeyId} sessionFocus={sessionFocus} streamState={streamState} requests={requests} upstreams={upstreams} filters={requestFilters} loading={requestsLoading} hasOlder={hasOlderRequests} onApply={(filters) => { setRequestFilters(filters); void loadRequests(filters); }} onClear={() => { setRequestFilters(emptyRequestFilters); void loadRequests(emptyRequestFilters); }} onLoadOlder={() => void loadRequests(requestFilters, true)} onSelect={selectRequest} />}
       {tab === 'usage' && <UsageAnalysis token={token} tenant={tenant} upstreams={upstreams} onOpenSession={(session: UsageAnalysisSessionBucket) => { setSessionFocus({ sessionId: session.id, keyId: session.key_id, revision: Date.now() }); setTrafficMode('sessions'); setTab('traffic'); }} />}
       {tab === 'providers' && <UpstreamProviders token={token} tenant={tenant} providers={providers} values={upstreams} onChanged={refresh} />}
       {tab === 'routes' && <RouteWorkspace token={token} tenant={tenant} upstreams={upstreams} providers={providers} />}
@@ -420,7 +400,7 @@ export function Operator() {
   </Shell>;
 }
 
-function Traffic({ token, tenant, mode, onModeChange, sessionRevision, sessionEventKeyId, sessionFocus, streamError, requests, upstreams, filters, loading, hasOlder, onApply, onClear, onLoadOlder, onSelect }: {
+function Traffic({ token, tenant, mode, onModeChange, sessionRevision, sessionEventKeyId, sessionFocus, streamState, requests, upstreams, filters, loading, hasOlder, onApply, onClear, onLoadOlder, onSelect }: {
   token: string;
   tenant: string;
   mode: 'requests' | 'sessions';
@@ -428,7 +408,7 @@ function Traffic({ token, tenant, mode, onModeChange, sessionRevision, sessionEv
   sessionRevision: number;
   sessionEventKeyId: string;
   sessionFocus?: SessionFocus;
-  streamError: string;
+  streamState: SessionStreamState;
   requests: RequestView[];
   upstreams: UpstreamAccount[];
   filters: RequestFilters;
@@ -439,168 +419,9 @@ function Traffic({ token, tenant, mode, onModeChange, sessionRevision, sessionEv
   onLoadOlder: () => void;
   onSelect: (request: RequestView) => Promise<void>;
 }) {
-  const { locale, t } = useI18n();
+  const { t } = useI18n();
   const [draft, setDraft] = useState(filters);
-  const [sessions, setSessions] = useState<LogicalSessionSummary[]>([]);
-  const [sessionDetail, setSessionDetail] = useState<LogicalSessionDetail>();
-  const [selectedSession, setSelectedSession] = useState<LogicalSessionSummary>();
-  const [sessionLoading, setSessionLoading] = useState(false);
-  const [hasOlderSessions, setHasOlderSessions] = useState(false);
-  const [sessionNextCursor, setSessionNextCursor] = useState<LogicalSessionCursor | null>(null);
-  const [sessionsGeneratedAt, setSessionsGeneratedAt] = useState(0);
-  const [sessionError, setSessionError] = useState('');
-  const [sessionDraft, setSessionDraft] = useState<SessionFilters>(emptySessionFilters);
-  const [sessionFilters, setSessionFilters] = useState<SessionFilters>(emptySessionFilters);
-  const [sessionLiveState, setSessionLiveState] = useState<'live' | 'refreshing' | 'disconnected'>('live');
-  const sessionListSequence = useRef(0);
-  const sessionDetailSequence = useRef(0);
-  const handledSessionFocus = useRef(0);
   useEffect(() => setDraft(filters), [filters]);
-
-  async function loadSessions(older = false, selectedFilters = sessionFilters, background = false) {
-    const sequence = ++sessionListSequence.current;
-    const credential = token.trim();
-    if (!credential || !tenant) {
-      setSessions([]);
-      setHasOlderSessions(false);
-      setSessionNextCursor(null);
-      return;
-    }
-    const before = older ? sessionNextCursor ?? undefined : undefined;
-    if (!background) setSessionLoading(true);
-    else setSessionLiveState('refreshing');
-    setSessionError('');
-    try {
-      const response = await api<LogicalSessionListResponse>(operatorSessionsPath(tenant, selectedFilters, before), credential);
-      if (sequence !== sessionListSequence.current) return;
-      const page = response.sessions;
-      setSessions((current) => {
-        if (background) {
-          const refreshed = new Set(page.map((session) => `${session.key_id}:${session.session_id}`));
-          return [...page, ...current.filter((session) => !refreshed.has(`${session.key_id}:${session.session_id}`))];
-        }
-        if (!older) return page;
-        const known = new Set(current.map((session) => `${session.key_id}:${session.session_id}`));
-        return [...current, ...page.filter((session) => !known.has(`${session.key_id}:${session.session_id}`))];
-      });
-      if (!background || sessions.length <= 50) setSessionNextCursor(response.next_cursor);
-      setSessionsGeneratedAt(response.generated_at);
-      if (!background || sessions.length <= 50) setHasOlderSessions(response.next_cursor !== null);
-      if (!older && sessionFocus && handledSessionFocus.current !== sessionFocus.revision) {
-        const focused = page.find((session) => session.session_id === sessionFocus.sessionId && session.key_id === sessionFocus.keyId);
-        if (focused) {
-          handledSessionFocus.current = sessionFocus.revision;
-          void selectSession(focused);
-        }
-      }
-    } catch (reason) {
-      if (sequence !== sessionListSequence.current) return;
-      setSessionError(messageOf(reason, t('sessions.loadFailed')));
-      if (!older) setSessions([]);
-    } finally {
-      if (sequence === sessionListSequence.current) {
-        setSessionLoading(false);
-        setSessionLiveState(streamError ? 'disconnected' : 'live');
-      }
-    }
-  }
-
-  async function selectSession(session: LogicalSessionSummary) {
-    const sequence = ++sessionDetailSequence.current;
-    setSelectedSession(session); setSessionLoading(true); setSessionError('');
-    try {
-      const next = await api<LogicalSessionDetail>(operatorSessionDetailPath(tenant, session), token.trim());
-      if (sequence === sessionDetailSequence.current) setSessionDetail(next);
-    } catch (reason) {
-      if (sequence === sessionDetailSequence.current) setSessionError(messageOf(reason, t('sessions.detailFailed')));
-    } finally {
-      if (sequence === sessionDetailSequence.current) setSessionLoading(false);
-    }
-  }
-
-  async function refreshSelectedSession() {
-    const session = selectedSession;
-    if (!session) return;
-    const sequence = ++sessionDetailSequence.current;
-    try {
-      const page = await api<LogicalSessionDetail>(operatorSessionDetailPath(tenant, session), token.trim());
-      if (sequence !== sessionDetailSequence.current) return;
-      setSessionDetail((latest) => {
-        if (!latest || latest.session_id !== page.session_id) return latest;
-        const requests = new Map(latest.requests.map((request) => [request.request_id, request]));
-        for (const request of page.requests) requests.set(request.request_id, request);
-        const edges = new Map(latest.edges.map((edge) => [`${edge.from_request_id ?? ''}:${edge.to_request_id}:${edge.relation}`, edge]));
-        for (const edge of page.edges) edges.set(`${edge.from_request_id ?? ''}:${edge.to_request_id}:${edge.relation}`, edge);
-        return {
-          ...latest,
-          requests: [...requests.values()].sort((left, right) => left.created_at - right.created_at || left.request_id.localeCompare(right.request_id)),
-          edges: [...edges.values()],
-          edges_truncated: page.edges_truncated || latest.edges_truncated,
-        };
-      });
-    } catch (reason) {
-      if (sequence === sessionDetailSequence.current) setSessionError(messageOf(reason, t('sessions.detailFailed')));
-    }
-  }
-
-  async function loadEarlierSessionRequests() {
-    const current = sessionDetail;
-    const session = selectedSession;
-    if (!current?.next_cursor || !session) return;
-    const sequence = ++sessionDetailSequence.current;
-    setSessionLoading(true); setSessionError('');
-    try {
-      const page = await api<LogicalSessionDetail>(operatorSessionDetailPath(tenant, session, current.next_cursor), token.trim());
-      if (sequence !== sessionDetailSequence.current) return;
-      setSessionDetail((latest) => {
-        if (!latest || latest.session_id !== page.session_id) return latest;
-        const requestIds = new Set(page.requests.map((request) => request.request_id));
-        const edgeKeys = new Set(page.edges.map((edge) => `${edge.from_request_id ?? ''}:${edge.to_request_id}:${edge.relation}`));
-        return {
-          ...page,
-          requests: [...page.requests, ...latest.requests.filter((request) => !requestIds.has(request.request_id))],
-          edges: [...page.edges, ...latest.edges.filter((edge) => !edgeKeys.has(`${edge.from_request_id ?? ''}:${edge.to_request_id}:${edge.relation}`))],
-          edges_truncated: page.edges_truncated || latest.edges_truncated,
-        };
-      });
-    } catch (reason) {
-      if (sequence === sessionDetailSequence.current) setSessionError(messageOf(reason, t('sessions.detailFailed')));
-    } finally {
-      if (sequence === sessionDetailSequence.current) setSessionLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    if (!sessionFocus) return;
-    const focusedFilters: SessionFilters = { q: sessionFocus.sessionId, keyId: sessionFocus.keyId, model: '', state: '' };
-    setSessionDraft(focusedFilters);
-    setSessionFilters(focusedFilters);
-  }, [sessionFocus?.revision]);
-
-  useEffect(() => {
-    sessionListSequence.current += 1;
-    sessionDetailSequence.current += 1;
-    setSessions([]);
-    setSessionDetail(undefined);
-    setSelectedSession(undefined);
-    setHasOlderSessions(false);
-    setSessionNextCursor(null);
-    setSessionsGeneratedAt(0);
-    if (mode === 'sessions') void loadSessions(false, sessionFilters);
-  }, [mode, token, tenant, sessionFilters]);
-
-  useEffect(() => {
-    if (mode !== 'sessions' || !token.trim() || !tenant || streamError || sessionRevision === 0) {
-      setSessionLiveState(streamError ? 'disconnected' : 'live');
-      return;
-    }
-    setSessionLiveState('refreshing');
-    const timer = window.setTimeout(() => {
-      void loadSessions(false, sessionFilters, true);
-      if (selectedSession?.key_id === sessionEventKeyId) void refreshSelectedSession();
-    }, 500);
-    return () => window.clearTimeout(timer);
-  }, [sessionRevision, sessionEventKeyId, streamError]);
 
   return <article className="panel"><div className="panel-title traffic-heading"><div><h2>{mode === 'sessions' ? t('sessions.recent') : filtersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{mode === 'sessions' ? t('sessions.monitorHint') : filtersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><button type="button" className={mode === 'requests' ? 'active' : ''} aria-pressed={mode === 'requests'} onClick={() => onModeChange('requests')}>{t('sessions.requestsMode')}</button><button type="button" className={mode === 'sessions' ? 'active' : ''} aria-pressed={mode === 'sessions'} onClick={() => onModeChange('sessions')}>{t('sessions.sessionsMode')}</button></div></div>
     {mode === 'requests' ? <>
@@ -624,19 +445,9 @@ function Traffic({ token, tenant, mode, onModeChange, sessionRevision, sessionEv
       </form>
       <RequestTable requests={requests} onSelect={(request) => void onSelect(request)} />
       {hasOlder && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
-    </> : <>
-      {!tenant && <div className="notice warning" role="status">{t('sessions.selectTenant')}</div>}
-      {sessionError && <div className="notice error" role="alert">{sessionError}</div>}
-      <div className={`session-live-state ${sessionLiveState}`} role="status"><span>{t(`sessions.live.${sessionLiveState}`)}</span>{sessionLiveState === 'disconnected' && <button type="button" className="secondary" disabled={sessionLoading} onClick={() => void loadSessions(false, sessionFilters)}>{t('sessions.retry')}</button>}</div>
-      <form className="session-controls" onSubmit={(event) => { event.preventDefault(); setSessionFilters({ ...sessionDraft }); }}><label>{t('sessions.search')}<input value={sessionDraft.q} onChange={(event) => setSessionDraft({ ...sessionDraft, q: event.target.value })} placeholder={t('sessions.searchPlaceholder')} /></label><label>{t('traffic.keyId')}<input value={sessionDraft.keyId} onChange={(event) => setSessionDraft({ ...sessionDraft, keyId: event.target.value })} placeholder="019f…" /></label><label>{t('request.model')}<input value={sessionDraft.model} onChange={(event) => setSessionDraft({ ...sessionDraft, model: event.target.value })} /></label><label>{t('sessions.state')}<select value={sessionDraft.state} onChange={(event) => setSessionDraft({ ...sessionDraft, state: event.target.value as SessionFilters['state'] })}><option value="">{t('common.all')}</option><option value="active">{t('sessions.filter.active')}</option><option value="has_errors">{t('sessions.filter.hasErrors')}</option></select></label><div className="filter-actions"><button type="submit" disabled={sessionLoading || !tenant}>{t('traffic.applyFilters')}</button><button type="button" className="secondary" disabled={sessionLoading || !Object.values(sessionFilters).some(Boolean)} onClick={() => { setSessionDraft(emptySessionFilters); setSessionFilters(emptySessionFilters); }}>{t('traffic.clearFilters')}</button></div></form>
-      <p className="muted session-result-count">{t('sessions.serverFiltered', { count: sessions.length })}{sessionsGeneratedAt > 0 && <> · {t('sessions.generatedAt', { time: new Date(sessionsGeneratedAt).toLocaleString(locale) })}</>}</p>
-      <SessionList values={sessions} loading={sessionLoading} showCredential onSelect={(session) => void selectSession(session)} />
-      {hasOlderSessions && <div className="load-more"><button type="button" className="secondary" disabled={sessionLoading} onClick={() => void loadSessions(true, sessionFilters)}>{sessionLoading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
-    </>}
-    {sessionDetail && <SessionDrawer detail={sessionDetail} summary={selectedSession} showDiagnosticIds loading={sessionLoading} onLoadOlder={() => void loadEarlierSessionRequests()} onSelect={(request) => { setSessionDetail(undefined); setSelectedSession(undefined); void onSelect(request); }} onClose={() => { setSessionDetail(undefined); setSelectedSession(undefined); }} />}
+    </> : <SessionMonitor token={token} tenant={tenant} revision={sessionRevision} eventKeyId={sessionEventKeyId} focus={sessionFocus} streamState={streamState} onSelectRequest={onSelect} />}
   </article>;
 }
-
 function UpstreamProviders({ token, tenant, providers, values, onChanged }: { token: string; tenant: string; providers: ProviderType[]; values: UpstreamAccount[]; onChanged: () => Promise<void> }) {
   const { locale, t } = useI18n();
   const [method, setMethod] = useState<'direct' | 'authorization'>('direct');

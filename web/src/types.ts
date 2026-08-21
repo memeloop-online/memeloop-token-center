@@ -84,9 +84,6 @@ export interface UsageAnalysisMetrics {
 export interface UsageAnalysisBucket extends UsageAnalysisMetrics {
   id: string;
   label: string;
-  key_id?: string;
-  key_alias?: string;
-  unlinked?: boolean;
 }
 
 export interface UsageAnalysisSessionBucket extends UsageAnalysisBucket {
@@ -140,7 +137,7 @@ export interface OperatorUsageAnalysis {
   time_series: UsageAnalysisTimeBucket[];
   by_model: UsageAnalysisBucket[];
   by_key: UsageAnalysisBucket[];
-  by_session?: UsageAnalysisSessionBucket[];
+  by_session: UsageAnalysisSessionBucket[];
   by_upstream: UsageAnalysisBucket[];
   by_protocol: UsageAnalysisBucket[];
   by_status: UsageAnalysisBucket[];

@@ -120,11 +120,11 @@ function successRate(metrics: UsageAnalysisMetrics) {
   return metrics.requests > 0 ? metrics.success / metrics.requests : undefined;
 }
 
-function DimensionTable({ title, values, onSelect, labelForValue }: {
+function DimensionTable<T extends UsageAnalysisBucket>({ title, values, onSelect, labelForValue }: {
   title: string;
-  values: UsageAnalysisBucket[];
-  onSelect?: (value: UsageAnalysisBucket) => void;
-  labelForValue?: (value: UsageAnalysisBucket) => string;
+  values: T[];
+  onSelect?: (value: T) => void;
+  labelForValue?: (value: T) => string;
 }) {
   const { locale, t } = useI18n();
   return <article className="panel usage-dimension"><div className="panel-title"><h2>{title}</h2><span>{formatNumber(values.length, locale)}</span></div>
@@ -316,7 +316,7 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
       </div></div><TrendChart points={stats.time_series} granularity={stats.granularity} metric={trendMetric} currency={effectiveTrendCurrency} onSelectBucket={selectUtcBucket} /></article>}
       {tab === 'models' && <DimensionTable title={t('usage.models')} values={stats.by_model} onSelect={(bucket) => applyDimension('model', bucket)} />}
       {tab === 'keys' && <DimensionTable title={t('usage.keys')} values={stats.by_key} onSelect={(bucket) => applyDimension('keyId', bucket)} />}
-      {tab === 'sessions' && <><p className="usage-dimension-contract">{t('usage.sessionGrouping')}</p><DimensionTable title={t('usage.sessions')} values={stats.by_session ?? []} labelForValue={(bucket) => bucket.unlinked || bucket.id.startsWith('unlinked:') ? t('sessions.unlinkedRequests') : bucket.label} onSelect={(bucket) => onOpenSession(bucket as UsageAnalysisSessionBucket)} /></>}
+      {tab === 'sessions' && <><p className="usage-dimension-contract">{t('usage.sessionGrouping')}</p><DimensionTable title={t('usage.sessions')} values={stats.by_session} labelForValue={(bucket) => bucket.unlinked || bucket.id.startsWith('unlinked:') ? t('sessions.unlinkedRequests') : bucket.label} onSelect={onOpenSession} /></>}
       {tab === 'upstreams' && <><p className="usage-dimension-contract">{t(`usage.upstreamGrouping.${stats.upstream_grouping}`)}</p><DimensionTable title={t('usage.upstreams')} values={stats.by_upstream} labelForValue={(bucket) => bucket.id === 'unassigned' ? t('usage.unassigned') : bucket.label} onSelect={(bucket) => applyDimension('upstreamId', bucket)} /></>}
       {tab === 'heatmap' && <article className="panel"><div className="panel-title"><h2>{t('usage.heatmap')}</h2><span>{stats.time_zone}</span></div><Heatmap values={stats.heatmap} /></article>}
     </section>}

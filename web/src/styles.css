@@ -387,8 +387,15 @@ button.bucket-heading:hover b {
 }
 
 .session-live-state.live { color: #65d7b6; }
+.session-live-state.connecting { color: #80bde8; }
 .session-live-state.refreshing { color: #e7c277; }
-.session-live-state.disconnected { color: #f29292; }
+.session-live-state.reconnecting { color: #f29292; }
+.session-metric-negative b { color: #ff9a9a; }
+:root[data-theme='light'] .session-live-state.live { color: #08795f; }
+:root[data-theme='light'] .session-live-state.connecting { color: #176a9d; }
+:root[data-theme='light'] .session-live-state.refreshing { color: #8b5f00; }
+:root[data-theme='light'] .session-live-state.reconnecting { color: #aa2828; }
+:root[data-theme='light'] .session-metric-negative b { color: #aa2828; }
 .session-result-count { font-size: 12px; }
 .candidate-edges { margin-top: 18px; }
 .candidate-edges > .muted { margin: 8px 0; }

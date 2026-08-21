@@ -81,6 +81,7 @@ export async function streamSse<T>(
   credential: string,
   signal: AbortSignal,
   onEvent: (message: SseMessage<T>) => void,
+  onOpen?: () => void,
 ): Promise<void> {
   const response = await fetch(path, {
     headers: { Authorization: `Bearer ${credential}` },
@@ -88,6 +89,7 @@ export async function streamSse<T>(
   });
   if (!response.ok) throw new ApiError(`HTTP ${response.status}`, response.status);
   if (!response.body) throw new Error('浏览器不支持流式响应');
+  onOpen?.();
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffered = '';
