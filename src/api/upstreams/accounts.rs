@@ -48,6 +48,7 @@ pub(in crate::api) async fn create_upstream(
             state.config.key_pepper.as_bytes(),
         )
         .await?;
+    super::trigger_upstream_model_sync(state, account.id);
     Ok((StatusCode::CREATED, Json(account)))
 }
 
@@ -250,20 +251,20 @@ pub(in crate::api) async fn update_upstream(
     let driver = state.db.upstream_driver(account_id).await?;
     validate_provider_config_schema(&state, &driver, &body.config)?;
     validate_upstream_destination(&driver, &body.config, &service, &state).await?;
-    Ok(Json(
-        state
-            .db
-            .update_upstream_account(
-                account_id,
-                &body.tenant_external_id,
-                UpdateUpstreamAccountInput {
-                    name: body.name,
-                    config: body.config,
-                    expected_updated_at: body.expected_updated_at,
-                },
-            )
-            .await?,
-    ))
+    let account = state
+        .db
+        .update_upstream_account(
+            account_id,
+            &body.tenant_external_id,
+            UpdateUpstreamAccountInput {
+                name: body.name,
+                config: body.config,
+                expected_updated_at: body.expected_updated_at,
+            },
+        )
+        .await?;
+    super::trigger_upstream_model_sync(state, account_id);
+    Ok(Json(account))
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,17 +294,20 @@ pub(in crate::api) async fn set_upstream_status(
             .await?;
         credential.validate(unix_millis())?;
     }
-    Ok(Json(
-        state
-            .db
-            .set_upstream_account_status(
-                account_id,
-                &body.tenant_external_id,
-                &body.status,
-                body.expected_updated_at,
-            )
-            .await?,
-    ))
+    let should_sync = body.status == "active";
+    let account = state
+        .db
+        .set_upstream_account_status(
+            account_id,
+            &body.tenant_external_id,
+            &body.status,
+            body.expected_updated_at,
+        )
+        .await?;
+    if should_sync {
+        super::trigger_upstream_model_sync(state, account_id);
+    }
+    Ok(Json(account))
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,15 +364,15 @@ pub(in crate::api) async fn rotate_upstream_credential(
     let credential: UpstreamCredential = serde_json::from_value(body.credential)
         .map_err(|error| AppError::BadRequest(format!("invalid upstream credential: {error}")))?;
     credential.validate(unix_millis())?;
-    Ok(Json(
-        state
-            .db
-            .rotate_upstream_credential(
-                account_id,
-                credential,
-                idempotency_key,
-                state.config.key_pepper.as_bytes(),
-            )
-            .await?,
-    ))
+    let account = state
+        .db
+        .rotate_upstream_credential(
+            account_id,
+            credential,
+            idempotency_key,
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?;
+    super::trigger_upstream_model_sync(state, account_id);
+    Ok(Json(account))
 }

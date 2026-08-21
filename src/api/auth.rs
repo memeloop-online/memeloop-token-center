@@ -145,6 +145,18 @@ pub(super) async fn require_service(
     Ok(service)
 }
 
+pub(super) async fn require_service_any(
+    headers: &HeaderMap,
+    state: &AppState,
+    scopes: &[&str],
+) -> Result<AuthenticatedService, AppError> {
+    let service = authenticated_service(headers, state).await?;
+    if !scopes.iter().any(|scope| service.allows(scope)) {
+        return Err(AppError::Forbidden);
+    }
+    Ok(service)
+}
+
 async fn authenticated_service(
     headers: &HeaderMap,
     state: &AppState,

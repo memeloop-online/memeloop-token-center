@@ -76,9 +76,11 @@ pub(crate) use migrations::{POSTGRES_MIGRATIONS, SQLITE_MIGRATIONS};
 #[cfg(test)]
 use migrations::{apply_migration_range, maintain_postgres_partitions};
 pub use providers::{
-    CreateModelRouteInput, CreateUpstreamAccountInput, ImportManagedOAuthAccountInput,
+    AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, CreateModelRouteInput,
+    CreateUpstreamAccountInput, DiscoveredUpstreamModel, ImportManagedOAuthAccountInput,
     ManagedOAuthImportResult, ManagedOAuthImportStatus, ReauthorizeUpstreamAccountInput,
-    UpdateModelRouteInput, UpdateUpstreamAccountInput,
+    ReplaceModelCatalogResult, UpdateModelRouteInput, UpdateUpstreamAccountInput,
+    UpstreamModelCatalogView, UpstreamModelView,
 };
 #[cfg(test)]
 pub(crate) use requests::claim_request_record_locator;

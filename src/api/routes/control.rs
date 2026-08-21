@@ -114,6 +114,18 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(probe_upstream_health),
         )
         .route(
+            "/internal/v1/upstreams/{account_id}/models",
+            get(list_upstream_models),
+        )
+        .route(
+            "/internal/v1/upstreams/{account_id}/models/sync",
+            post(sync_upstream_models),
+        )
+        .route(
+            "/internal/v1/upstream-models",
+            get(aggregate_upstream_models),
+        )
+        .route(
             "/internal/v1/upstreams/{account_id}/oauth/refresh",
             post(refresh_upstream_oauth),
         )

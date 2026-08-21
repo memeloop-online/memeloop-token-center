@@ -810,6 +810,95 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/upstreams/{account_id}/models:
+    get:
+      tags: [Upstream providers]
+      operationId: listUpstreamModels
+      summary: Search the last complete model catalog for one upstream
+      description: A stale or failed refresh retains the last complete snapshot. The response never includes upstream response bodies or credentials. Either `providers:read` or `routes:read` is accepted.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/TenantFilter'
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 500 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+      responses:
+        '200':
+          description: Current account-scoped catalog snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamModelCatalog' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/upstreams/{account_id}/models/sync:
+    post:
+      tags: [Upstream providers]
+      operationId: syncUpstreamModels
+      summary: Refresh one upstream model catalog using its stored destination and credential
+      description: Concurrent refreshes are collapsed by a database lease. The client cannot supply a discovery URL. Failure returns a static error code while preserving the prior snapshot.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/TenantFilter'
+      responses:
+        '200':
+          description: Refreshed, stale, unsupported, or already-syncing catalog state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamModelCatalog' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/upstream-models:
+    get:
+      tags: [Model routes]
+      operationId: searchEligibleUpstreamModels
+      summary: Search model coverage for explicit providers and provider groups
+      description: Explicit accounts and included provider groups are unioned, then excluded provider groups are removed. Exclusion always wins. Route groups and credential groups never participate. Either `providers:read` or `routes:read` is accepted.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:read
+      parameters:
+        - $ref: '#/components/parameters/RequiredTenant'
+        - name: account_ids
+          in: query
+          description: Comma-separated explicit upstream account UUIDs, at most 100.
+          schema: { type: string }
+        - name: include_provider_group_ids
+          in: query
+          description: Comma-separated provider group UUIDs, at most 100.
+          schema: { type: string }
+        - name: exclude_provider_group_ids
+          in: query
+          description: Comma-separated provider group UUIDs, at most 100. Exclusion wins over explicit and included selection.
+          schema: { type: string }
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 500 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+      responses:
+        '200':
+          description: Bounded model union with per-model coverage.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AggregatedUpstreamModelCatalog' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/upstreams/{account_id}/oauth/refresh:
     post:
       tags: [Upstream providers]
@@ -3682,6 +3771,68 @@ components:
         tenant_external_id: { type: [string, 'null'], minLength: 1, maxLength: 200 }
         expected_version: { type: integer, format: int64, minimum: 0 }
         value: {}
+    UpstreamModel:
+      type: object
+      additionalProperties: false
+      required: [id, protocol, context_window, reservation_token_bound, reservation_bound_source]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 500 }
+        protocol: { type: string, minLength: 1, maxLength: 64 }
+        context_window: { type: [integer, 'null'], format: int64, minimum: 1 }
+        reservation_token_bound:
+          type: [integer, 'null']
+          format: int64
+          minimum: 1
+          description: Conservative MemeLoop reservation bound; this is not an upstream-declared maximum output size.
+        reservation_bound_source:
+          type: [string, 'null']
+          enum: [mtc_context_window_bound, administrator_override, null]
+    UpstreamModelCatalog:
+      type: object
+      additionalProperties: false
+      required: [account_id, status, credential_generation, last_attempt_at, last_success_at, expires_at, error_code, models]
+      properties:
+        account_id: { type: string, format: uuid }
+        status: { type: string, enum: [unknown, syncing, ready, stale, error] }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+        last_attempt_at: { type: [integer, 'null'], format: int64 }
+        last_success_at: { type: [integer, 'null'], format: int64 }
+        expires_at: { type: [integer, 'null'], format: int64 }
+        error_code:
+          type: [string, 'null']
+          enum: [unsupported, destination_invalid, credential_invalid, connection_failed, authentication_failed, rate_limited, upstream_unavailable, redirect_rejected, response_too_large, invalid_response, null]
+        models:
+          type: array
+          maxItems: 200
+          items: { $ref: '#/components/schemas/UpstreamModel' }
+    AggregatedUpstreamModel:
+      type: object
+      additionalProperties: false
+      required: [id, protocol, supported_account_count, eligible_account_count, complete_coverage, context_window, reservation_token_bound]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 500 }
+        protocol: { type: string, minLength: 1, maxLength: 64 }
+        supported_account_count: { type: integer, format: int64, minimum: 1 }
+        eligible_account_count: { type: integer, format: int64, minimum: 1 }
+        complete_coverage: { type: boolean }
+        context_window: { type: [integer, 'null'], format: int64, minimum: 1 }
+        reservation_token_bound:
+          type: [integer, 'null']
+          format: int64
+          minimum: 1
+          description: Conservative MemeLoop reservation bound; this is not an upstream-declared maximum output size.
+    AggregatedUpstreamModelCatalog:
+      type: object
+      additionalProperties: false
+      required: [data, eligible_account_count, unknown_account_count, stale_account_count]
+      properties:
+        data:
+          type: array
+          maxItems: 200
+          items: { $ref: '#/components/schemas/AggregatedUpstreamModel' }
+        eligible_account_count: { type: integer, format: int64, minimum: 0 }
+        unknown_account_count: { type: integer, format: int64, minimum: 0 }
+        stale_account_count: { type: integer, format: int64, minimum: 0 }
     CreateModelRouteRequest:
       type: object
       additionalProperties: false
