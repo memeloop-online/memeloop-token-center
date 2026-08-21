@@ -8,9 +8,20 @@ use memeloop_token_center::{
 };
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use sqlx::Row;
 use uuid::Uuid;
 
 const WEBHOOK_SECRET: &str = "postgres-cloud-webhook-secret-longer-than-32-bytes";
+
+fn framed_digest(parts: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((*part).len().to_be_bytes());
+        digest.update(part);
+    }
+    format!("{:x}", digest.finalize())
+}
 
 fn snapshot(tenant: &str, principal: &str, version: i64, desired: &str, rpm: u64) -> Value {
     json!({
@@ -119,7 +130,7 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
     let unique = Uuid::now_v7();
     let tenant = format!("postgres-cloud-{unique}");
     let principal = format!("member-{unique}");
-    let mut config = Config::for_test(database_url);
+    let mut config = Config::for_test(database_url.clone());
     config.memeloop_cloud_webhook_secret = Some(WEBHOOK_SECRET.into());
     let state = AppState::initialize(config).await.unwrap();
     let test_state = state.clone();
@@ -391,5 +402,103 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
             .len(),
         1
     );
+
+    let atomic_tenant = format!("postgres-cloud-atomic-{unique}");
+    let atomic_principal = format!("postgres-cloud-atomic-member-{unique}");
+    let original_route = seed_route(&test_state, &atomic_tenant, "gpt-5", 20).await;
+    let replacement_route = seed_route(&test_state, &atomic_tenant, "gpt-5", 21).await;
+    let mut initial = snapshot(&atomic_tenant, &atomic_principal, 1, "10", 10);
+    initial["route_ids"] = json!([original_route]);
+    let initial: Value = send(&client, &url, "postgres-cloud-atomic-initial", &initial)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let atomic_key_id = Uuid::parse_str(initial["credential"]["key_id"].as_str().unwrap()).unwrap();
+
+    let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let original_audit = sqlx::query(
+        "SELECT event_key_hash, request_hash FROM memeloop_cloud_subscription_events WHERE key_id = $1",
+    )
+    .bind(atomic_key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let original_event_hash: String = original_audit.try_get("event_key_hash").unwrap();
+    let original_request_hash: String = original_audit.try_get("request_hash").unwrap();
+    let retry_event_id = "postgres-cloud-atomic-late-audit-conflict";
+    let conflicting_event_hash =
+        framed_digest(&[atomic_tenant.as_bytes(), retry_event_id.as_bytes()]);
+    let changed = sqlx::query(
+        "UPDATE memeloop_cloud_subscription_events SET event_key_hash = $1, request_hash = $2 WHERE key_id = $3",
+    )
+    .bind(&conflicting_event_hash)
+    .bind("f".repeat(64))
+    .bind(atomic_key_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+
+    let mut update = snapshot(&atomic_tenant, &atomic_principal, 2, "20", 20);
+    update["route_ids"] = json!([replacement_route]);
+    assert_eq!(
+        send(&client, &url, retry_event_id, &update).await.status(),
+        StatusCode::CONFLICT
+    );
+    let atomic_keys = test_state
+        .db
+        .list_managed_keys(Some(&atomic_tenant), Some(&atomic_principal))
+        .await
+        .unwrap();
+    assert_eq!(atomic_keys.len(), 1);
+    assert_eq!(atomic_keys[0].available_balance, "10");
+    assert_eq!(atomic_keys[0].policy.requests_per_minute, 10);
+    let atomic_entitlement = test_state
+        .db
+        .list_entitlements(
+            Some(&atomic_tenant),
+            Some("memeloop-cloud"),
+            Some("postgres-cloud-subscription"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(atomic_entitlement[0].version, 1);
+    assert_eq!(atomic_entitlement[0].remaining, "10");
+    assert_eq!(
+        test_state
+            .db
+            .credential_routing(atomic_key_id, &atomic_tenant)
+            .await
+            .unwrap()
+            .effective_route_ids,
+        vec![original_route]
+    );
+
+    sqlx::query(
+        "UPDATE memeloop_cloud_subscription_events SET event_key_hash = $1, request_hash = $2 WHERE key_id = $3",
+    )
+    .bind(original_event_hash)
+    .bind(original_request_hash)
+    .bind(atomic_key_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let retried = send(&client, &url, retry_event_id, &update).await;
+    assert_eq!(retried.status(), StatusCode::CREATED);
+    let retried: Value = retried.json().await.unwrap();
+    assert_eq!(retried["entitlement"]["version"], 2);
+    assert_eq!(retried["entitlement"]["remaining"], "20");
+    assert_eq!(retried["policy"]["requests_per_minute"], 20);
+    assert_eq!(
+        test_state
+            .db
+            .credential_routing(atomic_key_id, &atomic_tenant)
+            .await
+            .unwrap()
+            .effective_route_ids,
+        vec![replacement_route]
+    );
+    pool.close().await;
     server.abort();
 }

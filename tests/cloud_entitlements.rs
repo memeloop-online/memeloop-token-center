@@ -18,8 +18,10 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 const WEBHOOK_SECRET: &str = "test-memeloop-cloud-webhook-secret-long-enough";
+static FIXTURE_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 struct Fixture {
+    _permit: tokio::sync::SemaphorePermit<'static>,
     _directory: TempDir,
     database_url: String,
     client: Client,
@@ -30,6 +32,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        // Production deliberately admits at most four webhook bodies at once.
+        // Keep this integration-test process within that same global budget so
+        // parallel test fixtures cannot steal permits from one another.
+        let permit = FIXTURE_PERMITS.acquire().await.unwrap();
         let directory = tempfile::tempdir().unwrap();
         let database_url = format!(
             "sqlite://{}?mode=rwc",
@@ -47,6 +53,7 @@ impl Fixture {
                 .unwrap();
         });
         Self {
+            _permit: permit,
             _directory: directory,
             database_url,
             client: Client::new(),
