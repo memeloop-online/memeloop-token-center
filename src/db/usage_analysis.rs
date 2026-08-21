@@ -1327,6 +1327,36 @@ mod tests {
         assert!(!sql.contains("$1 = '' OR"), "{sql}");
     }
 
+    #[test]
+    fn session_dimension_uses_time_indexes_and_never_sums_cost_across_currencies() {
+        for (granularity, rollup_table, bucket_column) in [
+            (
+                UsageAnalysisGranularity::Hour,
+                "session_usage_hourly",
+                "hour_bucket",
+            ),
+            (
+                UsageAnalysisGranularity::Day,
+                "session_usage_daily",
+                "day_bucket",
+            ),
+        ] {
+            let sql = session_usage_dimension_sql(granularity, true);
+            assert!(
+                sql.contains(&format!("FROM {rollup_table} rollup")),
+                "{sql}"
+            );
+            assert!(
+                sql.contains(&format!("rollup.{bucket_column} >= $3")),
+                "{sql}"
+            );
+            assert_eq!(sql.matches("fact.created_at >=").count(), 2, "{sql}");
+            assert_eq!(sql.matches("fact.tenant_id = $1").count(), 2, "{sql}");
+            assert!(sql.contains("GROUP BY session_id, currency"), "{sql}");
+            assert!(!sql.contains("SUM(cost_micros) OVER"), "{sql}");
+        }
+    }
+
     #[tokio::test]
     async fn postgres_boundary_queries_use_bounded_fact_index_ranges() {
         let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {

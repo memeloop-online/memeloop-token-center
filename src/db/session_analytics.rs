@@ -179,6 +179,47 @@ impl Database {
                        OR (last_activity_at = $4 AND session_id < $5)
                     ORDER BY last_activity_at DESC, session_id DESC
                     LIMIT $3
+               ), recent_activity AS (
+                   SELECT recent.key_id, recent.session_id, request.model,
+                          request.protocol, request.status_code, request.created_at,
+                          request.id, 1 AS live
+                     FROM recent
+                     JOIN request_records request
+                       ON request.key_id = recent.key_id
+                      AND request.conversation_cluster_id = recent.session_id
+                   UNION ALL
+                   SELECT recent.key_id, recent.session_id, request.model,
+                          request.protocol, request.status_code, request.created_at,
+                          request.id, 1
+                     FROM recent
+                     JOIN request_records request
+                       ON request.key_id = recent.key_id
+                      AND request.conversation_cluster_id IS NULL
+                      AND recent.session_id = 'unlinked:' || recent.key_id
+                   UNION ALL
+                   SELECT recent.key_id, recent.session_id, archive.model,
+                          archive.protocol, archive.status_code,
+                          archive.source_started_at, archive.archive_request_id, 0
+                     FROM recent
+                     JOIN session_archive_unlinked_requests archive
+                       ON archive.key_id = recent.key_id
+                      AND archive.conversation_cluster_id = recent.session_id
+                   UNION ALL
+                   SELECT recent.key_id, recent.session_id, archive.model,
+                          archive.protocol, archive.status_code,
+                          archive.source_started_at, archive.archive_request_id, 0
+                     FROM recent
+                     JOIN session_archive_unlinked_requests archive
+                       ON archive.key_id = recent.key_id
+                      AND archive.conversation_cluster_id IS NULL
+                      AND recent.session_id = 'unlinked:' || recent.key_id
+               ), latest_activity AS (
+                   SELECT recent_activity.*,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY key_id, session_id
+                              ORDER BY created_at DESC, id DESC
+                          ) AS activity_rank
+                     FROM recent_activity
                )
                SELECT recent.*, key_record.alias AS key_alias,
                       COALESCE(totals.currency, '') AS currency,
@@ -197,63 +238,13 @@ impl Database {
                       COALESCE(completed.duration_count, 0) AS duration_count,
                       COALESCE(completed.duration_sum_ms, 0) AS duration_sum_ms,
                       COALESCE(active.active_requests, 0) AS active_requests,
-                      COALESCE((
-                          SELECT activity.model FROM (
-                              SELECT request.model, request.created_at, request.id
-                                FROM request_records request
-                               WHERE request.key_id = recent.key_id
-                                 AND COALESCE(request.conversation_cluster_id,
-                                     'unlinked:' || request.key_id) = recent.session_id
-                              UNION ALL
-                              SELECT archive.model, archive.source_started_at,
-                                     archive.archive_request_id
-                                FROM session_archive_unlinked_requests archive
-                               WHERE archive.key_id = recent.key_id
-                                 AND COALESCE(archive.conversation_cluster_id,
-                                     'unlinked:' || archive.key_id) = recent.session_id
-                          ) activity
-                          ORDER BY activity.created_at DESC, activity.id DESC LIMIT 1
-                      ), '') AS model,
-                      COALESCE((
-                          SELECT activity.protocol FROM (
-                              SELECT request.protocol, request.created_at, request.id
-                                FROM request_records request
-                               WHERE request.key_id = recent.key_id
-                                 AND COALESCE(request.conversation_cluster_id,
-                                     'unlinked:' || request.key_id) = recent.session_id
-                              UNION ALL
-                              SELECT archive.protocol, archive.source_started_at,
-                                     archive.archive_request_id
-                                FROM session_archive_unlinked_requests archive
-                               WHERE archive.key_id = recent.key_id
-                                 AND COALESCE(archive.conversation_cluster_id,
-                                     'unlinked:' || archive.key_id) = recent.session_id
-                          ) activity
-                          ORDER BY activity.created_at DESC, activity.id DESC LIMIT 1
-                      ), '') AS protocol,
-                      COALESCE((
-                          SELECT CASE WHEN activity.status_code IS NULL AND activity.live = 1
-                                      THEN 'active'
-                                      WHEN activity.status_code IS NULL THEN 'unknown'
-                                      WHEN activity.status_code BETWEEN 200 AND 399 THEN 'success'
-                                      ELSE 'error' END
-                            FROM (
-                              SELECT request.status_code, request.created_at, request.id,
-                                     1 AS live
-                                FROM request_records request
-                               WHERE request.key_id = recent.key_id
-                                 AND COALESCE(request.conversation_cluster_id,
-                                     'unlinked:' || request.key_id) = recent.session_id
-                              UNION ALL
-                              SELECT archive.status_code, archive.source_started_at,
-                                     archive.archive_request_id, 0
-                                FROM session_archive_unlinked_requests archive
-                               WHERE archive.key_id = recent.key_id
-                                 AND COALESCE(archive.conversation_cluster_id,
-                                     'unlinked:' || archive.key_id) = recent.session_id
-                          ) activity
-                          ORDER BY activity.created_at DESC, activity.id DESC LIMIT 1
-                      ), 'unknown') AS last_status
+                      COALESCE(latest_activity.model, '') AS model,
+                      COALESCE(latest_activity.protocol, '') AS protocol,
+                      CASE WHEN latest_activity.status_code IS NULL AND
+                                     latest_activity.live = 1 THEN 'active'
+                           WHEN latest_activity.status_code IS NULL THEN 'unknown'
+                           WHEN latest_activity.status_code BETWEEN 200 AND 399 THEN 'success'
+                           ELSE 'error' END AS last_status
                  FROM recent
                  JOIN key_records key_record
                    ON key_record.id = recent.key_id
@@ -274,6 +265,10 @@ impl Database {
                    ON totals.tenant_id = recent.tenant_id
                   AND totals.key_id = recent.key_id
                   AND totals.session_id = recent.session_id
+                 LEFT JOIN latest_activity
+                   ON latest_activity.key_id = recent.key_id
+                  AND latest_activity.session_id = recent.session_id
+                  AND latest_activity.activity_rank = 1
                 ORDER BY recent.last_activity_at DESC, recent.session_id DESC,
                          recent.key_id DESC, totals.currency ASC"#,
         )
