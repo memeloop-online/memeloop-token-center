@@ -36,6 +36,8 @@ fi
 grep -Fq \
   'cargo build --locked --release --bin memeloop-token-center --bin import-cpa-session-archive' \
   "$dockerfile"
+grep -Fq 'cargo clean --release --package memeloop-token-center' "$dockerfile"
+grep -Fq 'COPY build.rs ./build.rs' "$dockerfile"
 
 workflow_files=$(find "$workflow_directory" -maxdepth 1 -type f \
   \( -name '*.yml' -o -name '*.yaml' \) -print | sort)

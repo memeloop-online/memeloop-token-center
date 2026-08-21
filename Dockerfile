@@ -37,11 +37,9 @@ RUN mkdir -p src tests \
     && printf 'fn main() {}\n' > tests/cucumber.rs \
     && printf 'fn main() {}\n' > tests/postgres.rs \
     && cargo build --locked --release --bin memeloop-token-center \
-    && rm -rf target/release/.fingerprint/memeloop-token-center-* \
-      target/release/deps/libmemeloop_token_center* \
-      target/release/deps/memeloop_token_center-* \
-      target/release/memeloop-token-center \
+    && cargo clean --release --package memeloop-token-center \
     && rm -rf src
+COPY build.rs ./build.rs
 COPY src ./src
 COPY migrations ./migrations
 COPY schemas ./schemas
