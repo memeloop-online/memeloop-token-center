@@ -62,6 +62,28 @@ async fn unauthenticated_declared_oversized_status(service_url: &str, path: &str
         .expect("parse authentication response status")
 }
 
+async fn assert_normalized_control_rejection(response: reqwest::Response, label: &str) {
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+    assert!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json")),
+        "{label} did not return JSON"
+    );
+    let body = response
+        .json::<Value>()
+        .await
+        .unwrap_or_else(|error| panic!("{label} rejection JSON: {error}"));
+    assert_eq!(body["error"]["code"], "invalid_request", "{label}");
+    assert_eq!(
+        body["error"]["message"],
+        "invalid request: request parameters or body do not match the API schema",
+        "{label}"
+    );
+}
+
 async fn issue_service_token(world: &TokenCenterWorld, name: &str, scopes: &[&str]) -> String {
     let response = world
         .client
@@ -462,6 +484,109 @@ async fn every_service_scope_is_exact(world: &mut TokenCenterWorld) {
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_scope_is_not_wildcard(world, "credits:write", &token).await;
 
+    let token = issue_service_token(world, "scope-entitlements-read", &["entitlements:read"]).await;
+    let response = world
+        .client
+        .get(format!("{}/internal/v1/entitlements", world.service_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("entitlements:read operation");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_scope_is_not_wildcard(world, "entitlements:read", &token).await;
+
+    let token =
+        issue_service_token(world, "scope-entitlements-write", &["entitlements:write"]).await;
+    let response = world
+        .client
+        .put(format!("{}/internal/v1/entitlements", world.service_url))
+        .bearer_auth(&token)
+        .header("idempotency-key", "security:scope-entitlement")
+        .json(&json!({
+            "tenant_external_id": "scope-tenant",
+            "account_id": account_id,
+            "provider": "scope-provider",
+            "external_subscription_id": "scope-subscription",
+            "external_cycle_id": "scope-cycle",
+            "period_start": 1_700_000_000_000_i64,
+            "period_end": 4_100_000_000_000_i64,
+            "currency": "USD",
+            "desired": "1",
+            "version": 1,
+            "source": "scope-matrix"
+        }))
+        .send()
+        .await
+        .expect("entitlements:write operation");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_scope_is_not_wildcard(world, "entitlements:write", &token).await;
+
+    let token = issue_service_token(world, "scope-imports-cpa-write", &["imports:cpa:write"]).await;
+    let response = world
+        .client
+        .get(format!(
+            "{}/internal/v1/imports/cpa/managed-oauth/capabilities",
+            world.service_url
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("imports:cpa:write operation");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_scope_is_not_wildcard(world, "imports:cpa:write", &token).await;
+
+    let token = issue_service_token(
+        world,
+        "scope-quarantine-read",
+        &["imports:session_archive:quarantine:read"],
+    )
+    .await;
+    let response = world
+        .client
+        .get(format!(
+            "{}/internal/v1/imports/session-archive/quarantine?tenant_external_id=scope-tenant",
+            world.service_url
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("imports:session_archive:quarantine:read operation");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_scope_is_not_wildcard(world, "imports:session_archive:quarantine:read", &token).await;
+
+    let token = issue_service_token(
+        world,
+        "scope-quarantine-resolve",
+        &["imports:session_archive:quarantine:resolve"],
+    )
+    .await;
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/imports/session-archive/quarantine/{}/resolutions",
+            world.service_url,
+            Uuid::now_v7()
+        ))
+        .bearer_auth(&token)
+        .header("idempotency-key", "security:scope-quarantine-resolution")
+        .json(&json!({
+            "tenant_external_id": "scope-tenant",
+            "action": "dismiss",
+            "key_id": null,
+            "expected_record_digest": "a".repeat(64),
+            "evidence_digest": "b".repeat(64),
+            "note": "scope authorization matrix"
+        }))
+        .send()
+        .await
+        .expect("imports:session_archive:quarantine:resolve operation");
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "the exact scope passed authorization and reached the deliberately missing fixture"
+    );
+    assert_scope_is_not_wildcard(world, "imports:session_archive:quarantine:resolve", &token).await;
+
     for (scope, path) in [
         ("plugins:read", "/internal/v1/plugins"),
         ("prices:read", "/internal/v1/generation-prices"),
@@ -482,6 +607,60 @@ async fn every_service_scope_is_exact(world: &mut TokenCenterWorld) {
         assert_eq!(response.status(), StatusCode::OK, "scope={scope}");
         assert_scope_is_not_wildcard(world, scope, &token).await;
     }
+
+    let token = issue_service_token(world, "scope-metrics-read", &["metrics:read"]).await;
+    let response = world
+        .client
+        .get(format!("{}/version", world.service_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("metrics:read operation");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_scope_is_not_wildcard(world, "metrics:read", &token).await;
+
+    let token = issue_service_token(world, "scope-oauth-write", &["oauth:write"]).await;
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/oauth/cursor/start",
+            world.service_url
+        ))
+        .bearer_auth(&token)
+        .json(&json!({
+            "tenant_external_id": "scope-oauth-tenant",
+            "account_name": "scope-oauth-account",
+            "provider_driver": "http-json",
+            "provider_config": {
+                "base_url": world.mock.as_ref().expect("mock upstream").uri(),
+                "network_scope": "private"
+            }
+        }))
+        .send()
+        .await
+        .expect("oauth:write operation");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_scope_is_not_wildcard(world, "oauth:write", &token).await;
+
+    let token = issue_service_token(world, "scope-plugins-write", &["plugins:write"]).await;
+    let response = world
+        .client
+        .put(format!(
+            "{}/internal/v1/plugins/not-installed/configuration",
+            world.service_url
+        ))
+        .bearer_auth(&token)
+        .header("idempotency-key", "security:scope-plugin-configuration")
+        .json(&json!({"expected_version": 0, "value": {}}))
+        .send()
+        .await
+        .expect("plugins:write operation");
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "the exact scope passed authorization and reached the deliberately absent plugin"
+    );
+    assert_scope_is_not_wildcard(world, "plugins:write", &token).await;
 
     let token = issue_service_token(world, "scope-prices-write", &["prices:write"]).await;
     let response = world
@@ -528,7 +707,8 @@ async fn every_service_scope_is_exact(world: &mut TokenCenterWorld) {
             "public_model": "scope-route-public",
             "upstream_account_id": provider["id"],
             "upstream_model": "scope-route-upstream",
-            "protocol": "openai"
+            "protocol": "openai",
+            "custom_model_confirmed": true
         }))
         .send()
         .await
@@ -727,6 +907,57 @@ async fn authentication_precedes_body_parsing(world: &mut TokenCenterWorld) {
         let oversized_status =
             unauthenticated_declared_oversized_status(&world.service_url, path).await;
         assert_eq!(oversized_status, StatusCode::UNAUTHORIZED, "path={path}");
+    }
+
+    let valid_key_body = json!({
+        "tenant_external_id": "normalized-rejection-tenant",
+        "principal_external_id": "normalized-rejection-principal",
+        "alias": "normalized-rejection",
+        "currency": "USD"
+    });
+    for (label, body) in [
+        ("malformed body", "{ definitely-not-json".to_owned()),
+        ("missing fields", "{}".to_owned()),
+        (
+            "unknown field",
+            serde_json::to_string(&{
+                let mut body = valid_key_body.clone();
+                body["unknown_field"] = json!(true);
+                body
+            })
+            .expect("serialize unknown-field rejection"),
+        ),
+    ] {
+        let response = world
+            .client
+            .post(format!("{}/internal/v1/keys", world.service_url))
+            .bearer_auth("test-service-token")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{label} control rejection: {error}"));
+        assert_normalized_control_rejection(response, label).await;
+    }
+
+    for (label, path) in [
+        (
+            "invalid query extractor",
+            "/internal/v1/keys?limit=not-a-number",
+        ),
+        (
+            "invalid path extractor",
+            "/internal/v1/imports/session-archive/quarantine/not-a-uuid",
+        ),
+    ] {
+        let response = world
+            .client
+            .get(format!("{}{path}", world.service_url))
+            .bearer_auth("test-service-token")
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{label} control rejection: {error}"));
+        assert_normalized_control_rejection(response, label).await;
     }
 }
 

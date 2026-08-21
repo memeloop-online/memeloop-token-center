@@ -1,6 +1,6 @@
 # Security audit
 
-Last reviewed: 2026-08-20
+Last reviewed: 2026-08-21
 
 This document records the security boundary reviewed before exposing the control
 and gateway services to dogfood traffic. It is not a substitute for an external
@@ -23,15 +23,19 @@ escape from its declared capabilities.
 
 | Area | Current control |
 | --- | --- |
-| Authentication | Control and gateway protected routes authenticate before body extraction. Service scopes and tenant scope are checked separately; a private upstream destination additionally requires a global service credential. The global bootstrap token must be generated from at least 32 random bytes; startup rejects encoded values shorter than 32 bytes or containing Unicode whitespace/`Cc` control characters anywhere. This prevents invisible-character ambiguity and validates a minimum format, not entropy. |
+| Authentication | Control and gateway protected routes authenticate before body extraction. Authenticated control requests normalize malformed/missing/unknown JSON and invalid query/path extractor failures into one generic JSON 400 envelope, without exposing parser internals. Service scopes and tenant scope are checked separately; a private upstream destination additionally requires a global service credential. The global bootstrap token must be generated from at least 32 random bytes; startup rejects encoded values shorter than 32 bytes or containing Unicode whitespace/`Cc` control characters anywhere. This prevents invisible-character ambiguity and validates a minimum format, not entropy. |
 | Credential storage | Downstream and service credentials are stored as keyed hashes. Upstream OAuth/API credentials and replayable rotation responses are encrypted. Rotation advances a generation under a stable key/account identity so history does not move. Secret values are not written to normal tracing fields. |
-| SQL injection | Runtime values are bound parameters. The migration-time dynamic column identifier is selected only from a fixed in-code two-item allowlist. |
+| SQL injection | Runtime values are bound parameters. The migration-time dynamic column identifier is selected only from a fixed in-code two-item allowlist. `security_injection_matrix` sends quote, comment, boolean, UNION and stacked-statement payloads through tenant, principal, alias, model, error, source and cursor inputs. It verifies exact results and schema survival on SQLite and PostgreSQL. |
+| Authorization | `new_security_acceptance.feature` independently issues every one of the 23 supported managed-service scopes, exercises its matching operation family, and proves a different operation family remains forbidden. Entitlement, CPA import, archive quarantine, metrics, OAuth and plugin capabilities are part of the same matrix. |
+| Groups | Provider groups select or exclude upstream candidates and route groups collect routable rules, so both participate at the model-routing layer. Credential groups are presentation-only classification: they cannot appear as a routing-grant subject or target. `security_routing_groups` proves adding, moving between, and removing credential-group memberships cannot change `/v1/models`, exact grants, selected provider candidates, or synchronous/persisted generation routing. It also proves a disabled retired CPA bridge retained in the legacy compatibility column cannot hide an active provider-group candidate or rewrite request history. Request schemas reject credential-group authorization fields, and provider/route/credential group IDs fail closed across tenants. |
+| Role isolation | `metrics::gateway_and_control_roles_return_404_for_every_opposite_operation_family` probes representative operations from every control and gateway family. An operation absent from a runtime role must return 404, not an authentication challenge. The ingress must preserve that application boundary. |
+| Log redaction | `security_log_redaction` installs a task-local tracing collector and uses distinct canaries for proxy, OAuth, CPA import, database, object-store conversion and an actual archive-reaper worker failure. It checks both HTTP responses and tracing output without printing the canary values on assertion failure. |
 | Command injection | Production code does not invoke an operating-system shell or child process. The `Command` references in `main.rs` are CLI enum variants, not process execution. |
 | Path traversal | Archive object locations use a restricted internal alphabet and object-store parsing. Plugin component paths reject absolute/parent components, are canonicalized, and must remain below the canonical package root; package symlinks are rejected. |
 | Browser boundary | Responses set a restrictive CSP, deny framing and object embedding, and constrain scripts/connects to the same origin. Bearer credentials are sent only in authorization headers. |
 | Resource bounds | Request bodies, upstream bodies, archive reads, image concurrency, gateway concurrency, plugin memory/table/instance counts, plugin HTTP bodies, and plugin execution time are bounded. Redirect following is disabled. |
 | Plugin isolation | Wasmtime components receive only declared host capabilities. Plugin/provider IDs are restricted to 1–64 lowercase ASCII letters, digits or hyphens. Traffic-policy reasons and `host.log` guest messages are never retained, reflected to clients or recorded verbatim; plugin logs contain only the validated plugin ID and host-owned fixed decision/event codes. HTTP allowlists are exact HTTPS origins, and plugin HTTP remains public-only until private-destination approval metadata exists. |
-| Dependency surface | SQLx and `rust_decimal` default features are disabled to avoid unused MySQL and `rkyv` dependency paths. The default service does not link `rsa`, `rkyv`, Sigstore or the OCI client. The opt-in offline OCI installer uses the official Sigstore client only for public-key verification; Sigstore's OpenID dependency includes `rsa`, whose RUSTSEC-2023-0071 advisory affects private-key timing operations that the installer neither accepts nor invokes. CI proves the exact dependency path and fails if `rsa` enters the default service or `rkyv` becomes reachable under any feature. A freshly fetched 1,217-entry RustSec database found no other known vulnerability on the review date. Registry yanked-status queries were not separately verified. |
+| Dependency surface | SQLx and `rust_decimal` default features are disabled to avoid unused MySQL and `rkyv` paths. The service does not link `rsa`, `rkyv`, `rkyv_derive`, `sqlx-mysql` or Sigstore under either the default or all-feature dependency tree; CI fails if any reappears. Plugin package verification delegates to the external Cosign executable instead of embedding that supply chain. `cargo audit` runs without advisory exceptions; an unavailable or stale advisory database is not evidence of current cleanliness. |
 
 ## Outbound network boundary
 
@@ -134,9 +138,20 @@ cargo check --all-targets
 cargo test network::tests --lib
 cargo test pinned_client_keeps_the_original_http_host --lib
 cargo test plugin::tests --lib
-cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0235
+cargo test --test security_injection_matrix -- --test-threads=1 --nocapture
+cargo test --test security_log_redaction -- --test-threads=1
+cargo test --test security_routing_groups -- --test-threads=1
+cargo test --test metrics gateway_and_control_roles_return_404_for_every_opposite_operation_family
+cargo audit
 helm lint charts/memeloop-token-center
 ```
+
+The PostgreSQL injection matrix is never silently reported as PostgreSQL
+evidence. It prints an explicit `SECURITY_GATE_SKIPPED` marker when the optional
+local `MTC_TEST_POSTGRES_URL` is absent, and fails when either CI or
+`MTC_REQUIRE_POSTGRES_SECURITY=1` requires the backend. Release CI supplies
+`MTC_TEST_POSTGRES_URL`; therefore a missing PostgreSQL service is a failed gate,
+not a green SQLite-only substitute.
 
 The unit coverage includes private/reserved and embedded IP representations,
 mixed public/private DNS answers, explicit loopback-test gating, retained Host

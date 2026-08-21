@@ -1,7 +1,7 @@
 use axum::{
     Router,
     body::{Body, to_bytes},
-    http::{Request, StatusCode, header},
+    http::{Method, Request, StatusCode, header},
 };
 use memeloop_token_center::{
     AppState, api,
@@ -30,6 +30,21 @@ async fn get(application: &Router, path: &str) -> axum::response::Response {
             Request::builder()
                 .uri(path)
                 .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response")
+}
+
+async fn request(application: &Router, method: Method, path: &str) -> axum::response::Response {
+    application
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
                 .expect("request"),
         )
         .await
@@ -146,6 +161,92 @@ async fn public_gateway_role_does_not_register_operational_metadata_routes() {
         get(&application, "/version").await.status(),
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn gateway_and_control_roles_return_404_for_every_opposite_operation_family() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("role-isolation.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .expect("application state");
+    let gateway = api::router_for_role(state.clone(), RuntimeRole::Gateway);
+    let control = api::router_for_role(state, RuntimeRole::Control);
+    let id = "00000000-0000-7000-8000-000000000001";
+
+    let control_operations = [
+        (Method::GET, "/operator".to_owned()),
+        (Method::GET, "/version".to_owned()),
+        (Method::GET, "/metrics".to_owned()),
+        (Method::GET, "/internal/v1/keys".to_owned()),
+        (Method::POST, "/internal/v1/service-tokens".to_owned()),
+        (Method::GET, "/internal/v1/provider-types".to_owned()),
+        (Method::GET, "/internal/v1/plugins".to_owned()),
+        (Method::GET, "/internal/v1/schemas".to_owned()),
+        (Method::POST, "/internal/v1/oauth/cursor/start".to_owned()),
+        (Method::GET, "/internal/v1/upstreams".to_owned()),
+        (Method::GET, format!("/internal/v1/upstreams/{id}/models")),
+        (
+            Method::GET,
+            "/internal/v1/imports/cpa/managed-oauth/capabilities".to_owned(),
+        ),
+        (
+            Method::GET,
+            "/internal/v1/imports/session-archive/quarantine?tenant_external_id=t".to_owned(),
+        ),
+        (Method::GET, "/internal/v1/requests".to_owned()),
+        (Method::GET, "/internal/v1/stats".to_owned()),
+        (Method::GET, "/internal/v1/request-events".to_owned()),
+        (Method::GET, "/internal/v1/model-routes".to_owned()),
+        (Method::GET, "/internal/v1/provider-groups".to_owned()),
+        (Method::GET, "/internal/v1/route-groups".to_owned()),
+        (Method::GET, "/internal/v1/credential-groups".to_owned()),
+        (Method::GET, "/internal/v1/model-prices".to_owned()),
+        (Method::GET, "/internal/v1/generation-prices".to_owned()),
+        (Method::GET, format!("/internal/v1/accounts/{id}/ledger")),
+        (Method::GET, "/internal/v1/entitlements".to_owned()),
+        (
+            Method::PUT,
+            "/internal/v1/integrations/memeloop-cloud/subscription".to_owned(),
+        ),
+    ];
+    for (method, path) in control_operations {
+        let response = request(&gateway, method.clone(), &path).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "gateway unexpectedly registered control operation {method} {path}"
+        );
+    }
+
+    let gateway_operations = [
+        (Method::GET, "/portal"),
+        (Method::GET, "/self/v1/key"),
+        (Method::GET, "/self/v1/key/limits"),
+        (Method::GET, "/self/v1/requests"),
+        (Method::GET, "/self/v1/stats"),
+        (Method::GET, "/self/v1/generations"),
+        (Method::GET, "/self/v1/conversations"),
+        (Method::GET, "/v1/models"),
+        (Method::POST, "/v1/chat/completions"),
+        (Method::POST, "/v1/responses"),
+        (Method::POST, "/v1/embeddings"),
+        (Method::POST, "/v1/messages"),
+        (Method::POST, "/v1/generations"),
+        (Method::POST, "/v1/videos/generations"),
+        (Method::POST, "/v1/images/generations"),
+    ];
+    for (method, path) in gateway_operations {
+        let response = request(&control, method.clone(), path).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "control unexpectedly registered gateway operation {method} {path}"
+        );
+    }
 }
 
 #[tokio::test]
