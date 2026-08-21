@@ -307,19 +307,24 @@ pub(in crate::api) async fn start_cursor_oauth(
             "custom Cursor OAuth endpoints are disabled".into(),
         ));
     }
-    Ok(Json(start_cursor_login(
-        StartCursorLogin {
-            tenant_external_id: body.tenant_external_id,
-            account_name: body.account_name,
-            provider_driver: body.provider_driver,
-            provider_config: body.provider_config,
-            endpoints,
-            oauth_driver: "cursor".to_owned(),
-            reauthorize,
-        },
-        state.config.key_pepper.as_bytes(),
-        unix_millis(),
-    )?))
+    Ok(Json(
+        start_cursor_login(
+            &state.db,
+            StartCursorLogin {
+                tenant_external_id: body.tenant_external_id,
+                account_name: body.account_name,
+                provider_driver: body.provider_driver,
+                provider_config: body.provider_config,
+                endpoints,
+                oauth_driver: "cursor".to_owned(),
+                reauthorize,
+            },
+            service.service_id,
+            state.config.key_pepper.as_bytes(),
+            unix_millis(),
+        )
+        .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,23 +381,28 @@ pub(in crate::api) async fn start_provider_adapter_oauth(
         &state,
     )
     .await?;
-    Ok(Json(start_cursor_login(
-        StartCursorLogin {
-            tenant_external_id: body.tenant_external_id,
-            account_name: body.account_name,
-            provider_driver: body.provider_driver,
-            provider_config: body.provider_config,
-            endpoints: CursorOAuthEndpoints {
-                login_url: adapter.login_url.clone(),
-                poll_url: adapter.poll_url.clone(),
-                refresh_url: adapter.refresh_url.clone(),
+    Ok(Json(
+        start_cursor_login(
+            &state.db,
+            StartCursorLogin {
+                tenant_external_id: body.tenant_external_id,
+                account_name: body.account_name,
+                provider_driver: body.provider_driver,
+                provider_config: body.provider_config,
+                endpoints: CursorOAuthEndpoints {
+                    login_url: adapter.login_url.clone(),
+                    poll_url: adapter.poll_url.clone(),
+                    refresh_url: adapter.refresh_url.clone(),
+                },
+                oauth_driver: "provider_adapter".to_owned(),
+                reauthorize,
             },
-            oauth_driver: "provider_adapter".to_owned(),
-            reauthorize,
-        },
-        state.config.key_pepper.as_bytes(),
-        unix_millis(),
-    )?))
+            service.service_id,
+            state.config.key_pepper.as_bytes(),
+            unix_millis(),
+        )
+        .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -408,11 +418,13 @@ pub(in crate::api) async fn poll_cursor_oauth(
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     match poll_cursor_login(
+        &state.db,
         &state.http,
         &body.session_token,
         state.config.key_pepper.as_bytes(),
         unix_millis(),
         service.tenant_external_id.as_deref(),
+        service.service_id,
         state.config.allow_oauth_loopback,
     )
     .await?
@@ -427,8 +439,19 @@ pub(in crate::api) async fn poll_cursor_oauth(
             })),
         )
             .into_response()),
-        CursorPollResult::Ready(ready) => {
-            let ready = *ready;
+        CursorPollResult::Consumed {
+            account_id,
+            tenant_external_id,
+        } => {
+            require_service_tenant(&service, &tenant_external_id)?;
+            let account = state
+                .db
+                .upstream_account_for_reauthorization(account_id, &tenant_external_id)
+                .await?;
+            Ok((StatusCode::OK, Json(account)).into_response())
+        }
+        CursorPollResult::Ready { lease_owner, login } => {
+            let ready = *login;
             require_service_tenant(&service, &ready.tenant_external_id)?;
             validate_provider_schema(
                 &state,
@@ -487,6 +510,16 @@ pub(in crate::api) async fn poll_cursor_oauth(
             } else {
                 StatusCode::CREATED
             };
+            state
+                .db
+                .finish_oauth_login_session(
+                    ready.session_id,
+                    lease_owner,
+                    account.id,
+                    unix_millis(),
+                )
+                .await?;
+            super::trigger_upstream_model_sync(state.clone(), account.id);
             Ok((status, Json(account)).into_response())
         }
     }

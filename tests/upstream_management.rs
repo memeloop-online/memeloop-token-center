@@ -275,7 +275,7 @@ async fn retired_subscription_accounts_remain_readable_but_cannot_be_reactivated
                     "provider": "copilot",
                     "network_scope": "private"
                 }),
-                credential: UpstreamCredential::SubscriptionBridge {
+                credential: UpstreamCredential::LegacySubscriptionBridge {
                     handle: "oldhandle".into(),
                     secret: Some("encrypted-bridge-secret".into()),
                 },
@@ -301,7 +301,7 @@ async fn retired_subscription_accounts_remain_readable_but_cannot_be_reactivated
                     oauth_session_id: Uuid::now_v7(),
                     oauth_driver: "subscription_bridge".into(),
                     oauth_refresh_url: None,
-                    credential: UpstreamCredential::SubscriptionBridge {
+                    credential: UpstreamCredential::LegacySubscriptionBridge {
                         handle: "newhandle".into(),
                         secret: None,
                     },
@@ -317,7 +317,7 @@ async fn retired_subscription_accounts_remain_readable_but_cannot_be_reactivated
         .await
         .unwrap();
     match credential {
-        UpstreamCredential::SubscriptionBridge { handle, secret } => {
+        UpstreamCredential::LegacySubscriptionBridge { handle, secret } => {
             assert_eq!(handle, "oldhandle");
             assert_eq!(secret.as_deref(), Some("encrypted-bridge-secret"));
         }
@@ -358,6 +358,22 @@ async fn retired_subscription_accounts_remain_readable_but_cannot_be_reactivated
             .await
             .is_err()
     );
+    let (status, _) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{}/credential", account.id),
+        &state.config.service_token,
+        Some("retired-account-api-rotation"),
+        Some(json!({
+            "credential": {
+                "type": "subscription_bridge",
+                "handle": "replacement",
+                "secret": "must-not-install"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
