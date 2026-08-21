@@ -6,6 +6,20 @@ fail() {
   exit 1
 }
 
+validate_digest() {
+  candidate=$1
+  label=$2
+  case "$candidate" in
+    sha256:*) ;;
+    *) fail "$label is not a sha256 digest" ;;
+  esac
+  hex=${candidate#sha256:}
+  case "$hex" in
+    *[!0-9a-f]* | '') fail "$label contains non-lowercase-hex characters" ;;
+  esac
+  [ "${#hex}" -eq 64 ] || fail "$label does not contain exactly 64 hexadecimal characters"
+}
+
 repository=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 : "${HARBOR_REPOSITORY_PREFIX:?HARBOR_REPOSITORY_PREFIX is required}"
 : "${HARBOR_USERNAME:?HARBOR_USERNAME is required}"
@@ -17,15 +31,35 @@ repository=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 : "${RELEASE_EVIDENCE_DIR:?RELEASE_EVIDENCE_DIR is required}"
 : "${BUILDKIT_HOST:?BUILDKIT_HOST must point at the isolated rootless builder}"
 
+docker_config=
+cleanup() {
+  unset HARBOR_USERNAME HARBOR_PASSWORD COSIGN_PRIVATE_KEY COSIGN_PASSWORD COSIGN_PUBLIC_KEY
+  if [ -n "$docker_config" ]; then
+    rm -rf -- "$docker_config"
+  fi
+}
+trap cleanup EXIT HUP INT TERM
+
 for tool in buildctl cosign crane jq trivy; do
   command -v "$tool" >/dev/null 2>&1 || fail "$tool is not installed on the release runner"
 done
 [ ! -S /var/run/docker.sock ] || fail "the host Docker socket must not be mounted"
+[ ! -S /run/containerd/containerd.sock ] || fail "the host containerd socket must not be mounted"
+[ ! -S /var/run/crio/crio.sock ] || fail "the host CRI-O socket must not be mounted"
 
 case "$BUILDKIT_HOST" in
-  unix://* | tcp://*) ;;
-  *) fail "BUILDKIT_HOST must use an explicit unix:// or tcp:// endpoint" ;;
+  unix:///run/user/*/buildkit/buildkitd.sock) ;;
+  *) fail "BUILDKIT_HOST must be an absolute same-Pod rootless BuildKit Unix socket" ;;
 esac
+socket_tail=${BUILDKIT_HOST#unix:///run/user/}
+socket_uid=${socket_tail%%/*}
+case "$socket_uid" in
+  '' | *[!0-9]*) fail "BUILDKIT_HOST user component must be numeric" ;;
+esac
+[ "$socket_tail" = "$socket_uid/buildkit/buildkitd.sock" ] || \
+  fail "BUILDKIT_HOST contains an unexpected path component"
+buildkit_socket=${BUILDKIT_HOST#unix://}
+[ -S "$buildkit_socket" ] || fail "rootless BuildKit Unix socket does not exist"
 
 cd "$repository"
 release_rows=$(ops/ci/validate-release-inputs.sh \
@@ -33,10 +67,6 @@ release_rows=$(ops/ci/validate-release-inputs.sh \
 mkdir -p "$RELEASE_EVIDENCE_DIR"
 chmod 0700 "$RELEASE_EVIDENCE_DIR"
 docker_config=$(mktemp -d "${RUNNER_TEMP:-/tmp}/mtc-harbor-auth.XXXXXX")
-cleanup() {
-  rm -rf -- "$docker_config"
-}
-trap cleanup EXIT HUP INT TERM
 chmod 0700 "$docker_config"
 export DOCKER_CONFIG=$docker_config
 
@@ -52,34 +82,6 @@ source_url=${FORGEJO_SERVER_URL:-https://forgejo.invalid}/${FORGEJO_REPOSITORY:-
 release_manifest="$RELEASE_EVIDENCE_DIR/harbor-release-$RELEASE_REVISION.jsonl"
 : >"$release_manifest"
 chmod 0600 "$release_manifest"
-
-verify_buildkit_attestations() {
-  image=$1
-  digest=$2
-  index_file=$3
-  crane manifest "$image@$digest" >"$index_file"
-  jq -e '.manifests | type == "array"' "$index_file" >/dev/null || \
-    fail "$image did not publish an OCI index containing attestations"
-  sbom=false
-  provenance=false
-  for attestation_digest in $(jq -r '
-    .manifests[] |
-    select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") |
-    .digest' "$index_file"); do
-    attestation_file="$RELEASE_EVIDENCE_DIR/attestation-${attestation_digest#sha256:}.json"
-    crane manifest "$image@$attestation_digest" >"$attestation_file"
-    predicates=$(jq -r '.layers[]?.annotations["in-toto.io/predicate-type"] // empty' \
-      "$attestation_file")
-    if printf '%s\n' "$predicates" | grep -Eiq 'spdx'; then
-      sbom=true
-    fi
-    if printf '%s\n' "$predicates" | grep -Eq 'https://slsa.dev/provenance/'; then
-      provenance=true
-    fi
-  done
-  [ "$sbom" = true ] || fail "$image is missing its BuildKit SPDX SBOM attestation"
-  [ "$provenance" = true ] || fail "$image is missing its BuildKit SLSA provenance attestation"
-}
 
 printf '%s\n' "$release_rows" | while IFS='|' read -r scope dockerfile image_name tagged_reference; do
   [ -n "$scope" ] || continue
@@ -99,7 +101,7 @@ printf '%s\n' "$release_rows" | while IFS='|' read -r scope dockerfile image_nam
     --opt "label:org.opencontainers.image.revision=$RELEASE_REVISION" \
     --opt attest:sbom= \
     --opt attest:provenance=mode=max \
-    --output "type=image,name=$tagged_reference,push=true,oci-mediatypes=true,name-canonical=true" \
+    --output "type=image,name=$tagged_reference,push=true,oci-mediatypes=true,oci-artifact=true,name-canonical=true" \
     --metadata-file "$metadata" \
     --progress plain
   if [ "$scope" = service ]; then
@@ -114,12 +116,9 @@ printf '%s\n' "$release_rows" | while IFS='|' read -r scope dockerfile image_nam
   "$@"
 
   digest=$(jq -r '."containerimage.digest" // empty' "$metadata")
-  digest_hex=${digest#sha256:}
-  case "$digest_hex" in
-    *[!0-9a-f]* | '') fail "$scope build returned an invalid digest" ;;
-  esac
-  [ "${#digest_hex}" -eq 64 ] || fail "$scope digest does not contain 64 hexadecimal characters"
+  validate_digest "$digest" "$scope build digest"
   resolved=$(crane digest "$tagged_reference")
+  validate_digest "$resolved" "$scope resolved tag digest"
   [ "$resolved" = "$digest" ] || \
     fail "$tagged_reference resolved to $resolved instead of $digest"
   digest_reference="$image@$digest"
@@ -142,8 +141,8 @@ printf '%s\n' "$release_rows" | while IFS='|' read -r scope dockerfile image_nam
     '.config.Entrypoint == [$expected]' "$config" >/dev/null || \
     fail "$scope image entrypoint is not the hardened executable"
 
-  verify_buildkit_attestations "$image" "$digest" \
-    "$RELEASE_EVIDENCE_DIR/$scope-index.json"
+  ops/ci/verify-buildkit-attestations.sh "$image" "$digest" \
+    "$RELEASE_EVIDENCE_DIR/$scope-index.json" "$RELEASE_EVIDENCE_DIR"
   trivy image --image-src remote --scanners vuln --severity HIGH,CRITICAL \
     --exit-code 1 "$digest_reference"
 

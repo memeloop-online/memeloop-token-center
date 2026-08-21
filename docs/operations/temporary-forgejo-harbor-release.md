@@ -102,6 +102,10 @@ requires an exact digest match. It verifies non-root user/entrypoint and OCI
 revision labels, attached SPDX SBOM and SLSA provenance, scans the exact
 digest for HIGH/CRITICAL vulnerabilities, signs it with Cosign, attaches a
 signed release predicate, and verifies both signature and predicate. A
+BuildKit attestation is counted only after the OCI index descriptor, native OCI
+artifact manifest and subject, in-toto layer, statement `_type`, `predicateType`, and
+the exact linux/amd64 subject SHA-256 have all been parsed and matched. Registry
+strings alone are never treated as attestation evidence. A
 release is complete only when one manifest contains exactly all three digest
 references for the same revision.
 
@@ -119,6 +123,10 @@ Only the `release-harbor` job receives these Forgejo Actions secrets:
 - `COSIGN_PRIVATE_KEY`
 - `COSIGN_PASSWORD`
 - `COSIGN_PUBLIC_KEY`
+
+All five exist only in the environment of the single publisher shell step;
+checkout and the seven-day digest-evidence upload receive none of them. The
+publisher's exit trap unsets them and deletes its temporary auth directory.
 
 Use a Harbor robot account restricted to push/pull the three `mtc-ci`
 repositories. The Cosign key is dedicated to this temporary path. Secrets are

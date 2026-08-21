@@ -4,6 +4,8 @@ set -eu
 repository=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 workflow="$repository/.forgejo/workflows/harbor-release.yml"
 publisher="$repository/ops/ci/publish-harbor-images.sh"
+attestation_verifier="$repository/ops/ci/verify-buildkit-attestations.sh"
+attestation_fixtures="$repository/tests/ops/forgejo-attestation-fixtures.sh"
 validator="$repository/ops/ci/validate-release-inputs.sh"
 shared_contracts="$repository/ops/ci/run-release-source-contracts.sh"
 runbook="$repository/docs/operations/temporary-forgejo-harbor-release.md"
@@ -15,6 +17,8 @@ fail() {
 
 test -f "$workflow"
 test -x "$publisher"
+test -x "$attestation_verifier"
+test -x "$attestation_fixtures"
 test -x "$validator"
 test -x "$shared_contracts"
 test -f "$runbook"
@@ -70,6 +74,27 @@ if grep -Eq 'build-arg:[^[:space:]]*(PASSWORD|PRIVATE_KEY|TOKEN)|--(build-arg|op
   "$workflow" "$publisher"; then
   fail "secret material must never enter image build arguments"
 fi
+publish_block=$(sed -n \
+  '/- name: Build, scan, attest, sign, and verify immutable Harbor images/,/- name: Retain the digest-only release evidence/p' \
+  "$workflow")
+test "$(printf '%s\n' "$publish_block" | grep -c 'secrets\.' || true)" -eq 5 || \
+  fail "all five release secrets must be scoped to the publish shell step"
+job_env_block=$(sed -n '/^  release-harbor:/,/^[[:space:]]*steps:/p' "$workflow")
+if printf '%s\n' "$job_env_block" | grep -q 'secrets\.'; then
+  fail "release secrets must not be injected at job scope"
+fi
+checkout_block=$(sed -n \
+  '/- name: Check out the exact gated revision/,/- name: Build, scan, attest, sign, and verify immutable Harbor images/p' \
+  "$workflow")
+if printf '%s\n' "$checkout_block" | grep -q 'secrets\.'; then
+  fail "checkout must receive no Harbor or Cosign secret"
+fi
+artifact_block=$(sed -n '/- name: Retain the digest-only release evidence/,$p' "$workflow")
+if printf '%s\n' "$artifact_block" | grep -q 'secrets\.'; then
+  fail "artifact upload must receive no Harbor or Cosign secret"
+fi
+printf '%s\n' "$artifact_block" | grep -Fq 'retention-days: 7' || \
+  fail "secret-free release evidence retention must remain short"
 
 for required in \
   'cargo fmt --all -- --check' \
@@ -107,9 +132,11 @@ if grep -Eqi ':(latest|master)([^a-z0-9_-]|$)|tag=(latest|master)' "$publisher" 
 fi
 
 for required in \
+  'unset HARBOR_USERNAME HARBOR_PASSWORD COSIGN_PRIVATE_KEY COSIGN_PASSWORD COSIGN_PUBLIC_KEY' \
   'buildctl --addr "$BUILDKIT_HOST" build' \
   '--opt attest:sbom=' \
   '--opt attest:provenance=mode=max' \
+  'oci-artifact=true' \
   '"containerimage.digest"' \
   'crane digest "$tagged_reference"' \
   'trivy image --image-src remote' \
@@ -121,9 +148,32 @@ for required in \
   grep -Fq -- "$required" "$publisher" || fail "missing release control: $required"
 done
 grep -Fq '[ ! -S /var/run/docker.sock ]' "$publisher"
+grep -Fq '[ ! -S /run/containerd/containerd.sock ]' "$publisher"
+grep -Fq '[ ! -S /var/run/crio/crio.sock ]' "$publisher"
+grep -Fq 'unix:///run/user/*/buildkit/buildkitd.sock' "$publisher"
+grep -Fq '[ -S "$buildkit_socket" ]' "$publisher"
+if grep -Eq 'BUILDKIT_HOST.*tcp://|unix://\* \| tcp://' "$publisher"; then
+  fail "publisher must reject TCP and arbitrary Unix BuildKit endpoints"
+fi
 if grep -Eq '(^|[[:space:]])docker[[:space:]]+(build|push|run|login)' "$publisher"; then
   fail "publisher must use isolated rootless BuildKit, never Docker"
 fi
+
+for required in \
+  'crane manifest "$image@$index_digest"' \
+  'crane blob "$image@$layer_digest"' \
+  'vnd.docker.reference.digest' \
+  'application/vnd.in-toto+json' \
+  'application/vnd.docker.attestation.manifest.v1+json' \
+  'https://in-toto.io/Statement/v1' \
+  '.predicateType == $predicate' \
+  '(.digest.sha256 == $subject)' \
+  'verified SPDX SBOM statement is missing' \
+  'verified SLSA provenance statement is missing'; do
+  grep -Fq -- "$required" "$attestation_verifier" || \
+    fail "missing deep attestation validation: $required"
+done
+grep -Fq 'tests/ops/forgejo-attestation-fixtures.sh' "$shared_contracts"
 
 grep -Fq 'https://git.k3s.onetwo.website' "$runbook"
 grep -Fq 'http://forgejo-http.forgejo.svc.cluster.local:3000' "$runbook"
