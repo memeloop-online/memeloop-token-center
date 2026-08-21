@@ -124,6 +124,15 @@ Then('六类可靠关系、候选关系和未关联请求被明确区分', async
   const drawer = page.getByRole('dialog');
   const text = await drawer.textContent() ?? '';
   for (const relation of ['继续', '重试', '编辑', '分支', '压缩', '子代理']) assert.match(text, new RegExp(relation));
+  for (const sentence of ['延续了', '是对', '修改了', '创建了分支', '上下文后继续', '派生的子代理请求']) {
+    assert.match(text, new RegExp(sentence), `missing natural-language relationship: ${sentence}`);
+  }
+  await page.locator('.rail .language-toggle').click();
+  const englishText = await drawer.textContent() ?? '';
+  for (const sentence of ['continues the conversation', 'retries', 'edits the input', 'branches from', 'compacting the context', 'subagent request spawned']) {
+    assert.match(englishText, new RegExp(sentence), `missing English natural-language relationship: ${sentence}`);
+  }
+  await page.locator('.rail .language-toggle').click();
   const candidate = drawer.locator('.candidate-edges');
   await candidate.locator('summary').click();
   assert.match(await candidate.textContent() ?? '', /候选仅供排查|未用于归类/);

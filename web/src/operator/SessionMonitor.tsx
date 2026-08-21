@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
 import { api } from '../api';
 import { useI18n } from '../i18n';
 import { SessionDrawer, SessionList } from '../SessionViews';
+import { drainSessionEventKeys, mergeSessionPage } from './sessionRefresh';
 import type {
   LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, RequestView,
 } from '../types';
@@ -49,11 +50,11 @@ function messageOf(reason: unknown, fallback: string) {
   return reason instanceof Error ? reason.message : fallback;
 }
 
-export function SessionMonitor({ token, tenant, revision, eventKeyId, focus, streamState, onSelectRequest }: {
+export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, streamState, onSelectRequest }: {
   token: string;
   tenant: string;
   revision: number;
-  eventKeyId: string;
+  eventKeyIds: RefObject<Set<string>>;
   focus?: SessionFocus;
   streamState: SessionStreamState;
   onSelectRequest: (request: RequestView) => Promise<void>;
@@ -102,28 +103,22 @@ export function SessionMonitor({ token, tenant, revision, eventKeyId, focus, str
       );
       if (sequence !== listSequence.current) return;
       const page = response.sessions;
+      const resetActiveTail = background && loadedOlderList.current && selectedFilters.state === 'active';
       setSessions((current) => {
-        if (background && loadedOlderList.current) {
-          const keys = new Set(page.map((session) => `${session.key_id}:${session.session_id}`));
-          const oldTail = current.slice(firstPageSize.current)
-            .filter((session) => !keys.has(`${session.key_id}:${session.session_id}`));
-          firstPageSize.current = page.length;
-          return [...page, ...oldTail];
-        }
-        if (background) {
-          firstPageSize.current = page.length;
-          return page;
-        }
-        if (!older) {
-          firstPageSize.current = page.length;
-          loadedOlderList.current = false;
-          return page;
-        }
-        loadedOlderList.current = true;
-        const known = new Set(current.map((session) => `${session.key_id}:${session.session_id}`));
-        return [...current, ...page.filter((session) => !known.has(`${session.key_id}:${session.session_id}`))];
+        const merged = mergeSessionPage({
+          current,
+          page,
+          firstPageSize: firstPageSize.current,
+          loadedOlder: loadedOlderList.current,
+          older,
+          background,
+          state: selectedFilters.state,
+        });
+        firstPageSize.current = merged.firstPageSize;
+        loadedOlderList.current = merged.loadedOlder;
+        return merged.sessions;
       });
-      if (!background || !loadedOlderList.current) setNextCursor(response.next_cursor);
+      if (!background || !loadedOlderList.current || resetActiveTail) setNextCursor(response.next_cursor);
       setGeneratedAt(response.generated_at);
       if (!older && focus && handledFocus.current !== focus.revision) {
         const focused = page.find((session) => session.session_id === focus.sessionId && session.key_id === focus.keyId);
@@ -271,10 +266,10 @@ export function SessionMonitor({ token, tenant, revision, eventKeyId, focus, str
 
   useEffect(() => {
     if (!token.trim() || !tenant || revision === 0) return;
-    if (eventKeyId) dirtyKeyIds.current.add(eventKeyId);
+    for (const keyId of drainSessionEventKeys(eventKeyIds.current)) dirtyKeyIds.current.add(keyId);
     refreshDirty.current = true;
     scheduleRefresh();
-  }, [revision, eventKeyId]);
+  }, [revision, eventKeyIds]);
 
   const status = refreshing ? 'refreshing' : streamState === 'idle' ? 'connecting' : streamState;
   return <>

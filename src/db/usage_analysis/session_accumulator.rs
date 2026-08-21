@@ -7,6 +7,7 @@ use super::{AppError, UsageMetricsAccumulator};
 #[derive(Default)]
 pub(super) struct SessionUsageAccumulator {
     pub(super) id: String,
+    pub(super) label: String,
     pub(super) key_id: String,
     pub(super) key_alias: String,
     pub(super) metrics: UsageMetricsAccumulator,
@@ -17,11 +18,13 @@ pub(super) fn accumulate_session_usage_row(
     row: &AnyRow,
 ) -> Result<(), AppError> {
     let id: String = row.try_get("bucket_id")?;
+    let label: String = row.try_get("bucket_label")?;
     let key_id: String = row.try_get("key_id")?;
     let key_alias: String = row.try_get("key_alias")?;
     let session = projections.entry((id.clone(), key_id.clone())).or_default();
     if session.id.is_empty() {
         session.id = id;
+        session.label = label;
         session.key_id = key_id;
         session.key_alias = key_alias;
     }

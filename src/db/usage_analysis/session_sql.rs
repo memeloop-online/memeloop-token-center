@@ -84,7 +84,8 @@ pub(super) fn session_usage_dimension_sql(
                   AND ($12 = '' OR LOWER(principal.external_id) LIKE $12 ESCAPE '\')
            ),
            grouped_sessions AS (
-               SELECT key_id, key_alias, session_id, currency, SUM(requests) AS requests,
+               SELECT key_id, key_alias, session_id, currency,
+                      MIN(model) AS primary_model, SUM(requests) AS requests,
                       SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END)
                           AS successful_requests,
                       SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END)
@@ -110,7 +111,10 @@ pub(super) fn session_usage_dimension_sql(
                  FROM with_session_totals
            )
            SELECT 'session' AS bucket_kind, session_id AS bucket_id,
-                  session_id AS bucket_label, key_id, key_alias, currency,
+                  CASE WHEN session_id LIKE 'unlinked:%' OR primary_model = ''
+                       THEN key_alias ELSE key_alias || ' · ' || primary_model END
+                      AS bucket_label,
+                  key_id, key_alias, currency,
                   CAST(requests AS BIGINT) AS requests,
                   CAST(successful_requests AS BIGINT) AS successful_requests,
                   CAST(failed_requests AS BIGINT) AS failed_requests,

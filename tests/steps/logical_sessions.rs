@@ -660,6 +660,15 @@ async fn usage_by_session_contract(world: &TokenCenterWorld) {
     finish_unlinked(world, &key, "currency-usd-model", 1_000_000).await;
     let cny_request = finish_unlinked(world, &key, "currency-cny-model", 2_000_000).await;
     change_unlinked_currency(world, &key, cny_request, "currency-cny-model", "CNY").await;
+    let linked_session = completed_session(
+        world,
+        &key,
+        "readable-usage-session",
+        "readable-session-model",
+        200,
+        3_000_000,
+    )
+    .await;
     let now = unix_millis();
     let (status, body) = get_json(
         world,
@@ -673,9 +682,13 @@ async fn usage_by_session_contract(world: &TokenCenterWorld) {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let sessions = body["by_session"].as_array().expect("usage by_session");
-    assert_eq!(sessions.len(), 1, "{body}");
-    let session = &sessions[0];
+    assert_eq!(sessions.len(), 2, "{body}");
+    let session = sessions
+        .iter()
+        .find(|session| session["unlinked"] == true)
+        .expect("unlinked usage bucket");
     assert_eq!(session["id"], format!("unlinked:{}", key.key_id));
+    assert_eq!(session["label"], "Mixed currency credential");
     assert_eq!(session["key_id"], key.key_id.to_string());
     assert_eq!(session["key_alias"], "Mixed currency credential");
     assert_eq!(session["unlinked"], true);
@@ -687,11 +700,21 @@ async fn usage_by_session_contract(world: &TokenCenterWorld) {
             {"currency": "USD", "cost": "1"}
         ])
     );
+    let linked = sessions
+        .iter()
+        .find(|session| session["id"] == linked_session)
+        .expect("linked usage bucket");
+    assert_eq!(
+        linked["label"],
+        "Mixed currency credential · readable-session-model"
+    );
+    assert_eq!(linked["key_id"], key.key_id.to_string());
+    assert_eq!(linked["unlinked"], false);
     assert_eq!(
         body["summary"]["costs"],
         json!([
             {"currency": "CNY", "cost": "2"},
-            {"currency": "USD", "cost": "1"}
+            {"currency": "USD", "cost": "4"}
         ])
     );
 }

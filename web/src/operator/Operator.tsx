@@ -1,6 +1,6 @@
 import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from 'react';
 import { ApiError, api, streamSse } from '../api';
 import { DrawerFrame, RequestTable, Shell } from '../components';
 import { formatCurrency, formatNumber } from '../format';
@@ -20,6 +20,7 @@ import { MultiCombobox, type ComboboxOption } from './MultiCombobox';
 import { UpstreamModelCombobox } from './UpstreamModelCombobox';
 import { Plugins } from './Plugins';
 import { SessionMonitor, type SessionFocus, type SessionStreamState } from './SessionMonitor';
+import { enqueueSessionEventKey } from './sessionRefresh';
 import { UsageAnalysis } from './UsageAnalysis';
 
 type Tab = 'traffic' | 'usage' | 'providers' | 'routes' | 'pricing' | 'credentials' | 'services' | 'plugins';
@@ -198,7 +199,6 @@ export function Operator() {
   const [tab, setTab] = useState<Tab>('traffic');
   const [trafficMode, setTrafficMode] = useState<'requests' | 'sessions'>('requests');
   const [sessionRevision, setSessionRevision] = useState(0);
-  const [sessionEventKeyId, setSessionEventKeyId] = useState('');
   const [sessionFocus, setSessionFocus] = useState<SessionFocus>();
   const [tenant, setTenant] = useState('');
   const [tenants, setTenants] = useState<TenantView[]>([]);
@@ -217,6 +217,7 @@ export function Operator() {
   const requestEventCursor = useRef<RequestEventCursor | undefined>(undefined);
   const requestEventScope = useRef<RequestEventScope | undefined>(undefined);
   const liveRequestEvents = useRef(new Map<string, RequestEvent>());
+  const sessionEventKeyIds = useRef(new Set<string>());
 
   async function refresh() {
     const refreshCredential = token;
@@ -294,6 +295,7 @@ export function Operator() {
       || previousScope.filters !== requestFilters) {
       requestEventCursor.current = undefined;
       liveRequestEvents.current.clear();
+      sessionEventKeyIds.current.clear();
       requestEventScope.current = { credential: token, tenant, filters: requestFilters };
       setStreamError('');
     }
@@ -328,8 +330,8 @@ export function Operator() {
               }
               setStreamError('');
               setStreamState('live');
+              enqueueSessionEventKey(sessionEventKeyIds.current, event.key_id);
               setSessionRevision((revision) => revision + 1);
-              setSessionEventKeyId(event.key_id);
               setRequests((current) => {
                 const previous = current.find((request) => request.request_id === event.request_id);
                 const next = requestViewFromEvent(event, previous);
@@ -387,7 +389,7 @@ export function Operator() {
     {error && <div className="notice error" role="alert">{error}</div>}
     {streamError && <div className="notice error" role="alert">{streamError}</div>}
     <section id={`operator-panel-${tab}`} role="tabpanel" aria-labelledby={`operator-tab-${tab}`} tabIndex={0}>
-      {tab === 'traffic' && <Traffic token={token} tenant={tenant} mode={trafficMode} onModeChange={setTrafficMode} sessionRevision={sessionRevision} sessionEventKeyId={sessionEventKeyId} sessionFocus={sessionFocus} streamState={streamState} requests={requests} upstreams={upstreams} filters={requestFilters} loading={requestsLoading} hasOlder={hasOlderRequests} onApply={(filters) => { setRequestFilters(filters); void loadRequests(filters); }} onClear={() => { setRequestFilters(emptyRequestFilters); void loadRequests(emptyRequestFilters); }} onLoadOlder={() => void loadRequests(requestFilters, true)} onSelect={selectRequest} />}
+      {tab === 'traffic' && <Traffic token={token} tenant={tenant} mode={trafficMode} onModeChange={setTrafficMode} sessionRevision={sessionRevision} sessionEventKeyIds={sessionEventKeyIds} sessionFocus={sessionFocus} streamState={streamState} requests={requests} upstreams={upstreams} filters={requestFilters} loading={requestsLoading} hasOlder={hasOlderRequests} onApply={(filters) => { setRequestFilters(filters); void loadRequests(filters); }} onClear={() => { setRequestFilters(emptyRequestFilters); void loadRequests(emptyRequestFilters); }} onLoadOlder={() => void loadRequests(requestFilters, true)} onSelect={selectRequest} />}
       {tab === 'usage' && <UsageAnalysis token={token} tenant={tenant} upstreams={upstreams} onOpenSession={(session: UsageAnalysisSessionBucket) => { setSessionFocus({ sessionId: session.id, keyId: session.key_id, revision: Date.now() }); setTrafficMode('sessions'); setTab('traffic'); }} />}
       {tab === 'providers' && <UpstreamProviders token={token} tenant={tenant} providers={providers} values={upstreams} onChanged={refresh} />}
       {tab === 'routes' && <RouteWorkspace token={token} tenant={tenant} upstreams={upstreams} providers={providers} />}
@@ -400,13 +402,13 @@ export function Operator() {
   </Shell>;
 }
 
-function Traffic({ token, tenant, mode, onModeChange, sessionRevision, sessionEventKeyId, sessionFocus, streamState, requests, upstreams, filters, loading, hasOlder, onApply, onClear, onLoadOlder, onSelect }: {
+function Traffic({ token, tenant, mode, onModeChange, sessionRevision, sessionEventKeyIds, sessionFocus, streamState, requests, upstreams, filters, loading, hasOlder, onApply, onClear, onLoadOlder, onSelect }: {
   token: string;
   tenant: string;
   mode: 'requests' | 'sessions';
   onModeChange: (mode: 'requests' | 'sessions') => void;
   sessionRevision: number;
-  sessionEventKeyId: string;
+  sessionEventKeyIds: RefObject<Set<string>>;
   sessionFocus?: SessionFocus;
   streamState: SessionStreamState;
   requests: RequestView[];
@@ -445,7 +447,7 @@ function Traffic({ token, tenant, mode, onModeChange, sessionRevision, sessionEv
       </form>
       <RequestTable requests={requests} onSelect={(request) => void onSelect(request)} />
       {hasOlder && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
-    </> : <SessionMonitor token={token} tenant={tenant} revision={sessionRevision} eventKeyId={sessionEventKeyId} focus={sessionFocus} streamState={streamState} onSelectRequest={onSelect} />}
+    </> : <SessionMonitor token={token} tenant={tenant} revision={sessionRevision} eventKeyIds={sessionEventKeyIds} focus={sessionFocus} streamState={streamState} onSelectRequest={onSelect} />}
   </article>;
 }
 function UpstreamProviders({ token, tenant, providers, values, onChanged }: { token: string; tenant: string; providers: ProviderType[]; values: UpstreamAccount[]; onChanged: () => Promise<void> }) {

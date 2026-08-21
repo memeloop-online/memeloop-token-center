@@ -231,7 +231,7 @@ impl Database {
                 Ok(UsageAnalysisSessionBucket {
                     unlinked: accumulator.id.starts_with("unlinked:"),
                     id: accumulator.id.clone(),
-                    label: accumulator.id,
+                    label: accumulator.label,
                     key_id: parse_uuid(accumulator.key_id)?,
                     key_alias: accumulator.key_alias,
                     metrics: accumulator.metrics.finish_without_p95(),
