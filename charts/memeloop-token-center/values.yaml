@@ -13,6 +13,9 @@ fullnameOverride: ""
 
 migration:
   enabled: true
+  # Must equal the greatest migration registered by the release binary.
+  # The packaging contract rejects drift between this value and migrations/.
+  schemaVersion: 51
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4
@@ -122,7 +125,7 @@ config:
   serviceTokenSecret:
     name: memeloop-token-center-secrets
     key: service-token
-  # Optional HMAC secret used by the signed MemeLoop Cloud subscription bridge.
+  # Optional HMAC secret used by signed MemeLoop Cloud entitlement webhooks.
   # Keep `name` empty to leave the integration endpoint fail-closed.
   memeloopCloudWebhookSecret:
     name: ""

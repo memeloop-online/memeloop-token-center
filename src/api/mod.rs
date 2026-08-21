@@ -14,7 +14,7 @@ use axum::{
     extract::{DefaultBodyLimit, MatchedPath, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, patch, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};

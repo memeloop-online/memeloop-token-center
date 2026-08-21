@@ -1,11 +1,11 @@
 use super::*;
 
 pub(super) async fn operator_index() -> Response {
-    web_index(false).await
+    web_index().await
 }
 
 pub(super) async fn portal_index() -> Response {
-    web_index(true).await
+    web_index().await
 }
 
 fn web_root() -> PathBuf {
@@ -14,18 +14,14 @@ fn web_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/usr/share/memeloop-token-center/web"))
 }
 
-async fn web_index(allow_fallback: bool) -> Response {
+async fn web_index() -> Response {
     let mut response = match tokio::fs::read(web_root().join("index.html")).await {
         Ok(body) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response(),
-        Err(error) if allow_fallback => {
-            tracing::warn!(%error, "built web application is unavailable; serving fallback portal");
-            Html(include_str!("../portal.html")).into_response()
-        }
         Err(error) => {
-            tracing::error!(%error, "built operator web application is unavailable");
+            tracing::error!(%error, "built web application is unavailable");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "operator assets are not installed",
+                "web assets are not installed",
             )
                 .into_response()
         }
