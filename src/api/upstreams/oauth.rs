@@ -423,9 +423,11 @@ pub(in crate::api) async fn poll_cursor_oauth(
         &body.session_token,
         state.config.key_pepper.as_bytes(),
         unix_millis(),
-        service.tenant_external_id.as_deref(),
-        service.service_id,
-        state.config.allow_oauth_loopback,
+        crate::oauth::CursorPollAuthority {
+            required_tenant: service.tenant_external_id.as_deref(),
+            operator_service_id: service.service_id,
+            allow_test_loopback: state.config.allow_oauth_loopback,
+        },
     )
     .await?
     {

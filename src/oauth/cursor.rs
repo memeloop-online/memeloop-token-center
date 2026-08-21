@@ -244,22 +244,28 @@ pub async fn start_cursor_login(
 // This is the transport/database boundary for one poll operation. Keeping the
 // authorization context explicit makes every caller provide tenant, operator,
 // clock, and loopback policy instead of hiding authority in shared state.
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+pub struct CursorPollAuthority<'a> {
+    pub required_tenant: Option<&'a str>,
+    pub operator_service_id: Option<Uuid>,
+    pub allow_test_loopback: bool,
+}
+
 pub async fn poll_cursor_login(
     db: &Database,
     http: &reqwest::Client,
     session_token: &str,
     key_material: &[u8],
     now: i64,
-    required_tenant: Option<&str>,
-    operator_service_id: Option<Uuid>,
-    allow_test_loopback: bool,
+    authority: CursorPollAuthority<'_>,
 ) -> Result<CursorPollResult, AppError> {
     let session: CursorLoginSessionToken =
         open_private_json(session_token, key_material, CURSOR_SESSION_AAD)
             .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
-    if required_tenant.is_some_and(|tenant| tenant != session.tenant_external_id)
-        || session.operator_service_id != operator_service_id
+    if authority
+        .required_tenant
+        .is_some_and(|tenant| tenant != session.tenant_external_id)
+        || session.operator_service_id != authority.operator_service_id
     {
         return Err(AppError::Forbidden);
     }
@@ -315,7 +321,7 @@ pub async fn poll_cursor_login(
         oauth_adapter_endpoint_scope(
             &state.poll_url,
             "poll_url",
-            allow_test_loopback,
+            authority.allow_test_loopback,
             network::scope_from_config(&state.provider_config),
         )?
     } else {
@@ -328,8 +334,13 @@ pub async fn poll_cursor_login(
         .query_pairs_mut()
         .append_pair("uuid", &state.uuid)
         .append_pair("verifier", &state.verifier);
-    let outbound_http =
-        network::client_for_url(http, poll_url.as_str(), scope, allow_test_loopback).await?;
+    let outbound_http = network::client_for_url(
+        http,
+        poll_url.as_str(),
+        scope,
+        authority.allow_test_loopback,
+    )
+    .await?;
     let response = outbound_http
         .get(poll_url)
         .send()

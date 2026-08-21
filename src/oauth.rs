@@ -13,9 +13,10 @@ pub use adapter::{
     refresh_managed_oauth_credential, resolve_managed_oauth_refresh_adapter,
 };
 pub use cursor::{
-    CursorOAuthEndpoints, CursorPollResult, DEFAULT_CURSOR_LOGIN_URL, DEFAULT_CURSOR_POLL_URL,
-    DEFAULT_CURSOR_REFRESH_URL, OAuthLoginStart, OAuthReauthorizationTarget, ReadyCursorLogin,
-    StartCursorLogin, poll_cursor_login, refresh_cursor_credential, start_cursor_login,
+    CursorOAuthEndpoints, CursorPollAuthority, CursorPollResult, DEFAULT_CURSOR_LOGIN_URL,
+    DEFAULT_CURSOR_POLL_URL, DEFAULT_CURSOR_REFRESH_URL, OAuthLoginStart,
+    OAuthReauthorizationTarget, ReadyCursorLogin, StartCursorLogin, poll_cursor_login,
+    refresh_cursor_credential, start_cursor_login,
 };
 #[cfg(test)]
 pub(crate) use endpoint::validate_oauth_endpoint;
@@ -279,9 +280,11 @@ mod tests {
             &started.session_token,
             key_material,
             2_000,
-            Some("tenant-b"),
-            None,
-            true,
+            CursorPollAuthority {
+                required_tenant: Some("tenant-b"),
+                operator_service_id: None,
+                allow_test_loopback: true,
+            },
         )
         .await
         .expect_err("cross-tenant polling must be rejected before I/O");
@@ -330,9 +333,11 @@ mod tests {
             &started.session_token,
             key_material,
             now.saturating_add(1),
-            Some("cursor-replay"),
-            None,
-            true,
+            CursorPollAuthority {
+                required_tenant: Some("cursor-replay"),
+                operator_service_id: None,
+                allow_test_loopback: true,
+            },
         )
         .await
         .expect("poll Cursor login")
@@ -372,9 +377,11 @@ mod tests {
             &started.session_token,
             key_material,
             now.saturating_add(3),
-            Some("cursor-replay"),
-            None,
-            true,
+            CursorPollAuthority {
+                required_tenant: Some("cursor-replay"),
+                operator_service_id: None,
+                allow_test_loopback: true,
+            },
         )
         .await
         .expect("replay consumed Cursor login")
