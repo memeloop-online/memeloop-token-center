@@ -46,6 +46,7 @@ mod router;
 mod routes;
 mod routing;
 mod self_service;
+mod sessions;
 mod traffic;
 mod upstreams;
 mod usage_analysis;
@@ -87,6 +88,7 @@ pub use router::{router, router_for_role};
 use routes::{control_router, gateway_router};
 use routing::*;
 use self_service::*;
+use sessions::*;
 use traffic::{
     AppliedTraffic, Protocol, TrafficPolicyProtocols,
     apply_traffic_plugin_for_existing_idempotency, apply_traffic_policy,

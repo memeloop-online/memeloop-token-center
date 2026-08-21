@@ -181,6 +181,88 @@ async fn execute_sql_script(pool: &AnyPool, sql: &'static str) {
 }
 
 #[tokio::test]
+async fn logical_session_api_is_stable_key_scoped_and_cursor_paginated() {
+    let fixture = Fixture::new("logical-session-api").await;
+    let (first_request, first_cluster) = observe_request(
+        &fixture.state,
+        &fixture.key,
+        &json!({"input": [{"role": "user", "content": "first session"}]}),
+        &ConversationHints::default(),
+        "Codex",
+    )
+    .await;
+    let (_second_request, second_cluster) = observe_request(
+        &fixture.state,
+        &fixture.key,
+        &json!({"input": [{"role": "user", "content": "unrelated second session"}]}),
+        &ConversationHints::default(),
+        "Claude Code",
+    )
+    .await;
+    assert_ne!(first_cluster, second_cluster);
+
+    let (status, first_page) = fixture.get("/self/v1/sessions?limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{first_page}");
+    let first_page = first_page.as_array().expect("session list");
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0]["key_id"], fixture.key.key_id.to_string());
+    assert_eq!(first_page[0]["active_requests"], 1);
+    let cursor_at = first_page[0]["last_activity_at"].as_i64().unwrap();
+    let cursor_session = first_page[0]["session_id"].as_str().unwrap();
+    let (status, second_page) = fixture
+        .get(&format!(
+            "/self/v1/sessions?limit=1&before_last_activity_at={cursor_at}&before_session_id={cursor_session}"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second_page}");
+    let second_page = second_page.as_array().expect("second session page");
+    assert_eq!(second_page.len(), 1);
+    assert_ne!(second_page[0]["session_id"], cursor_session);
+
+    let (status, detail) = fixture
+        .get(&format!("/self/v1/sessions/{first_cluster}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["cluster_id"], first_cluster.to_string());
+    assert_eq!(detail["unlinked"], false);
+    assert!(
+        detail["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|request| { request["request_id"] == first_request.to_string() })
+    );
+
+    let other = fixture
+        .state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "conversation-logical-session-api".into(),
+                principal_external_id: "other-user".into(),
+                alias: "Other key".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy {
+                    allowed_models: vec!["*".into()],
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            PEPPER,
+        )
+        .await
+        .expect("create other stable key");
+    let (status, hidden) = get_for_bearer(
+        &fixture.state,
+        &format!("/self/v1/sessions/{first_cluster}"),
+        &other.key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+}
+
+#[tokio::test]
 async fn candidates_are_visible_but_do_not_merge_and_empty_context_never_links() {
     let fixture = Fixture::new("candidate").await;
     let first_request = fixture.start_request("memory://first").await;

@@ -29,6 +29,8 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
             "/self/v1/conversations/{cluster_id}",
             get(self_conversation_detail),
         )
+        .route("/self/v1/sessions", get(self_sessions))
+        .route("/self/v1/sessions/{session_id}", get(self_session_detail))
         .route("/v1/responses", post(proxy_openai_responses))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(proxy_openai_chat))

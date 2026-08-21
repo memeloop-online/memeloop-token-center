@@ -189,6 +189,38 @@ async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
     let (source_kind, protocol, input_tokens, generation_units, modality, billing_unit) =
         match activity.kind {
             SeedUsageKind::Request { input_tokens } => {
+                let request_id = Uuid::now_v7().to_string();
+                sqlx::query(
+                    r#"INSERT INTO request_records (
+                           id, tenant_id, key_id, created_at, completed_at, protocol, model,
+                           status_code, duration_ms, input_tokens, output_tokens, cost_micros,
+                           error_code, request_object, response_object, reservation_id,
+                           upstream_account_id, model_route_id, currency
+                       ) VALUES ($1, $2, $3, $4, $4, 'openai-responses', $5, $6, 20, $7,
+                                 0, $8, NULLIF($9, ''), $10, $11, $12, NULLIF($13, ''),
+                                 NULL, $14)"#,
+                )
+                .bind(&request_id)
+                .bind(&tenant_id)
+                .bind(&key_id)
+                .bind(activity.created_at)
+                .bind(activity.model)
+                .bind(if activity.status_class == "success" {
+                    200_i64
+                } else {
+                    500_i64
+                })
+                .bind(input_tokens)
+                .bind(activity.cost_micros)
+                .bind(activity.error_code)
+                .bind(format!("memory://usage-analysis/{request_id}/request"))
+                .bind(format!("memory://usage-analysis/{request_id}/response"))
+                .bind(Uuid::now_v7().to_string())
+                .bind(&upstream_account_id)
+                .bind(activity.currency)
+                .execute(pool)
+                .await
+                .unwrap();
                 sqlx::query(
                     r#"INSERT INTO request_stats_facts (
                        request_id, tenant_id, key_id, created_at, model, protocol,
@@ -198,7 +230,7 @@ async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
                    ) VALUES ($1, $2, $3, $4, $5, 'openai-responses', $6, $7, $8, '',
                              20, $9, 0, 0, 0, 'default', $10, $11)"#,
                 )
-                .bind(Uuid::now_v7().to_string())
+                .bind(&request_id)
                 .bind(&tenant_id)
                 .bind(&key_id)
                 .bind(activity.created_at)
@@ -294,6 +326,45 @@ async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
             .await
             .unwrap();
     }
+    if source_kind == "request" {
+        for (table, bucket_column, bucket) in [
+            (
+                "session_usage_hourly",
+                "hour_bucket",
+                activity.created_at.div_euclid(3_600_000),
+            ),
+            (
+                "session_usage_daily",
+                "day_bucket",
+                activity.created_at.div_euclid(86_400_000),
+            ),
+        ] {
+            let sql = format!(
+                r#"INSERT INTO {table} (
+                       tenant_id, key_id, session_id, {bucket_column}, model, protocol,
+                       status_class, error_code, upstream_account_id, model_route_id,
+                       currency, requests, input_tokens, output_tokens, duration_count,
+                       duration_sum_ms, cost_micros
+                   ) VALUES ($1, $2, $3, $4, $5, 'openai', $6, $7, $8, '', $9,
+                             1, $10, 0, 1, 20, $11)"#
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&tenant_id)
+                .bind(&key_id)
+                .bind(format!("unlinked:{key_id}"))
+                .bind(bucket)
+                .bind(activity.model)
+                .bind(activity.status_class)
+                .bind(activity.error_code)
+                .bind(&upstream_account_id)
+                .bind(activity.currency)
+                .bind(input_tokens)
+                .bind(activity.cost_micros)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
     if source_kind == "generation" {
         for (table, bucket_column, bucket) in [
             (
@@ -386,6 +457,20 @@ fn assert_multibucket_metrics(body: &Value) {
             .unwrap()
             .iter()
             .any(|bucket| bucket["id"] == "error" && bucket["requests"] == 3),
+        "{body}"
+    );
+    let by_session = body["by_session"].as_array().unwrap();
+    assert_eq!(by_session.len(), 2, "{body}");
+    assert!(
+        by_session
+            .iter()
+            .any(|bucket| bucket["requests"] == 3 && bucket["costs"][0]["currency"] == "USD"),
+        "{body}"
+    );
+    assert!(
+        by_session
+            .iter()
+            .any(|bucket| bucket["requests"] == 1 && bucket["costs"][0]["currency"] == "CNY"),
         "{body}"
     );
 }

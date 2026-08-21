@@ -198,6 +198,17 @@ impl Database {
                 .then_with(|| left.currency.cmp(&right.currency))
         });
 
+        let session_sql = session_usage_dimension_sql(range.granularity, tenant_scoped);
+        let session_rows =
+            bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(session_sql)), main_plan)
+                .fetch_all(&self.pool)
+                .await?;
+        let mut session_projection: BTreeMap<(String, String), UsageMetricsAccumulator> =
+            BTreeMap::new();
+        for row in session_rows {
+            accumulate_session_usage_row(&mut session_projection, &row)?;
+        }
+
         let summary = projections
             .remove(&("summary".to_owned(), "summary".to_owned()))
             .unwrap_or_default()
@@ -205,6 +216,14 @@ impl Database {
         let mut time_series = Vec::new();
         let mut by_model = Vec::new();
         let mut by_key = Vec::new();
+        let mut by_session = session_projection
+            .into_iter()
+            .map(|((_kind, id), accumulator)| UsageAnalysisBucket {
+                id,
+                label: accumulator.label.clone(),
+                metrics: accumulator.finish_without_p95(),
+            })
+            .collect::<Vec<_>>();
         let mut by_upstream = Vec::new();
         let mut by_protocol = Vec::new();
         let mut by_status = Vec::new();
@@ -237,6 +256,7 @@ impl Database {
         for buckets in [
             &mut by_model,
             &mut by_key,
+            &mut by_session,
             &mut by_upstream,
             &mut by_protocol,
             &mut by_status,
@@ -276,6 +296,7 @@ impl Database {
             time_series,
             by_model,
             by_key,
+            by_session,
             by_upstream,
             by_protocol,
             by_status,
@@ -744,6 +765,137 @@ fn generation_usage_dimension_sql(
     )
 }
 
+fn session_usage_dimension_sql(
+    granularity: UsageAnalysisGranularity,
+    tenant_scoped: bool,
+) -> String {
+    let (table, bucket_column) = match granularity {
+        UsageAnalysisGranularity::Hour => ("session_usage_hourly", "hour_bucket"),
+        UsageAnalysisGranularity::Day => ("session_usage_daily", "day_bucket"),
+    };
+    let tenant_predicate = if tenant_scoped {
+        "AND {alias}.tenant_id = $1"
+    } else {
+        "AND CAST($1 AS TEXT) = ''"
+    };
+    let filters = |alias: &str| {
+        format!(
+            r#"{tenant_predicate}
+              AND ($2 = '' OR {alias}.key_id = $2)
+              AND ($5 = '' OR {alias}.model = $5)
+              AND ($6 = '' OR {alias}.protocol = $6)
+              AND ($7 = ''
+                   OR ($7 = 'success' AND {alias}.status_class = 'success')
+                   OR ($7 = 'error' AND {alias}.status_class = 'failure'))
+              AND ($8 = '' OR {alias}.error_code = $8)
+              AND ($9 = ''
+                   OR ($9 = 'unassigned' AND {alias}.upstream_account_id = '')
+                   OR {alias}.upstream_account_id = $9)
+              AND ($10 = '' OR {alias}.model_route_id = $10)"#,
+            tenant_predicate = tenant_predicate.replace("{alias}", alias),
+        )
+    };
+    let rollup_filters = filters("rollup");
+    let fact_filters = filters("fact");
+    format!(
+        r#"WITH session_activity AS (
+               SELECT rollup.tenant_id, rollup.key_id, rollup.session_id,
+                      rollup.model, rollup.protocol, rollup.status_class,
+                      rollup.error_code, rollup.upstream_account_id,
+                      rollup.model_route_id, rollup.currency, rollup.requests,
+                      rollup.input_tokens, rollup.output_tokens,
+                      rollup.duration_count, rollup.duration_sum_ms,
+                      rollup.cost_micros
+                 FROM {table} rollup
+                WHERE rollup.{bucket_column} >= $3 AND rollup.{bucket_column} < $4
+                  {rollup_filters}
+               UNION ALL
+               SELECT fact.tenant_id, fact.key_id,
+                      COALESCE(record.conversation_cluster_id, 'unlinked:' || fact.key_id),
+                      fact.model,
+                      CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%'
+                           THEN 'anthropic'
+                           WHEN fact.protocol = 'openai-image' THEN 'openai-image'
+                           ELSE 'openai' END,
+                      fact.status_class, fact.error_code, fact.upstream_account_id,
+                      fact.model_route_id, fact.currency, 1, fact.input_tokens,
+                      fact.output_tokens, 1, fact.duration_ms, fact.cost_micros
+                 FROM request_stats_facts fact
+                 JOIN request_records record
+                   ON record.id = fact.request_id AND record.created_at = fact.created_at
+                WHERE $13 <= $14 AND fact.created_at >= $13 AND fact.created_at <= $14
+                  {fact_filters}
+               UNION ALL
+               SELECT fact.tenant_id, fact.key_id,
+                      COALESCE(record.conversation_cluster_id, 'unlinked:' || fact.key_id),
+                      fact.model,
+                      CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%'
+                           THEN 'anthropic'
+                           WHEN fact.protocol = 'openai-image' THEN 'openai-image'
+                           ELSE 'openai' END,
+                      fact.status_class, fact.error_code, fact.upstream_account_id,
+                      fact.model_route_id, fact.currency, 1, fact.input_tokens,
+                      fact.output_tokens, 1, fact.duration_ms, fact.cost_micros
+                 FROM request_stats_facts fact
+                 JOIN request_records record
+                   ON record.id = fact.request_id AND record.created_at = fact.created_at
+                WHERE $15 <= $16 AND fact.created_at >= $15 AND fact.created_at <= $16
+                  {fact_filters}
+           ),
+           filtered_sessions AS (
+               SELECT activity.*
+                 FROM session_activity activity
+                 JOIN key_records key_record
+                   ON key_record.id = activity.key_id
+                  AND key_record.tenant_id = activity.tenant_id
+                 JOIN principals principal
+                   ON principal.id = key_record.principal_id
+                  AND principal.tenant_id = key_record.tenant_id
+                WHERE ($11 = '' OR LOWER(key_record.alias) LIKE $11 ESCAPE '\')
+                  AND ($12 = '' OR LOWER(principal.external_id) LIKE $12 ESCAPE '\')
+           ),
+           grouped_sessions AS (
+               SELECT session_id, currency, SUM(requests) AS requests,
+                      SUM(CASE WHEN status_class = 'success' THEN requests ELSE 0 END)
+                          AS successful_requests,
+                      SUM(CASE WHEN status_class = 'failure' THEN requests ELSE 0 END)
+                          AS failed_requests,
+                      SUM(input_tokens) AS input_tokens,
+                      SUM(output_tokens) AS output_tokens,
+                      SUM(duration_count) AS duration_count,
+                      SUM(duration_sum_ms) AS duration_sum_ms,
+                      SUM(cost_micros) AS cost_micros
+                 FROM filtered_sessions
+                GROUP BY session_id, currency
+           ),
+           with_session_totals AS (
+               SELECT grouped_sessions.*,
+                      SUM(requests) OVER (PARTITION BY session_id) AS session_requests
+                 FROM grouped_sessions
+           ),
+           ranked_sessions AS (
+               SELECT with_session_totals.*,
+                      DENSE_RANK() OVER (
+                          ORDER BY session_requests DESC, session_id ASC
+                      ) AS session_rank
+                 FROM with_session_totals
+           )
+           SELECT 'session' AS bucket_kind, session_id AS bucket_id,
+                  session_id AS bucket_label, currency,
+                  CAST(requests AS BIGINT) AS requests,
+                  CAST(successful_requests AS BIGINT) AS successful_requests,
+                  CAST(failed_requests AS BIGINT) AS failed_requests,
+                  CAST(input_tokens AS BIGINT) AS input_tokens,
+                  CAST(output_tokens AS BIGINT) AS output_tokens,
+                  CAST(duration_count AS BIGINT) AS duration_count,
+                  CAST(duration_sum_ms AS BIGINT) AS duration_sum_ms,
+                  CAST(cost_micros AS BIGINT) AS cost_micros
+             FROM ranked_sessions
+            WHERE session_rank <= 100
+            ORDER BY session_rank, session_id, currency"#,
+    )
+}
+
 fn usage_analysis_main_sql(
     backend: DatabaseBackend,
     granularity: UsageAnalysisGranularity,
@@ -932,6 +1084,73 @@ impl UsageMetricsAccumulator {
                 .collect(),
         }
     }
+
+    fn finish_without_p95(self) -> UsageAnalysisMetrics {
+        let avg_duration_ms = (self.duration_count > 0)
+            .then(|| self.duration_sum_ms as f64 / self.duration_count as f64);
+        UsageAnalysisMetrics {
+            requests: self.requests,
+            success: self.successful_requests,
+            failed: self.failed_requests,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            generation_units: 0,
+            avg_duration_ms,
+            p95_duration_ms: None,
+            costs: self
+                .costs
+                .into_iter()
+                .map(|(currency, micros)| UsageAnalysisCost {
+                    currency,
+                    cost: micros_to_decimal_string(micros),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn accumulate_session_usage_row(
+    projections: &mut BTreeMap<(String, String), UsageMetricsAccumulator>,
+    row: &AnyRow,
+) -> Result<(), AppError> {
+    let kind: String = row.try_get("bucket_kind")?;
+    let id: String = row.try_get("bucket_id")?;
+    let label: String = row.try_get("bucket_label")?;
+    let accumulator = projections.entry((kind, id)).or_default();
+    if accumulator.label.is_empty() {
+        accumulator.label = label;
+    }
+    accumulator.requests = accumulator
+        .requests
+        .saturating_add(row.try_get("requests")?);
+    accumulator.successful_requests = accumulator
+        .successful_requests
+        .saturating_add(row.try_get("successful_requests")?);
+    accumulator.failed_requests = accumulator
+        .failed_requests
+        .saturating_add(row.try_get("failed_requests")?);
+    accumulator.input_tokens = accumulator
+        .input_tokens
+        .saturating_add(row.try_get("input_tokens")?);
+    accumulator.output_tokens = accumulator
+        .output_tokens
+        .saturating_add(row.try_get("output_tokens")?);
+    accumulator.duration_count = accumulator
+        .duration_count
+        .saturating_add(row.try_get("duration_count")?);
+    accumulator.duration_sum_ms = accumulator
+        .duration_sum_ms
+        .saturating_add(row.try_get("duration_sum_ms")?);
+    let currency: String = row.try_get("currency")?;
+    let cost_micros: i64 = row.try_get("cost_micros")?;
+    accumulator
+        .costs
+        .entry(currency)
+        .and_modify(|cost| *cost = cost.saturating_add(cost_micros))
+        .or_insert(cost_micros);
+    Ok(())
 }
 
 fn accumulate_usage_row(

@@ -573,29 +573,9 @@ impl Database {
                 ));
             }
         };
-        let finished = record_request_finished_in_transaction(
-            &mut transaction,
-            &FinishRequest {
-                request_id: input.request_id,
-                status_code,
-                duration_ms: input.duration_ms.max(0),
-                input_tokens: usage.total_input_tokens(),
-                cached_input_tokens: usage.cached_input_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-                output_tokens: usage.output_tokens,
-                service_tier: usage.service_tier.clone(),
-                cost_micros,
-                error_code,
-                response_object,
-            },
-            now,
-        )
-        .await?;
-        if !finished {
-            return Err(AppError::Conflict(
-                "request terminal ownership changed".into(),
-            ));
-        }
+        // Attach the proven logical conversation before materializing session rollups.
+        // This keeps the request in its inferred cluster instead of first accounting it
+        // under the explicit `unlinked:<stable-key-id>` sentinel.
         if let Some(conversation) = input.conversation {
             if conversation.key.tenant_id != input.tenant_id
                 || conversation.key.key_id != input.reservation.key_id
@@ -623,6 +603,29 @@ impl Database {
                 )
                 .await?;
             }
+        }
+        let finished = record_request_finished_in_transaction(
+            &mut transaction,
+            &FinishRequest {
+                request_id: input.request_id,
+                status_code,
+                duration_ms: input.duration_ms.max(0),
+                input_tokens: usage.total_input_tokens(),
+                cached_input_tokens: usage.cached_input_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                output_tokens: usage.output_tokens,
+                service_tier: usage.service_tier.clone(),
+                cost_micros,
+                error_code,
+                response_object,
+            },
+            now,
+        )
+        .await?;
+        if !finished {
+            return Err(AppError::Conflict(
+                "request terminal ownership changed".into(),
+            ));
         }
         transaction.commit().await?;
         Ok(FinishProxyRequestResult::Finished {
@@ -920,6 +923,106 @@ pub(crate) async fn record_request_finished_in_transaction(
     if fact_inserted {
         sqlx::query(
             "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, duration_count, duration_sum_ms, cost_micros) SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, 1, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, 1, duration_ms, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency) DO UPDATE SET requests = request_daily_aggregates.requests + 1, input_tokens = request_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = request_daily_aggregates.output_tokens + excluded.output_tokens, cached_input_tokens = request_daily_aggregates.cached_input_tokens + excluded.cached_input_tokens, cache_write_tokens = request_daily_aggregates.cache_write_tokens + excluded.cache_write_tokens, duration_count = request_daily_aggregates.duration_count + excluded.duration_count, duration_sum_ms = request_daily_aggregates.duration_sum_ms + excluded.duration_sum_ms, cost_micros = request_daily_aggregates.cost_micros + excluded.cost_micros",
+        )
+        .bind(&request_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO session_usage_totals (
+                   tenant_id, key_id, session_id, currency, last_activity_at,
+                   requests, errors, input_tokens, output_tokens, duration_count,
+                   duration_sum_ms, cost_micros)
+               SELECT fact.tenant_id, fact.key_id,
+                      COALESCE(record.conversation_cluster_id, 'unlinked:' || fact.key_id),
+                      fact.currency, fact.created_at, 1,
+                      CASE WHEN fact.status_class = 'failure' THEN 1 ELSE 0 END,
+                      fact.input_tokens, fact.output_tokens, 1, fact.duration_ms,
+                      fact.cost_micros
+                 FROM request_stats_facts fact
+                 JOIN request_records record
+                   ON record.id = fact.request_id AND record.created_at = fact.created_at
+                WHERE fact.request_id = $1
+               ON CONFLICT (tenant_id, key_id, session_id, currency)
+               DO UPDATE SET
+                   last_activity_at = CASE
+                       WHEN session_usage_totals.last_activity_at < excluded.last_activity_at
+                       THEN excluded.last_activity_at
+                       ELSE session_usage_totals.last_activity_at END,
+                   requests = session_usage_totals.requests + excluded.requests,
+                   errors = session_usage_totals.errors + excluded.errors,
+                   input_tokens = session_usage_totals.input_tokens + excluded.input_tokens,
+                   output_tokens = session_usage_totals.output_tokens + excluded.output_tokens,
+                   duration_count = session_usage_totals.duration_count + excluded.duration_count,
+                   duration_sum_ms = session_usage_totals.duration_sum_ms + excluded.duration_sum_ms,
+                   cost_micros = session_usage_totals.cost_micros + excluded.cost_micros"#,
+        )
+        .bind(&request_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO session_usage_hourly (
+                   tenant_id, key_id, session_id, hour_bucket, model, protocol,
+                   status_class, error_code, upstream_account_id, model_route_id,
+                   currency, requests, input_tokens, output_tokens, duration_count,
+                   duration_sum_ms, cost_micros)
+               SELECT fact.tenant_id, fact.key_id,
+                      COALESCE(record.conversation_cluster_id, 'unlinked:' || fact.key_id),
+                      fact.created_at / 3600000, fact.model,
+                      CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%'
+                           THEN 'anthropic'
+                           WHEN fact.protocol = 'openai-image' THEN 'openai-image'
+                           ELSE 'openai' END,
+                      fact.status_class, fact.error_code, fact.upstream_account_id,
+                      fact.model_route_id, fact.currency, 1, fact.input_tokens,
+                      fact.output_tokens, 1, fact.duration_ms, fact.cost_micros
+                 FROM request_stats_facts fact
+                 JOIN request_records record
+                   ON record.id = fact.request_id AND record.created_at = fact.created_at
+                WHERE fact.request_id = $1
+               ON CONFLICT (
+                   tenant_id, key_id, session_id, hour_bucket, model, protocol,
+                   status_class, error_code, upstream_account_id, model_route_id, currency)
+               DO UPDATE SET
+                   requests = session_usage_hourly.requests + excluded.requests,
+                   input_tokens = session_usage_hourly.input_tokens + excluded.input_tokens,
+                   output_tokens = session_usage_hourly.output_tokens + excluded.output_tokens,
+                   duration_count = session_usage_hourly.duration_count + excluded.duration_count,
+                   duration_sum_ms = session_usage_hourly.duration_sum_ms + excluded.duration_sum_ms,
+                   cost_micros = session_usage_hourly.cost_micros + excluded.cost_micros"#,
+        )
+        .bind(&request_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO session_usage_daily (
+                   tenant_id, key_id, session_id, day_bucket, model, protocol,
+                   status_class, error_code, upstream_account_id, model_route_id,
+                   currency, requests, input_tokens, output_tokens, duration_count,
+                   duration_sum_ms, cost_micros)
+               SELECT fact.tenant_id, fact.key_id,
+                      COALESCE(record.conversation_cluster_id, 'unlinked:' || fact.key_id),
+                      fact.created_at / 86400000, fact.model,
+                      CASE WHEN fact.protocol = 'anthropic' OR fact.protocol LIKE 'anthropic-%'
+                           THEN 'anthropic'
+                           WHEN fact.protocol = 'openai-image' THEN 'openai-image'
+                           ELSE 'openai' END,
+                      fact.status_class, fact.error_code, fact.upstream_account_id,
+                      fact.model_route_id, fact.currency, 1, fact.input_tokens,
+                      fact.output_tokens, 1, fact.duration_ms, fact.cost_micros
+                 FROM request_stats_facts fact
+                 JOIN request_records record
+                   ON record.id = fact.request_id AND record.created_at = fact.created_at
+                WHERE fact.request_id = $1
+               ON CONFLICT (
+                   tenant_id, key_id, session_id, day_bucket, model, protocol,
+                   status_class, error_code, upstream_account_id, model_route_id, currency)
+               DO UPDATE SET
+                   requests = session_usage_daily.requests + excluded.requests,
+                   input_tokens = session_usage_daily.input_tokens + excluded.input_tokens,
+                   output_tokens = session_usage_daily.output_tokens + excluded.output_tokens,
+                   duration_count = session_usage_daily.duration_count + excluded.duration_count,
+                   duration_sum_ms = session_usage_daily.duration_sum_ms + excluded.duration_sum_ms,
+                   cost_micros = session_usage_daily.cost_micros + excluded.cost_micros"#,
         )
         .bind(&request_id)
         .execute(&mut **tx)

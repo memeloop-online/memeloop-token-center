@@ -379,6 +379,38 @@ pub struct ConversationClusterDetail {
     pub edges_truncated: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct LogicalSessionSummary {
+    pub session_id: String,
+    pub cluster_id: Option<Uuid>,
+    pub unlinked: bool,
+    pub key_id: Uuid,
+    pub key_alias: String,
+    pub model: String,
+    pub protocol: String,
+    pub last_status: String,
+    pub last_activity_at: i64,
+    pub active_requests: i64,
+    pub requests: i64,
+    pub errors: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub avg_duration_ms: Option<f64>,
+    pub costs: Vec<UsageAnalysisCost>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LogicalSessionDetail {
+    pub session_id: String,
+    pub cluster_id: Option<Uuid>,
+    pub unlinked: bool,
+    pub requests: Vec<ConversationRequestView>,
+    pub edges: Vec<ConversationEdgeView>,
+    pub has_more: bool,
+    pub next_cursor: Option<ConversationCursor>,
+    pub edges_truncated: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct StatsSummary {
     pub total_requests: i64,
@@ -496,6 +528,7 @@ pub struct UsageAnalysisResponse {
     pub time_series: Vec<UsageAnalysisTimeBucket>,
     pub by_model: Vec<UsageAnalysisBucket>,
     pub by_key: Vec<UsageAnalysisBucket>,
+    pub by_session: Vec<UsageAnalysisBucket>,
     pub by_upstream: Vec<UsageAnalysisBucket>,
     pub by_protocol: Vec<UsageAnalysisBucket>,
     pub by_status: Vec<UsageAnalysisBucket>,

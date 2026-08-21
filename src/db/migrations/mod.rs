@@ -269,9 +269,14 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0049_memeloop_cloud_event_queries.sql"),
     },
     Migration {
-        version: 49,
+        version: 50,
         name: "generation usage modality and billing dimensions",
-        sql: include_str!("../../../migrations/common/0049_generation_usage_dimensions.sql"),
+        sql: include_str!("../../../migrations/common/0050_generation_usage_dimensions.sql"),
+    },
+    Migration {
+        version: 51,
+        name: "logical session usage rollups",
+        sql: include_str!("../../../migrations/common/0051_session_usage_rollups.sql"),
     },
 ];
 
@@ -528,9 +533,14 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0049_memeloop_cloud_event_queries.sql"),
     },
     Migration {
-        version: 49,
+        version: 50,
         name: "generation usage modality and billing dimensions",
-        sql: include_str!("../../../migrations/common/0049_generation_usage_dimensions.sql"),
+        sql: include_str!("../../../migrations/common/0050_generation_usage_dimensions.sql"),
+    },
+    Migration {
+        version: 51,
+        name: "logical session usage rollups",
+        sql: include_str!("../../../migrations/common/0051_session_usage_rollups.sql"),
     },
 ];
 

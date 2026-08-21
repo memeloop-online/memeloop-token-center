@@ -48,6 +48,7 @@ mod requests;
 mod rotation;
 mod routing;
 mod rows;
+mod session_analytics;
 mod time;
 mod usage_analysis;
 mod validation;

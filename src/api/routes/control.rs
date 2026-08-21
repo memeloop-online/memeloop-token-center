@@ -92,6 +92,11 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(usage_analysis::internal_usage_analysis),
         )
         .route("/internal/v1/request-events", get(internal_request_events))
+        .route("/internal/v1/sessions", get(internal_sessions))
+        .route(
+            "/internal/v1/sessions/{session_id}",
+            get(internal_session_detail),
+        )
         .route(
             "/internal/v1/upstreams/{account_id}/credential",
             put(rotate_upstream_credential),
