@@ -50,9 +50,13 @@ Never put a CPA credential, CPA management token, Token Center service token or
 database password in an argument, environment variable, ConfigMap, shell
 substitution, here-document, Job annotation, terminal transcript or temporary
 file. The candidate client credentials and both HTTP tokens are read into
-process memory only. PostgreSQL connection settings may use the normal libpq
-Secret integration; the Job mounts a mode-`0440` `PGPASSFILE` rather than
-placing the database password or URI in argv or the environment.
+process memory only. PostgreSQL connection settings use libpq Secret
+integration rather than placing the password or URI in argv or the environment.
+Kubernetes projects the source Secret as mode `0440` for the pod's private GID.
+A non-root, no-capabilities init container copies it into a memory-backed
+`emptyDir` as UID/GID 10001 mode `0600`, which is the permission contract
+libpq actually accepts. The importer mounts only that prepared file, read-only,
+as `PGPASSFILE`. A direct mode-`0440` pgpass projection is invalid.
 
 Normal output is one JSON object containing counts only. It deliberately omits
 credentials, hashes, hash prefixes, key UUIDs, fingerprints, URLs and response

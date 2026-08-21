@@ -4,7 +4,6 @@ set -eu
 : "${PGHOST:?PGHOST is required}"
 : "${PGPORT:=5432}"
 : "${PGUSER:?PGUSER is required}"
-: "${PGPASSWORD:?PGPASSWORD is required}"
 : "${PGDATABASE:?PGDATABASE is required}"
 : "${CPAMP_SQLITE_PATH:=/source/usage.sqlite}"
 : "${IMPORT_TENANT_EXTERNAL_ID:=cpa-dogfood-import}"
@@ -28,9 +27,34 @@ case "$CPAMP_ALLOW_UNMAPPED" in true|false) ;; *) echo "CPAMP_ALLOW_UNMAPPED mus
 [ -r "$CPAMP_SQLITE_PATH" ] || { echo "CPAMP SQLite database is not readable" >&2; exit 2; }
 case "$CPAMP_IMPORT_SOURCE" in *[!A-Za-z0-9._:-]*|'') echo "CPAMP_IMPORT_SOURCE contains unsupported characters" >&2; exit 2;; esac
 
-# Use libpq's individual environment variables so credentials never appear in
-# argv and the Debian psql wrapper never interprets a URI as a local database.
-export PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE
+# Production Jobs use a private libpq password file prepared by their init
+# container. PGPASSWORD remains accepted for isolated test harnesses, but a
+# caller must supply exactly one credential mechanism and neither value is ever
+# placed in argv.
+if [ -n "${PGPASSFILE:-}" ] && [ -n "${PGPASSWORD:-}" ]; then
+  echo "set exactly one of PGPASSFILE or PGPASSWORD" >&2
+  exit 2
+elif [ -n "${PGPASSFILE:-}" ]; then
+  [ -f "$PGPASSFILE" ] && [ ! -L "$PGPASSFILE" ] && [ -r "$PGPASSFILE" ] || {
+    echo "PGPASSFILE must be a readable regular non-symlink file" >&2
+    exit 2
+  }
+  pgpass_mode=$(stat -c '%a' "$PGPASSFILE")
+  [ "$pgpass_mode" = 600 ] || {
+    echo "PGPASSFILE must have mode 0600" >&2
+    exit 2
+  }
+  export PGPASSFILE
+elif [ -n "${PGPASSWORD:-}" ]; then
+  export PGPASSWORD
+else
+  echo "PGPASSFILE or PGPASSWORD is required" >&2
+  exit 2
+fi
+
+# Use libpq's individual connection variables so the Debian psql wrapper never
+# interprets a URI as a local database.
+export PGHOST PGPORT PGUSER PGDATABASE
 
 cleanup_import_lock() {
   if [ -n "${CPAMP_LOCK_PID:-}" ]; then
