@@ -15,6 +15,7 @@ export const model = 'browser-e2e-model';
 export interface SeedState {
   clientCredential: string;
   clientKeyId: string;
+  otherClientCredential: string;
   otherClientKeyId: string;
   globalServiceCredential: string;
   serviceCredential: string;
@@ -250,7 +251,7 @@ async function seedThroughHttp(): Promise<SeedState> {
       route_group_ids: [],
     },
   });
-  const otherClient = await requestJson<{ key_id: string }>('/internal/v1/keys', {
+  const otherClient = await requestJson<{ key: string; key_id: string }>('/internal/v1/keys', {
     method: 'POST', credential: bootstrapToken,
     body: {
       tenant_external_id: tenant,
@@ -353,6 +354,7 @@ async function seedThroughHttp(): Promise<SeedState> {
   return {
     clientCredential: client.key,
     clientKeyId: client.key_id,
+    otherClientCredential: otherClient.key,
     globalServiceCredential: globalService.token,
     otherClientKeyId: otherClient.key_id,
     serviceCredential: service.token,

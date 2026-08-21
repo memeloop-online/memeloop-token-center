@@ -143,6 +143,23 @@ const upstream = createServer((request, response) => {
     const prompt = Array.isArray(body.messages)
       ? body.messages.map((message) => String(message?.content ?? '')).join('\n')
       : '';
+    if (prompt.includes('force session active success') || prompt.includes('force session active error')) {
+      const fail = prompt.includes('force session active error');
+      setTimeout(() => {
+        response.writeHead(fail ? 429 : 200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify(fail ? {
+          error: { type: 'rate_limit_error', message: 'mock delayed session rate limit' },
+        } : {
+          id: 'chatcmpl-browser-session-live',
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: body.model,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'browser delayed session response' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+        }));
+      }, 1_500);
+      return;
+    }
     if (prompt.includes('force observable error')) {
       response.writeHead(429, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ error: { type: 'rate_limit_error', message: 'mock observable rate limit' } }));

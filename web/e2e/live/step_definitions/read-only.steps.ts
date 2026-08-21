@@ -24,9 +24,9 @@ Then('操作台 favicon 和暗色主题正确', async function (this: LiveWorld)
   assert.ok(await page.locator('.brand-mark img').evaluate((image) => (image as HTMLImageElement).naturalWidth > 0));
 });
 
-Then('最近三十天请求统计的六个视图均可读取', async function (this: LiveWorld) {
+Then('最近三十天请求统计的七个视图均可读取', async function (this: LiveWorld) {
   const page = this.requirePage();
-  for (const name of ['总览', '趋势分析', '模型分析', '客户端凭据分析', '上游凭证分析', '用量热力图']) {
+  for (const name of ['总览', '趋势分析', '模型分析', '客户端凭据分析', '会话分析', '上游凭证分析', '用量热力图']) {
     const tab = page.getByRole('tab', { name, exact: true });
     await tab.click();
     assert.equal(await tab.getAttribute('aria-selected'), 'true');
