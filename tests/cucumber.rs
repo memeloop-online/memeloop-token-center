@@ -33,6 +33,8 @@ use wiremock::{
 
 #[path = "steps/cloud_entitlements.rs"]
 mod cloud_entitlements;
+#[path = "steps/logical_sessions.rs"]
+mod logical_sessions;
 #[path = "steps/security_acceptance.rs"]
 mod security_acceptance;
 
