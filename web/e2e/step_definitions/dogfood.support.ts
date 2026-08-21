@@ -77,7 +77,7 @@ export async function submitPortalGeneration(
   await panel.getByLabel('提示词').fill(prompt);
   if (kind === 'video') await panel.getByLabel('时长（秒）').fill(duration);
   if (Object.keys(parameters).length) await assertVisible(panel.getByRole('heading', { name: '工作流参数', exact: true }));
-  for (const [label, value] of Object.entries(parameters)) await panel.getByLabel(label, { exact: true }).fill(value);
+  for (const [label, value] of Object.entries(parameters)) await panel.getByLabel(label).fill(value);
   const endpoint = kind === 'video' ? '/v1/videos/generations' : '/v1/images/generations';
   const responsePromise = page.waitForResponse((response) => response.url().endsWith(endpoint) && response.request().method() === 'POST');
   await panel.getByRole('button', { name: '开始生成', exact: true }).click();

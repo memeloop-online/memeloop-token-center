@@ -199,8 +199,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
     required: ['prompt', 'width', 'height'],
     properties: {
       prompt: { type: 'string', minLength: 1, maxLength: 2000 },
-      width: { type: 'integer', minimum: 64, maximum: 2048, multipleOf: 64, default: 512 },
-      height: { type: 'integer', minimum: 64, maximum: 2048, multipleOf: 64, default: 512 },
+      width: { type: 'integer', minimum: 64, maximum: 2048, default: 512 },
+      height: { type: 'integer', minimum: 64, maximum: 2048, default: 512 },
     },
   }, null, 2));
   const comfyResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/upstreams') && response.request().method() === 'POST');
@@ -285,7 +285,6 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await manualPricing.getByRole('button', { name: '保存手动价格', exact: true }).click();
   assert.equal((await imagePriceResponsePromise).status(), 200);
   await manualPricing.getByRole('textbox', { name: '模型', exact: true }).fill(videoModel);
-  await manualPricing.getByLabel('币种', { exact: true }).selectOption('USD');
   await manualPricing.getByLabel('计费单位').selectOption('second');
   await manualPricing.getByLabel('单位价格').fill('0.1');
   const priceResponsePromise = page.waitForResponse((response) => response.url().includes(`/internal/v1/generation-prices/USD/${videoModel}`) && response.request().method() === 'POST');
@@ -412,7 +411,10 @@ When('用户通过门户创建并取消排队中的图片任务', async function
   const observation = requireMultimodalObservation(this);
   const blocker = await requestJson<{ job_id: string }>('/v1/images/generations', {
     method: 'POST', credential: observation.blockerCredential,
-    body: { model: observation.imageModel, input: { parameters: { prompt: 'browser-worker-blocker' } } },
+    body: {
+      model: observation.imageModel,
+      input: { parameters: { prompt: 'browser-worker-blocker', width: 512, height: 512 } },
+    },
   });
   await eventually(async () => {
     assert.ok(blocker.job_id);
