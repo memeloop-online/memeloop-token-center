@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
 use getrandom::fill;
@@ -6,7 +8,7 @@ use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use url::Url;
+use url::{Host, Url};
 use uuid::Uuid;
 
 pub mod codex_device;
@@ -369,9 +371,19 @@ pub async fn start_cursor_login(
     }
     let oauth_driver = input.oauth_driver.clone();
     let _ = validate_config(&input.provider_config)?;
-    let mut login_url = validate_oauth_endpoint(&input.endpoints.login_url, "login_url")?;
-    let poll_url = validate_oauth_endpoint(&input.endpoints.poll_url, "poll_url")?;
-    let refresh_url = validate_oauth_endpoint(&input.endpoints.refresh_url, "refresh_url")?;
+    let (mut login_url, poll_url, refresh_url) = if oauth_driver == "provider_adapter" {
+        (
+            oauth_adapter_endpoint_scope(&input.endpoints.login_url, "login_url", false)?.0,
+            oauth_adapter_endpoint_scope(&input.endpoints.poll_url, "poll_url", false)?.0,
+            oauth_adapter_endpoint_scope(&input.endpoints.refresh_url, "refresh_url", false)?.0,
+        )
+    } else {
+        (
+            validate_oauth_endpoint(&input.endpoints.login_url, "login_url")?,
+            validate_oauth_endpoint(&input.endpoints.poll_url, "poll_url")?,
+            validate_oauth_endpoint(&input.endpoints.refresh_url, "refresh_url")?,
+        )
+    };
     let mut verifier_bytes = [0_u8; 32];
     fill(&mut verifier_bytes).map_err(|_| AppError::Internal)?;
     let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
@@ -490,18 +502,18 @@ pub async fn poll_cursor_login(
             )?,
         ),
     };
-    let mut poll_url = validate_oauth_endpoint(&state.poll_url, "poll_url")?;
+    let (mut poll_url, scope) = if state.oauth_driver == "provider_adapter" {
+        oauth_adapter_endpoint_scope(&state.poll_url, "poll_url", allow_test_loopback)?
+    } else {
+        (
+            validate_oauth_endpoint(&state.poll_url, "poll_url")?,
+            OutboundScope::Public,
+        )
+    };
     poll_url
         .query_pairs_mut()
         .append_pair("uuid", &state.uuid)
         .append_pair("verifier", &state.verifier);
-    let scope = if state.oauth_driver == "provider_adapter" {
-        // Plugin adapters are installed by the cluster administrator and may
-        // intentionally expose their poll endpoint only inside the cluster.
-        OutboundScope::Private
-    } else {
-        OutboundScope::Public
-    };
     let outbound_http =
         network::client_for_url(http, poll_url.as_str(), scope, allow_test_loopback).await?;
     let response = outbound_http
@@ -679,10 +691,17 @@ pub async fn refresh_cursor_credential(
 pub(crate) fn validate_oauth_endpoint(value: &str, field: &str) -> Result<Url, AppError> {
     let url = Url::parse(value)
         .map_err(|_| AppError::BadRequest(format!("OAuth {field} must be a URL")))?;
-    let private_http = url.scheme() == "http" && url.host_str().is_some_and(is_private_oauth_host);
+    let private_http = url.scheme() == "http"
+        && url.host().is_some_and(|host| match host {
+            Host::Domain(host) => {
+                network::is_private_cluster_name(host) || is_loopback_oauth_name(host)
+            }
+            Host::Ipv4(address) => address.is_loopback(),
+            Host::Ipv6(address) => address.is_loopback(),
+        });
     if url.scheme() != "https" && !private_http {
         return Err(AppError::BadRequest(format!(
-            "OAuth {field} must use HTTPS (private cluster HTTP is allowed)"
+            "OAuth {field} must use HTTPS (explicit cluster HTTP is allowed)"
         )));
     }
     if url.username() != "" || url.password().is_some() || url.fragment().is_some() {
@@ -690,6 +709,12 @@ pub(crate) fn validate_oauth_endpoint(value: &str, field: &str) -> Result<Url, A
             "OAuth {field} cannot contain credentials or a fragment"
         )));
     }
+    Ok(url)
+}
+
+pub(crate) fn validate_oauth_adapter_endpoint(value: &str, field: &str) -> Result<Url, AppError> {
+    let url = validate_oauth_endpoint(value, field)?;
+    classify_oauth_endpoint(&url, field, false)?;
     Ok(url)
 }
 
@@ -711,17 +736,7 @@ fn validate_managed_oauth_adapter_endpoint_inner(
             "OAuth {field} cannot contain a query"
         )));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| AppError::BadRequest(format!("OAuth {field} must include a host")))?;
-    if let Ok(address) = host.parse::<std::net::IpAddr>()
-        && !(allow_test_loopback && address.is_loopback())
-        && !crate::network::is_public_ip(address)
-    {
-        return Err(AppError::BadRequest(format!(
-            "OAuth {field} cannot target a private or reserved IP address"
-        )));
-    }
+    classify_oauth_endpoint(&url, field, allow_test_loopback)?;
     Ok(url)
 }
 
@@ -731,46 +746,55 @@ fn managed_oauth_endpoint_scope(
 ) -> Result<(Url, OutboundScope), AppError> {
     let url =
         validate_managed_oauth_adapter_endpoint_inner(value, "adapter_url", allow_test_loopback)?;
-    let host = url.host_str().ok_or_else(|| {
-        AppError::BadRequest("managed OAuth adapter URL must include a host".into())
-    })?;
-    if host
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|address| address.is_loopback())
-    {
-        if !allow_test_loopback {
-            return Err(AppError::BadRequest(
-                "managed OAuth adapter loopback destinations are disabled".into(),
-            ));
-        }
-        return Ok((url, OutboundScope::Private));
-    }
-    let private_cluster =
-        !host.contains('.') || host.ends_with(".svc") || host.ends_with(".svc.cluster.local");
-    Ok((
-        url,
-        if private_cluster {
-            OutboundScope::Private
-        } else {
-            OutboundScope::Public
-        },
-    ))
+    let scope = classify_oauth_endpoint(&url, "adapter_url", allow_test_loopback)?;
+    Ok((url, scope))
 }
 
-fn is_private_oauth_host(host: &str) -> bool {
-    if let Ok(address) = host.parse::<std::net::IpAddr>() {
-        return match address {
-            std::net::IpAddr::V4(address) => {
-                address.is_private() || address.is_loopback() || address.is_link_local()
-            }
-            std::net::IpAddr::V6(address) => {
-                address.is_loopback()
-                    || address.is_unique_local()
-                    || address.is_unicast_link_local()
-            }
-        };
+pub(crate) fn oauth_adapter_endpoint_scope(
+    value: &str,
+    field: &str,
+    allow_test_loopback: bool,
+) -> Result<(Url, OutboundScope), AppError> {
+    let url = validate_oauth_endpoint(value, field)?;
+    let scope = classify_oauth_endpoint(&url, field, allow_test_loopback)?;
+    Ok((url, scope))
+}
+
+fn classify_oauth_endpoint(
+    url: &Url,
+    field: &str,
+    allow_test_loopback: bool,
+) -> Result<OutboundScope, AppError> {
+    let host = url
+        .host()
+        .ok_or_else(|| AppError::BadRequest(format!("OAuth {field} must include a host")))?;
+    match host {
+        Host::Domain(host) if network::is_private_cluster_name(host) => Ok(OutboundScope::Private),
+        Host::Domain(_) => Ok(OutboundScope::Public),
+        Host::Ipv4(address) => classify_oauth_ip(IpAddr::V4(address), field, allow_test_loopback),
+        Host::Ipv6(address) => classify_oauth_ip(IpAddr::V6(address), field, allow_test_loopback),
     }
-    !host.contains('.') || host.ends_with(".svc") || host.ends_with(".svc.cluster.local")
+}
+
+fn classify_oauth_ip(
+    address: IpAddr,
+    field: &str,
+    allow_test_loopback: bool,
+) -> Result<OutboundScope, AppError> {
+    if allow_test_loopback && address.is_loopback() {
+        return Ok(OutboundScope::Private);
+    }
+    if !network::is_public_ip(address) {
+        return Err(AppError::BadRequest(format!(
+            "OAuth {field} cannot target a private or reserved IP address"
+        )));
+    }
+    Ok(OutboundScope::Public)
+}
+
+fn is_loopback_oauth_name(host: &str) -> bool {
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    normalized == "localhost" || normalized.ends_with(".localhost")
 }
 
 async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
@@ -884,6 +908,43 @@ mod tests {
         .unwrap();
         assert_eq!(private.driver, "provider_adapter");
         assert!(validate_oauth_endpoint("http://oauth.example.com/login", "login_url").is_err());
+        assert_eq!(
+            oauth_adapter_endpoint_scope(
+                "http://oauth-adapter.default.svc/poll",
+                "poll_url",
+                false,
+            )
+            .unwrap()
+            .1,
+            OutboundScope::Private
+        );
+        for endpoint in [
+            "https://[::1]/oauth",
+            "https://[fe80::1]/oauth",
+            "https://[fc00::1]/oauth",
+            "https://[::ffff:169.254.169.254]/oauth",
+            "https://[64:ff9b::a9fe:a9fe]/oauth",
+            "https://[2002:7f00:1::]/oauth",
+        ] {
+            assert!(
+                oauth_adapter_endpoint_scope(endpoint, "adapter_url", false).is_err(),
+                "interactive adapter accepted {endpoint}"
+            );
+            assert!(
+                validate_managed_oauth_adapter_endpoint(endpoint, "adapter_url").is_err(),
+                "managed adapter accepted {endpoint}"
+            );
+        }
+        assert_eq!(
+            oauth_adapter_endpoint_scope(
+                "https://[2606:4700:4700::1111]/oauth",
+                "adapter_url",
+                false,
+            )
+            .unwrap()
+            .1,
+            OutboundScope::Public
+        );
     }
 
     #[tokio::test]

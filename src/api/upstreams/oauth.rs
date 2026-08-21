@@ -571,9 +571,12 @@ pub(crate) async fn refresh_managed_upstream_oauth(
         Ok(match driver.as_str() {
             "cursor" | "provider_adapter" => {
                 let refresh_scope = if driver == "provider_adapter" {
-                    // Interactive plugin adapters are installed by the cluster
-                    // administrator and may intentionally be in-cluster.
-                    OutboundScope::Private
+                    crate::oauth::oauth_adapter_endpoint_scope(
+                        &refresh_url,
+                        "refresh_url",
+                        state.config.allow_oauth_loopback,
+                    )?
+                    .1
                 } else {
                     OutboundScope::Public
                 };

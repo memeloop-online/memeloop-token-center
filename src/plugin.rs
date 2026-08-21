@@ -1680,7 +1680,7 @@ fn validate_provider_contribution(
             ("poll_url", &adapter.poll_url),
             ("refresh_url", &adapter.refresh_url),
         ] {
-            crate::oauth::validate_oauth_endpoint(endpoint, field)?;
+            crate::oauth::validate_oauth_adapter_endpoint(endpoint, field)?;
         }
     }
     if let Some(adapter) = &provider.managed_oauth_adapter {

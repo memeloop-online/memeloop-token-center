@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use url::Url;
+use url::{Host, Url};
 
 use crate::error::AppError;
 
@@ -42,36 +42,74 @@ pub fn scope_from_config(config: &Value) -> OutboundScope {
 /// original hostname. Pinned clients explicitly bypass environment proxies;
 /// otherwise a proxy could resolve the hostname again and undo this boundary.
 pub async fn client_for_url(
-    shared_private_client: &reqwest::Client,
+    shared_http: &reqwest::Client,
     value: &str,
     scope: OutboundScope,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
     let url = checked_http_url(value)?;
-    if scope == OutboundScope::Private {
-        return Ok(shared_private_client.clone());
-    }
-
     let host = url
-        .host_str()
+        .host()
         .ok_or_else(|| AppError::BadRequest("outbound URL must include a host".into()))?;
-    let loopback_name = is_loopback_name(host);
-    if url.scheme() != "https" && !(allow_test_loopback && loopback_name) {
+    let host_name = match &host {
+        Host::Domain(host) => *host,
+        Host::Ipv4(address) => {
+            return validated_literal_client(
+                shared_http,
+                IpAddr::V4(*address),
+                url.scheme(),
+                allow_test_loopback,
+            );
+        }
+        Host::Ipv6(address) => {
+            return validated_literal_client(
+                shared_http,
+                IpAddr::V6(*address),
+                url.scheme(),
+                allow_test_loopback,
+            );
+        }
+    };
+    let loopback_name = is_loopback_name(host_name);
+    let private_cluster_name =
+        scope == OutboundScope::Private && is_private_cluster_name(host_name);
+    if url.scheme() != "https" && !(allow_test_loopback && loopback_name) && !private_cluster_name {
         return Err(AppError::BadRequest(
-            "public outbound URLs must use HTTPS".into(),
+            "outbound URLs must use HTTPS outside explicit cluster services".into(),
         ));
+    }
+    // Cluster service discovery is an explicit global-operator authority. It
+    // is the only production private-DNS exception; arbitrary hostnames that
+    // resolve to RFC1918, link-local, or metadata addresses remain forbidden.
+    if private_cluster_name {
+        return Ok(shared_http.clone());
     }
 
     let port = url.port_or_known_default().ok_or_else(|| {
         AppError::BadRequest("outbound URL must use a known or explicit port".into())
     })?;
-    let addresses = resolve_once(host, port).await?;
+    let addresses = resolve_once(host_name, port).await?;
     let test_loopback = allow_test_loopback
         && loopback_name
         && addresses.iter().all(|address| address.ip().is_loopback());
     validate_public_addresses(&addresses, test_loopback)?;
+    crate::build_pinned_http_client(host_name, &addresses).map_err(|_| AppError::Internal)
+}
 
-    crate::build_pinned_http_client(host, &addresses).map_err(|_| AppError::Internal)
+fn validated_literal_client(
+    shared_http: &reqwest::Client,
+    address: IpAddr,
+    scheme: &str,
+    allow_test_loopback: bool,
+) -> Result<reqwest::Client, AppError> {
+    let test_loopback = allow_test_loopback && address.is_loopback();
+    if scheme != "https" && !test_loopback {
+        return Err(AppError::BadRequest(
+            "outbound IP literals must use HTTPS".into(),
+        ));
+    }
+    validate_public_addresses(&[SocketAddr::new(address, 0)], test_loopback)?;
+    Ok(shared_http.clone())
 }
 
 fn validate_public_addresses(
@@ -149,6 +187,11 @@ fn is_loopback_name(host: &str) -> bool {
         || normalized
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+pub(crate) fn is_private_cluster_name(host: &str) -> bool {
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    normalized.ends_with(".svc") || normalized.ends_with(".svc.cluster.local")
 }
 
 pub fn is_public_ip(address: IpAddr) -> bool {
@@ -289,6 +332,21 @@ mod tests {
             .await
             .is_ok()
         );
+        for endpoint in [
+            "https://10.0.0.1/provider",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/provider",
+            "https://[::ffff:169.254.169.254]/provider",
+            "https://[64:ff9b::a9fe:a9fe]/provider",
+            "https://[2002:7f00:1::]/provider",
+        ] {
+            assert!(
+                client_for_url(&shared, endpoint, OutboundScope::Private, false)
+                    .await
+                    .is_err(),
+                "private scope accepted {endpoint}"
+            );
+        }
     }
 
     #[test]
