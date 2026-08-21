@@ -26,6 +26,13 @@ struct CloudSubscriptionWebhook {
     version: i64,
     status: CloudSubscriptionStatus,
     policy: KeyPolicy,
+    /// Normalized route grants. Presence (including an empty array) opts in to
+    /// the grants contract; only older senders that omit both fields use the
+    /// one-time `allowed_models` compatibility snapshot.
+    #[serde(default)]
+    route_ids: Option<Vec<Uuid>>,
+    #[serde(default)]
+    route_group_ids: Option<Vec<Uuid>>,
     #[serde(default)]
     proration: Option<Value>,
 }
@@ -163,7 +170,7 @@ fn entitlement_operation(
     }
 }
 
-/// Signed, idempotent full-state bridge used only by MemeLoop Cloud. It keeps
+/// Signed, idempotent full-state subscription webhook used by MemeLoop Cloud. It keeps
 /// the durable credit account and key identity stable while applying quota and
 /// policy under the same monotonically increasing subscription version.
 pub(in crate::api) async fn sync_memeloop_cloud_subscription(
@@ -181,7 +188,7 @@ pub(in crate::api) async fn sync_memeloop_cloud_subscription(
     // Validate every entitlement field before creating durable identity rows.
     // The placeholder account is replaced only after the stable principal has
     // been resolved.
-    let mut operation = entitlement_operation(&payload, Uuid::nil(), &event_digest)?;
+    let operation = entitlement_operation(&payload, Uuid::nil(), &event_digest)?;
     crate::db::validate_entitlement_operation(&operation)?;
     let provisioning_key = format!(
         "memeloop-cloud-principal:{}",
@@ -190,82 +197,71 @@ pub(in crate::api) async fn sync_memeloop_cloud_subscription(
             payload.principal_external_id.as_bytes(),
         ])
     );
-    let existing = state
-        .db
-        .list_entitlements(
-            Some(&payload.tenant_external_id),
-            Some(MEMELOOP_CLOUD_PROVIDER),
-            Some(&payload.external_subscription_id),
-        )
-        .await?;
-    let credential = if existing.is_empty() {
-        if matches!(payload.status, CloudSubscriptionStatus::Cancelled) {
-            return Err(AppError::NotFound);
-        }
-        state
-            .db
-            .provision_cloud_credential(
-                &payload.tenant_external_id,
-                &payload.principal_external_id,
-                &payload.currency,
-                &provisioning_key,
-                state.config.key_pepper.as_bytes(),
-            )
-            .await?
-    } else {
-        state
-            .db
-            .cloud_credential_for_entitlement(
-                CloudCredentialEntitlementBinding {
-                    tenant_external_id: payload.tenant_external_id.clone(),
-                    principal_external_id: payload.principal_external_id.clone(),
-                    provider: MEMELOOP_CLOUD_PROVIDER.into(),
-                    external_subscription_id: payload.external_subscription_id.clone(),
-                    currency: payload.currency.clone(),
-                    provisioning_idempotency_key: provisioning_key,
-                },
-                state.config.key_pepper.as_bytes(),
-            )
-            .await?
-    };
-    if let EntitlementOperation::Reconcile(input) = &mut operation {
-        input.account_id = credential.account_id;
-    }
     // A bounded digest is used as the durable event namespace; the raw event
     // identifier may contain provider punctuation and is never persisted or
     // reflected into logs.
     let event_key_hash = digest(&[payload.tenant_external_id.as_bytes(), event_id.as_bytes()]);
     let reconciliation_key = format!("memeloop-cloud-event:{event_key_hash}");
-    let entitlement = state
+    let routing = match payload.status {
+        CloudSubscriptionStatus::Cancelled => {
+            if payload
+                .route_ids
+                .as_ref()
+                .is_some_and(|ids| !ids.is_empty())
+                || payload
+                    .route_group_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.is_empty())
+            {
+                return Err(AppError::BadRequest(
+                    "cancelled subscription cannot grant model routes".into(),
+                ));
+            }
+            CloudRoutingGrantSnapshot::DenyAll
+        }
+        CloudSubscriptionStatus::Active => {
+            if payload.route_ids.is_some() || payload.route_group_ids.is_some() {
+                CloudRoutingGrantSnapshot::Explicit {
+                    route_ids: payload.route_ids.clone().unwrap_or_default(),
+                    route_group_ids: payload.route_group_ids.clone().unwrap_or_default(),
+                }
+            } else {
+                CloudRoutingGrantSnapshot::LegacyAllowedModels(
+                    payload.policy.allowed_models.clone(),
+                )
+            }
+        }
+    };
+    let result = state
         .db
-        .reconcile_entitlement(operation, &reconciliation_key)
-        .await?;
-    let policy = state
-        .db
-        .update_key_policy_for_entitlement_version(
-            credential.key_id,
-            &payload.tenant_external_id,
-            MEMELOOP_CLOUD_PROVIDER,
-            &payload.external_subscription_id,
-            payload.version,
-            payload.policy,
-        )
-        .await?;
-    state
-        .db
-        .record_cloud_subscription_event(CloudSubscriptionEventInput {
-            tenant_external_id: payload.tenant_external_id.clone(),
-            principal_external_id: payload.principal_external_id.clone(),
-            key_id: credential.key_id,
-            entitlement_id: entitlement.entitlement.entitlement_id,
-            event_key_hash,
-            request_hash: event_digest,
-            version: payload.version,
-            subscription_status: match payload.status {
-                CloudSubscriptionStatus::Active => "active".into(),
-                CloudSubscriptionStatus::Cancelled => "cancelled".into(),
+        .apply_cloud_entitlement(
+            ApplyCloudEntitlementInput {
+                tenant_external_id: payload.tenant_external_id.clone(),
+                principal_external_id: payload.principal_external_id.clone(),
+                provider: MEMELOOP_CLOUD_PROVIDER.into(),
+                external_subscription_id: payload.external_subscription_id.clone(),
+                currency: payload.currency.clone(),
+                provisioning_idempotency_key: provisioning_key,
+                reconciliation_idempotency_key: reconciliation_key,
+                operation,
+                policy: payload.policy,
+                routing,
+                audit: CloudSubscriptionEventInput {
+                    tenant_external_id: payload.tenant_external_id.clone(),
+                    principal_external_id: payload.principal_external_id.clone(),
+                    key_id: Uuid::nil(),
+                    entitlement_id: Uuid::nil(),
+                    event_key_hash,
+                    request_hash: event_digest,
+                    version: payload.version,
+                    subscription_status: match payload.status {
+                        CloudSubscriptionStatus::Active => "active".into(),
+                        CloudSubscriptionStatus::Cancelled => "cancelled".into(),
+                    },
+                },
             },
-        })
+            state.config.key_pepper.as_bytes(),
+        )
         .await?;
 
     let status = match payload.status {
@@ -275,9 +271,9 @@ pub(in crate::api) async fn sync_memeloop_cloud_subscription(
     Ok((
         status,
         Json(json!({
-            "credential": credential,
-            "entitlement": entitlement,
-            "policy": policy,
+            "credential": result.credential,
+            "entitlement": result.entitlement,
+            "policy": result.policy,
         })),
     ))
 }

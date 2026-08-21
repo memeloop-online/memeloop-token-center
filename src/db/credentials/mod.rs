@@ -4,8 +4,11 @@ mod keys;
 mod legacy;
 mod service_tokens;
 
-pub(crate) use keys::validate_key_policy;
-pub use keys::{CloudCredentialEntitlementBinding, CreateKeyInput, ProvisionedCloudCredential};
+pub(crate) use keys::{
+    CloudCredentialProvisioningInput, replace_key_routing_grants_in_transaction,
+    validate_key_policy,
+};
+pub use keys::{CreateKeyInput, ProvisionedCloudCredential};
 pub use service_tokens::CreateServiceTokenInput;
 
 fn authenticated_key_from_row(

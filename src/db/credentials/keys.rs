@@ -1,4 +1,9 @@
+use std::collections::BTreeSet;
+
 use super::super::*;
+use crate::db::routing::{
+    bump_credential_grant_revisions, bump_route_grant_revisions, lock_routing_relation_writes,
+};
 
 const KEY_PROVISIONING_AAD: &[u8] = b"memeloop-token-center/key-provisioning-response/v1";
 const KEY_ROTATION_RESOURCE: &str = "key";
@@ -26,107 +31,187 @@ pub struct ProvisionedCloudCredential {
     pub key: Option<String>,
 }
 
-pub struct CloudCredentialEntitlementBinding {
-    pub tenant_external_id: String,
-    pub principal_external_id: String,
-    pub provider: String,
-    pub external_subscription_id: String,
-    pub currency: String,
-    pub provisioning_idempotency_key: String,
+pub(crate) struct CloudCredentialProvisioningInput<'a> {
+    pub tenant_external_id: &'a str,
+    pub principal_external_id: &'a str,
+    pub currency: &'a str,
+    pub provisioning_idempotency_key: &'a str,
+    pub create_if_missing: bool,
+    pub pepper: &'a [u8],
+    pub now: i64,
 }
 
 impl Database {
-    pub async fn cloud_credential_for_entitlement(
+    pub(crate) async fn provision_or_load_cloud_credential_in_transaction(
         &self,
-        binding: CloudCredentialEntitlementBinding,
-        pepper: &[u8],
-    ) -> Result<ProvisionedCloudCredential, AppError> {
-        let entitlement_exists = sqlx::query(
-            "SELECT e.id FROM subscription_entitlements e JOIN tenants t ON t.id = e.tenant_id WHERE t.external_id = $1 AND e.provider = $2 AND e.external_subscription_id = $3",
-        )
-        .bind(&binding.tenant_external_id)
-        .bind(&binding.provider)
-        .bind(&binding.external_subscription_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .is_some();
-        if !entitlement_exists {
-            return Err(AppError::NotFound);
-        }
-        let row = sqlx::query(
-            "SELECT k.id, k.account_id, k.alias, k.currency, k.credential_generation, k.issued_key_ciphertext, p.external_id AS principal_external_id, COALESCE((SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1), (SELECT lc.fingerprint FROM legacy_key_credentials lc WHERE lc.key_id = k.id AND lc.generation = k.credential_generation AND lc.revoked_at IS NULL ORDER BY lc.id LIMIT 1)) AS fingerprint FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN subscription_entitlements e ON e.tenant_id = t.id AND e.account_id = k.account_id WHERE t.external_id = $1 AND p.external_id = $2 AND e.provider = $3 AND e.external_subscription_id = $4 AND k.provisioning_idempotency_key = $5",
-        )
-        .bind(&binding.tenant_external_id)
-        .bind(&binding.principal_external_id)
-        .bind(&binding.provider)
-        .bind(&binding.external_subscription_id)
-        .bind(&binding.provisioning_idempotency_key)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(AppError::Forbidden)?;
-        provisioned_cloud_credential_from_row(
-            row,
-            &binding.principal_external_id,
-            Some(&binding.currency),
+        tx: &mut Transaction<'_, Any>,
+        input: CloudCredentialProvisioningInput<'_>,
+    ) -> Result<(String, ProvisionedCloudCredential), AppError> {
+        let CloudCredentialProvisioningInput {
+            tenant_external_id,
+            principal_external_id,
+            currency,
+            provisioning_idempotency_key,
+            create_if_missing,
             pepper,
-        )
-    }
+            now,
+        } = input;
+        validate_currency(currency)?;
+        validate_idempotency_key(provisioning_idempotency_key, "provisioning identity")?;
+        let bootstrap = CreateKeyInput {
+            tenant_external_id: tenant_external_id.to_owned(),
+            principal_external_id: principal_external_id.to_owned(),
+            alias: "MemeLoop Cloud".to_owned(),
+            currency: currency.to_owned(),
+            policy: KeyPolicy::default(),
+            initial_balance: Decimal::ZERO,
+            idempotency_key: Some(provisioning_idempotency_key.to_owned()),
+        };
+        validate_key_input(&bootstrap)?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948312))")
+                .bind(format!(
+                    "{}:{provisioning_idempotency_key}",
+                    tenant_external_id.trim()
+                ))
+                .execute(&mut **tx)
+                .await?;
+        }
 
-    /// Idempotently provisions the one stable downstream credential used by a
-    /// MemeLoop Cloud principal. The deterministic idempotency key is scoped by
-    /// tenant. Replays after secret-retention expiry return stable public
-    /// metadata without resurrecting or rotating credential material.
-    pub async fn provision_cloud_credential(
-        &self,
-        tenant_external_id: &str,
-        principal_external_id: &str,
-        currency: &str,
-        provisioning_idempotency_key: &str,
-        pepper: &[u8],
-    ) -> Result<ProvisionedCloudCredential, AppError> {
+        if create_if_missing {
+            sqlx::query(
+                "INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, $3) ON CONFLICT(external_id) DO NOTHING",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(tenant_external_id.trim())
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        }
+        let tenant_id: String = sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
+            .bind(tenant_external_id.trim())
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(AppError::NotFound)?
+            .try_get("id")?;
+
         let existing = sqlx::query(
-            "SELECT k.id, k.account_id, k.alias, k.currency, k.credential_generation, k.issued_key_ciphertext, p.external_id AS principal_external_id, COALESCE((SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1), (SELECT lc.fingerprint FROM legacy_key_credentials lc WHERE lc.key_id = k.id AND lc.generation = k.credential_generation AND lc.revoked_at IS NULL ORDER BY lc.id LIMIT 1)) AS fingerprint FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id WHERE t.external_id = $1 AND k.provisioning_idempotency_key = $2",
+            "SELECT k.id, k.account_id, k.alias, k.currency, k.status, k.credential_generation, k.issued_key_ciphertext, p.external_id AS principal_external_id, COALESCE((SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation ORDER BY (c.revoked_at IS NULL) DESC, c.id LIMIT 1), (SELECT lc.fingerprint FROM legacy_key_credentials lc WHERE lc.key_id = k.id AND lc.generation = k.credential_generation ORDER BY (lc.revoked_at IS NULL) DESC, lc.id LIMIT 1)) AS fingerprint, CASE WHEN EXISTS (SELECT 1 FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL) OR EXISTS (SELECT 1 FROM legacy_key_credentials lc WHERE lc.key_id = k.id AND lc.generation = k.credential_generation AND lc.revoked_at IS NULL) THEN 1 ELSE 0 END AS generation_active FROM key_records k JOIN principals p ON p.id = k.principal_id WHERE k.tenant_id = $1 AND k.provisioning_idempotency_key = $2",
         )
-        .bind(tenant_external_id)
+        .bind(&tenant_id)
         .bind(provisioning_idempotency_key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **tx)
         .await?;
         if let Some(row) = existing {
-            return provisioned_cloud_credential_from_row(
-                row,
-                principal_external_id,
-                Some(currency),
-                pepper,
-            );
+            return Ok((
+                tenant_id,
+                provisioned_cloud_credential_from_stable_row(
+                    row,
+                    principal_external_id.trim(),
+                    currency,
+                    pepper,
+                )?,
+            ));
+        }
+        if !create_if_missing {
+            return Err(AppError::NotFound);
         }
 
-        let issued = self
-            .create_key(
-                CreateKeyInput {
-                    tenant_external_id: tenant_external_id.to_owned(),
-                    principal_external_id: principal_external_id.to_owned(),
-                    alias: "MemeLoop Cloud".to_owned(),
-                    currency: currency.to_owned(),
-                    // The signed subscription snapshot is applied only after
-                    // the entitlement version is accepted. This deny-by-
-                    // default bootstrap policy prevents a partially processed
-                    // registration from spending credit.
-                    policy: KeyPolicy::default(),
-                    initial_balance: Decimal::ZERO,
-                    idempotency_key: Some(provisioning_idempotency_key.to_owned()),
-                },
-                pepper,
+        sqlx::query(
+            "INSERT INTO principals (id, tenant_id, external_id, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT(tenant_id, external_id) DO NOTHING",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&tenant_id)
+        .bind(principal_external_id.trim())
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        let principal_id: String =
+            sqlx::query("SELECT id FROM principals WHERE tenant_id = $1 AND external_id = $2")
+                .bind(&tenant_id)
+                .bind(principal_external_id.trim())
+                .fetch_one(&mut **tx)
+                .await?
+                .try_get("id")?;
+        let account_id = Uuid::now_v7();
+        let key_id = Uuid::now_v7();
+        let issued = crypto::issue_credential(key_id, pepper);
+        let issued_key = IssuedKey {
+            key_id,
+            account_id,
+            alias: "MemeLoop Cloud".to_owned(),
+            currency: currency.to_uppercase(),
+            credential_generation: 1,
+            key: issued.secret.clone(),
+            fingerprint: issued.fingerprint.clone(),
+        };
+        let issued_key_ciphertext = seal_private_json(&issued_key, pepper, KEY_PROVISIONING_AAD)?;
+        let provisioning_request_hash = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&serde_json::json!({
+                    "contract": "memeloop-cloud-stable-credential-v1",
+                    "tenant_external_id": tenant_external_id.trim(),
+                    "principal_external_id": principal_external_id.trim(),
+                    "currency": currency.to_uppercase(),
+                }))
+                .map_err(|_| AppError::Internal)?
             )
-            .await?;
-        Ok(ProvisionedCloudCredential {
-            key_id: issued.key_id,
-            account_id: issued.account_id,
-            alias: issued.alias,
-            currency: issued.currency,
-            credential_generation: issued.credential_generation,
-            fingerprint: issued.fingerprint,
-            key: Some(issued.key),
-        })
+        );
+        sqlx::query(
+            "INSERT INTO credit_accounts (id, tenant_id, principal_id, currency, available_micros, reserved_micros, created_at, updated_at) VALUES ($1, $2, $3, $4, 0, 0, $5, $6)",
+        )
+        .bind(account_id.to_string())
+        .bind(&tenant_id)
+        .bind(&principal_id)
+        .bind(currency.to_uppercase())
+        .bind(now)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO account_usage_state (account_id, settled_lifetime_micros, updated_at) VALUES ($1, 0, $2)",
+        )
+        .bind(account_id.to_string())
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, provisioning_idempotency_key, provisioning_request_hash, issued_key_ciphertext, created_at, updated_at) VALUES ($1, $2, $3, $4, 'MemeLoop Cloud', $5, $6, 'active', 1, $7, $8, $9, $10, $11)",
+        )
+        .bind(key_id.to_string())
+        .bind(&tenant_id)
+        .bind(&principal_id)
+        .bind(account_id.to_string())
+        .bind(currency.to_uppercase())
+        .bind(serde_json::to_string(&KeyPolicy::default()).map_err(|_| AppError::Internal)?)
+        .bind(provisioning_idempotency_key)
+        .bind(provisioning_request_hash)
+        .bind(issued_key_ciphertext)
+        .bind(now)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO key_budget_state (key_id, settled_lifetime_micros, reserved_micros, updated_at) VALUES ($1, 0, 0, $2)",
+        )
+        .bind(key_id.to_string())
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        insert_credential(tx, &issued, 1, now).await?;
+        Ok((
+            tenant_id,
+            ProvisionedCloudCredential {
+                key_id,
+                account_id,
+                alias: issued_key.alias,
+                currency: issued_key.currency,
+                credential_generation: 1,
+                fingerprint: issued_key.fingerprint,
+                key: Some(issued_key.key),
+            },
+        ))
     }
 
     pub async fn list_managed_keys(
@@ -218,6 +303,16 @@ impl Database {
         input: CreateKeyInput,
         pepper: &[u8],
     ) -> Result<IssuedKey, AppError> {
+        self.create_key_with_routing(input, &[], &[], pepper).await
+    }
+
+    pub async fn create_key_with_routing(
+        &self,
+        input: CreateKeyInput,
+        route_ids: &[Uuid],
+        route_group_ids: &[Uuid],
+        pepper: &[u8],
+    ) -> Result<IssuedKey, AppError> {
         validate_currency(&input.currency)?;
         validate_key_input(&input)?;
         let idempotency_key = input
@@ -245,6 +340,8 @@ impl Database {
                 "currency": input.currency.to_uppercase(),
                 "policy": input.policy,
                 "initial_balance": input.initial_balance.normalize().to_string()
+                ,"route_ids": route_ids
+                ,"route_group_ids": route_group_ids
             }))
             .expect("key provisioning request is JSON serializable");
             format!("{:x}", Sha256::digest(canonical))
@@ -390,6 +487,19 @@ impl Database {
         .execute(&mut *tx)
         .await?;
 
+        let legacy_allowed_models = (route_ids.is_empty() && route_group_ids.is_empty())
+            .then_some(input.policy.allowed_models.as_slice());
+        replace_key_routing_grants_in_transaction(
+            &mut tx,
+            &tenant_id,
+            key_id,
+            route_ids,
+            route_group_ids,
+            legacy_allowed_models,
+            now,
+        )
+        .await?;
+
         insert_credential(&mut tx, &issued, 1, now).await?;
         if initial_balance_micros != 0 {
             sqlx::query(
@@ -429,40 +539,6 @@ impl Database {
         Ok(policy)
     }
 
-    /// Applies a Cloud policy snapshot only while the corresponding durable
-    /// subscription version is still current. This compare-and-set prevents a
-    /// delayed older webhook from rolling policy back after a newer quota
-    /// snapshot has committed.
-    pub async fn update_key_policy_for_entitlement_version(
-        &self,
-        key_id: Uuid,
-        tenant_external_id: &str,
-        provider: &str,
-        external_subscription_id: &str,
-        version: i64,
-        policy: KeyPolicy,
-    ) -> Result<KeyPolicy, AppError> {
-        validate_key_policy(&policy)?;
-        let policy_json = serde_json::to_string(&policy).map_err(|_| AppError::Internal)?;
-        let result = sqlx::query(
-            "UPDATE key_records SET policy_json = $1, updated_at = $2 WHERE id = $3 AND status = 'active' AND EXISTS (SELECT 1 FROM subscription_entitlements e JOIN tenants t ON t.id = e.tenant_id WHERE t.external_id = $4 AND e.account_id = key_records.account_id AND e.provider = $5 AND e.external_subscription_id = $6 AND e.version = $7)",
-        )
-        .bind(policy_json)
-        .bind(unix_millis())
-        .bind(key_id.to_string())
-        .bind(tenant_external_id)
-        .bind(provider)
-        .bind(external_subscription_id)
-        .bind(version)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() != 1 {
-            return Err(AppError::Conflict(
-                "credential policy snapshot is stale or the credential is not active".into(),
-            ));
-        }
-        Ok(policy)
-    }
     pub async fn rotate_key(
         &self,
         key_id: Uuid,
@@ -770,10 +846,185 @@ impl Database {
     }
 }
 
-fn provisioned_cloud_credential_from_row(
+pub(crate) async fn replace_key_routing_grants_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    key_id: Uuid,
+    route_ids: &[Uuid],
+    route_group_ids: &[Uuid],
+    legacy_allowed_models: Option<&[String]>,
+    now: i64,
+) -> Result<(), AppError> {
+    let mut routes = route_ids.iter().copied().collect::<BTreeSet<_>>();
+    let groups = route_group_ids.iter().copied().collect::<BTreeSet<_>>();
+    if routes.len() > 500 || groups.len() > 500 {
+        return Err(AppError::BadRequest(
+            "credential routing grants cannot exceed 500 routes or route groups".into(),
+        ));
+    }
+    lock_routing_relation_writes(tx, tenant_id).await?;
+    let key_exists = sqlx::query("SELECT id FROM key_records WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
+        .bind(key_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some();
+    if !key_exists {
+        return Err(AppError::NotFound);
+    }
+    let old_route_rows = sqlx::query(
+        "SELECT model_route_id FROM routing_grants WHERE tenant_id = $1 AND key_id = $2 AND model_route_id IS NOT NULL ORDER BY model_route_id",
+    )
+    .bind(tenant_id)
+    .bind(key_id.to_string())
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut affected_routes = old_route_rows
+        .into_iter()
+        .map(|row| parse_uuid(row.try_get("model_route_id")?))
+        .collect::<Result<BTreeSet<_>, AppError>>()?;
+    require_grant_members(tx, "model_routes", tenant_id, &routes).await?;
+    require_grant_members(tx, "route_groups", tenant_id, &groups).await?;
+
+    if let Some(allowed_models) = legacy_allowed_models {
+        let allowed = allowed_models
+            .iter()
+            .map(|model| model.trim().to_owned())
+            .collect::<BTreeSet<_>>();
+        let rows = if allowed.contains("*") {
+            sqlx::query("SELECT id FROM model_routes WHERE tenant_id = $1 ORDER BY id")
+                .bind(tenant_id)
+                .fetch_all(&mut **tx)
+                .await?
+        } else if allowed.is_empty() {
+            Vec::new()
+        } else {
+            let mut sql =
+                "SELECT id FROM model_routes WHERE tenant_id = $1 AND public_model IN (".to_owned();
+            for index in 0..allowed.len() {
+                if index != 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('$');
+                sql.push_str(&(index + 2).to_string());
+            }
+            sql.push_str(") ORDER BY id");
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(tenant_id);
+            for model in allowed {
+                query = query.bind(model);
+            }
+            query.fetch_all(&mut **tx).await?
+        };
+        for row in rows {
+            routes.insert(parse_uuid(row.try_get("id")?)?);
+        }
+    }
+    affected_routes.extend(routes.iter().copied());
+
+    sqlx::query("DELETE FROM routing_grants WHERE tenant_id = $1 AND key_id = $2")
+        .bind(tenant_id)
+        .bind(key_id.to_string())
+        .execute(&mut **tx)
+        .await?;
+    for chunk in routes.iter().collect::<Vec<_>>().chunks(200) {
+        let mut sql = "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at) VALUES ".to_owned();
+        for index in 0..chunk.len() {
+            if index != 0 {
+                sql.push_str(", ");
+            }
+            let offset = index * 4;
+            sql.push_str(&format!(
+                "(${}, ${}, ${}, NULL, ${})",
+                offset + 1,
+                offset + 2,
+                offset + 3,
+                offset + 4
+            ));
+        }
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for route_id in chunk {
+            query = query
+                .bind(tenant_id)
+                .bind(key_id.to_string())
+                .bind(route_id.to_string())
+                .bind(now);
+        }
+        query.execute(&mut **tx).await?;
+    }
+    for chunk in groups.iter().collect::<Vec<_>>().chunks(200) {
+        let mut sql = "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at) VALUES ".to_owned();
+        for index in 0..chunk.len() {
+            if index != 0 {
+                sql.push_str(", ");
+            }
+            let offset = index * 4;
+            sql.push_str(&format!(
+                "(${}, ${}, NULL, ${}, ${})",
+                offset + 1,
+                offset + 2,
+                offset + 3,
+                offset + 4
+            ));
+        }
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for group_id in chunk {
+            query = query
+                .bind(tenant_id)
+                .bind(key_id.to_string())
+                .bind(group_id.to_string())
+                .bind(now);
+        }
+        query.execute(&mut **tx).await?;
+    }
+    bump_credential_grant_revisions(tx, tenant_id, &[key_id]).await?;
+    bump_route_grant_revisions(
+        tx,
+        tenant_id,
+        &affected_routes.into_iter().collect::<Vec<_>>(),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn require_grant_members(
+    tx: &mut Transaction<'_, Any>,
+    table: &str,
+    tenant_id: &str,
+    ids: &BTreeSet<Uuid>,
+) -> Result<(), AppError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let prefix = match table {
+        "model_routes" => "SELECT COUNT(*) AS found FROM model_routes WHERE tenant_id = ",
+        "route_groups" => "SELECT COUNT(*) AS found FROM route_groups WHERE tenant_id = ",
+        _ => return Err(AppError::Internal),
+    };
+    let mut sql = prefix.to_owned();
+    sql.push_str("$1 AND id IN (");
+    for index in 0..ids.len() {
+        if index != 0 {
+            sql.push_str(", ");
+        }
+        sql.push('$');
+        sql.push_str(&(index + 2).to_string());
+    }
+    sql.push(')');
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(tenant_id);
+    for id in ids {
+        query = query.bind(id.to_string());
+    }
+    let found: i64 = query.fetch_one(&mut **tx).await?.try_get("found")?;
+    if found != ids.len() as i64 {
+        return Err(AppError::NotFound);
+    }
+    Ok(())
+}
+
+fn provisioned_cloud_credential_from_stable_row(
     row: AnyRow,
     expected_principal: &str,
-    expected_currency: Option<&str>,
+    expected_currency: &str,
     pepper: &[u8],
 ) -> Result<ProvisionedCloudCredential, AppError> {
     let principal: String = row.try_get("principal_external_id")?;
@@ -781,7 +1032,7 @@ fn provisioned_cloud_credential_from_row(
     let currency: String = row.try_get("currency")?;
     if principal != expected_principal
         || alias != "MemeLoop Cloud"
-        || expected_currency.is_some_and(|expected| !currency.eq_ignore_ascii_case(expected))
+        || !currency.eq_ignore_ascii_case(expected_currency)
     {
         return Err(AppError::Conflict(
             "MemeLoop Cloud principal identity or currency does not match its stable credential"
@@ -789,15 +1040,21 @@ fn provisioned_cloud_credential_from_row(
         ));
     }
     let fingerprint: Option<String> = row.try_get("fingerprint")?;
-    let fingerprint = fingerprint.ok_or_else(|| {
-        AppError::Conflict("the stable MemeLoop Cloud credential is not active".into())
-    })?;
+    let fingerprint = fingerprint.ok_or(AppError::Internal)?;
+    let status: String = row.try_get("status")?;
     let generation: i64 = row.try_get("credential_generation")?;
+    let generation_active = row.try_get::<i64, _>("generation_active")? != 0;
     let ciphertext: Option<String> = row.try_get("issued_key_ciphertext")?;
-    let issued = if generation == 1 {
+    // Never replay a secret while the stable identity is suspended/revoked or
+    // after its generation has been revoked. Financial lifecycle events still
+    // receive stable public metadata so cancellation cannot be stranded.
+    let key = if status == "active" && generation == 1 && generation_active {
         ciphertext
             .as_deref()
-            .map(|ciphertext| open_private_json(ciphertext, pepper, KEY_PROVISIONING_AAD))
+            .map(|ciphertext| {
+                open_private_json::<IssuedKey>(ciphertext, pepper, KEY_PROVISIONING_AAD)
+                    .map(|issued| issued.key)
+            })
             .transpose()?
     } else {
         None
@@ -809,7 +1066,7 @@ fn provisioned_cloud_credential_from_row(
         currency,
         credential_generation: generation,
         fingerprint,
-        key: issued.map(|issued: IssuedKey| issued.key),
+        key,
     })
 }
 

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::super::*;
 
 #[derive(Clone, Debug, Serialize)]
@@ -44,6 +46,42 @@ pub enum EntitlementOperation {
     Replace(ReplaceEntitlementInput),
 }
 
+#[derive(Clone, Debug)]
+pub enum CloudRoutingGrantSnapshot {
+    /// The normalized contract. Empty vectors intentionally deny every route.
+    Explicit {
+        route_ids: Vec<Uuid>,
+        route_group_ids: Vec<Uuid>,
+    },
+    /// Compatibility for older Cloud senders. Models are resolved to the
+    /// tenant's routes once, while this transaction is committed.
+    LegacyAllowedModels(Vec<String>),
+    /// Cancellation always removes authorization regardless of payload data.
+    DenyAll,
+}
+
+#[derive(Clone, Debug)]
+pub struct ApplyCloudEntitlementInput {
+    pub tenant_external_id: String,
+    pub principal_external_id: String,
+    pub provider: String,
+    pub external_subscription_id: String,
+    pub currency: String,
+    pub provisioning_idempotency_key: String,
+    pub reconciliation_idempotency_key: String,
+    pub operation: EntitlementOperation,
+    pub policy: KeyPolicy,
+    pub routing: CloudRoutingGrantSnapshot,
+    pub audit: CloudSubscriptionEventInput,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ApplyCloudEntitlementResult {
+    pub credential: ProvisionedCloudCredential,
+    pub entitlement: EntitlementReconcileResult,
+    pub policy: KeyPolicy,
+}
+
 impl EntitlementOperation {
     fn tenant_external_id(&self) -> &str {
         match self {
@@ -83,11 +121,7 @@ impl Database {
         validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
         canonicalize_entitlement_operation(&mut operation)?;
         validate_entitlement_operation(&operation)?;
-        let canonical = serde_json::to_vec(&operation).map_err(|_| AppError::Internal)?;
-        let request_hash = format!("{:x}", Sha256::digest(&canonical));
         let tenant_external_id = operation.tenant_external_id().to_owned();
-        let now = unix_millis();
-        let reconciliation_id = Uuid::now_v7();
         let mut tx = self.begin_write_transaction().await?;
         let tenant = sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
             .bind(&tenant_external_id)
@@ -95,70 +129,322 @@ impl Database {
             .await?
             .ok_or(AppError::NotFound)?;
         let tenant_id: String = tenant.try_get("id")?;
-        if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948315))")
-                .bind(format!("{tenant_id}:{idempotency_key}"))
-                .execute(&mut *tx)
-                .await?;
-        } else {
-            // Acquire SQLite's write lock before checking the replay row so two
-            // concurrent first deliveries cannot both perform ledger changes.
-            sqlx::query("UPDATE tenants SET created_at = created_at WHERE id = $1")
-                .bind(&tenant_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        if let Some(replay) = sqlx::query(
-            "SELECT request_hash, response_json FROM entitlement_reconciliations WHERE tenant_id = $1 AND idempotency_key = $2",
+        let (result, _) = reconcile_entitlement_in_transaction(
+            &mut tx,
+            self.backend,
+            &tenant_id,
+            operation,
+            idempotency_key,
         )
-        .bind(&tenant_id)
-        .bind(idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            let existing_hash: String = replay.try_get("request_hash")?;
-            if existing_hash != request_hash {
-                return Err(AppError::Conflict(
-                    "Idempotency-Key was already used for a different entitlement request".into(),
-                ));
-            }
-            let response_json: String = replay.try_get("response_json")?;
-            let response =
-                serde_json::from_str(&response_json).map_err(|_| AppError::Internal)?;
-            tx.commit().await?;
-            return Ok(response);
-        }
-
-        let result = match operation {
-            EntitlementOperation::Reconcile(input) => {
-                reconcile_entitlement_snapshot(&mut tx, &tenant_id, &input, reconciliation_id, now)
-                    .await?
-            }
-            EntitlementOperation::Cancel(input) => {
-                cancel_entitlement_snapshot(&mut tx, &tenant_id, &input, reconciliation_id, now)
-                    .await?
-            }
-            EntitlementOperation::Replace(input) => {
-                replace_entitlement_snapshot(&mut tx, &tenant_id, &input, reconciliation_id, now)
-                    .await?
-            }
-        };
-        let response_json = serde_json::to_string(&result).map_err(|_| AppError::Internal)?;
-        sqlx::query(
-            "INSERT INTO entitlement_reconciliations (id, tenant_id, idempotency_key, request_hash, response_json, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(reconciliation_id.to_string())
-        .bind(&tenant_id)
-        .bind(idempotency_key)
-        .bind(request_hash)
-        .bind(response_json)
-        .bind(now)
-        .execute(&mut *tx)
         .await?;
-
         tx.commit().await?;
         Ok(result)
     }
+
+    /// Atomically applies the MemeLoop Cloud financial snapshot, stable
+    /// credential identity, rate policy, normalized routing grants, replay
+    /// record, and audit event. No externally visible partial state survives a
+    /// failed webhook.
+    pub async fn apply_cloud_entitlement(
+        &self,
+        mut input: ApplyCloudEntitlementInput,
+        pepper: &[u8],
+    ) -> Result<ApplyCloudEntitlementResult, AppError> {
+        validate_idempotency_key(
+            &input.reconciliation_idempotency_key,
+            "reconciliation identity",
+        )?;
+        validate_key_policy(&input.policy)?;
+        validate_cloud_routing_snapshot(&input.routing)?;
+        canonicalize_entitlement_operation(&mut input.operation)?;
+        validate_entitlement_operation(&input.operation)?;
+        let (active_snapshot, version) = match &input.operation {
+            EntitlementOperation::Reconcile(operation) => {
+                if operation.tenant_external_id != input.tenant_external_id
+                    || operation.provider != input.provider
+                    || operation.external_subscription_id != input.external_subscription_id
+                    || !operation.currency.eq_ignore_ascii_case(&input.currency)
+                {
+                    return Err(AppError::BadRequest(
+                        "Cloud entitlement identity fields must match".into(),
+                    ));
+                }
+                (true, operation.version)
+            }
+            EntitlementOperation::Cancel(operation) => {
+                if operation.tenant_external_id != input.tenant_external_id
+                    || operation.provider != input.provider
+                    || operation.external_subscription_id != input.external_subscription_id
+                {
+                    return Err(AppError::BadRequest(
+                        "Cloud entitlement identity fields must match".into(),
+                    ));
+                }
+                (false, operation.version)
+            }
+            EntitlementOperation::Replace(_) => {
+                return Err(AppError::BadRequest(
+                    "MemeLoop Cloud snapshots do not replace subscription identity".into(),
+                ));
+            }
+        };
+        if input.audit.tenant_external_id != input.tenant_external_id
+            || input.audit.principal_external_id != input.principal_external_id
+            || input.audit.version != version
+            || input.audit.subscription_status
+                != if active_snapshot {
+                    "active"
+                } else {
+                    "cancelled"
+                }
+        {
+            return Err(AppError::BadRequest(
+                "Cloud audit identity must match the entitlement snapshot".into(),
+            ));
+        }
+        if !active_snapshot && !matches!(input.routing, CloudRoutingGrantSnapshot::DenyAll) {
+            return Err(AppError::BadRequest(
+                "cancelled Cloud snapshots cannot grant model routes".into(),
+            ));
+        }
+
+        let now = unix_millis();
+        let mut tx = self.begin_write_transaction().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            let subscription_lock = serde_json::to_string(&(
+                &input.tenant_external_id,
+                &input.provider,
+                &input.external_subscription_id,
+            ))
+            .map_err(|_| AppError::Internal)?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948316))")
+                .bind(subscription_lock)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let bound_principal = sqlx::query(
+            "SELECT p.external_id FROM subscription_entitlements e JOIN tenants t ON t.id = e.tenant_id JOIN key_records k ON k.tenant_id = e.tenant_id AND k.account_id = e.account_id JOIN principals p ON p.id = k.principal_id WHERE t.external_id = $1 AND e.provider = $2 AND e.external_subscription_id = $3",
+        )
+        .bind(&input.tenant_external_id)
+        .bind(&input.provider)
+        .bind(&input.external_subscription_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = bound_principal {
+            let bound_principal: String = row.try_get("external_id")?;
+            if bound_principal != input.principal_external_id {
+                return Err(AppError::Forbidden);
+            }
+        }
+        let (tenant_id, credential) = self
+            .provision_or_load_cloud_credential_in_transaction(
+                &mut tx,
+                CloudCredentialProvisioningInput {
+                    tenant_external_id: &input.tenant_external_id,
+                    principal_external_id: &input.principal_external_id,
+                    currency: &input.currency,
+                    provisioning_idempotency_key: &input.provisioning_idempotency_key,
+                    create_if_missing: active_snapshot,
+                    pepper,
+                    now,
+                },
+            )
+            .await?;
+        if let EntitlementOperation::Reconcile(operation) = &mut input.operation {
+            operation.account_id = credential.account_id;
+        }
+        let (entitlement, replayed) = reconcile_entitlement_in_transaction(
+            &mut tx,
+            self.backend,
+            &tenant_id,
+            input.operation,
+            &input.reconciliation_idempotency_key,
+        )
+        .await?;
+
+        if replayed {
+            input.policy.allowed_models.clear();
+            input.audit.key_id = credential.key_id;
+            input.audit.entitlement_id = entitlement.entitlement.entitlement_id;
+            super::cloud::record_cloud_subscription_event_in_transaction(&mut tx, input.audit, now)
+                .await?;
+            tx.commit().await?;
+            return Ok(ApplyCloudEntitlementResult {
+                credential,
+                entitlement,
+                policy: input.policy,
+            });
+        }
+
+        let key_status: String = sqlx::query(
+            "SELECT k.status FROM key_records k JOIN subscription_entitlements e ON e.tenant_id = k.tenant_id AND e.account_id = k.account_id WHERE k.id = $1 AND k.tenant_id = $2 AND e.provider = $3 AND e.external_subscription_id = $4 AND e.version = $5",
+        )
+        .bind(credential.key_id.to_string())
+        .bind(&tenant_id)
+        .bind(&input.provider)
+        .bind(&input.external_subscription_id)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::Conflict(
+                "credential policy snapshot is stale or belongs to another entitlement".into(),
+            )
+        })?
+        .try_get("status")?;
+
+        // `allowed_models` remains accepted only as an input compatibility
+        // source. Clearing it before persistence prevents it becoming a second
+        // runtime authority beside normalized grants.
+        input.policy.allowed_models.clear();
+        let policy_json = serde_json::to_string(&input.policy).map_err(|_| AppError::Internal)?;
+        let updated = sqlx::query(
+            "UPDATE key_records SET policy_json = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+        )
+        .bind(policy_json)
+        .bind(now)
+        .bind(credential.key_id.to_string())
+        .bind(&tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "credential policy snapshot is stale".into(),
+            ));
+        }
+
+        let may_grant = active_snapshot && key_status == "active";
+        let (route_ids, route_group_ids, legacy_models) = if may_grant {
+            match &input.routing {
+                CloudRoutingGrantSnapshot::Explicit {
+                    route_ids,
+                    route_group_ids,
+                } => (route_ids.as_slice(), route_group_ids.as_slice(), None),
+                CloudRoutingGrantSnapshot::LegacyAllowedModels(models) => {
+                    (&[][..], &[][..], Some(models.as_slice()))
+                }
+                CloudRoutingGrantSnapshot::DenyAll => (&[][..], &[][..], None),
+            }
+        } else {
+            (&[][..], &[][..], None)
+        };
+        replace_key_routing_grants_in_transaction(
+            &mut tx,
+            &tenant_id,
+            credential.key_id,
+            route_ids,
+            route_group_ids,
+            legacy_models,
+            now,
+        )
+        .await?;
+
+        input.audit.key_id = credential.key_id;
+        input.audit.entitlement_id = entitlement.entitlement.entitlement_id;
+        super::cloud::record_cloud_subscription_event_in_transaction(&mut tx, input.audit, now)
+            .await?;
+        tx.commit().await?;
+        Ok(ApplyCloudEntitlementResult {
+            credential,
+            entitlement,
+            policy: input.policy,
+        })
+    }
+}
+
+fn validate_cloud_routing_snapshot(routing: &CloudRoutingGrantSnapshot) -> Result<(), AppError> {
+    let CloudRoutingGrantSnapshot::Explicit {
+        route_ids,
+        route_group_ids,
+    } = routing
+    else {
+        return Ok(());
+    };
+    if route_ids.len() > 500
+        || route_group_ids.len() > 500
+        || route_ids.iter().copied().collect::<BTreeSet<_>>().len() != route_ids.len()
+        || route_group_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != route_group_ids.len()
+    {
+        return Err(AppError::BadRequest(
+            "Cloud routing grants must contain at most 500 unique routes and route groups".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn reconcile_entitlement_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
+    tenant_id: &str,
+    operation: EntitlementOperation,
+    idempotency_key: &str,
+) -> Result<(EntitlementReconcileResult, bool), AppError> {
+    let canonical = serde_json::to_vec(&operation).map_err(|_| AppError::Internal)?;
+    let request_hash = format!("{:x}", Sha256::digest(&canonical));
+    let now = unix_millis();
+    let reconciliation_id = Uuid::now_v7();
+    if matches!(backend, DatabaseBackend::PostgreSql) {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948315))")
+            .bind(format!("{tenant_id}:{idempotency_key}"))
+            .execute(&mut **tx)
+            .await?;
+    } else {
+        // `BEGIN IMMEDIATE` already serializes SQLite writers. Touching the
+        // tenant also makes the lock ordering explicit for both call paths.
+        sqlx::query("UPDATE tenants SET created_at = created_at WHERE id = $1")
+            .bind(tenant_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    if let Some(replay) = sqlx::query(
+        "SELECT request_hash, response_json FROM entitlement_reconciliations WHERE tenant_id = $1 AND idempotency_key = $2",
+    )
+    .bind(tenant_id)
+    .bind(idempotency_key)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        let existing_hash: String = replay.try_get("request_hash")?;
+        if existing_hash != request_hash {
+            return Err(AppError::Conflict(
+                "Idempotency-Key was already used for a different entitlement request".into(),
+            ));
+        }
+        let response_json: String = replay.try_get("response_json")?;
+        return serde_json::from_str(&response_json)
+            .map(|response| (response, true))
+            .map_err(|_| AppError::Internal);
+    }
+
+    let result = match operation {
+        EntitlementOperation::Reconcile(input) => {
+            reconcile_entitlement_snapshot(tx, tenant_id, &input, reconciliation_id, now).await?
+        }
+        EntitlementOperation::Cancel(input) => {
+            cancel_entitlement_snapshot(tx, tenant_id, &input, reconciliation_id, now).await?
+        }
+        EntitlementOperation::Replace(input) => {
+            replace_entitlement_snapshot(tx, tenant_id, &input, reconciliation_id, now).await?
+        }
+    };
+    let response_json = serde_json::to_string(&result).map_err(|_| AppError::Internal)?;
+    sqlx::query(
+        "INSERT INTO entitlement_reconciliations (id, tenant_id, idempotency_key, request_hash, response_json, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(reconciliation_id.to_string())
+    .bind(tenant_id)
+    .bind(idempotency_key)
+    .bind(request_hash)
+    .bind(response_json)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok((result, false))
 }
 
 async fn lock_entitlement_account(

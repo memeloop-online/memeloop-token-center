@@ -1,8 +1,19 @@
-use memeloop_token_center::{AppState, api, config::Config, crypto};
+use memeloop_token_center::{
+    AppState, api,
+    config::Config,
+    crypto,
+    db::{
+        CreateGroupInput, CreateModelRouteInput, CreateUpstreamAccountInput,
+        DiscoveredUpstreamModel, GroupKind, ReplaceCredentialRoutingInput,
+        ReplaceGroupMembersInput,
+    },
+    provider::UpstreamCredential,
+};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 const WEBHOOK_SECRET: &str = "test-memeloop-cloud-webhook-secret-long-enough";
 
@@ -134,6 +145,338 @@ fn cancelled(
         "policy": policy(1, &[]),
         "proration": null
     })
+}
+
+async fn seed_route(state: &AppState, tenant: &str, model: &str, priority: i64) -> Uuid {
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.into(),
+                name: format!("cloud-upstream-{priority}"),
+                driver: "http-json".into(),
+                config: json!({
+                    "base_url": format!("http://127.0.0.1:{}", 18_000 + priority),
+                    "network_scope": "private"
+                }),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let lease_id = Uuid::now_v7();
+    assert!(
+        state
+            .db
+            .claim_upstream_model_catalog_sync(
+                account.id,
+                tenant,
+                account.credential_generation,
+                lease_id,
+            )
+            .await
+            .unwrap()
+    );
+    state
+        .db
+        .replace_upstream_model_catalog(
+            account.id,
+            tenant,
+            account.credential_generation,
+            lease_id,
+            "component",
+            &[DiscoveredUpstreamModel {
+                model_id: model.into(),
+                protocol: "openai".into(),
+                context_window: Some(128_000),
+                reservation_token_bound: Some(16_384),
+                reservation_bound_source: Some("test".into()),
+            }],
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.into(),
+            public_model: model.into(),
+            upstream_account_id: account.id,
+            upstream_model: model.into(),
+            protocol: "openai".into(),
+            priority,
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn cloud_grants_are_snapshot_scoped_and_cancel_fails_closed() {
+    let fixture = Fixture::new().await;
+    let tenant = "cloud-routing";
+    let principal = "cloud-routing-user";
+    let subscription = "cloud-routing-subscription";
+    let original_route = seed_route(&fixture.state, tenant, "gpt-5", 1).await;
+
+    let first: Value = fixture
+        .send(
+            "cloud-routing-1",
+            &active(tenant, principal, subscription, "cycle", "10", 1, 60),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let key_id = Uuid::parse_str(first["credential"]["key_id"].as_str().unwrap()).unwrap();
+    let first_routing = fixture
+        .state
+        .db
+        .credential_routing(key_id, tenant)
+        .await
+        .unwrap();
+    assert_eq!(first_routing.effective_route_ids, vec![original_route]);
+
+    // Legacy `allowed_models` is converted only once. A future route with the
+    // same public model must not be implicitly authorized.
+    let future_route = seed_route(&fixture.state, tenant, "gpt-5", 2).await;
+    let after_future_route = fixture
+        .state
+        .db
+        .credential_routing(key_id, tenant)
+        .await
+        .unwrap();
+    assert_eq!(after_future_route.effective_route_ids, vec![original_route]);
+
+    let mut invalid_grant = active(tenant, principal, subscription, "cycle", "11", 2, 70);
+    invalid_grant["route_ids"] = json!([Uuid::now_v7()]);
+    assert_eq!(
+        fixture
+            .send("cloud-routing-2", &invalid_grant)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let after_failed_snapshot = fixture
+        .state
+        .db
+        .list_entitlements(Some(tenant), Some("memeloop-cloud"), Some(subscription))
+        .await
+        .unwrap();
+    assert_eq!(after_failed_snapshot[0].version, 1);
+    assert_eq!(after_failed_snapshot[0].remaining, "10");
+    assert_eq!(
+        fixture
+            .state
+            .db
+            .credential_routing(key_id, tenant)
+            .await
+            .unwrap()
+            .effective_route_ids,
+        vec![original_route]
+    );
+
+    let route_group = fixture
+        .state
+        .db
+        .create_group(
+            GroupKind::Route,
+            CreateGroupInput {
+                tenant_external_id: tenant.into(),
+                name: "Cloud plan routes".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let route_group = fixture
+        .state
+        .db
+        .replace_group_members(
+            GroupKind::Route,
+            route_group.id,
+            ReplaceGroupMembersInput {
+                tenant_external_id: tenant.into(),
+                member_ids: vec![future_route],
+                expected_updated_at: route_group.updated_at,
+            },
+        )
+        .await
+        .unwrap();
+    let mut explicit = active(tenant, principal, subscription, "cycle", "11", 2, 70);
+    explicit["route_ids"] = json!([]);
+    explicit["route_group_ids"] = json!([route_group.id]);
+    // The failed full transaction did not consume its event identity.
+    let response = fixture.send("cloud-routing-2", &explicit).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let explicit_routing = fixture
+        .state
+        .db
+        .credential_routing(key_id, tenant)
+        .await
+        .unwrap();
+    let operator_revision_before_cloud_cancel = explicit_routing.grant_revision;
+    assert_eq!(explicit_routing.effective_route_ids, vec![future_route]);
+    assert_eq!(explicit_routing.route_group_ids, vec![route_group.id]);
+    assert_eq!(
+        fixture.send("cloud-routing-2", &explicit).await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        fixture
+            .state
+            .db
+            .credential_routing(key_id, tenant)
+            .await
+            .unwrap()
+            .grant_revision,
+        operator_revision_before_cloud_cancel,
+        "an idempotent replay must not create a phantom grant revision"
+    );
+    let tenant_id = fixture
+        .state
+        .db
+        .list_model_routes(Some(tenant))
+        .await
+        .unwrap()[0]
+        .tenant_id;
+    let available_before = fixture
+        .state
+        .db
+        .granted_available_models(key_id, tenant_id)
+        .await
+        .unwrap();
+    let credential_group = fixture
+        .state
+        .db
+        .create_group(
+            GroupKind::Credential,
+            CreateGroupInput {
+                tenant_external_id: tenant.into(),
+                name: "Cloud customers".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let credential_group = fixture
+        .state
+        .db
+        .replace_group_members(
+            GroupKind::Credential,
+            credential_group.id,
+            ReplaceGroupMembersInput {
+                tenant_external_id: tenant.into(),
+                member_ids: vec![key_id],
+                expected_updated_at: credential_group.updated_at,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .state
+            .db
+            .credential_routing(key_id, tenant)
+            .await
+            .unwrap()
+            .effective_route_ids,
+        vec![future_route],
+        "credential groups are presentation-only and cannot alter grants"
+    );
+    assert_eq!(
+        fixture
+            .state
+            .db
+            .granted_available_models(key_id, tenant_id)
+            .await
+            .unwrap(),
+        available_before,
+        "credential group membership cannot alter available models"
+    );
+    fixture
+        .state
+        .db
+        .replace_group_members(
+            GroupKind::Credential,
+            credential_group.id,
+            ReplaceGroupMembersInput {
+                tenant_external_id: tenant.into(),
+                member_ids: vec![],
+                expected_updated_at: credential_group.updated_at,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .state
+            .db
+            .credential_routing(key_id, tenant)
+            .await
+            .unwrap()
+            .effective_route_ids,
+        vec![future_route]
+    );
+
+    let cancellation = fixture
+        .send(
+            "cloud-routing-3",
+            &cancelled(tenant, principal, subscription, "cycle", 3),
+        )
+        .await;
+    assert_eq!(cancellation.status(), StatusCode::OK);
+    assert!(
+        fixture
+            .state
+            .db
+            .credential_routing(key_id, tenant)
+            .await
+            .unwrap()
+            .effective_route_ids
+            .is_empty()
+    );
+    let after_cancel_routing = fixture
+        .state
+        .db
+        .credential_routing(key_id, tenant)
+        .await
+        .unwrap();
+    assert!(after_cancel_routing.grant_revision > operator_revision_before_cloud_cancel);
+    assert!(matches!(
+        fixture
+            .state
+            .db
+            .replace_credential_routing(
+                key_id,
+                ReplaceCredentialRoutingInput {
+                    tenant_external_id: tenant.into(),
+                    route_ids: vec![original_route],
+                    route_group_ids: vec![],
+                    expected_grant_revision: operator_revision_before_cloud_cancel,
+                },
+            )
+            .await,
+        Err(memeloop_token_center::error::AppError::Conflict(_))
+    ));
+
+    // Presence of an empty normalized contract remains deny-all on
+    // reactivation; it must not fall back to the legacy model list.
+    let mut denied = active(tenant, principal, subscription, "cycle", "4", 4, 40);
+    denied["route_ids"] = json!([]);
+    let denied_response = fixture.send("cloud-routing-4", &denied).await;
+    assert_eq!(denied_response.status(), StatusCode::CREATED);
+    assert!(
+        fixture
+            .state
+            .db
+            .credential_routing(key_id, tenant)
+            .await
+            .unwrap()
+            .effective_route_ids
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -442,4 +785,130 @@ async fn invalid_or_unknown_snapshots_leave_no_orphan_credential() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn concurrent_first_cloud_events_cannot_leave_a_losing_principal_key() {
+    let fixture = Fixture::new().await;
+    let tenant = "cloud-concurrent-first";
+    let subscription = "shared-subscription";
+    let first = active(tenant, "principal-a", subscription, "cycle", "10", 1, 10);
+    let second = active(tenant, "principal-b", subscription, "cycle", "20", 2, 20);
+    let (first, second) = tokio::join!(
+        fixture.send("concurrent-first-a", &first),
+        fixture.send("concurrent-first-b", &second),
+    );
+    assert!(first.status().is_success() ^ second.status().is_success());
+    assert!(matches!(
+        (first.status(), second.status()),
+        (
+            StatusCode::CREATED,
+            StatusCode::FORBIDDEN | StatusCode::CONFLICT
+        ) | (
+            StatusCode::FORBIDDEN | StatusCode::CONFLICT,
+            StatusCode::CREATED
+        )
+    ));
+    let keys = fixture
+        .state
+        .db
+        .list_managed_keys(Some(tenant), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        keys.len(),
+        1,
+        "the losing transaction must not orphan a key"
+    );
+}
+
+#[tokio::test]
+async fn suspended_and_revoked_cloud_identity_updates_finance_without_expanding_access() {
+    let fixture = Fixture::new().await;
+    let tenant = "cloud-disabled-identity";
+    let principal = "disabled-member";
+    let subscription = "disabled-subscription";
+    let route_id = seed_route(&fixture.state, tenant, "gpt-5", 3).await;
+    let mut first = active(tenant, principal, subscription, "cycle", "10", 1, 10);
+    first["route_ids"] = json!([route_id]);
+    let first: Value = fixture
+        .send("disabled-1", &first)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let key_id = Uuid::parse_str(first["credential"]["key_id"].as_str().unwrap()).unwrap();
+
+    fixture
+        .state
+        .db
+        .set_key_status(key_id, "suspended")
+        .await
+        .unwrap();
+    let mut suspended_update = active(tenant, principal, subscription, "cycle", "12", 2, 20);
+    suspended_update["route_ids"] = json!([route_id]);
+    assert_eq!(
+        fixture.send("disabled-2", &suspended_update).await.status(),
+        StatusCode::CREATED
+    );
+    assert!(
+        fixture
+            .state
+            .db
+            .credential_routing(key_id, tenant)
+            .await
+            .unwrap()
+            .effective_route_ids
+            .is_empty()
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "disabled-3",
+                &cancelled(tenant, principal, subscription, "cycle", 3),
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    fixture
+        .state
+        .db
+        .set_key_status(key_id, "revoked")
+        .await
+        .unwrap();
+    let mut revoked_update = active(tenant, principal, subscription, "cycle", "5", 4, 30);
+    revoked_update["route_ids"] = json!([route_id]);
+    assert_eq!(
+        fixture.send("disabled-4", &revoked_update).await.status(),
+        StatusCode::CREATED
+    );
+    assert!(
+        fixture
+            .state
+            .db
+            .credential_routing(key_id, tenant)
+            .await
+            .unwrap()
+            .effective_route_ids
+            .is_empty()
+    );
+    assert_eq!(
+        fixture
+            .send(
+                "disabled-5",
+                &cancelled(tenant, principal, subscription, "cycle", 5),
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let keys = fixture
+        .state
+        .db
+        .list_managed_keys(Some(tenant), Some(principal))
+        .await
+        .unwrap();
+    assert_eq!(keys[0].status, "revoked");
 }
