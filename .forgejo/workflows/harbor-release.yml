@@ -1,0 +1,253 @@
+name: temporary-harbor-release
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-harbor-release-master
+  cancel-in-progress: false
+
+jobs:
+  quality-gates:
+    # This host-mode label is bound only to an ephemeral, non-privileged
+    # runner Pod. It is not a physical-node host runner and exposes no
+    # container daemon. PostgreSQL and MinIO are localhost Pod sidecars.
+    runs-on: mtc-quality-pod
+    timeout-minutes: 300
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+      MTC_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      MTC_TEST_S3_BUCKET: memeloop-token-center-test
+      MTC_TEST_S3_ACCESS_KEY: token-center-test
+      MTC_TEST_S3_SECRET_KEY: token-center-test-secret
+      MTC_TEST_S3_LIST_ONLY_ACCESS_KEY: mtc-list-only
+      MTC_TEST_S3_LIST_ONLY_SECRET_KEY: mtc-list-only-secret
+    steps:
+      - name: Check out the exact Forgejo revision
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Prove isolated clean master checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$GITHUB_SHA" in
+            *[!0-9a-f]*|'') echo 'GITHUB_SHA is not lowercase hexadecimal' >&2; exit 1 ;;
+          esac
+          test "${#GITHUB_SHA}" -eq 40
+          test "$GITHUB_REF" = refs/heads/master
+          test "$FORGEJO_SERVER_URL" = https://git.k3s.onetwo.website
+          test "$FORGEJO_REPOSITORY" = mtc-ci/memeloop-token-center
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test ! -S /var/run/docker.sock
+          test ! -e /run/containerd/containerd.sock
+      - name: Install the pinned Rust toolchain
+        uses: https://github.com/dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Install the pinned Node runtime
+        uses: https://github.com/actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Verify runner tools and sidecar health
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in cargo cargo-audit cargo-deny curl helm jq kubeconform npm \
+            psql python3 rustc sqlite3 trivy; do
+            command -v "$tool" >/dev/null
+          done
+          rustc --version | grep -F 'rustc 1.95.0 '
+          node --version | grep -F 'v24.18.0'
+          pg_isready --dbname "$MTC_TEST_POSTGRES_URL"
+          curl --fail --silent "$MTC_TEST_S3_ENDPOINT/minio/health/live" >/dev/null
+      - name: Reject committed secrets, infrastructure hazards, and vulnerable dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          trivy fs --scanners secret,misconfig --severity HIGH,CRITICAL \
+            --exit-code 1 --skip-dirs target --skip-dirs web/node_modules .
+          cargo deny --locked check advisories bans licenses sources
+          cargo audit --deny warnings
+          tests/ops/rust-decimal-vendor-contract.sh
+      - name: Enforce Rust formatting and Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Run SQLite, PostgreSQL, mock-upstream, and cucumber-rs tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --all-targets --all-features
+          cargo test --locked --test cucumber --all-features
+      - name: Run Cucumber.js, localization, schema, and browser acceptance
+        shell: bash
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/playwright
+        run: |
+          set -euo pipefail
+          npm --prefix web ci
+          npm --prefix web audit --audit-level=high
+          npm --prefix web run typecheck
+          npm --prefix web run test:localization
+          npm --prefix web run build
+          cargo build --locked --bin memeloop-token-center
+          (cd web && npx playwright install chromium && npm run test:e2e)
+      - name: Run SQLite migration and replay gate
+        shell: bash
+        env:
+          MTC_KEY_PEPPER: forgejo-test-key-pepper-with-more-than-thirty-two-bytes
+          MTC_SERVICE_TOKEN: forgejo-test-bootstrap-token-not-for-production
+          MTC_ARCHIVE_BACKEND: filesystem
+          MTC_ARCHIVE_PATH: ${{ runner.temp }}/sqlite-migration-archive
+        run: |
+          set -euo pipefail
+          database="$RUNNER_TEMP/forgejo-migration.sqlite"
+          export MTC_DATABASE_URL="sqlite://$database?mode=rwc"
+          cargo run --locked --bin memeloop-token-center -- migrate
+          first=$(sqlite3 "$database" 'SELECT count(*) FROM _sqlx_migrations WHERE success = 1')
+          cargo run --locked --bin memeloop-token-center -- migrate
+          second=$(sqlite3 "$database" 'SELECT count(*) FROM _sqlx_migrations WHERE success = 1')
+          test "$first" -gt 0
+          test "$first" = "$second"
+      - name: Run PostgreSQL migration and replay gate
+        shell: bash
+        env:
+          MTC_DATABASE_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+          MTC_KEY_PEPPER: forgejo-test-key-pepper-with-more-than-thirty-two-bytes
+          MTC_SERVICE_TOKEN: forgejo-test-bootstrap-token-not-for-production
+          MTC_ARCHIVE_BACKEND: filesystem
+          MTC_ARCHIVE_PATH: ${{ runner.temp }}/postgres-migration-archive
+        run: |
+          set -euo pipefail
+          cargo run --locked --bin memeloop-token-center -- migrate
+          first=$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
+            -c 'SELECT count(*) FROM _sqlx_migrations WHERE success = true')
+          cargo run --locked --bin memeloop-token-center -- migrate
+          second=$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
+            -c 'SELECT count(*) FROM _sqlx_migrations WHERE success = true')
+          test "$first" -gt 0
+          test "$first" = "$second"
+      - name: Run CPAMP initial, overlap, incremental, and replay migration acceptance
+        shell: bash
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGDATABASE: memeloop_token_center_test
+          PGUSER: token_center
+          PGPASSWORD: token_center
+        run: |
+          set -euo pipefail
+          schema="mig_${GITHUB_SHA:0:24}"
+          run_id="forgejo-${FORGEJO_RUN_ID:-0}-${FORGEJO_RUN_ATTEMPT:-1}"
+          acceptance="$RUNNER_TEMP/cpamp-acceptance"
+          mkdir -p "$acceptance"
+          cp ops/migrate-cpamp.sh "$acceptance/migrate-cpamp.sh"
+          cp tests/fixtures/cpamp/initial.sql "$acceptance/initial.sql"
+          for migration in 0001_initial 0002_query_indexes 0004_request_events \
+            0005_generation_jobs 0018_model_price_tiers 0019_session_archive_import \
+            0021_request_locators 0022_budget_rollups 0023_generation_daily_aggregates \
+            0024_request_stats_rollups 0027_cpamp_source_digests; do
+            cp "migrations/postgres/$migration.sql" "$acceptance/$migration.sql" 2>/dev/null || \
+              cp "migrations/common/$migration.sql" "$acceptance/$migration.sql"
+          done
+          cleanup() {
+            psql -X --no-psqlrc -v ON_ERROR_STOP=1 -v schema="$schema" \
+              -c 'DROP SCHEMA IF EXISTS :"schema" CASCADE' >/dev/null
+          }
+          trap cleanup EXIT HUP INT TERM
+          psql -X --no-psqlrc -v ON_ERROR_STOP=1 -v schema="$schema" \
+            -c 'CREATE SCHEMA :"schema"'
+          ACCEPTANCE_SCHEMA="$schema" ACCEPTANCE_RUN_ID="$run_id" \
+            ACCEPTANCE_WORK_ROOT="$acceptance" \
+            tests/ops/cpamp-import-postgres-acceptance.sh
+      - name: Validate OpenAPI source and role boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/openapi-venv"
+          python3 -m venv "$venv"
+          "$venv/bin/pip" install --requirement tests/ops/requirements-openapi.txt
+          "$venv/bin/python" tests/ops/test-openapi-contract.py
+          "$venv/bin/python" tests/ops/check-openapi-contract.py \
+            --output "$RUNNER_TEMP/openapi-contract-$GITHUB_SHA.json"
+      - name: Validate Helm, release, importer, and migration source contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          export KUBECONFORM_BIN="$(command -v kubeconform)"
+          tests/ops/helm-packaging-contract.sh
+          ops/ci/run-release-source-contracts.sh
+          tests/ops/session-archive-import-job-contract.sh
+          tests/ops/history-partition-backfill-static.sh
+          tests/ops/request-stats-reconcile-static.sh
+          tests/ops/cpa-migration-audit-contract.sh
+          python3 tests/ops/test-session-archive-delta-export.py
+          python3 tests/ops/test_cpa_upstream_import.py
+          python3 tests/ops/test_legacy_credentials_bulk.py
+      - name: Run optimized memory and 500 MiB streaming gate
+        shell: bash
+        timeout-minutes: 45
+        env:
+          MTC_BUILD_GIT_SHA: ${{ forgejo.sha }}
+        run: |
+          set -euo pipefail
+          export MTC_BUILD_TIMESTAMP="$(git show -s --format=%cI HEAD)"
+          export MTC_BUILD_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo build --locked --release --bin memeloop-token-center
+          ops/benchmark-memory.sh \
+            --profile acceptance \
+            --binary target/release/memeloop-token-center \
+            --gateway-limit-mib 256 \
+            --gateway-headroom-mib 32 \
+            --output "$RUNNER_TEMP/memory-$GITHUB_SHA.json"
+
+  release-harbor:
+    needs: [quality-gates]
+    if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/master'
+    # A separate non-privileged runner Pod exposes only its same-Pod rootless
+    # BuildKit Unix socket. It has no Docker/containerd host socket.
+    runs-on: mtc-release-rootless
+    timeout-minutes: 180
+    env:
+      HARBOR_REPOSITORY_PREFIX: harbor.k3s.onetwo.website/mtc-ci
+      RELEASE_REVISION: ${{ forgejo.sha }}
+      RELEASE_EVIDENCE_DIR: ${{ runner.temp }}/harbor-release
+      BUILDKIT_HOST: ${{ vars.MTC_ROOTLESS_BUILDKIT_HOST }}
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+      COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+      COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+      COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+    steps:
+      - name: Check out the exact gated revision
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build, scan, attest, sign, and verify immutable Harbor images
+        shell: bash
+        run: ops/ci/publish-harbor-images.sh
+      - name: Retain the digest-only release evidence
+        if: always()
+        uses: https://data.forgejo.org/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: harbor-release-${{ forgejo.sha }}
+          path: ${{ runner.temp }}/harbor-release/
+          if-no-files-found: error
+          retention-days: 30

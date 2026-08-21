@@ -11,6 +11,7 @@ test -f "$workflow"
 test -f "$workflow_directory/memory-acceptance.yml"
 test -f "$dockerfile"
 test -f "$cargo_config"
+test -f "$repository/.forgejo/workflows/harbor-release.yml"
 test ! -e "$repository/.forgejo/workflows/build.yaml"
 
 grep -Fq 'ARG NODE_IMAGE=node:24.18.0-bookworm-slim' "$dockerfile"
@@ -103,6 +104,8 @@ if printf '%s\n' "$cargo_resolution_lines" | grep -v -- '--locked' >/dev/null; t
   exit 1
 fi
 
+grep -Fq 'ops/ci/validate-release-inputs.sh' "$workflow"
+grep -Fq 'ops/ci/run-release-source-contracts.sh' "$workflow"
 grep -Fq 'ghcr.io/linonetwo/memeloop-token-center' "$workflow"
 grep -Fq 'ghcr.io/linonetwo/memeloop-token-center-importer' "$workflow"
 grep -Fq 'ghcr.io/linonetwo/memeloop-token-center-plugin-installer' "$workflow"

@@ -7,6 +7,11 @@ set -eu
 : "${PGUSER:?PGUSER is required}"
 : "${PGPASSWORD:?PGPASSWORD is required}"
 : "${PGDATABASE:?PGDATABASE is required}"
+work_root=${ACCEPTANCE_WORK_ROOT:-/work}
+case "$work_root" in
+  /*) ;;
+  *) echo "ACCEPTANCE_WORK_ROOT must be absolute" >&2; exit 2 ;;
+esac
 
 case "$ACCEPTANCE_SCHEMA" in
   mig_[a-f0-9]*) ;;
@@ -60,25 +65,25 @@ run_import() {
     CPAMP_OVERLAP_MS=86400000 \
     CPAMP_RESET_IMPORT=false \
     CPAMP_ALLOW_UNMAPPED=false \
-    sh /work/migrate-cpamp.sh >/dev/null
+    sh "$work_root/migrate-cpamp.sh" >/dev/null
 }
 
 current_schema=$(psql_target -Atc 'SELECT current_schema()')
 assert_equal "$current_schema" "$ACCEPTANCE_SCHEMA" "PostgreSQL search_path isolation"
-psql_target -f /work/0001_initial.sql >/dev/null
-psql_target -f /work/0002_query_indexes.sql >/dev/null
-psql_target -f /work/0004_request_events.sql >/dev/null
-psql_target -f /work/0005_generation_jobs.sql >/dev/null
-psql_target -f /work/0018_model_price_tiers.sql >/dev/null
-psql_target -f /work/0019_session_archive_import.sql >/dev/null
+psql_target -f "$work_root/0001_initial.sql" >/dev/null
+psql_target -f "$work_root/0002_query_indexes.sql" >/dev/null
+psql_target -f "$work_root/0004_request_events.sql" >/dev/null
+psql_target -f "$work_root/0005_generation_jobs.sql" >/dev/null
+psql_target -f "$work_root/0018_model_price_tiers.sql" >/dev/null
+psql_target -f "$work_root/0019_session_archive_import.sql" >/dev/null
 psql_target -c 'CREATE TABLE IF NOT EXISTS request_records_default PARTITION OF request_records DEFAULT' >/dev/null
-psql_target -f /work/0021_request_locators.sql >/dev/null
-psql_target -f /work/0022_budget_rollups.sql >/dev/null
-psql_target -f /work/0023_generation_daily_aggregates.sql >/dev/null
-psql_target -f /work/0024_request_stats_rollups.sql >/dev/null
-psql_target -f /work/0027_cpamp_source_digests.sql >/dev/null
+psql_target -f "$work_root/0021_request_locators.sql" >/dev/null
+psql_target -f "$work_root/0022_budget_rollups.sql" >/dev/null
+psql_target -f "$work_root/0023_generation_daily_aggregates.sql" >/dev/null
+psql_target -f "$work_root/0024_request_stats_rollups.sql" >/dev/null
+psql_target -f "$work_root/0027_cpamp_source_digests.sql" >/dev/null
 
-sqlite3 "$same_duplicate_db" < /work/initial.sql
+sqlite3 "$same_duplicate_db" < "$work_root/initial.sql"
 sqlite3 "$same_duplicate_db" <<'SQL'
 DELETE FROM usage_events;
 INSERT INTO usage_events VALUES
@@ -113,7 +118,7 @@ assert_equal "$same_duplicate_state" "1|1|1|1" \
   "same event hash and payload deduplicate idempotently"
 echo "phase=same-payload-duplicate source_rows=2 distinct_hashes=1 requests=1 links=1 replay=stable"
 
-sqlite3 "$conflicting_duplicate_db" < /work/initial.sql
+sqlite3 "$conflicting_duplicate_db" < "$work_root/initial.sql"
 sqlite3 "$conflicting_duplicate_db" <<'SQL'
 DELETE FROM usage_events;
 INSERT INTO usage_events VALUES
@@ -145,7 +150,7 @@ assert_equal "$conflicting_duplicate_state" "0|0" \
   "same event hash with different payload fails closed"
 echo "phase=conflicting-payload-duplicate exit=nonzero tenant_rows=0 checkpoints=0"
 
-sqlite3 "$source_db" < /work/initial.sql
+sqlite3 "$source_db" < "$work_root/initial.sql"
 run_import "$tenant" "$source" "$source_db"
 run_import "$tenant" "$source" "$source_db"
 
@@ -411,7 +416,7 @@ SQL
 assert_equal "$scoped_request_ids" "12|12|12|12|12" "tenant/source-scoped deterministic IDs and analytics"
 echo "phase=checkpoint-isolation checkpoint_pairs=3/3 scoped_request_ids=12/12 scoped_analytics=12/12/12"
 
-sqlite3 "$unmapped_db" < /work/initial.sql
+sqlite3 "$unmapped_db" < "$work_root/initial.sql"
 sqlite3 "$unmapped_db" "DELETE FROM usage_events; INSERT INTO usage_events VALUES ('fixture-event-unmapped', 'legacy-unmapped', 500000000, 'openai', 'fixture-model', '/v1/responses', 'invalid-hash', 1, 1, 10, 0, NULL, NULL); DELETE FROM api_key_aliases;"
 if run_import "$unmapped_tenant" "$source" "$unmapped_db" >"$work_dir/unmapped.log" 2>&1; then
   echo "unmapped import unexpectedly succeeded" >&2
@@ -445,7 +450,7 @@ if CPAMP_SQLITE_PATH="$source_db" \
   CPAMP_RESET_IMPORT=true \
   CPAMP_RESET_CONFIRM=DELETE_CPA_DOGFOOD_IMPORT \
   CPAMP_ALLOW_UNMAPPED=false \
-  sh /work/migrate-cpamp.sh >"$work_dir/reset-guard.log" 2>&1; then
+  sh "$work_root/migrate-cpamp.sh" >"$work_dir/reset-guard.log" 2>&1; then
   echo "reset with an operator-owned provider unexpectedly succeeded" >&2
   exit 1
 fi
