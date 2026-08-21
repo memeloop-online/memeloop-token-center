@@ -15,12 +15,16 @@ import binascii
 import datetime as dt
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
+import re
+import socket
 import sqlite3
 import stat
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,14 +34,21 @@ from typing import Any, BinaryIO, Iterable
 
 
 SOURCE_FINGERPRINT_VERSION = 1
+COLLECTOR_FINGERPRINT_VERSION = 2
 CHECKPOINT_VERSION = 2
 MANIFEST_VERSION = 2
-SESSIONS_PATH = "/v0/management/plugins/cpa-session-archive/sessions"
-EXPORT_PATH = "/v0/management/plugins/cpa-session-archive/export"
-STATS_PATH = "/v0/management/plugins/cpa-session-archive/stats"
+CPA_PLUGIN_SESSIONS_PATH = "/v0/management/plugins/cpa-session-archive/sessions"
+CPA_PLUGIN_EXPORT_PATH = "/v0/management/plugins/cpa-session-archive/export"
+CPA_PLUGIN_STATS_PATH = "/v0/management/plugins/cpa-session-archive/stats"
+COLLECTOR_SESSIONS_PATH = "/v1/sessions"
+COLLECTOR_EXPORT_PATH = "/v1/export-tickets"
+COLLECTOR_STATS_PATH = "/v1/stats"
+TICKET_PATH_PREFIX = "/archive-api/v1/exports/"
 STABLE_CURSOR_PROTOCOL = "session-snapshot-cursor-v1"
 LEGACY_PROJECTION_PROTOCOL = "legacy-last-at-limit-v1"
 MAX_SESSION_COUNT = 1_000_000
+MAX_MANAGEMENT_RESPONSE_BYTES = 8 * 1024 * 1024
+TOKEN_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 
 
 class DeltaError(RuntimeError):
@@ -48,6 +59,18 @@ class StableCursorUnsupported(DeltaError):
     """The source explicitly returned its legacy session-list representation."""
 
 
+class SourceHTTPError(DeltaError):
+    def __init__(self, status: int, retry_after: float | None = None) -> None:
+        super().__init__(f"source request returned HTTP {status}")
+        self.status = status
+        self.retry_after = retry_after
+
+
+class SnapshotExpired(SourceHTTPError):
+    def __init__(self) -> None:
+        super().__init__(410)
+
+
 @dataclass(frozen=True)
 class SessionProjection:
     sessions: list[dict[str, Any]]
@@ -55,6 +78,28 @@ class SessionProjection:
     request_count: int
     snapshot: str | None = None
     ingest_fence: str | None = None
+
+
+@dataclass(frozen=True)
+class SourcePaths:
+    mode: str
+    sessions: str
+    export: str
+    stats: str
+
+
+CPA_PLUGIN_PATHS = SourcePaths(
+    "cpa-plugin-input",
+    CPA_PLUGIN_SESSIONS_PATH,
+    CPA_PLUGIN_EXPORT_PATH,
+    CPA_PLUGIN_STATS_PATH,
+)
+COLLECTOR_PATHS = SourcePaths(
+    "collector-direct",
+    COLLECTOR_SESSIONS_PATH,
+    COLLECTOR_EXPORT_PATH,
+    COLLECTOR_STATS_PATH,
+)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -174,11 +219,63 @@ def load_token(path: Path) -> str:
     return token
 
 
-def safe_origin(raw: str, allow_http: bool, label: str) -> tuple[str, str]:
+def validate_token(raw: str, label: str) -> str:
+    if (
+        not raw
+        or len(raw.encode("utf-8")) > 16_384
+        or any(ord(char) < 0x21 or ord(char) > 0x7E for char in raw)
+    ):
+        raise DeltaError(f"{label} is invalid")
+    return raw
+
+
+def load_token_env(name: str) -> str:
+    if not TOKEN_ENV_NAME.fullmatch(name):
+        raise DeltaError("token environment variable name is invalid")
+    value = os.environ.get(name)
+    if value is None:
+        raise DeltaError("token environment variable is missing")
+    return validate_token(value, "token environment secret")
+
+
+def normalize_host(value: str) -> str:
+    return value.rstrip(".").lower()
+
+
+def private_http_host(host: str, allowed: frozenset[str]) -> bool:
+    normalized = normalize_host(host)
+    if normalized not in allowed:
+        return False
+    try:
+        addresses = {
+            ipaddress.ip_address(item[4][0].split("%", 1)[0])
+            for item in socket.getaddrinfo(normalized, None, type=socket.SOCK_STREAM)
+        }
+    except (OSError, ValueError):
+        return False
+    if not addresses:
+        return False
+    for address in addresses:
+        if (
+            not address.is_private
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_unspecified
+            or str(address) in {"169.254.169.254", "100.100.100.200"}
+        ):
+            return False
+    return True
+
+
+def safe_origin(
+    raw: str,
+    private_http_hosts: frozenset[str] | bool,
+    label: str,
+) -> tuple[str, str]:
     if not raw or any(ord(char) < 0x21 or ord(char) > 0x7E for char in raw):
         raise DeltaError(f"{label} is invalid")
     parsed = urllib.parse.urlsplit(raw)
-    if parsed.scheme not in ({"https", "http"} if allow_http else {"https"}):
+    if parsed.scheme not in {"https", "http"}:
         raise DeltaError(f"{label} must use HTTPS")
     if (
         not parsed.netloc
@@ -188,6 +285,19 @@ def safe_origin(raw: str, allow_http: bool, label: str) -> tuple[str, str]:
         or parsed.fragment
     ):
         raise DeltaError(f"{label} is invalid")
+    host = parsed.hostname
+    if host is None:
+        raise DeltaError(f"{label} is invalid")
+    legacy_allow_http = private_http_hosts is True
+    allowed_hosts = (
+        frozenset() if isinstance(private_http_hosts, bool) else private_http_hosts
+    )
+    if parsed.scheme == "http" and not (
+        legacy_allow_http or private_http_host(host, allowed_hosts)
+    ):
+        raise DeltaError(
+            f"{label} HTTP host is not in the resolved private allowlist"
+        )
     origin = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     prefix = parsed.path.rstrip("/")
     return origin, origin + prefix
@@ -244,50 +354,98 @@ class SourceClient:
         self,
         base_url: str,
         download_base_url: str,
-        token: str,
+        token: str | None,
         timeout: float,
-        allow_http: bool,
+        private_http_hosts: frozenset[str] | bool,
+        collector_direct: bool = False,
+        max_retries: int = 5,
+        retry_base_seconds: float = 0.5,
+        deadline: float | None = None,
     ) -> None:
         self.origin, self.base = safe_origin(
-            base_url, allow_http, "CPA management base URL"
+            base_url, private_http_hosts, "archive source base URL"
         )
         self.download_origin, self.download_base = safe_origin(
-            download_base_url, allow_http, "archive download base URL"
+            download_base_url, private_http_hosts, "archive download base URL"
         )
         self.token = token
         self.timeout = timeout
+        self.paths = COLLECTOR_PATHS if collector_direct else CPA_PLUGIN_PATHS
+        self.collector_direct = collector_direct
+        self.max_retries = max_retries
+        self.retry_base_seconds = retry_base_seconds
+        self.deadline = deadline
+        if collector_direct and self.download_origin != self.origin:
+            raise DeltaError(
+                "collector-direct ticket downloads must use the collector origin"
+            )
+        if collector_direct and token is not None:
+            raise DeltaError("collector-direct requests must not carry a CPA token")
+
+    def _request_timeout(self) -> float:
+        if self.deadline is None:
+            return self.timeout
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise DeltaError("source export exceeded the configured elapsed-time limit")
+        return min(self.timeout, remaining)
+
+    def _retry_delay(
+        self, attempt: int, retry_after: str | None
+    ) -> float:
+        delay = min(self.retry_base_seconds * (2**attempt), 10.0)
+        if retry_after is not None and retry_after.isdecimal():
+            delay = min(max(delay, float(retry_after)), 30.0)
+        if self.deadline is not None:
+            delay = min(delay, max(0.0, self.deadline - time.monotonic()))
+        return delay
+
+    def _wait_for_retry(self, attempt: int, retry_after: str | None) -> None:
+        delay = self._retry_delay(attempt, retry_after)
+        if delay <= 0:
+            raise DeltaError("source export exceeded the configured elapsed-time limit")
+        time.sleep(delay)
 
     def _management_json(self, path: str, query: dict[str, str]) -> Any:
         url = self.base + path
         if query:
             url += "?" + urllib.parse.urlencode(query)
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/json",
-                "User-Agent": "memeloop-token-center-delta-export/1",
-            },
-        )
-        try:
-            with HTTP_OPENER.open(request, timeout=self.timeout) as response:
-                if response.status != 200:
-                    raise DeltaError(
-                        f"source management request returned HTTP {response.status}"
-                    )
-                payload = response.read(8 * 1024 * 1024 + 1)
-        except urllib.error.HTTPError as error:
-            raise DeltaError(
-                f"source management request returned HTTP {error.code}"
-            ) from None
-        except (
-            urllib.error.URLError,
-            http.client.HTTPException,
-            TimeoutError,
-            OSError,
-        ):
-            raise DeltaError("source management request failed") from None
-        if len(payload) > 8 * 1024 * 1024:
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "memeloop-token-center-delta-export/1",
+        }
+        if self.token is not None:
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(url, headers=headers)
+        payload: bytes | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                with HTTP_OPENER.open(
+                    request, timeout=self._request_timeout()
+                ) as response:
+                    if response.status != 200:
+                        raise SourceHTTPError(response.status)
+                    payload = response.read(MAX_MANAGEMENT_RESPONSE_BYTES + 1)
+                    break
+            except urllib.error.HTTPError as error:
+                retry_after = error.headers.get("Retry-After")
+                error.close()
+                if error.code == 410:
+                    raise SnapshotExpired() from None
+                if error.code in {429, 503} and attempt < self.max_retries:
+                    self._wait_for_retry(attempt, retry_after)
+                    continue
+                raise SourceHTTPError(error.code) from None
+            except (
+                urllib.error.URLError,
+                http.client.HTTPException,
+                TimeoutError,
+                OSError,
+            ):
+                raise DeltaError("source management request failed") from None
+        if payload is None:
+            raise DeltaError("source management request failed")
+        if len(payload) > MAX_MANAGEMENT_RESPONSE_BYTES:
             raise DeltaError("source management response is too large")
         try:
             return unwrap_json(strict_json_loads(payload))
@@ -348,17 +506,17 @@ class SourceClient:
         return output
 
     def sessions(self, limit: int) -> list[dict[str, Any]]:
-        payload = self._management_json(SESSIONS_PATH, {"limit": str(limit)})
+        payload = self._management_json(self.paths.sessions, {"limit": str(limit)})
         if isinstance(payload, dict):
             payload = payload.get("sessions", payload.get("items"))
         return self._session_items(payload, strict_tie_order=False)
 
-    @staticmethod
-    def _opaque_cursor(value: Any, label: str) -> str:
+    def _opaque_cursor(self, value: Any, label: str) -> str:
+        maximum = 128 if self.collector_direct else 4096
         if (
             not isinstance(value, str)
             or not value
-            or len(value) > 4096
+            or len(value) > maximum
             or any(ord(character) < 0x21 or ord(character) > 0x7E for character in value)
         ):
             raise DeltaError(f"source {label} is invalid")
@@ -395,6 +553,7 @@ class SourceClient:
         expected: tuple[str, str, int, int, str] | None = None
         expected_snapshot = snapshot
         previous: tuple[dt.datetime, str] | None = None
+        page_count = 0
 
         while True:
             query = {
@@ -408,7 +567,7 @@ class SourceClient:
                 query["after_ingest_fence"] = after_ingest_fence
             if cursor is not None:
                 query["cursor"] = cursor
-            payload = self._management_json(SESSIONS_PATH, query)
+            payload = self._management_json(self.paths.sessions, query)
             if (
                 not isinstance(payload, dict)
                 or payload.get("cursor_protocol") != STABLE_CURSOR_PROTOCOL
@@ -467,8 +626,14 @@ class SourceClient:
 
             raw_items = payload.get("sessions", payload.get("items"))
             page = self._session_items(raw_items, strict_tie_order=True)
+            page_count += 1
             if len(page) > limit or (not page and not complete):
                 raise DeltaError("source stable session projection page is invalid")
+            if not complete and len(page) != limit:
+                raise DeltaError("source stable session projection has a short page gap")
+            maximum_pages = max(1, (session_count + limit - 1) // limit)
+            if page_count > maximum_pages:
+                raise DeltaError("source stable session projection has too many pages")
             for item in page:
                 session_id = item["session_id"]
                 last_at = parse_time(item["last_at"], "source session last_at")
@@ -515,7 +680,7 @@ class SourceClient:
         )
 
     def stats_records(self) -> int:
-        payload = self._management_json(STATS_PATH, {})
+        payload = self._management_json(self.paths.stats, {})
         if not isinstance(payload, dict):
             raise DeltaError("source stats response is invalid")
         records = payload.get("records")
@@ -523,17 +688,35 @@ class SourceClient:
             raise DeltaError("source stats record count is invalid")
         return records
 
+    def verify_offline_full(self) -> None:
+        payload = self._management_json(self.paths.stats, {})
+        if not isinstance(payload, dict):
+            raise DeltaError("source stats response is invalid")
+        protocols = payload.get("session_cursor_protocols")
+        if (
+            not isinstance(protocols, list)
+            or STABLE_CURSOR_PROTOCOL not in protocols
+            or payload.get("offline_full_snapshot_enabled") is not True
+        ):
+            raise DeltaError(
+                "collector does not advertise an enabled offline full snapshot"
+            )
+
     def ticket_url(
         self,
         session_id: str,
         snapshot: str | None = None,
         records_sha256: str | None = None,
     ) -> str:
-        query = {"id": session_id, "scope": "session", "format": "archive"}
+        query = {
+            ("session_id" if self.collector_direct else "id"): session_id,
+            "scope": "session",
+            "format": "archive",
+        }
         if snapshot is not None:
             query["snapshot"] = snapshot
         payload = self._management_json(
-            EXPORT_PATH,
+            self.paths.export,
             query,
         )
         if not isinstance(payload, dict) or not isinstance(payload.get("url"), str):
@@ -549,7 +732,8 @@ class SourceClient:
             for character in payload["url"]
         ):
             raise DeltaError("source export ticket response is invalid")
-        ticket = urllib.parse.urljoin(self.download_base + "/", payload["url"])
+        raw_ticket = payload["url"]
+        ticket = urllib.parse.urljoin(self.download_base + "/", raw_ticket)
         parsed = urllib.parse.urlsplit(ticket)
         ticket_origin = urllib.parse.urlunsplit(
             (parsed.scheme, parsed.netloc, "", "", "")
@@ -559,9 +743,38 @@ class SourceClient:
             or parsed.username
             or parsed.password
             or parsed.fragment
-            or not parsed.path.startswith("/archive-api/v1/exports/")
+            or not parsed.path.startswith(TICKET_PATH_PREFIX)
         ):
             raise DeltaError("source export ticket escaped the configured download origin")
+        capability = parsed.path[len(TICKET_PATH_PREFIX) :]
+        decoded_capability = urllib.parse.unquote(capability)
+        if (
+            not capability
+            or "/" in capability
+            or "\\" in capability
+            or "/" in decoded_capability
+            or "\\" in decoded_capability
+            or decoded_capability in {".", ".."}
+            or len(decoded_capability) > 512
+            or any(
+                ord(character) < 0x21 or ord(character) > 0x7E
+                for character in decoded_capability
+            )
+        ):
+            raise DeltaError("source export ticket path is invalid")
+        if self.collector_direct:
+            if parsed.query or not re.fullmatch(r"[0-9a-f]{64}", capability):
+                raise DeltaError("collector export capability is invalid")
+        elif parsed.query:
+            query_values = urllib.parse.parse_qs(
+                parsed.query, keep_blank_values=True, strict_parsing=True
+            )
+            if (
+                set(query_values) != {"snapshot"}
+                or snapshot is None
+                or query_values["snapshot"] != [snapshot]
+            ):
+                raise DeltaError("source export ticket query is invalid")
         return ticket
 
     def export_lines(
@@ -571,28 +784,51 @@ class SourceClient:
         snapshot: str | None = None,
         records_sha256: str | None = None,
     ) -> Iterable[bytes]:
-        ticket = self.ticket_url(session_id, snapshot, records_sha256)
-        request = urllib.request.Request(
-            ticket,
-            headers={
-                "Accept": "application/x-ndjson",
-                "User-Agent": "memeloop-token-center-delta-export/1",
-            },
-        )
-        try:
-            response: BinaryIO = HTTP_OPENER.open(request, timeout=self.timeout)
-        except urllib.error.HTTPError as error:
-            raise DeltaError(f"source archive export returned HTTP {error.code}") from None
-        except (
-            urllib.error.URLError,
-            http.client.HTTPException,
-            TimeoutError,
-            OSError,
-        ):
-            raise DeltaError("source archive export failed") from None
+        response: BinaryIO | None = None
+        for attempt in range(self.max_retries + 1):
+            ticket = self.ticket_url(session_id, snapshot, records_sha256)
+            request = urllib.request.Request(
+                ticket,
+                headers={
+                    "Accept": "application/x-ndjson",
+                    "User-Agent": "memeloop-token-center-delta-export/1",
+                },
+            )
+            try:
+                response = HTTP_OPENER.open(
+                    request, timeout=self._request_timeout()
+                )
+                break
+            except urllib.error.HTTPError as error:
+                status = error.code
+                error.close()
+                if (
+                    self.collector_direct
+                    and snapshot is not None
+                    and status == 404
+                    and attempt < self.max_retries
+                ):
+                    self._wait_for_retry(attempt, None)
+                    continue
+                if self.collector_direct and snapshot is not None and status == 404:
+                    raise SnapshotExpired() from None
+                raise DeltaError(
+                    f"source archive export returned HTTP {status}"
+                ) from None
+            except (
+                urllib.error.URLError,
+                http.client.HTTPException,
+                TimeoutError,
+                OSError,
+            ):
+                raise DeltaError("source archive export failed") from None
+        if response is None:
+            raise DeltaError("source archive export failed")
         try:
             while True:
+                self._request_timeout()
                 line = response.readline(maximum + 1)
+                self._request_timeout()
                 if not line:
                     break
                 if len(line) > maximum:
@@ -611,17 +847,24 @@ class SourceClient:
 
 
 def source_fingerprint(client: SourceClient) -> str:
+    descriptor = {
+        "origin": client.origin,
+        "base": client.base,
+        "download_origin": client.download_origin,
+        "download_base": client.download_base,
+        "sessions_path": client.paths.sessions,
+        "export_path": client.paths.export,
+        "stats_path": client.paths.stats,
+        "version": (
+            COLLECTOR_FINGERPRINT_VERSION
+            if client.collector_direct
+            else SOURCE_FINGERPRINT_VERSION
+        ),
+    }
+    if client.collector_direct:
+        descriptor["source_mode"] = client.paths.mode
     material = json.dumps(
-        {
-            "origin": client.origin,
-            "base": client.base,
-            "download_origin": client.download_origin,
-            "download_base": client.download_base,
-            "sessions_path": SESSIONS_PATH,
-            "export_path": EXPORT_PATH,
-            "stats_path": STATS_PATH,
-            "version": SOURCE_FINGERPRINT_VERSION,
-        },
+        descriptor,
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
@@ -958,7 +1201,10 @@ def load_session_projection(
     try:
         return client.stable_sessions(limit, lower_bound)
     except StableCursorUnsupported:
-        pass
+        if client.collector_direct:
+            raise DeltaError(
+                f"collector does not implement {STABLE_CURSOR_PROTOCOL}"
+            ) from None
     legacy = client.sessions(limit)
     verify_complete_projection(legacy, limit, source_records)
     selected = select_sessions(legacy, lower_bound)
@@ -1021,13 +1267,28 @@ def verify_source_clock(
 
 
 def export_delta(args: argparse.Namespace) -> dict[str, Any]:
-    token = load_token(args.token_file)
+    token = None
+    if not args.collector_direct:
+        token = (
+            load_token(args.token_file)
+            if args.token_file is not None
+            else load_token_env(args.token_env)
+        )
+    private_http_hosts: frozenset[str] | bool = (
+        True
+        if args.allow_http
+        else frozenset(normalize_host(item) for item in args.private_http_host)
+    )
     client = SourceClient(
         args.base_url,
         args.download_base_url or args.base_url,
         token,
         args.timeout_seconds,
-        args.allow_http,
+        private_http_hosts,
+        collector_direct=args.collector_direct,
+        max_retries=args.max_retries,
+        retry_base_seconds=args.retry_base_seconds,
+        deadline=args.deadline,
     )
     fingerprint = source_fingerprint(client)
     checkpoint = load_checkpoint(args.checkpoint, fingerprint)
@@ -1069,6 +1330,16 @@ def export_delta(args: argparse.Namespace) -> dict[str, Any]:
         )
         prior_ingest_fence = checkpoint.get("source_ingest_fence")
         sequence = checkpoint["sequence"] + 1
+    if args.collector_direct and prior_ingest_fence is None:
+        if not args.offline_full:
+            raise DeltaError(
+                "the first collector-direct snapshot requires --offline-full"
+            )
+        client.verify_offline_full()
+    elif args.offline_full:
+        raise DeltaError(
+            "--offline-full is only valid for the first collector-direct snapshot"
+        )
     try:
         lower_bound = prior_watermark - dt.timedelta(seconds=args.overlap_seconds)
     except OverflowError as error:
@@ -1273,6 +1544,8 @@ def export_delta(args: argparse.Namespace) -> dict[str, Any]:
             "session_limit": args.session_limit,
             "session_count": len(selected),
             "session_projection_protocol": first_projection.protocol,
+            "source_mode": client.paths.mode,
+            "offline_full_snapshot": bool(args.offline_full),
             "source_projection_requests": first_projection.request_count,
             "source_snapshot_sha256": (
                 None
@@ -1313,13 +1586,23 @@ def export_delta(args: argparse.Namespace) -> dict[str, Any]:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Export a checkpointed cpa-session-archive delta through CPA/API2"
+        description=(
+            "Export a checkpointed cpa-session-archive delta directly from the "
+            "collector or through the legacy CPA plugin migration input"
+        )
     )
     result.add_argument("--base-url", required=True)
     result.add_argument("--download-base-url")
-    result.add_argument("--token-file", required=True, type=Path)
+    token = result.add_mutually_exclusive_group()
+    token.add_argument("--token-file", type=Path)
+    token.add_argument("--token-env", metavar="ENV_NAME")
     result.add_argument("--checkpoint", required=True, type=Path)
     result.add_argument("--output", required=True, type=Path)
+    result.add_argument("--collector-direct", action="store_true")
+    result.add_argument("--offline-full", action="store_true")
+    result.add_argument(
+        "--private-http-host", action="append", default=[], metavar="HOST"
+    )
     result.add_argument("--since")
     result.add_argument("--overlap-seconds", type=int, default=86_400)
     result.add_argument("--session-limit", type=int, default=1000)
@@ -1327,11 +1610,34 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-download-bytes", type=int, default=64 * 1024**3)
     result.add_argument("--max-output-bytes", type=int, default=64 * 1024**3)
     result.add_argument("--timeout-seconds", type=float, default=60.0)
+    result.add_argument("--max-elapsed-seconds", type=float, default=6 * 3600)
+    result.add_argument("--max-retries", type=int, default=5)
+    result.add_argument("--retry-base-seconds", type=float, default=0.5)
     result.add_argument("--max-future-skew-seconds", type=int, default=3600)
     result.add_argument("--require-stable-source", action="store_true")
+    # Legacy migration-input compatibility for the existing local mock only.
     result.add_argument("--allow-http", action="store_true")
     result.add_argument("--resume", action="store_true")
     return result
+
+
+def run_export(args: argparse.Namespace) -> dict[str, Any]:
+    for attempt in range(args.max_retries + 1):
+        try:
+            return export_delta(args)
+        except SnapshotExpired:
+            if attempt >= args.max_retries:
+                raise DeltaError(
+                    "collector snapshot or export ticket repeatedly expired"
+                ) from None
+            remaining = args.deadline - time.monotonic()
+            delay = min(args.retry_base_seconds * (2**attempt), 10.0, remaining)
+            if delay <= 0:
+                raise DeltaError(
+                    "source export exceeded the configured elapsed-time limit"
+                ) from None
+            time.sleep(delay)
+    raise DeltaError("collector snapshot retry limit was exceeded")
 
 
 def main() -> int:
@@ -1348,9 +1654,36 @@ def main() -> int:
         raise DeltaError("max output bytes must cover one line and be at most 1 TiB")
     if args.timeout_seconds <= 0 or args.timeout_seconds > 3600:
         raise DeltaError("timeout seconds must be between 0 and 3600")
+    if args.max_elapsed_seconds <= 0 or args.max_elapsed_seconds > 24 * 3600:
+        raise DeltaError("max elapsed seconds must be between 0 and 86400")
+    if args.max_retries < 0 or args.max_retries > 20:
+        raise DeltaError("max retries must be between 0 and 20")
+    if args.retry_base_seconds <= 0 or args.retry_base_seconds > 30:
+        raise DeltaError("retry base seconds must be between 0 and 30")
     if args.max_future_skew_seconds < 0 or args.max_future_skew_seconds > 86_400:
         raise DeltaError("max future skew seconds must be between 0 and 86400")
-    manifest = export_delta(args)
+    if args.offline_full and not args.collector_direct:
+        raise DeltaError("--offline-full requires --collector-direct")
+    if args.collector_direct and (args.token_file is not None or args.token_env is not None):
+        raise DeltaError("collector-direct does not accept a CPA token")
+    if not args.collector_direct and args.token_file is None and args.token_env is None:
+        raise DeltaError("the legacy CPA plugin input requires --token-file or --token-env")
+    if args.collector_direct and args.allow_http:
+        raise DeltaError(
+            "collector-direct HTTP requires an exact --private-http-host allowlist"
+        )
+    if args.allow_http and args.private_http_host:
+        raise DeltaError("--allow-http and --private-http-host cannot be combined")
+    normalized_hosts = [normalize_host(item) for item in args.private_http_host]
+    if any(
+        not item or item != raw.rstrip(".").lower()
+        for item, raw in zip(normalized_hosts, args.private_http_host)
+    ):
+        raise DeltaError("private HTTP host allowlist contains an invalid host")
+    if len(set(normalized_hosts)) != len(normalized_hosts):
+        raise DeltaError("private HTTP host allowlist contains duplicates")
+    args.deadline = time.monotonic() + args.max_elapsed_seconds
+    manifest = run_export(args)
     print(
         json.dumps(
             {

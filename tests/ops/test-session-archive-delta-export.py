@@ -143,6 +143,12 @@ class SourceState:
         self.ingest_sequence = 0
         self.record_ingest_sequence: dict[str, int] = {}
         self.serve_live_snapshot_exports = False
+        self.offline_full_enabled = False
+        self.direct_ticket_targets: dict[str, tuple[str, str]] = {}
+        self.direct_ticket_url: str | None = None
+        self.expire_direct_ticket_once = False
+        self.stable_transient_statuses: list[int] = []
+        self.direct_authorization_seen = False
 
     @property
     def request_count(self) -> int:
@@ -197,13 +203,20 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
         sessions_path = "/v0/management/plugins/cpa-session-archive/sessions"
         stats_path = "/v0/management/plugins/cpa-session-archive/stats"
         export_path = "/v0/management/plugins/cpa-session-archive/export"
+        direct_sessions_path = "/v1/sessions"
+        direct_stats_path = "/v1/stats"
+        direct_export_path = "/v1/export-tickets"
         if parsed.path == "/leak":
             state.leak_calls += 1
             self.send_json({"authorization": self.headers.get("Authorization")})
             return
-        if parsed.path == sessions_path:
+        if parsed.path in {sessions_path, direct_sessions_path}:
             state.session_calls += 1
-            if not self.management_authorized():
+            if parsed.path == direct_sessions_path:
+                state.direct_authorization_seen |= bool(
+                    self.headers.get("Authorization")
+                )
+            elif not self.management_authorized():
                 return
             if state.redirect_sessions:
                 self.send_response(302)
@@ -212,6 +225,12 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
                 return
             query = urllib.parse.parse_qs(parsed.query)
             if query.get("cursor_protocol", [""])[0] == STABLE_CURSOR_PROTOCOL:
+                if state.stable_transient_statuses:
+                    status = state.stable_transient_statuses.pop(0)
+                    self.send_response(status)
+                    self.send_header("Retry-After", "0")
+                    self.end_headers()
+                    return
                 if not state.stable_cursor_supported:
                     # v0.7.21 treats unknown query parameters as facet filters.
                     self.send_management_json({"sessions": []})
@@ -332,23 +351,38 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
             limit = int(query.get("limit", ["100"])[0])
             self.send_management_json({"sessions": snapshots[index][:limit]})
             return
-        if parsed.path == stats_path:
+        if parsed.path in {stats_path, direct_stats_path}:
             state.stats_calls += 1
-            if not self.management_authorized():
+            if parsed.path == direct_stats_path:
+                state.direct_authorization_seen |= bool(
+                    self.headers.get("Authorization")
+                )
+            elif not self.management_authorized():
                 return
             default_count = sum(len(rows) for rows in state.exports.values())
             values = state.stats_values or [default_count]
             index = min(state.stats_calls - 1, len(values) - 1)
-            self.send_management_json(
-                {"records": values[index], "sessions": len(state.sessions)}
-            )
+            response = {"records": values[index], "sessions": len(state.sessions)}
+            if parsed.path == direct_stats_path:
+                response.update(
+                    {
+                        "session_cursor_protocols": [STABLE_CURSOR_PROTOCOL],
+                        "offline_full_snapshot_enabled": state.offline_full_enabled,
+                    }
+                )
+            self.send_management_json(response)
             return
-        if parsed.path == export_path:
+        if parsed.path in {export_path, direct_export_path}:
             state.export_calls += 1
-            if not self.management_authorized():
+            if parsed.path == direct_export_path:
+                state.direct_authorization_seen |= bool(
+                    self.headers.get("Authorization")
+                )
+            elif not self.management_authorized():
                 return
             query = urllib.parse.parse_qs(parsed.query)
-            session_id = query.get("id", [""])[0]
+            direct = parsed.path == direct_export_path
+            session_id = query.get("session_id" if direct else "id", [""])[0]
             snapshot = query.get("snapshot", [""])[0]
             exports = state.exports
             if snapshot:
@@ -361,8 +395,16 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
             if session_id not in exports:
                 self.send_json({"error": "missing"}, 404)
                 return
-            if state.cross_origin_ticket:
+            if state.direct_ticket_url is not None and direct:
+                url = state.direct_ticket_url
+            elif state.cross_origin_ticket:
                 url = "http://example.invalid/archive-api/v1/exports/private-ticket"
+            elif direct:
+                capability = hashlib.sha256(
+                    f"{session_id}\0{snapshot}".encode()
+                ).hexdigest()
+                state.direct_ticket_targets[capability] = (session_id, snapshot)
+                url = "/archive-api/v1/exports/" + capability
             else:
                 url = "/archive-api/v1/exports/ticket-" + urllib.parse.quote(
                     session_id, safe=""
@@ -381,6 +423,36 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
             self.send_management_json(response)
             return
         ticket_prefix = "/archive-api/v1/exports/ticket-"
+        direct_ticket_prefix = "/archive-api/v1/exports/"
+        if parsed.path.startswith(direct_ticket_prefix) and not parsed.path.startswith(ticket_prefix):
+            state.ticket_calls += 1
+            if self.headers.get("Authorization"):
+                state.ticket_authorization_seen = True
+            if state.expire_direct_ticket_once:
+                state.expire_direct_ticket_once = False
+                self.send_json({"error": "expired"}, 404)
+                return
+            capability = parsed.path[len(direct_ticket_prefix) :]
+            target = state.direct_ticket_targets.get(capability)
+            if target is None:
+                self.send_json({"error": "ticket"}, 404)
+                return
+            session_id, snapshot = target
+            stored = state.stable_snapshots.get(snapshot)
+            rows = None if stored is None else stored[1].get(session_id)
+            if rows is None:
+                self.send_json({"error": "ticket"}, 404)
+                return
+            body = b"".join(
+                json.dumps(row, separators=(",", ":")).encode("utf-8") + b"\n"
+                for row in rows
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path.startswith(ticket_prefix):
             state.ticket_calls += 1
             if self.headers.get("Authorization"):
@@ -477,6 +549,56 @@ class DeltaExporterTest(unittest.TestCase):
             text=True,
             capture_output=True,
             timeout=15,
+            check=False,
+        )
+
+    def run_direct_export(
+        self,
+        output: Path,
+        *,
+        since: str | None = "2026-08-16T00:00:00Z",
+        offline_full: bool = True,
+        extra: list[str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            "python3",
+            str(EXPORTER),
+            "--collector-direct",
+            "--base-url",
+            self.base_url,
+            "--private-http-host",
+            "127.0.0.1",
+            "--checkpoint",
+            str(self.checkpoint),
+            "--output",
+            str(output),
+            "--overlap-seconds",
+            "3600",
+            "--max-line-bytes",
+            "1024",
+            "--max-download-bytes",
+            "1048576",
+            "--max-output-bytes",
+            "1048576",
+            "--timeout-seconds",
+            "5",
+            "--max-elapsed-seconds",
+            "15",
+            "--retry-base-seconds",
+            "0.01",
+        ]
+        if offline_full:
+            command.append("--offline-full")
+        if since is not None:
+            command.extend(["--since", since])
+        if extra:
+            command.extend(extra)
+        return subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=20,
             check=False,
         )
 
@@ -981,6 +1103,135 @@ class DeltaExporterTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("write barrier", result.stderr)
         self.assertFalse(self.checkpoint.exists())
+
+    def test_collector_direct_offline_full_retries_transients_and_expired_ticket(self) -> None:
+        first, second = self.configure_two_records()
+        self.state.stable_cursor_supported = True
+        self.state.offline_full_enabled = True
+        self.state.stable_transient_statuses = [503, 429]
+        self.state.expire_direct_ticket_once = True
+        output = self.temporary / "collector-full.jsonl"
+        result = self.run_direct_export(
+            output,
+            extra=["--session-limit", "1", "--max-retries", "4"],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exported = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual(exported, [first, second])
+        manifest = json.loads(Path(str(output) + ".manifest.json").read_text())
+        self.assertEqual(manifest["source_mode"], "collector-direct")
+        self.assertTrue(manifest["offline_full_snapshot"])
+        self.assertEqual(manifest["session_projection_protocol"], STABLE_CURSOR_PROTOCOL)
+        self.assertFalse(self.state.direct_authorization_seen)
+        self.assertFalse(self.state.ticket_authorization_seen)
+        self.assertGreaterEqual(self.state.ticket_calls, 3)
+
+    def test_collector_direct_requires_offline_advertisement_and_never_falls_back(self) -> None:
+        self.configure_two_records()
+        self.state.stable_cursor_supported = True
+        missing_flag = self.run_direct_export(
+            self.temporary / "missing-offline.jsonl", offline_full=False
+        )
+        self.assertEqual(missing_flag.returncode, 2)
+        self.assertIn("requires --offline-full", missing_flag.stderr)
+
+        not_advertised = self.run_direct_export(
+            self.temporary / "not-advertised.jsonl"
+        )
+        self.assertEqual(not_advertised.returncode, 2)
+        self.assertIn("does not advertise", not_advertised.stderr)
+
+        self.state.offline_full_enabled = True
+        self.state.stable_cursor_supported = False
+        no_stable = self.run_direct_export(self.temporary / "no-stable.jsonl")
+        self.assertEqual(no_stable.returncode, 2)
+        self.assertIn("does not implement", no_stable.stderr)
+        self.assertFalse(self.checkpoint.exists())
+
+    def test_collector_direct_incremental_fence_captures_old_timestamp_arrival(self) -> None:
+        original = record(
+            "request-original",
+            "private-session",
+            "2026-08-16T01:00:00Z",
+            "2026-08-16T01:01:00Z",
+        )
+        self.state.sessions = [summary(original["session_id"], [original])]
+        self.state.exports = {original["session_id"]: [original]}
+        self.state.stats_values = [1, 1, 1, 1]
+        self.state.stable_cursor_supported = True
+        self.state.offline_full_enabled = True
+        first_output = self.temporary / "collector-baseline.jsonl"
+        first_result = self.run_direct_export(first_output)
+        self.assertEqual(first_result.returncode, 0, first_result.stderr)
+        first_checkpoint = json.loads(self.checkpoint.read_text())
+
+        late = record(
+            "request-late",
+            "private-session",
+            "2026-08-15T01:00:00Z",
+            "2026-08-15T01:01:00Z",
+        )
+        self.state.exports[original["session_id"]].append(late)
+        self.state.sessions = [summary(original["session_id"], [original, late])]
+        self.state.stats_values = [2, 2, 2]
+        second_output = self.temporary / "collector-delta.jsonl"
+        second_result = self.run_direct_export(
+            second_output,
+            since=None,
+            offline_full=False,
+        )
+        self.assertEqual(second_result.returncode, 0, second_result.stderr)
+        exported = [json.loads(line) for line in second_output.read_text().splitlines()]
+        self.assertEqual(
+            {item["request_id"] for item in exported},
+            {"request-original", "request-late"},
+        )
+        second_manifest = json.loads(
+            Path(str(second_output) + ".manifest.json").read_text()
+        )
+        self.assertEqual(
+            second_manifest["prior_source_ingest_fence"],
+            first_checkpoint["source_ingest_fence"],
+        )
+        self.assertGreater(
+            int(second_manifest["source_ingest_fence"]),
+            int(second_manifest["prior_source_ingest_fence"]),
+        )
+
+    def test_collector_direct_rejects_malicious_ticket_and_cpa_token(self) -> None:
+        row = record(
+            "request-1",
+            "private-session",
+            "2026-08-16T01:00:00Z",
+            "2026-08-16T01:01:00Z",
+        )
+        self.state.sessions = [summary(row["session_id"], [row])]
+        self.state.exports = {row["session_id"]: [row]}
+        self.state.stats_values = [1, 1]
+        self.state.stable_cursor_supported = True
+        self.state.offline_full_enabled = True
+        malicious = [
+            "//example.invalid/archive-api/v1/exports/" + "a" * 64,
+            "/archive-api/v1/exports/" + "a" * 64 + "?leak=1",
+            "/archive-api/v1/exports/%2e%2e",
+            "/archive-api/v1/exports/not-a-capability",
+        ]
+        for index, value in enumerate(malicious):
+            self.state.direct_ticket_url = value
+            result = self.run_direct_export(
+                self.temporary / f"malicious-{index}.jsonl",
+                extra=["--max-retries", "0"],
+            )
+            self.assertEqual(result.returncode, 2, value)
+            self.assertFalse(self.checkpoint.exists())
+        self.state.direct_ticket_url = None
+        result = self.run_direct_export(
+            self.temporary / "token-refused.jsonl",
+            extra=["--token-env", "MTC_TEST_SOURCE_TOKEN"],
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("does not accept a CPA token", result.stderr)
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
