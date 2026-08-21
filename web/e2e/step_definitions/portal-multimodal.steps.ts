@@ -333,6 +333,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
     clientKeyId: created.key_id,
     imageModel,
     videoModel,
+    generationResponses: [],
   });
   this.assertNoBrowserFailures();
 });
@@ -340,6 +341,14 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
 When('普通凭据用户通过中文亮色门户创建图片和视频任务', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const observation = requireMultimodalObservation(this);
+  page.on('response', (response) => {
+    const url = new URL(response.url());
+    if (url.origin !== new URL(baseURL).origin) return;
+    if (!url.pathname.startsWith('/self/v1/generations')
+      && url.pathname !== '/v1/images/generations'
+      && url.pathname !== '/v1/videos/generations') return;
+    observation.generationResponses.push(response.text());
+  });
   await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 390, height: 844 } });
   await page.locator('input[type="password"]').fill(observation.clientCredential);
   await page.getByRole('button', { name: '载入', exact: true }).click();
@@ -361,6 +370,33 @@ Then('门户自动轮询到图片和视频成功并显示准确计费', async fu
   await assertContains(metric(page, '可用余额 (USD)'), '$9.3');
   await assertContains(metric(page, '总费用'), '$0.7');
   await assertAttribute(page.locator('html'), 'data-theme', 'light');
+});
+
+Then('上游短期签名不出现在响应、页面、详情或持久化存储中', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const observation = requireMultimodalObservation(this);
+  const canary = 'never-persist';
+  const responseBodies = await Promise.all(observation.generationResponses);
+  assert.ok(responseBodies.length >= 4, 'expected browser generation submission and polling responses');
+  assert.ok(responseBodies.every((body) => !body.includes(canary)), 'provider canary leaked through a browser generation response');
+  assert.ok(!(await page.content()).includes(canary), 'provider canary leaked into the rendered portal DOM');
+
+  const jobs = await requestJson<Array<{ job_id: string; model: string }>>('/self/v1/generations?limit=100', {
+    credential: observation.clientCredential,
+  });
+  const video = jobs.find((job) => job.model === observation.videoModel);
+  assert.ok(video, 'successful browser video generation was missing from self-service history');
+  const detail = await requestJson<unknown>(`/self/v1/generations/${video.job_id}`, {
+    credential: observation.clientCredential,
+  });
+  assert.ok(!JSON.stringify(detail).includes(canary), 'provider canary leaked through self-service generation detail');
+
+  const mockPort = Number(process.env.MTC_E2E_MOCK_PORT ?? 41740);
+  const persistenceResponse = await fetch(`http://127.0.0.1:${mockPort}/__e2e/never-persist-state`, {
+    signal: AbortSignal.timeout(1_000),
+  });
+  assert.equal(persistenceResponse.status, 200);
+  assert.deepEqual(await persistenceResponse.json(), { database: false, archive: false });
 });
 
 Then('用户通过真实下载控件取得归档图片和视频', async function (this: DogfoodWorld) {

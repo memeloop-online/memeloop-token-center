@@ -19,6 +19,7 @@ export interface MultimodalObservation {
   clientKeyId: string;
   imageModel: string;
   videoModel: string;
+  generationResponses: Promise<string>[];
 }
 export interface CredentialGroupObservation {
   routing: unknown;

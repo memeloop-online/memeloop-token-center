@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,6 +40,26 @@ let stopPromise;
 let comfySequence = 0;
 let blockerActive = false;
 
+function directoryContains(root, needle) {
+  try {
+    return readdirSync(root).some((entry) => {
+      const path = join(root, entry);
+      return statSync(path).isDirectory()
+        ? directoryContains(path, needle)
+        : readFileSync(path).includes(needle);
+    });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function databaseContains(needle) {
+  return readdirSync(testDirectory)
+    .filter((entry) => entry.startsWith('browser.db'))
+    .some((entry) => readFileSync(join(testDirectory, entry)).includes(needle));
+}
+
 const upstream = createServer((request, response) => {
   const chunks = [];
   request.on('data', (chunk) => chunks.push(chunk));
@@ -54,6 +74,15 @@ const upstream = createServer((request, response) => {
     if (request.method === 'GET' && requestUrl.pathname === '/__e2e/blocker-active') {
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
       response.end(JSON.stringify({ active: blockerActive }));
+      return;
+    }
+    if (request.method === 'GET' && requestUrl.pathname === '/__e2e/never-persist-state') {
+      const needle = Buffer.from('never-persist');
+      response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      response.end(JSON.stringify({
+        database: databaseContains(needle),
+        archive: directoryContains(join(testDirectory, 'archive'), needle),
+      }));
       return;
     }
     if (request.method === 'POST' && requestUrl.pathname === '/api/v3/contents/generations/tasks') {
