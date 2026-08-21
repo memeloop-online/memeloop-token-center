@@ -241,6 +241,10 @@ pub async fn start_cursor_login(
     })
 }
 
+// This is the transport/database boundary for one poll operation. Keeping the
+// authorization context explicit makes every caller provide tenant, operator,
+// clock, and loopback policy instead of hiding authority in shared state.
+#[allow(clippy::too_many_arguments)]
 pub async fn poll_cursor_login(
     db: &Database,
     http: &reqwest::Client,
