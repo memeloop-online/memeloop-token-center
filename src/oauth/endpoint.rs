@@ -19,12 +19,14 @@ pub(super) fn validate_oauth_endpoint_with_scope(
     let url = Url::parse(value)
         .map_err(|_| AppError::BadRequest(format!("OAuth {field} must be a URL")))?;
     let private_http = url.scheme() == "http"
-        && (scope == OutboundScope::Private
-            || url.host().is_some_and(|host| match host {
-                Host::Domain(host) => is_loopback_oauth_name(host),
-                Host::Ipv4(address) => address.is_loopback(),
-                Host::Ipv6(address) => address.is_loopback(),
-            }));
+        && url.host().is_some_and(|host| match host {
+            Host::Domain(host) => {
+                is_loopback_oauth_name(host)
+                    || (scope == OutboundScope::Private && is_private_cluster_service(host))
+            }
+            Host::Ipv4(address) => address.is_loopback(),
+            Host::Ipv6(address) => address.is_loopback(),
+        });
     if url.scheme() != "https" && !private_http {
         return Err(AppError::BadRequest(format!(
             "OAuth {field} must use HTTPS unless the account is explicitly private"
@@ -58,13 +60,13 @@ fn validate_managed_oauth_adapter_endpoint_inner(
     field: &str,
     allow_test_loopback: bool,
 ) -> Result<Url, AppError> {
-    let url = validate_oauth_endpoint(value, field)?;
+    let url = validate_oauth_endpoint_with_scope(value, field, OutboundScope::Private)?;
     if url.query().is_some() {
         return Err(AppError::BadRequest(format!(
             "OAuth {field} cannot contain a query"
         )));
     }
-    classify_oauth_endpoint(&url, field, allow_test_loopback, OutboundScope::Public)?;
+    classify_oauth_endpoint(&url, field, allow_test_loopback, OutboundScope::Private)?;
     Ok(url)
 }
 
@@ -78,7 +80,7 @@ pub(super) fn managed_oauth_endpoint_scope(
         &url,
         "adapter_url",
         allow_test_loopback,
-        OutboundScope::Public,
+        OutboundScope::Private,
     )?;
     Ok((url, scope))
 }
@@ -107,7 +109,16 @@ fn classify_oauth_endpoint(
         Host::Domain(host) if is_loopback_oauth_name(host) && !allow_test_loopback => Err(
             AppError::BadRequest(format!("OAuth {field} cannot target a loopback host")),
         ),
-        Host::Domain(_) => Ok(configured_scope),
+        Host::Domain(host) if is_private_cluster_service(host) => {
+            if configured_scope == OutboundScope::Private {
+                Ok(OutboundScope::Private)
+            } else {
+                Err(AppError::BadRequest(format!(
+                    "OAuth {field} cannot target a private cluster service"
+                )))
+            }
+        }
+        Host::Domain(_) => Ok(OutboundScope::Public),
         Host::Ipv4(address) => classify_oauth_ip(
             IpAddr::V4(address),
             field,
@@ -127,16 +138,13 @@ fn classify_oauth_ip(
     address: IpAddr,
     field: &str,
     allow_test_loopback: bool,
-    configured_scope: OutboundScope,
+    _configured_scope: OutboundScope,
 ) -> Result<OutboundScope, AppError> {
     if allow_test_loopback && address.is_loopback() {
-        return Ok(configured_scope);
+        return Ok(OutboundScope::Public);
     }
-    if network::is_public_ip(address)
-        || (configured_scope == OutboundScope::Private
-            && network::is_safe_private_upstream_ip(address))
-    {
-        return Ok(configured_scope);
+    if network::is_public_ip(address) {
+        return Ok(OutboundScope::Public);
     }
     Err(AppError::BadRequest(format!(
         "OAuth {field} cannot target a private or reserved IP address"
@@ -146,4 +154,15 @@ fn classify_oauth_ip(
 fn is_loopback_oauth_name(host: &str) -> bool {
     let normalized = host.trim_end_matches('.').to_ascii_lowercase();
     normalized == "localhost" || normalized.ends_with(".localhost")
+}
+
+fn is_private_cluster_service(host: &str) -> bool {
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels = normalized.split('.').collect::<Vec<_>>();
+    matches!(
+        labels.as_slice(),
+        [service, namespace, "svc"]
+            | [service, namespace, "svc", "cluster", "local"]
+            if !service.is_empty() && !namespace.is_empty()
+    )
 }

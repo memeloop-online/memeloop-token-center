@@ -154,7 +154,9 @@ pub(super) async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     if authenticated_api {
-        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        if !headers.contains_key(header::CACHE_CONTROL) {
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
         headers.insert(
             header::HeaderName::from_static("x-mtc-api-version"),
             HeaderValue::from_static("v1"),

@@ -1574,9 +1574,9 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
             oauth_adapter: Some(crate::provider::OAuthAdapterContribution {
                 api_version: "oauth-adapter-v1".to_owned(),
                 flow_kind: crate::provider::OAuthFlowKind::CursorPkce,
-                login_url: "http://10.0.0.1:8080/login".to_owned(),
-                poll_url: "http://10.0.0.1:8080/poll".to_owned(),
-                refresh_url: "http://10.0.0.1:8080/refresh".to_owned(),
+                login_url: "http://oauth-adapter.default.svc/login".to_owned(),
+                poll_url: "http://oauth-adapter.default.svc/poll".to_owned(),
+                refresh_url: "http://oauth-adapter.default.svc/refresh".to_owned(),
             }),
             managed_oauth_adapter: None,
             component_adapter: None,
@@ -1593,7 +1593,7 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
                         "account_name": "plugin-primary",
                         "provider_driver": "plugin-provider",
                         "provider_config": {
-                            "base_url": "http://10.0.0.1:8080",
+                            "base_url": "http://plugin-upstream.default.svc",
                             "network_scope": "private"
                         }
                     })

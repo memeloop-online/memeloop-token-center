@@ -153,7 +153,7 @@ mod tests {
                 false,
                 OutboundScope::Private,
             )
-            .is_ok()
+            .is_err()
         );
         assert!(
             oauth_adapter_endpoint_scope(
@@ -169,7 +169,19 @@ mod tests {
                 "http://oauth-adapter.default.svc/poll",
                 "adapter_url",
             )
-            .is_err()
+            .is_ok()
+        );
+        assert_eq!(
+            endpoint::managed_oauth_endpoint_scope("http://oauth-adapter.default.svc/poll", false,)
+                .unwrap()
+                .1,
+            OutboundScope::Private
+        );
+        assert_eq!(
+            endpoint::managed_oauth_endpoint_scope("https://oauth.example.com/poll", false)
+                .unwrap()
+                .1,
+            OutboundScope::Public
         );
         assert_eq!(
             oauth_adapter_endpoint_scope(
@@ -181,6 +193,27 @@ mod tests {
             .unwrap()
             .1,
             OutboundScope::Private
+        );
+        assert_eq!(
+            oauth_adapter_endpoint_scope(
+                "https://oauth.example.com/poll",
+                "poll_url",
+                false,
+                OutboundScope::Private,
+            )
+            .unwrap()
+            .1,
+            OutboundScope::Public,
+            "a private upstream account must not grant private DNS authority to a public adapter"
+        );
+        assert!(
+            oauth_adapter_endpoint_scope(
+                "http://oauth.example.com/poll",
+                "poll_url",
+                false,
+                OutboundScope::Private,
+            )
+            .is_err()
         );
         for endpoint in [
             "https://[::1]/oauth",

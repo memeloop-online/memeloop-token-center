@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, process::ExitCode, time::Duration};
 
 use clap::{Parser, Subcommand};
 use memeloop_token_center::{
@@ -53,7 +53,7 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .json()
@@ -67,8 +67,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "token center build"
     );
 
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error_code) => {
+            error!(
+                error_code,
+                "token center stopped before completing its lifecycle"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), &'static str> {
     let cli = Cli::parse();
-    let config = Config::from_env()?;
+    let config = Config::from_env().map_err(|_| "configuration_invalid")?;
 
     match cli.command {
         Command::Migrate => {
@@ -76,14 +89,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 &config.database_url,
                 config.database_max_connections,
             )
-            .await?;
-            database.migrate().await?;
+            .await
+            .map_err(|_| "database_connect_failed")?;
+            database
+                .migrate()
+                .await
+                .map_err(|_| "database_migration_failed")?;
             info!("database schema is current");
         }
         Command::Serve { role } => {
-            let state = AppState::initialize(config.clone()).await?;
-            let address: SocketAddr = config.listen.parse()?;
-            let listener = TcpListener::bind(address).await?;
+            let state = AppState::initialize(config.clone())
+                .await
+                .map_err(|_| "application_initialization_failed")?;
+            let address: SocketAddr = config
+                .listen
+                .parse()
+                .map_err(|_| "listen_address_invalid")?;
+            let listener = TcpListener::bind(address)
+                .await
+                .map_err(|_| "listen_bind_failed")?;
             let (worker_shutdown, mut worker_task) = if role.runs_worker() {
                 let (sender, receiver) = watch::channel(false);
                 let task = tokio::spawn(worker::run_until_shutdown(state.clone(), receiver));
@@ -118,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
             }
-            result?;
+            result.map_err(|_| "http_server_failed")?;
         }
     }
 

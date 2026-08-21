@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, process::ExitCode};
 
 use clap::Parser;
 use memeloop_token_center::{
@@ -87,8 +87,21 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> ExitCode {
     let args = Args::parse();
+    match run(&args).await {
+        Ok(output) => {
+            println!("{output}");
+            ExitCode::SUCCESS
+        }
+        Err(error_code) => {
+            eprintln!("session archive import failed: {error_code}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(args: &Args) -> Result<String, &'static str> {
     let options = SessionArchiveImportOptions {
         input: &args.input,
         plan_directory: &args.plan_directory,
@@ -107,12 +120,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         apply: args.apply,
     };
     // Reject unsafe resource settings before opening database or object-store connections.
-    validate_session_archive_import_options(&options)?;
-    let config = Config::from_session_archive_import_env()?;
-    let db = Database::connect_with_max(&config.database_url, 2).await?;
-    db.ensure_session_archive_import_schema().await?;
-    let archive = ArchiveStore::from_config(&config).await?;
-    let stats = import_session_archive(&db, &archive, &options).await?;
-    println!("{}", serde_json::to_string(&stats)?);
-    Ok(())
+    validate_session_archive_import_options(&options).map_err(|_| "import_options_invalid")?;
+    let config = Config::from_session_archive_import_env().map_err(|_| "configuration_invalid")?;
+    let db = Database::connect_with_max(&config.database_url, 2)
+        .await
+        .map_err(|_| "database_connect_failed")?;
+    db.ensure_session_archive_import_schema()
+        .await
+        .map_err(|_| "database_schema_invalid")?;
+    let archive = ArchiveStore::from_config(&config)
+        .await
+        .map_err(|_| "archive_initialization_failed")?;
+    let stats = import_session_archive(&db, &archive, &options)
+        .await
+        .map_err(|_| "archive_import_failed")?;
+    serde_json::to_string(&stats).map_err(|_| "result_serialization_failed")
 }

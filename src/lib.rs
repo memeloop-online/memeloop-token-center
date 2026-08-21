@@ -54,24 +54,49 @@ pub struct AppState {
     pub(crate) proxy_lifecycle_permits: Arc<tokio::sync::Semaphore>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum InitializationError {
+    #[error("database initialization failed")]
+    Database,
+    #[error("archive initialization failed")]
+    Archive,
+    #[error("plugin initialization failed")]
+    Plugin,
+    #[error("HTTP client initialization failed")]
+    HttpClient,
+}
+
 impl AppState {
-    pub async fn initialize(config: Config) -> anyhow_free::Result<Self> {
+    pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
         if config.run_migrations_on_start {
             let migration_db = Database::connect_for_migration(
                 &config.database_url,
                 config.database_max_connections,
             )
-            .await?;
-            migration_db.migrate().await?;
+            .await
+            .map_err(|_| InitializationError::Database)?;
+            migration_db
+                .migrate()
+                .await
+                .map_err(|_| InitializationError::Database)?;
             migration_db.close().await;
         }
         let db = Database::connect_with_max(&config.database_url, config.database_max_connections)
-            .await?;
-        let archive = ArchiveStore::from_config(&config).await?;
-        let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())?;
-        plugins.validate_stored_configurations().await?;
+            .await
+            .map_err(|_| InitializationError::Database)?;
+        let archive = ArchiveStore::from_config(&config)
+            .await
+            .map_err(|_| InitializationError::Archive)?;
+        let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())
+            .map_err(|_| InitializationError::Plugin)?;
+        plugins
+            .validate_stored_configurations()
+            .await
+            .map_err(|_| InitializationError::Plugin)?;
         let mut providers = ProviderCatalog::builtins();
-        providers.extend(plugins.provider_types())?;
+        providers
+            .extend(plugins.provider_types())
+            .map_err(|_| InitializationError::Plugin)?;
 
         Ok(Self {
             config: Arc::new(config),
@@ -84,7 +109,7 @@ impl AppState {
             proxy_lifecycle_permits: Arc::new(tokio::sync::Semaphore::new(
                 PROXY_LIFECYCLE_CONCURRENCY,
             )),
-            http: build_http_client()?,
+            http: build_http_client().map_err(|_| InitializationError::HttpClient)?,
         })
     }
 }
@@ -116,10 +141,6 @@ pub(crate) fn build_pinned_http_client(
         .pool_max_idle_per_host(0)
         .resolve_to_addrs(hostname, addresses)
         .build()
-}
-
-mod anyhow_free {
-    pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[cfg(test)]
