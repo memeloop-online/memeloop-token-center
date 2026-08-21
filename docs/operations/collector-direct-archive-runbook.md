@@ -13,6 +13,8 @@ default-deny NetworkPolicy so only the Job pod label can connect. Use cluster
 TLS, including an mTLS sidecar or service-mesh policy when the cluster provides
 it, or explicitly allow exactly one private Service DNS name with
 `--private-http-host`.
+The exporter disables environment HTTP proxies for management and ticket
+requests, so a capability or archive body cannot leave this reviewed origin.
 
 Keep the source URL byte-for-byte stable for the baseline and all deltas. A
 practical layout is one migration-only Service whose selector initially targets
@@ -60,9 +62,10 @@ sha256sum /evidence/archive-baseline-000001.jsonl
 
 HTTP 503 means digest preparation is still bounded and in progress; HTTP 429
 means the one-snapshot capacity is occupied. The exporter retries both with a
-bounded backoff. HTTP 410 or an expired download ticket discards only the
-unpublished attempt. It never advances the atomic checkpoint until every page,
-record count and digest has been verified.
+bounded backoff until `--max-elapsed-seconds` during the offline baseline. HTTP
+410 or an expired download ticket discards only the unpublished attempt. It
+never advances the atomic checkpoint until every page, record count and digest
+has been verified.
 
 ## Online deltas
 
@@ -117,6 +120,8 @@ source request.
 ## Failure and rollback
 
 - Never edit a checkpoint, manifest or JSONL to bypass a refusal.
+- The private checkpoint lock file serializes the complete load/export/resume/
+  commit transaction. A second Job waits only within its elapsed-time bound.
 - On 401/403/invalid protocol, stop; those responses are not transient.
 - On repeated 410, 429 or 503, retain evidence and investigate collector health,
   active snapshot age and digest queue statistics.

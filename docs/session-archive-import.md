@@ -35,8 +35,12 @@ writes.
 ## Acquiring incremental source deltas
 
 `cpa-session-archive` exposes whole-session export tickets, not a record-level
-`since` cursor. `ops/export-cpa-session-archive-delta.py` turns the bounded API2
-session projection into a conservative source-side cursor:
+`since` cursor. `ops/export-cpa-session-archive-delta.py` turns its bounded
+session projection into a conservative source-side cursor. Prefer the native
+0.8 collector contract described in
+[`operations/collector-direct-archive-runbook.md`](operations/collector-direct-archive-runbook.md).
+The CPA plugin endpoint remains only as an input adapter for migrations from an
+older deployment:
 
 1. read the exact indexed-record count and the `last_at`-ordered session list;
 2. select every session at or after `checkpoint - overlap`;
@@ -52,11 +56,19 @@ session projection into a conservative source-side cursor:
    SHA-256 manifest chained to the prior output digest and the next source
    checkpoint.
 
-The management token must be a regular, non-symlink file with mode `0600`. It is
-never accepted in argv or an environment variable. Production URLs must use
-HTTPS; `--allow-http` exists only for the local mock test. Redirects are refused,
-the one-time download ticket must remain on the configured download origin, and
-the ticket, session ids and payload are never printed. If API2 advertises the
+The direct collector has no Authorization middleware. Direct mode rejects CPA
+tokens, never emits an Authorization header, and must be isolated by a
+NetworkPolicy. Its source must be an exactly allowlisted private cluster host or
+use HTTPS with a client certificate and private key. Direct tickets are fixed to
+the collector origin and `/archive-api/v1/exports/<64-lowercase-hex>`.
+
+The older CPA plugin input requires exactly one management secret source:
+`--token-file` reads a regular non-symlink mode-`0600` file, while
+`--token-env ENV_NAME` reads the named injected environment secret. The secret
+value is never accepted in argv. Production plugin URLs use HTTPS;
+`--allow-http` exists only for its local mock test. Redirects are refused, the
+one-time download ticket must remain on the configured download origin, and the
+ticket, session ids and payload are never printed. If the plugin advertises the
 ticket on a separate origin, set an explicitly reviewed `--download-base-url`.
 
 Record a trusted UTC fence immediately **before** starting the full baseline

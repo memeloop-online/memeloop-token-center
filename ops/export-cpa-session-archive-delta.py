@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Export a replay-safe cpa-session-archive delta through CPA/API2.
+"""Export a replay-safe cpa-session-archive delta from a bounded source API.
 
-The upstream collector exposes only whole-session exports. This driver prefers a
-snapshot-bound stable cursor and falls back to the bounded legacy projection only
-when its overlap window is provably complete. It never logs the management
-credential, snapshot, export ticket, session id, or archived payload.
+Native collector mode requires a snapshot-bound stable cursor. The historical
+CPA plugin input adapter can fall back to a bounded legacy projection only when
+its overlap window is provably complete. This driver never logs credentials,
+snapshots, export tickets, session ids, or archived payloads.
 """
 
 from __future__ import annotations
@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import http.client
 import ipaddress
@@ -21,6 +23,7 @@ import os
 import re
 import socket
 import sqlite3
+import ssl
 import stat
 import sys
 import tempfile
@@ -115,9 +118,6 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         new_url: str,
     ) -> None:
         return None
-
-
-HTTP_OPENER = urllib.request.build_opener(NoRedirect)
 
 
 def parse_time(value: str, label: str) -> dt.datetime:
@@ -236,6 +236,60 @@ def load_token_env(name: str) -> str:
     if value is None:
         raise DeltaError("token environment variable is missing")
     return validate_token(value, "token environment secret")
+
+
+def load_mtls_context(cert_file: Path, key_file: Path) -> ssl.SSLContext:
+    cert_metadata = cert_file.lstat()
+    if stat.S_ISLNK(cert_metadata.st_mode) or not stat.S_ISREG(
+        cert_metadata.st_mode
+    ):
+        raise DeltaError("mTLS certificate must be a regular non-symlink file")
+    ensure_private_regular(key_file, "mTLS private key")
+    context = ssl.create_default_context()
+    try:
+        context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+    except (OSError, ssl.SSLError):
+        raise DeltaError("mTLS client certificate could not be loaded") from None
+    return context
+
+
+def checkpoint_lock_path(checkpoint: Path) -> Path:
+    return checkpoint.with_name(f".{checkpoint.name}.lock")
+
+
+@contextlib.contextmanager
+def checkpoint_transaction_lock(
+    checkpoint: Path, deadline: float
+) -> Iterable[None]:
+    checkpoint.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = checkpoint_lock_path(checkpoint)
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise DeltaError("checkpoint transaction lock could not be opened safely") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
+            raise DeltaError("checkpoint transaction lock must be a private regular file")
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise DeltaError(
+                        "checkpoint transaction lock exceeded the elapsed-time limit"
+                    ) from None
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def normalize_host(value: str) -> str:
@@ -361,6 +415,9 @@ class SourceClient:
         max_retries: int = 5,
         retry_base_seconds: float = 0.5,
         deadline: float | None = None,
+        tls_context: ssl.SSLContext | None = None,
+        max_download_bytes: int | None = None,
+        offline_full: bool = False,
     ) -> None:
         self.origin, self.base = safe_origin(
             base_url, private_http_hosts, "archive source base URL"
@@ -375,12 +432,34 @@ class SourceClient:
         self.max_retries = max_retries
         self.retry_base_seconds = retry_base_seconds
         self.deadline = deadline
+        self.max_download_bytes = max_download_bytes
+        self.downloaded_bytes = 0
+        self.offline_full = offline_full
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            NoRedirect,
+            urllib.request.HTTPSHandler(context=tls_context),
+        )
         if collector_direct and self.download_origin != self.origin:
             raise DeltaError(
                 "collector-direct ticket downloads must use the collector origin"
             )
         if collector_direct and token is not None:
             raise DeltaError("collector-direct requests must not carry a CPA token")
+        if collector_direct:
+            source_host = urllib.parse.urlsplit(self.origin).hostname
+            allowed_hosts = (
+                frozenset()
+                if isinstance(private_http_hosts, bool)
+                else private_http_hosts
+            )
+            if source_host is None or not (
+                private_http_host(source_host, allowed_hosts)
+                or tls_context is not None
+            ):
+                raise DeltaError(
+                    "collector-direct requires a private host allowlist or mTLS"
+                )
 
     def _request_timeout(self) -> float:
         if self.deadline is None:
@@ -393,7 +472,7 @@ class SourceClient:
     def _retry_delay(
         self, attempt: int, retry_after: str | None
     ) -> float:
-        delay = min(self.retry_base_seconds * (2**attempt), 10.0)
+        delay = min(self.retry_base_seconds * (2 ** min(attempt, 20)), 10.0)
         if retry_after is not None and retry_after.isdecimal():
             delay = min(max(delay, float(retry_after)), 30.0)
         if self.deadline is not None:
@@ -418,9 +497,10 @@ class SourceClient:
             headers["Authorization"] = f"Bearer {self.token}"
         request = urllib.request.Request(url, headers=headers)
         payload: bytes | None = None
-        for attempt in range(self.max_retries + 1):
+        attempt = 0
+        while True:
             try:
-                with HTTP_OPENER.open(
+                with self.opener.open(
                     request, timeout=self._request_timeout()
                 ) as response:
                     if response.status != 200:
@@ -432,8 +512,17 @@ class SourceClient:
                 error.close()
                 if error.code == 410:
                     raise SnapshotExpired() from None
-                if error.code in {429, 503} and attempt < self.max_retries:
+                extended_offline_wait = (
+                    self.collector_direct
+                    and self.offline_full
+                    and path == self.paths.sessions
+                    and error.code in {429, 503}
+                )
+                if error.code in {429, 503} and (
+                    attempt < self.max_retries or extended_offline_wait
+                ):
                     self._wait_for_retry(attempt, retry_after)
+                    attempt += 1
                     continue
                 raise SourceHTTPError(error.code) from None
             except (
@@ -795,7 +884,7 @@ class SourceClient:
                 },
             )
             try:
-                response = HTTP_OPENER.open(
+                response = self.opener.open(
                     request, timeout=self._request_timeout()
                 )
                 break
@@ -831,6 +920,14 @@ class SourceClient:
                 self._request_timeout()
                 if not line:
                     break
+                self.downloaded_bytes += len(line)
+                if (
+                    self.max_download_bytes is not None
+                    and self.downloaded_bytes > self.max_download_bytes
+                ):
+                    raise DeltaError(
+                        "source archive downloads exceed the configured limit"
+                    )
                 if len(line) > maximum:
                     raise DeltaError("source archive record exceeds the configured line limit")
                 if line.strip():
@@ -1279,6 +1376,9 @@ def export_delta(args: argparse.Namespace) -> dict[str, Any]:
         if args.allow_http
         else frozenset(normalize_host(item) for item in args.private_http_host)
     )
+    tls_context = None
+    if args.client_cert_file is not None and args.client_key_file is not None:
+        tls_context = load_mtls_context(args.client_cert_file, args.client_key_file)
     client = SourceClient(
         args.base_url,
         args.download_base_url or args.base_url,
@@ -1289,6 +1389,9 @@ def export_delta(args: argparse.Namespace) -> dict[str, Any]:
         max_retries=args.max_retries,
         retry_base_seconds=args.retry_base_seconds,
         deadline=args.deadline,
+        tls_context=tls_context,
+        max_download_bytes=args.max_download_bytes,
+        offline_full=args.offline_full,
     )
     fingerprint = source_fingerprint(client)
     checkpoint = load_checkpoint(args.checkpoint, fingerprint)
@@ -1352,6 +1455,11 @@ def export_delta(args: argparse.Namespace) -> dict[str, Any]:
         raise DeltaError("source checkpoint timestamp exceeds the future-skew limit")
 
     source_records_before = client.stats_records()
+    if (
+        checkpoint is not None
+        and source_records_before < checkpoint["last_source_records"]
+    ):
+        raise DeltaError("source record count moved backwards since the checkpoint")
     first_projection = load_session_projection(
         client,
         lower_bound,
@@ -1384,7 +1492,6 @@ def export_delta(args: argparse.Namespace) -> dict[str, Any]:
             "CREATE TABLE seen_records(request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, "
             "digest TEXT NOT NULL, canonical BLOB NOT NULL)"
         )
-        downloaded_bytes = 0
         selected_bytes = 0
         for session in sorted(selected, key=lambda item: item["session_id"]):
             session_id = session["session_id"]
@@ -1395,9 +1502,6 @@ def export_delta(args: argparse.Namespace) -> dict[str, Any]:
                 first_projection.snapshot,
                 session.get("records_sha256"),
             ):
-                downloaded_bytes += len(raw_line)
-                if downloaded_bytes > args.max_download_bytes:
-                    raise DeltaError("source archive downloads exceed the configured limit")
                 try:
                     item = strict_json_loads(raw_line)
                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
@@ -1603,6 +1707,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--private-http-host", action="append", default=[], metavar="HOST"
     )
+    result.add_argument("--client-cert-file", type=Path)
+    result.add_argument("--client-key-file", type=Path)
     result.add_argument("--since")
     result.add_argument("--overlap-seconds", type=int, default=86_400)
     result.add_argument("--session-limit", type=int, default=1000)
@@ -1664,7 +1770,9 @@ def main() -> int:
         raise DeltaError("max future skew seconds must be between 0 and 86400")
     if args.offline_full and not args.collector_direct:
         raise DeltaError("--offline-full requires --collector-direct")
-    if args.collector_direct and (args.token_file is not None or args.token_env is not None):
+    if args.collector_direct and (
+        args.token_file is not None or args.token_env is not None
+    ):
         raise DeltaError("collector-direct does not accept a CPA token")
     if not args.collector_direct and args.token_file is None and args.token_env is None:
         raise DeltaError("the legacy CPA plugin input requires --token-file or --token-env")
@@ -1674,6 +1782,10 @@ def main() -> int:
         )
     if args.allow_http and args.private_http_host:
         raise DeltaError("--allow-http and --private-http-host cannot be combined")
+    if (args.client_cert_file is None) != (args.client_key_file is None):
+        raise DeltaError("mTLS requires both --client-cert-file and --client-key-file")
+    if args.client_cert_file is not None and not args.collector_direct:
+        raise DeltaError("mTLS client files are only valid with --collector-direct")
     normalized_hosts = [normalize_host(item) for item in args.private_http_host]
     if any(
         not item or item != raw.rstrip(".").lower()
@@ -1683,7 +1795,8 @@ def main() -> int:
     if len(set(normalized_hosts)) != len(normalized_hosts):
         raise DeltaError("private HTTP host allowlist contains duplicates")
     args.deadline = time.monotonic() + args.max_elapsed_seconds
-    manifest = run_export(args)
+    with checkpoint_transaction_lock(args.checkpoint, args.deadline):
+        manifest = run_export(args)
     print(
         json.dumps(
             {

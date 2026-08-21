@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Black-box tests for the CPA/API2 session archive delta exporter."""
+"""Black-box tests for native and legacy session archive delta sources."""
 
 from __future__ import annotations
 
 import base64
 import datetime as dt
+import fcntl
 import hashlib
 import http.server
 import importlib.util
@@ -149,6 +150,8 @@ class SourceState:
         self.expire_direct_ticket_once = False
         self.stable_transient_statuses: list[int] = []
         self.direct_authorization_seen = False
+        self.expire_stable_replay_once = False
+        self.ticket_whitespace_bytes = 0
 
     @property
     def request_count(self) -> int:
@@ -211,8 +214,9 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"authorization": self.headers.get("Authorization")})
             return
         if parsed.path in {sessions_path, direct_sessions_path}:
+            direct_sessions = parsed.path == direct_sessions_path
             state.session_calls += 1
-            if parsed.path == direct_sessions_path:
+            if direct_sessions:
                 state.direct_authorization_seen |= bool(
                     self.headers.get("Authorization")
                 )
@@ -303,8 +307,16 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
                         state.after_snapshot_sessions = []
                         state.after_snapshot_exports = {}
                 stored = state.stable_snapshots.get(snapshot)
+                if snapshot and direct_sessions and state.expire_stable_replay_once:
+                    state.expire_stable_replay_once = False
+                    state.stable_snapshots.pop(snapshot, None)
+                    self.send_json({"error": "snapshot expired"}, 410)
+                    return
                 if stored is None:
-                    self.send_json({"error": "snapshot expired"}, 409)
+                    self.send_json(
+                        {"error": "snapshot expired"},
+                        410 if direct_sessions else 409,
+                    )
                     return
                 all_sessions = stored[0]
                 cursor = query.get("cursor", [""])[0]
@@ -443,7 +455,7 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
             if rows is None:
                 self.send_json({"error": "ticket"}, 404)
                 return
-            body = b"".join(
+            body = b"\n" * state.ticket_whitespace_bytes + b"".join(
                 json.dumps(row, separators=(",", ":")).encode("utf-8") + b"\n"
                 for row in rows
             )
@@ -469,7 +481,7 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
             if rows is None:
                 self.send_json({"error": "ticket"}, 404)
                 return
-            body = b"".join(
+            body = b"\n" * state.ticket_whitespace_bytes + b"".join(
                 json.dumps(row, separators=(",", ":")).encode("utf-8") + b"\n"
                 for row in rows
             )
@@ -514,6 +526,7 @@ class DeltaExporterTest(unittest.TestCase):
         output: Path,
         *,
         since: str | None = "2026-08-16T00:00:00Z",
+        token_env: bool = False,
         extra: list[str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = [
@@ -522,8 +535,6 @@ class DeltaExporterTest(unittest.TestCase):
             "--base-url",
             self.base_url,
             "--allow-http",
-            "--token-file",
-            str(self.token_file),
             "--checkpoint",
             str(self.checkpoint),
             "--output",
@@ -539,6 +550,12 @@ class DeltaExporterTest(unittest.TestCase):
             "--timeout-seconds",
             "5",
         ]
+        environment = os.environ.copy()
+        if token_env:
+            command.extend(["--token-env", "MTC_TEST_SOURCE_TOKEN"])
+            environment["MTC_TEST_SOURCE_TOKEN"] = TOKEN
+        else:
+            command.extend(["--token-file", str(self.token_file)])
         if since is not None:
             command.extend(["--since", since])
         if extra:
@@ -546,6 +563,7 @@ class DeltaExporterTest(unittest.TestCase):
         return subprocess.run(
             command,
             cwd=ROOT,
+            env=environment,
             text=True,
             capture_output=True,
             timeout=15,
@@ -558,6 +576,7 @@ class DeltaExporterTest(unittest.TestCase):
         *,
         since: str | None = "2026-08-16T00:00:00Z",
         offline_full: bool = True,
+        hostile_proxy: bool = False,
         extra: list[str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = [
@@ -593,9 +612,20 @@ class DeltaExporterTest(unittest.TestCase):
             command.extend(["--since", since])
         if extra:
             command.extend(extra)
+        environment = os.environ.copy()
+        if hostile_proxy:
+            environment.update(
+                {
+                    "HTTP_PROXY": "http://127.0.0.1:9",
+                    "HTTPS_PROXY": "http://127.0.0.1:9",
+                    "ALL_PROXY": "http://127.0.0.1:9",
+                    "NO_PROXY": "",
+                }
+            )
         return subprocess.run(
             command,
             cwd=ROOT,
+            env=environment,
             text=True,
             capture_output=True,
             timeout=20,
@@ -660,6 +690,13 @@ class DeltaExporterTest(unittest.TestCase):
             "payload-secret-that-must-never-appear",
         ):
             self.assertNotIn(secret, combined)
+
+    def test_legacy_plugin_input_accepts_named_environment_secret(self) -> None:
+        self.configure_two_records()
+        output = self.temporary / "legacy-env-token.jsonl"
+        result = self.run_export(output, token_env=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(TOKEN, result.stdout + result.stderr)
 
     def test_incremental_overlap_and_pending_resume_are_replay_safe(self) -> None:
         first = record(
@@ -1108,12 +1145,13 @@ class DeltaExporterTest(unittest.TestCase):
         first, second = self.configure_two_records()
         self.state.stable_cursor_supported = True
         self.state.offline_full_enabled = True
-        self.state.stable_transient_statuses = [503, 429]
+        self.state.stable_transient_statuses = [503] * 7 + [429]
         self.state.expire_direct_ticket_once = True
         output = self.temporary / "collector-full.jsonl"
         result = self.run_direct_export(
             output,
-            extra=["--session-limit", "1", "--max-retries", "4"],
+            hostile_proxy=True,
+            extra=["--session-limit", "1", "--max-retries", "1"],
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         exported = [json.loads(line) for line in output.read_text().splitlines()]
@@ -1125,6 +1163,13 @@ class DeltaExporterTest(unittest.TestCase):
         self.assertFalse(self.state.direct_authorization_seen)
         self.assertFalse(self.state.ticket_authorization_seen)
         self.assertGreaterEqual(self.state.ticket_calls, 3)
+        calls_before_resume = self.state.request_count
+        replay = self.run_direct_export(
+            output,
+            extra=["--session-limit", "1", "--resume"],
+        )
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertEqual(self.state.request_count, calls_before_resume)
 
     def test_collector_direct_requires_offline_advertisement_and_never_falls_back(self) -> None:
         self.configure_two_records()
@@ -1232,6 +1277,101 @@ class DeltaExporterTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("does not accept a CPA token", result.stderr)
         self.assertNotIn(TOKEN, result.stdout + result.stderr)
+
+    def test_collector_direct_410_discards_attempt_without_checkpoint(self) -> None:
+        self.configure_two_records()
+        self.state.stable_cursor_supported = True
+        self.state.offline_full_enabled = True
+        self.state.expire_stable_replay_once = True
+        output = self.temporary / "expired-snapshot.jsonl"
+        result = self.run_direct_export(
+            output,
+            extra=["--max-retries", "0"],
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("repeatedly expired", result.stderr)
+        self.assertFalse(output.exists())
+        self.assertFalse(Path(str(output) + ".manifest.json").exists())
+        self.assertFalse(self.checkpoint.exists())
+
+    def test_legacy_source_fingerprint_remains_v1_compatible(self) -> None:
+        client = DELTA_EXPORT.SourceClient(
+            self.base_url,
+            self.base_url,
+            TOKEN,
+            5,
+            True,
+        )
+        material = json.dumps(
+            {
+                "origin": self.base_url,
+                "base": self.base_url,
+                "download_origin": self.base_url,
+                "download_base": self.base_url,
+                "sessions_path": "/v0/management/plugins/cpa-session-archive/sessions",
+                "export_path": "/v0/management/plugins/cpa-session-archive/export",
+                "stats_path": "/v0/management/plugins/cpa-session-archive/stats",
+                "version": 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        self.assertEqual(
+            DELTA_EXPORT.source_fingerprint(client),
+            hashlib.sha256(material).hexdigest(),
+        )
+        self.assertEqual(client._retry_delay(1_000_000, None), 10.0)
+
+    def test_blank_download_bytes_are_bounded_before_json_filtering(self) -> None:
+        row = record(
+            "request-1",
+            "private-session",
+            "2026-08-16T01:00:00Z",
+            "2026-08-16T01:01:00Z",
+        )
+        self.state.sessions = [summary(row["session_id"], [row])]
+        self.state.exports = {row["session_id"]: [row]}
+        self.state.stats_values = [1, 1]
+        self.state.ticket_whitespace_bytes = 2048
+        result = self.run_export(
+            self.temporary / "blank-flood.jsonl",
+            extra=["--max-download-bytes", "1024"],
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("downloads exceed", result.stderr)
+        self.assertFalse(self.checkpoint.exists())
+
+    def test_checkpoint_lock_bounds_concurrent_export_before_source_access(self) -> None:
+        lock_path = DELTA_EXPORT.checkpoint_lock_path(self.checkpoint)
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_export(
+                self.temporary / "locked.jsonl",
+                extra=["--max-elapsed-seconds", "0.05"],
+            )
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("transaction lock", result.stderr)
+        self.assertEqual(self.state.request_count, 0)
+        self.assertFalse(self.checkpoint.exists())
+
+    def test_source_record_count_cannot_move_backwards_across_checkpoint(self) -> None:
+        self.configure_two_records()
+        first = self.run_export(self.temporary / "count-before.jsonl")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        checkpoint_before = self.checkpoint.read_bytes()
+        self.state.stats_calls = 0
+        self.state.stats_values = [1]
+        second = self.run_export(
+            self.temporary / "count-after.jsonl",
+            since=None,
+        )
+        self.assertEqual(second.returncode, 2)
+        self.assertIn("moved backwards", second.stderr)
+        self.assertEqual(self.checkpoint.read_bytes(), checkpoint_before)
 
 
 if __name__ == "__main__":
