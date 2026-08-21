@@ -13,6 +13,7 @@ pub mod codex_device;
 pub mod managed;
 
 use crate::{
+    db::{BeginOAuthLoginSession, Database, OAuthLoginClaim, OAuthLoginSessionReference},
     error::AppError,
     network::{self, OutboundScope},
     provider::{
@@ -22,7 +23,9 @@ use crate::{
     },
 };
 
-const CURSOR_LOGIN_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-login/v1";
+const CURSOR_SESSION_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-session/v2";
+const CURSOR_STATE_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-state/v2";
+const CURSOR_READY_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-ready/v2";
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGED_OAUTH_REQUEST_BYTES: usize = MAX_OAUTH_RESPONSE_BYTES + 64 * 1024;
 #[cfg(not(test))]
@@ -109,7 +112,15 @@ struct CursorLoginState {
     reauthorize: Option<OAuthReauthorizationTarget>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CursorLoginSessionToken {
+    session_id: Uuid,
+    tenant_external_id: String,
+    operator_service_id: Option<Uuid>,
+    expires_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReadyCursorLogin {
     pub session_id: Uuid,
     pub tenant_external_id: String,
@@ -124,8 +135,17 @@ pub struct ReadyCursorLogin {
 
 #[derive(Clone, Debug)]
 pub enum CursorPollResult {
-    Pending { retry_after_seconds: u64 },
-    Ready(Box<ReadyCursorLogin>),
+    Pending {
+        retry_after_seconds: u64,
+    },
+    Consumed {
+        account_id: Uuid,
+        tenant_external_id: String,
+    },
+    Ready {
+        lease_owner: Uuid,
+        login: Box<ReadyCursorLogin>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -330,8 +350,10 @@ async fn managed_oauth_adapter_call(
     })
 }
 
-pub fn start_cursor_login(
+pub async fn start_cursor_login(
+    db: &Database,
     input: StartCursorLogin,
+    operator_service_id: Option<Uuid>,
     key_material: &[u8],
     now: i64,
 ) -> Result<OAuthLoginStart, AppError> {
@@ -362,8 +384,9 @@ pub fn start_cursor_login(
         .append_pair("mode", "login")
         .append_pair("redirectTarget", "cli");
     let expires_at = now.saturating_add(10 * 60 * 1000);
+    let session_id = Uuid::now_v7();
     let state = CursorLoginState {
-        session_id: Uuid::now_v7(),
+        session_id,
         tenant_external_id: input.tenant_external_id,
         account_name: input.account_name.trim().to_owned(),
         provider_driver: input.provider_driver,
@@ -376,7 +399,22 @@ pub fn start_cursor_login(
         expires_at,
         reauthorize: input.reauthorize,
     };
-    let session_token = seal_private_json(&state, key_material, CURSOR_LOGIN_AAD)?;
+    let session = CursorLoginSessionToken {
+        session_id,
+        tenant_external_id: state.tenant_external_id.clone(),
+        operator_service_id,
+        expires_at,
+    };
+    db.begin_oauth_login_session(BeginOAuthLoginSession {
+        session_id,
+        tenant_external_id: state.tenant_external_id.clone(),
+        operator_service_id,
+        state_ciphertext: seal_private_json(&state, key_material, CURSOR_STATE_AAD)?,
+        next_poll_at: now,
+        expires_at,
+    })
+    .await?;
+    let session_token = seal_private_json(&session, key_material, CURSOR_SESSION_AAD)?;
     Ok(OAuthLoginStart {
         driver: oauth_driver,
         login_url: login_url.to_string(),
@@ -387,21 +425,71 @@ pub fn start_cursor_login(
 }
 
 pub async fn poll_cursor_login(
+    db: &Database,
     http: &reqwest::Client,
     session_token: &str,
     key_material: &[u8],
     now: i64,
     required_tenant: Option<&str>,
+    operator_service_id: Option<Uuid>,
     allow_test_loopback: bool,
 ) -> Result<CursorPollResult, AppError> {
-    let state: CursorLoginState = open_private_json(session_token, key_material, CURSOR_LOGIN_AAD)
-        .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
-    if required_tenant.is_some_and(|tenant| tenant != state.tenant_external_id) {
+    let session: CursorLoginSessionToken =
+        open_private_json(session_token, key_material, CURSOR_SESSION_AAD)
+            .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
+    if required_tenant.is_some_and(|tenant| tenant != session.tenant_external_id)
+        || session.operator_service_id != operator_service_id
+    {
         return Err(AppError::Forbidden);
     }
-    if state.expires_at <= now {
+    if session.expires_at <= now {
         return Err(AppError::BadRequest("OAuth login session expired".into()));
     }
+    let reference = OAuthLoginSessionReference {
+        session_id: session.session_id,
+        tenant_external_id: session.tenant_external_id.clone(),
+        operator_service_id: session.operator_service_id,
+        expires_at: session.expires_at,
+    };
+    let (lease_owner, state) = match db.claim_oauth_login_poll(&reference, now, 1).await? {
+        OAuthLoginClaim::Pending {
+            retry_after_seconds,
+        } => {
+            return Ok(CursorPollResult::Pending {
+                retry_after_seconds,
+            });
+        }
+        OAuthLoginClaim::Consumed { account_id } => {
+            return Ok(CursorPollResult::Consumed {
+                account_id,
+                tenant_external_id: session.tenant_external_id,
+            });
+        }
+        OAuthLoginClaim::Ready {
+            lease_owner,
+            ready_ciphertext,
+        } => {
+            return Ok(CursorPollResult::Ready {
+                lease_owner,
+                login: Box::new(open_private_json(
+                    &ready_ciphertext,
+                    key_material,
+                    CURSOR_READY_AAD,
+                )?),
+            });
+        }
+        OAuthLoginClaim::Claimed {
+            lease_owner,
+            state_ciphertext,
+        } => (
+            lease_owner,
+            open_private_json::<CursorLoginState>(
+                &state_ciphertext,
+                key_material,
+                CURSOR_STATE_AAD,
+            )?,
+        ),
+    };
     let mut poll_url = validate_oauth_endpoint(&state.poll_url, "poll_url")?;
     poll_url
         .query_pairs_mut()
@@ -420,19 +508,44 @@ pub async fn poll_cursor_login(
         .get(poll_url)
         .send()
         .await
-        .map_err(AppError::from)?;
+        .map_err(AppError::from);
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = db
+                .release_oauth_login_poll(state.session_id, lease_owner, now)
+                .await;
+            return Err(error);
+        }
+    };
     if response.status() == reqwest::StatusCode::NOT_FOUND {
+        drop(response);
+        db.release_oauth_login_poll(state.session_id, lease_owner, now)
+            .await?;
         return Ok(CursorPollResult::Pending {
             retry_after_seconds: 1,
         });
     }
     if !response.status().is_success() {
+        let status = response.status();
+        drop(response);
+        let _ = db
+            .release_oauth_login_poll(state.session_id, lease_owner, now)
+            .await;
         return Err(AppError::Upstream(format!(
             "Cursor OAuth poll returned {}",
-            response.status()
+            status
         )));
     }
-    let body = bounded_body(response).await?;
+    let body = match bounded_body(response).await {
+        Ok(body) => body,
+        Err(error) => {
+            let _ = db
+                .release_oauth_login_poll(state.session_id, lease_owner, now)
+                .await;
+            return Err(error);
+        }
+    };
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct CursorTokens {
@@ -448,7 +561,7 @@ pub async fn poll_cursor_login(
     }
     let expires_at = token_expiry_millis(&tokens.access_token)
         .unwrap_or_else(|| now.saturating_add(60 * 60 * 1000));
-    Ok(CursorPollResult::Ready(Box::new(ReadyCursorLogin {
+    let ready = ReadyCursorLogin {
         session_id: state.session_id,
         tenant_external_id: state.tenant_external_id,
         account_name: state.account_name,
@@ -465,7 +578,37 @@ pub async fn poll_cursor_login(
             adapter_state: None,
         },
         reauthorize: state.reauthorize,
-    })))
+    };
+    db.stage_oauth_login_ready(
+        ready.session_id,
+        lease_owner,
+        seal_private_json(&ready, key_material, CURSOR_READY_AAD)?,
+        now,
+    )
+    .await?;
+    match db.claim_oauth_login_poll(&reference, now, 1).await? {
+        OAuthLoginClaim::Ready {
+            lease_owner,
+            ready_ciphertext,
+        } => Ok(CursorPollResult::Ready {
+            lease_owner,
+            login: Box::new(open_private_json(
+                &ready_ciphertext,
+                key_material,
+                CURSOR_READY_AAD,
+            )?),
+        }),
+        OAuthLoginClaim::Consumed { account_id } => Ok(CursorPollResult::Consumed {
+            account_id,
+            tenant_external_id: session.tenant_external_id,
+        }),
+        OAuthLoginClaim::Pending {
+            retry_after_seconds,
+        } => Ok(CursorPollResult::Pending {
+            retry_after_seconds,
+        }),
+        OAuthLoginClaim::Claimed { .. } => Err(AppError::Internal),
+    }
 }
 
 pub async fn refresh_cursor_credential(
@@ -664,10 +807,28 @@ mod tests {
         matchers::{body_json, method, path},
     };
 
-    #[test]
-    fn cursor_login_state_is_encrypted_and_contains_pkce_query() {
+    async fn sqlite_database() -> (tempfile::TempDir, Database) {
+        let directory = tempfile::tempdir().expect("OAuth test temporary directory");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("oauth.db").display()
+        );
+        let database = Database::connect(&database_url)
+            .await
+            .expect("connect OAuth test database");
+        database
+            .migrate()
+            .await
+            .expect("migrate OAuth test database");
+        (directory, database)
+    }
+
+    #[tokio::test]
+    async fn cursor_login_state_is_encrypted_and_contains_pkce_query() {
+        let (_directory, database) = sqlite_database().await;
         let stable_account_id = Uuid::now_v7();
         let started = start_cursor_login(
+            &database,
             StartCursorLogin {
                 tenant_external_id: "default".to_owned(),
                 account_name: "cursor-one".to_owned(),
@@ -680,9 +841,11 @@ mod tests {
                     expected_updated_at: 999,
                 }),
             },
+            None,
             b"test material with at least 32 bytes",
             1_000,
         )
+        .await
         .unwrap();
         assert!(started.login_url.contains("challenge="));
         assert!(started.login_url.contains("uuid="));
@@ -695,9 +858,11 @@ mod tests {
         assert_eq!(started.expires_at, 601_000);
     }
 
-    #[test]
-    fn provider_adapter_allows_private_cluster_http_but_rejects_public_http() {
+    #[tokio::test]
+    async fn provider_adapter_allows_private_cluster_http_but_rejects_public_http() {
+        let (_directory, database) = sqlite_database().await;
         let private = start_cursor_login(
+            &database,
             StartCursorLogin {
                 tenant_external_id: "default".to_owned(),
                 account_name: "plugin-oauth".to_owned(),
@@ -711,9 +876,11 @@ mod tests {
                 oauth_driver: "provider_adapter".to_owned(),
                 reauthorize: None,
             },
+            None,
             b"test material with at least 32 bytes",
             1_000,
         )
+        .await
         .unwrap();
         assert_eq!(private.driver, "provider_adapter");
         assert!(validate_oauth_endpoint("http://oauth.example.com/login", "login_url").is_err());
@@ -721,8 +888,10 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_poll_checks_tenant_before_network_io() {
+        let (_directory, database) = sqlite_database().await;
         let key_material = b"test material with at least 32 bytes";
         let started = start_cursor_login(
+            &database,
             StartCursorLogin {
                 tenant_external_id: "tenant-a".to_owned(),
                 account_name: "cursor-one".to_owned(),
@@ -732,22 +901,124 @@ mod tests {
                 oauth_driver: "cursor".to_owned(),
                 reauthorize: None,
             },
+            None,
             key_material,
             1_000,
         )
+        .await
         .unwrap();
 
         let error = poll_cursor_login(
+            &database,
             &reqwest::Client::new(),
             &started.session_token,
             key_material,
             2_000,
             Some("tenant-b"),
+            None,
             true,
         )
         .await
         .expect_err("cross-tenant polling must be rejected before I/O");
         assert!(matches!(error, AppError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn cursor_poll_result_is_durable_single_use_and_replayable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth/poll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accessToken": "cursor-access-token",
+                "refreshToken": "cursor-refresh-token"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_directory, database) = sqlite_database().await;
+        let now = crate::db::unix_millis();
+        let key_material = b"test material with at least 32 bytes";
+        let started = start_cursor_login(
+            &database,
+            StartCursorLogin {
+                tenant_external_id: "cursor-replay".to_owned(),
+                account_name: "cursor-primary".to_owned(),
+                provider_driver: "http-json".to_owned(),
+                provider_config: json!({"base_url": "https://provider.example"}),
+                endpoints: CursorOAuthEndpoints {
+                    login_url: format!("{}/auth/login", server.uri()),
+                    poll_url: format!("{}/auth/poll", server.uri()),
+                    refresh_url: format!("{}/auth/refresh", server.uri()),
+                },
+                oauth_driver: "cursor".to_owned(),
+                reauthorize: None,
+            },
+            None,
+            key_material,
+            now,
+        )
+        .await
+        .expect("start Cursor login");
+        let (lease_owner, ready) = match poll_cursor_login(
+            &database,
+            &crate::build_http_client().expect("HTTP client"),
+            &started.session_token,
+            key_material,
+            now.saturating_add(1),
+            Some("cursor-replay"),
+            None,
+            true,
+        )
+        .await
+        .expect("poll Cursor login")
+        {
+            CursorPollResult::Ready { lease_owner, login } => (lease_owner, *login),
+            other => panic!("unexpected Cursor result: {other:?}"),
+        };
+        let account = database
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: ready.tenant_external_id.clone(),
+                    name: ready.account_name,
+                    driver: ready.provider_driver,
+                    config: ready.provider_config,
+                    credential: ready.credential,
+                    oauth_session_id: Some(ready.session_id),
+                    oauth_driver: Some(ready.oauth_driver),
+                    oauth_refresh_url: Some(ready.refresh_url),
+                },
+                key_material,
+            )
+            .await
+            .expect("create Cursor upstream");
+        database
+            .finish_oauth_login_session(
+                ready.session_id,
+                lease_owner,
+                account.id,
+                now.saturating_add(2),
+            )
+            .await
+            .expect("finish Cursor login");
+
+        match poll_cursor_login(
+            &database,
+            &crate::build_http_client().expect("HTTP client"),
+            &started.session_token,
+            key_material,
+            now.saturating_add(3),
+            Some("cursor-replay"),
+            None,
+            true,
+        )
+        .await
+        .expect("replay consumed Cursor login")
+        {
+            CursorPollResult::Consumed { account_id, .. } => {
+                assert_eq!(account_id, account.id);
+            }
+            other => panic!("unexpected replay result: {other:?}"),
+        }
     }
 
     #[tokio::test]

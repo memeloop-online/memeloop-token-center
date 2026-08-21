@@ -529,31 +529,29 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const { locale, t } = useI18n();
   const oauthProviders = providers.filter((provider) => provider.oauth_adapter || provider.id === 'openai-codex');
   const existingOAuthProvider = oauthProviders.find((provider) => provider.id === existing?.driver);
-  const [providerChoice, setProviderChoice] = useState(existingOAuthProvider ? `provider:${existingOAuthProvider.id}` : 'cursor');
-  const selectedProvider = providerChoice.startsWith('provider:')
-    ? oauthProviders.find((provider) => provider.id === providerChoice.slice('provider:'.length))
-    : undefined;
-  const [name, setName] = useState(existing?.name ?? 'cursor-primary');
-  const [baseUrl, setBaseUrl] = useState(typeof existing?.config.base_url === 'string' ? existing.config.base_url : 'http://cursor-adapter:8080');
+  const initialProvider = existingOAuthProvider ?? oauthProviders[0];
+  const [providerChoice, setProviderChoice] = useState(initialProvider?.id ?? '');
+  const selectedProvider = oauthProviders.find((provider) => provider.id === providerChoice);
+  const [name, setName] = useState(existing?.name ?? (initialProvider ? `${initialProvider.id}-primary` : ''));
   const [session, setSession] = useState<{ login_url?: string; verification_url?: string; user_code?: string; session_token: string; expires_at?: number; poll_after_seconds?: number }>();
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const reset = () => { setSession(undefined); setMessage(''); setError(''); };
   useEffect(() => { setSession(undefined); setMessage(''); setError(''); }, [tenant]);
   const start = async (providerConfig?: unknown) => {
-    if (!tenant) return;
+    if (!tenant || !selectedProvider) return;
     try {
       const target = existing ? { upstream_account_id: existing.id } : {};
       if (selectedProvider?.id === 'openai-codex') setSession(await api('/internal/v1/oauth/codex/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...target }) }));
-      else if (!selectedProvider) setSession(await api('/internal/v1/oauth/cursor/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: existing?.driver ?? 'http-json', provider_config: existing?.config ?? { base_url: baseUrl }, ...target }) }));
       else setSession(await api('/internal/v1/oauth/provider-adapter/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: selectedProvider.id, provider_config: existing?.config ?? providerConfig, ...target }) }));
       setMessage(''); setError('');
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
   };
   const poll = async () => {
     if (!session) return;
-    const path = selectedProvider?.id === 'openai-codex' ? '/internal/v1/oauth/codex/poll'
-      : selectedProvider ? '/internal/v1/oauth/provider-adapter/poll' : '/internal/v1/oauth/cursor/poll';
+    if (!selectedProvider) return;
+    const path = selectedProvider.id === 'openai-codex' ? '/internal/v1/oauth/codex/poll'
+      : '/internal/v1/oauth/provider-adapter/poll';
     try {
       const result = await api<UpstreamAccount | { status: string; message?: string }>(path, token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token }) });
       if ('id' in result) { setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id })); setSession(undefined); await onChanged(); }
@@ -562,12 +560,13 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   };
   return <div className="authorization-form"><p className="muted">{t('providers.oauthSecurity')}</p>
     {error && <div className="notice error" role="alert">{error}</div>}
-    <label>{t('providers.provider')}<select disabled={Boolean(existing)} value={providerChoice} onChange={(event) => { const next = event.target.value; setProviderChoice(next); setName(next === 'cursor' ? 'cursor-primary' : `${next.slice('provider:'.length)}-primary`); reset(); }}><option value="cursor">{t('providers.cursorDirect')}</option>{oauthProviders.map((value) => <option key={value.id} value={`provider:${value.id}`}>{value.display_name}</option>)}</select></label>
+    {oauthProviders.length === 0 ? <div className="empty">{t('providers.noAdapter')}</div> : <>
+    <label>{t('providers.provider')}<select disabled={Boolean(existing)} value={providerChoice} onChange={(event) => { const next = event.target.value; setProviderChoice(next); setName(`${next}-primary`); reset(); }}>{oauthProviders.map((value) => <option key={value.id} value={value.id}>{value.display_name}</option>)}</select></label>
     <label>{t('providers.name')}<input readOnly={Boolean(existing)} value={name} onChange={(event) => setName(event.target.value)} /></label>
-    {!selectedProvider && <label>{t('providers.adapterUrl')}<input readOnly={Boolean(existing)} value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label>}
     {selectedProvider && selectedProvider.id !== 'openai-codex' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant}>{t('common.startLogin')}</button></Form> : <div className="button-row"><button type="button" onClick={() => void start()} disabled={!tenant || Boolean(session)}>{t('common.startLogin')}</button>{session && <><a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noreferrer">{t('common.openAuthorization')}</a><button type="button" onClick={() => void poll()}>{t('common.checkAuthorization')}</button></>}</div>}
     {session?.user_code && <div className="device-authorization" role="status"><p>{t('providers.codexSecurity')}</p><b>{t('providers.deviceCode')}</b><code>{session.user_code}</code></div>}
     {message && <div className="notice success" role="status">{message}</div>}
+    </>}
   </div>;
 }
 
