@@ -229,7 +229,7 @@ pub(super) async fn admit_cloud_webhook_before_body(
 }
 
 #[cfg(test)]
-mod tests {
+mod response_body_guard_tests {
     use std::sync::Arc;
 
     use axum::body::Bytes;

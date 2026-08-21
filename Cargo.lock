@@ -2231,6 +2231,8 @@ dependencies = [
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "http",
+ "hyper",
+ "hyper-util",
  "jsonschema",
  "jsonwebtoken",
  "mime_guess",
