@@ -325,12 +325,8 @@ async fn managed_oauth_adapter_call(
     allow_test_loopback: bool,
 ) -> Result<Vec<u8>, AppError> {
     let (url, scope) = managed_oauth_endpoint_scope(endpoint, allow_test_loopback)?;
-    let client = match scope {
-        OutboundScope::Public => {
-            network::client_for_url(shared_http, url.as_str(), scope, allow_test_loopback).await?
-        }
-        OutboundScope::Private => crate::build_http_client().map_err(|_| AppError::Internal)?,
-    };
+    let client =
+        network::client_for_url(shared_http, url.as_str(), scope, allow_test_loopback).await?;
     let response = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -371,11 +367,30 @@ pub async fn start_cursor_login(
     }
     let oauth_driver = input.oauth_driver.clone();
     let _ = validate_config(&input.provider_config)?;
+    let provider_scope = network::scope_from_config(&input.provider_config);
     let (mut login_url, poll_url, refresh_url) = if oauth_driver == "provider_adapter" {
         (
-            oauth_adapter_endpoint_scope(&input.endpoints.login_url, "login_url", false)?.0,
-            oauth_adapter_endpoint_scope(&input.endpoints.poll_url, "poll_url", false)?.0,
-            oauth_adapter_endpoint_scope(&input.endpoints.refresh_url, "refresh_url", false)?.0,
+            oauth_adapter_endpoint_scope(
+                &input.endpoints.login_url,
+                "login_url",
+                false,
+                provider_scope,
+            )?
+            .0,
+            oauth_adapter_endpoint_scope(
+                &input.endpoints.poll_url,
+                "poll_url",
+                false,
+                provider_scope,
+            )?
+            .0,
+            oauth_adapter_endpoint_scope(
+                &input.endpoints.refresh_url,
+                "refresh_url",
+                false,
+                provider_scope,
+            )?
+            .0,
         )
     } else {
         (
@@ -503,7 +518,12 @@ pub async fn poll_cursor_login(
         ),
     };
     let (mut poll_url, scope) = if state.oauth_driver == "provider_adapter" {
-        oauth_adapter_endpoint_scope(&state.poll_url, "poll_url", allow_test_loopback)?
+        oauth_adapter_endpoint_scope(
+            &state.poll_url,
+            "poll_url",
+            allow_test_loopback,
+            network::scope_from_config(&state.provider_config),
+        )?
     } else {
         (
             validate_oauth_endpoint(&state.poll_url, "poll_url")?,
@@ -628,6 +648,7 @@ pub async fn refresh_cursor_credential(
     refresh_url: &str,
     credential: &UpstreamCredential,
     now: i64,
+    configured_scope: OutboundScope,
 ) -> Result<UpstreamCredential, AppError> {
     let UpstreamCredential::OAuth {
         refresh_token: Some(refresh_token),
@@ -638,7 +659,8 @@ pub async fn refresh_cursor_credential(
             "upstream account has no OAuth refresh token".into(),
         ));
     };
-    let refresh_url = validate_oauth_endpoint(refresh_url, "refresh_url")?;
+    let refresh_url =
+        validate_oauth_endpoint_with_scope(refresh_url, "refresh_url", configured_scope)?;
     let response = http
         .post(refresh_url)
         .bearer_auth(refresh_token)
@@ -689,19 +711,26 @@ pub async fn refresh_cursor_credential(
 }
 
 pub(crate) fn validate_oauth_endpoint(value: &str, field: &str) -> Result<Url, AppError> {
+    validate_oauth_endpoint_with_scope(value, field, OutboundScope::Public)
+}
+
+fn validate_oauth_endpoint_with_scope(
+    value: &str,
+    field: &str,
+    scope: OutboundScope,
+) -> Result<Url, AppError> {
     let url = Url::parse(value)
         .map_err(|_| AppError::BadRequest(format!("OAuth {field} must be a URL")))?;
     let private_http = url.scheme() == "http"
-        && url.host().is_some_and(|host| match host {
-            Host::Domain(host) => {
-                network::is_private_cluster_name(host) || is_loopback_oauth_name(host)
-            }
-            Host::Ipv4(address) => address.is_loopback(),
-            Host::Ipv6(address) => address.is_loopback(),
-        });
+        && (scope == OutboundScope::Private
+            || url.host().is_some_and(|host| match host {
+                Host::Domain(host) => is_loopback_oauth_name(host),
+                Host::Ipv4(address) => address.is_loopback(),
+                Host::Ipv6(address) => address.is_loopback(),
+            }));
     if url.scheme() != "https" && !private_http {
         return Err(AppError::BadRequest(format!(
-            "OAuth {field} must use HTTPS (explicit cluster HTTP is allowed)"
+            "OAuth {field} must use HTTPS unless the account is explicitly private"
         )));
     }
     if url.username() != "" || url.password().is_some() || url.fragment().is_some() {
@@ -713,8 +742,10 @@ pub(crate) fn validate_oauth_endpoint(value: &str, field: &str) -> Result<Url, A
 }
 
 pub(crate) fn validate_oauth_adapter_endpoint(value: &str, field: &str) -> Result<Url, AppError> {
-    let url = validate_oauth_endpoint(value, field)?;
-    classify_oauth_endpoint(&url, field, false)?;
+    // Catalog contributions are syntax only: the account's operator-approved
+    // network scope is enforced again before every login, poll, and refresh.
+    let url = validate_oauth_endpoint_with_scope(value, field, OutboundScope::Private)?;
+    classify_oauth_endpoint(&url, field, false, OutboundScope::Private)?;
     Ok(url)
 }
 
@@ -736,7 +767,7 @@ fn validate_managed_oauth_adapter_endpoint_inner(
             "OAuth {field} cannot contain a query"
         )));
     }
-    classify_oauth_endpoint(&url, field, allow_test_loopback)?;
+    classify_oauth_endpoint(&url, field, allow_test_loopback, OutboundScope::Public)?;
     Ok(url)
 }
 
@@ -746,7 +777,12 @@ fn managed_oauth_endpoint_scope(
 ) -> Result<(Url, OutboundScope), AppError> {
     let url =
         validate_managed_oauth_adapter_endpoint_inner(value, "adapter_url", allow_test_loopback)?;
-    let scope = classify_oauth_endpoint(&url, "adapter_url", allow_test_loopback)?;
+    let scope = classify_oauth_endpoint(
+        &url,
+        "adapter_url",
+        allow_test_loopback,
+        OutboundScope::Public,
+    )?;
     Ok((url, scope))
 }
 
@@ -754,9 +790,10 @@ pub(crate) fn oauth_adapter_endpoint_scope(
     value: &str,
     field: &str,
     allow_test_loopback: bool,
+    configured_scope: OutboundScope,
 ) -> Result<(Url, OutboundScope), AppError> {
-    let url = validate_oauth_endpoint(value, field)?;
-    let scope = classify_oauth_endpoint(&url, field, allow_test_loopback)?;
+    let url = validate_oauth_endpoint_with_scope(value, field, configured_scope)?;
+    let scope = classify_oauth_endpoint(&url, field, allow_test_loopback, configured_scope)?;
     Ok((url, scope))
 }
 
@@ -764,15 +801,28 @@ fn classify_oauth_endpoint(
     url: &Url,
     field: &str,
     allow_test_loopback: bool,
+    configured_scope: OutboundScope,
 ) -> Result<OutboundScope, AppError> {
     let host = url
         .host()
         .ok_or_else(|| AppError::BadRequest(format!("OAuth {field} must include a host")))?;
     match host {
-        Host::Domain(host) if network::is_private_cluster_name(host) => Ok(OutboundScope::Private),
-        Host::Domain(_) => Ok(OutboundScope::Public),
-        Host::Ipv4(address) => classify_oauth_ip(IpAddr::V4(address), field, allow_test_loopback),
-        Host::Ipv6(address) => classify_oauth_ip(IpAddr::V6(address), field, allow_test_loopback),
+        Host::Domain(host) if is_loopback_oauth_name(host) && !allow_test_loopback => Err(
+            AppError::BadRequest(format!("OAuth {field} cannot target a loopback host")),
+        ),
+        Host::Domain(_) => Ok(configured_scope),
+        Host::Ipv4(address) => classify_oauth_ip(
+            IpAddr::V4(address),
+            field,
+            allow_test_loopback,
+            configured_scope,
+        ),
+        Host::Ipv6(address) => classify_oauth_ip(
+            IpAddr::V6(address),
+            field,
+            allow_test_loopback,
+            configured_scope,
+        ),
     }
 }
 
@@ -780,16 +830,20 @@ fn classify_oauth_ip(
     address: IpAddr,
     field: &str,
     allow_test_loopback: bool,
+    configured_scope: OutboundScope,
 ) -> Result<OutboundScope, AppError> {
     if allow_test_loopback && address.is_loopback() {
-        return Ok(OutboundScope::Private);
+        return Ok(configured_scope);
     }
-    if !network::is_public_ip(address) {
-        return Err(AppError::BadRequest(format!(
-            "OAuth {field} cannot target a private or reserved IP address"
-        )));
+    if network::is_public_ip(address)
+        || (configured_scope == OutboundScope::Private
+            && network::is_safe_private_upstream_ip(address))
+    {
+        return Ok(configured_scope);
     }
-    Ok(OutboundScope::Public)
+    Err(AppError::BadRequest(format!(
+        "OAuth {field} cannot target a private or reserved IP address"
+    )))
 }
 
 fn is_loopback_oauth_name(host: &str) -> bool {
@@ -891,7 +945,10 @@ mod tests {
                 tenant_external_id: "default".to_owned(),
                 account_name: "plugin-oauth".to_owned(),
                 provider_driver: "plugin-provider".to_owned(),
-                provider_config: json!({"base_url": "http://plugin-upstream.default.svc"}),
+                provider_config: json!({
+                    "base_url": "http://plugin-upstream.default.svc",
+                    "network_scope": "private"
+                }),
                 endpoints: CursorOAuthEndpoints {
                     login_url: "http://oauth-adapter.default.svc/login".to_owned(),
                     poll_url: "http://oauth-adapter.default.svc/poll".to_owned(),
@@ -908,11 +965,37 @@ mod tests {
         .unwrap();
         assert_eq!(private.driver, "provider_adapter");
         assert!(validate_oauth_endpoint("http://oauth.example.com/login", "login_url").is_err());
+        assert!(
+            oauth_adapter_endpoint_scope(
+                "http://10.1.2.3:8080/poll",
+                "poll_url",
+                false,
+                OutboundScope::Private,
+            )
+            .is_ok()
+        );
+        assert!(
+            oauth_adapter_endpoint_scope(
+                "https://169.254.169.254/latest/meta-data",
+                "poll_url",
+                false,
+                OutboundScope::Private,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_managed_oauth_adapter_endpoint(
+                "http://oauth-adapter.default.svc/poll",
+                "adapter_url",
+            )
+            .is_err()
+        );
         assert_eq!(
             oauth_adapter_endpoint_scope(
                 "http://oauth-adapter.default.svc/poll",
                 "poll_url",
                 false,
+                OutboundScope::Private,
             )
             .unwrap()
             .1,
@@ -927,7 +1010,13 @@ mod tests {
             "https://[2002:7f00:1::]/oauth",
         ] {
             assert!(
-                oauth_adapter_endpoint_scope(endpoint, "adapter_url", false).is_err(),
+                oauth_adapter_endpoint_scope(
+                    endpoint,
+                    "adapter_url",
+                    false,
+                    OutboundScope::Public,
+                )
+                .is_err(),
                 "interactive adapter accepted {endpoint}"
             );
             assert!(
@@ -940,6 +1029,7 @@ mod tests {
                 "https://[2606:4700:4700::1111]/oauth",
                 "adapter_url",
                 false,
+                OutboundScope::Public,
             )
             .unwrap()
             .1,
@@ -1102,6 +1192,7 @@ mod tests {
             &endpoint,
             &credential,
             crate::db::unix_millis(),
+            OutboundScope::Public,
         )
         .await
         .unwrap_err();

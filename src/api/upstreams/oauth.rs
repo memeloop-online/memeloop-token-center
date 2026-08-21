@@ -564,7 +564,7 @@ pub(crate) async fn refresh_managed_upstream_oauth(
         return Ok(replay);
     }
     let refreshed: Result<UpstreamCredential, AppError> = async {
-        let (_, credential) = state
+        let (account, credential) = state
             .db
             .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
             .await?;
@@ -575,6 +575,7 @@ pub(crate) async fn refresh_managed_upstream_oauth(
                         &refresh_url,
                         "refresh_url",
                         state.config.allow_oauth_loopback,
+                        network::scope_from_config(&account.config),
                     )?
                     .1
                 } else {
@@ -587,8 +588,14 @@ pub(crate) async fn refresh_managed_upstream_oauth(
                     state.config.allow_oauth_loopback,
                 )
                 .await?;
-                refresh_cursor_credential(&refresh_http, &refresh_url, &credential, unix_millis())
-                    .await?
+                refresh_cursor_credential(
+                    &refresh_http,
+                    &refresh_url,
+                    &credential,
+                    unix_millis(),
+                    refresh_scope,
+                )
+                .await?
             }
             _ => {
                 let adapter =

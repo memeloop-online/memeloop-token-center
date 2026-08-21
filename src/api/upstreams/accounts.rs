@@ -150,7 +150,7 @@ async fn validate_secondary_outbound_urls(
         let oauth_scope = if config.pointer("/oauth/driver").and_then(Value::as_str)
             == Some("provider_adapter")
         {
-            OutboundScope::Private
+            scope
         } else {
             OutboundScope::Public
         };

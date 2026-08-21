@@ -58,6 +58,7 @@ pub async fn client_for_url(
                 shared_http,
                 IpAddr::V4(*address),
                 url.scheme(),
+                scope,
                 allow_test_loopback,
             );
         }
@@ -66,25 +67,12 @@ pub async fn client_for_url(
                 shared_http,
                 IpAddr::V6(*address),
                 url.scheme(),
+                scope,
                 allow_test_loopback,
             );
         }
     };
     let loopback_name = is_loopback_name(host_name);
-    let private_cluster_name =
-        scope == OutboundScope::Private && is_private_cluster_name(host_name);
-    if url.scheme() != "https" && !(allow_test_loopback && loopback_name) && !private_cluster_name {
-        return Err(AppError::BadRequest(
-            "outbound URLs must use HTTPS outside explicit cluster services".into(),
-        ));
-    }
-    // Cluster service discovery is an explicit global-operator authority. It
-    // is the only production private-DNS exception; arbitrary hostnames that
-    // resolve to RFC1918, link-local, or metadata addresses remain forbidden.
-    if private_cluster_name {
-        return Ok(shared_http.clone());
-    }
-
     let port = url.port_or_known_default().ok_or_else(|| {
         AppError::BadRequest("outbound URL must use a known or explicit port".into())
     })?;
@@ -92,7 +80,8 @@ pub async fn client_for_url(
     let test_loopback = allow_test_loopback
         && loopback_name
         && addresses.iter().all(|address| address.ip().is_loopback());
-    validate_public_addresses(&addresses, test_loopback)?;
+    validate_addresses(&addresses, scope, test_loopback)?;
+    validate_transport_security(url.scheme(), &addresses, scope, test_loopback)?;
     crate::build_pinned_http_client(host_name, &addresses).map_err(|_| AppError::Internal)
 }
 
@@ -100,20 +89,19 @@ fn validated_literal_client(
     shared_http: &reqwest::Client,
     address: IpAddr,
     scheme: &str,
+    scope: OutboundScope,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
     let test_loopback = allow_test_loopback && address.is_loopback();
-    if scheme != "https" && !test_loopback {
-        return Err(AppError::BadRequest(
-            "outbound IP literals must use HTTPS".into(),
-        ));
-    }
-    validate_public_addresses(&[SocketAddr::new(address, 0)], test_loopback)?;
+    let addresses = [SocketAddr::new(address, 0)];
+    validate_addresses(&addresses, scope, test_loopback)?;
+    validate_transport_security(scheme, &addresses, scope, test_loopback)?;
     Ok(shared_http.clone())
 }
 
-fn validate_public_addresses(
+fn validate_addresses(
     addresses: &[SocketAddr],
+    scope: OutboundScope,
     allow_all_loopback: bool,
 ) -> Result<(), AppError> {
     if addresses.is_empty() {
@@ -121,12 +109,47 @@ fn validate_public_addresses(
             "outbound host returned no addresses".into(),
         ));
     }
-    if !allow_all_loopback && addresses.iter().any(|address| !is_public_ip(address.ip())) {
+    if allow_all_loopback && addresses.iter().all(|address| address.ip().is_loopback()) {
+        return Ok(());
+    }
+    if addresses.iter().all(|address| is_public_ip(address.ip())) {
+        return Ok(());
+    }
+    let all_safe_private = addresses
+        .iter()
+        .all(|address| is_safe_private_upstream_ip(address.ip()));
+    if scope == OutboundScope::Private && all_safe_private {
+        return Ok(());
+    }
+    if addresses
+        .iter()
+        .any(|address| is_forbidden_outbound_ip(address.ip()))
+    {
         return Err(AppError::BadRequest(
-            "public outbound host resolved to a private or reserved address".into(),
+            "outbound host resolved to a forbidden address".into(),
         ));
     }
-    Ok(())
+    Err(AppError::BadRequest(
+        "outbound host returned mixed public and private addresses".into(),
+    ))
+}
+
+fn validate_transport_security(
+    scheme: &str,
+    addresses: &[SocketAddr],
+    scope: OutboundScope,
+    allow_all_loopback: bool,
+) -> Result<(), AppError> {
+    let cleartext_is_private = scope == OutboundScope::Private
+        && addresses
+            .iter()
+            .all(|address| is_safe_private_upstream_ip(address.ip()));
+    if scheme == "https" || allow_all_loopback || cleartext_is_private {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(
+        "outbound URLs must use HTTPS unless every pinned address is explicitly private".into(),
+    ))
 }
 
 pub async fn client_for_config_url(
@@ -189,16 +212,24 @@ fn is_loopback_name(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-pub(crate) fn is_private_cluster_name(host: &str) -> bool {
-    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
-    normalized.ends_with(".svc") || normalized.ends_with(".svc.cluster.local")
-}
-
 pub fn is_public_ip(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_public_ipv4(address),
         IpAddr::V6(address) => is_public_ipv6(address),
     }
+}
+
+pub(crate) fn is_safe_private_upstream_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => address.is_private(),
+        IpAddr::V6(address) => {
+            address.to_ipv4_mapped().is_none() && (address.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+fn is_forbidden_outbound_ip(address: IpAddr) -> bool {
+    !is_public_ip(address) && !is_safe_private_upstream_ip(address)
 }
 
 fn is_public_ipv4(address: Ipv4Addr) -> bool {
@@ -317,15 +348,25 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            client_for_url(
+                &shared,
+                "http://1.1.1.1/provider",
+                OutboundScope::Private,
+                false,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
-    async fn private_scope_uses_the_preapproved_shared_client() {
+    async fn private_scope_allows_exact_safe_lan_endpoint_but_not_metadata() {
         let shared = crate::build_http_client().unwrap();
         assert!(
             client_for_url(
                 &shared,
-                "http://provider.default.svc.cluster.local:8080",
+                "http://10.0.0.1:8188/provider",
                 OutboundScope::Private,
                 false,
             )
@@ -333,7 +374,6 @@ mod tests {
             .is_ok()
         );
         for endpoint in [
-            "https://10.0.0.1/provider",
             "https://169.254.169.254/latest/meta-data",
             "https://[::1]/provider",
             "https://[::ffff:169.254.169.254]/provider",
@@ -350,13 +390,48 @@ mod tests {
     }
 
     #[test]
-    fn mixed_public_and_private_dns_answer_fails_closed() {
+    fn private_scope_requires_uniform_safe_private_answers() {
+        let private = [
+            "10.0.0.1:443".parse().unwrap(),
+            "192.168.1.10:443".parse().unwrap(),
+        ];
+        assert!(validate_addresses(&private, OutboundScope::Private, false).is_ok());
+        assert!(validate_addresses(&private, OutboundScope::Public, false).is_err());
+
         let addresses = [
             "1.1.1.1:443".parse().unwrap(),
-            "169.254.169.254:443".parse().unwrap(),
+            "10.0.0.1:443".parse().unwrap(),
         ];
-        assert!(validate_public_addresses(&addresses, false).is_err());
-        assert!(validate_public_addresses(&addresses[..1], false).is_ok());
-        assert!(validate_public_addresses(&[], false).is_err());
+        assert!(validate_addresses(&addresses, OutboundScope::Private, false).is_err());
+        assert!(validate_addresses(&addresses[..1], OutboundScope::Public, false).is_ok());
+        assert!(validate_addresses(&[], OutboundScope::Public, false).is_err());
+        assert!(
+            validate_transport_security("http", &addresses[..1], OutboundScope::Private, false,)
+                .is_err(),
+            "private-config public DNS answers must not permit cleartext"
+        );
+        assert!(
+            validate_transport_security("http", &private, OutboundScope::Private, false).is_ok(),
+            "explicit private ComfyUI endpoints may use cleartext on the private network"
+        );
+    }
+
+    #[test]
+    fn private_scope_never_allows_metadata_or_transition_bypasses() {
+        for value in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "::1",
+            "fe80::1",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "2002:7f00:1::",
+        ] {
+            let addresses = [SocketAddr::new(value.parse().unwrap(), 443)];
+            assert!(
+                validate_addresses(&addresses, OutboundScope::Private, false).is_err(),
+                "private scope accepted {value}"
+            );
+        }
     }
 }
