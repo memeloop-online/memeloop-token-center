@@ -400,6 +400,10 @@ async fn finish_openai_image_response(
             return fail_image_request(context, "upstream_image_invalid_json").await;
         }
     };
+    // serde_json owns every string in `parsed`, so the bounded upstream body is
+    // no longer needed. Releasing it here avoids retaining two copies of a
+    // large b64_json payload throughout validation and serialization.
+    drop(response_bytes);
     let urls = match openai_image_urls(&parsed, context.expected_image_count) {
         Ok(urls) => urls,
         Err(_) => {
@@ -447,7 +451,7 @@ async fn finish_openai_image_response(
         };
         archived_assets.push(asset);
     }
-    let sanitized = match sanitize_openai_image_response(&parsed, request_id, &archived_assets) {
+    let sanitized = match sanitize_openai_image_response(parsed, request_id, &archived_assets) {
         Ok(response) => response,
         Err(_) => {
             return fail_image_request_with_staging(
@@ -458,8 +462,9 @@ async fn finish_openai_image_response(
             .await;
         }
     };
-    let archive_bytes =
-        Bytes::from(serde_json::to_vec(&sanitized).map_err(|_| AppError::Internal)?);
+    let archive_bytes = serde_json::to_vec(&sanitized).map_err(|_| AppError::Internal)?;
+    drop(sanitized);
+    let archive_bytes = Bytes::from(archive_bytes);
     let response_object =
         match archive_synchronous_image_response(context, &mut result_lease, archive_bytes.clone())
             .await
@@ -522,10 +527,7 @@ pub(in crate::api) fn openai_image_urls(
         let b64 = item.get("b64_json").and_then(Value::as_str);
         match (url, b64) {
             (Some(url), None) => urls.push(url),
-            (None, Some(encoded))
-                if STANDARD
-                    .decode(encoded)
-                    .is_ok_and(|decoded| !decoded.is_empty()) => {}
+            (None, Some(encoded)) if is_valid_bounded_base64(encoded, MAX_IMAGE_RESPONSE) => {}
             _ => {
                 return Err(AppError::Upstream(
                     "image upstream response result has invalid image data".into(),
@@ -537,20 +539,35 @@ pub(in crate::api) fn openai_image_urls(
 }
 
 pub(in crate::api) fn sanitize_openai_image_response(
-    value: &Value,
+    mut value: Value,
     request_id: Uuid,
     assets: &[crate::model::ArchivedGenerationAsset],
 ) -> Result<Value, AppError> {
+    let created = value
+        .get("created")
+        .and_then(Value::as_i64)
+        .filter(|created| *created >= 0)
+        .unwrap_or_else(|| unix_millis() / 1_000);
+    let usage = value.get("usage").and_then(sanitize_image_usage);
     let data = value
-        .get("data")
-        .and_then(Value::as_array)
+        .as_object_mut()
+        .and_then(|object| object.remove("data"))
+        .and_then(|data| match data {
+            Value::Array(data) => Some(data),
+            _ => None,
+        })
         .ok_or_else(|| AppError::Upstream("image upstream response has no data array".into()))?;
     let mut assets = assets.iter();
     let mut sanitized_data = Vec::with_capacity(data.len());
     for item in data {
-        let object = item.as_object().ok_or_else(|| {
-            AppError::Upstream("image upstream response result is invalid".into())
-        })?;
+        let mut object = match item {
+            Value::Object(object) => object,
+            _ => {
+                return Err(AppError::Upstream(
+                    "image upstream response result is invalid".into(),
+                ));
+            }
+        };
         let mut sanitized = serde_json::Map::new();
         if object.get("url").and_then(Value::as_str).is_some() {
             let asset = assets.next().ok_or_else(|| {
@@ -573,22 +590,21 @@ pub(in crate::api) fn sanitize_openai_image_response(
                     "filename": asset.filename
                 }),
             );
-        } else if let Some(encoded) = object.get("b64_json").and_then(Value::as_str) {
-            sanitized.insert("b64_json".to_owned(), Value::String(encoded.to_owned()));
+        } else if let Some(Value::String(encoded)) = object.remove("b64_json") {
+            sanitized.insert("b64_json".to_owned(), Value::String(encoded));
         } else {
             return Err(AppError::Upstream(
                 "image upstream response result has invalid image data".into(),
             ));
         }
-        if let Some(revised_prompt) = object
-            .get("revised_prompt")
-            .and_then(Value::as_str)
-            .filter(|prompt| prompt.len() <= 32_000 && !prompt.contains('\0'))
+        if let Some(Value::String(revised_prompt)) =
+            object.remove("revised_prompt").filter(|prompt| {
+                prompt
+                    .as_str()
+                    .is_some_and(|prompt| prompt.len() <= 32_000 && !prompt.contains('\0'))
+            })
         {
-            sanitized.insert(
-                "revised_prompt".to_owned(),
-                Value::String(revised_prompt.to_owned()),
-            );
+            sanitized.insert("revised_prompt".to_owned(), Value::String(revised_prompt));
         }
         sanitized_data.push(Value::Object(sanitized));
     }
@@ -597,18 +613,13 @@ pub(in crate::api) fn sanitize_openai_image_response(
             "image upstream asset metadata does not match results".into(),
         ));
     }
-    let mut response = json!({
-        "created": value
-            .get("created")
-            .and_then(Value::as_i64)
-            .filter(|created| *created >= 0)
-            .unwrap_or_else(|| unix_millis() / 1_000),
-        "data": sanitized_data
-    });
-    if let Some(usage) = value.get("usage").and_then(sanitize_image_usage) {
-        response["usage"] = usage;
+    let mut response = serde_json::Map::new();
+    response.insert("created".to_owned(), json!(created));
+    response.insert("data".to_owned(), Value::Array(sanitized_data));
+    if let Some(usage) = usage {
+        response.insert("usage".to_owned(), usage);
     }
-    Ok(response)
+    Ok(Value::Object(response))
 }
 
 fn sanitize_image_usage(value: &Value) -> Option<Value> {
@@ -714,35 +725,37 @@ async fn finish_responses_tool_image(
             return fail_image_request(context, "upstream_image_invalid_json").await;
         }
     };
-    let mut images = Vec::new();
-    collect_image_results(&response, &mut images);
-    if !has_one_valid_bounded_image(&images) {
-        return fail_image_request(context, "upstream_image_invalid_payload").await;
-    }
-    let usage = response.get("usage").and_then(sanitize_image_usage);
+    // Parsing has copied the image string into the Value. Drop the upstream
+    // allocation before extracting that String by ownership.
+    drop(bytes);
+    let (image, usage) = match extract_responses_tool_image(response) {
+        Ok(extracted) => extracted,
+        Err(_) => {
+            return fail_image_request(context, "upstream_image_invalid_payload").await;
+        }
+    };
     #[derive(serde::Serialize)]
-    struct ImageData<'a> {
-        b64_json: &'a str,
+    struct ImageData {
+        b64_json: String,
     }
 
     #[derive(serde::Serialize)]
-    struct ImageResponse<'a> {
+    struct ImageResponse {
         created: i64,
-        data: Vec<ImageData<'a>>,
+        data: [ImageData; 1],
         #[serde(skip_serializing_if = "Option::is_none")]
         usage: Option<Value>,
     }
 
     let transformed = ImageResponse {
         created: unix_millis() / 1_000,
-        data: images
-            .into_iter()
-            .map(|image| ImageData { b64_json: image })
-            .collect(),
+        data: [ImageData { b64_json: image }],
         usage,
     };
     let response_bytes =
-        Bytes::from(serde_json::to_vec(&transformed).expect("image response is JSON serializable"));
+        serde_json::to_vec(&transformed).expect("image response is JSON serializable");
+    drop(transformed);
+    let response_bytes = Bytes::from(response_bytes);
     if response_bytes.len() > MAX_IMAGE_RESPONSE {
         return fail_image_request(context, "upstream_image_response_too_large").await;
     }
@@ -792,11 +805,11 @@ async fn finish_responses_tool_image(
         .map_err(|_| AppError::Internal)
 }
 
-fn collect_image_results<'a>(value: &'a Value, images: &mut Vec<&'a str>) {
+fn take_image_results(value: &mut Value, images: &mut Vec<String>) {
     match value {
         Value::Array(values) => {
             for value in values {
-                collect_image_results(value, images);
+                take_image_results(value, images);
             }
         }
         Value::Object(object) => {
@@ -804,24 +817,51 @@ fn collect_image_results<'a>(value: &'a Value, images: &mut Vec<&'a str>) {
                 .get("type")
                 .and_then(Value::as_str)
                 .is_some_and(|value| value == "image_generation_call")
-                && let Some(result) = object.get("result").and_then(Value::as_str)
+                && object.get("result").is_some_and(Value::is_string)
+                && let Some(Value::String(result)) = object.remove("result")
             {
                 images.push(result);
             }
-            for value in object.values() {
-                collect_image_results(value, images);
+            for value in object.values_mut() {
+                take_image_results(value, images);
             }
         }
         _ => {}
     }
 }
 
+pub(in crate::api) fn extract_responses_tool_image(
+    mut response: Value,
+) -> Result<(String, Option<Value>), AppError> {
+    let usage = response.get("usage").and_then(sanitize_image_usage);
+    let mut images = Vec::with_capacity(1);
+    take_image_results(&mut response, &mut images);
+    if !has_one_valid_bounded_image(&images) {
+        return Err(AppError::Upstream(
+            "image upstream response has invalid image results".into(),
+        ));
+    }
+    Ok((images.pop().expect("one image was validated"), usage))
+}
+
 pub(in crate::api) fn has_one_valid_bounded_image<T: AsRef<str>>(images: &[T]) -> bool {
     let Some(image) = images.first().filter(|_| images.len() == 1) else {
         return false;
     };
-    let encoded = image.as_ref().as_bytes();
+    is_valid_bounded_base64(image.as_ref(), MAX_IMAGE_RESPONSE)
+}
+
+pub(in crate::api) fn is_valid_bounded_base64(encoded: &str, max_decoded_len: usize) -> bool {
+    let encoded = encoded.as_bytes();
     if encoded.is_empty() || !encoded.len().is_multiple_of(4) {
+        return false;
+    }
+
+    // This bound rejects impossible inputs up front without allocating a
+    // decoded image. The per-quantum decoder below performs strict alphabet
+    // and padding validation using only three bytes of scratch space.
+    let max_encoded_len = max_decoded_len.div_ceil(3).saturating_mul(4);
+    if encoded.len() > max_encoded_len {
         return false;
     }
 
@@ -835,8 +875,11 @@ pub(in crate::api) fn has_one_valid_bounded_image<T: AsRef<str>>(images: &[T]) -
         let Ok(written) = STANDARD.decode_slice(quantum, &mut decoded_quantum) else {
             return false;
         };
-        decoded_len = decoded_len.saturating_add(written);
-        if decoded_len > MAX_IMAGE_RESPONSE {
+        let Some(next_len) = decoded_len.checked_add(written) else {
+            return false;
+        };
+        decoded_len = next_len;
+        if decoded_len > max_decoded_len {
             return false;
         }
     }

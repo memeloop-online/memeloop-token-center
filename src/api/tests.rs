@@ -824,6 +824,58 @@ fn responses_tool_requires_exactly_one_valid_base64_image() {
 }
 
 #[test]
+fn responses_tool_moves_one_nested_image_and_rejects_duplicates() {
+    let encoded = STANDARD.encode(b"nested image");
+    let nested = json!({
+        "output": [{
+            "content": [{
+                "type": "container",
+                "items": [{
+                    "type": "image_generation_call",
+                    "result": encoded
+                }]
+            }]
+        }],
+        "usage": {
+            "total_tokens": 9,
+            "provider_secret": "must-not-leak"
+        }
+    });
+    let (extracted, usage) =
+        extract_responses_tool_image(nested).expect("one nested image is accepted");
+    assert_eq!(extracted, STANDARD.encode(b"nested image"));
+    assert_eq!(usage, Some(json!({"total_tokens": 9})));
+
+    let duplicate = json!({
+        "output": [
+            {"type": "image_generation_call", "result": STANDARD.encode(b"one")},
+            {"nested": {"type": "image_generation_call", "result": STANDARD.encode(b"two")}}
+        ]
+    });
+    assert!(extract_responses_tool_image(duplicate).is_err());
+    assert!(extract_responses_tool_image(json!({"output": []})).is_err());
+    assert!(
+        extract_responses_tool_image(json!({
+            "type": "image_generation_call",
+            "result": "invalid padding==="
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn standard_base64_validation_rejects_invalid_padding_and_decoded_bounds() {
+    assert!(is_valid_bounded_base64("YWJj", 3));
+    assert!(!is_valid_bounded_base64("YWJj", 2));
+    assert!(is_valid_bounded_base64("YQ==", 1));
+    assert!(!is_valid_bounded_base64("YQ==", 0));
+    assert!(!is_valid_bounded_base64("Y=Jj", 3));
+    assert!(!is_valid_bounded_base64("YW=J", 3));
+    assert!(!is_valid_bounded_base64("YQ=A", 3));
+    assert!(!is_valid_bounded_base64("YWJj====", 6));
+}
+
+#[test]
 fn standard_image_results_match_requested_count_and_contain_real_data() {
     assert!(
         openai_image_urls(
@@ -879,7 +931,7 @@ fn image_success_response_is_a_whitelist_and_never_replays_provider_secrets() {
         }
     });
 
-    let sanitized = sanitize_openai_image_response(&upstream, request_id, &[asset])
+    let sanitized = sanitize_openai_image_response(upstream, request_id, &[asset])
         .expect("valid provider response");
     assert_eq!(sanitized["created"], 42);
     assert_eq!(
@@ -901,6 +953,39 @@ fn image_success_response_is_a_whitelist_and_never_replays_provider_secrets() {
     assert!(!rendered.contains("provider-secret-response-id"));
     assert!(!rendered.contains("provider_trace"));
     assert!(!rendered.contains("provider_debug"));
+}
+
+#[test]
+fn base64_image_sanitization_preserves_the_response_contract() {
+    let request_id = Uuid::now_v7();
+    let encoded = STANDARD.encode(b"image bytes");
+    let upstream = json!({
+        "id": "provider-secret-response-id",
+        "created": 42,
+        "data": [{
+            "b64_json": encoded,
+            "revised_prompt": "safe prompt",
+            "provider_trace": "must-not-leak"
+        }],
+        "usage": {
+            "output_tokens": 11,
+            "provider_debug": "must-not-leak"
+        }
+    });
+
+    let sanitized = sanitize_openai_image_response(upstream, request_id, &[])
+        .expect("valid base64 provider response");
+    assert_eq!(
+        sanitized,
+        json!({
+            "created": 42,
+            "data": [{
+                "b64_json": STANDARD.encode(b"image bytes"),
+                "revised_prompt": "safe prompt"
+            }],
+            "usage": {"output_tokens": 11}
+        })
+    );
 }
 
 #[tokio::test]

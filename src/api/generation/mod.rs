@@ -12,9 +12,9 @@ pub(super) use synchronous_entry::{CreateGenerationRequest, create_image_generat
 
 #[cfg(test)]
 pub(super) use synchronous_image::{
-    ImageResponseReadError, acquire_image_permit_with_heartbeat, has_one_valid_bounded_image,
-    openai_image_urls, read_image_response_bounded, sanitize_openai_image_response,
-    scoped_upstream_image_idempotency,
+    ImageResponseReadError, acquire_image_permit_with_heartbeat, extract_responses_tool_image,
+    has_one_valid_bounded_image, is_valid_bounded_base64, openai_image_urls,
+    read_image_response_bounded, sanitize_openai_image_response, scoped_upstream_image_idempotency,
 };
 
 #[cfg(test)]
