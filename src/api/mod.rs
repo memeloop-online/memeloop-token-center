@@ -1,10 +1,12 @@
 use std::{
     collections::BTreeMap,
-    future::Future,
     path::{Component, PathBuf},
     str::FromStr,
     time::{Duration, Instant},
 };
+
+#[cfg(test)]
+use std::future::Future;
 
 use axum::{
     Json, Router,
@@ -56,9 +58,9 @@ use archive_quarantine::{
     get_archive_quarantine, list_archive_quarantine, resolve_archive_quarantine,
 };
 use auth::{
-    authenticate_control_before_body, authenticate_downstream, authenticate_gateway_before_body,
-    management_tenant, require_global_service, require_service, require_service_any,
-    require_service_tenant,
+    admit_cloud_webhook_before_body, authenticate_control_before_body, authenticate_downstream,
+    authenticate_gateway_before_body, management_tenant, require_global_service, require_service,
+    require_service_any, require_service_tenant,
 };
 use billing::*;
 use cloud_entitlements::{

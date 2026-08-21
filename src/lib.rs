@@ -38,6 +38,7 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // matching the read timeout to the overall deadline does not make it unbounded.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(21 * 60);
+const PROXY_LIFECYCLE_CONCURRENCY: usize = 16;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -49,6 +50,7 @@ pub struct AppState {
     pub plugins: PluginRuntime,
     pub metrics: metrics::Metrics,
     pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
+    pub(crate) proxy_lifecycle_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -72,6 +74,9 @@ impl AppState {
             plugins,
             metrics: metrics::Metrics::default(),
             request_event_streams: request_event_stream::RequestEventStreamLimiter::default(),
+            proxy_lifecycle_permits: Arc::new(tokio::sync::Semaphore::new(
+                PROXY_LIFECYCLE_CONCURRENCY,
+            )),
             http: build_http_client()?,
         })
     }

@@ -124,6 +124,15 @@ pub(super) async fn authenticate_gateway_before_body(
     next: Next,
 ) -> Result<Response, AppError> {
     let _ = authenticate_downstream(request.headers(), &state).await?;
+    let _image_lifecycle_permit = if request.uri().path() == "/v1/images/generations" {
+        Some(
+            IMAGE_RESPONSE_PERMITS
+                .try_acquire()
+                .map_err(|_| AppError::RateLimited)?,
+        )
+    } else {
+        None
+    };
     if request.method() == axum::http::Method::POST {
         request = match crate::gateway_body::admit_gateway_request_body(
             request,
@@ -154,6 +163,40 @@ pub(super) async fn authenticate_gateway_before_body(
             }
         };
     }
+    Ok(next.run(request).await)
+}
+
+pub(super) async fn admit_cloud_webhook_before_body(
+    State(_state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let _body_permit = CLOUD_WEBHOOK_BODY_PERMITS
+        .try_acquire()
+        .map_err(|_| AppError::RateLimited)?;
+    request = match crate::gateway_body::admit_request_body(
+        request,
+        CLOUD_WEBHOOK_BODY_READ_DEADLINE,
+        MAX_CLOUD_WEBHOOK_BODY,
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
+            return Ok(control_body_rejection(
+                StatusCode::REQUEST_TIMEOUT,
+                "request_body_timeout",
+                "request body was not received before the deadline",
+            ));
+        }
+        Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected) => {
+            return Ok(control_body_rejection(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_body_too_large",
+                "request body exceeds the supported limit",
+            ));
+        }
+    };
     Ok(next.run(request).await)
 }
 

@@ -218,7 +218,7 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(list_memeloop_cloud_subscription_events),
         )
         .route_layer(middleware::from_fn_with_state(
-            state,
+            state.clone(),
             authenticate_control_before_body,
         ))
         .layer(ConcurrencyLimitLayer::new(CONTROL_IN_FLIGHT_REQUESTS));
@@ -226,7 +226,12 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route("/operator", get(operator_index))
         .route(
             "/internal/v1/integrations/memeloop-cloud/subscription",
-            put(sync_memeloop_cloud_subscription).layer(DefaultBodyLimit::max(64 * 1024)),
+            put(sync_memeloop_cloud_subscription)
+                .layer(DefaultBodyLimit::max(MAX_CLOUD_WEBHOOK_BODY))
+                .layer(middleware::from_fn_with_state(
+                    state,
+                    admit_cloud_webhook_before_body,
+                )),
         )
         .merge(authenticated)
 }

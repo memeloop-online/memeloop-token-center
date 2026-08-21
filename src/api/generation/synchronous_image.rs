@@ -155,22 +155,8 @@ pub(super) async fn execute_synchronous_image_request(
         return fail_image_request(context, "archive_metadata").await;
     }
 
-    // Both OpenAI Images and Responses-tool providers share the same hard
-    // memory/concurrency envelope. Keeping this permit through URL asset
-    // archival also prevents a signed-URL provider from bypassing the bound.
-    let _image_response_permit = match acquire_image_permit_with_heartbeat(
-        &IMAGE_RESPONSE_PERMITS,
-        Duration::from_secs(5 * 60),
-        || renew_image_request_claim(context),
-    )
-    .await
-    {
-        Ok(Some(permit)) => permit,
-        Ok(None) => {
-            return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
-        }
-        Err(_) => return fail_image_request(context, "image_concurrency_unavailable").await,
-    };
+    // The route lifecycle permit was acquired before the request body was read
+    // and remains held by the authentication middleware through this handler.
     if !renew_image_request_claim(context).await? {
         return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
     }
@@ -239,6 +225,7 @@ async fn renew_image_request_claim(context: &SyncImageRequest<'_>) -> Result<boo
     }
 }
 
+#[cfg(test)]
 pub(in crate::api) async fn acquire_image_permit_with_heartbeat<'a, F, Fut>(
     semaphore: &'a tokio::sync::Semaphore,
     heartbeat_interval: Duration,

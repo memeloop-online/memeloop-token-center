@@ -16,6 +16,14 @@ pub(super) async fn proxy(
     protocol: Protocol,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
+    let proxy_lifecycle_permit = state
+        .proxy_lifecycle_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::LimitExceeded {
+            reason: crate::error::LimitReason::ConcurrencyExhausted,
+            retry_after_seconds: Some(1),
+        })?;
     let request_id = Uuid::now_v7();
     let original_request_json: Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
@@ -545,6 +553,9 @@ pub(super) async fn proxy(
         ..
     } = buffered_request;
     tokio::spawn(async move {
+        // Streaming responses outlive the handler response. Keep the workload
+        // permit inside this task until archive and billing finalization end.
+        let _proxy_lifecycle_permit = proxy_lifecycle_permit;
         let mut upstream_stream = upstream.bytes_stream();
         let mut archive_writer = archive_writer;
         let mut response_archive_attempt = response_archive_attempt;

@@ -333,6 +333,43 @@ async fn send_response_usage_request(fixture: &CodexRouteFixture, body: &Value) 
         .unwrap()
 }
 
+#[tokio::test]
+async fn exhausted_proxy_lifecycle_budget_rejects_before_upstream_or_reservation() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let mut fixture = response_usage_fixture("lifecycle-budget", &upstream, 0).await;
+    fixture.state.proxy_lifecycle_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let held = fixture
+        .state
+        .proxy_lifecycle_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+
+    let response = send_response_usage_request(
+        &fixture,
+        &json!({"model": fixture.model.clone(), "input": "probe", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(held);
+}
+
 fn archive_file_count(root: &std::path::Path) -> usize {
     std::fs::read_dir(root)
         .map(|entries| {

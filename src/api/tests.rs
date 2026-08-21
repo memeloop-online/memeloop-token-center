@@ -727,7 +727,18 @@ fn upstream_image_idempotency_is_secret_and_scoped_to_stable_identity() {
 }
 
 #[tokio::test]
-async fn all_synchronous_image_paths_share_exactly_two_response_permits() {
+async fn synchronous_image_budget_is_acquired_before_reading_the_request_body() {
+    let fixture = generation_api_fixture(
+        "image-lifecycle",
+        "comfyui",
+        "job",
+        KeyPolicy {
+            allowed_models: vec!["generation-api-model-image-lifecycle".to_owned()],
+            ..KeyPolicy::default()
+        },
+        Decimal::TEN,
+    )
+    .await;
     let both = IMAGE_RESPONSE_PERMITS
         .acquire_many(2)
         .await
@@ -736,8 +747,26 @@ async fn all_synchronous_image_paths_share_exactly_two_response_permits() {
         tokio::time::timeout(Duration::from_millis(25), IMAGE_RESPONSE_PERMITS.acquire())
             .await
             .is_err(),
-        "a third synchronous image response must wait"
+        "a third synchronous image lifecycle must not have a permit"
     );
+
+    let response = tokio::time::timeout(
+        Duration::from_millis(100),
+        router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(
+            Request::post("/v1/images/generations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+                .body(Body::from_stream(futures_util::stream::pending::<
+                    Result<Bytes, Infallible>,
+                >()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("an exhausted image budget must reject without reading the body")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
     drop(both);
     let _released =
         tokio::time::timeout(Duration::from_millis(100), IMAGE_RESPONSE_PERMITS.acquire())
@@ -1170,6 +1199,45 @@ async fn authenticated_control_rejects_declared_oversized_body_before_reading_it
     .expect("declared oversized control request is rejected before reading")
     .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn cloud_webhook_rejects_declared_oversized_body_before_reading_it() {
+    let (state, _directory) = test_state().await;
+    let response = tokio::time::timeout(
+        Duration::from_millis(100),
+        router_for_role(state.clone(), RuntimeRole::Control).oneshot(
+            Request::put("/internal/v1/integrations/memeloop-cloud/subscription")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, MAX_CLOUD_WEBHOOK_BODY + 1)
+                .body(Body::from_stream(futures_util::stream::pending::<
+                    Result<Bytes, Infallible>,
+                >()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("declared oversized webhook must reject without reading the body")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let all = CLOUD_WEBHOOK_BODY_PERMITS
+        .acquire_many(4)
+        .await
+        .expect("acquire all webhook body permits");
+    let saturated = tokio::time::timeout(
+        Duration::from_millis(100),
+        router_for_role(state, RuntimeRole::Control).oneshot(
+            Request::put("/internal/v1/integrations/memeloop-cloud/subscription")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("an exhausted webhook budget must fail fast")
+    .unwrap();
+    assert_eq!(saturated.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(all);
 }
 
 #[tokio::test]
