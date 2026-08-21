@@ -239,6 +239,21 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
             .effective_route_ids,
         vec![future_route]
     );
+    let historical_replay = send(&client, &url, "postgres-cloud-event-1", &v1).await;
+    assert_eq!(historical_replay.status(), StatusCode::CREATED);
+    let historical_replay: Value = historical_replay.json().await.unwrap();
+    assert_eq!(historical_replay["entitlement"], first["entitlement"]);
+    assert_eq!(historical_replay["policy"]["requests_per_minute"], 30);
+    assert_eq!(
+        test_state
+            .db
+            .credential_routing(parsed_key_id, &tenant)
+            .await
+            .unwrap()
+            .effective_route_ids,
+        vec![future_route],
+        "historical replay must not restore the old routing snapshot"
+    );
     assert_eq!(
         send(
             &client,
@@ -290,6 +305,17 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
             .key_id,
         parsed_key_id
     );
+    let replay_after_rotation = send(&client, &url, "postgres-cloud-event-1", &v1).await;
+    assert_eq!(replay_after_rotation.status(), StatusCode::CREATED);
+    let replay_after_rotation: Value = replay_after_rotation.json().await.unwrap();
+    assert_eq!(replay_after_rotation["entitlement"], first["entitlement"]);
+    assert_eq!(replay_after_rotation["credential"]["key_id"], key_id);
+    assert_eq!(
+        replay_after_rotation["credential"]["credential_generation"],
+        2
+    );
+    assert!(replay_after_rotation["credential"]["key"].is_null());
+    assert_eq!(replay_after_rotation["policy"]["requests_per_minute"], 30);
     test_state
         .db
         .set_key_status(parsed_key_id, "suspended")

@@ -1346,13 +1346,25 @@ async fn authenticated_control_rejects_declared_oversized_body_before_reading_it
 
 #[tokio::test]
 async fn cloud_webhook_rejects_declared_oversized_body_before_reading_it() {
-    let (state, _directory) = test_state().await;
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("cloud-body-admission.db").display()
+    );
+    let mut config = Config::for_test(database_url);
+    config.memeloop_cloud_webhook_secret = Some("cloud-body-admission-secret".to_owned());
+    let state = AppState::initialize(config).await.unwrap();
+    let timestamp = (crate::db::unix_millis() / 1_000).to_string();
+    let signature = format!("v1={}", "A".repeat(43));
     let response = tokio::time::timeout(
         Duration::from_millis(100),
         router_for_role(state.clone(), RuntimeRole::Control).oneshot(
             Request::put("/internal/v1/integrations/memeloop-cloud/subscription")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::CONTENT_LENGTH, MAX_CLOUD_WEBHOOK_BODY + 1)
+                .header("idempotency-key", "oversized-cloud-body")
+                .header("x-mtc-webhook-timestamp", &timestamp)
+                .header("x-mtc-webhook-signature", &signature)
                 .body(Body::from_stream(futures_util::stream::pending::<
                     Result<Bytes, Infallible>,
                 >()))
@@ -1372,6 +1384,9 @@ async fn cloud_webhook_rejects_declared_oversized_body_before_reading_it() {
         router_for_role(state, RuntimeRole::Control).oneshot(
             Request::put("/internal/v1/integrations/memeloop-cloud/subscription")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "saturated-cloud-body")
+                .header("x-mtc-webhook-timestamp", timestamp)
+                .header("x-mtc-webhook-signature", signature)
                 .body(Body::empty())
                 .unwrap(),
         ),
@@ -1381,6 +1396,73 @@ async fn cloud_webhook_rejects_declared_oversized_body_before_reading_it() {
     .unwrap();
     assert_eq!(saturated.status(), StatusCode::TOO_MANY_REQUESTS);
     drop(all);
+}
+
+#[tokio::test]
+async fn cloud_webhook_preflight_rejects_bad_headers_without_reading_the_body() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("cloud-header-preflight.db").display()
+    );
+    let mut config = Config::for_test(database_url);
+    config.memeloop_cloud_webhook_secret = Some("cloud-header-preflight-secret".to_owned());
+    let state = AppState::initialize(config).await.unwrap();
+    let application = router_for_role(state, RuntimeRole::Control);
+    let current = (crate::db::unix_millis() / 1_000).to_string();
+    let valid_shape = format!("v1={}", "A".repeat(43));
+
+    let mut requests = vec![
+        Request::put("/internal/v1/integrations/memeloop-cloud/subscription")
+            .header("idempotency-key", "missing-signature")
+            .header("x-mtc-webhook-timestamp", &current)
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<Bytes, Infallible>,
+            >()))
+            .unwrap(),
+        Request::put("/internal/v1/integrations/memeloop-cloud/subscription")
+            .header("idempotency-key", "stale-timestamp")
+            .header(
+                "x-mtc-webhook-timestamp",
+                (crate::db::unix_millis() / 1_000 - 301).to_string(),
+            )
+            .header("x-mtc-webhook-signature", &valid_shape)
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<Bytes, Infallible>,
+            >()))
+            .unwrap(),
+        Request::put("/internal/v1/integrations/memeloop-cloud/subscription")
+            .header("idempotency-key", "malformed-signature")
+            .header("x-mtc-webhook-timestamp", &current)
+            .header("x-mtc-webhook-signature", "v1=short")
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<Bytes, Infallible>,
+            >()))
+            .unwrap(),
+    ];
+    let mut duplicated = Request::put("/internal/v1/integrations/memeloop-cloud/subscription")
+        .header("idempotency-key", "duplicate-timestamp")
+        .header("x-mtc-webhook-timestamp", &current)
+        .header("x-mtc-webhook-signature", &valid_shape)
+        .body(Body::from_stream(futures_util::stream::pending::<
+            Result<Bytes, Infallible>,
+        >()))
+        .unwrap();
+    duplicated
+        .headers_mut()
+        .append("x-mtc-webhook-timestamp", current.parse().unwrap());
+    requests.push(duplicated);
+
+    for request in requests {
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            application.clone().oneshot(request),
+        )
+        .await
+        .expect("invalid webhook headers must reject before reading a pending body")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[tokio::test]

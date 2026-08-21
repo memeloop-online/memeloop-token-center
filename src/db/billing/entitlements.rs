@@ -278,6 +278,42 @@ impl Database {
         )
         .await?;
 
+        if replayed {
+            // A reconciliation replay is bound to its stored entitlement row,
+            // not to the mutable current subscription version. A later webhook
+            // may already have advanced that version, changed policy, or
+            // rotated the credential while this event identity must remain an
+            // idempotent success with no financial or routing mutation.
+            let policy_json: String = sqlx::query(
+                "SELECT k.policy_json FROM key_records k JOIN subscription_entitlements e ON e.tenant_id = k.tenant_id AND e.account_id = k.account_id WHERE k.id = $1 AND k.tenant_id = $2 AND e.provider = $3 AND e.external_subscription_id = $4 AND e.id = $5",
+            )
+            .bind(credential.key_id.to_string())
+            .bind(&tenant_id)
+            .bind(&input.provider)
+            .bind(&input.external_subscription_id)
+            .bind(entitlement.entitlement.entitlement_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict(
+                    "credential no longer belongs to the replayed entitlement".into(),
+                )
+            })?
+            .try_get("policy_json")?;
+            let effective_policy =
+                serde_json::from_str(&policy_json).map_err(|_| AppError::Internal)?;
+            input.audit.key_id = credential.key_id;
+            input.audit.entitlement_id = entitlement.entitlement.entitlement_id;
+            super::cloud::record_cloud_subscription_event_in_transaction(&mut tx, input.audit, now)
+                .await?;
+            tx.commit().await?;
+            return Ok(ApplyCloudEntitlementResult {
+                credential,
+                entitlement,
+                policy: effective_policy,
+            });
+        }
+
         let key_row = sqlx::query(
             "SELECT k.status, k.policy_json FROM key_records k JOIN subscription_entitlements e ON e.tenant_id = k.tenant_id AND e.account_id = k.account_id WHERE k.id = $1 AND k.tenant_id = $2 AND e.provider = $3 AND e.external_subscription_id = $4 AND e.version = $5",
         )
@@ -297,19 +333,6 @@ impl Database {
         let mut effective_policy: KeyPolicy =
             serde_json::from_str(&key_row.try_get::<String, _>("policy_json")?)
                 .map_err(|_| AppError::Internal)?;
-
-        if replayed {
-            input.audit.key_id = credential.key_id;
-            input.audit.entitlement_id = entitlement.entitlement.entitlement_id;
-            super::cloud::record_cloud_subscription_event_in_transaction(&mut tx, input.audit, now)
-                .await?;
-            tx.commit().await?;
-            return Ok(ApplyCloudEntitlementResult {
-                credential,
-                entitlement,
-                policy: effective_policy,
-            });
-        }
 
         // Subscription automation owns financial snapshots, but it does not own
         // the operator-controlled credential lifecycle. A disabled stable key

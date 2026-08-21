@@ -1,10 +1,12 @@
 use axum::{
     Json,
+    body::Body,
     extract::{Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use serde_json::json;
 use std::time::Duration;
 
@@ -129,7 +131,7 @@ pub(super) async fn authenticate_gateway_before_body(
     next: Next,
 ) -> Result<Response, AppError> {
     let _ = authenticate_downstream(request.headers(), &state).await?;
-    let _image_lifecycle_permit = if request.uri().path() == "/v1/images/generations" {
+    let image_lifecycle_permit = if request.uri().path() == "/v1/images/generations" {
         Some(
             IMAGE_RESPONSE_PERMITS
                 .try_acquire()
@@ -168,14 +170,35 @@ pub(super) async fn authenticate_gateway_before_body(
             }
         };
     }
-    Ok(next.run(request).await)
+    let response = next.run(request).await;
+    Ok(match image_lifecycle_permit {
+        Some(permit) => hold_response_body_permit(response, permit),
+        None => response,
+    })
+}
+
+/// Keeps a lifecycle guard alive until the response body reaches EOF, errors,
+/// or is dropped by the downstream connection. Returning an Axum response does
+/// not mean Hyper has delivered its body, so a middleware-local guard is
+/// otherwise released too early for large synchronous image responses.
+fn hold_response_body_permit<P>(response: Response, permit: P) -> Response
+where
+    P: Send + 'static,
+{
+    let (parts, body) = response.into_parts();
+    let stream = futures_util::stream::unfold(
+        (body.into_data_stream(), permit),
+        |(mut body, permit)| async move { body.next().await.map(|item| (item, (body, permit))) },
+    );
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 pub(super) async fn admit_cloud_webhook_before_body(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
+    super::cloud_entitlements::preflight_cloud_webhook(&state, request.headers())?;
     let _body_permit = CLOUD_WEBHOOK_BODY_PERMITS
         .try_acquire()
         .map_err(|_| AppError::RateLimited)?;
@@ -203,6 +226,61 @@ pub(super) async fn admit_cloud_webhook_before_body(
         }
     };
     Ok(next.run(request).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Bytes;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn response_body_guard_is_held_until_eof() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let response = hold_response_body_permit(
+            Response::new(Body::from(Bytes::from_static(b"image"))),
+            permit,
+        );
+        assert_eq!(semaphore.available_permits(), 0);
+
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"image")
+        );
+        assert_eq!(
+            semaphore.available_permits(),
+            0,
+            "reading the last data frame is not the same as observing EOF"
+        );
+        assert!(body.next().await.is_none());
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_body_guard_is_released_on_drop_and_error() {
+        let dropped = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = dropped.clone().try_acquire_owned().unwrap();
+        let response = hold_response_body_permit(Response::new(Body::from("image")), permit);
+        assert_eq!(dropped.available_permits(), 0);
+        drop(response);
+        assert_eq!(dropped.available_permits(), 1);
+
+        let failed = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = failed.clone().try_acquire_owned().unwrap();
+        let body = Body::from_stream(futures_util::stream::once(async {
+            Err::<Bytes, _>(std::io::Error::other("downstream body failure"))
+        }));
+        let response = hold_response_body_permit(Response::new(body), permit);
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.unwrap().is_err());
+        assert_eq!(failed.available_permits(), 0);
+        drop(body);
+        assert_eq!(failed.available_permits(), 1);
+    }
 }
 
 pub(super) async fn require_service(

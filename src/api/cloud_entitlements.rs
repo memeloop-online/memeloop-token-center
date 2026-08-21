@@ -51,24 +51,20 @@ fn default_cloud_event_limit() -> i64 {
     100
 }
 
-fn required_ascii_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, AppError> {
-    headers
-        .get(name)
-        .ok_or(AppError::Unauthorized)?
-        .to_str()
-        .map_err(|_| AppError::Unauthorized)
+fn unique_ascii_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
 }
 
-fn authenticate_cloud_webhook(
-    state: &AppState,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Result<(), AppError> {
-    let secret = state
-        .config
-        .memeloop_cloud_webhook_secret
-        .as_deref()
-        .ok_or(AppError::Unauthorized)?;
+fn required_ascii_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, AppError> {
+    unique_ascii_header(headers, name).ok_or(AppError::Unauthorized)
+}
+
+fn validated_webhook_timestamp(headers: &HeaderMap) -> Result<&str, AppError> {
     let timestamp = required_ascii_header(headers, "x-mtc-webhook-timestamp")?;
     if timestamp.is_empty()
         || timestamp.len() > 20
@@ -83,6 +79,49 @@ fn authenticate_cloud_webhook(
     if current_seconds.abs_diff(timestamp_seconds) > WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS as u64 {
         return Err(AppError::Unauthorized);
     }
+    Ok(timestamp)
+}
+
+fn webhook_signature_has_valid_shape(signature: &str) -> bool {
+    signature.strip_prefix("v1=").is_some_and(|encoded| {
+        encoded.len() == 43
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    })
+}
+
+/// Performs every webhook check that does not require reading the signed body.
+/// This keeps missing, stale, duplicated, and malformed authentication headers
+/// from consuming one of the deliberately small body-read admission slots.
+pub(in crate::api) fn preflight_cloud_webhook(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), AppError> {
+    if state.config.memeloop_cloud_webhook_secret.is_none() {
+        return Err(AppError::Unauthorized);
+    }
+    let _ = validated_webhook_timestamp(headers)?;
+    let signature = required_ascii_header(headers, "x-mtc-webhook-signature")?;
+    if !webhook_signature_has_valid_shape(signature) {
+        return Err(AppError::Unauthorized);
+    }
+    let _ = required_event_id(headers)?;
+    Ok(())
+}
+
+fn authenticate_cloud_webhook(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), AppError> {
+    let secret = state
+        .config
+        .memeloop_cloud_webhook_secret
+        .as_deref()
+        .ok_or(AppError::Unauthorized)?;
+    preflight_cloud_webhook(state, headers)?;
+    let timestamp = validated_webhook_timestamp(headers)?;
     let signature = required_ascii_header(headers, "x-mtc-webhook-signature")?;
     if !crate::crypto::verify_webhook_payload(secret.as_bytes(), timestamp, body, signature) {
         return Err(AppError::Unauthorized);
@@ -91,9 +130,7 @@ fn authenticate_cloud_webhook(
 }
 
 fn required_event_id(headers: &HeaderMap) -> Result<&str, AppError> {
-    headers
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
+    unique_ascii_header(headers, "idempotency-key")
         .filter(|value| {
             !value.is_empty()
                 && value.len() <= 200

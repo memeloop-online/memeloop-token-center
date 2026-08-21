@@ -575,6 +575,23 @@ async fn signed_cloud_lifecycle_is_idempotent_ordered_and_keeps_stable_history()
     assert_eq!(upgraded["entitlement"]["remaining"], "30");
     assert_eq!(upgraded["policy"]["requests_per_minute"], 300);
 
+    let historical_replay = fixture.send("cloud-event-1", &first_body).await;
+    assert_eq!(historical_replay.status(), StatusCode::CREATED);
+    let historical_replay: Value = historical_replay.json().await.unwrap();
+    assert_eq!(historical_replay["entitlement"], first["entitlement"]);
+    assert_eq!(
+        historical_replay["policy"]["requests_per_minute"], 300,
+        "a historical replay reports the current effective policy"
+    );
+    let current_after_replay = fixture
+        .state
+        .db
+        .list_entitlements(Some(tenant), Some("memeloop-cloud"), Some(subscription))
+        .await
+        .unwrap();
+    assert_eq!(current_after_replay[0].version, 3);
+    assert_eq!(current_after_replay[0].remaining, "30");
+
     // A delayed v2 event is rejected and cannot roll quota or policy back.
     assert_eq!(
         fixture
@@ -692,6 +709,18 @@ async fn signed_cloud_lifecycle_is_idempotent_ordered_and_keeps_stable_history()
     assert_eq!(rotated_auth.key_id.to_string(), key_id);
     assert_eq!(rotated_auth.account_id.to_string(), account_id);
     assert_eq!(rotated_auth.policy.requests_per_minute, 90);
+
+    let replay_after_rotation = fixture.send("cloud-event-1", &first_body).await;
+    assert_eq!(replay_after_rotation.status(), StatusCode::CREATED);
+    let replay_after_rotation: Value = replay_after_rotation.json().await.unwrap();
+    assert_eq!(replay_after_rotation["entitlement"], first["entitlement"]);
+    assert_eq!(replay_after_rotation["credential"]["key_id"], key_id);
+    assert_eq!(
+        replay_after_rotation["credential"]["credential_generation"],
+        2
+    );
+    assert!(replay_after_rotation["credential"]["key"].is_null());
+    assert_eq!(replay_after_rotation["policy"]["requests_per_minute"], 90);
 
     let other_tenant: Value = fixture
         .send(
