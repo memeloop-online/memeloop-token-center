@@ -14,7 +14,7 @@ Before({ tags: '@live and @readonly' }, async function (this: LiveWorld) {
 
 After({ tags: '@live and @readonly' }, async function (this: LiveWorld) {
   try {
-    this.assertReadOnlyAndClean();
+    await this.assertReadOnlyAndClean();
   } finally {
     await this.context?.close();
     this.page = undefined;

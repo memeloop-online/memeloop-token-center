@@ -17,15 +17,22 @@ export function assertSecureLiveURL(name: string, url: URL): void {
   assert.equal(url.username, '', `${name} must not contain credentials`);
   assert.equal(url.password, '', `${name} must not contain credentials`);
   assert.equal(url.hash, '', `${name} must not contain a fragment`);
+  assert.equal(url.pathname, '/', `${name} must be an origin without a path`);
+  assert.equal(url.search, '', `${name} must be an origin without a query`);
 }
 
-export function isAllowedLiveDestination(requestURL: string, allowedOrigins: ReadonlySet<string>): boolean {
+export function isAllowedLiveDestination(
+  requestURL: string,
+  allowedOrigins: ReadonlySet<string>,
+  activeOrigin: string,
+): boolean {
   try {
     const url = new URL(requestURL);
     return url.protocol === 'https:'
       && url.username === ''
       && url.password === ''
-      && allowedOrigins.has(url.origin);
+      && allowedOrigins.has(url.origin)
+      && url.origin === activeOrigin;
   } catch {
     return false;
   }
@@ -34,11 +41,49 @@ export function isAllowedLiveDestination(requestURL: string, allowedOrigins: Rea
 export function urlContainsCredential(requestURL: string, credentials: readonly string[]): boolean {
   try {
     const url = new URL(requestURL);
-    const exposedValues = [url.pathname, ...url.searchParams.values()];
+    const decodedPath = safelyDecode(url.pathname);
+    const exposedValues = [requestURL, url.pathname, decodedPath, ...url.searchParams.values()];
     return credentials.some((credential) => credential.length > 0
       && exposedValues.some((value) => value.includes(credential)));
   } catch {
     return true;
+  }
+}
+
+export function headersContainCredential(
+  headers: Readonly<Record<string, string>>,
+  credential: string,
+): boolean {
+  if (credential.length === 0) return false;
+  return Object.values(headers).some((value) => value.includes(credential));
+}
+
+export interface CredentialOriginBinding {
+  credential: string;
+  origin: string;
+}
+
+export function credentialsAreBoundToDestination(
+  requestURL: string,
+  headers: Readonly<Record<string, string>>,
+  bindings: readonly CredentialOriginBinding[],
+): boolean {
+  let destination: URL;
+  try {
+    destination = new URL(requestURL);
+  } catch {
+    return false;
+  }
+  return bindings.every(({ credential, origin }) => (
+    !headersContainCredential(headers, credential) || destination.origin === origin
+  ));
+}
+
+function safelyDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
   }
 }
 

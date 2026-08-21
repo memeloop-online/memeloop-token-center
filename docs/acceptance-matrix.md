@@ -1,6 +1,6 @@
 # Product requirement acceptance matrix
 
-Snapshot: 2026-08-18. The current working tree, not earlier status messages, is authoritative for this matrix.
+Snapshot: 2026-08-21. The current working tree, not earlier status messages, is authoritative for this matrix.
 
 Status meanings:
 
@@ -19,7 +19,7 @@ Status meanings:
 | ARC-04 | S3 archive in production, simple memory/filesystem test backends | Implemented | `ArchiveStore::from_config` and bounded-read unit tests | Real S3 outage/retry and retention verification remains. |
 | ARC-05 | Optimized large-volume request/event/aggregate schema | Pending verification | PostgreSQL partitions and query indexes under `migrations/postgres`; aggregate queries under `src/db/` | Provide EXPLAIN/latency evidence at imported-data scale and retention/partition lifecycle evidence. |
 | ARC-06 | Low-memory gateway compared with CPA | Pending verification | bounded bodies, streaming archive, small SQL pool, image semaphore, and an exact-revision 15-minute CI harness are present | Run the harness for the release SHA, retain its JSON/log artifact and image digest, then verify the 256 MiB Pod cgroup peak/events; source and an untracked workflow are not execution evidence. |
-| ARC-07 | Gateway/control/worker separation | Implemented | `RuntimeRole`, `router_for_role`, Helm role deployments | Verify public ingress never routes `/internal/v1/*`. |
+| ARC-07 | Gateway/control/worker separation | Pending deployed verification | `RuntimeRole`, `router_for_role`, Helm role deployments; the read-only live Cucumber.js gate requires exact `404` for gateway `/operator` and `/internal/v1/tenants` (a `401` or `403` is a failure) | Run the live gate against the release ingress and retain its result; repository coverage alone does not prove the deployed routing boundary. |
 | ARC-08 | Helm/K8s deployment | Implemented | `charts/memeloop-token-center` | Chart smoke test and upgrade/rollback acceptance remain. |
 | ARC-09 | Production readiness/liveness separation | Implemented | anonymous `/livez`; bounded/coalesced DB+archive `/readyz`; deprecated `/healthz`; Helm probes; metrics integration tests 3/3 | Verify real dependency outage behavior in a deployed K8s environment. |
 | ARC-10 | Prometheus metrics and ServiceMonitor | Implemented | control-only `metrics:read` `/metrics`, bounded labels, ServiceMonitor, metrics integration 3/3 and unit 3/3; Helm/kubeconform checks passed | Verify Prometheus scrape, alert rules, and dashboards in the deployed cluster. |
@@ -137,6 +137,7 @@ Status meanings:
 | SEC-03 | SQL/command/path injection protection | Functional PostgreSQL verified | `security_injection_matrix` sends quote/comment/boolean/UNION/stacked payloads through tenant, principal, alias, model, error, source and cursor inputs, verifies exact results and schema survival; SQLite always runs, and a fresh isolated PostgreSQL 17 database applied migrations 1–48 before the matrix passed | Keep `MTC_REQUIRE_POSTGRES_SECURITY=1` for any release gate outside CI; add property/fuzz generation without replacing the deterministic matrix. |
 | SEC-04 | Secret-safe HTTP errors/logging | Implemented for core failure families | task-local tracing capture plus distinct canaries cover proxy, OAuth, CPA import, database, object-store conversion and an actual archive-reaper worker failure; existing plugin tests cover guest-controlled log content | Extend canary coverage whenever a new external error source or tracing field is added. |
 | SEC-05 | Public browser security headers | Implemented | CSP, HSTS, no-store, nosniff, frame and permissions policy middleware | Recheck at ingress/CDN after every deployment. |
+| SEC-06 | Live browser cannot exfiltrate credentials or upstream secrets | Pending deployed verification | `web/e2e/live/security.ts` confines every request to the active configured HTTPS origin, binds operator/client credentials to control/gateway respectively, blocks credential-bearing URLs and cross-origin credential headers, and audits a seeded `provider_secret` canary in list/detail API bodies plus DOM | Run `npm run test:e2e:live:readonly` with a dedicated disabled trial-provider canary against the release; do not use an actual provider secret as the sentinel. |
 
 ## Verification evidence for this snapshot
 

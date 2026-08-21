@@ -57,6 +57,18 @@ Then('英文请求数使用三位分隔且主题色正确', async function (this
   assert.equal(await page.locator('meta[name="theme-color"]').getAttribute('content'), '#f4f7f5');
 });
 
+Then('操作员列表和请求详情均不泄漏上游凭据金丝雀', async function (this: LiveWorld) {
+  const page = this.requirePage();
+  await page.getByRole('tab', { name: '实时请求', exact: true }).click();
+  const detailButton = page.locator('table').getByRole('button', { name: /请求详情$/ }).first();
+  await detailButton.waitFor({ state: 'visible', timeout: 60_000 });
+  await this.assertProviderSecretAbsent(['/internal/v1/upstreams', '/internal/v1/requests']);
+  await detailButton.click();
+  await page.getByRole('dialog').waitFor({ state: 'visible' });
+  await this.assertProviderSecretAbsent(['/internal/v1/requests/']);
+  await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
+});
+
 When('只读验收使用旧客户端凭据打开自助门户', async function (this: LiveWorld) {
   const page = this.requirePage();
   const configuration = liveRuntime.requireConfiguration();
@@ -78,17 +90,14 @@ Then('自助门户至少显示一条历史请求', async function (this: LiveWor
 });
 
 Then('公网网关健康检查可读', async function (this: LiveWorld) {
-  const response = await this.requirePage().goto(new URL('/healthz', liveRuntime.requireConfiguration().gatewayURL).toString(), {
-    waitUntil: 'domcontentloaded',
-  });
+  const response = await this.navigate(liveRuntime.requireConfiguration().gatewayURL, '/healthz');
   assert.equal(response?.status(), 200);
 });
 
 Then('公网网关不暴露操作台和内部 API', async function (this: LiveWorld) {
-  const page = this.requirePage();
   const gatewayURL = liveRuntime.requireConfiguration().gatewayURL;
   for (const path of ['/operator', '/internal/v1/tenants']) {
-    const response = await page.goto(new URL(path, gatewayURL).toString(), { waitUntil: 'domcontentloaded' });
+    const response = await this.navigate(gatewayURL, path);
     assert.equal(response?.status(), 404, `${path} must not be routed by the public gateway`);
   }
 });
