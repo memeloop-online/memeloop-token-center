@@ -79,9 +79,15 @@ impl Database {
         now: i64,
         poll_interval_seconds: u64,
     ) -> Result<OAuthLoginClaim, AppError> {
-        let interval_millis = i64::try_from(poll_interval_seconds.clamp(1, 60))
-            .unwrap_or(60)
-            .saturating_mul(1_000);
+        if poll_interval_seconds == 0 {
+            return Err(AppError::BadRequest(
+                "OAuth login poll interval must be positive".into(),
+            ));
+        }
+        let interval_millis = i64::try_from(poll_interval_seconds)
+            .map_err(|_| AppError::BadRequest("OAuth login poll interval is too large".into()))?
+            .checked_mul(1_000)
+            .ok_or_else(|| AppError::BadRequest("OAuth login poll interval is too large".into()))?;
         let lease_owner = Uuid::now_v7();
         let lease_expires_at = now.saturating_add(CLAIM_LEASE_MILLIS);
         let next_poll_at = now.saturating_add(interval_millis);
@@ -203,6 +209,56 @@ impl Database {
     ) -> Result<(), AppError> {
         let changed = sqlx::query(
             "UPDATE oauth_login_sessions SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL, updated_at = $1 WHERE id = $2 AND status = 'polling' AND lease_owner = $3",
+        )
+        .bind(now)
+        .bind(session_id.to_string())
+        .bind(lease_owner.to_string())
+        .execute(&self.pool)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::Conflict("OAuth login poll lease changed".into()));
+        }
+        Ok(())
+    }
+
+    pub async fn reschedule_oauth_login_poll(
+        &self,
+        session_id: Uuid,
+        lease_owner: Uuid,
+        state_ciphertext: String,
+        next_poll_at: i64,
+        now: i64,
+    ) -> Result<(), AppError> {
+        if state_ciphertext.is_empty() || state_ciphertext.len() > 256 * 1024 || next_poll_at <= now
+        {
+            return Err(AppError::BadRequest(
+                "OAuth login reschedule is invalid".into(),
+            ));
+        }
+        let changed = sqlx::query(
+            "UPDATE oauth_login_sessions SET status = 'pending', state_ciphertext = $1, next_poll_at = $2, lease_owner = NULL, lease_expires_at = NULL, updated_at = $3 WHERE id = $4 AND status = 'polling' AND lease_owner = $5 AND expires_at > $3",
+        )
+        .bind(state_ciphertext)
+        .bind(next_poll_at)
+        .bind(now)
+        .bind(session_id.to_string())
+        .bind(lease_owner.to_string())
+        .execute(&self.pool)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::Conflict("OAuth login poll lease changed".into()));
+        }
+        Ok(())
+    }
+
+    pub async fn fail_oauth_login_poll(
+        &self,
+        session_id: Uuid,
+        lease_owner: Uuid,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let changed = sqlx::query(
+            "UPDATE oauth_login_sessions SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL, updated_at = $1 WHERE id = $2 AND status = 'polling' AND lease_owner = $3",
         )
         .bind(now)
         .bind(session_id.to_string())

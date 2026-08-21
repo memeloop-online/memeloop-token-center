@@ -8,47 +8,6 @@ import type { DogfoodWorld } from '../support/world.js';
 import { assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertValue, assertVisible, applyUsageFilter, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
 When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且不显示旧桥接项', async function (this: DogfoodWorld) {
   const page = this.requirePage();
-  await page.route('**/internal/v1/provider-types', async (route) => {
-    const response = await route.fetch();
-    const providers = await response.json() as Array<{ id: string }>;
-    const contributed = [
-      ['anthropic-claude', 'Anthropic Claude'],
-      ['github-copilot', 'GitHub Copilot'],
-      ['cursor', 'Cursor'],
-    ].filter(([id]) => !providers.some((provider) => provider.id === id))
-      .map(([id, display_name]) => ({
-        id,
-        display_name,
-        protocols: ['openai'],
-        modalities: ['text'],
-        config_schema: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['base_url'],
-          properties: { base_url: { type: 'string', format: 'uri', default: `https://${id}.example.test` } },
-        },
-        credential_schema: { type: 'object', additionalProperties: true },
-        oauth_adapter: {
-          api_version: 'oauth-adapter-v1',
-          flow_kind: 'cursor_pkce',
-          login_url: `http://${id}-oauth.default.svc/login`,
-          poll_url: `http://${id}-oauth.default.svc/poll`,
-          refresh_url: `http://${id}-oauth.default.svc/refresh`,
-        },
-        source: `plugin:${id}@1.0.0`,
-      }));
-    const codex = providers.some((provider) => provider.id === 'openai-codex') ? [] : [{
-      id: 'openai-codex',
-      display_name: 'OpenAI Codex',
-      protocols: ['openai'],
-      modalities: ['text'],
-      config_schema: { type: 'object', additionalProperties: false, properties: {} },
-      credential_schema: { type: 'object', additionalProperties: false, properties: {} },
-      oauth_adapter: null,
-      source: 'built-in',
-    }];
-    await route.fulfill({ response, json: [...providers, ...codex, ...contributed] });
-  });
   await page.route('**/internal/v1/oauth/codex/start', async (route) => {
     assert.equal(route.request().method(), 'POST');
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({

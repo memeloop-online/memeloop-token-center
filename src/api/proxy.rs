@@ -428,7 +428,9 @@ pub(super) async fn proxy(
         if let Some(version) = headers.get("anthropic-version") {
             request = request.header("anthropic-version", version);
         }
-        if let Some(beta) = headers.get("anthropic-beta") {
+        if route_driver.as_deref() == Some(crate::oauth::claude::PROVIDER_DRIVER) {
+            request = request.header("anthropic-beta", crate::oauth::claude::OAUTH_BETA_HEADER);
+        } else if let Some(beta) = headers.get("anthropic-beta") {
             request = request.header("anthropic-beta", beta);
         }
     }

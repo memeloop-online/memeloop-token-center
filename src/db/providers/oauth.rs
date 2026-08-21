@@ -30,7 +30,11 @@ impl Database {
         }
         if !matches!(
             input.oauth_driver.as_str(),
-            "cursor" | "provider_adapter" | "openai_codex_device"
+            "cursor"
+                | "provider_adapter"
+                | "openai_codex_device"
+                | "anthropic_claude_manual_pkce"
+                | "github_copilot_device"
         ) {
             return Err(AppError::BadRequest(
                 "unsupported OAuth reauthorization lifecycle".into(),

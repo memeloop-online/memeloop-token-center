@@ -3,6 +3,8 @@ mod health;
 mod managed_import;
 mod models;
 mod oauth;
+mod oauth_claude;
+mod oauth_copilot;
 
 pub(in crate::api) use accounts::{
     create_upstream, delete_upstream, list_upstreams, rotate_upstream_credential,
@@ -22,3 +24,5 @@ pub(in crate::api) use oauth::{
     poll_codex_oauth, poll_cursor_oauth, refresh_upstream_oauth, start_codex_oauth,
     start_cursor_oauth, start_provider_adapter_oauth,
 };
+pub(in crate::api) use oauth_claude::{complete_claude_oauth, start_claude_oauth};
+pub(in crate::api) use oauth_copilot::{poll_copilot_oauth, start_copilot_oauth};

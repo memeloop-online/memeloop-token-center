@@ -4,7 +4,7 @@ use super::accounts::{
     validate_upstream_destination,
 };
 
-async fn reauthorization_target(
+pub(super) async fn reauthorization_target(
     state: &AppState,
     account_id: Option<Uuid>,
     tenant_external_id: &str,
@@ -25,17 +25,7 @@ async fn reauthorization_target(
             "upstream account does not support interactive reauthorization".into(),
         ));
     }
-    let existing_oauth_driver = if account.driver == CODEX_PROVIDER_DRIVER {
-        CODEX_OAUTH_DRIVER
-    } else if state
-        .providers
-        .get(&account.driver)
-        .is_some_and(|provider| provider.oauth_adapter.is_some())
-    {
-        "provider_adapter"
-    } else {
-        "cursor"
-    };
+    let (existing_oauth_driver, _) = state.db.upstream_oauth_lifecycle(account_id).await?;
     if account.name != account_name.trim()
         || account.driver != provider_driver
         || account.config != *provider_config
@@ -571,6 +561,24 @@ pub(crate) async fn refresh_managed_upstream_oauth(
             .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
             .await?;
         Ok(match driver.as_str() {
+            crate::oauth::claude::OAUTH_DRIVER => {
+                crate::oauth::claude::refresh_claude_credential(
+                    &state.http,
+                    &credential,
+                    unix_millis(),
+                    state.config.allow_oauth_loopback,
+                )
+                .await?
+            }
+            crate::oauth::copilot::OAUTH_DRIVER => {
+                crate::oauth::copilot::refresh_copilot_credential(
+                    &state.http,
+                    &credential,
+                    unix_millis(),
+                    state.config.allow_oauth_loopback,
+                )
+                .await?
+            }
             "cursor" | "provider_adapter" => {
                 let refresh_scope = if driver == "provider_adapter" {
                     crate::oauth::oauth_adapter_endpoint_scope(

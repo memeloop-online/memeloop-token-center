@@ -453,10 +453,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const providerGroups = useGroups('provider', token, tenant);
-  // OpenAI Codex is intentionally authorization-only. Keep it in the same
-  // provider catalog and account list, but do not offer a direct form that the
-  // server must reject.
-  const directProviders = providers.filter((value) => value.id !== 'openai-codex');
+  const directProviders = providers.filter((value) => !value.oauth_adapter);
   const provider = directProviders.find((value) => value.id === driver) ?? directProviders[0];
   const schema = useMemo<RJSFSchema | undefined>(() => {
     if (!provider) return undefined;
@@ -579,30 +576,44 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
 
 function AuthorizationConnection({ token, tenant, providers, existing, onChanged }: { token: string; tenant: string; providers: ProviderType[]; existing?: UpstreamAccount; onChanged: () => Promise<void> }) {
   const { locale, t } = useI18n();
-  const oauthProviders = providers.filter((provider) => provider.oauth_adapter || provider.id === 'openai-codex');
+  const oauthProviders = providers.filter((provider) => provider.oauth_adapter);
   const existingOAuthProvider = oauthProviders.find((provider) => provider.id === existing?.driver);
   const initialProvider = existingOAuthProvider ?? oauthProviders[0];
   const [providerChoice, setProviderChoice] = useState(initialProvider?.id ?? '');
   const selectedProvider = oauthProviders.find((provider) => provider.id === providerChoice);
   const [name, setName] = useState(existing?.name ?? (initialProvider ? `${initialProvider.id}-primary` : ''));
   const [session, setSession] = useState<{ login_url?: string; verification_url?: string; user_code?: string; session_token: string; expires_at?: number; poll_after_seconds?: number }>();
+  const [manualCode, setManualCode] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const reset = () => { setSession(undefined); setMessage(''); setError(''); };
-  useEffect(() => { setSession(undefined); setMessage(''); setError(''); }, [tenant]);
+  const reset = () => { setSession(undefined); setManualCode(''); setMessage(''); setError(''); };
+  useEffect(() => { setSession(undefined); setManualCode(''); setMessage(''); setError(''); }, [tenant]);
   const start = async (providerConfig?: unknown) => {
     if (!tenant || !selectedProvider) return;
     try {
       const target = existing ? { upstream_account_id: existing.id } : {};
-      if (selectedProvider?.id === 'openai-codex') setSession(await api('/internal/v1/oauth/codex/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...target }) }));
-      else setSession(await api('/internal/v1/oauth/provider-adapter/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: selectedProvider.id, provider_config: existing?.config ?? providerConfig, ...target }) }));
+      const flow = selectedProvider.oauth_adapter?.flow_kind;
+      if (flow === 'openai_device') {
+        setSession(await api('/internal/v1/oauth/codex/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...target }) }));
+      } else if (flow === 'claude_manual_pkce') {
+        setSession(await api('/internal/v1/oauth/claude/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...target }) }));
+      } else if (flow === 'github_device_copilot') {
+        setSession(await api('/internal/v1/oauth/copilot/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, ...target }) }));
+      } else if (flow === 'cursor_pkce' && selectedProvider.source === 'builtin') {
+        setSession(await api('/internal/v1/oauth/cursor/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: selectedProvider.id, provider_config: existing?.config ?? { base_url: 'https://api2.cursor.sh', network_scope: 'public' }, ...target }) }));
+      } else {
+        setSession(await api('/internal/v1/oauth/provider-adapter/start', token, { method: 'POST', body: JSON.stringify({ tenant_external_id: tenant, account_name: name, provider_driver: selectedProvider.id, provider_config: existing?.config ?? providerConfig, ...target }) }));
+      }
       setMessage(''); setError('');
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
   };
   const poll = async () => {
     if (!session) return;
     if (!selectedProvider) return;
-    const path = selectedProvider.id === 'openai-codex' ? '/internal/v1/oauth/codex/poll'
+    const flow = selectedProvider.oauth_adapter?.flow_kind;
+    const path = flow === 'openai_device' ? '/internal/v1/oauth/codex/poll'
+      : flow === 'github_device_copilot' ? '/internal/v1/oauth/copilot/poll'
+      : flow === 'cursor_pkce' && selectedProvider.source === 'builtin' ? '/internal/v1/oauth/cursor/poll'
       : '/internal/v1/oauth/provider-adapter/poll';
     try {
       const result = await api<UpstreamAccount | { status: string; message?: string }>(path, token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token }) });
@@ -610,12 +621,21 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
       else setMessage(result.message ?? t('providers.waiting'));
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
   };
+  const complete = async () => {
+    if (!session || selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce') return;
+    try {
+      const result = await api<UpstreamAccount>('/internal/v1/oauth/claude/complete', token, { method: 'POST', body: JSON.stringify({ session_token: session.session_token, authorization_code: manualCode }) });
+      setMessage(t(existing ? 'providers.reauthorized' : 'providers.ready', existing ? { name: result.name } : { id: result.id }));
+      setSession(undefined); setManualCode(''); await onChanged();
+    } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
+  };
   return <div className="authorization-form"><p className="muted">{t('providers.oauthSecurity')}</p>
     {error && <div className="notice error" role="alert">{error}</div>}
     {oauthProviders.length === 0 ? <div className="empty">{t('providers.noAdapter')}</div> : <>
     <label>{t('providers.provider')}<select disabled={Boolean(existing)} value={providerChoice} onChange={(event) => { const next = event.target.value; setProviderChoice(next); setName(`${next}-primary`); reset(); }}>{oauthProviders.map((value) => <option key={value.id} value={value.id}>{value.display_name}</option>)}</select></label>
     <label>{t('providers.name')}<input readOnly={Boolean(existing)} value={name} onChange={(event) => setName(event.target.value)} /></label>
-    {selectedProvider && selectedProvider.id !== 'openai-codex' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant}>{t('common.startLogin')}</button></Form> : <div className="button-row"><button type="button" onClick={() => void start()} disabled={!tenant || Boolean(session)}>{t('common.startLogin')}</button>{session && <><a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noreferrer">{t('common.openAuthorization')}</a><button type="button" onClick={() => void poll()}>{t('common.checkAuthorization')}</button></>}</div>}
+    {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant}>{t('common.startLogin')}</button></Form> : <div className="button-row"><button type="button" onClick={() => void start()} disabled={!tenant || Boolean(session)}>{t('common.startLogin')}</button>{session && <><a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noreferrer">{t('common.openAuthorization')}</a>{selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && <button type="button" onClick={() => void poll()}>{t('common.checkAuthorization')}</button>}</>}</div>}
+    {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><button type="button" disabled={!manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</button></div>}
     {session?.user_code && <div className="device-authorization" role="status"><p>{t('providers.codexSecurity')}</p><b>{t('providers.deviceCode')}</b><code>{session.user_code}</code></div>}
     {message && <div className="notice success" role="status">{message}</div>}
     </>}

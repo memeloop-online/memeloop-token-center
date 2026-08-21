@@ -33,6 +33,12 @@ pub(super) fn upstream_can_reauthorize(
         && oauth_session_id.is_some()
         && matches!(
             oauth_driver,
-            Some("cursor" | "provider_adapter" | "openai_codex_device")
+            Some(
+                "cursor"
+                    | "provider_adapter"
+                    | "openai_codex_device"
+                    | "anthropic_claude_manual_pkce"
+                    | "github_copilot_device"
+            )
         )
 }

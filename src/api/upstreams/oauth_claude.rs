@@ -1,0 +1,207 @@
+use super::super::*;
+use super::{
+    accounts::{
+        validate_provider_config_schema, validate_provider_schema, validate_upstream_destination,
+    },
+    oauth::reauthorization_target,
+};
+use crate::oauth::claude;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct StartClaudeOAuthRequest {
+    #[serde(default = "default_tenant")]
+    tenant_external_id: String,
+    account_name: String,
+    #[serde(default)]
+    upstream_account_id: Option<Uuid>,
+}
+
+pub(in crate::api) async fn start_claude_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StartClaudeOAuthRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "oauth:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    let provider_config = if let Some(account_id) = body.upstream_account_id {
+        state
+            .db
+            .upstream_account_for_reauthorization(account_id, &body.tenant_external_id)
+            .await?
+            .config
+    } else {
+        json!({"base_url": "https://api.anthropic.com", "network_scope": "public"})
+    };
+    validate_provider_config_schema(&state, claude::PROVIDER_DRIVER, &provider_config)?;
+    let reauthorize = reauthorization_target(
+        &state,
+        body.upstream_account_id,
+        &body.tenant_external_id,
+        &body.account_name,
+        claude::PROVIDER_DRIVER,
+        &provider_config,
+        claude::OAUTH_DRIVER,
+    )
+    .await?;
+    validate_upstream_destination(claude::PROVIDER_DRIVER, &provider_config, &service, &state)
+        .await?;
+    Ok(Json(
+        claude::start_claude_login(
+            &state.db,
+            claude::StartClaudeLogin {
+                tenant_external_id: body.tenant_external_id,
+                account_name: body.account_name,
+                operator_service_id: service.service_id,
+                provider_config,
+                reauthorize,
+            },
+            state.config.key_pepper.as_bytes(),
+            unix_millis(),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct CompleteClaudeOAuthRequest {
+    session_token: String,
+    authorization_code: String,
+}
+
+pub(in crate::api) async fn complete_claude_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CompleteClaudeOAuthRequest>,
+) -> Result<Response, AppError> {
+    let service = require_service(&headers, &state, "oauth:write").await?;
+    match claude::complete_claude_login(
+        &state.db,
+        &state.http,
+        &body.session_token,
+        &body.authorization_code,
+        state.config.key_pepper.as_bytes(),
+        unix_millis(),
+        claude::ClaudeCompleteScope {
+            required_tenant: service.tenant_external_id.as_deref(),
+            operator_service_id: service.service_id,
+        },
+        state.config.allow_oauth_loopback,
+    )
+    .await?
+    {
+        claude::ClaudeCompleteResult::Pending {
+            retry_after_seconds,
+        } => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "pending",
+                "retry_after_seconds": retry_after_seconds
+            })),
+        )
+            .into_response()),
+        claude::ClaudeCompleteResult::Consumed {
+            account_id,
+            tenant_external_id,
+        } => {
+            require_service_tenant(&service, &tenant_external_id)?;
+            let account = state
+                .db
+                .upstream_account_for_reauthorization(account_id, &tenant_external_id)
+                .await?;
+            Ok((StatusCode::OK, Json(account)).into_response())
+        }
+        claude::ClaudeCompleteResult::Ready { lease_owner, login } => {
+            finish_claude_login(&state, &service, lease_owner, *login).await
+        }
+    }
+}
+
+async fn finish_claude_login(
+    state: &AppState,
+    service: &AuthenticatedService,
+    lease_owner: Uuid,
+    ready: claude::ReadyClaudeLogin,
+) -> Result<Response, AppError> {
+    require_service_tenant(service, &ready.tenant_external_id)?;
+    validate_provider_schema(
+        state,
+        claude::PROVIDER_DRIVER,
+        &ready.provider_config,
+        &ready.credential,
+    )?;
+    validate_upstream_destination(
+        claude::PROVIDER_DRIVER,
+        &ready.provider_config,
+        service,
+        state,
+    )
+    .await?;
+    let reauthorizing = ready.reauthorize.is_some();
+    let account = match ready.reauthorize {
+        Some(target) => {
+            let (_, current) = state
+                .db
+                .upstream_account_with_credential(
+                    target.account_id,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await?;
+            if claude::claude_account_id(&current)? != claude::claude_account_id(&ready.credential)?
+            {
+                return Err(AppError::Conflict(
+                    "reauthorization must use the same Anthropic account".into(),
+                ));
+            }
+            state
+                .db
+                .reauthorize_upstream_account(
+                    target.account_id,
+                    ReauthorizeUpstreamAccountInput {
+                        tenant_external_id: ready.tenant_external_id,
+                        expected_updated_at: target.expected_updated_at,
+                        driver: claude::PROVIDER_DRIVER.to_owned(),
+                        oauth_session_id: ready.session_id,
+                        oauth_driver: ready.oauth_driver,
+                        oauth_refresh_url: Some(ready.refresh_url),
+                        credential: ready.credential,
+                    },
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await?
+        }
+        None => {
+            state
+                .db
+                .create_upstream_account(
+                    CreateUpstreamAccountInput {
+                        tenant_external_id: ready.tenant_external_id,
+                        name: ready.account_name,
+                        driver: claude::PROVIDER_DRIVER.to_owned(),
+                        config: ready.provider_config,
+                        credential: ready.credential,
+                        oauth_session_id: Some(ready.session_id),
+                        oauth_driver: Some(ready.oauth_driver),
+                        oauth_refresh_url: Some(ready.refresh_url),
+                    },
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await?
+        }
+    };
+    state
+        .db
+        .finish_oauth_login_session(ready.session_id, lease_owner, account.id, unix_millis())
+        .await?;
+    super::trigger_upstream_model_sync(state.clone(), account.id);
+    Ok((
+        if reauthorizing {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
+        Json(account),
+    )
+        .into_response())
+}

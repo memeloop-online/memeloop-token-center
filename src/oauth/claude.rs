@@ -39,7 +39,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_LIFETIME_MILLIS: i64 = 10 * 60 * 1_000;
 const MAX_TOKEN_LIFETIME_SECONDS: i64 = 365 * 24 * 60 * 60;
 const MAX_SECRET_BYTES: usize = 128 * 1024;
-const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
+pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 
 #[derive(Clone, Debug)]
 pub struct StartClaudeLogin {

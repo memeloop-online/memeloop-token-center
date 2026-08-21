@@ -3,7 +3,9 @@ use futures_util::StreamExt;
 use crate::error::AppError;
 
 mod adapter;
+pub mod claude;
 pub mod codex_device;
+pub mod copilot;
 mod cursor;
 mod endpoint;
 pub mod managed;
