@@ -7187,6 +7187,288 @@ async fn workbuddy_requests_share_conversation(world: &mut TokenCenterWorld) {
     assert_eq!(detail["edges"][0]["evidence"]["explicit_session"], true);
 }
 
+async fn control_json(
+    world: &TokenCenterWorld,
+    method: Method,
+    path: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = world
+        .client
+        .request(method, format!("{}{}", world.service_url, path))
+        .bearer_auth("test-service-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("group routing control request");
+    let status = response.status();
+    let value = response
+        .json::<Value>()
+        .await
+        .expect("group routing control response JSON");
+    (status, value)
+}
+
+#[when("the operator configures overlapping provider groups and two route groups")]
+async fn configure_overlapping_routing_groups(world: &mut TokenCenterWorld) {
+    let tenant = "cucumber-routing-groups";
+    let (status, issued) = control_json(
+        world,
+        Method::POST,
+        "/internal/v1/keys",
+        json!({
+            "tenant_external_id": tenant,
+            "principal_external_id": "group-routed-user",
+            "alias": "group-routed-credential",
+            "currency": "USD",
+            "initial_balance": "10",
+            "policy": {"allowed_models": ["group-routed-model"]}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    let key_id = issued["key_id"]
+        .as_str()
+        .expect("group-routed key id")
+        .to_owned();
+    let old_key = issued["key"]
+        .as_str()
+        .expect("group-routed secret")
+        .to_owned();
+
+    let mut accounts = Vec::new();
+    for name in ["excluded-upstream", "selected-upstream"] {
+        let (status, account) = control_json(
+            world,
+            Method::POST,
+            "/internal/v1/upstreams",
+            json!({
+                "tenant_external_id": tenant,
+                "name": name,
+                "driver": "http-json",
+                "config": {"base_url": world.mock.as_ref().expect("mock upstream").uri()},
+                "credential": {"type": "none"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{account}");
+        accounts.push(
+            account["id"]
+                .as_str()
+                .expect("group-routed account id")
+                .to_owned(),
+        );
+    }
+
+    let mut provider_groups = Vec::new();
+    for (name, members) in [
+        (
+            "all-providers",
+            vec![accounts[0].clone(), accounts[1].clone()],
+        ),
+        ("temporarily-excluded", vec![accounts[0].clone()]),
+    ] {
+        let (status, group) = control_json(
+            world,
+            Method::POST,
+            "/internal/v1/provider-groups",
+            json!({"tenant_external_id": tenant, "name": name}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{group}");
+        let group_id = group["id"].as_str().expect("provider group id").to_owned();
+        let (status, updated) = control_json(
+            world,
+            Method::PUT,
+            &format!("/internal/v1/provider-groups/{group_id}/members"),
+            json!({
+                "tenant_external_id": tenant,
+                "member_ids": members,
+                "expected_updated_at": group["updated_at"]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        provider_groups.push(group_id);
+    }
+
+    let (status, route) = control_json(
+        world,
+        Method::POST,
+        "/internal/v1/model-routes",
+        json!({
+            "tenant_external_id": tenant,
+            "public_model": "group-routed-model",
+            "upstream_model": "group-routed-upstream-model",
+            "protocol": "openai",
+            "priority": 0,
+            "upstream_account_ids": accounts,
+            "included_provider_group_ids": [provider_groups[0]],
+            "excluded_provider_group_ids": [provider_groups[1]],
+            "route_group_names": ["primary-routes", "codex-routes"],
+            "granted_credential_ids": [key_id],
+            "custom_model_confirmed": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{route}");
+    let route_id = route["id"]
+        .as_str()
+        .expect("group-routed route id")
+        .to_owned();
+    let route_group_ids = route["route_group_ids"]
+        .as_array()
+        .expect("two route group ids")
+        .clone();
+    assert_eq!(route_group_ids.len(), 2, "{route}");
+
+    let (status, current) = control_json(
+        world,
+        Method::GET,
+        &format!("/internal/v1/keys/{key_id}/routing?tenant_external_id={tenant}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{current}");
+    let (status, routing) = control_json(
+        world,
+        Method::PUT,
+        &format!("/internal/v1/keys/{key_id}/routing"),
+        json!({
+            "tenant_external_id": tenant,
+            "route_ids": [route_id],
+            "route_group_ids": route_group_ids,
+            "expected_grant_revision": current["grant_revision"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{routing}");
+
+    world.response = json!({
+        "tenant": tenant,
+        "key_id": key_id,
+        "old_key": old_key,
+        "selected_account_id": accounts[1],
+        "route_id": route_id,
+        "route_group_ids": route_group_ids,
+        "routing_before_rotation": routing,
+        "route": route
+    });
+}
+
+#[then("provider exclusions win and overlapping route group grants are deduplicated")]
+async fn group_exclusions_and_intersections_are_exact(world: &mut TokenCenterWorld) {
+    let route = &world.response["route"];
+    assert_eq!(
+        route["candidate_upstream_account_ids"],
+        json!([world.response["selected_account_id"]]),
+        "an excluded provider must be removed even when explicit and included: {route}"
+    );
+    assert_eq!(
+        route["route_group_ids"].as_array().map(Vec::len),
+        Some(2),
+        "one route must be allowed to belong to multiple route groups"
+    );
+    let routing = &world.response["routing_before_rotation"];
+    assert_eq!(routing["route_ids"], json!([world.response["route_id"]]));
+    assert_eq!(
+        routing["route_group_ids"],
+        world.response["route_group_ids"]
+    );
+    assert_eq!(
+        routing["effective_route_ids"],
+        json!([world.response["route_id"]]),
+        "direct and overlapping group grants must deduplicate the effective route"
+    );
+
+    let response = world
+        .client
+        .get(format!("{}/v1/models", world.service_url))
+        .bearer_auth(world.response["old_key"].as_str().expect("old routed key"))
+        .send()
+        .await
+        .expect("list models for group-routed credential");
+    assert_eq!(response.status(), StatusCode::OK);
+    let models: Value = response.json().await.expect("group-routed models JSON");
+    assert_eq!(models["data"][0]["id"], "group-routed-model");
+    world.response["models_before_rotation"] = models;
+}
+
+#[when("the operator rotates the group-routed credential")]
+async fn rotate_group_routed_credential(world: &mut TokenCenterWorld) {
+    let key_id = world.response["key_id"]
+        .as_str()
+        .expect("group-routed key id");
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/keys/{key_id}/rotate",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .header("idempotency-key", "cucumber-group-routing-rotation")
+        .send()
+        .await
+        .expect("rotate group-routed credential");
+    assert_eq!(response.status(), StatusCode::OK);
+    let rotated: Value = response
+        .json()
+        .await
+        .expect("rotated group-routed key JSON");
+    assert_eq!(rotated["key_id"], world.response["key_id"]);
+    world.response["rotated_key"] = rotated["key"].clone();
+}
+
+#[then("the rotated credential preserves its route and route-group authorization")]
+async fn rotated_group_routing_is_stable(world: &mut TokenCenterWorld) {
+    let old_response = world
+        .client
+        .get(format!("{}/v1/models", world.service_url))
+        .bearer_auth(world.response["old_key"].as_str().expect("old routed key"))
+        .send()
+        .await
+        .expect("old group-routed key authentication");
+    assert_eq!(old_response.status(), StatusCode::UNAUTHORIZED);
+
+    let tenant = world.response["tenant"].as_str().expect("routing tenant");
+    let key_id = world.response["key_id"].as_str().expect("routing key id");
+    let (status, routing) = control_json(
+        world,
+        Method::GET,
+        &format!("/internal/v1/keys/{key_id}/routing?tenant_external_id={tenant}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{routing}");
+    let before = &world.response["routing_before_rotation"];
+    for field in [
+        "route_ids",
+        "route_group_ids",
+        "effective_route_ids",
+        "grant_revision",
+    ] {
+        assert_eq!(routing[field], before[field], "rotation changed {field}");
+    }
+
+    let response = world
+        .client
+        .get(format!("{}/v1/models", world.service_url))
+        .bearer_auth(
+            world.response["rotated_key"]
+                .as_str()
+                .expect("rotated routed key"),
+        )
+        .send()
+        .await
+        .expect("rotated group-routed key model list");
+    assert_eq!(response.status(), StatusCode::OK);
+    let models: Value = response
+        .json()
+        .await
+        .expect("rotated group-routed models JSON");
+    assert_eq!(models, world.response["models_before_rotation"]);
+}
+
 #[tokio::main]
 async fn main() {
     let postgres_enabled = std::env::var_os("MTC_TEST_POSTGRES_URL").is_some();

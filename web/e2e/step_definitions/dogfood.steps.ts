@@ -25,11 +25,16 @@ interface CredentialGroupObservation {
   routing: unknown;
   models: unknown;
 }
+interface GroupRoutingObservation {
+  routeId: string;
+  routeGroupIds: string[];
+}
 
 const realtimeReconnectObservations = new WeakMap<DogfoodWorld, RealtimeReconnectObservation>();
 const strictUsageObservations = new WeakMap<DogfoodWorld, StrictUsageObservation>();
 const multimodalObservations = new WeakMap<DogfoodWorld, MultimodalObservation>();
 const credentialGroupObservations = new WeakMap<DogfoodWorld, CredentialGroupObservation>();
+const groupRoutingObservations = new WeakMap<DogfoodWorld, GroupRoutingObservation>();
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const groupedModel = 'browser-group-routed-model';
 
@@ -293,7 +298,10 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
   await assertNoCount(providerGroups.locator('.selection-chip'));
   await memberInput.fill('Browser mock');
   await memberInput.press('Enter');
+  await memberInput.fill('Browser secondary');
+  await memberInput.press('Enter');
   await memberInput.press('Escape');
+  await assertContains(providerGroups.locator('.selection-chip'), 'Browser secondary upstream');
   await assertAttribute(memberInput, 'aria-expanded', 'false');
   const savedProviderMembers = page.waitForResponse((response) => response.url().includes('/internal/v1/provider-groups/') && response.url().endsWith('/members') && response.request().method() === 'PUT');
   await providerGroups.getByRole('button', { name: '保存成员', exact: true }).click();
@@ -301,23 +309,44 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
   assert.equal(providerMembersResponse.status(), 200);
   const providerMembersPayload = providerMembersResponse.request().postDataJSON() as Record<string, unknown>;
   assert.deepEqual(Object.keys(providerMembersPayload).sort(), ['expected_updated_at', 'member_ids', 'tenant_external_id']);
-  assert.deepEqual(providerMembersPayload.member_ids, [seed.upstreamId]);
+  assert.deepEqual(providerMembersPayload.member_ids, [seed.upstreamId, seed.otherUpstreamId]);
+
+  const excludedGroup = await requestJson<{ id: string; updated_at: number }>('/internal/v1/provider-groups', {
+    method: 'POST',
+    credential: seed.serviceCredential,
+    body: { tenant_external_id: tenant, name: '暂停使用' },
+  });
+  await requestJson(`/internal/v1/provider-groups/${excludedGroup.id}/members`, {
+    method: 'PUT',
+    credential: seed.serviceCredential,
+    body: {
+      tenant_external_id: tenant,
+      member_ids: [seed.upstreamId],
+      expected_updated_at: excludedGroup.updated_at,
+    },
+  });
 
   await connectOperator(this, 'dark');
   await page.getByRole('tab', { name: '模型路由', exact: true }).click();
   const reloadedProviderGroups = page.locator('.group-manager[data-group-kind="provider"]');
   await assertContains(reloadedProviderGroups, '主力提供商');
+  await assertContains(reloadedProviderGroups, '暂停使用');
   await assertContains(reloadedProviderGroups.locator('.selection-chip'), 'Browser mock upstream');
+  await assertContains(reloadedProviderGroups.locator('.selection-chip'), 'Browser secondary upstream');
 
   const routeEditor = page.locator('article.form-panel').filter({ has: page.getByRole('heading', { name: '创建模型路由', exact: true }) });
   await routeEditor.getByLabel('公开模型').fill(groupedModel);
   const includeProviders = routeEditor.getByRole('combobox', { name: '包含提供商组', exact: true });
   await includeProviders.fill('主力');
   await includeProviders.press('Enter');
+  const excludeProviders = routeEditor.getByRole('combobox', { name: '排除提供商组', exact: true });
+  await excludeProviders.fill('暂停使用');
+  await excludeProviders.press('Enter');
   const groupedCatalog = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return url.pathname === '/internal/v1/upstream-models'
       && url.searchParams.get('include_provider_group_ids') === providerGroup.id
+      && url.searchParams.get('exclude_provider_group_ids') === excludedGroup.id
       && url.searchParams.get('q') === 'mock-provider-model';
   });
   await routeEditor.getByLabel('上游模型').fill('mock-provider-model');
@@ -333,6 +362,9 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
   assert.ok(routeGroupListId);
   await assertContains(routeEditor.locator(`#${routeGroupListId}`).getByRole('option'), '创建路由组“默认路由”');
   await routeGroupInput.press('Enter');
+  await routeGroupInput.fill('Codex 路由');
+  await assertContains(routeEditor.locator(`#${routeGroupListId}`).getByRole('option'), '创建路由组“Codex 路由”');
+  await routeGroupInput.press('Enter');
   const exactCredentials = routeEditor.getByRole('combobox', { name: '授权给具体凭据', exact: true });
   await exactCredentials.fill('Browser E2E credential');
   await exactCredentials.press('Enter');
@@ -345,9 +377,18 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
   assert.equal(Object.hasOwn(createdRoutePayload, 'upstream_account_id'), false);
   assert.deepEqual(createdRoutePayload.upstream_account_ids, []);
   assert.deepEqual(createdRoutePayload.included_provider_group_ids, [providerGroup.id]);
-  assert.deepEqual(createdRoutePayload.route_group_names, ['默认路由']);
+  assert.deepEqual(createdRoutePayload.excluded_provider_group_ids, [excludedGroup.id]);
+  assert.deepEqual(createdRoutePayload.route_group_names, ['默认路由', 'Codex 路由']);
   assert.deepEqual(createdRoutePayload.granted_credential_ids, [seed.clientKeyId]);
   assert.equal(createdRoutePayload.custom_model_confirmed, false);
+  const createdRouteBody = await createdRouteResponse.json() as {
+    id: string; route_group_ids: string[]; candidate_upstream_account_ids: string[];
+  };
+  assert.deepEqual(createdRouteBody.candidate_upstream_account_ids, [seed.otherUpstreamId]);
+  assert.equal(createdRouteBody.route_group_ids.length, 2);
+  groupRoutingObservations.set(this, {
+    routeId: createdRouteBody.id, routeGroupIds: createdRouteBody.route_group_ids,
+  });
   const routeRow = page.locator('tbody tr').filter({ hasText: groupedModel });
   await assertVisible(routeRow);
 
@@ -355,12 +396,14 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
   await page.getByRole('tab', { name: '模型路由', exact: true }).click();
   const reloadedRouteGroups = page.locator('.group-manager[data-group-kind="route"]');
   await assertContains(reloadedRouteGroups, '默认路由');
+  await assertContains(reloadedRouteGroups, 'Codex 路由');
   await assertContains(reloadedRouteGroups.locator('.selection-chip'), groupedModel);
 });
 
 Then('提供商组参与路由候选而路由组参与凭据授权', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
+  const observation = groupRoutingObservations.get(this);
   await page.getByRole('tab', { name: '凭据管理', exact: true }).click();
   const credential = page.locator('.managed-resource').filter({ hasText: seed.clientKeyId });
   const openedRouting = page.waitForResponse((response) => response.url().includes(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'GET');
@@ -372,6 +415,8 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   const routeGroupInput = routing.getByRole('combobox', { name: '路由组', exact: true });
   await routeGroupInput.fill('默认路由');
   await routeGroupInput.press('Enter');
+  await routeGroupInput.fill('Codex 路由');
+  await routeGroupInput.press('Enter');
   const routingSaved = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'PUT');
   await routing.getByRole('button', { name: '保存', exact: true }).click();
   const routingSavedResponse = await routingSaved;
@@ -379,7 +424,18 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   const routingPayload = routingSavedResponse.request().postDataJSON() as Record<string, unknown>;
   assert.equal(Object.hasOwn(routingPayload, 'expected_updated_at'), false);
   assert.equal(typeof routingPayload.expected_grant_revision, 'number');
+  assert.ok(observation, '应记录创建的多组路由');
+  assert.deepEqual(
+    [...(routingPayload.route_group_ids as string[])].sort(),
+    [...observation.routeGroupIds].sort(),
+  );
+  const savedRouting = await routingSavedResponse.json() as { effective_route_ids: string[] };
+  assert.equal(
+    savedRouting.effective_route_ids.filter((id) => id === observation.routeId).length,
+    1,
+  );
   await assertContains(routing, '默认路由');
+  await assertContains(routing, 'Codex 路由');
   await assertContains(routing, '当前共可使用');
 
   const credentialRoutingPath = `/internal/v1/keys/${seed.clientKeyId}/routing?tenant_external_id=${encodeURIComponent(tenant)}`;
@@ -395,6 +451,8 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   await assertContains(page.getByRole('alert'), '路由权限已被其他操作修改，已重新加载最新内容。');
   await assertNotContains(routing, '默认路由');
   await routeGroupInput.fill('默认路由');
+  await routeGroupInput.press('Enter');
+  await routeGroupInput.fill('Codex 路由');
   await routeGroupInput.press('Enter');
   const retrySave = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'PUT');
   await routing.getByRole('button', { name: '保存', exact: true }).click();

@@ -45,3 +45,10 @@ Feature: Black-box credential policy and tenant isolation acceptance
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI upstream returns a successful completion
     Then TPM concurrency daily weekly and lifetime policies are independently enforced
+
+  Scenario: Group routing exclusions overlap and credential rotation preserve authorization
+    Given a token center backed by SQLite and memory object storage
+    When the operator configures overlapping provider groups and two route groups
+    Then provider exclusions win and overlapping route group grants are deduplicated
+    When the operator rotates the group-routed credential
+    Then the rotated credential preserves its route and route-group authorization

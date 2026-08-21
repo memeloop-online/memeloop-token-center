@@ -20,6 +20,8 @@ export interface SeedState {
   serviceCredential: string;
   upstreamId: string;
   upstreamName: string;
+  otherUpstreamId: string;
+  otherUpstreamName: string;
   routeId: string;
 }
 
@@ -183,6 +185,24 @@ async function seedThroughHttp(): Promise<SeedState> {
     assert.equal(catalog.status, 'ready');
     assert.ok(catalog.models.length > 0);
   }, 30_000, 'mock upstream model catalog did not become ready');
+  const otherUpstream = await requestJson<{ id: string }>('/internal/v1/upstreams', {
+    method: 'POST', credential: bootstrapToken,
+    body: {
+      tenant_external_id: tenant,
+      name: 'Browser secondary upstream',
+      driver: 'http-json',
+      config: { base_url: `http://127.0.0.1:${mockPort}` },
+      credential: { type: 'api_key', value: 'browser-secondary-upstream-not-a-secret' },
+    },
+  });
+  await eventually(async () => {
+    const catalog = await requestJson<{ status: string; models: Array<{ id: string }> }>(
+      `/internal/v1/upstreams/${otherUpstream.id}/models/sync?tenant_external_id=${encodeURIComponent(tenant)}`,
+      { method: 'POST', credential: bootstrapToken },
+    );
+    assert.equal(catalog.status, 'ready');
+    assert.ok(catalog.models.length > 0);
+  }, 30_000, 'secondary mock upstream model catalog did not become ready');
   const route = await requestJson<{ id: string }>('/internal/v1/model-routes', {
     method: 'POST', credential: bootstrapToken,
     body: {
@@ -338,6 +358,8 @@ async function seedThroughHttp(): Promise<SeedState> {
     serviceCredential: service.token,
     upstreamId: upstream.id,
     upstreamName: 'Browser mock upstream',
+    otherUpstreamId: otherUpstream.id,
+    otherUpstreamName: 'Browser secondary upstream',
     routeId: route.id,
   };
 }

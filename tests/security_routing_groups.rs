@@ -64,6 +64,7 @@ fn key_input(tenant: &str, principal: &str) -> CreateKeyInput {
                 "secure-route-model".to_owned(),
                 "secure-generation-model".to_owned(),
                 "secure-bridge-fallback-model".to_owned(),
+                "secure-filtered-model".to_owned(),
             ],
             ..KeyPolicy::default()
         },
@@ -167,7 +168,29 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
         .await
         .expect("tenant B upstream");
 
-    for (account, tenant) in [(&account_a, "routing-a"), (&account_b, "routing-b")] {
+    let account_a_secondary = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "routing-a".to_owned(),
+                name: "routing-a-secondary-upstream".to_owned(),
+                driver: "http-json".to_owned(),
+                config: json!({"base_url": "http://127.0.0.1:18084", "network_scope": "private"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            pepper,
+        )
+        .await
+        .expect("tenant A secondary upstream");
+
+    for (account, tenant) in [
+        (&account_a, "routing-a"),
+        (&account_a_secondary, "routing-a"),
+        (&account_b, "routing-b"),
+    ] {
         let lease = Uuid::now_v7();
         assert!(
             state
@@ -228,6 +251,30 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
         )
         .await
         .expect("provider group active member");
+    let candidate_provider_group = state
+        .db
+        .create_group(
+            GroupKind::Provider,
+            CreateGroupInput {
+                tenant_external_id: "routing-a".to_owned(),
+                name: "All candidate providers".to_owned(),
+            },
+        )
+        .await
+        .expect("candidate provider group");
+    let candidate_provider_group = state
+        .db
+        .replace_group_members(
+            GroupKind::Provider,
+            candidate_provider_group.id,
+            ReplaceGroupMembersInput {
+                tenant_external_id: "routing-a".to_owned(),
+                member_ids: vec![account_a.id, account_a_secondary.id],
+                expected_updated_at: candidate_provider_group.updated_at,
+            },
+        )
+        .await
+        .expect("candidate provider group members");
     let route_group = state
         .db
         .create_group(
@@ -239,6 +286,17 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
         )
         .await
         .expect("route group");
+    let secondary_route_group = state
+        .db
+        .create_group(
+            GroupKind::Route,
+            CreateGroupInput {
+                tenant_external_id: "routing-a".to_owned(),
+                name: "Route group B".to_owned(),
+            },
+        )
+        .await
+        .expect("secondary route group");
     let credential_group = state
         .db
         .create_group(
@@ -297,6 +355,29 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
         })
         .await
         .expect("exact-credential generation route");
+    let (filtered_route, filtered_routing) = state
+        .db
+        .create_routed_model_route(CreateRoutedModelRouteInput {
+            tenant_external_id: "routing-a".to_owned(),
+            public_model: "secure-filtered-model".to_owned(),
+            upstream_model: "secure-upstream-model".to_owned(),
+            protocol: "openai".to_owned(),
+            priority: 0,
+            upstream_account_ids: vec![account_a.id],
+            included_provider_group_ids: vec![candidate_provider_group.id],
+            excluded_provider_group_ids: vec![provider_group.id],
+            route_group_ids: vec![route_group.id, secondary_route_group.id],
+            route_group_names: Vec::new(),
+            granted_credential_ids: vec![exact.key_id],
+            custom_model_confirmed: false,
+        })
+        .await
+        .expect("provider-group filtered route");
+    assert_eq!(
+        filtered_routing.candidate_upstream_account_ids,
+        vec![account_a_secondary.id]
+    );
+    assert_eq!(filtered_routing.route_group_ids.len(), 2);
     let bridge = state
         .db
         .create_upstream_account(
@@ -353,15 +434,33 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             ReplaceCredentialRoutingInput {
                 tenant_external_id: "routing-a".to_owned(),
                 route_ids: Vec::new(),
-                route_group_ids: vec![route_group.id],
+                route_group_ids: vec![route_group.id, secondary_route_group.id],
                 expected_grant_revision: initial_group_routing.grant_revision,
             },
         )
         .await
         .expect("grant route group to credential");
     assert!(group_routing_before.route_ids.is_empty());
-    assert_eq!(group_routing_before.route_group_ids, vec![route_group.id]);
-    assert_eq!(group_routing_before.effective_route_ids.len(), 3);
+    assert_eq!(group_routing_before.route_group_ids.len(), 2);
+    assert!(
+        group_routing_before
+            .route_group_ids
+            .contains(&route_group.id)
+    );
+    assert!(
+        group_routing_before
+            .route_group_ids
+            .contains(&secondary_route_group.id)
+    );
+    assert_eq!(group_routing_before.effective_route_ids.len(), 4);
+    assert_eq!(
+        group_routing_before
+            .effective_route_ids
+            .iter()
+            .filter(|id| **id == filtered_route.id)
+            .count(),
+        1
+    );
 
     let exact_key = state
         .db
@@ -430,6 +529,24 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
         .expect("resolve legacy bridge fallback")
         .expect("active provider-group candidate wins");
     assert_eq!(bridge_fallback_before.route_id, bridge_fallback_route.id);
+    let filtered_before = state
+        .db
+        .resolve_authorized_upstream_with_hint(
+            exact_key.key_id,
+            exact_key.tenant_id,
+            "secure-filtered-model",
+            "openai",
+            RouteSelectionOptions {
+                upstream_account_hint: None,
+                selection_seed: seed,
+            },
+            pepper,
+        )
+        .await
+        .expect("resolve provider-group filtered route")
+        .expect("non-excluded candidate remains available");
+    assert_eq!(filtered_before.route_id, filtered_route.id);
+    assert_eq!(filtered_before.account_id, account_a_secondary.id);
     assert_eq!(bridge_fallback_before.account_id, account_a.id);
     let bridge_history_request_id = Uuid::now_v7();
     state
@@ -492,10 +609,11 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
         .granted_available_models(group_key.key_id, group_key.tenant_id)
         .await
         .expect("route-group models before classification");
-    assert_eq!(exact_models_before.len(), 3);
+    assert_eq!(exact_models_before.len(), 4);
     assert!(exact_models_before.contains(&"secure-route-model".to_owned()));
     assert!(exact_models_before.contains(&"secure-generation-model".to_owned()));
     assert!(exact_models_before.contains(&"secure-bridge-fallback-model".to_owned()));
+    assert!(exact_models_before.contains(&"secure-filtered-model".to_owned()));
     assert!(classified_models_before.is_empty());
     assert_eq!(group_models_before, exact_models_before);
     let exact_public_models_before = public_models(&state, &exact.key).await;
@@ -511,6 +629,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
         exact_public_model_ids,
         [
             "secure-bridge-fallback-model",
+            "secure-filtered-model",
             "secure-generation-model",
             "secure-route-model",
         ]
@@ -529,7 +648,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
         .credential_routing(exact.key_id, "routing-a")
         .await
         .expect("exact routing before classification");
-    assert_eq!(exact_routing_before.route_ids.len(), 3);
+    assert_eq!(exact_routing_before.route_ids.len(), 4);
     assert!(exact_routing_before.route_ids.contains(&route.id));
     assert!(
         exact_routing_before
@@ -541,6 +660,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             .route_ids
             .contains(&bridge_fallback_route.id)
     );
+    assert!(exact_routing_before.route_ids.contains(&filtered_route.id));
 
     let credential_group = state
         .db
@@ -976,6 +1096,115 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
             .expect("exact routing after classification removal")
             .route_ids,
         exact_routing_before.route_ids
+    );
+
+    let exact_before_rotation = state
+        .db
+        .credential_routing(exact.key_id, "routing-a")
+        .await
+        .expect("exact routing before rotation");
+    let rotated_exact = state
+        .db
+        .rotate_key(exact.key_id, "routing-exact-rotation", pepper)
+        .await
+        .expect("rotate exact-route credential");
+    assert_eq!(rotated_exact.key_id, exact.key_id);
+    assert!(matches!(
+        state.db.authenticate_key(&exact.key, pepper).await,
+        Err(AppError::Unauthorized)
+    ));
+    let rotated_exact_auth = state
+        .db
+        .authenticate_key(&rotated_exact.key, pepper)
+        .await
+        .expect("authenticate rotated exact-route credential");
+    let exact_after_rotation = state
+        .db
+        .credential_routing(rotated_exact.key_id, "routing-a")
+        .await
+        .expect("exact routing after rotation");
+    assert_eq!(
+        exact_after_rotation.route_ids,
+        exact_before_rotation.route_ids
+    );
+    assert_eq!(
+        exact_after_rotation.route_group_ids,
+        exact_before_rotation.route_group_ids
+    );
+    assert_eq!(
+        exact_after_rotation.effective_route_ids,
+        exact_before_rotation.effective_route_ids
+    );
+    assert_eq!(
+        exact_after_rotation.grant_revision,
+        exact_before_rotation.grant_revision
+    );
+    assert_eq!(
+        public_models(&state, &rotated_exact.key).await,
+        exact_public_models_before
+    );
+    let filtered_after_rotation = state
+        .db
+        .resolve_authorized_upstream_with_hint(
+            rotated_exact_auth.key_id,
+            rotated_exact_auth.tenant_id,
+            "secure-filtered-model",
+            "openai",
+            RouteSelectionOptions {
+                upstream_account_hint: None,
+                selection_seed: seed,
+            },
+            pepper,
+        )
+        .await
+        .expect("resolve filtered route after credential rotation")
+        .expect("rotated credential keeps the filtered route grant");
+    assert_eq!(filtered_after_rotation.route_id, filtered_before.route_id);
+    assert_eq!(
+        filtered_after_rotation.account_id,
+        filtered_before.account_id
+    );
+
+    let group_before_rotation = state
+        .db
+        .credential_routing(group_granted.key_id, "routing-a")
+        .await
+        .expect("route-group routing before rotation");
+    let rotated_group = state
+        .db
+        .rotate_key(group_granted.key_id, "routing-group-rotation", pepper)
+        .await
+        .expect("rotate route-group credential");
+    assert_eq!(rotated_group.key_id, group_granted.key_id);
+    assert!(matches!(
+        state.db.authenticate_key(&group_granted.key, pepper).await,
+        Err(AppError::Unauthorized)
+    ));
+    state
+        .db
+        .authenticate_key(&rotated_group.key, pepper)
+        .await
+        .expect("authenticate rotated route-group credential");
+    let group_after_rotation = state
+        .db
+        .credential_routing(rotated_group.key_id, "routing-a")
+        .await
+        .expect("route-group routing after rotation");
+    assert_eq!(
+        group_after_rotation.route_group_ids,
+        group_before_rotation.route_group_ids
+    );
+    assert_eq!(
+        group_after_rotation.effective_route_ids,
+        group_before_rotation.effective_route_ids
+    );
+    assert_eq!(
+        group_after_rotation.grant_revision,
+        group_before_rotation.grant_revision
+    );
+    assert_eq!(
+        public_models(&state, &rotated_group.key).await,
+        group_public_models_before
     );
 
     let other_routing = state
