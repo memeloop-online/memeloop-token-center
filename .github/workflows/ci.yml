@@ -301,9 +301,9 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
           build-args: |
-            MTC_BUILD_GIT_SHA=${{ github.sha }}
-            MTC_BUILD_TIMESTAMP=${{ github.event.head_commit.timestamp }}
-            MTC_BUILD_TARGET=linux/amd64
+            MTC_BUILD_GIT_SHA_INPUT=${{ github.sha }}
+            MTC_BUILD_TIMESTAMP_INPUT=${{ github.event.head_commit.timestamp }}
+            MTC_BUILD_TARGET_INPUT=linux/amd64
           cache-from: type=gha,scope=${{ matrix.cache_scope }}
           cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
           provenance: mode=max

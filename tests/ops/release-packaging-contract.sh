@@ -75,6 +75,8 @@ grep -Fq 'ghcr.io/linonetwo/memeloop-token-center' "$workflow"
 grep -Fq 'ghcr.io/linonetwo/memeloop-token-center-importer' "$workflow"
 grep -Fq 'dockerfile: Dockerfile' "$workflow"
 grep -Fq 'dockerfile: Dockerfile.importer' "$workflow"
+grep -Fq 'MTC_BUILD_GIT_SHA_INPUT=${{ github.sha }}' "$workflow"
+grep -Fq 'ARG MTC_BUILD_GIT_SHA_INPUT=unknown' "$dockerfile"
 # These are intentionally literal GitHub/JQ expressions in the audited workflow.
 # shellcheck disable=SC2016
 grep -Fq 'DIGEST: ${{ steps.build.outputs.digest }}' "$workflow"

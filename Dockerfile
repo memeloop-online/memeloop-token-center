@@ -14,9 +14,9 @@ RUN npm run build
 FROM ${RUST_IMAGE} AS builder
 ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian
 ARG CARGO_REGISTRY=sparse+https://rsproxy.cn/index/
-ARG MTC_BUILD_GIT_SHA=unknown
-ARG MTC_BUILD_TIMESTAMP=unknown
-ARG MTC_BUILD_TARGET=unknown
+ARG MTC_BUILD_GIT_SHA_INPUT=unknown
+ARG MTC_BUILD_TIMESTAMP_INPUT=unknown
+ARG MTC_BUILD_TARGET_INPUT=unknown
 RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends cmake clang perl pkg-config \
@@ -44,9 +44,9 @@ COPY src ./src
 COPY migrations ./migrations
 COPY schemas ./schemas
 COPY wit ./wit
-RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA}" \
-    MTC_BUILD_TIMESTAMP="${MTC_BUILD_TIMESTAMP}" \
-    MTC_BUILD_TARGET="${MTC_BUILD_TARGET}" \
+RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA_INPUT}" \
+    MTC_BUILD_TIMESTAMP="${MTC_BUILD_TIMESTAMP_INPUT}" \
+    MTC_BUILD_TARGET="${MTC_BUILD_TARGET_INPUT}" \
     cargo build --locked --release --bin memeloop-token-center --bin import-cpa-session-archive \
     && cp target/release/memeloop-token-center /tmp/memeloop-token-center \
     && cp target/release/import-cpa-session-archive /tmp/import-cpa-session-archive \
