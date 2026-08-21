@@ -78,22 +78,6 @@ async fn generation_api_fixture(
     let state = AppState::initialize(config).await.unwrap();
     let tenant = format!("generation-api-{label}");
     let model = format!("generation-api-model-{label}");
-    let issued = state
-        .db
-        .create_key(
-            CreateKeyInput {
-                tenant_external_id: tenant.clone(),
-                principal_external_id: "member".to_owned(),
-                alias: label.to_owned(),
-                currency: "USD".to_owned(),
-                policy,
-                initial_balance,
-                idempotency_key: None,
-            },
-            state.config.key_pepper.as_bytes(),
-        )
-        .await
-        .unwrap();
     let upstream = state
         .db
         .create_upstream_account(
@@ -115,16 +99,34 @@ async fn generation_api_fixture(
         )
         .await
         .unwrap();
-    state
+    let route = state
         .db
         .create_model_route(CreateModelRouteInput {
-            tenant_external_id: tenant,
+            tenant_external_id: tenant.clone(),
             public_model: model.clone(),
             upstream_account_id: upstream.id,
             upstream_model: "workflow-v1".to_owned(),
             protocol: "generation".to_owned(),
             priority: 0,
         })
+        .await
+        .unwrap();
+    let issued = state
+        .db
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: tenant,
+                principal_external_id: "member".to_owned(),
+                alias: label.to_owned(),
+                currency: "USD".to_owned(),
+                policy,
+                initial_balance,
+                idempotency_key: None,
+            },
+            &[route.id],
+            &[],
+            state.config.key_pepper.as_bytes(),
+        )
         .await
         .unwrap();
     state
@@ -204,17 +206,51 @@ async fn rejected_proxy_admission_does_not_write_the_archive() {
     let mut config = Config::for_test(database_url);
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(archive_path.display().to_string());
-    config.upstream_openai_url = Some(upstream.uri());
-    config.upstream_openai_key = Some("unused-upstream-key".to_owned());
     let state = AppState::initialize(config).await.unwrap();
     state
         .db
         .upsert_model_price("archive-admission-model", "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
+    let upstream_account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "archive-admission".to_owned(),
+                name: "archive-admission".to_owned(),
+                driver: "http-json".to_owned(),
+                config: json!({
+                    "base_url": upstream.uri(),
+                    "network_scope": "public"
+                }),
+                credential: UpstreamCredential::ApiKey {
+                    value: "unused-upstream-key".to_owned(),
+                    header: "authorization".to_owned(),
+                    prefix: "Bearer ".to_owned(),
+                },
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: "archive-admission".to_owned(),
+            public_model: "archive-admission-model".to_owned(),
+            upstream_account_id: upstream_account.id,
+            upstream_model: "archive-admission-model".to_owned(),
+            protocol: "openai".to_owned(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
     let issued = state
         .db
-        .create_key(
+        .create_key_with_routing(
             CreateKeyInput {
                 tenant_external_id: "archive-admission".to_owned(),
                 principal_external_id: "member".to_owned(),
@@ -227,6 +263,8 @@ async fn rejected_proxy_admission_does_not_write_the_archive() {
                 initial_balance: Decimal::ZERO,
                 idempotency_key: None,
             },
+            &[route.id],
+            &[],
             state.config.key_pepper.as_bytes(),
         )
         .await
@@ -278,18 +316,52 @@ async fn upstream_rate_limit_status_is_preserved_but_its_body_is_sanitized() {
         "sqlite://{}?mode=rwc",
         directory.path().join("upstream-429.db").display()
     );
-    let mut config = Config::for_test(database_url);
-    config.upstream_openai_url = Some(upstream.uri());
-    config.upstream_openai_key = Some("test-upstream-key".to_owned());
+    let config = Config::for_test(database_url);
     let state = AppState::initialize(config).await.unwrap();
     state
         .db
         .upsert_model_price("upstream-429-model", "USD", Decimal::ONE, Decimal::ONE)
         .await
         .unwrap();
+    let upstream_account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "upstream-429".to_owned(),
+                name: "upstream-429".to_owned(),
+                driver: "http-json".to_owned(),
+                config: json!({
+                    "base_url": upstream.uri(),
+                    "network_scope": "public"
+                }),
+                credential: UpstreamCredential::ApiKey {
+                    value: "test-upstream-key".to_owned(),
+                    header: "authorization".to_owned(),
+                    prefix: "Bearer ".to_owned(),
+                },
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: "upstream-429".to_owned(),
+            public_model: "upstream-429-model".to_owned(),
+            upstream_account_id: upstream_account.id,
+            upstream_model: "upstream-429-model".to_owned(),
+            protocol: "openai".to_owned(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
     let issued = state
         .db
-        .create_key(
+        .create_key_with_routing(
             CreateKeyInput {
                 tenant_external_id: "upstream-429".to_owned(),
                 principal_external_id: "member".to_owned(),
@@ -302,6 +374,8 @@ async fn upstream_rate_limit_status_is_preserved_but_its_body_is_sanitized() {
                 initial_balance: Decimal::ONE,
                 idempotency_key: None,
             },
+            &[route.id],
+            &[],
             state.config.key_pepper.as_bytes(),
         )
         .await

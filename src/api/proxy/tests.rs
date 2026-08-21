@@ -138,26 +138,6 @@ async fn codex_route_fixture(label: &str) -> CodexRouteFixture {
     let tenant = format!("codex-route-{label}");
     let model = format!("codex-public-{label}");
     let upstream_model = format!("gpt-codex-{label}");
-    let issued = state
-        .db
-        .create_key(
-            CreateKeyInput {
-                tenant_external_id: tenant.clone(),
-                principal_external_id: "member".to_owned(),
-                alias: format!("codex-{label}"),
-                currency: "USD".to_owned(),
-                policy: KeyPolicy {
-                    allowed_models: vec![model.clone()],
-                    max_concurrency: 4,
-                    ..KeyPolicy::default()
-                },
-                initial_balance: Decimal::ONE,
-                idempotency_key: None,
-            },
-            state.config.key_pepper.as_bytes(),
-        )
-        .await
-        .unwrap();
     let upstream = state
         .db
         .create_upstream_account(
@@ -192,13 +172,35 @@ async fn codex_route_fixture(label: &str) -> CodexRouteFixture {
     let route = state
         .db
         .create_model_route(CreateModelRouteInput {
-            tenant_external_id: tenant,
+            tenant_external_id: tenant.clone(),
             public_model: model.clone(),
             upstream_account_id: upstream.id,
             upstream_model: upstream_model.clone(),
             protocol: "openai".to_owned(),
             priority: 0,
         })
+        .await
+        .unwrap();
+    let issued = state
+        .db
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: tenant,
+                principal_external_id: "member".to_owned(),
+                alias: format!("codex-{label}"),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    allowed_models: vec![model.clone()],
+                    max_concurrency: 4,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            &[route.id],
+            &[],
+            state.config.key_pepper.as_bytes(),
+        )
         .await
         .unwrap();
     state
@@ -240,26 +242,6 @@ async fn response_usage_fixture(
     let state = AppState::initialize(config).await.unwrap();
     let tenant = format!("compatibility-route-{label}");
     let model = "gpt-5.6-sol".to_owned();
-    let issued = state
-        .db
-        .create_key(
-            CreateKeyInput {
-                tenant_external_id: tenant.clone(),
-                principal_external_id: "member".to_owned(),
-                alias: format!("compatibility-{label}"),
-                currency: "USD".to_owned(),
-                policy: KeyPolicy {
-                    allowed_models: vec![model.clone()],
-                    max_concurrency: 4,
-                    ..KeyPolicy::default()
-                },
-                initial_balance: Decimal::ONE,
-                idempotency_key: None,
-            },
-            state.config.key_pepper.as_bytes(),
-        )
-        .await
-        .unwrap();
     let upstream_account = state
         .db
         .create_upstream_account(
@@ -288,13 +270,35 @@ async fn response_usage_fixture(
     let route = state
         .db
         .create_model_route(CreateModelRouteInput {
-            tenant_external_id: tenant,
+            tenant_external_id: tenant.clone(),
             public_model: model.clone(),
             upstream_account_id: upstream_account.id,
             upstream_model: model.clone(),
             protocol: "openai".to_owned(),
             priority: 0,
         })
+        .await
+        .unwrap();
+    let issued = state
+        .db
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: tenant,
+                principal_external_id: "member".to_owned(),
+                alias: format!("compatibility-{label}"),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    allowed_models: vec![model.clone()],
+                    max_concurrency: 4,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            &[route.id],
+            &[],
+            state.config.key_pepper.as_bytes(),
+        )
         .await
         .unwrap();
     state
@@ -499,7 +503,8 @@ async fn codex_chat_and_embeddings_fail_before_reservation_archive_or_upstream()
         let response = send_codex_route(&fixture, &upstream, path, request).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("OpenAI Responses only"));
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("Responses protocol only"), "{body}");
     }
     assert!(
         fixture
