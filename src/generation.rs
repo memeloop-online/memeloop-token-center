@@ -6,6 +6,12 @@ use std::sync::{
 use futures_util::StreamExt;
 use reqwest::Response;
 use serde_json::{Map, Value};
+
+mod comfyui_schema;
+pub use comfyui_schema::{
+    effective_parameter_schema as comfyui_parameter_schema,
+    validate_config as validate_comfyui_config, validate_parameters as validate_comfyui_parameters,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -544,6 +550,7 @@ async fn submit(
                     "ComfyUI accepts at most 100 scalar workflow parameters".into(),
                 ));
             }
+            validate_comfyui_parameters(&route.config, &Value::Object(parameters.clone()))?;
             let mut workflow = route
                 .config
                 .get("workflow_template")

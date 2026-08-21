@@ -367,6 +367,10 @@ impl ProviderCatalog {
                     "workflow_template": {
                         "type": "object",
                         "description": "Versioned administrator-owned graph. Use {\"$mtc_param\":\"name\"} placeholders for downstream scalar parameters."
+                    },
+                    "parameter_schema": {
+                        "type": "object",
+                        "description": "Optional closed scalar JSON Schema. properties and required must exactly match workflow placeholders; unsafe keywords such as $ref are rejected."
                     }
                 }
             }),

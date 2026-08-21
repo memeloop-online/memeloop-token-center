@@ -200,6 +200,9 @@ fn validate_provider_config(driver: &str, config: &Value) -> Result<(), AppError
             "{driver} requires an administrator-owned workflow_id and workflow_template"
         )));
     }
+    if driver == "comfyui" {
+        crate::generation::validate_comfyui_config(config)?;
+    }
     Ok(())
 }
 

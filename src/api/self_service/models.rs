@@ -95,67 +95,7 @@ fn generation_parameter_schema(driver: &str, config_json: &str) -> Option<Value>
         return None;
     }
     let config: Value = serde_json::from_str(config_json).ok()?;
-    let workflow = config.get("workflow_template")?;
-    let mut names = std::collections::BTreeSet::new();
-    collect_workflow_parameters(workflow, &mut names, 0)?;
-    if names.is_empty() || names.len() > 100 {
-        return None;
-    }
-    let properties = names
-        .iter()
-        .map(|name| {
-            (
-                name.clone(),
-                json!({"type": ["string", "number", "boolean", "null"]}),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    Some(json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "additionalProperties": false,
-        "required": names,
-        "properties": properties
-    }))
-}
-
-fn collect_workflow_parameters(
-    value: &Value,
-    names: &mut std::collections::BTreeSet<String>,
-    depth: usize,
-) -> Option<()> {
-    if depth > 64 {
-        return None;
-    }
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                collect_workflow_parameters(value, names, depth + 1)?;
-            }
-        }
-        Value::Object(object) => {
-            if object.len() == 1 && object.contains_key("$mtc_param") {
-                let name = object.get("$mtc_param")?.as_str()?;
-                if !safe_parameter_name(name) {
-                    return None;
-                }
-                names.insert(name.to_owned());
-            } else {
-                for value in object.values() {
-                    collect_workflow_parameters(value, names, depth + 1)?;
-                }
-            }
-        }
-        _ => {}
-    }
-    Some(())
-}
-
-fn safe_parameter_name(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
-        && name.len() <= 64
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    crate::generation::comfyui_parameter_schema(&config).ok()
 }
 
 #[cfg(test)]
@@ -172,6 +112,15 @@ mod tests {
                         "prompt": {"$mtc_param": "prompt"},
                         "seed": {"$mtc_param": "seed"}
                     }}
+                },
+                "parameter_schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["prompt", "seed"],
+                    "properties": {
+                        "prompt": {"title": "Prompt", "type": "string", "enum": ["cat", "dog"]},
+                        "seed": {"type": "integer", "minimum": 0, "maximum": 100}
+                    }
                 }
             })
             .to_string(),
@@ -180,6 +129,9 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["additionalProperties"], false);
         assert!(schema["properties"].get("prompt").is_some());
+        assert_eq!(schema["properties"]["prompt"]["title"], "Prompt");
+        assert_eq!(schema["properties"]["prompt"]["enum"][0], "cat");
+        assert_eq!(schema["properties"]["seed"]["maximum"], 100);
         assert!(schema.get("input").is_none());
     }
 
