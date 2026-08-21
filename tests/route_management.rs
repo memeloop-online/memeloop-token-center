@@ -39,11 +39,18 @@ async fn json_request(
         .await
         .unwrap();
     let status = response.status();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let value = if bytes.is_empty() {
         Value::Null
-    } else {
+    } else if is_json {
         serde_json::from_slice(&bytes).unwrap()
+    } else {
+        Value::String(String::from_utf8_lossy(&bytes).into_owned())
     };
     (status, value)
 }
@@ -156,6 +163,20 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
         .await
         .unwrap();
 
+    let (status, routing) = json_request(
+        &state,
+        "GET",
+        &format!(
+            "/internal/v1/model-routes/{}/routing?tenant_external_id=route-tenant-a",
+            route.id
+        ),
+        &tenant_service.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let grant_revision = routing["grant_revision"].as_i64().unwrap();
+
     let (status, _) = json_request(
         &state,
         "PATCH",
@@ -191,7 +212,9 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
         "upstream_model": "upstream-a-v2",
         "protocol": "openai",
         "priority": 10,
-        "expected_updated_at": route.updated_at
+        "custom_model_confirmed": true,
+        "expected_updated_at": route.updated_at,
+        "expected_grant_revision": grant_revision
     });
     let (status, value) = json_request(
         &state,
@@ -228,7 +251,9 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
             "upstream_model": "upstream-a-v3",
             "protocol": "openai",
             "priority": 11,
-            "expected_updated_at": route.updated_at
+            "custom_model_confirmed": true,
+            "expected_updated_at": route.updated_at,
+            "expected_grant_revision": grant_revision
         })),
     )
     .await;
@@ -280,7 +305,8 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
         "upstream_account_id": upstream.id,
         "upstream_model": "global-managed-upstream",
         "protocol": "openai",
-        "priority": 12
+        "priority": 12,
+        "custom_model_confirmed": true
     });
     let (status, value) = json_request(
         &state,

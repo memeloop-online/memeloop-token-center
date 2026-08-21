@@ -239,9 +239,29 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         ),
     },
     Migration {
+        version: 44,
+        name: "atomic upstream model catalogs",
+        sql: include_str!("../../../migrations/common/0044_upstream_model_catalog.sql"),
+    },
+    Migration {
+        version: 45,
+        name: "durable OAuth login sessions",
+        sql: include_str!("../../../migrations/common/0045_oauth_login_sessions.sql"),
+    },
+    Migration {
+        version: 46,
+        name: "route model catalog policy",
+        sql: include_str!("../../../migrations/common/0046_route_catalog_policy.sql"),
+    },
+    Migration {
         version: 47,
         name: "immutable generation route snapshots",
         sql: include_str!("../../../migrations/common/0047_generation_route_snapshot.sql"),
+    },
+    Migration {
+        version: 48,
+        name: "routing grant relation revisions",
+        sql: include_str!("../../../migrations/common/0048_routing_grant_relation_revisions.sql"),
     },
 ];
 
@@ -468,9 +488,29 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         ),
     },
     Migration {
+        version: 44,
+        name: "atomic upstream model catalogs",
+        sql: include_str!("../../../migrations/common/0044_upstream_model_catalog.sql"),
+    },
+    Migration {
+        version: 45,
+        name: "durable OAuth login sessions",
+        sql: include_str!("../../../migrations/common/0045_oauth_login_sessions.sql"),
+    },
+    Migration {
+        version: 46,
+        name: "route model catalog policy",
+        sql: include_str!("../../../migrations/common/0046_route_catalog_policy.sql"),
+    },
+    Migration {
         version: 47,
         name: "immutable generation route snapshots",
         sql: include_str!("../../../migrations/common/0047_generation_route_snapshot.sql"),
+    },
+    Migration {
+        version: 48,
+        name: "routing grant relation revisions",
+        sql: include_str!("../../../migrations/common/0048_routing_grant_relation_revisions.sql"),
     },
 ];
 

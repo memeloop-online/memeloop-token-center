@@ -35,6 +35,7 @@ mod cloud_entitlements;
 mod control_requests;
 mod credentials;
 mod generation;
+mod groups;
 mod health;
 mod limits;
 mod model_routes;
@@ -43,6 +44,7 @@ mod proxy;
 mod request_detail;
 mod router;
 mod routes;
+mod routing;
 mod self_service;
 mod traffic;
 mod upstreams;
@@ -66,6 +68,7 @@ use control_requests::{
 };
 use credentials::*;
 use generation::*;
+use groups::*;
 use health::{
     deprecated_health, liveness, observe_http, prometheus_metrics, readiness, security_headers,
     version,
@@ -79,6 +82,7 @@ use plugins::{get_plugin_configuration, put_plugin_configuration};
 use request_detail::*;
 pub use router::{router, router_for_role};
 use routes::{control_router, gateway_router};
+use routing::*;
 use self_service::*;
 use traffic::{
     Protocol, apply_traffic_policy, component_provider_timeout, component_provider_url,
@@ -96,13 +100,14 @@ use crate::{
     archive_staging::{ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS, ArchiveStagingPurpose},
     config::RuntimeRole,
     db::{
-        AttachGenerationJobResult, AttachSynchronousImageRequestObject, CancelEntitlementInput,
-        CloudCredentialEntitlementBinding, CloudSubscriptionEventInput, CreateGenerationJobResult,
-        CreateKeyInput, CreateServiceTokenInput, CreateUpstreamAccountInput, EntitlementOperation,
-        FinishProxyRequest, FinishProxyRequestResult, FinishSynchronousImageRequest,
-        FinishSynchronousImageResult, GenerationJobIdempotency, ProxyConversationInput,
-        ReauthorizeUpstreamAccountInput, ReconcileEntitlementInput, ReplaceEntitlementInput,
-        RequestListFilter, StartGenerationJobInput, StartProxyRequest,
+        ApplyCloudEntitlementInput, AttachGenerationJobResult, AttachSynchronousImageRequestObject,
+        CancelEntitlementInput, CloudRoutingGrantSnapshot, CloudSubscriptionEventInput,
+        CreateGenerationJobResult, CreateKeyInput, CreateServiceTokenInput,
+        CreateUpstreamAccountInput, EntitlementOperation, FinishProxyRequest,
+        FinishProxyRequestResult, FinishSynchronousImageRequest, FinishSynchronousImageResult,
+        GenerationJobIdempotency, ProxyConversationInput, ReauthorizeUpstreamAccountInput,
+        ReconcileEntitlementInput, ReplaceEntitlementInput, RequestListFilter,
+        RouteSelectionOptions, StartGenerationJobInput, StartProxyRequest,
         StartSynchronousImageRequest, StartSynchronousImageResult, StatsFilter,
         SynchronousImageIdempotencyClaim, UpdateUpstreamAccountInput, unix_millis,
     },
@@ -111,10 +116,13 @@ use crate::{
     network::{self, OutboundScope},
     oauth::{
         CursorOAuthEndpoints, CursorPollResult, OAuthReauthorizationTarget, StartCursorLogin,
-        StartSubscriptionBridgeLogin, SubscriptionBridgePollResult, poll_cursor_login,
-        poll_subscription_bridge_login, refresh_cursor_credential,
-        refresh_managed_oauth_credential, resolve_managed_oauth_refresh_adapter,
-        start_cursor_login, start_subscription_bridge_login,
+        codex_device::{
+            CodexDevicePollResult, CodexDevicePollScope, OAUTH_DRIVER as CODEX_OAUTH_DRIVER,
+            PROVIDER_DRIVER as CODEX_PROVIDER_DRIVER, StartCodexDeviceLogin,
+            poll_codex_device_login, start_codex_device_login,
+        },
+        poll_cursor_login, refresh_cursor_credential, refresh_managed_oauth_credential,
+        resolve_managed_oauth_refresh_adapter, start_cursor_login,
     },
     plugin::{PreparedProviderRequest, memeloop::token_center::types::RequestContext},
     provider::{UpstreamCredential, validate_config},

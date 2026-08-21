@@ -13,6 +13,10 @@ pub(in crate::api) struct CreateKeyRequest {
     policy: KeyPolicy,
     #[serde(default = "zero_amount")]
     initial_balance: String,
+    #[serde(default)]
+    route_ids: Vec<Uuid>,
+    #[serde(default)]
+    route_group_ids: Vec<Uuid>,
 }
 
 pub(in crate::api) fn default_tenant() -> String {
@@ -47,7 +51,7 @@ pub(in crate::api) async fn create_key(
         .map(str::to_owned);
     let issued = state
         .db
-        .create_key(
+        .create_key_with_routing(
             CreateKeyInput {
                 tenant_external_id: body.tenant_external_id,
                 principal_external_id: body.principal_external_id,
@@ -57,6 +61,8 @@ pub(in crate::api) async fn create_key(
                 initial_balance,
                 idempotency_key,
             },
+            &body.route_ids,
+            &body.route_group_ids,
             state.config.key_pepper.as_bytes(),
         )
         .await?;

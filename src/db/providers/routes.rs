@@ -1,3 +1,7 @@
+use super::super::routing::{
+    bump_credential_grant_revisions, bump_route_group_relation_timestamps,
+    lock_routing_relation_writes,
+};
 use super::super::*;
 
 pub struct CreateModelRouteInput {
@@ -81,7 +85,7 @@ impl Database {
             return Err(AppError::Forbidden);
         }
         let inserted = sqlx::query(
-            "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9) ON CONFLICT(tenant_id, public_model, protocol, priority) DO NOTHING",
+            "INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9) ON CONFLICT(id) DO NOTHING",
         )
         .bind(route_id.to_string())
         .bind(&tenant_id)
@@ -115,6 +119,9 @@ impl Database {
                 "another route already uses this public model, protocol, and priority".into(),
             ));
         }
+        sqlx::query("INSERT INTO model_route_upstream_accounts (tenant_id, model_route_id, upstream_account_id, upstream_model, scheduling_weight, created_at, catalog_policy) VALUES ($1, $2, $3, $4, 100, $5, 'explicit_custom')")
+            .bind(&tenant_id).bind(route_id.to_string()).bind(input.upstream_account_id.to_string())
+            .bind(input.upstream_model.trim()).bind(now).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(ModelRouteView {
             id: route_id,
@@ -215,6 +222,11 @@ impl Database {
                 "reload the model route before saving it again".into(),
             ));
         }
+        sqlx::query("DELETE FROM model_route_upstream_accounts WHERE tenant_id = $1 AND model_route_id = $2")
+            .bind(current_view.tenant_id.to_string()).bind(route_id.to_string()).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO model_route_upstream_accounts (tenant_id, model_route_id, upstream_account_id, upstream_model, scheduling_weight, created_at, catalog_policy) VALUES ($1, $2, $3, $4, 100, $5, 'explicit_custom')")
+            .bind(current_view.tenant_id.to_string()).bind(route_id.to_string()).bind(input.upstream_account_id.to_string())
+            .bind(upstream_model).bind(updated_at).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(ModelRouteView {
             id: route_id,
@@ -284,17 +296,27 @@ impl Database {
         expected_updated_at: i64,
     ) -> Result<(), AppError> {
         let mut tx = self.begin_write_transaction().await?;
-        let route = sqlx::query(
-            "SELECT r.tenant_id, r.enabled, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
+        let tenant_id = sqlx::query(
+            "SELECT r.tenant_id FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
         )
         .bind(route_id.to_string())
         .bind(tenant_external_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(route) = route else {
+        let Some(tenant_id) = tenant_id else {
             tx.commit().await?;
             return Ok(());
         };
+        let tenant_id: String = tenant_id.try_get("tenant_id")?;
+        lock_routing_relation_writes(&mut tx, &tenant_id).await?;
+        let route = sqlx::query(
+            "SELECT enabled, updated_at FROM model_routes WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(route_id.to_string())
+        .bind(&tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
         let enabled = route.try_get::<i64, _>("enabled")? != 0;
         let updated_at: i64 = route.try_get("updated_at")?;
         if enabled {
@@ -318,11 +340,31 @@ impl Database {
                 "the route has request history and must be retained in a disabled state".into(),
             ));
         }
+        let granted_key_ids = sqlx::query(
+            "SELECT key_id AS id FROM routing_grants WHERE tenant_id = $1 AND model_route_id = $2 ORDER BY key_id",
+        )
+        .bind(&tenant_id)
+        .bind(route_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| parse_uuid(row.try_get("id")?))
+        .collect::<Result<Vec<_>, _>>()?;
+        let route_group_ids = sqlx::query(
+            "SELECT route_group_id AS id FROM model_route_group_memberships WHERE tenant_id = $1 AND model_route_id = $2 ORDER BY route_group_id",
+        )
+        .bind(&tenant_id)
+        .bind(route_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| parse_uuid(row.try_get("id")?))
+        .collect::<Result<Vec<_>, _>>()?;
         let changed = sqlx::query(
             "DELETE FROM model_routes WHERE id = $1 AND tenant_id = $2 AND enabled = 0 AND updated_at = $3",
         )
         .bind(route_id.to_string())
-        .bind(route.try_get::<String, _>("tenant_id")?)
+        .bind(&tenant_id)
         .bind(expected_updated_at)
         .execute(&mut *tx)
         .await?;
@@ -331,6 +373,9 @@ impl Database {
                 "reload the model route before deleting it".into(),
             ));
         }
+        bump_credential_grant_revisions(&mut tx, &tenant_id, &granted_key_ids).await?;
+        bump_route_group_relation_timestamps(&mut tx, &tenant_id, &route_group_ids, unix_millis())
+            .await?;
         tx.commit().await?;
         Ok(())
     }

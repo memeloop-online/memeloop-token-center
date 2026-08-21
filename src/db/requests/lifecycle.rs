@@ -93,20 +93,8 @@ pub enum AttachProxyArchiveResult {
 
 impl Database {
     pub async fn allowed_models(&self, key: &AuthenticatedKey) -> Result<Vec<String>, AppError> {
-        let rows = sqlx::query("SELECT model FROM model_prices WHERE currency = $1 UNION SELECT model FROM generation_prices WHERE currency = $2 ORDER BY model")
-            .bind(&key.currency)
-            .bind(&key.currency)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter()
-            .map(|row| row.try_get::<String, _>("model").map_err(AppError::from))
-            .filter(|result| {
-                result
-                    .as_ref()
-                    .map(|model| key.policy.allows_model(model))
-                    .unwrap_or(true)
-            })
-            .collect()
+        self.granted_available_models(key.key_id, key.tenant_id)
+            .await
     }
 
     pub async fn start_proxy_request(

@@ -84,13 +84,6 @@ impl Protocol {
             Self::AnthropicCountTokens => "/v1/messages/count_tokens",
         }
     }
-
-    pub(super) fn is_openai(self) -> bool {
-        matches!(
-            self,
-            Self::OpenAiChat | Self::OpenAiResponses | Self::OpenAiEmbeddings
-        )
-    }
 }
 
 pub(super) fn inject_controlled_output_ceiling(
@@ -144,10 +137,9 @@ pub(super) struct AppliedTraffic {
 }
 
 /// Traffic plugins run only after core key authentication. Both the client
-/// model and the effective rewritten model are checked against the stable key
-/// policy; each caller must then resolve the rewritten route and price before
-/// reserving credit. This shared gate keeps text, synchronous images, and
-/// asynchronous Seedance/ComfyUI submissions on identical policy semantics.
+/// model and the effective rewritten model must resolve through normalized
+/// exact-route or route-group grants. A plugin may narrow the resulting
+/// account candidates, but cannot create a permission or bypass exclusions.
 pub(super) async fn apply_traffic_policy(
     state: &AppState,
     key: &AuthenticatedKey,
@@ -165,7 +157,11 @@ pub(super) async fn apply_traffic_policy(
         .filter(|value| !value.trim().is_empty() && value.len() <= 200)
         .ok_or_else(|| AppError::BadRequest("model is required".into()))?
         .to_owned();
-    if !key.policy.allows_model(&requested_model) {
+    if !state
+        .db
+        .credential_has_available_route(key.key_id, key.tenant_id, &requested_model, protocol)
+        .await?
+    {
         return Err(AppError::Forbidden);
     }
     let plugins = state.plugins.clone();
@@ -220,7 +216,11 @@ pub(super) async fn apply_traffic_policy(
             "plugin returned an invalid model".into(),
         ));
     }
-    if !key.policy.allows_model(&model) {
+    if !state
+        .db
+        .credential_has_available_route(key.key_id, key.tenant_id, &model, protocol)
+        .await?
+    {
         return Err(AppError::Forbidden);
     }
     request_json["model"] = Value::String(model.clone());

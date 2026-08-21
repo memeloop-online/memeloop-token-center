@@ -6,6 +6,7 @@ pub(in crate::api) async fn create_generation(
     Json(body): Json<CreateGenerationRequest>,
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
+    let routing_selection_seed = Uuid::now_v7();
     let applied = apply_traffic_policy(
         &state,
         &key,
@@ -24,11 +25,15 @@ pub(in crate::api) async fn create_generation(
     }
     let route = state
         .db
-        .resolve_upstream_with_hint(
+        .resolve_authorized_upstream_with_hint(
+            key.key_id,
             key.tenant_id,
             &body.model,
             "generation",
-            applied.upstream_account_hint,
+            RouteSelectionOptions {
+                upstream_account_hint: applied.upstream_account_hint,
+                selection_seed: routing_selection_seed,
+            },
             state.config.key_pepper.as_bytes(),
         )
         .await?

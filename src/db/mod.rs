@@ -38,12 +38,15 @@ mod billing;
 mod constants;
 mod credentials;
 mod generation;
+mod groups;
 mod migrations;
+mod oauth_sessions;
 mod plugin_configurations;
 mod plugin_kv;
 mod providers;
 mod requests;
 mod rotation;
+mod routing;
 mod rows;
 mod time;
 mod usage_analysis;
@@ -57,24 +60,29 @@ use validation::*;
 
 pub(crate) use billing::validate_entitlement_operation;
 pub use billing::{
-    CancelEntitlementInput, CloudSubscriptionEventInput, EntitlementOperation,
+    ApplyCloudEntitlementInput, ApplyCloudEntitlementResult, CancelEntitlementInput,
+    CloudRoutingGrantSnapshot, CloudSubscriptionEventInput, EntitlementOperation,
     ReconcileEntitlementInput, ReplaceEntitlementInput,
 };
-pub(crate) use credentials::validate_key_policy;
-pub use credentials::{
-    CloudCredentialEntitlementBinding, CreateKeyInput, CreateServiceTokenInput,
-    ProvisionedCloudCredential,
+pub(crate) use credentials::{
+    CloudCredentialProvisioningInput, replace_key_routing_grants_in_transaction,
+    validate_key_policy,
 };
+pub use credentials::{CreateKeyInput, CreateServiceTokenInput, ProvisionedCloudCredential};
 pub use generation::{
     AttachGenerationJobResult, AttachSynchronousImageRequestObject, CreateGenerationJobInput,
     CreateGenerationJobResult, FinishGenerationJobInput, FinishSynchronousImageRequest,
     FinishSynchronousImageResult, GenerationJobIdempotency, StartGenerationJobInput,
     StartSynchronousImageRequest, StartSynchronousImageResult, SynchronousImageIdempotencyClaim,
 };
+pub use groups::{
+    CreateGroupInput, GroupKind, GroupView, ReplaceGroupMembersInput, UpdateGroupInput,
+};
 pub use migrations::{BlockedPartition, PartitionMaintenanceReport};
 pub(crate) use migrations::{POSTGRES_MIGRATIONS, SQLITE_MIGRATIONS};
 #[cfg(test)]
 use migrations::{apply_migration_range, maintain_postgres_partitions};
+pub use oauth_sessions::{BeginOAuthLoginSession, OAuthLoginClaim, OAuthLoginSessionReference};
 pub use providers::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, CreateModelRouteInput,
     CreateUpstreamAccountInput, DiscoveredUpstreamModel, ImportManagedOAuthAccountInput,
@@ -109,6 +117,10 @@ pub(crate) use requests::{
 pub(crate) use requests::{
     FILTERED_ACTIVITY_SOURCE_FACTS, FILTERED_ACTIVITY_SOURCE_PENDING,
     FILTERED_ACTIVITY_SOURCE_ROLLUPS,
+};
+pub use routing::{
+    CreateRoutedModelRouteInput, CredentialRoutingView, ReplaceCredentialRoutingInput,
+    ReplaceRouteRoutingInput, RouteRoutingView, RouteSelectionOptions, UpdateRoutedModelRouteInput,
 };
 pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
 

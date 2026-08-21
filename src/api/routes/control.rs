@@ -7,6 +7,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route("/internal/v1/keys/{key_id}/alias", patch(rename_key))
         .route("/internal/v1/keys/{key_id}/limits", get(key_limits))
         .route("/internal/v1/keys/{key_id}/policy", put(update_key_policy))
+        .route(
+            "/internal/v1/keys/{key_id}/routing",
+            get(get_credential_routing).put(replace_credential_routing),
+        )
         .route("/internal/v1/keys/{key_id}/status", patch(set_key_status))
         .route(
             "/internal/v1/keys/{key_id}/legacy-credentials",
@@ -34,6 +38,8 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route("/internal/v1/schemas", get(configuration_schemas))
         .route("/internal/v1/oauth/cursor/start", post(start_cursor_oauth))
         .route("/internal/v1/oauth/cursor/poll", post(poll_cursor_oauth))
+        .route("/internal/v1/oauth/codex/start", post(start_codex_oauth))
+        .route("/internal/v1/oauth/codex/poll", post(poll_codex_oauth))
         .route(
             "/internal/v1/oauth/provider-adapter/start",
             post(start_provider_adapter_oauth),
@@ -41,14 +47,6 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/oauth/provider-adapter/poll",
             post(poll_cursor_oauth),
-        )
-        .route(
-            "/internal/v1/oauth/subscription-bridge/start",
-            post(start_subscription_bridge_oauth),
-        )
-        .route(
-            "/internal/v1/oauth/subscription-bridge/poll",
-            post(poll_subscription_bridge_oauth),
         )
         .route(
             "/internal/v1/upstreams",
@@ -62,11 +60,6 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             "/internal/v1/imports/cpa/managed-oauth",
             post(import_cpa_managed_oauth)
                 .layer(DefaultBodyLimit::max(MAX_MANAGED_OAUTH_IMPORT_REQUEST)),
-        )
-        .route(
-            "/internal/v1/imports/cpa/subscription-accounts",
-            post(import_cpa_subscription_accounts)
-                .layer(DefaultBodyLimit::max(MAX_CPA_IMPORT_BODY)),
         )
         .route(
             "/internal/v1/imports/session-archive/quarantine",
@@ -138,6 +131,46 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             put(update_model_route)
                 .patch(set_model_route_enabled)
                 .delete(delete_model_route),
+        )
+        .route(
+            "/internal/v1/model-routes/{route_id}/routing",
+            get(get_route_routing).put(replace_route_routing),
+        )
+        .route(
+            "/internal/v1/provider-groups",
+            get(list_provider_groups).post(create_provider_group),
+        )
+        .route(
+            "/internal/v1/provider-groups/{group_id}",
+            put(update_provider_group).delete(delete_provider_group),
+        )
+        .route(
+            "/internal/v1/provider-groups/{group_id}/members",
+            put(replace_provider_group_members),
+        )
+        .route(
+            "/internal/v1/route-groups",
+            get(list_route_groups).post(create_route_group),
+        )
+        .route(
+            "/internal/v1/route-groups/{group_id}",
+            put(update_route_group).delete(delete_route_group),
+        )
+        .route(
+            "/internal/v1/route-groups/{group_id}/members",
+            put(replace_route_group_members),
+        )
+        .route(
+            "/internal/v1/credential-groups",
+            get(list_credential_groups).post(create_credential_group),
+        )
+        .route(
+            "/internal/v1/credential-groups/{group_id}",
+            put(update_credential_group).delete(delete_credential_group),
+        )
+        .route(
+            "/internal/v1/credential-groups/{group_id}/members",
+            put(replace_credential_group_members),
         )
         .route("/internal/v1/model-prices", get(list_model_prices))
         .route(

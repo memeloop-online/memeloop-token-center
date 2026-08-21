@@ -292,7 +292,7 @@ async fn aggregate_uses_only_provider_groups_and_exclusion_wins() {
     }
     let included = state
         .db
-        .create_routing_group(
+        .create_group(
             GroupKind::Provider,
             CreateGroupInput {
                 tenant_external_id: "aggregate-tenant".into(),
@@ -303,7 +303,7 @@ async fn aggregate_uses_only_provider_groups_and_exclusion_wins() {
         .unwrap();
     let included = state
         .db
-        .replace_routing_group_members(
+        .replace_group_members(
             GroupKind::Provider,
             included.id,
             ReplaceGroupMembersInput {
@@ -316,7 +316,7 @@ async fn aggregate_uses_only_provider_groups_and_exclusion_wins() {
         .unwrap();
     let excluded = state
         .db
-        .create_routing_group(
+        .create_group(
             GroupKind::Provider,
             CreateGroupInput {
                 tenant_external_id: "aggregate-tenant".into(),
@@ -327,7 +327,7 @@ async fn aggregate_uses_only_provider_groups_and_exclusion_wins() {
         .unwrap();
     let excluded = state
         .db
-        .replace_routing_group_members(
+        .replace_group_members(
             GroupKind::Provider,
             excluded.id,
             ReplaceGroupMembersInput {
@@ -361,7 +361,7 @@ async fn aggregate_uses_only_provider_groups_and_exclusion_wins() {
 
     let route_group = state
         .db
-        .create_routing_group(
+        .create_group(
             GroupKind::Route,
             CreateGroupInput {
                 tenant_external_id: "aggregate-tenant".into(),
@@ -380,7 +380,7 @@ async fn aggregate_uses_only_provider_groups_and_exclusion_wins() {
 
     let credential_group = state
         .db
-        .create_routing_group(
+        .create_group(
             GroupKind::Credential,
             CreateGroupInput {
                 tenant_external_id: "aggregate-tenant".into(),

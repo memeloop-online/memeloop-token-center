@@ -85,11 +85,15 @@ async fn proxy_openai_image_generation(
     let preparation = async {
         let route = state
             .db
-            .resolve_upstream_with_hint(
+            .resolve_authorized_upstream_with_hint(
+                key.key_id,
                 key.tenant_id,
                 &model,
                 "generation",
-                applied.upstream_account_hint,
+                RouteSelectionOptions {
+                    upstream_account_hint: applied.upstream_account_hint,
+                    selection_seed: request_id,
+                },
                 state.config.key_pepper.as_bytes(),
             )
             .await?
