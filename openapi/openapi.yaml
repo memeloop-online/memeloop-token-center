@@ -5102,6 +5102,27 @@ components:
       properties:
         currency: { $ref: '#/components/schemas/Currency' }
         cost: { $ref: '#/components/schemas/NonNegativeMoney' }
+    UsageAnalysisGenerationUnitsByModality:
+      type: object
+      additionalProperties: false
+      required: [modality, currency, units]
+      properties:
+        modality:
+          type: string
+          enum: [image, video, unknown]
+        currency: { $ref: '#/components/schemas/Currency' }
+        units: { type: integer, format: int64, minimum: 0 }
+    UsageAnalysisGenerationUnitsByBillingUnit:
+      type: object
+      additionalProperties: false
+      required: [billing_unit, currency, units]
+      properties:
+        billing_unit:
+          type: string
+          minLength: 1
+          description: Immutable generation price billing-unit snapshot, or unknown.
+        currency: { $ref: '#/components/schemas/Currency' }
+        units: { type: integer, format: int64, minimum: 0 }
     UsageAnalysisMetrics:
       type: object
       required: [requests, success, failed, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, avg_duration_ms, p95_duration_ms, costs]
@@ -5165,7 +5186,7 @@ components:
     UsageAnalysis:
       type: object
       additionalProperties: false
-      required: [from_created_at, to_created_at, granularity, time_zone, p95_is_approximate, p95_method, upstream_grouping, summary, time_series, by_model, by_key, by_upstream, by_protocol, by_status, errors, heatmap]
+      required: [from_created_at, to_created_at, granularity, time_zone, p95_is_approximate, p95_method, upstream_grouping, summary, generation_units_by_modality, generation_units_by_billing_unit, time_series, by_model, by_key, by_upstream, by_protocol, by_status, errors, heatmap]
       properties:
         from_created_at: { type: integer, format: int64, minimum: 0 }
         to_created_at: { type: integer, format: int64, minimum: 0 }
@@ -5181,6 +5202,14 @@ components:
             and OAuth rotations. Historical requests are never relabelled as the
             account's current credential generation.
         summary: { $ref: '#/components/schemas/UsageAnalysisMetrics' }
+        generation_units_by_modality:
+          type: array
+          description: Units remain separated by currency and are never added across currencies.
+          items: { $ref: '#/components/schemas/UsageAnalysisGenerationUnitsByModality' }
+        generation_units_by_billing_unit:
+          type: array
+          description: Units remain separated by currency and are never added across currencies.
+          items: { $ref: '#/components/schemas/UsageAnalysisGenerationUnitsByBillingUnit' }
         time_series:
           type: array
           items: { $ref: '#/components/schemas/UsageAnalysisTimeBucket' }

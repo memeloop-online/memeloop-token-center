@@ -426,6 +426,20 @@ pub struct UsageAnalysisCost {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub struct UsageAnalysisGenerationUnitsByModality {
+    pub modality: String,
+    pub currency: String,
+    pub units: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct UsageAnalysisGenerationUnitsByBillingUnit {
+    pub billing_unit: String,
+    pub currency: String,
+    pub units: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct UsageAnalysisMetrics {
     pub requests: i64,
     pub success: i64,
@@ -477,6 +491,8 @@ pub struct UsageAnalysisResponse {
     /// credential rotations. Historical requests are never relabelled as the current generation.
     pub upstream_grouping: String,
     pub summary: UsageAnalysisMetrics,
+    pub generation_units_by_modality: Vec<UsageAnalysisGenerationUnitsByModality>,
+    pub generation_units_by_billing_unit: Vec<UsageAnalysisGenerationUnitsByBillingUnit>,
     pub time_series: Vec<UsageAnalysisTimeBucket>,
     pub by_model: Vec<UsageAnalysisBucket>,
     pub by_key: Vec<UsageAnalysisBucket>,

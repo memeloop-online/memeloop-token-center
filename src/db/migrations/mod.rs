@@ -268,6 +268,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "MemeLoop Cloud event query indexes",
         sql: include_str!("../../../migrations/common/0049_memeloop_cloud_event_queries.sql"),
     },
+    Migration {
+        version: 49,
+        name: "generation usage modality and billing dimensions",
+        sql: include_str!("../../../migrations/common/0049_generation_usage_dimensions.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -521,6 +526,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 49,
         name: "MemeLoop Cloud event query indexes",
         sql: include_str!("../../../migrations/common/0049_memeloop_cloud_event_queries.sql"),
+    },
+    Migration {
+        version: 49,
+        name: "generation usage modality and billing dimensions",
+        sql: include_str!("../../../migrations/common/0049_generation_usage_dimensions.sql"),
     },
 ];
 

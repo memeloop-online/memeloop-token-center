@@ -156,9 +156,15 @@ fn assert_exact_boundary_response(body: &Value, bucket_start: i64) {
     );
 }
 
-enum SeedUsageKind {
-    Request { input_tokens: i64 },
-    Generation { units: i64 },
+enum SeedUsageKind<'a> {
+    Request {
+        input_tokens: i64,
+    },
+    Generation {
+        units: i64,
+        modality: &'a str,
+        billing_unit: &'a str,
+    },
 }
 
 struct SeedUsageActivity<'a> {
@@ -170,7 +176,7 @@ struct SeedUsageActivity<'a> {
     error_code: &'a str,
     upstream_account_id: Option<Uuid>,
     cost_micros: i64,
-    kind: SeedUsageKind,
+    kind: SeedUsageKind<'a>,
 }
 
 async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
@@ -180,58 +186,66 @@ async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
         .upstream_account_id
         .map(|id| id.to_string())
         .unwrap_or_default();
-    let (source_kind, protocol, input_tokens, generation_units) = match activity.kind {
-        SeedUsageKind::Request { input_tokens } => {
-            sqlx::query(
-                r#"INSERT INTO request_stats_facts (
+    let (source_kind, protocol, input_tokens, generation_units, modality, billing_unit) =
+        match activity.kind {
+            SeedUsageKind::Request { input_tokens } => {
+                sqlx::query(
+                    r#"INSERT INTO request_stats_facts (
                        request_id, tenant_id, key_id, created_at, model, protocol,
                        status_class, error_code, upstream_account_id, model_route_id,
                        duration_ms, input_tokens, output_tokens, cached_input_tokens,
                        cache_write_tokens, service_tier, currency, cost_micros
                    ) VALUES ($1, $2, $3, $4, $5, 'openai-responses', $6, $7, $8, '',
                              20, $9, 0, 0, 0, 'default', $10, $11)"#,
-            )
-            .bind(Uuid::now_v7().to_string())
-            .bind(&tenant_id)
-            .bind(&key_id)
-            .bind(activity.created_at)
-            .bind(activity.model)
-            .bind(activity.status_class)
-            .bind(activity.error_code)
-            .bind(&upstream_account_id)
-            .bind(input_tokens)
-            .bind(activity.currency)
-            .bind(activity.cost_micros)
-            .execute(pool)
-            .await
-            .unwrap();
-            ("request", "openai", input_tokens, 0)
-        }
-        SeedUsageKind::Generation { units } => {
-            sqlx::query(
-                r#"INSERT INTO generation_stats_facts (
+                )
+                .bind(Uuid::now_v7().to_string())
+                .bind(&tenant_id)
+                .bind(&key_id)
+                .bind(activity.created_at)
+                .bind(activity.model)
+                .bind(activity.status_class)
+                .bind(activity.error_code)
+                .bind(&upstream_account_id)
+                .bind(input_tokens)
+                .bind(activity.currency)
+                .bind(activity.cost_micros)
+                .execute(pool)
+                .await
+                .unwrap();
+                ("request", "openai", input_tokens, 0, "", "")
+            }
+            SeedUsageKind::Generation {
+                units,
+                modality,
+                billing_unit,
+            } => {
+                sqlx::query(
+                    r#"INSERT INTO generation_stats_facts (
                        job_id, tenant_id, key_id, created_at, model, status_class,
                        error_code, upstream_account_id, duration_ms, cost_micros, billed_units,
-                       currency
-                   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 20, $9, $10, $11)"#,
-            )
-            .bind(Uuid::now_v7().to_string())
-            .bind(&tenant_id)
-            .bind(&key_id)
-            .bind(activity.created_at)
-            .bind(activity.model)
-            .bind(activity.status_class)
-            .bind(activity.error_code)
-            .bind(&upstream_account_id)
-            .bind(activity.cost_micros)
-            .bind(units)
-            .bind(activity.currency)
-            .execute(pool)
-            .await
-            .unwrap();
-            ("generation", "generation", 0, units)
-        }
-    };
+                       currency, modality, billing_unit, model_route_id
+                   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 20, $9, $10, $11,
+                             $12, $13, '')"#,
+                )
+                .bind(Uuid::now_v7().to_string())
+                .bind(&tenant_id)
+                .bind(&key_id)
+                .bind(activity.created_at)
+                .bind(activity.model)
+                .bind(activity.status_class)
+                .bind(activity.error_code)
+                .bind(&upstream_account_id)
+                .bind(activity.cost_micros)
+                .bind(units)
+                .bind(activity.currency)
+                .bind(modality)
+                .bind(billing_unit)
+                .execute(pool)
+                .await
+                .unwrap();
+                ("generation", "generation", 0, units, modality, billing_unit)
+            }
+        };
 
     for (table, bucket_column, bucket) in [
         (
@@ -280,6 +294,43 @@ async fn seed_usage_activity(pool: &AnyPool, activity: SeedUsageActivity<'_>) {
             .await
             .unwrap();
     }
+    if source_kind == "generation" {
+        for (table, bucket_column, bucket) in [
+            (
+                "generation_usage_dimensions_hourly",
+                "hour_bucket",
+                activity.created_at.div_euclid(3_600_000),
+            ),
+            (
+                "generation_usage_dimensions_daily",
+                "day_bucket",
+                activity.created_at.div_euclid(86_400_000),
+            ),
+        ] {
+            let sql = format!(
+                r#"INSERT INTO {table} (
+                       tenant_id, key_id, {bucket_column}, model, status_class,
+                       error_code, upstream_account_id, model_route_id, modality,
+                       billing_unit, currency, units
+                   ) VALUES ($1, $2, $3, $4, $5, $6, $7, '', $8, $9, $10, $11)"#
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&tenant_id)
+                .bind(&key_id)
+                .bind(bucket)
+                .bind(activity.model)
+                .bind(activity.status_class)
+                .bind(activity.error_code)
+                .bind(&upstream_account_id)
+                .bind(modality)
+                .bind(billing_unit)
+                .bind(activity.currency)
+                .bind(generation_units)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
 }
 
 fn assert_multibucket_metrics(body: &Value) {
@@ -289,6 +340,22 @@ fn assert_multibucket_metrics(body: &Value) {
     assert_eq!(body["summary"]["failed"], 3, "{body}");
     assert_eq!(body["summary"]["input_tokens"], 90, "{body}");
     assert_eq!(body["summary"]["generation_units"], 12, "{body}");
+    assert_eq!(
+        body["generation_units_by_modality"],
+        serde_json::json!([
+            {"modality": "image", "currency": "CNY", "units": 8},
+            {"modality": "video", "currency": "USD", "units": 4}
+        ]),
+        "{body}"
+    );
+    assert_eq!(
+        body["generation_units_by_billing_unit"],
+        serde_json::json!([
+            {"billing_unit": "job", "currency": "CNY", "units": 8},
+            {"billing_unit": "second", "currency": "USD", "units": 4}
+        ]),
+        "{body}"
+    );
     assert_eq!(body["summary"]["costs"][0]["currency"], "CNY", "{body}");
     assert_eq!(body["summary"]["costs"][0]["cost"], "11", "{body}");
     assert_eq!(body["summary"]["costs"][1]["currency"], "USD", "{body}");
@@ -414,7 +481,11 @@ async fn assert_multibucket_usage_analysis(database_url: String, tenant: String)
             error_code: "edge_generation_error",
             upstream_account_id: None,
             cost_micros: 2_000_000,
-            kind: SeedUsageKind::Generation { units: 2 },
+            kind: SeedUsageKind::Generation {
+                units: 2,
+                modality: "image",
+                billing_unit: "job",
+            },
         },
         SeedUsageActivity {
             key: &cny,
@@ -436,7 +507,11 @@ async fn assert_multibucket_usage_analysis(database_url: String, tenant: String)
             error_code: "",
             upstream_account_id: Some(upstream.id),
             cost_micros: 4_000_000,
-            kind: SeedUsageKind::Generation { units: 4 },
+            kind: SeedUsageKind::Generation {
+                units: 4,
+                modality: "video",
+                billing_unit: "second",
+            },
         },
         SeedUsageActivity {
             key: &usd,
@@ -458,7 +533,11 @@ async fn assert_multibucket_usage_analysis(database_url: String, tenant: String)
             error_code: "",
             upstream_account_id: None,
             cost_micros: 6_000_000,
-            kind: SeedUsageKind::Generation { units: 6 },
+            kind: SeedUsageKind::Generation {
+                units: 6,
+                modality: "image",
+                billing_unit: "job",
+            },
         },
         SeedUsageActivity {
             key: &cny,
@@ -469,7 +548,11 @@ async fn assert_multibucket_usage_analysis(database_url: String, tenant: String)
             error_code: "",
             upstream_account_id: None,
             cost_micros: 80_000_000,
-            kind: SeedUsageKind::Generation { units: 80 },
+            kind: SeedUsageKind::Generation {
+                units: 80,
+                modality: "image",
+                billing_unit: "job",
+            },
         },
     ];
     for activity in activities {
