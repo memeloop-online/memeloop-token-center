@@ -7,6 +7,41 @@ use super::{
 };
 use crate::oauth::copilot;
 
+pub(crate) fn trigger_copilot_remint_on_auth_failure(
+    state: &AppState,
+    route_driver: Option<&str>,
+    upstream_account_id: Option<Uuid>,
+    request_id: Uuid,
+    status: StatusCode,
+) {
+    if route_driver != Some(copilot::PROVIDER_DRIVER)
+        || !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+    {
+        return;
+    }
+    let Some(account_id) = upstream_account_id else {
+        return;
+    };
+    let refresh_state = state.clone();
+    let idempotency_key = format!("copilot-capi-{request_id}");
+    tokio::spawn(async move {
+        if let Err(error) = super::oauth::refresh_managed_upstream_oauth(
+            &refresh_state,
+            account_id,
+            &idempotency_key,
+        )
+        .await
+        {
+            tracing::warn!(
+                %account_id,
+                status = %status,
+                error = %error,
+                "Copilot short-token remint failed"
+            );
+        }
+    });
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct StartCopilotOAuthRequest {

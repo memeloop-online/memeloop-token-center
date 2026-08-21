@@ -387,7 +387,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
       alias: 'Browser worker blocker fixture',
       currency: 'USD',
       initial_balance: '1',
-      policy: { allowed_models: [imageModel] },
+      policy: {},
       route_ids: [imageRoute.id],
       route_group_ids: [],
     },

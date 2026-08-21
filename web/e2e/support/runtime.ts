@@ -239,7 +239,6 @@ async function seedThroughHttp(): Promise<SeedState> {
       currency: 'USD',
       initial_balance: '1000',
       policy: {
-        allowed_models: [model],
         requests_per_minute: 1000,
         tokens_per_minute: 200000000,
         max_concurrency: 4,
@@ -260,7 +259,6 @@ async function seedThroughHttp(): Promise<SeedState> {
       currency: 'USD',
       initial_balance: '1',
       policy: {
-        allowed_models: [model],
         requests_per_minute: 1,
         tokens_per_minute: 100,
         max_concurrency: 1,

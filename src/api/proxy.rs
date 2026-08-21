@@ -3,43 +3,16 @@ use super::*;
 #[path = "codex_transport.rs"]
 mod codex_transport;
 
+mod lifecycle;
 mod streaming;
+
+use lifecycle::{AbortTaskOnDrop, run_bounded_proxy_lifecycle};
 
 #[cfg(test)]
 mod tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
-
-struct AbortTaskOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
-
-impl<T> AbortTaskOnDrop<T> {
-    fn new(task: tokio::task::JoinHandle<T>) -> Self {
-        Self(Some(task))
-    }
-
-    fn abort(&mut self) {
-        if let Some(task) = self.0.take() {
-            task.abort();
-        }
-    }
-}
-
-impl<T> Drop for AbortTaskOnDrop<T> {
-    fn drop(&mut self) {
-        self.abort();
-    }
-}
-
-async fn run_bounded_proxy_lifecycle<F>(
-    deadline: tokio::time::Instant,
-    lifecycle: F,
-) -> Result<F::Output, tokio::time::error::Elapsed>
-where
-    F: std::future::Future,
-{
-    tokio::time::timeout_at(deadline, lifecycle).await
-}
 
 pub(super) async fn proxy(
     state: AppState,
@@ -466,29 +439,13 @@ pub(super) async fn proxy(
     };
     let status = upstream.status();
     if !status.is_success() {
-        if route_driver.as_deref() == Some(crate::oauth::copilot::PROVIDER_DRIVER)
-            && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-            && let Some(account_id) = upstream_account_id
-        {
-            let refresh_state = state.clone();
-            let idempotency_key = format!("copilot-capi-{request_id}");
-            tokio::spawn(async move {
-                if let Err(error) = crate::api::refresh_managed_upstream_oauth(
-                    &refresh_state,
-                    account_id,
-                    &idempotency_key,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        %account_id,
-                        status = %status,
-                        error = %error,
-                        "Copilot short-token remint failed"
-                    );
-                }
-            });
-        }
+        crate::api::trigger_copilot_remint_on_auth_failure(
+            &state,
+            route_driver.as_deref(),
+            upstream_account_id,
+            request_id,
+            status,
+        );
         drop(upstream);
         return finish_buffered_request(
             &buffered_request,
