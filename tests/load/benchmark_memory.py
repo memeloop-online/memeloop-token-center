@@ -154,7 +154,12 @@ class MockHandler(BaseHTTPRequestHandler):
                 total = int(benchmark.get("bytes", 0))
                 chunk = max(4096, min(int(benchmark.get("chunk_bytes", 262144)), MIB))
                 delay_ms = float(benchmark.get("delay_ms", 0))
-                self._stream_bytes(total, chunk, delay_ms)
+                self._stream_bytes(
+                    total,
+                    chunk,
+                    delay_ms,
+                    content_type="text/event-stream",
+                )
                 return
             self._send_json(
                 200,
@@ -485,6 +490,25 @@ def stop_process(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=3)
 
 
+def custom_model_route_payload(
+    tenant: str,
+    public_model: str,
+    upstream_account_id: str,
+    upstream_model: str,
+    protocol: str,
+) -> dict[str, object]:
+    """Build a benchmark-only route that explicitly opts into a custom model."""
+    return {
+        "tenant_external_id": tenant,
+        "public_model": public_model,
+        "upstream_account_id": upstream_account_id,
+        "upstream_model": upstream_model,
+        "protocol": protocol,
+        "priority": 0,
+        "custom_model_confirmed": True,
+    }
+
+
 def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) -> str:
     tenant = "memory-benchmark"
     text_model = "benchmark-text"
@@ -508,14 +532,9 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
         "POST",
         "/internal/v1/model-routes",
         service_token,
-        {
-            "tenant_external_id": tenant,
-            "public_model": text_model,
-            "upstream_account_id": text_upstream["id"],
-            "upstream_model": text_model,
-            "protocol": "openai",
-            "priority": 0,
-        },
+        custom_model_route_payload(
+            tenant, text_model, text_upstream["id"], text_model, "openai"
+        ),
     )
     api_json(
         control_url,
@@ -542,14 +561,9 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
         "POST",
         "/internal/v1/model-routes",
         service_token,
-        {
-            "tenant_external_id": tenant,
-            "public_model": asset_model,
-            "upstream_account_id": asset_upstream["id"],
-            "upstream_model": asset_model,
-            "protocol": "generation",
-            "priority": 0,
-        },
+        custom_model_route_payload(
+            tenant, asset_model, asset_upstream["id"], asset_model, "generation"
+        ),
     )
     api_json(
         control_url,
@@ -580,14 +594,13 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
         "POST",
         "/internal/v1/model-routes",
         service_token,
-        {
-            "tenant_external_id": tenant,
-            "public_model": image_model,
-            "upstream_account_id": image_upstream["id"],
-            "upstream_model": "benchmark-image-upstream",
-            "protocol": "generation",
-            "priority": 0,
-        },
+        custom_model_route_payload(
+            tenant,
+            image_model,
+            image_upstream["id"],
+            "benchmark-image-upstream",
+            "generation",
+        ),
     )
     api_json(
         control_url,

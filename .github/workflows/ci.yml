@@ -105,6 +105,10 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python3 tests/ops/test_legacy_credentials_bulk.py
+      - name: Verify memory harness seed contract
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 tests/load/test_benchmark_memory.py
       - name: Run isolated legacy credential PostgreSQL operator acceptance
         id: isolated_legacy_pg
         env:
