@@ -1,5 +1,6 @@
 mod assets;
 mod jobs;
+mod responses_tool_image;
 mod synchronous_entry;
 mod synchronous_image;
 

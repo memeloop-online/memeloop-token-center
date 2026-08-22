@@ -112,6 +112,15 @@ pub(crate) async fn write_generation_staging_bytes(
     object_name: &str,
     bytes: bytes::Bytes,
 ) -> Result<StagedArchiveObject, AppError> {
+    write_generation_staging_segments(state, lease, object_name, [bytes]).await
+}
+
+pub(crate) async fn write_generation_staging_segments(
+    state: &AppState,
+    lease: &mut ArchiveStagingWriteLease,
+    object_name: &str,
+    segments: impl IntoIterator<Item = bytes::Bytes>,
+) -> Result<StagedArchiveObject, AppError> {
     if object_name.is_empty()
         || object_name.contains('/')
         || !object_name
@@ -124,9 +133,13 @@ pub(crate) async fn write_generation_staging_bytes(
     }
     let locator = format!("{}/{object_name}", lease.key.canonical_prefix());
     let mut writer = state.archive.start_writer(&locator).await?;
-    if let Err(error) = await_with_staging_heartbeat(state, lease, writer.write(bytes)).await? {
-        let _ = writer.abort().await;
-        return Err(error);
+    for segment in segments {
+        if let Err(error) =
+            await_with_staging_heartbeat(state, lease, writer.write(segment)).await?
+        {
+            let _ = writer.abort().await;
+            return Err(error);
+        }
     }
     await_with_staging_heartbeat(state, lease, writer.finish_staged()).await?
 }

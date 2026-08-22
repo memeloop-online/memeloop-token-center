@@ -706,46 +706,22 @@ async fn finish_responses_tool_image(
         let error_code = format!("upstream_http_{}", upstream_status.as_u16());
         return fail_image_request(context, &error_code).await;
     }
-    let response = match serde_json::from_slice::<Value>(&bytes) {
-        Ok(response) => response,
-        Err(_) => {
+    let parsed = match super::responses_tool_image::parse_responses_tool_image(&bytes) {
+        Ok(parsed) => parsed,
+        Err(super::responses_tool_image::ResponsesToolImageParseError::InvalidJson) => {
             return fail_image_request(context, "upstream_image_invalid_json").await;
         }
-    };
-    // Parsing has copied the image string into the Value. Drop the upstream
-    // allocation before extracting that String by ownership.
-    drop(bytes);
-    let (image, usage) = match extract_responses_tool_image(response) {
-        Ok(extracted) => extracted,
-        Err(_) => {
+        Err(super::responses_tool_image::ResponsesToolImageParseError::InvalidPayload) => {
             return fail_image_request(context, "upstream_image_invalid_payload").await;
         }
     };
-    #[derive(serde::Serialize)]
-    struct ImageData {
-        b64_json: String,
-    }
-
-    #[derive(serde::Serialize)]
-    struct ImageResponse {
-        created: i64,
-        data: [ImageData; 1],
-        #[serde(skip_serializing_if = "Option::is_none")]
-        usage: Option<Value>,
-    }
-
-    let transformed = ImageResponse {
-        created: unix_millis() / 1_000,
-        data: [ImageData { b64_json: image }],
-        usage,
-    };
-    let response_bytes =
-        serde_json::to_vec(&transformed).expect("image response is JSON serializable");
-    drop(transformed);
-    let response_bytes = Bytes::from(response_bytes);
-    if response_bytes.len() > MAX_IMAGE_RESPONSE {
-        return fail_image_request(context, "upstream_image_response_too_large").await;
-    }
+    let (response_segments, response_len) =
+        match build_responses_tool_image_segments(bytes, parsed, unix_millis() / 1_000) {
+            Ok(response) => response,
+            Err(_) => {
+                return fail_image_request(context, "upstream_image_response_too_large").await;
+            }
+        };
     let mut result_lease = crate::generation::begin_generation_staging_attempt(
         state,
         crate::archive_staging::ArchiveStagingOwner::SynchronousRequest(request_id),
@@ -753,14 +729,15 @@ async fn finish_responses_tool_image(
         Uuid::now_v7(),
     )
     .await?;
-    let response_object = match archive_synchronous_image_response(
-        context,
+    let response_object = match crate::generation::write_generation_staging_segments(
+        state,
         &mut result_lease,
-        response_bytes.clone(),
+        "response.json",
+        response_segments.clone(),
     )
     .await
     {
-        Ok(location) => location,
+        Ok(staged) => staged.object_locator,
         Err(_) => {
             return fail_image_request_with_staging(context, "archive_write", Some(&result_lease))
                 .await;
@@ -786,12 +763,47 @@ async fn finish_responses_tool_image(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CONTENT_LENGTH, response_bytes.len())
+        .header(header::CONTENT_LENGTH, response_len)
         .header(REQUEST_ID_HEADER, request_id.to_string())
-        .body(Body::from(response_bytes))
+        .body(Body::from_stream(futures_util::stream::iter(
+            response_segments
+                .into_iter()
+                .map(Ok::<_, std::convert::Infallible>),
+        )))
         .map_err(|_| AppError::Internal)
 }
 
+fn build_responses_tool_image_segments(
+    bytes: Bytes,
+    parsed: super::responses_tool_image::ParsedResponsesToolImage,
+    created: i64,
+) -> Result<([Bytes; 3], usize), AppError> {
+    let prefix = Bytes::from(format!(
+        "{{\"created\":{created},\"data\":[{{\"b64_json\":\""
+    ));
+    let image = bytes.slice(parsed.image_range);
+    let mut suffix = Vec::with_capacity(256);
+    suffix.extend_from_slice(b"\"}]");
+    if let Some(usage) = parsed.usage {
+        suffix.extend_from_slice(b",\"usage\":");
+        serde_json::to_writer(&mut suffix, &usage).map_err(|_| AppError::Internal)?;
+    }
+    suffix.push(b'}');
+    let suffix = Bytes::from(suffix);
+    let response_len = prefix
+        .len()
+        .checked_add(image.len())
+        .and_then(|length| length.checked_add(suffix.len()))
+        .ok_or(AppError::Internal)?;
+    if response_len > MAX_IMAGE_RESPONSE {
+        return Err(AppError::Upstream(
+            "image response exceeds the bounded response size".into(),
+        ));
+    }
+    Ok(([prefix, image, suffix], response_len))
+}
+
+#[cfg(test)]
 fn take_image_results(value: &mut Value, images: &mut Vec<String>) {
     match value {
         Value::Array(values) => {
@@ -817,6 +829,7 @@ fn take_image_results(value: &mut Value, images: &mut Vec<String>) {
     }
 }
 
+#[cfg(test)]
 pub(in crate::api) fn extract_responses_tool_image(
     mut response: Value,
 ) -> Result<(String, Option<Value>), AppError> {
@@ -831,6 +844,7 @@ pub(in crate::api) fn extract_responses_tool_image(
     Ok((images.pop().expect("one image was validated"), usage))
 }
 
+#[cfg(test)]
 pub(in crate::api) fn has_one_valid_bounded_image<T: AsRef<str>>(images: &[T]) -> bool {
     let Some(image) = images.first().filter(|_| images.len() == 1) else {
         return false;
@@ -871,4 +885,62 @@ pub(in crate::api) fn is_valid_bounded_base64(encoded: &str, max_decoded_len: us
         }
     }
     decoded_len != 0
+}
+
+#[cfg(test)]
+mod segmented_response_tests {
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+
+    #[test]
+    fn benchmark_sized_response_is_exact_and_keeps_the_image_segment_shared() {
+        let raw = vec![b'x'; 11 * 1024 * 1024];
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&raw)),
+            "d3cc623cd0df8c815806104a74383e616f7fc26c4c8710ae8d787809de886bea"
+        );
+        let encoded = STANDARD.encode(&raw);
+        assert_eq!(encoded.len(), 15_379_116);
+        let upstream = Bytes::from(
+            serde_json::to_vec(&json!({
+                "id": "resp_memory_image",
+                "output": [{
+                    "type": "image_generation_call",
+                    "id": "ig_memory_image",
+                    "result": encoded
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }))
+            .expect("mock upstream response is JSON"),
+        );
+        let parsed = super::super::responses_tool_image::parse_responses_tool_image(&upstream)
+            .expect("benchmark image is valid");
+        let image_pointer = upstream.as_ptr() as usize + parsed.image_range.start;
+        let (segments, content_length) =
+            build_responses_tool_image_segments(upstream, parsed, 1_700_000_000)
+                .expect("bounded response builds");
+        assert_eq!(content_length, 15_379_225);
+        assert_eq!(segments[1].as_ptr() as usize, image_pointer);
+        assert_eq!(
+            segments.iter().map(Bytes::len).sum::<usize>(),
+            content_length
+        );
+        let archived_response = segments.clone().concat();
+        let response = segments.concat();
+        assert_eq!(archived_response, response);
+        let value: Value = serde_json::from_slice(&response).expect("response is valid JSON");
+        let decoded = STANDARD
+            .decode(value["data"][0]["b64_json"].as_str().expect("image string"))
+            .expect("image is strict base64");
+        assert_eq!(decoded.len(), 11 * 1024 * 1024);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(decoded)),
+            "d3cc623cd0df8c815806104a74383e616f7fc26c4c8710ae8d787809de886bea"
+        );
+        assert_eq!(
+            value["usage"],
+            json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+        );
+    }
 }
