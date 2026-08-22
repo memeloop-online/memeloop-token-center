@@ -333,7 +333,10 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
     assert!(catalog.get("cpa-codex-oauth").is_some());
     assert!(!catalog.is_public("cpa-codex-oauth"));
     assert!(catalog.get("cpa-subscription-bridge").is_none());
-    assert!(!catalog.supports_direct_creation("openai-codex"));
+    assert!(!catalog.supports_direct_credential("openai-codex", "oauth"));
+    // The schema remains authoritative and rejects unsupported API-key shapes
+    // before the authorization-flow guard is consulted.
+    assert!(catalog.supports_direct_credential("openai-codex", "api_key"));
 
     assert!(
         catalog

@@ -86,7 +86,6 @@ async fn create_credential(
         "currency": "USD",
         "initial_balance": initial_balance,
         "policy": {
-            "allowed_models": ["model-a"],
             "requests_per_minute": 60,
             "tokens_per_minute": 100000,
             "max_concurrency": 4,
@@ -166,7 +165,6 @@ async fn exercise_credential_and_ledger_acceptance(state: AppState, label: &str)
         "currency": "USD",
         "initial_balance": "7",
         "policy": {
-            "allowed_models": ["model-a"],
             "requests_per_minute": 60,
             "tokens_per_minute": 100000,
             "max_concurrency": 4,

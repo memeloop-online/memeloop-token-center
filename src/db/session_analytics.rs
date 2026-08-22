@@ -143,12 +143,12 @@ impl Database {
             r#"WITH completed AS (
                    SELECT totals.tenant_id, totals.key_id, totals.session_id,
                           MAX(totals.last_activity_at) AS last_activity_at,
-                          SUM(totals.requests) AS requests,
-                          SUM(totals.errors) AS errors,
-                          SUM(totals.input_tokens) AS input_tokens,
-                          SUM(totals.output_tokens) AS output_tokens,
-                          SUM(totals.duration_count) AS duration_count,
-                          SUM(totals.duration_sum_ms) AS duration_sum_ms
+                          CAST(SUM(totals.requests) AS BIGINT) AS requests,
+                          CAST(SUM(totals.errors) AS BIGINT) AS errors,
+                          CAST(SUM(totals.input_tokens) AS BIGINT) AS input_tokens,
+                          CAST(SUM(totals.output_tokens) AS BIGINT) AS output_tokens,
+                          CAST(SUM(totals.duration_count) AS BIGINT) AS duration_count,
+                          CAST(SUM(totals.duration_sum_ms) AS BIGINT) AS duration_sum_ms
                      FROM session_usage_totals totals
                     WHERE totals.tenant_id = $1
                       AND ($2 = '' OR totals.key_id = $2)

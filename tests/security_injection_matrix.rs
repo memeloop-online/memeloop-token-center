@@ -96,7 +96,7 @@ async fn exercise_injection_matrix(database_url: String, backend: &str) {
                 "alias": alias,
                 "currency": "USD",
                 "initial_balance": "10",
-                "policy": {"allowed_models": [model]}
+                "policy": {}
             })),
         )
         .await;

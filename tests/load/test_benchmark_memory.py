@@ -52,6 +52,8 @@ class BenchmarkSeedContractTests(unittest.TestCase):
             requests.append((path, payload))
             if path == "/internal/v1/upstreams":
                 return {"id": f"upstream-{len(requests)}"}
+            if path == "/internal/v1/model-routes":
+                return {"id": f"route-{len(requests)}"}
             if path == "/internal/v1/keys":
                 return {"key": "mts_test"}
             return {}
@@ -76,6 +78,11 @@ class BenchmarkSeedContractTests(unittest.TestCase):
         self.assertEqual(issued_key, "mts_test")
         self.assertEqual(len(routes), 3)
         self.assertEqual({route["protocol"] for route in routes}, {"openai", "generation"})
+        key_payload = next(
+            payload for path, payload in requests if path == "/internal/v1/keys"
+        )
+        self.assertEqual(len(key_payload["route_ids"]), 3)
+        self.assertNotIn("allowed_models", key_payload["policy"])
         for route in routes:
             with self.subTest(model=route["public_model"]):
                 self.assertIs(route["custom_model_confirmed"], True)

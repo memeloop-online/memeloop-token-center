@@ -29,15 +29,18 @@ pub(in crate::api) async fn create_upstream(
     if !state.providers.is_public(&body.driver) {
         return Err(AppError::BadRequest("unknown provider driver".into()));
     }
-    if !state.providers.supports_direct_creation(&body.driver) {
-        return Err(AppError::BadRequest(
-            "this upstream must be connected with its authorization flow".into(),
-        ));
-    }
     validate_provider_config_schema(&state, &body.driver, &body.config)?;
     validate_provider_credential_schema(&state, &body.driver, &body.credential)?;
     let credential: UpstreamCredential = serde_json::from_value(body.credential)
         .map_err(|error| AppError::BadRequest(format!("invalid upstream credential: {error}")))?;
+    if !state
+        .providers
+        .supports_direct_credential(&body.driver, credential.auth_kind())
+    {
+        return Err(AppError::BadRequest(
+            "this upstream must be connected with its authorization flow".into(),
+        ));
+    }
     validate_upstream_destination(&body.driver, &body.config, &service, &state).await?;
     credential.validate(unix_millis())?;
     let account = state

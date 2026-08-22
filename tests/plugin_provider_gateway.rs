@@ -97,6 +97,109 @@ async fn plugin_provider_onboards_through_the_real_management_api() {
 }
 
 #[tokio::test]
+async fn oauth_only_provider_rejects_raw_oauth_on_the_direct_creation_api() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("oauth-only-provider.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .unwrap();
+    let response = api::router_for_role(state.clone(), RuntimeRole::Control)
+        .oneshot(
+            Request::post("/internal/v1/upstreams")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", state.config.service_token),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "tenant_external_id": "oauth-only-provider",
+                        "name": "raw-oauth-must-not-be-accepted",
+                        "driver": "openai-codex",
+                        "config": {
+                            "base_url": "https://chatgpt.com/backend-api/codex",
+                            "network_scope": "public",
+                            "reservation_token_bounds": {}
+                        },
+                        "credential": {
+                            "type": "oauth",
+                            "access_token": "raw-access-secret",
+                            "refresh_token": "raw-refresh-secret",
+                            "expires_at": unix_millis() + 3_600_000,
+                            "adapter_state": {}
+                        }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["error"]["code"], "invalid_request");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("authorization flow"))
+    );
+    assert!(!error.to_string().contains("raw-access-secret"));
+    assert!(!error.to_string().contains("raw-refresh-secret"));
+}
+
+#[tokio::test]
+async fn direct_only_provider_accepts_its_schema_declared_api_key() {
+    let mock = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("direct-only-provider.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .unwrap();
+    let response = api::router_for_role(state.clone(), RuntimeRole::Control)
+        .oneshot(
+            Request::post("/internal/v1/upstreams")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", state.config.service_token),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "tenant_external_id": "direct-only-provider",
+                        "name": "direct-api-key",
+                        "driver": "http-json",
+                        "config": {
+                            "base_url": mock.uri(),
+                            "network_scope": "public"
+                        },
+                        "credential": {
+                            "type": "api_key",
+                            "value": "direct-provider-secret"
+                        }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let account: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{account}");
+    assert_eq!(account["driver"], "http-json");
+    assert_eq!(account["connection_method"], "api_key");
+    assert!(!account.to_string().contains("direct-provider-secret"));
+}
+#[tokio::test]
 async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_secrets_billing_and_archive()
  {
     let mock = MockServer::start().await;

@@ -120,9 +120,9 @@ jobs:
           database="$RUNNER_TEMP/forgejo-migration.sqlite"
           export MTC_DATABASE_URL="sqlite://$database?mode=rwc"
           cargo run --locked --bin memeloop-token-center -- migrate
-          first=$(sqlite3 "$database" 'SELECT count(*) FROM _sqlx_migrations WHERE success = 1')
+          first=$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations WHERE success = 1')
           cargo run --locked --bin memeloop-token-center -- migrate
-          second=$(sqlite3 "$database" 'SELECT count(*) FROM _sqlx_migrations WHERE success = 1')
+          second=$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations WHERE success = 1')
           test "$first" -gt 0
           test "$first" = "$second"
       - name: Run PostgreSQL migration and replay gate
@@ -137,10 +137,10 @@ jobs:
           set -euo pipefail
           cargo run --locked --bin memeloop-token-center -- migrate
           first=$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
-            -c 'SELECT count(*) FROM _sqlx_migrations WHERE success = true')
+            -c 'SELECT count(*) FROM schema_migrations WHERE success = true')
           cargo run --locked --bin memeloop-token-center -- migrate
           second=$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
-            -c 'SELECT count(*) FROM _sqlx_migrations WHERE success = true')
+            -c 'SELECT count(*) FROM schema_migrations WHERE success = true')
           test "$first" -gt 0
           test "$first" = "$second"
       - name: Run CPAMP initial, overlap, incremental, and replay migration acceptance

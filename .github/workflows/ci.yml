@@ -274,9 +274,9 @@ jobs:
           database="$RUNNER_TEMP/migration-smoke.sqlite"
           export MTC_DATABASE_URL="sqlite://$database?mode=rwc"
           cargo run --locked --bin memeloop-token-center -- migrate
-          first_count="$(sqlite3 "$database" 'SELECT count(*) FROM _sqlx_migrations WHERE success = 1')"
+          first_count="$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')"
           cargo run --locked --bin memeloop-token-center -- migrate
-          second_count="$(sqlite3 "$database" 'SELECT count(*) FROM _sqlx_migrations WHERE success = 1')"
+          second_count="$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')"
           test "$first_count" -gt 0
           test "$second_count" = "$first_count"
       - name: PostgreSQL migration and replay smoke test
@@ -289,10 +289,10 @@ jobs:
         run: |
           cargo run --locked --bin memeloop-token-center -- migrate
           first_count="$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
-            -c 'SELECT count(*) FROM _sqlx_migrations WHERE success = true')"
+            -c 'SELECT count(*) FROM schema_migrations')"
           cargo run --locked --bin memeloop-token-center -- migrate
           second_count="$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
-            -c 'SELECT count(*) FROM _sqlx_migrations WHERE success = true')"
+            -c 'SELECT count(*) FROM schema_migrations')"
           test "$first_count" -gt 0
           test "$second_count" = "$first_count"
       - name: Seed 100k-row observability scale fixture

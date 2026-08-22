@@ -573,7 +573,7 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
             "credential": {"type": "none"},
         },
     )
-    api_json(
+    text_route = api_json(
         control_url,
         "POST",
         "/internal/v1/model-routes",
@@ -602,7 +602,7 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
             "credential": {"type": "none"},
         },
     )
-    api_json(
+    asset_route = api_json(
         control_url,
         "POST",
         "/internal/v1/model-routes",
@@ -635,7 +635,7 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
             "credential": {"type": "none"},
         },
     )
-    api_json(
+    image_route = api_json(
         control_url,
         "POST",
         "/internal/v1/model-routes",
@@ -666,8 +666,8 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
             "alias": "Memory benchmark credential",
             "currency": "USD",
             "initial_balance": "100000",
+            "route_ids": [text_route["id"], asset_route["id"], image_route["id"]],
             "policy": {
-                "allowed_models": [text_model, asset_model, image_model],
                 "requests_per_minute": 1000000,
                 "tokens_per_minute": 1000000000,
                 "max_concurrency": 32,

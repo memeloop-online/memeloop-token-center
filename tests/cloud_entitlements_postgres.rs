@@ -36,7 +36,6 @@ fn snapshot(tenant: &str, principal: &str, version: i64, desired: &str, rpm: u64
         "version": version,
         "status": "active",
         "policy": {
-            "allowed_models": ["gpt-5"],
             "requests_per_minute": rpm,
             "tokens_per_minute": rpm * 1_000,
             "max_concurrency": 2,
@@ -61,7 +60,6 @@ fn cancelled_snapshot(tenant: &str, principal: &str, version: i64) -> Value {
         "version": version,
         "status": "cancelled",
         "policy": {
-            "allowed_models": [],
             "requests_per_minute": 1,
             "tokens_per_minute": 1,
             "max_concurrency": 1,
@@ -141,7 +139,8 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
     let client = Client::new();
     let first_route = seed_route(&test_state, &tenant, "gpt-5", 10).await;
 
-    let v1 = snapshot(&tenant, &principal, 1, "10", 10);
+    let mut v1 = snapshot(&tenant, &principal, 1, "10", 10);
+    v1["route_ids"] = json!([first_route]);
     let first = send(&client, &url, "postgres-cloud-event-1", &v1).await;
     assert_eq!(first.status(), StatusCode::CREATED);
     let first: Value = first.json().await.unwrap();
@@ -159,6 +158,8 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
         vec![first_route]
     );
     let future_route = seed_route(&test_state, &tenant, "gpt-5", 11).await;
+    // A later route sharing the same public model requires a newer Cloud
+    // snapshot to grant that stable route id explicitly.
     assert_eq!(
         test_state
             .db
@@ -167,7 +168,7 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
             .unwrap()
             .effective_route_ids,
         vec![first_route],
-        "legacy wildcard/model conversion must not grant a future route"
+        "an explicit route grant must not authorize a future route"
     );
     assert!(
         !test_state
@@ -332,14 +333,15 @@ async fn postgres_cloud_events_serialize_versions_and_replay_stable_identity() {
         .status(),
         StatusCode::CONFLICT
     );
-    assert!(
+    assert_eq!(
         test_state
             .db
             .credential_routing(parsed_key_id, &tenant)
             .await
             .unwrap()
-            .effective_route_ids
-            .is_empty()
+            .effective_route_ids,
+        vec![future_route],
+        "a rejected suspended update must preserve the prior routing snapshot"
     );
     assert_eq!(
         send(

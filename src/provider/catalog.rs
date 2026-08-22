@@ -455,11 +455,14 @@ impl ProviderCatalog {
         self.types.iter().any(|provider| provider.id == driver)
     }
 
-    /// Interactive-only builtins must be provisioned through their server-owned
-    /// authorization flow so callers cannot inject raw OAuth material.
-    pub fn supports_direct_creation(&self, driver: &str) -> bool {
-        self.get(driver)
-            .is_some_and(|provider| self.is_public(driver) && provider.oauth_adapter.is_none())
+    /// Interactive OAuth material must be provisioned through the server-owned
+    /// authorization flow. Providers may still declare API-key or unauthenticated
+    /// credentials alongside OAuth; those remain equal direct connection methods.
+    pub fn supports_direct_credential(&self, driver: &str, credential_kind: &str) -> bool {
+        self.get(driver).is_some_and(|provider| {
+            self.is_public(driver)
+                && (provider.oauth_adapter.is_none() || credential_kind != "oauth")
+        })
     }
 
     /// Return only the controlled source identifiers accepted by the current

@@ -107,9 +107,8 @@ impl Drop for Fixture {
     }
 }
 
-fn policy(rpm: u64, models: &[&str]) -> Value {
+fn policy(rpm: u64) -> Value {
     json!({
-        "allowed_models": models,
         "requests_per_minute": rpm,
         "tokens_per_minute": rpm * 1_000,
         "max_concurrency": 4,
@@ -139,7 +138,7 @@ fn active(
         "desired": desired,
         "version": version,
         "status": "active",
-        "policy": policy(rpm, &["gpt-5"]),
+        "policy": policy(rpm),
         "proration": {"plan": "pro"}
     })
 }
@@ -162,7 +161,7 @@ fn cancelled(
         "desired": null,
         "version": version,
         "status": "cancelled",
-        "policy": policy(1, &[]),
+        "policy": policy(1),
         "proration": null
     })
 }
@@ -242,11 +241,10 @@ async fn cloud_grants_are_snapshot_scoped_and_cancel_fails_closed() {
     let subscription = "cloud-routing-subscription";
     let original_route = seed_route(&fixture.state, tenant, "gpt-5", 1).await;
 
+    let mut first_snapshot = active(tenant, principal, subscription, "cycle", "10", 1, 60);
+    first_snapshot["route_ids"] = json!([original_route]);
     let first: Value = fixture
-        .send(
-            "cloud-routing-1",
-            &active(tenant, principal, subscription, "cycle", "10", 1, 60),
-        )
+        .send("cloud-routing-1", &first_snapshot)
         .await
         .json()
         .await
@@ -260,8 +258,8 @@ async fn cloud_grants_are_snapshot_scoped_and_cancel_fails_closed() {
         .unwrap();
     assert_eq!(first_routing.effective_route_ids, vec![original_route]);
 
-    // Legacy `allowed_models` is converted only once. A future route with the
-    // same public model must not be implicitly authorized.
+    // The explicit stable-id grant does not authorize a future route sharing
+    // the same public model.
     let future_route = seed_route(&fixture.state, tenant, "gpt-5", 2).await;
     let after_future_route = fixture
         .state
@@ -528,7 +526,7 @@ async fn signed_cloud_lifecycle_is_idempotent_ordered_and_keeps_stable_history()
     assert_eq!(replay["entitlement"], first["entitlement"]);
 
     let mut conflicting_replay = first_body.clone();
-    conflicting_replay["policy"] = policy(61, &["gpt-5"]);
+    conflicting_replay["policy"] = policy(61);
     assert_eq!(
         fixture
             .send("cloud-event-1", &conflicting_replay)
@@ -1031,7 +1029,7 @@ async fn entitlement_and_event_queries_are_bound_to_service_tenant_or_authentica
         .await
         .unwrap();
     assert_eq!(self_view.status(), StatusCode::OK);
-    assert_eq!(self_view.headers()["cache-control"], "no-store");
+    assert_eq!(self_view.headers()["cache-control"], "private, no-store");
     let self_view: Value = self_view.json().await.unwrap();
     assert_eq!(self_view["entitlements"].as_array().unwrap().len(), 1);
     assert_eq!(
