@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { World, setWorldConstructor, type IWorldOptions } from '@cucumber/cucumber';
 import type { BrowserContext, Page } from 'playwright';
 import { baseURL, runtime } from './runtime.js';
+import { isExpectedModelCatalogAbort } from './request-failures.js';
 
 export class DogfoodWorld extends World {
   context?: BrowserContext;
@@ -27,6 +28,8 @@ export class DogfoodWorld extends World {
       const failure = request.failure()?.errorText ?? 'unknown';
       // React intentionally aborts the long-lived SSE tail during a tab or tenant change.
       if (request.url().includes('/internal/v1/request-events') && failure.includes('ERR_ABORTED')) return;
+      // The model picker debounces searches and cancels only the superseded catalog GET.
+      if (isExpectedModelCatalogAbort(request.method(), request.url(), failure)) return;
       this.failedRequests.push(`${request.method()} ${request.url()}: ${failure}`);
     });
   }
