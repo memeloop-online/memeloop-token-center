@@ -155,27 +155,22 @@ jobs:
           set -euo pipefail
           schema="mig_${GITHUB_SHA:0:24}"
           run_id="forgejo-${FORGEJO_RUN_ID:-0}-${FORGEJO_RUN_ATTEMPT:-1}"
-          acceptance="$RUNNER_TEMP/cpamp-acceptance"
-          mkdir -p "$acceptance"
-          cp ops/migrate-cpamp.sh "$acceptance/migrate-cpamp.sh"
-          cp tests/fixtures/cpamp/initial.sql "$acceptance/initial.sql"
-          for migration in 0001_initial 0002_query_indexes 0004_request_events \
-            0005_generation_jobs 0018_model_price_tiers 0019_session_archive_import \
-            0021_request_locators 0022_budget_rollups 0023_generation_daily_aggregates \
-            0024_request_stats_rollups 0027_cpamp_source_digests; do
-            cp "migrations/postgres/$migration.sql" "$acceptance/$migration.sql" 2>/dev/null || \
-              cp "migrations/common/$migration.sql" "$acceptance/$migration.sql"
-          done
+          acceptance=$(mktemp -d "$RUNNER_TEMP/cpamp-acceptance-$run_id.XXXXXX")
           cleanup() {
-            psql -X --no-psqlrc -v ON_ERROR_STOP=1 -v schema="$schema" \
-              -c 'DROP SCHEMA IF EXISTS :"schema" CASCADE' >/dev/null
+            printf 'DROP SCHEMA IF EXISTS :"schema" CASCADE;\n' \
+              | psql -X --no-psqlrc -v ON_ERROR_STOP=1 \
+                -v schema="$schema" >/dev/null 2>&1 || true
+            chmod 0700 -- "$acceptance" 2>/dev/null || true
+            rm -rf -- "$acceptance"
           }
           trap cleanup EXIT HUP INT TERM
-          psql -X --no-psqlrc -v ON_ERROR_STOP=1 -v schema="$schema" \
-            -c 'CREATE SCHEMA :"schema"'
+          ops/ci/prepare-cpamp-acceptance-bundle.sh "$acceptance"
+          printf 'CREATE SCHEMA :"schema";\n' \
+            | psql -X --no-psqlrc -v ON_ERROR_STOP=1 \
+              -v schema="$schema"
           ACCEPTANCE_SCHEMA="$schema" ACCEPTANCE_RUN_ID="$run_id" \
             ACCEPTANCE_WORK_ROOT="$acceptance" \
-            tests/ops/cpamp-import-postgres-acceptance.sh
+            "$acceptance/cpamp-import-postgres-acceptance.sh"
       - name: Validate OpenAPI source and role boundaries
         shell: bash
         run: |

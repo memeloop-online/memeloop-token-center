@@ -9,19 +9,79 @@ workflow_policy_fixtures="$repository/tests/ops/github-workflow-policy-fixtures.
 shared_contracts="$repository/ops/ci/run-release-source-contracts.sh"
 dockerfile="$repository/Dockerfile"
 importer_contract="$repository/tests/ops/importer-image-contract.sh"
+bundle_preparer="$repository/ops/ci/prepare-cpamp-acceptance-bundle.sh"
 cargo_config="$repository/.cargo/config.toml"
+bundle_test_root=$(mktemp -d "${TMPDIR:-/tmp}/mtc-cpamp-bundle-contract.XXXXXX")
+cleanup() {
+  chmod -R u+w -- "$bundle_test_root" 2>/dev/null || true
+  rm -rf -- "$bundle_test_root"
+}
+trap cleanup EXIT HUP INT TERM
 
 test -f "$workflow"
 test -f "$workflow_directory/memory-acceptance.yml"
 test -f "$dockerfile"
 test -f "$importer_contract"
+test -x "$bundle_preparer"
+grep -Fq '[ -f "$source_file" ] && [ ! -L "$source_file" ]' "$bundle_preparer"
 test -x "$workflow_policy"
 test -x "$workflow_policy_fixtures"
 test -x "$shared_contracts"
 test -f "$cargo_config"
 test -f "$repository/.forgejo/workflows/harbor-release.yml"
 test ! -e "$repository/.forgejo/workflows/build.yaml"
-sh -n "$importer_contract"
+sh -n "$importer_contract" "$bundle_preparer"
+
+bundle="$bundle_test_root/bundle"
+mkdir -m 0700 -- "$bundle"
+"$bundle_preparer" "$bundle"
+mkdir -m 0700 -- "$bundle_test_root/real-target"
+ln -s real-target "$bundle_test_root/target-link"
+if "$bundle_preparer" "$bundle_test_root/target-link" >/dev/null 2>&1; then
+  echo 'CPAMP acceptance bundle preparer accepted a symlink target' >&2
+  exit 1
+fi
+ln -s "$bundle_test_root" "$bundle_test_root/parent-link"
+if "$bundle_preparer" "$bundle_test_root/parent-link/escape" >/dev/null 2>&1; then
+  echo 'CPAMP acceptance bundle preparer accepted a symlink parent path' >&2
+  exit 1
+fi
+actual_bundle=$(CDPATH='' cd -- "$bundle" && find . -mindepth 1 -maxdepth 1 -type f -print \
+  | sed 's#^./##' | sort)
+expected_bundle=$(cat <<'EOF'
+0001_initial.sql
+0002_query_indexes.sql
+0004_request_events.sql
+0005_generation_jobs.sql
+0018_model_price_tiers.sql
+0019_session_archive_import.sql
+0021_request_locators.sql
+0022_budget_rollups.sql
+0023_generation_daily_aggregates.sql
+0024_request_stats_rollups.sql
+0027_cpamp_source_digests.sql
+cpamp-import-postgres-acceptance.sh
+initial.sql
+migrate-cpamp.sh
+EOF
+)
+test "$actual_bundle" = "$expected_bundle"
+cmp "$repository/tests/ops/cpamp-import-postgres-acceptance.sh" \
+  "$bundle/cpamp-import-postgres-acceptance.sh"
+cmp "$repository/ops/migrate-cpamp.sh" "$bundle/migrate-cpamp.sh"
+cmp "$repository/tests/fixtures/cpamp/initial.sql" "$bundle/initial.sql"
+for migration in 0001_initial 0002_query_indexes 0004_request_events \
+  0005_generation_jobs 0018_model_price_tiers 0019_session_archive_import \
+  0021_request_locators 0022_budget_rollups 0023_generation_daily_aggregates \
+  0024_request_stats_rollups 0027_cpamp_source_digests; do
+  source="$repository/migrations/postgres/$migration.sql"
+  [ -f "$source" ] || source="$repository/migrations/common/$migration.sql"
+  cmp "$source" "$bundle/$migration.sql"
+done
+test "$(stat -c '%a' "$bundle/cpamp-import-postgres-acceptance.sh")" = 555
+test "$(stat -c '%a' "$bundle/migrate-cpamp.sh")" = 555
+test "$(stat -c '%a' "$bundle")" = 555
+test "$(find "$bundle" -maxdepth 1 -type f -name '*.sql' ! -perm 0444 -print -quit)" = ''
 
 grep -Fq 'ARG NODE_IMAGE=node:24.18.0-bookworm-slim' "$dockerfile"
 grep -Fq 'ARG RUST_IMAGE=rust:1.95.0-bookworm' "$dockerfile"
@@ -158,7 +218,17 @@ grep -Fq 'if-no-files-found: error' "$workflow"
 grep -Fq 'SQLite migration and replay smoke test' "$workflow"
 grep -Fq 'PostgreSQL migration and replay smoke test' "$workflow"
 grep -Fq 'Exercise CPAMP initial, overlap, incremental, and replay imports' "$workflow"
-grep -Fq 'tests/ops/cpamp-import-postgres-acceptance.sh:/acceptance.sh:ro' "$workflow"
+grep -Fq 'acceptance=$(mktemp -d "$RUNNER_TEMP/cpamp-acceptance-$run_id.XXXXXX")' "$workflow"
+grep -Fq 'ops/ci/prepare-cpamp-acceptance-bundle.sh "$acceptance"' "$workflow"
+grep -Fq -- '--env ACCEPTANCE_WORK_ROOT=/acceptance' "$workflow"
+grep -Fq -- '--volume "$acceptance:/acceptance:ro"' "$workflow"
+grep -Fq '/acceptance/cpamp-import-postgres-acceptance.sh' "$workflow"
+grep -Fq 'rm -rf -- "$acceptance"' "$workflow"
+if grep -Fq 'cpamp-import-postgres-acceptance.sh:/acceptance.sh:ro' "$workflow"; then
+  echo 'CPAMP acceptance must mount the complete reviewed bundle, not one script' >&2
+  exit 1
+fi
+grep -Fq 'test ! -e /work' "$importer_contract"
 grep -Fq 'cargo fmt --all -- --check' "$workflow"
 grep -Fq 'cargo clippy --locked --all-targets --all-features -- -D warnings' "$workflow"
 grep -Fq 'cargo test --locked --all-targets --all-features' "$workflow"

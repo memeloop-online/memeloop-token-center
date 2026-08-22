@@ -8,6 +8,7 @@ attestation_verifier="$repository/ops/ci/verify-buildkit-attestations.sh"
 attestation_fixtures="$repository/tests/ops/forgejo-attestation-fixtures.sh"
 validator="$repository/ops/ci/validate-release-inputs.sh"
 shared_contracts="$repository/ops/ci/run-release-source-contracts.sh"
+bundle_preparer="$repository/ops/ci/prepare-cpamp-acceptance-bundle.sh"
 runbook="$repository/docs/operations/temporary-forgejo-harbor-release.md"
 
 fail() {
@@ -21,6 +22,7 @@ test -x "$attestation_verifier"
 test -x "$attestation_fixtures"
 test -x "$validator"
 test -x "$shared_contracts"
+test -x "$bundle_preparer"
 test -f "$runbook"
 test ! -e "$repository/.forgejo/workflows/build.yaml"
 
@@ -119,6 +121,16 @@ for required in \
   grep -Fq -- "$required" "$workflow" || fail "missing quality gate: $required"
 done
 grep -Fq 'wiremock = ' "$repository/Cargo.toml" || fail "mock-upstream test dependency is absent"
+grep -Fq 'acceptance=$(mktemp -d "$RUNNER_TEMP/cpamp-acceptance-$run_id.XXXXXX")' "$workflow" || \
+  fail "Forgejo CPAMP acceptance must use a unique temporary bundle"
+grep -Fq 'ops/ci/prepare-cpamp-acceptance-bundle.sh "$acceptance"' "$workflow" || \
+  fail "Forgejo CPAMP acceptance must use the shared reviewed bundle"
+grep -Fq 'ACCEPTANCE_WORK_ROOT="$acceptance"' "$workflow" || \
+  fail "Forgejo CPAMP acceptance work root must be explicit"
+grep -Fq '"$acceptance/cpamp-import-postgres-acceptance.sh"' "$workflow" || \
+  fail "Forgejo CPAMP acceptance must execute the bundled harness"
+grep -Fq 'rm -rf -- "$acceptance"' "$workflow" || \
+  fail "Forgejo CPAMP acceptance bundle must be cleaned"
 
 grep -Fq 'ops/ci/validate-release-inputs.sh' "$repository/.github/workflows/ci.yml"
 grep -Fq 'ops/ci/run-release-source-contracts.sh' "$repository/.github/workflows/ci.yml"

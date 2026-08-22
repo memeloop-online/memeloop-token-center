@@ -326,17 +326,22 @@ jobs:
           PGUSER: token_center
           PGPASSWORD: token_center
         run: |
+          set -euo pipefail
           schema="mig_${GITHUB_SHA:0:24}"
           printf '%s\n' "$schema" | LC_ALL=C grep -Eq '^mig_[0-9a-f]{24}$'
           run_id="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           image="memeloop-token-center-importer:ci-${GITHUB_SHA}"
+          acceptance=$(mktemp -d "$RUNNER_TEMP/cpamp-acceptance-$run_id.XXXXXX")
           cleanup() {
             printf 'DROP SCHEMA IF EXISTS :"schema" CASCADE;\n' \
               | psql -X --no-psqlrc -v ON_ERROR_STOP=1 \
-                -v schema="$schema" >/dev/null
+                -v schema="$schema" >/dev/null 2>&1 || true
             docker image rm "$image" >/dev/null 2>&1 || true
+            chmod 0700 -- "$acceptance" 2>/dev/null || true
+            rm -rf -- "$acceptance"
           }
           trap cleanup EXIT HUP INT TERM
+          ops/ci/prepare-cpamp-acceptance-bundle.sh "$acceptance"
           printf 'CREATE SCHEMA :"schema";\n' \
             | psql -X --no-psqlrc -v ON_ERROR_STOP=1 \
               -v schema="$schema"
@@ -346,11 +351,13 @@ jobs:
             --security-opt no-new-privileges --cap-drop ALL \
             --env ACCEPTANCE_SCHEMA="$schema" \
             --env ACCEPTANCE_RUN_ID="$run_id" \
+            --env ACCEPTANCE_WORK_ROOT=/acceptance \
             --env PGHOST=127.0.0.1 --env PGPORT=5432 \
             --env PGDATABASE="$PGDATABASE" --env PGUSER="$PGUSER" \
             --env PGPASSWORD="$PGPASSWORD" \
-            --volume "$PWD/tests/ops/cpamp-import-postgres-acceptance.sh:/acceptance.sh:ro" \
-            --entrypoint /bin/sh "$image" /acceptance.sh
+            --volume "$acceptance:/acceptance:ro" \
+            --entrypoint /bin/sh "$image" \
+            /acceptance/cpamp-import-postgres-acceptance.sh
 
   api-contract:
     runs-on: ubuntu-latest
