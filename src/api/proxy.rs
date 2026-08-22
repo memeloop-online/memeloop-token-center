@@ -1630,6 +1630,18 @@ fn conversation_hints(headers: &HeaderMap, body: &Value) -> crate::conversation:
             .get("type")
             .and_then(Value::as_str)
             .is_some_and(|value| value == "compaction");
+    // Deliberately narrower than the other compatibility hints: subagent
+    // ancestry is security-sensitive and must never be inferred from UA,
+    // originator, client name, branch ids, or semantic similarity.
+    let explicit_subagent_marker = headers
+        .get("x-mtc-subagent")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "true")
+        || body
+            .pointer("/metadata/subagent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let subagent = explicit_subagent_marker && parent_turn_id.is_some();
 
     crate::conversation::ConversationHints {
         session_id,
@@ -1637,6 +1649,7 @@ fn conversation_hints(headers: &HeaderMap, body: &Value) -> crate::conversation:
         parent_turn_id,
         branch_id,
         compaction,
+        subagent,
     }
 }
 

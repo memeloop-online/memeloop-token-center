@@ -97,12 +97,21 @@ pub(super) fn conversation_hints(record: &ArchiveRecord) -> ConversationHints {
         .facets
         .get("request.kind")
         .is_some_and(|values| values.iter().any(|value| value.contains("compaction")));
+    // Archive envelopes have no trusted transport header. Accept only the
+    // typed metadata marker, and only when the archive also names a parent.
+    let subagent = parent_turn_id.is_some()
+        && record
+            .metadata
+            .get("subagent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     ConversationHints {
         session_id: nonempty(&record.session_id).map(str::to_owned),
         turn_id,
         parent_turn_id,
         branch_id,
         compaction,
+        subagent,
     }
 }
 
@@ -224,6 +233,49 @@ pub(super) async fn read_bounded_line(
         reader.consume(take);
         if line.last() == Some(&b'\n') {
             return Ok(Some(line));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn record(metadata: Value, facets: Value) -> ArchiveRecord {
+        serde_json::from_value(json!({
+            "schema_version": 2,
+            "session_id": "archive-session",
+            "request_id": "archive-request",
+            "started_at": "2026-08-22T00:00:00Z",
+            "completed_at": "2026-08-22T00:00:01Z",
+            "metadata": metadata,
+            "facets": facets
+        }))
+        .expect("archive record")
+    }
+
+    #[test]
+    fn archive_subagent_marker_requires_a_typed_marker_and_explicit_parent() {
+        let linked = conversation_hints(&record(
+            json!({"subagent": true, "parent_response_id": "parent-response"}),
+            json!({}),
+        ));
+        assert!(linked.subagent);
+        assert_eq!(linked.parent_turn_id.as_deref(), Some("parent-response"));
+
+        for candidate in [
+            record(json!({"subagent": true}), json!({})),
+            record(
+                json!({"subagent": "true", "parent_response_id": "parent"}),
+                json!({}),
+            ),
+            record(
+                json!({"client_name": "subagent"}),
+                json!({"parent.turn.id": ["parent"]}),
+            ),
+        ] {
+            assert!(!conversation_hints(&candidate).subagent);
         }
     }
 }

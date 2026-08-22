@@ -63,3 +63,19 @@ Feature: Logical conversations across supported coding clients and protocols
     And WorkBuddy sends two OpenAI chat turns for model "gpt-test"
     Then the response status is 200
     And the WorkBuddy requests form one logical conversation
+
+  Scenario: Explicit header and body markers create paginated subagent ancestry
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI upstream returns a successful completion
+    When the service creates a key for principal "explicit-subagents" allowing model "gpt-test"
+    And the client sends a parent with header-marked and body-marked subagents for model "gpt-test"
+    Then the response status is 200
+    And the paginated conversation exposes two explicit subagent edges
+
+  Scenario: Client vocabulary and orphan markers never imply subagent ancestry
+    Given a token center backed by SQLite and memory object storage
+    And the mock OpenAI upstream returns a successful completion
+    When the service creates a key for principal "implicit-subagents" allowing model "gpt-test"
+    And the client sends UA branch and orphan subagent hints for model "gpt-test"
+    Then the response status is 200
+    And no logical conversation contains a subagent edge

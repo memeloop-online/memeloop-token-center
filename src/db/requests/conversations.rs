@@ -249,7 +249,9 @@ impl Database {
                 let branch_changed = hints.branch_id.is_some()
                     && candidate_branch.is_some()
                     && hints.branch_id.as_deref() != candidate_branch.as_deref();
-                let relation = if same_turn {
+                let relation = if direct_parent && hints.subagent {
+                    RelationKind::Subagent
+                } else if same_turn {
                     RelationKind::Retry
                 } else if hints.compaction
                     || (explicit_match && atom_hashes.len() * 2 < previous_hashes.len())
@@ -374,6 +376,7 @@ impl Database {
                 "same_turn": selection.same_turn,
                 "branch": hints.branch_id.is_some(),
                 "compaction": hints.compaction,
+                "subagent": hints.subagent && selection.direct_parent,
                 "semantic_prefix": selection.semantic_prefix,
                 "compaction_overlap": selection.compaction_overlap,
                 "client_match": selection.client_match,

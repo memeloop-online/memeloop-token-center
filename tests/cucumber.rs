@@ -6983,6 +6983,252 @@ async fn conversation_has_compactions_then_branch(world: &mut TokenCenterWorld) 
     }
 }
 
+async fn send_subagent_chat(
+    world: &TokenCenterWorld,
+    model: &str,
+    content: &str,
+    headers: &[(&str, &str)],
+    metadata: Option<Value>,
+) -> StatusCode {
+    let mut request = world
+        .client
+        .post(format!("{}/v1/chat/completions", world.service_url))
+        .bearer_auth(&world.current_key);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let mut body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": content}]
+    });
+    if let Some(metadata) = metadata {
+        body["metadata"] = metadata;
+    }
+    let response = request
+        .json(&body)
+        .send()
+        .await
+        .expect("subagent gateway request");
+    let status = response.status();
+    let _ = response.bytes().await.expect("subagent gateway response");
+    status
+}
+
+#[when(
+    expr = "the client sends a parent with header-marked and body-marked subagents for model {string}"
+)]
+async fn client_sends_explicit_subagent_turns(world: &mut TokenCenterWorld, model: String) {
+    assert_eq!(
+        send_subagent_chat(
+            world,
+            &model,
+            "gateway parent",
+            &[
+                ("x-mtc-conversation-id", "gateway-subagent-session"),
+                ("x-mtc-turn-id", "gateway-parent")
+            ],
+            None,
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send_subagent_chat(
+            world,
+            &model,
+            "header child",
+            &[
+                ("x-mtc-conversation-id", "gateway-subagent-session"),
+                ("x-mtc-parent-turn-id", "gateway-parent"),
+                ("x-mtc-subagent", "true"),
+                // A branch hint must not override the explicit subagent relation.
+                ("x-mtc-branch-id", "worker-header")
+            ],
+            None,
+        )
+        .await,
+        StatusCode::OK
+    );
+    world.status = Some(
+        send_subagent_chat(
+            world,
+            &model,
+            "body child",
+            &[],
+            Some(json!({
+                "conversation_id": "gateway-subagent-session",
+                "parent_turn_id": "gateway-parent",
+                "subagent": true
+            })),
+        )
+        .await,
+    );
+}
+
+#[then("the paginated conversation exposes two explicit subagent edges")]
+async fn paginated_conversation_exposes_subagent_edges(world: &mut TokenCenterWorld) {
+    let clusters = world
+        .client
+        .get(format!(
+            "{}/self/v1/conversations?limit=1",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("subagent conversation list")
+        .json::<Value>()
+        .await
+        .expect("subagent conversation list JSON");
+    assert_eq!(clusters.as_array().map(Vec::len), Some(1), "{clusters}");
+    assert_eq!(clusters[0]["request_count"], 3, "{clusters}");
+    let cluster_id = clusters[0]["cluster_id"]
+        .as_str()
+        .expect("subagent cluster id");
+
+    let mut cursor: Option<(i64, String)> = None;
+    let mut request_ids = std::collections::HashSet::new();
+    let mut subagent_targets = std::collections::HashSet::new();
+    loop {
+        let mut url = format!(
+            "{}/self/v1/conversations/{cluster_id}?limit=1",
+            world.service_url
+        );
+        if let Some((created_at, request_id)) = &cursor {
+            url.push_str(&format!(
+                "&before_created_at={created_at}&before_request_id={request_id}"
+            ));
+        }
+        let page = world
+            .client
+            .get(url)
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("paginated subagent detail")
+            .json::<Value>()
+            .await
+            .expect("paginated subagent detail JSON");
+        assert_eq!(page["requests"].as_array().map(Vec::len), Some(1), "{page}");
+        request_ids.insert(
+            page["requests"][0]["request_id"]
+                .as_str()
+                .expect("page request id")
+                .to_owned(),
+        );
+        for edge in page["edges"].as_array().expect("page edges") {
+            if edge["relation"] == "subagent" {
+                assert_eq!(edge["evidence"]["explicit_parent"], true, "{edge}");
+                assert_eq!(edge["evidence"]["subagent"], true, "{edge}");
+                subagent_targets.insert(
+                    edge["to_request_id"]
+                        .as_str()
+                        .expect("subagent target id")
+                        .to_owned(),
+                );
+            }
+        }
+        cursor = page["next_cursor"].as_object().map(|next| {
+            (
+                next["before_created_at"]
+                    .as_i64()
+                    .expect("cursor timestamp"),
+                next["before_request_id"]
+                    .as_str()
+                    .expect("cursor request id")
+                    .to_owned(),
+            )
+        });
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(request_ids.len(), 3);
+    assert_eq!(subagent_targets.len(), 2);
+}
+
+#[when(expr = "the client sends UA branch and orphan subagent hints for model {string}")]
+async fn client_sends_implicit_subagent_hints(world: &mut TokenCenterWorld, model: String) {
+    assert_eq!(
+        send_subagent_chat(
+            world,
+            &model,
+            "implicit root",
+            &[("x-mtc-turn-id", "implicit-root")],
+            None,
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send_subagent_chat(
+            world,
+            &model,
+            "UA branch vocabulary",
+            &[
+                ("user-agent", "codex-subagent/1.0"),
+                ("x-mtc-client-name", "subagent-originator"),
+                ("x-mtc-branch-id", "subagent-worker")
+            ],
+            None,
+        )
+        .await,
+        StatusCode::OK
+    );
+    world.status = Some(
+        send_subagent_chat(
+            world,
+            &model,
+            "orphan explicit marker",
+            &[("x-mtc-subagent", "true")],
+            None,
+        )
+        .await,
+    );
+}
+
+#[then("no logical conversation contains a subagent edge")]
+async fn no_conversation_contains_subagent_edge(world: &mut TokenCenterWorld) {
+    let clusters = world
+        .client
+        .get(format!(
+            "{}/self/v1/conversations?limit=100",
+            world.service_url
+        ))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("implicit subagent conversation list")
+        .json::<Value>()
+        .await
+        .expect("implicit subagent conversation list JSON");
+    assert_eq!(clusters.as_array().map(Vec::len), Some(3), "{clusters}");
+    for cluster in clusters.as_array().expect("conversation array") {
+        let cluster_id = cluster["cluster_id"].as_str().expect("cluster id");
+        let detail = world
+            .client
+            .get(format!(
+                "{}/self/v1/conversations/{cluster_id}?limit=200",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("implicit subagent detail")
+            .json::<Value>()
+            .await
+            .expect("implicit subagent detail JSON");
+        assert!(
+            detail["edges"]
+                .as_array()
+                .expect("conversation edges")
+                .iter()
+                .all(|edge| edge["relation"] != "subagent"),
+            "{detail}"
+        );
+    }
+}
+
 #[given("the mock Anthropic upstream requires metadata and a beta header")]
 async fn mock_anthropic_metadata_and_beta(world: &mut TokenCenterWorld) {
     Mock::given(method("POST"))

@@ -8,6 +8,12 @@ pub struct ConversationHints {
     pub parent_turn_id: Option<String>,
     pub branch_id: Option<String>,
     pub compaction: bool,
+    /// An explicit client assertion that this turn was spawned as a subagent.
+    /// The database only honors it when `parent_turn_id` resolves to an
+    /// observation no later than this turn and owned by the same tenant,
+    /// principal, and stable key.
+    #[serde(default)]
+    pub subagent: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -1467,3 +1467,72 @@ fn responses_sse_capture_bounds_and_skips_an_oversized_single_event() {
     failed.push(b"\n\ndata: [DONE]\n\n");
     assert_eq!(failed.finish(), ResponsesSseOutcome::Failed);
 }
+
+#[test]
+fn subagent_hint_accepts_only_the_restricted_header_or_typed_metadata_marker() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-mtc-subagent", "true".parse().unwrap());
+    let from_header = conversation_hints(
+        &headers,
+        &json!({"metadata": {"parent_turn_id": "parent-header"}}),
+    );
+    assert!(from_header.subagent);
+    assert_eq!(from_header.parent_turn_id.as_deref(), Some("parent-header"));
+
+    let from_body = conversation_hints(
+        &HeaderMap::new(),
+        &json!({
+            "metadata": {"subagent": true},
+            "previous_response_id": "parent-body"
+        }),
+    );
+    assert!(from_body.subagent);
+    assert_eq!(from_body.parent_turn_id.as_deref(), Some("parent-body"));
+
+    let mut orphan_headers = HeaderMap::new();
+    orphan_headers.insert("x-mtc-subagent", "true".parse().unwrap());
+    assert!(
+        !conversation_hints(&orphan_headers, &json!({})).subagent,
+        "an explicit marker without a parent reference must fail closed"
+    );
+
+    for (header_value, body) in [
+        (Some("1"), json!({"metadata": {"parent_turn_id": "parent"}})),
+        (
+            Some("TRUE"),
+            json!({"metadata": {"parent_turn_id": "parent"}}),
+        ),
+        (
+            Some("yes"),
+            json!({"metadata": {"parent_turn_id": "parent"}}),
+        ),
+        (
+            None,
+            json!({"subagent": true, "metadata": {"parent_turn_id": "parent"}}),
+        ),
+        (
+            None,
+            json!({"metadata": {"subagent": "true", "parent_turn_id": "parent"}}),
+        ),
+        (
+            None,
+            json!({
+                "metadata": {
+                    "originator": "subagent",
+                    "client_name": "subagent",
+                    "branch_id": "subagent",
+                    "parent_turn_id": "parent"
+                }
+            }),
+        ),
+    ] {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = header_value {
+            headers.insert("x-mtc-subagent", value.parse().unwrap());
+        }
+        assert!(
+            !conversation_hints(&headers, &body).subagent,
+            "unsupported marker was accepted: headers={headers:?}, body={body}"
+        );
+    }
+}

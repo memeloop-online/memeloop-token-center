@@ -14,6 +14,7 @@ use memeloop_token_center::{
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use sqlx::{AnyPool, Row};
+use std::collections::HashSet;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -167,6 +168,269 @@ async fn observe_request(
         .await
         .expect("record conversation observation");
     (request_id, cluster_id)
+}
+
+async fn assert_subagent_relation_contract(state: &AppState, database_url: &str, tenant: &str) {
+    let create = |alias: &str| CreateKeyInput {
+        tenant_external_id: tenant.to_owned(),
+        principal_external_id: "shared-principal".into(),
+        alias: alias.into(),
+        currency: "USD".into(),
+        policy: KeyPolicy {
+            allowed_models: vec!["*".into()],
+            ..KeyPolicy::default()
+        },
+        initial_balance: Decimal::TEN,
+        idempotency_key: None,
+    };
+    let issued_a = state
+        .db
+        .create_key(create("Subagent credential A"), PEPPER)
+        .await
+        .expect("create subagent credential A");
+    let issued_b = state
+        .db
+        .create_key(create("Subagent credential B"), PEPPER)
+        .await
+        .expect("create subagent credential B");
+    let key_a = state
+        .db
+        .authenticate_key(&issued_a.key, PEPPER)
+        .await
+        .expect("authenticate subagent credential A");
+    let key_b = state
+        .db
+        .authenticate_key(&issued_b.key, PEPPER)
+        .await
+        .expect("authenticate subagent credential B");
+    assert_eq!(key_a.tenant_id, key_b.tenant_id);
+    assert_eq!(key_a.principal_id, key_b.principal_id);
+    assert_ne!(key_a.key_id, key_b.key_id);
+
+    let (root_request, root_cluster) = observe_request(
+        state,
+        &key_a,
+        &json!({"input": "root request"}),
+        &ConversationHints {
+            turn_id: Some("root-turn".into()),
+            ..ConversationHints::default()
+        },
+        "Codex",
+    )
+    .await;
+    let (header_child, header_cluster) = observe_request(
+        state,
+        &key_a,
+        &json!({"input": "header-marked child"}),
+        &ConversationHints {
+            parent_turn_id: Some("root-turn".into()),
+            branch_id: Some("worker-one".into()),
+            subagent: true,
+            ..ConversationHints::default()
+        },
+        "Codex",
+    )
+    .await;
+    let (body_child, body_cluster) = observe_request(
+        state,
+        &key_a,
+        &json!({"input": "body-marked child"}),
+        &ConversationHints {
+            parent_turn_id: Some("root-turn".into()),
+            subagent: true,
+            ..ConversationHints::default()
+        },
+        "Codex",
+    )
+    .await;
+    assert_eq!(header_cluster, root_cluster);
+    assert_eq!(body_cluster, root_cluster);
+
+    // A limit-one walk proves that relation edges remain attached to their
+    // target page instead of disappearing at a pagination boundary.
+    let mut cursor = None;
+    let mut seen_requests = HashSet::new();
+    let mut seen_subagent_edges = Vec::new();
+    loop {
+        let detail = state
+            .db
+            .conversation_cluster_detail(
+                key_a.key_id,
+                root_cluster,
+                memeloop_token_center::db::ConversationDetailFilter {
+                    limit: 1,
+                    before_created_at: cursor.as_ref().map(
+                        |value: &memeloop_token_center::model::ConversationCursor| {
+                            value.before_created_at
+                        },
+                    ),
+                    before_request_id: cursor.as_ref().map(|value| value.before_request_id),
+                },
+            )
+            .await
+            .expect("paginated subagent conversation");
+        assert!(detail.requests.len() <= 1);
+        seen_requests.extend(
+            detail
+                .requests
+                .iter()
+                .map(|request| request.request.request_id),
+        );
+        for edge in &detail.edges {
+            if edge.relation == "subagent" {
+                assert_eq!(edge.from_request_id, Some(root_request));
+                assert_eq!(edge.evidence["explicit_parent"], true);
+                assert_eq!(edge.evidence["subagent"], true);
+                seen_subagent_edges.push(edge.to_request_id);
+            }
+        }
+        cursor = detail.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        seen_requests,
+        HashSet::from([root_request, header_child, body_child])
+    );
+    seen_subagent_edges.sort_unstable();
+    let mut expected_children = vec![header_child, body_child];
+    expected_children.sort_unstable();
+    assert_eq!(seen_subagent_edges, expected_children);
+
+    // A marker without a parent must fail closed.
+    let (_, orphan_cluster) = observe_request(
+        state,
+        &key_a,
+        &json!({"input": "orphan subagent"}),
+        &ConversationHints {
+            subagent: true,
+            ..ConversationHints::default()
+        },
+        "OrphanClient",
+    )
+    .await;
+    assert_ne!(orphan_cluster, root_cluster);
+
+    // UA/client/branch vocabulary is never a subagent signal.
+    let (_, implicit_cluster) = observe_request(
+        state,
+        &key_a,
+        &json!({"input": "implicit agent vocabulary"}),
+        &ConversationHints {
+            branch_id: Some("subagent-worker".into()),
+            ..ConversationHints::default()
+        },
+        "Codex subagent originator",
+    )
+    .await;
+    assert_ne!(implicit_cluster, root_cluster);
+
+    // Even an exact parent id is unavailable through another stable key.
+    let (_, cross_key_cluster) = observe_request(
+        state,
+        &key_b,
+        &json!({"input": "cross-key child"}),
+        &ConversationHints {
+            parent_turn_id: Some("root-turn".into()),
+            subagent: true,
+            ..ConversationHints::default()
+        },
+        "Codex",
+    )
+    .await;
+    assert_ne!(cross_key_cluster, root_cluster);
+
+    // A parent timestamp later than its child is also unavailable.
+    let (future_parent_request, _) = observe_request(
+        state,
+        &key_a,
+        &json!({"input": "future parent"}),
+        &ConversationHints {
+            turn_id: Some("future-parent".into()),
+            ..ConversationHints::default()
+        },
+        "FutureParent",
+    )
+    .await;
+    let pool = AnyPool::connect(database_url)
+        .await
+        .expect("connect subagent verification pool");
+    sqlx::query("UPDATE conversation_observations SET created_at = $1 WHERE request_id = $2")
+        .bind(memeloop_token_center::db::unix_millis() + 60_000)
+        .bind(future_parent_request.to_string())
+        .execute(&pool)
+        .await
+        .expect("move test parent into the future");
+    let (_, future_child_cluster) = observe_request(
+        state,
+        &key_a,
+        &json!({"input": "temporally invalid child"}),
+        &ConversationHints {
+            parent_turn_id: Some("future-parent".into()),
+            subagent: true,
+            ..ConversationHints::default()
+        },
+        "FutureChild",
+    )
+    .await;
+    assert_ne!(future_child_cluster, root_cluster);
+
+    let subagent_edges_for_a: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_edges e JOIN conversation_observations target ON target.id = e.to_observation_id WHERE target.key_id = $1 AND e.relation_kind = 'subagent'",
+    )
+    .bind(key_a.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count key A subagent edges");
+    let subagent_edges_for_b: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_edges e JOIN conversation_observations target ON target.id = e.to_observation_id WHERE target.key_id = $1 AND e.relation_kind = 'subagent'",
+    )
+    .bind(key_b.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count key B subagent edges");
+    assert_eq!(subagent_edges_for_a, 2);
+    assert_eq!(subagent_edges_for_b, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_subagent_relations_require_explicit_key_local_ancestry() {
+    let directory = tempfile::tempdir().expect("temporary SQLite directory");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("subagent-contract.sqlite").display()
+    );
+    let mut config = Config::for_test(database_url.clone());
+    config.key_pepper = String::from_utf8(PEPPER.to_vec()).expect("UTF-8 pepper");
+    let state = AppState::initialize(config)
+        .await
+        .expect("initialize SQLite subagent state");
+    assert_subagent_relation_contract(
+        &state,
+        &database_url,
+        &format!("subagent-sqlite-{}", Uuid::now_v7()),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_subagent_relations_require_explicit_key_local_ancestry() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let mut config = Config::for_test(database_url.clone());
+    config.key_pepper = String::from_utf8(PEPPER.to_vec()).expect("UTF-8 pepper");
+    let state = AppState::initialize(config)
+        .await
+        .expect("initialize PostgreSQL subagent state");
+    assert_subagent_relation_contract(
+        &state,
+        &database_url,
+        &format!("subagent-postgres-{}", Uuid::now_v7()),
+    )
+    .await;
 }
 
 async fn execute_sql_script(pool: &AnyPool, sql: &'static str) {

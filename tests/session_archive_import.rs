@@ -580,6 +580,7 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
         parent_turn_id: None,
         branch_id: None,
         compaction: false,
+        subagent: false,
     };
     let commit_input = |record_digest| SessionArchiveCommitInput {
         tenant_external_id: "archive-fixture",
@@ -1172,6 +1173,7 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
             parent_turn_id: None,
             branch_id: None,
             compaction: false,
+            subagent: false,
         };
         commit_db
             .commit_session_archive_request(SessionArchiveCommitInput {
