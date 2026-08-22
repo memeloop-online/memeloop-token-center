@@ -46,10 +46,10 @@ EOF
 ]}
 EOF
   cat >"$fixture/blob-$sbom_layer.json" <<EOF
-{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://spdx.dev/Document","predicate":{"SPDXID":"SPDXRef-DOCUMENT"}}
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://spdx.dev/Document","predicate":{"spdxVersion":"SPDX-2.3","SPDXID":"SPDXRef-DOCUMENT"}}
 EOF
   cat >"$fixture/blob-$provenance_layer.json" <<EOF
-{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://slsa.dev/provenance/v1","predicate":{"buildDefinition":{}}}
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://slsa.dev/provenance/v1","predicate":{"buildDefinition":{},"runDetails":{}}}
 EOF
 }
 
@@ -70,10 +70,25 @@ expect_rejected() {
 write_good
 verify >/dev/null
 
+# BuildKit still emits SLSA v0.2 by default in supported buildx releases.
+# Keep that explicit compatibility path covered without accepting URI wildcards.
+write_good
+python3 - "$fixture/manifest-$attestation_manifest.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text())
+payload["layers"][1]["annotations"]["in-toto.io/predicate-type"] = "https://slsa.dev/provenance/v0.2"
+path.write_text(json.dumps(payload))
+PY
+cat >"$fixture/blob-$provenance_layer.json" <<EOF
+{"_type":"https://in-toto.io/Statement/v0.1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://slsa.dev/provenance/v0.2","predicate":{"buildType":"https://mobyproject.org/buildkit@v1","builder":{}}}
+EOF
+verify >/dev/null
+
 # A valid predicate attached to a different subject must never be credited to
 # the image that was just built.
 cat >"$fixture/blob-$sbom_layer.json" <<EOF
-{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$wrong"}}],"predicateType":"https://spdx.dev/Document","predicate":{}}
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$wrong"}}],"predicateType":"https://spdx.dev/Document","predicate":{"spdxVersion":"SPDX-2.3","SPDXID":"SPDXRef-DOCUMENT"}}
 EOF
 expect_rejected wrong-subject
 
@@ -81,7 +96,7 @@ expect_rejected wrong-subject
 # URL name must identify the dynamic image and the selected linux/amd64 result.
 write_good
 cat >"$fixture/blob-$sbom_layer.json" <<EOF
-{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"pkg:docker/registry.example.test/other/service@sha-test?platform=linux%2Famd64","digest":{"sha256":"$subject"}}],"predicateType":"https://spdx.dev/Document","predicate":{}}
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"pkg:docker/registry.example.test/other/service@sha-test?platform=linux%2Famd64","digest":{"sha256":"$subject"}}],"predicateType":"https://spdx.dev/Document","predicate":{"spdxVersion":"SPDX-2.3","SPDXID":"SPDXRef-DOCUMENT"}}
 EOF
 expect_rejected wrong-subject-name
 
@@ -92,6 +107,35 @@ cat >"$fixture/blob-$sbom_layer.json" <<EOF
 {"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://example.test/not-spdx","predicate":{}}
 EOF
 expect_rejected predicate-mismatch
+
+# A declared SPDX predicate with an empty object is not SBOM evidence.
+# Digest and name binding alone must not make it acceptable.
+write_good
+cat >"$fixture/blob-$sbom_layer.json" <<EOF
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://spdx.dev/Document","predicate":{}}
+EOF
+expect_rejected empty-predicate
+
+# Omitting the predicate member entirely must also fail closed.
+write_good
+cat >"$fixture/blob-$sbom_layer.json" <<EOF
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://spdx.dev/Document"}
+EOF
+expect_rejected missing-predicate
+
+# SLSA v1 requires both halves of its minimum structural envelope.
+write_good
+cat >"$fixture/blob-$provenance_layer.json" <<EOF
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://slsa.dev/provenance/v1","predicate":{"buildDefinition":{}}}
+EOF
+expect_rejected v1-missing-run-details
+
+# A provenance-shaped URI outside the explicit allowlist cannot exploit a
+# wildcard suffix, even when descriptor and statement repeat the same value.
+write_good
+sed -i 's#https://slsa.dev/provenance/v1#https://slsa.dev/provenance/fake#g' \
+  "$fixture/manifest-$attestation_manifest.json" "$fixture/blob-$provenance_layer.json"
+expect_rejected unknown-provenance-fake
 
 # Short, uppercase, or otherwise malformed registry digests fail before blob
 # retrieval. This fixture uses a short layer digest.

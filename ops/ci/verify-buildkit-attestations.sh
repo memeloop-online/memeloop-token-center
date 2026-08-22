@@ -117,7 +117,8 @@ while IFS="$tab" read -r attestation_digest referenced_digest; do
     validate_digest "$layer_digest" "in-toto layer digest"
     case "$predicate_type" in
       https://spdx.dev/Document) marker=$sbom_marker ;;
-      https://slsa.dev/provenance/*) marker=$provenance_marker ;;
+      https://slsa.dev/provenance/v1 | https://slsa.dev/provenance/v0.2)
+        marker=$provenance_marker ;;
       *) fail "unrecognized or missing in-toto predicate type" ;;
     esac
     layer_hex=${layer_digest#sha256:}
@@ -127,6 +128,21 @@ while IFS="$tab" read -r attestation_digest referenced_digest; do
       ((.["_type"] == "https://in-toto.io/Statement/v0.1") or
        (.["_type"] == "https://in-toto.io/Statement/v1")) and
       .predicateType == $predicate and
+      ((.predicate | type) == "object") and
+      (if $predicate == "https://spdx.dev/Document" then
+         .predicate.SPDXID == "SPDXRef-DOCUMENT" and
+         ((.predicate.spdxVersion | type) == "string") and
+         (.predicate.spdxVersion | startswith("SPDX-"))
+       elif $predicate == "https://slsa.dev/provenance/v1" then
+         ((.predicate.buildDefinition | type) == "object") and
+         ((.predicate.runDetails | type) == "object")
+       elif $predicate == "https://slsa.dev/provenance/v0.2" then
+         ((.predicate.buildType | type) == "string") and
+         ((.predicate.buildType | length) > 0) and
+         ((.predicate.builder | type) == "object")
+       else
+         false
+       end) and
       (.subject | type == "array" and length > 0) and
       all(.subject[];
         (.name | type == "string") and
@@ -137,7 +153,7 @@ while IFS="$tab" read -r attestation_digest referenced_digest; do
         ((.digest | keys) == ["sha256"]) and
         (.digest.sha256 == $subject))
     ' "$statement" >/dev/null || \
-      fail "in-toto statement type, predicate, image name, or exact sha256 subject is invalid"
+      fail "in-toto statement type, predicate structure, image name, or exact sha256 subject is invalid"
     : >"$marker"
   done <<EOF
 $layer_rows

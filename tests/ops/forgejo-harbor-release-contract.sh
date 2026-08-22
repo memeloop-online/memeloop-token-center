@@ -168,12 +168,31 @@ for required in \
   'https://in-toto.io/Statement/v1' \
   '.predicateType == $predicate' \
   'startswith("pkg:docker/" + $image + "@")' \
+  'https://slsa.dev/provenance/v1 | https://slsa.dev/provenance/v0.2' \
+  '((.predicate | type) == "object")' \
+  '.predicate.SPDXID == "SPDXRef-DOCUMENT"' \
+  '.predicate.spdxVersion' \
+  '.predicate.buildDefinition' \
+  '.predicate.runDetails' \
+  '.predicate.buildType' \
+  '.predicate.builder' \
   'endswith("?platform=linux%2Famd64")' \
   '(.digest.sha256 == $subject)' \
   'verified SPDX SBOM statement is missing' \
   'verified SLSA provenance statement is missing'; do
   grep -Fq -- "$required" "$attestation_verifier" || \
     fail "missing deep attestation validation: $required"
+done
+if grep -Fq 'https://slsa.dev/provenance/*' "$attestation_verifier"; then
+  fail "SLSA predicate types must use an explicit allowlist"
+fi
+for malicious_fixture in \
+  empty-predicate \
+  missing-predicate \
+  v1-missing-run-details \
+  unknown-provenance-fake; do
+  grep -Fq "expect_rejected $malicious_fixture" "$attestation_fixtures" || \
+    fail "missing predicate bypass fixture: $malicious_fixture"
 done
 grep -Fq 'tests/ops/forgejo-attestation-fixtures.sh' "$shared_contracts"
 

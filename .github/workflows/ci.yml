@@ -444,7 +444,7 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          push: true
+          outputs: type=image,push=true,oci-mediatypes=true,oci-artifact=true
           tags: ${{ matrix.image }}:sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -607,6 +607,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install pinned workflow-policy parser dependencies
+        run: npm --prefix web ci --ignore-scripts
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
       - name: Install pinned Kubernetes schema validator
         run: |

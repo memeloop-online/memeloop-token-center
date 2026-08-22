@@ -4,6 +4,9 @@ set -eu
 repository=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 workflow_directory="$repository/.github/workflows"
 workflow="$workflow_directory/ci.yml"
+workflow_policy="$repository/web/scripts/verify-github-workflow-policy.mjs"
+workflow_policy_fixtures="$repository/tests/ops/github-workflow-policy-fixtures.sh"
+shared_contracts="$repository/ops/ci/run-release-source-contracts.sh"
 dockerfile="$repository/Dockerfile"
 importer_contract="$repository/tests/ops/importer-image-contract.sh"
 cargo_config="$repository/.cargo/config.toml"
@@ -12,6 +15,9 @@ test -f "$workflow"
 test -f "$workflow_directory/memory-acceptance.yml"
 test -f "$dockerfile"
 test -f "$importer_contract"
+test -x "$workflow_policy"
+test -x "$workflow_policy_fixtures"
+test -x "$shared_contracts"
 test -f "$cargo_config"
 test -f "$repository/.forgejo/workflows/harbor-release.yml"
 test ! -e "$repository/.forgejo/workflows/build.yaml"
@@ -69,10 +75,7 @@ fi
 grep -Fq 'node-version: 24.18.0' "$workflow"
 test "$(grep -c 'toolchain: 1.95.0' "$workflow")" -eq 4
 
-# Default to read-only and grant package publication only to the master release job.
-test "$(grep -c '^[[:space:]]*contents: read$' "$workflow")" -ge 2
-test "$(grep -c '^[[:space:]]*packages: write$' "$workflow")" -eq 1
-test "$(grep -c '^[[:space:]]*packages: read$' "$workflow")" -eq 1
+node "$workflow_policy" "$workflow" "$repository"
 test "$(grep -c '^[[:space:]]*contents: write$' "$workflow" || true)" -eq 0
 test "$(grep -c '^[[:space:]]*id-token: write$' "$workflow" || true)" -eq 0
 
@@ -88,12 +91,8 @@ grep -Fq 'repository-security:' "$workflow"
 grep -Fq 'dependency-security:' "$workflow"
 grep -Fq 'scanners: secret,misconfig' "$workflow"
 grep -Fq 'command: check advisories bans licenses sources' "$workflow"
-grep -Fq 'cargo install cargo-audit --version 0.22.2 --locked' "$workflow"
-grep -Fq 'cargo audit --deny warnings' "$workflow"
-if grep -E 'cargo audit|cargo-audit|rustsec/audit-check' "$workflow" | grep -Eq 'ignore:|--ignore'; then
-  echo 'RustSec CI must not suppress any advisory' >&2
-  exit 1
-fi
+grep -Fq 'verifyDependencySecurity(workflow.jobs['"'"'dependency-security'"'"'])' "$workflow_policy"
+grep -Fq '/--ignore(?:\s|=|$)/iu' "$workflow_policy"
 grep -Fq 'memory-acceptance:' "$workflow"
 grep -Fq 'uses: ./.github/workflows/memory-acceptance.yml' "$workflow"
 grep -Fq 'workflow_call:' "$workflow_directory/memory-acceptance.yml"
@@ -110,6 +109,7 @@ fi
 
 grep -Fq 'ops/ci/validate-release-inputs.sh' "$workflow"
 grep -Fq 'ops/ci/run-release-source-contracts.sh' "$workflow"
+grep -Fq 'tests/ops/github-workflow-policy-fixtures.sh' "$shared_contracts"
 grep -Fq 'ghcr.io/${{ github.repository_owner }}/memeloop-token-center' "$workflow"
 grep -Fq 'ghcr.io/${{ github.repository_owner }}/memeloop-token-center-importer' "$workflow"
 grep -Fq 'ghcr.io/${{ github.repository_owner }}/memeloop-token-center-plugin-installer' "$workflow"
