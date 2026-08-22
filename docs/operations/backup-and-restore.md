@@ -1,5 +1,11 @@
 # Backup and restore
 
+This runbook is scoped only to Token Center application recovery: its
+PostgreSQL state, S3-compatible archives and generated assets, configuration,
+and the key material required to decrypt or authenticate those records. It does
+not prescribe cluster-wide, Harbor, Forgejo, Longhorn, node-disk or unrelated
+service backups. Those are owned by the infrastructure operating procedures.
+
 Backups are part of the service boundary because PostgreSQL stores identities,
 permissions, balances, accounting and archive references while S3 stores the
 request and response bodies. Restoring only one side can produce missing archive

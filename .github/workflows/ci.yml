@@ -638,7 +638,7 @@ jobs:
         run: tests/ops/release-packaging-contract.sh
       - name: Enforce focused source-module boundaries
         run: tests/ops/source-module-size-contract.sh
-      - name: Validate shared GitHub and temporary Forgejo release contracts
+      - name: Validate GitHub release contracts
         run: ops/ci/run-release-source-contracts.sh
       - name: Build and exercise the hardened importer image
         run: tests/ops/importer-image-contract.sh

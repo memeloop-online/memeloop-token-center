@@ -8,6 +8,17 @@
 
 同一个镜像支持 `serve --role gateway|control|worker|all`。生产 Helm 默认拆分 gateway、control 与 worker；`all` 只供个人或临时测试部署。gateway 不注册 `/internal/v1/*`，control 不注册模型和 self-service 路由。
 
+## 产品与工程文档
+
+- [产品需求与明确排除项](docs/product-requirements.md)
+- [系统架构与信任边界](docs/architecture.md)
+- [开发交接、当前提交和剩余门禁](docs/development-handoff.md)
+- [HTTP API 契约](openapi/openapi.yaml)
+- [部署就绪条件](docs/deployment-readiness.md)
+- [验收矩阵](docs/acceptance-matrix.md)
+
+`docs/product-requirements.md` 是产品范围的权威入口；实现、测试或运维文档如与其冲突，必须先更新并评审产品需求，而不是静默改变范围。
+
 ## 凭据身份与权限
 
 一个逻辑凭据由不可变 UUIDv7 `key_id` 标识，密钥字符串只是它的一代 credential。轮换时只吊销旧 credential 并生成下一代，策略、余额账户、请求记录、统计和会话簇始终引用同一个 `key_id`，不复制或迁移历史。迁移 CPA 时还可把原凭据以 peppered HMAC credential 绑定到这个稳定身份；不会保存明文，也不要求客户端切换。
