@@ -1,5 +1,5 @@
 {
-  "type": "subscription-bridge",
+  "type": "cursor",
   "upstream": "cursor",
   "handle": "FixtureCursorHandle01",
   "label": "Fixture Cursor",

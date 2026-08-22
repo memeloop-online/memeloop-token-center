@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Inventory and import CPA upstream accounts through the control API.
 
-The source config, auth files, target service token, and optional subscription
-bridge secret are accepted only from owner-only regular files.  Secret values
-are kept outside the printable plan and are never included in errors or output.
+The source config, auth files, and target service token are accepted only from
+owner-only regular files. Secret values are kept outside the printable plan and
+are never included in errors or output.
 """
 
 from __future__ import annotations
@@ -97,11 +97,10 @@ class DirectAccount:
 
 
 @dataclass(frozen=True)
-class SubscriptionAccount:
-    source_id: str
-    source_basename: str
+class NativeReauthorization:
+    stable_id: str
     provider: str
-    document_ref: str
+    source_disabled: bool
 
 
 @dataclass(frozen=True)
@@ -114,7 +113,7 @@ class ManagedOAuthAccount:
 @dataclass(frozen=True)
 class Inventory:
     direct: tuple[DirectAccount, ...]
-    subscriptions: tuple[SubscriptionAccount, ...]
+    native_reauthorization_required: tuple[NativeReauthorization, ...]
     managed_oauth: tuple[ManagedOAuthAccount, ...]
     disabled_source_count: int
 
@@ -134,12 +133,6 @@ class SecretStore:
         value = self._values.get(reference)
         if not isinstance(value, str):
             raise ImportFailure("internal credential reference is invalid")
-        return value
-
-    def get_document(self, reference: str) -> dict[str, object]:
-        value = self._values.get(reference)
-        if not isinstance(value, dict):
-            raise ImportFailure("internal subscription reference is invalid")
         return value
 
     def take_document(self, reference: str) -> dict[str, object]:
@@ -582,16 +575,15 @@ def inventory_auth_accounts(
     root: pathlib.Path, secrets: SecretStore, allow_http_loopback: bool
 ) -> tuple[
     list[DirectAccount],
-    list[SubscriptionAccount],
+    list[NativeReauthorization],
     list[ManagedOAuthAccount],
     int,
 ]:
     direct: list[DirectAccount] = []
-    subscriptions: list[SubscriptionAccount] = []
+    native_reauthorization_required: list[NativeReauthorization] = []
     managed_oauth: list[ManagedOAuthAccount] = []
     disabled_count = 0
-    basenames: set[str] = set()
-    handles: set[str] = set()
+    handle_digests: set[bytes] = set()
     for relative_path, path in auth_files(root):
         document = parse_auth_document(
             read_owner_only_file(str(path), "CPA auth document", MAX_AUTH_BYTES)
@@ -604,56 +596,52 @@ def inventory_auth_accounts(
             raise ImportFailure("CPA auth document has no recognized type")
         record_type = type_value.strip().lower()
         upstream = document.get("upstream")
-        is_subscription = upstream in {"copilot", "cursor"} and "handle" in document
-        if is_subscription:
+        requires_native_reauthorization = (
+            upstream in {"copilot", "cursor"} and "handle" in document
+        )
+        if requires_native_reauthorization:
             if record_type not in {
                 "subscription-bridge",
                 "cpa-subscription-bridge",
                 "copilot",
                 "cursor",
             }:
-                raise ImportFailure("CPA subscription auth document has an unsupported type")
+                raise ImportFailure(
+                    "CPA opaque Copilot/Cursor auth document has an unsupported type"
+                )
             require_exact_fields(
                 document,
                 {"type", "upstream", "handle", "label", "login", "disabled"},
-                "CPA subscription auth document",
+                "CPA opaque Copilot/Cursor auth document",
             )
-            if disabled:
-                disabled_count += 1
-                continue
-            handle = secret_string(document.get("handle"), "CPA subscription handle")
+            handle = secret_string(
+                document.get("handle"), "CPA opaque Copilot/Cursor handle"
+            )
             if not HANDLE_PATTERN.fullmatch(handle):
-                raise ImportFailure("CPA subscription handle has an unsupported shape")
-            if handle in handles:
-                raise ImportFailure("CPA subscription handle is duplicated")
-            handles.add(handle)
-            basename = pathlib.PurePosixPath(relative_path).name
-            if basename in basenames:
-                raise ImportFailure("CPA subscription auth basenames are duplicated")
-            basenames.add(basename)
+                raise ImportFailure(
+                    "CPA opaque Copilot/Cursor handle has an unsupported shape"
+                )
+            handle_digest = hashlib.sha256(
+                b"cpa-opaque-account-handle\0" + handle.encode("utf-8")
+            ).digest()
+            if handle_digest in handle_digests:
+                raise ImportFailure("CPA opaque Copilot/Cursor handle is duplicated")
+            handle_digests.add(handle_digest)
+            handle = ""
             label = document.get("label")
             if label is not None and (
                 not isinstance(label, str) or not label or len(label) > 200
             ):
-                raise ImportFailure("CPA subscription label is invalid")
+                raise ImportFailure("CPA opaque Copilot/Cursor label is invalid")
             record_source = source_identity("auth", relative_path, record_type, upstream)
-            document_ref = f"subscription:{source_digest(record_source)}"
-            normalized: dict[str, object] = {
-                "type": "subscription-bridge",
-                "upstream": upstream,
-                "handle": handle,
-            }
-            if label is not None:
-                normalized["label"] = label
-            secrets.put(document_ref, normalized)
-            subscriptions.append(
-                SubscriptionAccount(
-                    source_id=record_source,
-                    source_basename=basename,
+            native_reauthorization_required.append(
+                NativeReauthorization(
+                    stable_id=source_digest(record_source),
                     provider=str(upstream),
-                    document_ref=document_ref,
+                    source_disabled=disabled,
                 )
             )
+            disabled_count += int(disabled)
             continue
         if record_type == "api_key":
             require_exact_fields(
@@ -731,7 +719,7 @@ def inventory_auth_accounts(
         if has_token_material(document):
             raise ImportFailure("CPA auth document has an unsupported managed OAuth type")
         raise ImportFailure("CPA auth document has an unsupported account type")
-    return direct, subscriptions, managed_oauth, disabled_count
+    return direct, native_reauthorization_required, managed_oauth, disabled_count
 
 
 def build_inventory(
@@ -745,24 +733,38 @@ def build_inventory(
         config, secrets, allow_http_loopback
     )
     auth_root = validate_auth_directory(auth_dir)
-    auth_direct, subscriptions, managed_oauth, disabled_auth = inventory_auth_accounts(
+    (
+        auth_direct,
+        native_reauthorization_required,
+        managed_oauth,
+        disabled_auth,
+    ) = inventory_auth_accounts(
         auth_root, secrets, allow_http_loopback
     )
     direct.extend(auth_direct)
-    if len(direct) + len(subscriptions) + len(managed_oauth) > MAX_ACCOUNTS:
+    if (
+        len(direct)
+        + len(native_reauthorization_required)
+        + len(managed_oauth)
+        > MAX_ACCOUNTS
+    ):
         raise ImportFailure("CPA source contains too many upstream accounts")
     source_ids = [record.source_id for record in direct]
-    source_ids.extend(record.source_id for record in subscriptions)
+    source_ids.extend(
+        record.stable_id for record in native_reauthorization_required
+    )
     source_ids.extend(record.stable_id for record in managed_oauth)
     names = [record.name for record in direct]
     if len(source_ids) != len(set(source_ids)) or len(names) != len(set(names)):
         raise ImportFailure("CPA source contains a stable identity conflict")
-    if not direct and not subscriptions and not managed_oauth:
+    if not direct and not native_reauthorization_required and not managed_oauth:
         raise ImportFailure("CPA source contains no active supported upstream accounts")
     return (
         Inventory(
             direct=tuple(direct),
-            subscriptions=tuple(subscriptions),
+            native_reauthorization_required=tuple(
+                native_reauthorization_required
+            ),
             managed_oauth=tuple(managed_oauth),
             disabled_source_count=disabled_config + disabled_auth,
         ),
@@ -946,8 +948,6 @@ def preflight_target(
         if isinstance(value, dict) and isinstance(value.get("id"), str)
     }
     required_drivers = {record.driver for record in inventory.direct}
-    if inventory.subscriptions:
-        required_drivers.add("cpa-subscription-bridge")
     if not required_drivers.issubset(provider_ids):
         raise ImportFailure("target is missing a provider driver required by the CPA source")
     query = urllib.parse.urlencode({"tenant_external_id": tenant})
@@ -1028,52 +1028,6 @@ def import_managed_oauth(
         else:
             replayed_count += 1
     return created_count, replayed_count
-
-
-def import_subscriptions(
-    opener: urllib.request.OpenerDirector,
-    base_url: str,
-    token: str,
-    tenant: str,
-    bridge_base_url: str,
-    bridge_secret: str | None,
-    inventory: Inventory,
-    secrets: SecretStore,
-) -> int:
-    imported_count = 0
-    for record in inventory.subscriptions:
-        body: dict[str, object] = {
-            "tenant_external_id": tenant,
-            "bridge_base_url": bridge_base_url,
-            "auth_files": [
-                {
-                    "filename": record.source_basename,
-                    "document": secrets.get_document(record.document_ref),
-                }
-            ],
-        }
-        if bridge_secret is not None:
-            body["bridge_secret"] = bridge_secret
-        result = request_json(
-            opener,
-            method="POST",
-            url=f"{base_url}/internal/v1/imports/cpa/subscription-accounts",
-            token=token,
-            label="CPA subscription account import",
-            expected_status=201,
-            body=body,
-        )
-        result_object = require_mapping(result, "CPA subscription import response")
-        imported = result_object.get("imported")
-        skipped = result_object.get("skipped")
-        if not isinstance(imported, list) or len(imported) != 1 or skipped != []:
-            raise ImportFailure("CPA subscription account was not imported exactly once")
-        imported_item = require_mapping(imported[0], "CPA subscription import item")
-        if imported_item.get("provider") != record.provider:
-            raise ImportFailure("CPA subscription import returned another provider")
-        validate_account(imported_item.get("account"), tenant, "CPA subscription import")
-        imported_count += 1
-    return imported_count
 
 
 def desired_credential(record: DirectAccount, secrets: SecretStore) -> dict[str, object]:
@@ -1181,7 +1135,6 @@ def summary(
     *,
     created_count: int = 0,
     replayed_count: int = 0,
-    imported_subscription_count: int = 0,
     created_managed_oauth_count: int = 0,
     replayed_managed_oauth_count: int = 0,
 ) -> dict[str, object]:
@@ -1198,13 +1151,22 @@ def summary(
         "created_count": created_count,
         "created_managed_oauth_count": created_managed_oauth_count,
         "disabled_source_count": inventory.disabled_source_count,
-        "imported_subscription_count": imported_subscription_count,
         "managed_oauth_account_count": len(inventory.managed_oauth),
         "managed_oauth_source_type_counts": managed_oauth_source_type_counts,
         "mode": mode,
+        "native_reauthorization_required": [
+            {
+                "provider": record.provider,
+                "source_disabled": record.source_disabled,
+                "source_stable_id": record.stable_id,
+            }
+            for record in inventory.native_reauthorization_required
+        ],
+        "native_reauthorization_required_count": len(
+            inventory.native_reauthorization_required
+        ),
         "replayed_count": replayed_count,
         "replayed_managed_oauth_count": replayed_managed_oauth_count,
-        "subscription_account_count": len(inventory.subscriptions),
     }
 
 
@@ -1218,8 +1180,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true", help="Perform control API writes.")
     parser.add_argument("--target-api-base-url", help="Private Token Center control base URL.")
     parser.add_argument("--service-token-file", help="Mode-0600 target service token file.")
-    parser.add_argument("--bridge-base-url", help="CPA subscription bridge base URL.")
-    parser.add_argument("--bridge-secret-file", help="Optional mode-0600 bridge secret file.")
     parser.add_argument("--ca-file", help="Optional CA bundle for the target control endpoint.")
     parser.add_argument(
         "--allow-http-loopback",
@@ -1236,15 +1196,11 @@ def run(argv: list[str]) -> int:
     inventory, secrets = build_inventory(
         args.config, args.auth_dir, args.allow_http_loopback
     )
-    bridge_base_url = None
-    if inventory.subscriptions:
-        if args.bridge_base_url is None:
-            raise ImportFailure("bridge base URL is required for CPA subscription accounts")
-        bridge_base_url = public_url(
-            args.bridge_base_url, "CPA subscription bridge base URL", args.allow_http_loopback
-        )
     if not args.apply:
         print(json.dumps(summary("dry-run", inventory), separators=(",", ":"), sort_keys=True))
+        return 0
+    if not inventory.direct and not inventory.managed_oauth:
+        print(json.dumps(summary("apply", inventory), separators=(",", ":"), sort_keys=True))
         return 0
     if not args.target_api_base_url or not args.service_token_file:
         raise ImportFailure("apply requires target API base URL and service token file")
@@ -1252,9 +1208,6 @@ def run(argv: list[str]) -> int:
         args.target_api_base_url, "target API base URL", args.allow_http_loopback
     )
     token = read_token(args.service_token_file, "target service token file")
-    bridge_secret = None
-    if args.bridge_secret_file:
-        bridge_secret = read_token(args.bridge_secret_file, "subscription bridge secret file")
     opener = opener_for(args.ca_file)
     existing = preflight_target(
         opener, target_base_url, token, args.tenant, inventory
@@ -1264,16 +1217,6 @@ def run(argv: list[str]) -> int:
         target_base_url,
         token,
         args.tenant,
-        inventory,
-        secrets,
-    )
-    imported_subscription_count = import_subscriptions(
-        opener,
-        target_base_url,
-        token,
-        args.tenant,
-        bridge_base_url or "",
-        bridge_secret,
         inventory,
         secrets,
     )
@@ -1293,7 +1236,6 @@ def run(argv: list[str]) -> int:
                 inventory,
                 created_count=created_count,
                 replayed_count=replayed_count,
-                imported_subscription_count=imported_subscription_count,
                 created_managed_oauth_count=created_managed_oauth_count,
                 replayed_managed_oauth_count=replayed_managed_oauth_count,
             ),

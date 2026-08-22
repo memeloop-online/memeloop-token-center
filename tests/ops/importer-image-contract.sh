@@ -88,9 +88,13 @@ docker run --rm \
   --entrypoint /usr/local/bin/import-cpa-upstreams \
   "$image" --help >"$workspace/cpa-upstream-help.txt"
 grep -Fq 'dry-run by default' "$workspace/cpa-upstream-help.txt"
-if grep -Eq -- '--(credential|api-key|service-token|bridge-secret)([ =]|$)' \
+if grep -Eq -- '--(credential|api-key|service-token)([ =]|$)' \
   "$workspace/cpa-upstream-help.txt"; then
   echo 'CPA upstream importer must not accept a plaintext secret argument' >&2
+  exit 1
+fi
+if grep -Eqi -- 'bridge|subscription-accounts' "$workspace/cpa-upstream-help.txt"; then
+  echo 'CPA upstream importer must not expose retired relay options' >&2
   exit 1
 fi
 
@@ -127,11 +131,11 @@ docker run --rm \
   "$image" \
   --config /source/config.yaml \
   --auth-dir /source/auth \
-  --bridge-base-url https://bridge.example.test \
   >"$workspace/cpa-upstream-dry-run.json"
 grep -Fq '"mode":"dry-run"' "$workspace/cpa-upstream-dry-run.json"
 grep -Fq '"api_account_count":6' "$workspace/cpa-upstream-dry-run.json"
-grep -Fq '"subscription_account_count":2' "$workspace/cpa-upstream-dry-run.json"
+grep -Fq '"native_reauthorization_required_count":2' \
+  "$workspace/cpa-upstream-dry-run.json"
 if grep -Eq 'fixture-only-|Fixture(Copilot|Cursor)Handle' \
   "$workspace/cpa-upstream-dry-run.json"; then
   echo 'CPA upstream dry-run leaked fixture credential material' >&2

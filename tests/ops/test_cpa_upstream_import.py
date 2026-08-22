@@ -25,7 +25,6 @@ IMPORTER = REPOSITORY / "ops" / "cpa-upstreams" / "import-cpa-upstreams.py"
 FIXTURES = REPOSITORY / "tests" / "fixtures" / "cpa-upstreams"
 SANITIZER = REPOSITORY / "tests" / "ops" / "sanitize-cpa-upstream-fixtures.py"
 TARGET_TOKEN = "fixture-only-target-service-token"
-BRIDGE_SECRET = "fixture-only-subscription-bridge-secret"
 
 
 def account_view(
@@ -57,7 +56,6 @@ class TargetState:
         self.accounts: dict[str, dict[str, object]] = {}
         self.account_names_by_id: dict[str, str] = {}
         self.idempotency: dict[str, tuple[bytes, str]] = {}
-        self.subscription_names: dict[str, str] = {}
         self.managed_oauth_imports: dict[
             tuple[str, str, str], tuple[bytes, dict[str, object]]
         ] = {}
@@ -66,6 +64,7 @@ class TargetState:
         self.managed_oauth_source_types = ["codex", "gemini-legacy"]
         self.managed_oauth_error_status: int | None = None
         self.managed_oauth_error_body: object = {"error": "fixture-only-reflected-secret"}
+        self.fail_next_credential_response_after_commit = False
         self.requests: list[tuple[str, str]] = []
         self.authorization_headers: list[str | None] = []
         self.write_count = 0
@@ -122,7 +121,6 @@ class MockTargetHandler(BaseHTTPRequestHandler):
                     200,
                     [
                         {"id": "http-json"},
-                        {"id": "cpa-subscription-bridge"},
                     ],
                 )
                 return
@@ -168,45 +166,6 @@ class MockTargetHandler(BaseHTTPRequestHandler):
                 )
                 self.server.state.add(account)
                 self._json(201, account)
-                return
-            if self.path == "/internal/v1/imports/cpa/subscription-accounts":
-                self.server.state.write_count += 1
-                auth_file = document["auth_files"][0]
-                auth_document = auth_file["document"]
-                provider = auth_document["upstream"]
-                handle = auth_document["handle"]
-                stable = hashlib.sha256(
-                    f"{document['tenant_external_id']}\0{provider}\0{handle}".encode()
-                ).hexdigest()[:16]
-                name = self.server.state.subscription_names.setdefault(
-                    handle, f"cpa-{provider}-{stable}"
-                )
-                account = self.server.state.accounts.get(name)
-                if account is None:
-                    account = account_view(
-                        name=name,
-                        driver="cpa-subscription-bridge",
-                        config={
-                            "base_url": document["bridge_base_url"],
-                            "provider": provider,
-                            "network_scope": "private",
-                        },
-                        tenant=document["tenant_external_id"],
-                    )
-                    self.server.state.add(account)
-                self._json(
-                    201,
-                    {
-                        "imported": [
-                            {
-                                "source_fingerprint": "fixture-only-fingerprint",
-                                "provider": provider,
-                                "account": account,
-                            }
-                        ],
-                        "skipped": [],
-                    },
-                )
                 return
             if self.path == "/internal/v1/imports/cpa/managed-oauth":
                 self.server.state.write_count += 1
@@ -303,6 +262,10 @@ class MockTargetHandler(BaseHTTPRequestHandler):
             account["credential_generation"] = int(account["credential_generation"]) + 1
             account["updated_at"] = int(account["updated_at"]) + 1
             self.server.state.idempotency[idempotency_key] = (body, name)
+            if self.server.state.fail_next_credential_response_after_commit:
+                self.server.state.fail_next_credential_response_after_commit = False
+                self.close_connection = True
+                return
             self._json(200, account)
 
     def do_PATCH(self) -> None:  # noqa: N802
@@ -384,7 +347,33 @@ def sys_executable() -> str:
 
 
 class CpaUpstreamImportTests(unittest.TestCase):
-    def test_supported_fixture_dry_run_is_count_only_and_sanitized(self) -> None:
+    def assert_native_reauthorization_list(
+        self, summary: dict[str, object], expected_providers: list[str]
+    ) -> list[dict[str, object]]:
+        entries = summary["native_reauthorization_required"]
+        self.assertIsInstance(entries, list)
+        assert isinstance(entries, list)
+        self.assertEqual(
+            summary["native_reauthorization_required_count"], len(expected_providers)
+        )
+        self.assertEqual(
+            [entry["provider"] for entry in entries], expected_providers
+        )
+        for entry in entries:
+            self.assertEqual(
+                set(entry), {"provider", "source_disabled", "source_stable_id"}
+            )
+            self.assertFalse(entry["source_disabled"])
+            stable_id = entry["source_stable_id"]
+            self.assertIsInstance(stable_id, str)
+            assert isinstance(stable_id, str)
+            self.assertRegex(stable_id, r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            len({entry["source_stable_id"] for entry in entries}), len(entries)
+        )
+        return entries
+
+    def test_supported_fixture_dry_run_is_safe_inventory_and_sanitized(self) -> None:
         sanitizer = subprocess.run(
             [sys_executable(), str(SANITIZER)], text=True, capture_output=True, check=False
         )
@@ -396,35 +385,38 @@ class CpaUpstreamImportTests(unittest.TestCase):
             source.config,
             "--auth-dir",
             source.auth,
-            "--bridge-base-url",
-            "https://bridge.example.test",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        reauthorization = self.assert_native_reauthorization_list(
+            summary, ["copilot", "cursor"]
+        )
+        del summary["native_reauthorization_required"]
         self.assertEqual(
-            json.loads(result.stdout),
+            summary,
             {
                 "api_account_count": 6,
                 "created_count": 0,
                 "created_managed_oauth_count": 0,
                 "disabled_source_count": 0,
-                "imported_subscription_count": 0,
                 "managed_oauth_account_count": 0,
                 "managed_oauth_source_type_counts": {},
                 "mode": "dry-run",
+                "native_reauthorization_required_count": 2,
                 "replayed_count": 0,
                 "replayed_managed_oauth_count": 0,
-                "subscription_account_count": 2,
             },
         )
         self.assertEqual(result.stderr, "")
         self.assertNotIn("fixture-only-", result.stdout)
         self.assertNotIn("FixtureCopilotHandle01", result.stdout)
+        self.assertNotIn("copilot-account.json", result.stdout)
+        self.assertEqual(len(reauthorization), 2)
 
     def test_apply_and_replay_create_no_duplicate_accounts(self) -> None:
         source = SecureSource("supported")
         self.addCleanup(source.close)
         token_file = source.secret_file("target-token", TARGET_TOKEN)
-        bridge_secret_file = source.secret_file("bridge-secret", BRIDGE_SECRET)
         with mock_target() as (base_url, state):
             arguments = (
                 "--config",
@@ -433,10 +425,6 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 source.auth,
                 "--tenant",
                 "fixture-tenant",
-                "--bridge-base-url",
-                f"{base_url}/bridge",
-                "--bridge-secret-file",
-                bridge_secret_file,
                 "--target-api-base-url",
                 base_url,
                 "--service-token-file",
@@ -447,10 +435,12 @@ class CpaUpstreamImportTests(unittest.TestCase):
             first = run_importer(*arguments)
             self.assertEqual(first.returncode, 0, first.stderr)
             first_summary = json.loads(first.stdout)
+            first_reauthorization = self.assert_native_reauthorization_list(
+                first_summary, ["copilot", "cursor"]
+            )
             self.assertEqual(first_summary["created_count"], 6)
             self.assertEqual(first_summary["replayed_count"], 0)
-            self.assertEqual(first_summary["imported_subscription_count"], 2)
-            self.assertEqual(len(state.accounts), 8)
+            self.assertEqual(len(state.accounts), 6)
             direct_generations = [
                 account["credential_generation"]
                 for account in state.accounts.values()
@@ -461,10 +451,13 @@ class CpaUpstreamImportTests(unittest.TestCase):
             second = run_importer(*arguments)
             self.assertEqual(second.returncode, 0, second.stderr)
             second_summary = json.loads(second.stdout)
+            second_reauthorization = self.assert_native_reauthorization_list(
+                second_summary, ["copilot", "cursor"]
+            )
             self.assertEqual(second_summary["created_count"], 0)
             self.assertEqual(second_summary["replayed_count"], 6)
-            self.assertEqual(second_summary["imported_subscription_count"], 2)
-            self.assertEqual(len(state.accounts), 8)
+            self.assertEqual(first_reauthorization, second_reauthorization)
+            self.assertEqual(len(state.accounts), 6)
             direct_generations = [
                 account["credential_generation"]
                 for account in state.accounts.values()
@@ -473,11 +466,66 @@ class CpaUpstreamImportTests(unittest.TestCase):
             self.assertEqual(direct_generations, [2] * 6)
             self.assertTrue(state.authorization_headers)
             self.assertEqual(set(state.authorization_headers), {f"Bearer {TARGET_TOKEN}"})
+            self.assertFalse(
+                any("subscription-accounts" in path for _, path in state.requests)
+            )
             for output in (first.stdout, first.stderr, second.stdout, second.stderr):
                 self.assertNotIn(TARGET_TOKEN, output)
-                self.assertNotIn(BRIDGE_SECRET, output)
                 self.assertNotIn("fixture-only-cpa-", output)
                 self.assertNotIn("FixtureCursorHandle01", output)
+
+    def test_ambiguous_credential_commit_recovers_by_replaying_same_snapshot(self) -> None:
+        source = SecureSource("supported")
+        self.addCleanup(source.close)
+        token_file = source.secret_file("target-token", TARGET_TOKEN)
+        with mock_target() as (base_url, state):
+            arguments = (
+                "--config",
+                source.config,
+                "--auth-dir",
+                source.auth,
+                "--tenant",
+                "fixture-recovery",
+                "--target-api-base-url",
+                base_url,
+                "--service-token-file",
+                token_file,
+                "--allow-http-loopback",
+                "--apply",
+            )
+            state.fail_next_credential_response_after_commit = True
+            interrupted = run_importer(*arguments)
+            self.assertEqual(interrupted.returncode, 2)
+            self.assertEqual(interrupted.stdout, "")
+            self.assertIn("credential convergence failed", interrupted.stderr)
+            self.assertEqual(len(state.accounts), 1)
+            first_account = next(iter(state.accounts.values()))
+            self.assertEqual(first_account["credential_generation"], 2)
+
+            recovered = run_importer(*arguments)
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            recovered_summary = json.loads(recovered.stdout)
+            self.assertEqual(recovered_summary["created_count"], 5)
+            self.assertEqual(recovered_summary["replayed_count"], 1)
+            self.assert_native_reauthorization_list(
+                recovered_summary, ["copilot", "cursor"]
+            )
+            self.assertEqual(len(state.accounts), 6)
+            self.assertEqual(
+                [
+                    account["credential_generation"]
+                    for account in state.accounts.values()
+                ],
+                [2] * 6,
+            )
+        for output in (
+            interrupted.stdout,
+            interrupted.stderr,
+            recovered.stdout,
+            recovered.stderr,
+        ):
+            self.assertNotIn(TARGET_TOKEN, output)
+            self.assertNotIn("FixtureCopilotHandle01", output)
 
     def test_managed_oauth_dry_run_is_count_only_and_makes_no_target_request(self) -> None:
         source = SecureSource("oauth-blocked")
@@ -503,16 +551,16 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 "created_count": 0,
                 "created_managed_oauth_count": 0,
                 "disabled_source_count": 0,
-                "imported_subscription_count": 0,
                 "managed_oauth_account_count": 2,
                 "managed_oauth_source_type_counts": {
                     "codex": 1,
                     "gemini-legacy": 1,
                 },
                 "mode": "dry-run",
+                "native_reauthorization_required": [],
+                "native_reauthorization_required_count": 0,
                 "replayed_count": 0,
                 "replayed_managed_oauth_count": 0,
-                "subscription_account_count": 0,
             },
         )
         self.assertEqual(result.stderr, "")
@@ -525,6 +573,48 @@ class CpaUpstreamImportTests(unittest.TestCase):
             "gemini-account.json",
         ):
             self.assertNotIn(forbidden, result.stdout + result.stderr)
+
+    def test_opaque_handles_are_report_only_when_no_target_endpoint_exists(self) -> None:
+        source = SecureSource("supported")
+        self.addCleanup(source.close)
+        source.config.write_text(
+            'auth-dir: "/root/.cli-proxy-api/auth"\n', encoding="utf-8"
+        )
+        source.config.chmod(0o600)
+        (source.auth / "private-api-account.json").unlink()
+        importer_source = IMPORTER.read_text(encoding="utf-8")
+        self.assertNotIn(
+            "/internal/v1/imports/cpa/subscription-accounts", importer_source
+        )
+        self.assertNotIn("--bridge-", importer_source)
+
+        with mock_target() as (_, state):
+            dry_run = run_importer(
+                "--config", source.config, "--auth-dir", source.auth
+            )
+            apply = run_importer(
+                "--config", source.config, "--auth-dir", source.auth, "--apply"
+            )
+
+        self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+        self.assertEqual(apply.returncode, 0, apply.stderr)
+        dry_summary = json.loads(dry_run.stdout)
+        apply_summary = json.loads(apply.stdout)
+        self.assertEqual(dry_summary["mode"], "dry-run")
+        self.assertEqual(apply_summary["mode"], "apply")
+        dry_summary.pop("mode")
+        apply_summary.pop("mode")
+        self.assertEqual(dry_summary, apply_summary)
+        self.assert_native_reauthorization_list(
+            dry_summary, ["copilot", "cursor"]
+        )
+        self.assertEqual(dry_summary["api_account_count"], 0)
+        self.assertEqual(dry_summary["managed_oauth_account_count"], 0)
+        self.assertEqual(state.requests, [])
+        for output in (dry_run.stdout, dry_run.stderr, apply.stdout, apply.stderr):
+            self.assertNotIn("FixtureCopilotHandle01", output)
+            self.assertNotIn("FixtureCursorHandle01", output)
+            self.assertNotIn("@example.test", output)
 
     def test_managed_oauth_apply_and_replay_use_capabilities_and_exact_requests(self) -> None:
         source = SecureSource("oauth-blocked")
@@ -636,8 +726,6 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 source.auth,
                 "--tenant",
                 "mixed-preflight",
-                "--bridge-base-url",
-                f"{base_url}/bridge",
                 "--target-api-base-url",
                 base_url,
                 "--service-token-file",
@@ -657,7 +745,7 @@ class CpaUpstreamImportTests(unittest.TestCase):
         self.assertTrue(all(method == "GET" for method, _ in state.requests[:3]))
         summary = json.loads(result.stdout)
         self.assertEqual(summary["managed_oauth_account_count"], 2)
-        self.assertEqual(summary["subscription_account_count"], 2)
+        self.assert_native_reauthorization_list(summary, ["copilot", "cursor"])
         self.assertEqual(summary["api_account_count"], 1)
 
     def test_missing_managed_oauth_capability_stops_before_any_write(self) -> None:
@@ -908,8 +996,6 @@ class CpaUpstreamImportTests(unittest.TestCase):
             source.config,
             "--auth-dir",
             source.auth,
-            "--bridge-base-url",
-            "https://bridge.example.test",
         )
         self.assertEqual(symlinked.returncode, 2)
         self.assertIn("symbolic link", symlinked.stderr)
@@ -949,8 +1035,6 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 source.config,
                 "--auth-dir",
                 source.auth,
-                "--bridge-base-url",
-                "https://bridge.example.test",
                 "--target-api-base-url",
                 base_url,
                 "--service-token-file",
@@ -966,8 +1050,6 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 source.config,
                 "--auth-dir",
                 source.auth,
-                "--bridge-base-url",
-                f"{base_url}/bridge",
                 "--target-api-base-url",
                 f"{base_url}/redirect",
                 "--service-token-file",
@@ -983,7 +1065,6 @@ class CpaUpstreamImportTests(unittest.TestCase):
         source = SecureSource("supported")
         self.addCleanup(source.close)
         token_file = source.secret_file("target-token", TARGET_TOKEN)
-        bridge_secret_file = source.secret_file("bridge-secret", BRIDGE_SECRET)
         with mock_target() as (base_url, state):
             arguments = (
                 "--config",
@@ -992,10 +1073,6 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 source.auth,
                 "--tenant",
                 "fixture-conflict",
-                "--bridge-base-url",
-                f"{base_url}/bridge",
-                "--bridge-secret-file",
-                bridge_secret_file,
                 "--target-api-base-url",
                 base_url,
                 "--service-token-file",
