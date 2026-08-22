@@ -993,6 +993,32 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
+  /internal/v1/upstreams/{account_id}/oauth/disconnect:
+    post:
+      tags: [Upstream providers]
+      operationId: disconnectUpstreamOAuth
+      summary: Revoke and disable an OAuth upstream while preserving its stable identity
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DisconnectUpstreamOAuthRequest' }
+      responses:
+        '200':
+          description: OAuth credential revoked locally and, when supported, at the provider.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DisconnectUpstreamOAuthResponse' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
   /internal/v1/oauth/cursor/start:
     post:
       tags: [Upstream providers]
@@ -1102,6 +1128,119 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/oauth/claude/start:
+    post:
+      tags: [Upstream providers]
+      operationId: startClaudeOAuth
+      summary: Start native Claude authorization
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartClaudeOAuthRequest' }
+      responses:
+        '200':
+          description: Expiring authorization URL and opaque session state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClaudeLoginStart' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/oauth/claude/complete:
+    post:
+      tags: [Upstream providers]
+      operationId: completeClaudeOAuth
+      summary: Complete native Claude authorization and create the upstream
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompleteClaudeOAuthRequest' }
+      responses:
+        '200':
+          description: Existing stable upstream reauthorized or a completed session replayed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '201':
+          description: Authorization completed and stable upstream created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '202':
+          description: Authorization completion is already in progress.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthPending' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/oauth/copilot/start:
+    post:
+      tags: [Upstream providers]
+      operationId: startGitHubCopilotOAuth
+      summary: Start native GitHub Copilot device authorization
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartCopilotOAuthRequest' }
+      responses:
+        '200':
+          description: Expiring device authorization details and opaque session state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CopilotDeviceLoginStart' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/oauth/copilot/poll:
+    post:
+      tags: [Upstream providers]
+      operationId: pollGitHubCopilotOAuth
+      summary: Poll native GitHub Copilot authorization and create the upstream when ready
+      security: [{ serviceBearer: [] }]
+      x-required-scope: oauth:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OAuthPollRequest' }
+      responses:
+        '200':
+          description: Existing stable upstream reauthorized or a completed session replayed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '201':
+          description: Authorization completed and stable upstream created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '202':
+          description: Authorization is still pending.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthPending' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
   /internal/v1/oauth/provider-adapter/start:
@@ -4198,6 +4337,38 @@ components:
         route_count: { type: integer, format: int64, minimum: 0, description: Includes disabled routes retained for audit. }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
+    DisconnectUpstreamOAuthRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_updated_at]
+      properties:
+        tenant_external_id: { type: string, default: default }
+        expected_updated_at:
+          type: integer
+          format: int64
+          description: Optimistic-concurrency value from the current upstream provider.
+    DisconnectUpstreamOAuthResponse:
+      type: object
+      additionalProperties: false
+      required: [account, provider_revocation]
+      properties:
+        account: { $ref: '#/components/schemas/UpstreamProvider' }
+        provider_revocation:
+          $ref: '#/components/schemas/ProviderRevocation'
+    ProviderRevocation:
+      type: object
+      additionalProperties: false
+      required: [kind, attempted, revoked]
+      properties:
+        kind:
+          type: string
+          enum: [provider_and_local, local_only]
+        attempted: { type: boolean }
+        revoked: { type: boolean }
+        status_code:
+          type: [integer, 'null']
+          minimum: 100
+          maximum: 599
     UpstreamHealthResult:
       type: object
       additionalProperties: false
@@ -4248,6 +4419,54 @@ components:
         tenant_external_id: { type: string, default: default }
         account_name: { type: string, minLength: 1 }
         upstream_account_id: { type: string, format: uuid, description: Existing stable OpenAI Codex upstream identity to reauthorize. }
+    StartClaudeOAuthRequest:
+      type: object
+      additionalProperties: false
+      required: [account_name]
+      properties:
+        tenant_external_id: { type: string, default: default }
+        account_name: { type: string, minLength: 1 }
+        upstream_account_id: { type: string, format: uuid, description: Existing stable Claude upstream identity to reauthorize. }
+    CompleteClaudeOAuthRequest:
+      type: object
+      additionalProperties: false
+      required: [session_token, authorization_code]
+      properties:
+        session_token: { type: string, writeOnly: true }
+        authorization_code:
+          type: string
+          minLength: 1
+          description: Authorization completion copied from the Claude callback as code#state.
+    ClaudeLoginStart:
+      type: object
+      additionalProperties: false
+      required: [driver, login_url, session_token, expires_at, security_notice]
+      properties:
+        driver: { const: anthropic-claude }
+        login_url: { type: string, format: uri }
+        session_token: { type: string, writeOnly: true, description: Authenticated, encrypted login state bound to the tenant and operator credential. }
+        expires_at: { type: integer, format: int64 }
+        security_notice: { const: paste_only_the_code_from_the_login_you_started }
+    StartCopilotOAuthRequest:
+      type: object
+      additionalProperties: false
+      required: [account_name]
+      properties:
+        tenant_external_id: { type: string, default: default }
+        account_name: { type: string, minLength: 1 }
+        upstream_account_id: { type: string, format: uuid, description: Existing stable GitHub Copilot upstream identity to reauthorize. }
+    CopilotDeviceLoginStart:
+      type: object
+      additionalProperties: false
+      required: [driver, verification_url, user_code, session_token, expires_at, poll_after_seconds, security_notice]
+      properties:
+        driver: { const: github-copilot }
+        verification_url: { type: string, format: uri }
+        user_code: { type: string, minLength: 1 }
+        session_token: { type: string, writeOnly: true, description: Authenticated, encrypted login state bound to the tenant and operator credential. }
+        expires_at: { type: integer, format: int64 }
+        poll_after_seconds: { type: integer, format: int64, minimum: 1, maximum: 60 }
+        security_notice: { const: only_continue_if_you_started_this_login }
     CodexDeviceLoginStart:
       type: object
       additionalProperties: false

@@ -96,9 +96,13 @@ artifact_digest=sha256:ddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
   --set roles.gateway.service.type=LoadBalancer >"$workspace/gateway-load-balancer.yaml"
 
 grep -q 'kind: NetworkPolicy' "$workspace/default.yaml"
-latest_migration=$(find "$repository/migrations/common" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]_*.sql' -exec basename {} \; | sed 's/_.*//' | sed 's/^0*//' | sort -n | tail -n 1)
+latest_sqlite_migration=$(find "$repository/migrations/common" "$repository/migrations/sqlite" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]_*.sql' -exec basename {} \; | sed 's/_.*//' | sed 's/^0*//' | sort -n | tail -n 1)
+latest_postgres_migration=$(find "$repository/migrations/common" "$repository/migrations/postgres" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]_*.sql' -exec basename {} \; | sed 's/_.*//' | sed 's/^0*//' | sort -n | tail -n 1)
 chart_schema=$(sed -n 's/^  schemaVersion: \([0-9][0-9]*\)$/\1/p' "$chart/values.yaml")
-test -n "$latest_migration"
+test -n "$latest_sqlite_migration"
+test -n "$latest_postgres_migration"
+test "$latest_sqlite_migration" = "$latest_postgres_migration"
+latest_migration=$latest_sqlite_migration
 test "$chart_schema" = "$latest_migration"
 grep -q "memeloop.io/schema-generation: \"v${latest_migration}\"" "$workspace/default.yaml"
 grep -q 'kind: PodDisruptionBudget' "$workspace/default.yaml"
