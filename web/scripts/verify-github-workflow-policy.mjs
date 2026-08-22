@@ -28,9 +28,10 @@ function assertExactPermissions(actual, expected, label) {
 }
 
 function assertNoLegacyOwner(repository) {
+  const retiredSelfOwner = ['linonetwo', 'memeloop-token-center'].join('/');
   const result = spawnSync(
     'git',
-    ['-C', repository, 'grep', '-n', '-I', '-F', 'linonetwo/memeloop-token-center', '--', '.'],
+    ['-C', repository, 'grep', '-n', '-I', '-F', retiredSelfOwner, '--', '.'],
     { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
   );
   if (result.status === 0) {

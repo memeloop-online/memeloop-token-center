@@ -107,7 +107,10 @@ expect_rejected push-shorthand-conflict
 # Scan only the retired Token Center identity across all tracked files. This
 # intentionally does not match external linonetwo/cpa-* integration sources.
 write_good
-printf '%s\n' 'https://github.com/linonetwo/memeloop-token-center' >"$fixture/retired-owner.txt"
+retired_owner=linonetwo
+retired_repository=memeloop-token-center
+printf 'https://github.com/%s/%s\n' "$retired_owner" "$retired_repository" \
+  >"$fixture/retired-owner.txt"
 git -C "$fixture" add retired-owner.txt
 expect_rejected retired-self-owner
 
