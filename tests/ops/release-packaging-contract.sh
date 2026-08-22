@@ -76,8 +76,6 @@ grep -Fq 'node-version: 24.18.0' "$workflow"
 test "$(grep -c 'toolchain: 1.95.0' "$workflow")" -eq 4
 
 node "$workflow_policy" "$workflow" "$repository"
-test "$(grep -c '^[[:space:]]*contents: write$' "$workflow" || true)" -eq 0
-test "$(grep -c '^[[:space:]]*id-token: write$' "$workflow" || true)" -eq 0
 
 checkout_count=$(printf '%s\n' "$uses_lines" | grep -c 'actions/checkout@')
 persist_false_count=$(grep -Rhc 'persist-credentials: false' "$workflow_directory"/* |

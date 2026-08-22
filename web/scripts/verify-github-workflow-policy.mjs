@@ -143,10 +143,12 @@ function verifyWorkflow(workflow) {
   );
 
   for (const [name, job] of Object.entries(workflow.jobs)) {
-    if (name === 'publish-ghcr') continue;
-    if (isRecord(job?.permissions) && job.permissions.packages === 'write') {
-      fail(`${name} must not receive packages: write`);
+    if (name === 'publish-ghcr' || name === 'verify-ghcr-release') continue;
+    if (!isRecord(job)) {
+      fail(`${name} job must be a mapping`);
     }
+    if (job.permissions === undefined) continue;
+    assertExactPermissions(job.permissions, { contents: 'read' }, name);
   }
 }
 

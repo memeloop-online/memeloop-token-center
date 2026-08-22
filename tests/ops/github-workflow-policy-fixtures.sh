@@ -56,6 +56,15 @@ switch (mode) {
   case 'other-packages-write':
     payload.jobs.rust.permissions = { contents: 'read', packages: 'write' };
     break;
+  case 'other-write-all':
+    payload.jobs.rust.permissions = 'write-all';
+    break;
+  case 'other-actions-write':
+    payload.jobs.rust.permissions = { actions: 'write' };
+    break;
+  case 'other-extra-scope':
+    payload.jobs.rust.permissions = { contents: 'read', checks: 'read' };
+    break;
   case 'rustsec-folded-ignore': {
     const audit = dependency.steps.find((step) => String(step.run ?? '').includes('cargo audit'));
     audit.run = 'cargo audit --deny warnings\n  --ignore RUSTSEC-2099-0001';
@@ -89,6 +98,18 @@ expect_rejected publish-permissions-downgrade
 write_good
 mutate other-packages-write
 expect_rejected unrelated-packages-write
+
+write_good
+mutate other-write-all
+expect_rejected unrelated-write-all
+
+write_good
+mutate other-actions-write
+expect_rejected unrelated-actions-write
+
+write_good
+mutate other-extra-scope
+expect_rejected unrelated-extra-scope
 
 # YAML parsing resolves the complete block scalar before the RustSec policy
 # checks it, so line folding cannot hide an advisory suppression flag.
