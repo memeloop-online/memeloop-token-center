@@ -337,7 +337,10 @@ export function Operator() {
             },
           );
           if (!controller.signal.aborted) {
-            setStreamError(t('traffic.streamDisconnected'));
+            // A clean SSE EOF is a normal reconnect boundary (for example an
+            // ingress stream lifetime). Keep the explicit reconnecting state,
+            // but reserve the error notice for failed HTTP or parsing paths.
+            setStreamError('');
             setStreamState('reconnecting');
           }
         } catch (reason) {
