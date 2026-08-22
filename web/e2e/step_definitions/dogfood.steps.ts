@@ -120,9 +120,9 @@ When('管理员进入请求统计', async function (this: DogfoodWorld) {
   await assertExactText(metric(page, '请求数'), '51');
 });
 
-Then('总览、趋势、模型、客户端凭据、会话、上游凭证和热力图七个视图都有真实数据', async function (this: DogfoodWorld) {
+Then('总览、趋势、模型、客户端凭据、会话、上游账户和热力图七个视图都有真实数据', async function (this: DogfoodWorld) {
   const page = this.requirePage();
-  const names = ['总览', '趋势分析', '模型分析', '客户端凭据分析', '会话分析', '上游凭证分析', '用量热力图'];
+  const names = ['总览', '趋势分析', '模型分析', '客户端凭据分析', '会话分析', '上游账户分析', '用量热力图'];
   for (const name of names) await assertVisible(page.getByRole('tab', { name, exact: true }));
 
   await assertContains(page.getByRole('tabpanel'), 'OpenAI');
@@ -140,8 +140,10 @@ Then('总览、趋势、模型、客户端凭据、会话、上游凭证和热�
 
   await page.getByRole('tab', { name: '会话分析', exact: true }).click();
   await assertContains(page.getByRole('tabpanel'), '未关联请求');
+  await assertContains(page.getByRole('tabpanel'), '按请求量显示前 100 个会话');
+  await assertContains(page.getByRole('tabpanel'), '不提供会话 P95');
 
-  await page.getByRole('tab', { name: '上游凭证分析', exact: true }).click();
+  await page.getByRole('tab', { name: '上游账户分析', exact: true }).click();
   await assertContains(page.getByRole('tabpanel'), 'Browser mock upstream');
   await assertContains(page.getByRole('tabpanel'), '按稳定上游账户归集');
 
@@ -228,8 +230,8 @@ Then('点击失败状态 bucket 使用 error 并仅显示失败结果', async fu
 Then('点击未分配上游使用 unassigned 并仅显示无上游结果', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await clearStrictUsageFilters(this, 17);
-  await page.getByRole('tab', { name: '上游凭证分析', exact: true }).click();
-  const upstreamPanel = usageDimension(page, '上游提供商');
+  await page.getByRole('tab', { name: '上游账户分析', exact: true }).click();
+  const upstreamPanel = usageDimension(page, '上游账户');
   const observation = requireStrictUsageObservation(this);
   const requestsBeforeClick = observation.requestUrls.length;
   const unassignedBucket = upstreamPanel.locator('.usage-filter-link').filter({ hasText: '未分配上游' });
@@ -294,8 +296,8 @@ Then('真实上游 UUID 和清除过滤保持可用且中英文亮暗主题无�
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   await clearStrictUsageFilters(this, 17);
-  await page.getByRole('tab', { name: '上游凭证分析', exact: true }).click();
-  let upstreamPanel = usageDimension(page, '上游提供商');
+  await page.getByRole('tab', { name: '上游账户分析', exact: true }).click();
+  let upstreamPanel = usageDimension(page, '上游账户');
   const observation = requireStrictUsageObservation(this);
   const requestsBeforeClick = observation.requestUrls.length;
   const assignedBucket = upstreamPanel.locator('.usage-filter-link').filter({ hasText: seed.upstreamName });
@@ -311,7 +313,7 @@ Then('真实上游 UUID 和清除过滤保持可用且中英文亮暗主题无�
   await assertNotContains(upstreamPanel, '未分配上游');
 
   await clearStrictUsageFilters(this, 17);
-  upstreamPanel = usageDimension(page, '上游提供商');
+  upstreamPanel = usageDimension(page, '上游账户');
   await assertValue(page.locator('.usage-controls').getByLabel('上游提供商'), '');
   await assertCount(upstreamPanel.locator('tbody tr'), 2);
   await assertContains(upstreamPanel, seed.upstreamName);
@@ -319,7 +321,7 @@ Then('真实上游 UUID 和清除过滤保持可用且中英文亮暗主题无�
 
   await page.locator('.rail .language-toggle').click();
   await assertAttribute(page.locator('html'), 'lang', 'en');
-  await assertVisible(page.getByRole('tab', { name: 'Upstream credential analysis', exact: true }));
+  await assertVisible(page.getByRole('tab', { name: 'Upstream account analysis', exact: true }));
   await assertVisible(page.getByRole('button', { name: 'Filter usage by Unassigned', exact: true }));
   await assertContains(page.locator('.usage-controls').getByLabel('Upstream provider'), 'Unassigned');
   await assertAttribute(page.locator('html'), 'data-theme', 'dark');
@@ -447,7 +449,7 @@ Then('七个统计视图呈现明确空态', async function (this: DogfoodWorld)
   await assertCount(page.getByText('此维度暂无数据', { exact: true }), 3);
   await page.getByRole('tab', { name: '趋势分析', exact: true }).click();
   await assertVisible(page.getByText('暂无趋势数据', { exact: true }));
-  for (const tab of ['模型分析', '客户端凭据分析', '会话分析', '上游凭证分析']) {
+  for (const tab of ['模型分析', '客户端凭据分析', '会话分析', '上游账户分析']) {
     await page.getByRole('tab', { name: tab, exact: true }).click();
     await assertVisible(page.getByText('此维度暂无数据', { exact: true }));
   }

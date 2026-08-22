@@ -6,8 +6,34 @@ import { baseURL, eventually, model, requestJson, runtime, tenant } from '../sup
 import type { DogfoodWorld } from '../support/world.js';
 
 import { assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertValue, assertVisible, applyUsageFilter, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
-When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且不显示旧桥接项', async function (this: DogfoodWorld) {
+When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且仅显示产品接入方式', async function (this: DogfoodWorld) {
   const page = this.requirePage();
+  await page.route('**/internal/v1/provider-types', async (route) => {
+    const response = await route.fetch();
+    const providerTypes = await response.json() as Array<Record<string, unknown>>;
+    providerTypes.push({
+      id: 'browser-dual-method',
+      display_name: 'Browser dual method',
+      protocols: ['openai'],
+      modalities: ['text'],
+      config_schema: { type: 'object', additionalProperties: false, properties: {} },
+      credential_schema: {
+        oneOf: [
+          { title: 'API key', type: 'object', properties: { type: { const: 'api_key' }, value: { type: 'string' } } },
+          { title: 'OAuth', type: 'object', properties: { type: { const: 'oauth' }, access_token: { type: 'string' } } },
+        ],
+      },
+      oauth_adapter: {
+        api_version: 'oauth-adapter-v1',
+        flow_kind: 'openai_device',
+        login_url: 'https://authorization.example.test/start',
+        poll_url: 'https://authorization.example.test/poll',
+        refresh_url: 'https://authorization.example.test/refresh',
+      },
+      source: 'browser-contract',
+    });
+    await route.fulfill({ response, json: providerTypes });
+  });
   await page.route('**/internal/v1/oauth/codex/start', async (route) => {
     assert.equal(route.request().method(), 'POST');
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
@@ -155,8 +181,10 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await assertVisible(page.getByRole('heading', { name: '上游服务', exact: true }));
   await assertContains(page.locator('.provider-list'), '连接并管理模型服务。');
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
+  await assertContains(onboarding.getByLabel('服务提供商'), 'Browser dual method');
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
   await assertVisible(onboarding.getByLabel('服务提供商'));
+  await assertContains(onboarding.getByLabel('服务提供商'), 'Browser dual method');
   await assertContains(onboarding.getByLabel('服务提供商'), 'Cursor');
   await assertContains(onboarding.getByLabel('服务提供商'), 'Anthropic Claude');
   await assertContains(onboarding.getByLabel('服务提供商'), 'GitHub Copilot');

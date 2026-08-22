@@ -30,7 +30,7 @@ export function Shell({ children, operator = false }: { children: ReactNode; ope
         <button className="language-toggle" type="button" aria-label={locale === 'zh-CN' ? t('language.en') : t('language.zh')} onClick={() => setLocale(locale === 'zh-CN' ? 'en' : 'zh-CN')} title={locale === 'zh-CN' ? t('language.en') : t('language.zh')}>
           {locale === 'zh-CN' ? 'EN' : '中'}
         </button>
-        <div className="rail-label">{operator ? 'OP' : 'SELF'}</div>
+        <div className="rail-label">{t(operator ? 'shell.operator' : 'shell.selfService')}</div>
       </aside>
       <main className="main">
         <div className="mobile-controls">

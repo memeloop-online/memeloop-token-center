@@ -21,7 +21,7 @@ Then('自助门户显示自己的 51 条请求和分页统计', async function (
   await assertExactText(metric(page, '总请求'), '51');
   await assertExactText(metric(page, '成功'), '50');
   await assertExactText(metric(page, '失败'), '1');
-  await assertExactText(metric(page, 'Tokens'), '600');
+  await assertExactText(metric(page, 'Token 用量'), '600');
   await assertContains(metric(page, '可用余额 (USD)'), '$');
   await assertContains(metric(page, '总费用'), '$');
   await assertVisible(page.getByRole('heading', { name: 'Browser E2E credential', exact: true }));

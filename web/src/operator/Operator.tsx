@@ -23,6 +23,7 @@ import { Plugins } from './Plugins';
 import { SessionMonitor, type SessionFocus, type SessionStreamState } from './SessionMonitor';
 import { enqueueSessionEventKey } from './sessionRefresh';
 import { UsageAnalysis } from './UsageAnalysis';
+import { directCredentialSchema, supportsDirectConnection } from './providerConnectionMethods';
 
 type Tab = 'traffic' | 'usage' | 'generations' | 'providers' | 'routes' | 'pricing' | 'credentials' | 'services' | 'plugins';
 type Translate = (key: string, variables?: Record<string, string | number>) => string;
@@ -456,7 +457,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const providerGroups = useGroups('provider', token, tenant);
-  const directProviders = providers.filter((value) => !value.oauth_adapter);
+  const directProviders = providers.filter(supportsDirectConnection);
   const provider = directProviders.find((value) => value.id === driver) ?? directProviders[0];
   const schema = useMemo<RJSFSchema | undefined>(() => {
     if (!provider) return undefined;
@@ -465,7 +466,8 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
       delete config.properties.oauth;
       delete config.properties.timeout_seconds;
     }
-    const credential = structuredClone(provider.credential_schema) as { oneOf?: Array<Record<string, unknown>> };
+    const credential = directCredentialSchema(provider.credential_schema) as { oneOf?: Array<Record<string, unknown>> } | undefined;
+    if (!credential) return undefined;
     if (provider.id === 'http-json' && credential.oneOf) {
       credential.oneOf = credential.oneOf.filter((option) => option.title !== 'OAuth').sort((left) => left.title === 'API key' ? -1 : 1).map((option) => {
         if (option.title !== 'API key') return option;
