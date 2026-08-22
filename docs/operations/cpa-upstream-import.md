@@ -42,8 +42,9 @@ Before starting, make an immutable CPA volume snapshot and stage only its
 `config.yaml` and declared auth directory for the importer UID. The importer
 requires:
 
-- `config.yaml`, every auth JSON, the target service token and source identity
-  key to be owner-owned, single-link, regular mode-`0600` files;
+- `config.yaml`, every auth JSON, the target service token and, when opaque
+  records exist, the source identity key to be owner-owned, single-link,
+  regular mode-`0600` files;
 - the auth root and every nested directory to be owner-owned mode `0700`;
 - no symlink or non-JSON file anywhere below the auth root; and
 - source and target sizes to remain within the built-in bounded-read limits.
@@ -79,17 +80,27 @@ requirements above:
 
 `--source-identity-key-file` is required only when the snapshot contains opaque
 Copilot/Cursor records. It must be an absolute path to a mode-`0600` regular,
-non-symlink file owned by the importer UID. Generate at least 32 random bytes;
-for example, stage the output of `openssl rand -hex 32` through the
-secret-management system. The importer accepts one final LF and removes exactly
-that byte. It does not trim spaces or any other key material. A short or
-detectably low-entropy key is rejected before any target request.
+non-symlink, single-link file owned by the importer UID. Generate it only with
+the release image's `/usr/local/bin/generate-source-identity-key` command. The
+command takes one new absolute target path, requires its parent directory to be
+owned by the current UID and not writable by group or other users, rejects every
+symlink path component and refuses to overwrite an existing target. It writes
+all bytes, fsyncs the file and parent, and produces no key material on stdout.
+
+The file format is a fixed magic and version followed by exactly 32 bytes from
+Python's operating-system-backed `secrets.token_bytes`. The importer accepts
+only that exact binary format; passwords, raw keys, hex/base64 text, a trailing
+LF, wrong versions and wrong lengths fail before any target request. Format
+validation is not presented as proof that arbitrary caller-written bytes are
+random. Use the reviewed generator, store the resulting file in the migration
+secret manager, and mount it in Kubernetes as binary Secret file data with mode
+`0600`; never use `stringData` or an environment variable.
 
 A successful dry-run returns counts and the non-secret native-authorization
 worklist:
 
 ```json
-{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"62ca3bea649404d4601f84f9544bc24ff49a78baa246141c72b9902269ad2b7d"},{"provider":"cursor","source_disabled":false,"source_stable_id":"4a3bf1c716cc68dc43f53e3cc5f5095407e677802111d931d2c77df5132a59d6"}],"native_reauthorization_required_count":2,"replayed_count":0,"replayed_managed_oauth_count":0}
+{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"3e37cd527b6365313440b4be4df9184b4dbe06c2aeb4c80628134bd38cb0ea38"},{"provider":"cursor","source_disabled":false,"source_stable_id":"2a8d8d1ee60dad9b93c5f8a479fb24fd38f48095da0c1e9cde5a00fc7ad650b3"}],"native_reauthorization_required_count":2,"replayed_count":0,"replayed_managed_oauth_count":0}
 ```
 
 Preserve the source snapshot and inventory output for review. Do not reorder API

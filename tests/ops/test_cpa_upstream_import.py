@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -22,11 +23,17 @@ from typing import Iterator
 
 REPOSITORY = pathlib.Path(__file__).resolve().parents[2]
 IMPORTER = REPOSITORY / "ops" / "cpa-upstreams" / "import-cpa-upstreams.py"
+KEY_GENERATOR = (
+    REPOSITORY / "ops" / "cpa-upstreams" / "generate-source-identity-key.py"
+)
 FIXTURES = REPOSITORY / "tests" / "fixtures" / "cpa-upstreams"
 SANITIZER = REPOSITORY / "tests" / "ops" / "sanitize-cpa-upstream-fixtures.py"
 TARGET_TOKEN = "fixture-only-target-service-token"
-SOURCE_IDENTITY_KEY = b"9f284ec3d871b05aa7c649de2138f470d5bca91e68f72403"
-OTHER_SOURCE_IDENTITY_KEY = b"b6e031a8c497f25d70be8164ac239df80a57e3469cb812fd"
+SOURCE_IDENTITY_KEY_PREFIX = b"MTC-SOURCE-ID-KEY\0\x01"
+SOURCE_IDENTITY_PAYLOAD = b"9f284ec3d871b05aa7c649de2138f470"
+OTHER_SOURCE_IDENTITY_PAYLOAD = b"b6e031a8c497f25d70be8164ac239df8"
+SOURCE_IDENTITY_KEY = SOURCE_IDENTITY_KEY_PREFIX + SOURCE_IDENTITY_PAYLOAD
+OTHER_SOURCE_IDENTITY_KEY = SOURCE_IDENTITY_KEY_PREFIX + OTHER_SOURCE_IDENTITY_PAYLOAD
 
 
 def account_view(
@@ -350,6 +357,11 @@ def run_importer(*arguments: object) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, text=True, capture_output=True, check=False)
 
 
+def run_key_generator(*arguments: object) -> subprocess.CompletedProcess[str]:
+    command = [sys_executable(), str(KEY_GENERATOR), *(str(value) for value in arguments)]
+    return subprocess.run(command, text=True, capture_output=True, check=False)
+
+
 def sys_executable() -> str:
     return os.environ.get("PYTHON", "python3")
 
@@ -389,7 +401,7 @@ class CpaUpstreamImportTests(unittest.TestCase):
         source = SecureSource("supported")
         self.addCleanup(source.close)
         source_identity_key_file = source.secret_bytes_file(
-            "source-identity-key", SOURCE_IDENTITY_KEY + b"\n"
+            "source-identity-key", SOURCE_IDENTITY_KEY
         )
         result = run_importer(
             "--config",
@@ -653,6 +665,90 @@ class CpaUpstreamImportTests(unittest.TestCase):
             self.assertNotIn("FixtureCursorHandle01", output)
             self.assertNotIn("@example.test", output)
 
+    def test_generated_source_identity_key_is_importable_and_never_overwritten(self) -> None:
+        source = SecureSource("supported")
+        self.addCleanup(source.close)
+        key_directory = pathlib.Path(source.temp.name) / "generated-key"
+        key_directory.mkdir(mode=0o700)
+        key_path = key_directory / "source-identity.key"
+
+        generated = run_key_generator(key_path)
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        self.assertEqual(generated.stdout, "")
+        self.assertEqual(generated.stderr, "")
+        key_document = key_path.read_bytes()
+        self.assertEqual(
+            len(key_document), len(SOURCE_IDENTITY_KEY_PREFIX) + 32
+        )
+        self.assertEqual(
+            key_document[: len(SOURCE_IDENTITY_KEY_PREFIX)],
+            SOURCE_IDENTITY_KEY_PREFIX,
+        )
+        metadata = key_path.stat()
+        self.assertTrue(stat.S_ISREG(metadata.st_mode))
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+        self.assertEqual(metadata.st_uid, os.geteuid())
+        self.assertEqual(metadata.st_nlink, 1)
+
+        imported = run_importer(
+            "--config",
+            source.config,
+            "--auth-dir",
+            source.auth,
+            "--source-identity-key-file",
+            key_path,
+        )
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        self.assert_native_reauthorization_list(
+            json.loads(imported.stdout), ["copilot", "cursor"]
+        )
+
+        refused = run_key_generator(key_path)
+        self.assertEqual(refused.returncode, 2)
+        self.assertEqual(refused.stdout, "")
+        self.assertEqual(key_path.read_bytes(), key_document)
+        self.assertNotIn(str(key_path), refused.stderr)
+        self.assertNotIn(key_document[-16:].hex(), refused.stderr)
+
+    def test_source_identity_key_generator_rejects_unsafe_targets_without_leaks(self) -> None:
+        source = SecureSource("supported")
+        self.addCleanup(source.close)
+        marker = "fixture-private-generator-target-marker"
+        safe_directory = pathlib.Path(source.temp.name) / f"{marker}-safe"
+        safe_directory.mkdir(mode=0o700)
+        unsafe_directory = pathlib.Path(source.temp.name) / f"{marker}-unsafe"
+        unsafe_directory.mkdir(mode=0o770)
+        unsafe_directory.chmod(0o770)
+        real_directory = pathlib.Path(source.temp.name) / f"{marker}-real"
+        real_directory.mkdir(mode=0o700)
+        linked_directory = pathlib.Path(source.temp.name) / f"{marker}-linked"
+        linked_directory.symlink_to(real_directory, target_is_directory=True)
+        victim = safe_directory / "victim"
+        victim.write_bytes(b"fixture-victim-must-not-change")
+        victim.chmod(0o600)
+        linked_target = safe_directory / f"{marker}-target-link"
+        linked_target.symlink_to(victim)
+        relative_target = os.path.relpath(
+            safe_directory / f"{marker}-relative", REPOSITORY
+        )
+
+        cases = (
+            ("relative", relative_target),
+            ("existing-symlink", linked_target),
+            ("unsafe-parent", unsafe_directory / f"{marker}-key"),
+            ("symlink-parent", linked_directory / f"{marker}-key"),
+        )
+        for label, target in cases:
+            with self.subTest(label=label):
+                result = run_key_generator(target)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertNotIn(marker, result.stderr)
+                self.assertNotIn("fixture-victim-must-not-change", result.stderr)
+        self.assertEqual(victim.read_bytes(), b"fixture-victim-must-not-change")
+        self.assertFalse((unsafe_directory / f"{marker}-key").exists())
+        self.assertFalse((real_directory / f"{marker}-key").exists())
+
     def test_opaque_source_ids_are_keyed_stable_and_not_dictionary_hashes(self) -> None:
         source = SecureSource("supported")
         self.addCleanup(source.close)
@@ -664,15 +760,8 @@ class CpaUpstreamImportTests(unittest.TestCase):
         key_file = source.secret_bytes_file(
             "fixture-private-source-identity-key", SOURCE_IDENTITY_KEY
         )
-        newline_key_file = source.secret_bytes_file(
-            "fixture-private-source-identity-key-newline", SOURCE_IDENTITY_KEY + b"\n"
-        )
         other_key_file = source.secret_bytes_file(
             "fixture-private-source-identity-key-other", OTHER_SOURCE_IDENTITY_KEY
-        )
-        spaced_key_file = source.secret_bytes_file(
-            "fixture-private-source-identity-key-spaced",
-            b" " + SOURCE_IDENTITY_KEY + b" ",
         )
 
         def inventory(key_path: pathlib.Path) -> dict[str, object]:
@@ -686,24 +775,21 @@ class CpaUpstreamImportTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             for forbidden in (
-                SOURCE_IDENTITY_KEY.decode("ascii"),
-                OTHER_SOURCE_IDENTITY_KEY.decode("ascii"),
+                SOURCE_IDENTITY_PAYLOAD.decode("ascii"),
+                OTHER_SOURCE_IDENTITY_PAYLOAD.decode("ascii"),
                 "fixture-private-source-identity-key",
             ):
                 self.assertNotIn(forbidden, result.stdout + result.stderr)
             return json.loads(result.stdout)
 
         first = inventory(key_file)
-        replay = inventory(newline_key_file)
+        replay = inventory(key_file)
         different_key = inventory(other_key_file)
-        spaced_key = inventory(spaced_key_file)
         first_entries = first["native_reauthorization_required"]
         replay_entries = replay["native_reauthorization_required"]
         different_entries = different_key["native_reauthorization_required"]
-        spaced_entries = spaced_key["native_reauthorization_required"]
         self.assertEqual(first_entries, replay_entries)
         self.assertNotEqual(first_entries, different_entries)
-        self.assertNotEqual(first_entries, spaced_entries)
 
         unkeyed_candidates: set[str] = set()
         for relative_path in (
@@ -741,9 +827,28 @@ class CpaUpstreamImportTests(unittest.TestCase):
         strong_key = source.secret_bytes_file(
             f"{secret_path_marker}-strong", SOURCE_IDENTITY_KEY
         )
-        weak_key = source.secret_bytes_file(f"{secret_path_marker}-weak", b"too-short")
-        low_entropy_key = source.secret_bytes_file(
-            f"{secret_path_marker}-low-entropy", b"x" * 64
+        password_key = source.secret_bytes_file(
+            f"{secret_path_marker}-password", b"correct horse battery staple"
+        )
+        hex_key = source.secret_bytes_file(
+            f"{secret_path_marker}-hex", SOURCE_IDENTITY_PAYLOAD.hex().encode("ascii")
+        )
+        old_raw_key = source.secret_bytes_file(
+            f"{secret_path_marker}-old-raw", SOURCE_IDENTITY_PAYLOAD
+        )
+        newline_key = source.secret_bytes_file(
+            f"{secret_path_marker}-newline", SOURCE_IDENTITY_KEY + b"\n"
+        )
+        wrong_magic_key = source.secret_bytes_file(
+            f"{secret_path_marker}-magic",
+            b"BAD-SOURCE-ID-KEY!\0\x01" + SOURCE_IDENTITY_PAYLOAD,
+        )
+        wrong_length_key = source.secret_bytes_file(
+            f"{secret_path_marker}-length", SOURCE_IDENTITY_KEY[:-1]
+        )
+        repeated_payload_key = source.secret_bytes_file(
+            f"{secret_path_marker}-repeated",
+            SOURCE_IDENTITY_KEY_PREFIX + b"x" * 32,
         )
         wide_key = source.secret_bytes_file(
             f"{secret_path_marker}-wide", SOURCE_IDENTITY_KEY
@@ -764,14 +869,39 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 "path must be absolute",
             ),
             (
-                "short",
-                ("--source-identity-key-file", weak_key),
-                "at least 32 random bytes",
+                "password",
+                ("--source-identity-key-file", password_key),
+                "invalid binary format",
             ),
             (
-                "low-entropy",
-                ("--source-identity-key-file", low_entropy_key),
-                "enough entropy",
+                "hex",
+                ("--source-identity-key-file", hex_key),
+                "invalid binary format",
+            ),
+            (
+                "old-raw",
+                ("--source-identity-key-file", old_raw_key),
+                "invalid binary format",
+            ),
+            (
+                "newline",
+                ("--source-identity-key-file", newline_key),
+                "invalid binary format",
+            ),
+            (
+                "wrong-magic",
+                ("--source-identity-key-file", wrong_magic_key),
+                "invalid binary format",
+            ),
+            (
+                "wrong-length",
+                ("--source-identity-key-file", wrong_length_key),
+                "invalid binary format",
+            ),
+            (
+                "repeated-payload",
+                ("--source-identity-key-file", repeated_payload_key),
+                "payload is invalid",
             ),
             (
                 "wide-permissions",
@@ -793,7 +923,7 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertIn(expected, result.stderr)
                 self.assertNotIn(secret_path_marker, result.stderr)
-                self.assertNotIn(SOURCE_IDENTITY_KEY.decode("ascii"), result.stderr)
+                self.assertNotIn(SOURCE_IDENTITY_PAYLOAD.decode("ascii"), result.stderr)
 
     def test_managed_oauth_apply_and_replay_use_capabilities_and_exact_requests(self) -> None:
         source = SecureSource("oauth-blocked")

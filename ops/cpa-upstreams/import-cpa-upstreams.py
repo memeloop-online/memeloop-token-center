@@ -13,7 +13,6 @@ import hashlib
 import hmac
 import ipaddress
 import json
-import math
 import os
 import pathlib
 import re
@@ -42,6 +41,8 @@ SAFE_NAME_PATTERN = re.compile(r"[^a-z0-9]+")
 HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,200}$")
 MANAGED_SOURCE_TYPE_PATTERN = re.compile(r"^[a-z0-9._-]{1,64}$")
 MANAGED_OAUTH_CONTRACT_VERSION = 1
+SOURCE_IDENTITY_KEY_PREFIX = b"MTC-SOURCE-ID-KEY\0\x01"
+SOURCE_IDENTITY_KEY_PAYLOAD_BYTES = 32
 MANAGED_OAUTH_SOURCE_TYPES = {
     "codex": "codex",
     "gemini": "gemini-legacy",
@@ -186,20 +187,21 @@ def read_source_identity_key(path_value: str) -> bytearray:
     value = bytearray(
         read_owner_only_file(path_value, "source identity key file", MAX_SECRET_BYTES)
     )
-    if value.endswith(b"\n"):
-        del value[-1]
-    if len(value) < 32:
+    expected_size = len(SOURCE_IDENTITY_KEY_PREFIX) + SOURCE_IDENTITY_KEY_PAYLOAD_BYTES
+    if len(value) != expected_size or not hmac.compare_digest(
+        value[: len(SOURCE_IDENTITY_KEY_PREFIX)], SOURCE_IDENTITY_KEY_PREFIX
+    ):
         value.clear()
-        raise ImportFailure("source identity key must contain at least 32 random bytes")
-    frequencies = {byte: value.count(byte) for byte in set(value)}
-    entropy = -sum(
-        (count / len(value)) * math.log2(count / len(value))
-        for count in frequencies.values()
-    )
-    if len(frequencies) < 12 or entropy < 3.0:
-        value.clear()
-        raise ImportFailure("source identity key does not contain enough entropy")
-    return value
+        raise ImportFailure("source identity key has an invalid binary format")
+    payload = bytearray(value[len(SOURCE_IDENTITY_KEY_PREFIX) :])
+    value.clear()
+    if payload == payload[:1] * len(payload):
+        payload.clear()
+        raise ImportFailure("source identity key payload is invalid")
+    if len(payload) != SOURCE_IDENTITY_KEY_PAYLOAD_BYTES:
+        payload.clear()
+        raise ImportFailure("source identity key has an invalid binary format")
+    return payload
 
 
 def validate_auth_directory(path_value: str) -> pathlib.Path:

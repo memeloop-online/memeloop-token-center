@@ -48,14 +48,17 @@ docker run --rm \
     test -x /usr/local/bin/audit-cpa-migration
     test -x /usr/local/bin/attach-legacy-cpa-credentials
     test -x /usr/local/bin/import-cpa-upstreams
+    test -x /usr/local/bin/generate-source-identity-key
     test ! -w /usr/local/bin/migrate-cpamp
     test ! -w /usr/local/bin/audit-cpa-migration
     test ! -w /usr/local/bin/attach-legacy-cpa-credentials
     test ! -w /usr/local/bin/import-cpa-upstreams
+    test ! -w /usr/local/bin/generate-source-identity-key
     test "$(stat -c %a /usr/local/bin/migrate-cpamp)" = 555
     test "$(stat -c %a /usr/local/bin/audit-cpa-migration)" = 555
     test "$(stat -c %a /usr/local/bin/attach-legacy-cpa-credentials)" = 555
     test "$(stat -c %a /usr/local/bin/import-cpa-upstreams)" = 555
+    test "$(stat -c %a /usr/local/bin/generate-source-identity-key)" = 555
     command -v psql >/dev/null
     command -v python3 >/dev/null
     command -v sqlite3 >/dev/null
@@ -117,12 +120,18 @@ docker run --rm \
   --entrypoint /bin/sh \
   "$image" -ec '
     cp -R /fixture/. /source/
-    umask 077
-    head -c 32 /dev/urandom > /source/source-identity.key
     find /source -type d -exec chmod 0700 {} +
     find /source -type f -exec chmod 0600 {} +
     chown -R 10001:10001 /source
   '
+docker run --rm \
+  --user 10001:10001 \
+  --read-only \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
+  --volume "$fixture_volume:/source" \
+  --entrypoint /usr/local/bin/generate-source-identity-key \
+  "$image" /source/source-identity.key
 docker run --rm \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=8m \
@@ -162,12 +171,15 @@ docker cp "$container_id:/usr/local/bin/migrate-cpamp" "$workspace/image-migrate
 docker cp "$container_id:/usr/local/bin/audit-cpa-migration" "$workspace/image-audit-cpa-migration"
 docker cp "$container_id:/usr/local/bin/attach-legacy-cpa-credentials" "$workspace/image-attach-legacy-cpa-credentials"
 docker cp "$container_id:/usr/local/bin/import-cpa-upstreams" "$workspace/image-import-cpa-upstreams"
+docker cp "$container_id:/usr/local/bin/generate-source-identity-key" "$workspace/image-generate-source-identity-key"
 cmp "$repository/ops/migrate-cpamp.sh" "$workspace/image-migrate-cpamp"
 cmp "$repository/ops/audit-cpa-migration.sh" "$workspace/image-audit-cpa-migration"
 cmp "$repository/ops/legacy-credentials/attach-legacy-cpa-credentials.py" \
   "$workspace/image-attach-legacy-cpa-credentials"
 cmp "$repository/ops/cpa-upstreams/import-cpa-upstreams.py" \
   "$workspace/image-import-cpa-upstreams"
+cmp "$repository/ops/cpa-upstreams/generate-source-identity-key.py" \
+  "$workspace/image-generate-source-identity-key"
 # Stream only regular-file payloads from the image tar. Do not extract the
 # rootfs: absolute compatibility symlinks such as /var/run must never resolve
 # into the host while a packaging test inspects an image.

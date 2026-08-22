@@ -241,12 +241,13 @@ if grep -Eq -- "-c ['\"](CREATE|DROP) SCHEMA" "$workflow"; then
   exit 1
 fi
 for importer_binary in migrate-cpamp audit-cpa-migration \
-  attach-legacy-cpa-credentials import-cpa-upstreams; do
+  attach-legacy-cpa-credentials import-cpa-upstreams \
+  generate-source-identity-key; do
   grep -Fqx \
     "docker cp \"\$container_id:/usr/local/bin/$importer_binary\" \"\$workspace/image-$importer_binary\"" \
     "$importer_contract"
 done
-test "$(grep -c '^docker cp "\$container_id:/usr/local/bin/' "$importer_contract")" -eq 4
+test "$(grep -c '^docker cp "\$container_id:/usr/local/bin/' "$importer_contract")" -eq 5
 grep -Fq 'npm audit --audit-level=high' "$workflow"
 grep -Fq 'npm run test:e2e' "$workflow"
 
