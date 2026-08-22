@@ -1,0 +1,103 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cpa-upstream-import-dry-run
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      activeDeadlineSeconds: 600
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      imagePullSecrets:
+        - name: REPLACE_IMAGE_PULL_SECRET
+      restartPolicy: Never
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: stage-source-identity-key
+          image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center-importer@sha256:REPLACE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              umask 077
+              cp -- /secret-source/source-identity.key /key-runtime/source-identity.key
+              chmod 0600 /key-runtime/source-identity.key
+              chown 10001:10001 /key-runtime/source-identity.key
+              test -f /key-runtime/source-identity.key
+              test "$(stat -c %u:%g:%a:%h /key-runtime/source-identity.key)" = "10001:10001:600:1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN"]
+            readOnlyRootFilesystem: true
+            runAsGroup: 0
+            runAsNonRoot: false
+            runAsUser: 0
+          resources:
+            limits:
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          volumeMounts:
+            - name: source-identity-key-secret
+              mountPath: /secret-source
+              readOnly: true
+            - name: source-identity-key-runtime
+              mountPath: /key-runtime
+      containers:
+        - name: inventory-cpa-upstreams
+          image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center-importer@sha256:REPLACE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/import-cpa-upstreams"]
+          args:
+            - --config
+            - /source/config.yaml
+            - --auth-dir
+            - /source/auth
+            - --source-identity-key-file
+            - /key-runtime/source-identity.key
+            - --tenant
+            - REPLACE_TENANT_EXTERNAL_ID
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsGroup: 10001
+            runAsNonRoot: true
+            runAsUser: 10001
+          resources:
+            limits:
+              memory: 128Mi
+            requests:
+              cpu: 25m
+              memory: 32Mi
+          volumeMounts:
+            - name: cpa-snapshot
+              mountPath: /source
+              readOnly: true
+            - name: source-identity-key-runtime
+              mountPath: /key-runtime
+              readOnly: true
+      volumes:
+        - name: cpa-snapshot
+          persistentVolumeClaim:
+            claimName: REPLACE_CPA_SNAPSHOT_CLAIM
+            readOnly: true
+        - name: source-identity-key-secret
+          secret:
+            secretName: REPLACE_SOURCE_IDENTITY_KEY_SECRET
+            defaultMode: 0400
+            items:
+              - key: source-identity.key
+                path: source-identity.key
+        - name: source-identity-key-runtime
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi

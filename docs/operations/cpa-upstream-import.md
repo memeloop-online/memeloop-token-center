@@ -84,8 +84,11 @@ non-symlink, single-link file owned by the importer UID. Generate it only with
 the release image's `/usr/local/bin/generate-source-identity-key` command. The
 command takes one new absolute target path, requires its parent directory to be
 owned by the current UID and not writable by group or other users, rejects every
-symlink path component and refuses to overwrite an existing target. It writes
-all bytes, fsyncs the file and parent, and produces no key material on stdout.
+symlink path component and refuses to overwrite an existing target. It writes a
+private random temporary file completely, fsyncs it, publishes it with a
+hard-link that cannot replace the target, removes only the private temporary
+name, and fsyncs the parent. A failed run never unlinks the public target name
+and produces no key material on stdout.
 
 The file format is a fixed magic and version followed by exactly 32 bytes from
 Python's operating-system-backed `secrets.token_bytes`. The importer accepts
@@ -93,8 +96,19 @@ only that exact binary format; passwords, raw keys, hex/base64 text, a trailing
 LF, wrong versions and wrong lengths fail before any target request. Format
 validation is not presented as proof that arbitrary caller-written bytes are
 random. Use the reviewed generator, store the resulting file in the migration
-secret manager, and mount it in Kubernetes as binary Secret file data with mode
-`0600`; never use `stringData` or an environment variable.
+secret manager as binary data; never use `stringData` or an environment
+variable.
+
+Do not point the importer at a Kubernetes Secret projected-volume path. The
+projection uses root-owned symbolic links, while the importer deliberately
+requires a real current-UID-owned, single-link regular file. Use the checked-in
+[`ops/kubernetes/cpa-upstream-import-dry-run-job.yaml`](../../ops/kubernetes/cpa-upstream-import-dry-run-job.yaml)
+example: its least-privilege init container copies the binary Secret entry into
+a memory-backed private `emptyDir`, sets owner `10001:10001` and mode `0600`, and
+verifies the resulting file. The importer mounts that `emptyDir` read-only and
+never mounts the Secret itself. Replace every explicit placeholder, stage the
+immutable CPA snapshot for UID `10001` as described above, inspect the manifest,
+and keep the example in dry-run mode until its output is approved.
 
 A successful dry-run returns counts and the non-secret native-authorization
 worklist:

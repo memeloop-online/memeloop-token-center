@@ -14,6 +14,7 @@ from typing import NoReturn
 
 KEY_PREFIX = b"MTC-SOURCE-ID-KEY\0\x01"
 KEY_PAYLOAD_BYTES = 32
+TEMP_NAME_ATTEMPTS = 16
 
 
 class GenerationFailure(RuntimeError):
@@ -71,26 +72,68 @@ def write_all(descriptor: int, document: bytearray) -> None:
         view.release()
 
 
+def create_private_temporary(parent_descriptor: int) -> tuple[int, str]:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for _ in range(TEMP_NAME_ATTEMPTS):
+        try:
+            suffix = secrets.token_hex(16)
+            temporary_name = f".mtc-source-identity-key-{suffix}.tmp"
+        except OSError as error:
+            raise GenerationFailure(
+                "cryptographic random generation is unavailable"
+            ) from error
+        try:
+            descriptor = os.open(
+                temporary_name, flags, 0o600, dir_fd=parent_descriptor
+            )
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise GenerationFailure(
+                "target key file could not be created safely"
+            ) from error
+        return descriptor, temporary_name
+    raise GenerationFailure("target key file could not be created safely")
+
+
+def remove_temporary(parent_descriptor: int, temporary_name: str) -> None:
+    try:
+        os.unlink(temporary_name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise GenerationFailure(
+            "temporary key file could not be removed safely"
+        ) from error
+    try:
+        os.fsync(parent_descriptor)
+    except OSError as error:
+        raise GenerationFailure(
+            "temporary key cleanup could not be synchronized"
+        ) from error
+
+
 def generate(path_value: str) -> None:
     target = pathlib.Path(path_value)
     parent_descriptor = open_safe_parent(target)
     descriptor: int | None = None
-    created = False
     document = bytearray(KEY_PREFIX)
-    document.extend(secrets.token_bytes(KEY_PAYLOAD_BYTES))
+    temporary_name: str | None = None
     try:
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0)
-        )
         try:
-            descriptor = os.open(
-                target.name, flags, 0o600, dir_fd=parent_descriptor
-            )
-            created = True
+            document.extend(secrets.token_bytes(KEY_PAYLOAD_BYTES))
+        except OSError as error:
+            raise GenerationFailure(
+                "cryptographic random generation is unavailable"
+            ) from error
+        try:
+            descriptor, temporary_name = create_private_temporary(parent_descriptor)
             os.fchmod(descriptor, 0o600)
             metadata = os.fstat(descriptor)
             if (
@@ -104,20 +147,36 @@ def generate(path_value: str) -> None:
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = None
+            os.link(
+                temporary_name,
+                target.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+            temporary_name = None
             os.fsync(parent_descriptor)
         except GenerationFailure:
             raise
         except OSError as error:
             raise GenerationFailure("target key file could not be created safely") from error
-    except BaseException:
+    except BaseException as error:
+        cleanup_failure: GenerationFailure | None = None
         if descriptor is not None:
-            os.close(descriptor)
-        if created:
             try:
-                os.unlink(target.name, dir_fd=parent_descriptor)
-                os.fsync(parent_descriptor)
+                os.close(descriptor)
             except OSError:
-                pass
+                cleanup_failure = GenerationFailure(
+                    "temporary key file could not be closed safely"
+                )
+        if temporary_name is not None:
+            try:
+                remove_temporary(parent_descriptor, temporary_name)
+            except GenerationFailure as remove_error:
+                cleanup_failure = remove_error
+        if cleanup_failure is not None:
+            raise cleanup_failure from error
         raise
     finally:
         document.clear()

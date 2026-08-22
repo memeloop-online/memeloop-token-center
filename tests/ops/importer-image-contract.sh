@@ -154,6 +154,37 @@ if grep -Eq 'fixture-only-|Fixture(Copilot|Cursor)Handle' \
   exit 1
 fi
 
+key_staging_job="$repository/ops/kubernetes/cpa-upstream-import-dry-run-job.yaml"
+grep -Fq 'automountServiceAccountToken: false' "$key_staging_job"
+grep -A1 -F 'imagePullSecrets:' "$key_staging_job" \
+  | grep -Fq 'name: REPLACE_IMAGE_PULL_SECRET'
+test "$(grep -c 'image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center-importer@sha256:REPLACE_DIGEST' "$key_staging_job")" -eq 2
+grep -Fq 'name: stage-source-identity-key' "$key_staging_job"
+grep -Fq 'cp -- /secret-source/source-identity.key /key-runtime/source-identity.key' "$key_staging_job"
+grep -Fq 'chown 10001:10001 /key-runtime/source-identity.key' "$key_staging_job"
+grep -Fq 'chmod 0600 /key-runtime/source-identity.key' "$key_staging_job"
+chmod_line=$(grep -nF 'chmod 0600 /key-runtime/source-identity.key' \
+  "$key_staging_job" | cut -d: -f1)
+chown_line=$(grep -nF 'chown 10001:10001 /key-runtime/source-identity.key' \
+  "$key_staging_job" | cut -d: -f1)
+test -n "$chmod_line"
+test -n "$chown_line"
+test "$chmod_line" -lt "$chown_line"
+grep -Fq 'test -f /key-runtime/source-identity.key' "$key_staging_job"
+grep -Fq '10001:10001:600:1' "$key_staging_job"
+grep -Fq 'defaultMode: 0400' "$key_staging_job"
+grep -Fq 'medium: Memory' "$key_staging_job"
+grep -Fq 'sizeLimit: 1Mi' "$key_staging_job"
+test "$(grep -c 'mountPath: /secret-source' "$key_staging_job")" -eq 1
+test "$(grep -c 'mountPath: /key-runtime' "$key_staging_job")" -eq 2
+grep -A2 -F 'mountPath: /key-runtime' "$key_staging_job" | grep -Fq 'readOnly: true'
+grep -A1 -F -- '- --source-identity-key-file' "$key_staging_job" \
+  | grep -Fq -- '- /key-runtime/source-identity.key'
+if grep -Eq '^[[:space:]]*-[[:space:]]*--apply[[:space:]]*$' "$key_staging_job"; then
+  echo 'checked-in CPA upstream import Job must remain a dry-run' >&2
+  exit 1
+fi
+
 if docker run --rm \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=8m \

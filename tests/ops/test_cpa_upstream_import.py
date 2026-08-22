@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -19,12 +20,18 @@ import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterator
+from unittest import mock
+
+import yaml
 
 
 REPOSITORY = pathlib.Path(__file__).resolve().parents[2]
 IMPORTER = REPOSITORY / "ops" / "cpa-upstreams" / "import-cpa-upstreams.py"
 KEY_GENERATOR = (
     REPOSITORY / "ops" / "cpa-upstreams" / "generate-source-identity-key.py"
+)
+KEY_STAGING_JOB = (
+    REPOSITORY / "ops" / "kubernetes" / "cpa-upstream-import-dry-run-job.yaml"
 )
 FIXTURES = REPOSITORY / "tests" / "fixtures" / "cpa-upstreams"
 SANITIZER = REPOSITORY / "tests" / "ops" / "sanitize-cpa-upstream-fixtures.py"
@@ -362,6 +369,17 @@ def run_key_generator(*arguments: object) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, text=True, capture_output=True, check=False)
 
 
+def load_key_generator_module():  # noqa: ANN201
+    spec = importlib.util.spec_from_file_location(
+        f"mtc_source_identity_key_generator_{uuid.uuid4().hex}", KEY_GENERATOR
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("source identity key generator could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def sys_executable() -> str:
     return os.environ.get("PYTHON", "python3")
 
@@ -392,6 +410,29 @@ class CpaUpstreamImportTests(unittest.TestCase):
             len({entry["source_stable_id"] for entry in entries}), len(entries)
         )
         return entries
+
+    def test_kubernetes_key_staging_is_least_privilege_and_ordered(self) -> None:
+        manifest = yaml.safe_load(KEY_STAGING_JOB.read_text(encoding="utf-8"))
+        pod = manifest["spec"]["template"]["spec"]
+        init_container = pod["initContainers"][0]
+        self.assertEqual(init_container["name"], "stage-source-identity-key")
+        self.assertEqual(
+            init_container["securityContext"]["capabilities"],
+            {"drop": ["ALL"], "add": ["CHOWN"]},
+        )
+        commands = [
+            line.strip()
+            for line in init_container["args"][0].splitlines()
+            if line.strip()
+        ]
+        copy_command = (
+            "cp -- /secret-source/source-identity.key "
+            "/key-runtime/source-identity.key"
+        )
+        chmod_command = "chmod 0600 /key-runtime/source-identity.key"
+        chown_command = "chown 10001:10001 /key-runtime/source-identity.key"
+        self.assertLess(commands.index(copy_command), commands.index(chmod_command))
+        self.assertLess(commands.index(chmod_command), commands.index(chown_command))
 
     def test_supported_fixture_dry_run_is_safe_inventory_and_sanitized(self) -> None:
         sanitizer = subprocess.run(
@@ -749,6 +790,118 @@ class CpaUpstreamImportTests(unittest.TestCase):
         self.assertFalse((unsafe_directory / f"{marker}-key").exists())
         self.assertFalse((real_directory / f"{marker}-key").exists())
 
+    def test_source_identity_key_generator_cleans_partial_temporary_file(self) -> None:
+        source = SecureSource("supported")
+        self.addCleanup(source.close)
+        key_directory = pathlib.Path(source.temp.name) / "partial-key"
+        key_directory.mkdir(mode=0o700)
+        key_path = key_directory / "source-identity.key"
+        generator = load_key_generator_module()
+        original_write = generator.os.write
+        write_count = 0
+
+        def interrupted_write(descriptor: int, value: memoryview) -> int:
+            nonlocal write_count
+            write_count += 1
+            if write_count == 1:
+                return original_write(descriptor, value[:7])
+            del value
+            raise OSError("fixture partial write failure")
+
+        with mock.patch.object(generator.os, "write", new=interrupted_write):
+            with self.assertRaises(generator.GenerationFailure):
+                generator.generate(str(key_path))
+
+        self.assertFalse(key_path.exists())
+        self.assertEqual(list(key_directory.iterdir()), [])
+
+    def test_source_identity_key_generator_never_unlinks_replacement_target(
+        self,
+    ) -> None:
+        source = SecureSource("supported")
+        self.addCleanup(source.close)
+        key_directory = pathlib.Path(source.temp.name) / "replacement-key"
+        key_directory.mkdir(mode=0o700)
+        key_path = key_directory / "source-identity.key"
+        replacement = b"fixture replacement must survive generator cleanup"
+        generator = load_key_generator_module()
+        original_link = generator.os.link
+
+        def link_then_replace(
+            source_name: str, target_name: str, **kwargs: object
+        ) -> None:
+            original_link(source_name, target_name, **kwargs)
+            key_path.unlink()
+            key_path.write_bytes(replacement)
+            key_path.chmod(0o600)
+            raise OSError("fixture ambiguous publish failure")
+
+        with mock.patch.object(generator.os, "link", side_effect=link_then_replace):
+            with self.assertRaises(generator.GenerationFailure):
+                generator.generate(str(key_path))
+
+        self.assertEqual(key_path.read_bytes(), replacement)
+        self.assertEqual(list(key_directory.iterdir()), [key_path])
+
+    def test_source_identity_key_generator_reports_temporary_cleanup_failure(
+        self,
+    ) -> None:
+        source = SecureSource("supported")
+        self.addCleanup(source.close)
+        key_directory = pathlib.Path(source.temp.name) / "cleanup-failure-key"
+        key_directory.mkdir(mode=0o700)
+        key_path = key_directory / "source-identity.key"
+        generator = load_key_generator_module()
+
+        def failed_write(descriptor: int, value: memoryview) -> int:
+            del descriptor, value
+            raise OSError("fixture write failure")
+
+        with (
+            mock.patch.object(generator.os, "write", new=failed_write),
+            mock.patch.object(
+                generator.os,
+                "unlink",
+                side_effect=OSError("fixture cleanup failure"),
+            ),
+            self.assertRaises(generator.GenerationFailure) as caught,
+        ):
+            generator.generate(str(key_path))
+
+        self.assertEqual(
+            str(caught.exception),
+            "temporary key file could not be removed safely",
+        )
+        self.assertNotIn(str(key_directory), str(caught.exception))
+        self.assertNotIn("source-identity.key", str(caught.exception))
+        self.assertFalse(key_path.exists())
+        temporary_files = list(key_directory.iterdir())
+        self.assertEqual(len(temporary_files), 1)
+        self.assertTrue(temporary_files[0].name.startswith(".mtc-source-identity-key-"))
+        temporary_files[0].unlink()
+
+    def test_source_identity_key_generator_closes_parent_when_csprng_fails(self) -> None:
+        source = SecureSource("supported")
+        self.addCleanup(source.close)
+        key_directory = pathlib.Path(source.temp.name) / "random-failure-key"
+        key_directory.mkdir(mode=0o700)
+        key_path = key_directory / "source-identity.key"
+        generator = load_key_generator_module()
+        descriptors_before = len(list(pathlib.Path("/proc/self/fd").iterdir()))
+
+        with mock.patch.object(
+            generator.secrets,
+            "token_bytes",
+            side_effect=OSError("fixture CSPRNG failure"),
+        ):
+            with self.assertRaises(generator.GenerationFailure):
+                generator.generate(str(key_path))
+
+        descriptors_after = len(list(pathlib.Path("/proc/self/fd").iterdir()))
+        self.assertEqual(descriptors_after, descriptors_before)
+        self.assertFalse(key_path.exists())
+        self.assertEqual(list(key_directory.iterdir()), [])
+
     def test_opaque_source_ids_are_keyed_stable_and_not_dictionary_hashes(self) -> None:
         source = SecureSource("supported")
         self.addCleanup(source.close)
@@ -843,6 +996,10 @@ class CpaUpstreamImportTests(unittest.TestCase):
             f"{secret_path_marker}-magic",
             b"BAD-SOURCE-ID-KEY!\0\x01" + SOURCE_IDENTITY_PAYLOAD,
         )
+        wrong_version_key = source.secret_bytes_file(
+            f"{secret_path_marker}-version",
+            b"MTC-SOURCE-ID-KEY\0\x02" + SOURCE_IDENTITY_PAYLOAD,
+        )
         wrong_length_key = source.secret_bytes_file(
             f"{secret_path_marker}-length", SOURCE_IDENTITY_KEY[:-1]
         )
@@ -891,6 +1048,11 @@ class CpaUpstreamImportTests(unittest.TestCase):
             (
                 "wrong-magic",
                 ("--source-identity-key-file", wrong_magic_key),
+                "invalid binary format",
+            ),
+            (
+                "wrong-version",
+                ("--source-identity-key-file", wrong_version_key),
                 "invalid binary format",
             ),
             (
