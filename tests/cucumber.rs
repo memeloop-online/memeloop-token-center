@@ -412,7 +412,7 @@ async fn create_seedance_route_and_key(world: &mut TokenCenterWorld) {
             "alias": "video",
             "currency": "USD",
             "initial_balance": "10",
-            "policy": {"allowed_models": ["seedance-public"]}
+            "policy": {}
         }))
         .send()
         .await
@@ -974,7 +974,7 @@ async fn create_metered_comfyui_route_and_key(
             "alias": alias,
             "currency": "USD",
             "initial_balance": "10",
-            "policy": {"allowed_models": [public_model]}
+            "policy": {}
         }))
         .send()
         .await
@@ -1055,7 +1055,6 @@ async fn create_megapixel_comfyui_route_and_key(world: &mut TokenCenterWorld) {
             "currency": "USD",
             "initial_balance": "10",
             "policy": {
-                "allowed_models": ["comfy-megapixel-public"],
                 "tokens_per_minute": 10000000
             }
         }))
@@ -1294,7 +1293,6 @@ async fn create_generation_admission_key(
             "currency": "USD",
             "initial_balance": initial_balance,
             "policy": {
-                "allowed_models": [allowed_model],
                 "requests_per_minute": requests_per_minute,
                 "tokens_per_minute": tokens_per_minute,
                 "max_concurrency": max_concurrency
@@ -2465,7 +2463,7 @@ async fn create_openai_image_route_and_key(world: &mut TokenCenterWorld) {
             "alias": "image-api",
             "currency": "USD",
             "initial_balance": "0.3",
-            "policy": {"allowed_models": ["gpt-image-public"]}
+            "policy": {}
         }))
         .send()
         .await
@@ -2690,7 +2688,7 @@ async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
                     "alias": "image-api-second-identity",
                     "currency": "USD",
                     "initial_balance": "0.3",
-                    "policy": {"allowed_models": ["gpt-image-public"]}
+                    "policy": {}
                 }))
                 .send()
                 .await
@@ -2994,7 +2992,7 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
             "alias": "other-image-api",
             "currency": "USD",
             "initial_balance": "0",
-            "policy": {"allowed_models": ["gpt-image-public"]}
+            "policy": {}
         }))
         .send()
         .await
@@ -3376,7 +3374,7 @@ async fn create_codex_responses_image_route_and_key(world: &mut TokenCenterWorld
             "alias": "codex-image-api",
             "currency": "USD",
             "initial_balance": "10",
-            "policy": {"allowed_models": ["codex-image-public"]}
+            "policy": {}
         }))
         .send()
         .await
@@ -3762,7 +3760,7 @@ async fn record_requests_for_two_tenants(
                 "alias": "imported",
                 "currency": "USD",
                 "initial_balance": "10",
-                "policy": {"allowed_models": ["global-stats-model"]}
+                "policy": {}
             }))
             .send()
             .await
@@ -3864,7 +3862,7 @@ async fn create_matrix_key(world: &TokenCenterWorld, tenant: &str, principal: &s
             "alias": format!("{tenant}-credential"),
             "currency": "USD",
             "initial_balance": "10",
-            "policy": {"allowed_models": ["matrix-model"]}
+            "policy": {}
         }))
         .send()
         .await
@@ -4432,7 +4430,7 @@ async fn create_key_for_routed_models(world: &mut TokenCenterWorld) {
             "alias": "routed",
             "currency": "USD",
             "initial_balance": "10",
-            "policy": {"allowed_models": ["api-public", "oauth-public"]}
+            "policy": {}
         }))
         .send()
         .await
@@ -4546,7 +4544,8 @@ async fn mock_cursor_oauth(world: &mut TokenCenterWorld) {
         .and(path("/cursor/auth/poll"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "accessToken": "cursor-access-1",
-            "refreshToken": "cursor-refresh-1"
+            "refreshToken": "cursor-refresh-1",
+            "accountId": "cursor-stable-account-1"
         })))
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
@@ -4554,7 +4553,8 @@ async fn mock_cursor_oauth(world: &mut TokenCenterWorld) {
         .and(path("/cursor/auth/exchange_user_api_key"))
         .and(header("authorization", "Bearer cursor-refresh-1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "accessToken": "cursor-access-2"
+            "accessToken": "cursor-access-2",
+            "accountId": "cursor-stable-account-1"
         })))
         .mount(world.mock.as_ref().expect("mock server"))
         .await;
@@ -4653,7 +4653,7 @@ async fn poll_cursor_oauth(world: &mut TokenCenterWorld) {
         .as_i64()
         .expect("Cursor generation");
     let retry = poll().await.expect("retry completed Cursor OAuth poll");
-    assert_eq!(retry.status(), StatusCode::CREATED);
+    assert_eq!(retry.status(), StatusCode::OK);
     let retry_value: Value = retry.json().await.expect("retried Cursor account JSON");
     assert_eq!(
         retry_value["id"],
@@ -4850,7 +4850,7 @@ async fn create_key(world: &mut TokenCenterWorld, principal: String, model: Stri
             "alias": "primary",
             "currency": "USD",
             "initial_balance": "10.00",
-            "policy": {"allowed_models": [model]}
+            "policy": {}
         }))
         .send()
         .await
@@ -4966,7 +4966,6 @@ async fn create_and_use_policy_credential(world: &mut TokenCenterWorld) {
     assert_eq!(price.status(), StatusCode::OK);
 
     world.expected_policy = json!({
-        "allowed_models": ["gpt-test"],
         "requests_per_minute": 7,
         "tokens_per_minute": 7000,
         "max_concurrency": 2,
@@ -5308,7 +5307,7 @@ async fn create_exhausted_key(world: &mut TokenCenterWorld, model: String) {
             "alias": "empty",
             "currency": "USD",
             "initial_balance": "0",
-            "policy": {"allowed_models": [model]}
+            "policy": {}
         }))
         .send()
         .await
@@ -5345,7 +5344,6 @@ async fn create_rate_limited_key(world: &mut TokenCenterWorld, model: String) {
             "currency": "USD",
             "initial_balance": "10",
             "policy": {
-                "allowed_models": [model],
                 "requests_per_minute": 1,
                 "tokens_per_minute": 100000,
                 "max_concurrency": 4
@@ -7224,7 +7222,7 @@ async fn configure_overlapping_routing_groups(world: &mut TokenCenterWorld) {
             "alias": "group-routed-credential",
             "currency": "USD",
             "initial_balance": "10",
-            "policy": {"allowed_models": ["group-routed-model"]}
+            "policy": {}
         }),
     )
     .await;

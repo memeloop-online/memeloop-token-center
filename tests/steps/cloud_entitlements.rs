@@ -7,9 +7,8 @@ use uuid::Uuid;
 
 const WEBHOOK_SECRET: &str = "test-memeloop-cloud-webhook-secret-long-enough";
 
-fn policy(rpm: u64, allowed: &[&str]) -> Value {
+fn policy(rpm: u64) -> Value {
     json!({
-        "allowed_models": allowed,
         "requests_per_minute": rpm,
         "tokens_per_minute": rpm * 1_000,
         "max_concurrency": 4,
@@ -31,7 +30,7 @@ fn active(version: i64, desired: &str, rpm: u64) -> Value {
         "desired": desired,
         "version": version,
         "status": "active",
-        "policy": policy(rpm, &["gpt-5"]),
+        "policy": policy(rpm),
         "proration": {"plan": "cucumber-pro"}
     })
 }
@@ -48,7 +47,7 @@ fn cancelled(version: i64) -> Value {
         "desired": null,
         "version": version,
         "status": "cancelled",
-        "policy": policy(1, &[]),
+        "policy": policy(1),
         "proration": null
     })
 }
