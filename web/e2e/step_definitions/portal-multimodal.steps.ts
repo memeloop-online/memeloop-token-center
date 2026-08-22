@@ -359,7 +359,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await assertContains(page.getByRole('status'), '价格已保存');
 
   await page.getByRole('tab', { name: '凭据管理', exact: true }).click();
-  const credentialPanel = page.locator('article.form-panel').filter({ has: page.getByRole('heading', { name: '创建下游凭据', exact: true }) });
+  const credentialPanel = page.locator('article.form-panel').filter({ has: page.getByRole('heading', { name: '创建客户端凭据', exact: true }) });
   const credentialForm = credentialPanel.locator('form');
   await credentialForm.locator('#root_principal_external_id').fill('browser-multimodal-user');
   await credentialForm.locator('#root_alias').fill('Browser multimodal credential');

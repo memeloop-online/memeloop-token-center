@@ -18,7 +18,7 @@ When('管理员以中文暗色主题连接控制台', async function (this: Dogf
 Then('下游凭据表单使用本地化校验且模型计费可见', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.getByRole('tab', { name: '凭据管理', exact: true }).click();
-  await assertVisible(page.getByRole('heading', { name: '创建下游凭据', exact: true }));
+  await assertVisible(page.getByRole('heading', { name: '创建客户端凭据', exact: true }));
   const createButton = page.getByRole('button', { name: '创建凭据', exact: true });
   await assertVisible(createButton);
   await createButton.click();
