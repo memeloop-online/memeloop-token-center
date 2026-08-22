@@ -239,6 +239,10 @@ fn bounded_token(raw: &RawValue) -> Option<i64> {
         .filter(|tokens| (0..=MAX_REPORTED_TOKENS).contains(tokens))
 }
 
+pub(super) fn parse_image_usage(raw: &RawValue) -> Option<SanitizedImageUsage> {
+    parse_usage(raw).ok().flatten()
+}
+
 fn parse_usage(raw: &RawValue) -> Result<Option<SanitizedImageUsage>, ParseError> {
     if !raw.get().starts_with('{') {
         return Ok(None);

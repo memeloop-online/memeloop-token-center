@@ -1,5 +1,6 @@
 mod assets;
 mod jobs;
+mod openai_image_response;
 mod responses_tool_image;
 mod synchronous_entry;
 mod synchronous_image;

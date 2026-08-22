@@ -267,21 +267,6 @@ pub(in crate::api) async fn read_image_response_bounded(
     Ok(Bytes::from(body))
 }
 
-async fn archive_synchronous_image_response(
-    context: &SyncImageRequest<'_>,
-    result_lease: &mut crate::archive_staging::ArchiveStagingWriteLease,
-    response: Bytes,
-) -> Result<String, AppError> {
-    Ok(crate::generation::write_generation_staging_bytes(
-        context.state,
-        result_lease,
-        "response.json",
-        response,
-    )
-    .await?
-    .object_locator)
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn commit_synchronous_image_terminal(
     context: &SyncImageRequest<'_>,
@@ -380,23 +365,19 @@ async fn finish_openai_image_response(
         let error_code = format!("upstream_http_{}", upstream_status.as_u16());
         return fail_image_request(context, &error_code).await;
     }
-    let mut archived_assets = Vec::new();
-    let parsed: Value = match serde_json::from_slice(&response_bytes) {
-        Ok(value) => value,
-        Err(_) => {
+    let parsed = match super::openai_image_response::parse_openai_image_response(
+        &response_bytes,
+        context.expected_image_count,
+    ) {
+        Ok(parsed) => parsed,
+        Err(super::openai_image_response::OpenAiImageParseError::InvalidJson) => {
             return fail_image_request(context, "upstream_image_invalid_json").await;
         }
-    };
-    // serde_json owns every string in `parsed`, so the bounded upstream body is
-    // no longer needed. Releasing it here avoids retaining two copies of a
-    // large b64_json payload throughout validation and serialization.
-    drop(response_bytes);
-    let urls = match openai_image_urls(&parsed, context.expected_image_count) {
-        Ok(urls) => urls,
-        Err(_) => {
+        Err(super::openai_image_response::OpenAiImageParseError::InvalidPayload) => {
             return fail_image_request(context, "upstream_image_invalid_payload").await;
         }
     };
+    let mut archived_assets = Vec::new();
     let mut result_lease = crate::generation::begin_generation_staging_attempt(
         state,
         crate::archive_staging::ArchiveStagingOwner::SynchronousRequest(request_id),
@@ -405,7 +386,7 @@ async fn finish_openai_image_response(
     )
     .await?;
     let archive_budget = crate::generation::AssetArchiveBudget::default();
-    for (index, url) in urls.into_iter().enumerate() {
+    for (index, url) in parsed.url_assets() {
         if !renew_image_request_claim(context).await? {
             return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
         }
@@ -438,34 +419,49 @@ async fn finish_openai_image_response(
         };
         archived_assets.push(asset);
     }
-    let sanitized = match sanitize_openai_image_response(parsed, request_id, &archived_assets) {
-        Ok(response) => response,
-        Err(_) => {
-            return fail_image_request_with_staging(
-                context,
-                "upstream_image_invalid_payload",
-                Some(&result_lease),
-            )
-            .await;
-        }
-    };
-    let archive_bytes = serde_json::to_vec(&sanitized).map_err(|_| AppError::Internal)?;
-    drop(sanitized);
-    let archive_bytes = Bytes::from(archive_bytes);
-    let response_object =
-        match archive_synchronous_image_response(context, &mut result_lease, archive_bytes.clone())
-            .await
-        {
-            Ok(location) => location,
-            Err(_) => {
+    let (response_segments, response_len) =
+        match super::openai_image_response::build_openai_image_segments(
+            response_bytes,
+            parsed,
+            request_id,
+            &archived_assets,
+            unix_millis() / 1_000,
+        ) {
+            Ok(response) => response,
+            Err(super::openai_image_response::OpenAiImageBuildError::TooLarge) => {
                 return fail_image_request_with_staging(
                     context,
-                    "archive_write",
+                    "upstream_image_response_too_large",
                     Some(&result_lease),
                 )
                 .await;
             }
+            Err(super::openai_image_response::OpenAiImageBuildError::InvalidAssets) => {
+                return fail_image_request_with_staging(
+                    context,
+                    "upstream_image_invalid_payload",
+                    Some(&result_lease),
+                )
+                .await;
+            }
+            Err(super::openai_image_response::OpenAiImageBuildError::Internal) => {
+                return Err(AppError::Internal);
+            }
         };
+    let response_object = match crate::generation::write_generation_staging_segments(
+        state,
+        &mut result_lease,
+        "response.json",
+        response_segments.clone(),
+    )
+    .await
+    {
+        Ok(staged) => staged.object_locator,
+        Err(_) => {
+            return fail_image_request_with_staging(context, "archive_write", Some(&result_lease))
+                .await;
+        }
+    };
     match commit_synchronous_image_terminal(
         context,
         i64::from(upstream_status.as_u16()),
@@ -486,12 +482,17 @@ async fn finish_openai_image_response(
     Response::builder()
         .status(upstream_status)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CONTENT_LENGTH, archive_bytes.len())
+        .header(header::CONTENT_LENGTH, response_len)
         .header(REQUEST_ID_HEADER, request_id.to_string())
-        .body(Body::from(archive_bytes))
+        .body(Body::from_stream(futures_util::stream::iter(
+            response_segments
+                .into_iter()
+                .map(Ok::<_, std::convert::Infallible>),
+        )))
         .map_err(|_| AppError::Internal)
 }
 
+#[cfg(test)]
 pub(in crate::api) fn openai_image_urls(
     value: &Value,
     expected_count: i64,
@@ -525,6 +526,7 @@ pub(in crate::api) fn openai_image_urls(
     Ok(urls)
 }
 
+#[cfg(test)]
 pub(in crate::api) fn sanitize_openai_image_response(
     mut value: Value,
     request_id: Uuid,
@@ -609,6 +611,7 @@ pub(in crate::api) fn sanitize_openai_image_response(
     Ok(Value::Object(response))
 }
 
+#[cfg(test)]
 fn sanitize_image_usage(value: &Value) -> Option<Value> {
     let object = value.as_object()?;
     let mut sanitized = serde_json::Map::new();

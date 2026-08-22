@@ -62,6 +62,7 @@ class MockState:
     def __init__(self) -> None:
         self.assets: dict[str, int] = {}
         self.image_raw_bytes = 11 * MIB
+        self.image_item_count = 10
         self.active_streams = 0
         self.peak_streams = 0
         self.lock = threading.Lock()
@@ -194,20 +195,30 @@ class MockHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"id": job_id})
             return
 
-        if self.path == "/v1/responses":
-            result = base64.b64encode(b"x" * self.state.image_raw_bytes).decode("ascii")
+        if self.path == "/v1/images/generations":
+            requested_count = body.get("n")
+            if requested_count != self.state.image_item_count:
+                self._send_json(400, {"error": "unexpected image result count"})
+                return
+            base_size, remainder = divmod(
+                self.state.image_raw_bytes, self.state.image_item_count
+            )
+            data = []
+            for index in range(self.state.image_item_count):
+                raw_size = base_size + (1 if index < remainder else 0)
+                data.append(
+                    {
+                        "b64_json": base64.b64encode(b"x" * raw_size).decode("ascii"),
+                        "revised_prompt": f"memory benchmark image {index}",
+                    }
+                )
             self._send_json(
                 200,
                 {
-                    "id": "resp_memory_image",
-                    "output": [
-                        {
-                            "type": "image_generation_call",
-                            "id": "ig_memory_image",
-                            "result": result,
-                        }
-                    ],
+                    "created": 1_700_000_000,
+                    "data": data,
                     "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    "provider_secret": "must-not-reach-the-client",
                 },
             )
             return
@@ -629,8 +640,6 @@ def seed(control_url: str, gateway_url: str, service_token: str, mock_url: str) 
             "driver": "http-json",
             "config": {
                 "base_url": mock_url,
-                "image_api_mode": "responses-tool",
-                "image_main_model": "benchmark-main",
             },
             "credential": {"type": "none"},
         },
@@ -906,7 +915,7 @@ def run_synchronous_images(
             {
                 "model": "benchmark-image",
                 "prompt": "bounded memory image",
-                "n": 1,
+                "n": 10,
                 "response_format": "b64_json",
             },
             timeout=120,
@@ -915,8 +924,10 @@ def run_synchronous_images(
         if status != 200:
             raise HarnessFailure(f"synchronous image failed with HTTP {status}")
         response = json.loads(body)
-        if len(response.get("data", [])) != 1:
-            raise HarnessFailure("synchronous image did not return exactly one result")
+        if len(response.get("data", [])) != 10:
+            raise HarnessFailure("synchronous image did not return exactly ten results")
+        if "must-not-reach-the-client" in body.decode("utf-8"):
+            raise HarnessFailure("synchronous image leaked a provider-only field")
         return len(body)
 
     started = time.monotonic()
@@ -927,6 +938,8 @@ def run_synchronous_images(
     return {
         "concurrency": 2,
         "responses": len(response_bytes),
+        "results_per_response": 10,
+        "raw_image_bytes_per_response": 11 * MIB,
         "maximum_response_bytes": max(response_bytes),
         "duration_seconds": round(time.monotonic() - started, 3),
         "gateway_peak_rss_mib": round(peak, 3),
