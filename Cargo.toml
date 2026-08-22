@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Open-source high-performance relay and usage analytics for AI text, image, and video workloads"
-repository = "https://github.com/linonetwo/memeloop-token-center"
-homepage = "https://github.com/linonetwo/memeloop-token-center"
-documentation = "https://github.com/linonetwo/memeloop-token-center/tree/master/docs"
+repository = "https://github.com/memeloop-online/memeloop-token-center"
+homepage = "https://github.com/memeloop-online/memeloop-token-center"
+documentation = "https://github.com/memeloop-online/memeloop-token-center/tree/master/docs"
 publish = false
 
 [lib]

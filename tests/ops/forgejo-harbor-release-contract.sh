@@ -167,6 +167,8 @@ for required in \
   'application/vnd.docker.attestation.manifest.v1+json' \
   'https://in-toto.io/Statement/v1' \
   '.predicateType == $predicate' \
+  'startswith("pkg:docker/" + $image + "@")' \
+  'endswith("?platform=linux%2Famd64")' \
   '(.digest.sha256 == $subject)' \
   'verified SPDX SBOM statement is missing' \
   'verified SLSA provenance statement is missing'; do

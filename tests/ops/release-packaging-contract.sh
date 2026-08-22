@@ -5,14 +5,17 @@ repository=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 workflow_directory="$repository/.github/workflows"
 workflow="$workflow_directory/ci.yml"
 dockerfile="$repository/Dockerfile"
+importer_contract="$repository/tests/ops/importer-image-contract.sh"
 cargo_config="$repository/.cargo/config.toml"
 
 test -f "$workflow"
 test -f "$workflow_directory/memory-acceptance.yml"
 test -f "$dockerfile"
+test -f "$importer_contract"
 test -f "$cargo_config"
 test -f "$repository/.forgejo/workflows/harbor-release.yml"
 test ! -e "$repository/.forgejo/workflows/build.yaml"
+sh -n "$importer_contract"
 
 grep -Fq 'ARG NODE_IMAGE=node:24.18.0-bookworm-slim' "$dockerfile"
 grep -Fq 'ARG RUST_IMAGE=rust:1.95.0-bookworm' "$dockerfile"
@@ -85,8 +88,9 @@ grep -Fq 'repository-security:' "$workflow"
 grep -Fq 'dependency-security:' "$workflow"
 grep -Fq 'scanners: secret,misconfig' "$workflow"
 grep -Fq 'command: check advisories bans licenses sources' "$workflow"
-grep -Fq 'uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0' "$workflow"
-if grep -A4 -F 'uses: rustsec/audit-check@' "$workflow" | grep -Eq 'ignore:|--ignore'; then
+grep -Fq 'cargo install cargo-audit --version 0.22.2 --locked' "$workflow"
+grep -Fq 'cargo audit --deny warnings' "$workflow"
+if grep -E 'cargo audit|cargo-audit|rustsec/audit-check' "$workflow" | grep -Eq 'ignore:|--ignore'; then
   echo 'RustSec CI must not suppress any advisory' >&2
   exit 1
 fi
@@ -106,9 +110,9 @@ fi
 
 grep -Fq 'ops/ci/validate-release-inputs.sh' "$workflow"
 grep -Fq 'ops/ci/run-release-source-contracts.sh' "$workflow"
-grep -Fq 'ghcr.io/linonetwo/memeloop-token-center' "$workflow"
-grep -Fq 'ghcr.io/linonetwo/memeloop-token-center-importer' "$workflow"
-grep -Fq 'ghcr.io/linonetwo/memeloop-token-center-plugin-installer' "$workflow"
+grep -Fq 'ghcr.io/${{ github.repository_owner }}/memeloop-token-center' "$workflow"
+grep -Fq 'ghcr.io/${{ github.repository_owner }}/memeloop-token-center-importer' "$workflow"
+grep -Fq 'ghcr.io/${{ github.repository_owner }}/memeloop-token-center-plugin-installer' "$workflow"
 grep -Fq 'dockerfile: Dockerfile' "$workflow"
 grep -Fq 'dockerfile: Dockerfile.importer' "$workflow"
 grep -Fq 'dockerfile: Dockerfile.plugin-installer' "$workflow"
@@ -129,13 +133,22 @@ grep -Fq 'scanners: vuln' "$workflow"
 grep -Fq 'image-ref: ${{ matrix.image }}@${{ steps.build.outputs.digest }}' "$workflow"
 grep -Fq 'severity: HIGH,CRITICAL' "$workflow"
 grep -Fq 'provenance: mode=max' "$workflow"
+grep -Fq 'test "$GITHUB_REPOSITORY" = memeloop-online/memeloop-token-center' "$workflow"
+grep -Fq 'go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz' "$workflow"
+grep -Fq '5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e' "$workflow"
+grep -Fq 'ops/ci/verify-buildkit-attestations.sh' "$workflow"
+grep -Fq 'crane digest "$tagged_reference"' "$workflow"
+grep -Fq -- '--arg source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"' "$workflow"
+grep -Fq '.config.Labels["org.opencontainers.image.source"] == $source' "$workflow"
+grep -Fq '.config.Labels["org.opencontainers.image.revision"] == $revision' "$workflow"
+grep -Fq '${{ runner.temp }}/${{ matrix.cache_scope }}-attestations/' "$workflow"
 grep -Fq 'sbom: true' "$workflow"
-grep -Fq -- '--format '"'"'{{json .SBOM}}'"'"'' "$workflow"
-grep -Fq -- '--format '"'"'{{json .Provenance}}'"'"'' "$workflow"
 grep -Fq 'verify-ghcr-release:' "$workflow"
 grep -Fq 'name: ghcr-release-${{ github.sha }}' "$workflow"
 grep -Fq 'length == 3 and' "$workflow"
 # These are intentionally literal GitHub/JQ expressions in the audited workflow.
+grep -Fq 'prefix="ghcr.io/${GITHUB_REPOSITORY_OWNER}"' "$workflow"
+grep -Fq '((map(.image) | sort) == $expected_images)' "$workflow"
 # shellcheck disable=SC2016
 grep -Fq 'DIGEST: ${{ steps.build.outputs.digest }}' "$workflow"
 # shellcheck disable=SC2016
@@ -151,6 +164,21 @@ grep -Fq 'tests/ops/cpamp-import-postgres-acceptance.sh:/acceptance.sh:ro' "$wor
 grep -Fq 'cargo fmt --all -- --check' "$workflow"
 grep -Fq 'cargo clippy --locked --all-targets --all-features -- -D warnings' "$workflow"
 grep -Fq 'cargo test --locked --all-targets --all-features' "$workflow"
+grep -Fq "grep -Eq '^mig_[0-9a-f]{24}$'" "$workflow"
+grep -Fq "printf 'CREATE SCHEMA :\"schema\";\\n'" "$workflow"
+grep -Fq "printf 'DROP SCHEMA IF EXISTS :\"schema\" CASCADE;\\n'" "$workflow"
+test "$(grep -c '| psql -X --no-psqlrc -v ON_ERROR_STOP=1' "$workflow")" -ge 2
+if grep -Eq -- "-c ['\"](CREATE|DROP) SCHEMA" "$workflow"; then
+  echo 'psql variables must be expanded from stdin, never sent literally with -c' >&2
+  exit 1
+fi
+for importer_binary in migrate-cpamp audit-cpa-migration \
+  attach-legacy-cpa-credentials import-cpa-upstreams; do
+  grep -Fqx \
+    "docker cp \"\$container_id:/usr/local/bin/$importer_binary\" \"\$workspace/image-$importer_binary\"" \
+    "$importer_contract"
+done
+test "$(grep -c '^docker cp "\$container_id:/usr/local/bin/' "$importer_contract")" -eq 4
 grep -Fq 'npm audit --audit-level=high' "$workflow"
 grep -Fq 'npm run test:e2e' "$workflow"
 

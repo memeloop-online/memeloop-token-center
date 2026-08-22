@@ -152,11 +152,9 @@ grep -Fq 'PGHOST is required' "$workspace/default.err"
 container_id=$(docker create --entrypoint /bin/true "$image")
 docker export "$container_id" >"$workspace/rootfs.tar"
 docker cp "$container_id:/usr/local/bin/migrate-cpamp" "$workspace/image-migrate-cpamp"
-docker cp "$container_id:/usr/local/bin/attach-legacy-cpa-credentials" \
 docker cp "$container_id:/usr/local/bin/audit-cpa-migration" "$workspace/image-audit-cpa-migration"
-  "$workspace/image-attach-legacy-cpa-credentials"
-docker cp "$container_id:/usr/local/bin/import-cpa-upstreams" \
-  "$workspace/image-import-cpa-upstreams"
+docker cp "$container_id:/usr/local/bin/attach-legacy-cpa-credentials" "$workspace/image-attach-legacy-cpa-credentials"
+docker cp "$container_id:/usr/local/bin/import-cpa-upstreams" "$workspace/image-import-cpa-upstreams"
 cmp "$repository/ops/migrate-cpamp.sh" "$workspace/image-migrate-cpamp"
 cmp "$repository/ops/audit-cpa-migration.sh" "$workspace/image-audit-cpa-migration"
 cmp "$repository/ops/legacy-credentials/attach-legacy-cpa-credentials.py" \

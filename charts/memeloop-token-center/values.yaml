@@ -1,5 +1,5 @@
 image:
-  repository: ghcr.io/linonetwo/memeloop-token-center
+  repository: ghcr.io/memeloop-online/memeloop-token-center
   tag: "0.1.0"
   # When non-empty, digest takes precedence over tag and all workloads render
   # repository@digest. Keep tag populated as the explicit fallback for local
@@ -161,7 +161,7 @@ plugins:
   ociInstaller:
     enabled: false
     image:
-      repository: ghcr.io/linonetwo/memeloop-token-center-plugin-installer
+      repository: ghcr.io/memeloop-online/memeloop-token-center-plugin-installer
       # Required when enabled. Tags are deliberately unsupported for the
       # privileged-before-start installer trust boundary.
       digest: ""

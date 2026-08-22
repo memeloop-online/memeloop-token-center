@@ -49,10 +49,10 @@ jobs:
           rust-version: 1.95.0
           command: check advisories bans licenses sources
           arguments: --all-features
+      - name: Install the pinned RustSec scanner with its audited lockfile
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Enforce the current RustSec advisory database with no exceptions
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ github.token }}
+        run: cargo audit --deny warnings
       - name: Reject forbidden dependency re-entry and verify vendored provenance
         run: |
           tests/ops/rust-decimal-vendor-contract.sh
@@ -327,16 +327,19 @@ jobs:
           PGPASSWORD: token_center
         run: |
           schema="mig_${GITHUB_SHA:0:24}"
+          printf '%s\n' "$schema" | LC_ALL=C grep -Eq '^mig_[0-9a-f]{24}$'
           run_id="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           image="memeloop-token-center-importer:ci-${GITHUB_SHA}"
           cleanup() {
-            psql -X --no-psqlrc -v ON_ERROR_STOP=1 -v schema="$schema" \
-              -c 'DROP SCHEMA IF EXISTS :"schema" CASCADE' >/dev/null
+            printf 'DROP SCHEMA IF EXISTS :"schema" CASCADE;\n' \
+              | psql -X --no-psqlrc -v ON_ERROR_STOP=1 \
+                -v schema="$schema" >/dev/null
             docker image rm "$image" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT HUP INT TERM
-          psql -X --no-psqlrc -v ON_ERROR_STOP=1 -v schema="$schema" \
-            -c 'CREATE SCHEMA :"schema"'
+          printf 'CREATE SCHEMA :"schema";\n' \
+            | psql -X --no-psqlrc -v ON_ERROR_STOP=1 \
+              -v schema="$schema"
           docker build --file Dockerfile.importer --tag "$image" .
           docker run --rm --network host --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=64m \
@@ -397,13 +400,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: ghcr.io/linonetwo/memeloop-token-center
+          - image: ghcr.io/${{ github.repository_owner }}/memeloop-token-center
             dockerfile: Dockerfile
             cache_scope: service
-          - image: ghcr.io/linonetwo/memeloop-token-center-importer
+          - image: ghcr.io/${{ github.repository_owner }}/memeloop-token-center-importer
             dockerfile: Dockerfile.importer
             cache_scope: importer
-          - image: ghcr.io/linonetwo/memeloop-token-center-plugin-installer
+          - image: ghcr.io/${{ github.repository_owner }}/memeloop-token-center-plugin-installer
             dockerfile: Dockerfile.plugin-installer
             cache_scope: plugin-installer
     steps:
@@ -412,9 +415,22 @@ jobs:
           persist-credentials: false
       - name: Validate shared immutable release inputs
         env:
-          RELEASE_REGISTRY: ghcr.io/linonetwo
+          RELEASE_REGISTRY: ghcr.io/${{ github.repository_owner }}
         run: |
+          test "$GITHUB_REPOSITORY" = memeloop-online/memeloop-token-center
           ops/ci/validate-release-inputs.sh "$RELEASE_REGISTRY" "$GITHUB_SHA" prefixed >/dev/null
+      - name: Install checksum-pinned crane registry client
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
+          destination="$RUNNER_TEMP/crane-bin"
+          curl --fail --location --retry 3 \
+            https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz \
+            --output "$archive"
+          echo '5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e  '"$archive" | sha256sum --check
+          mkdir -p "$destination"
+          tar -xzf "$archive" -C "$destination" crane
+          echo "$destination" >> "$GITHUB_PATH"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -459,38 +475,40 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           CACHE_SCOPE: ${{ matrix.cache_scope }}
         run: |
+          set -euo pipefail
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "build returned an invalid image digest: $DIGEST" >&2
             exit 1
           fi
+          test "$GITHUB_REPOSITORY" = memeloop-online/memeloop-token-center
           tagged_reference="${IMAGE}:sha-${GITHUB_SHA}"
-          digest_reference="${IMAGE}@${DIGEST}"
-          resolved_digest="$(docker buildx imagetools inspect "$tagged_reference" \
-            --format '{{json .Manifest}}' | jq -r '.digest // empty')"
+          resolved_digest="$(crane digest "$tagged_reference")"
           if [ "$resolved_digest" != "$DIGEST" ]; then
             echo "immutable tag resolved to $resolved_digest instead of the build digest" >&2
             exit 1
           fi
-          docker buildx imagetools inspect "$digest_reference" >/dev/null
-          docker buildx imagetools inspect "$digest_reference" \
-            --format '{{json .Image}}' >"$RUNNER_TEMP/${CACHE_SCOPE}-image.json"
-          docker buildx imagetools inspect "$digest_reference" \
-            --format '{{json .SBOM}}' >"$RUNNER_TEMP/${CACHE_SCOPE}-sbom.json"
-          docker buildx imagetools inspect "$digest_reference" \
-            --format '{{json .Provenance}}' >"$RUNNER_TEMP/${CACHE_SCOPE}-provenance.json"
-          jq -e --arg revision "$GITHUB_SHA" \
-            '[.. | objects | .config?.Labels? // empty |
-              .["org.opencontainers.image.revision"]? // empty] |
-             index($revision) != null' \
-            "$RUNNER_TEMP/${CACHE_SCOPE}-image.json" >/dev/null
+          index="$RUNNER_TEMP/${CACHE_SCOPE}-index.json"
+          attestations="$RUNNER_TEMP/${CACHE_SCOPE}-attestations"
+          mkdir -p "$attestations"
+          ops/ci/verify-buildkit-attestations.sh \
+            "$IMAGE" "$DIGEST" "$index" "$attestations"
+          platform_digest="$(jq -r '
+            [.manifests[] |
+             select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")][0].digest
+          ' "$index")"
+          if [[ ! "$platform_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "attestation verifier returned an invalid platform digest: $platform_digest" >&2
+            exit 1
+          fi
+          image_evidence="$RUNNER_TEMP/${CACHE_SCOPE}-image.json"
+          docker buildx imagetools inspect "${IMAGE}@${platform_digest}" \
+            --format '{{json .Image}}' >"$image_evidence"
           jq -e \
-            '[.. | objects | .SPDXID? // empty] |
-             index("SPDXRef-DOCUMENT") != null' \
-            "$RUNNER_TEMP/${CACHE_SCOPE}-sbom.json" >/dev/null
-          jq -e \
-            '[.. | objects | .buildType? // empty] |
-             index("https://mobyproject.org/buildkit@v1") != null' \
-            "$RUNNER_TEMP/${CACHE_SCOPE}-provenance.json" >/dev/null
+            --arg source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --arg revision "$GITHUB_SHA" '
+              .config.Labels["org.opencontainers.image.source"] == $source and
+              .config.Labels["org.opencontainers.image.revision"] == $revision
+            ' "$image_evidence" >/dev/null
       - name: Record immutable image digest manifest
         shell: bash
         env:
@@ -517,8 +535,8 @@ jobs:
           path: |
             ${{ runner.temp }}/${{ matrix.cache_scope }}-image-digest.json
             ${{ runner.temp }}/${{ matrix.cache_scope }}-image.json
-            ${{ runner.temp }}/${{ matrix.cache_scope }}-sbom.json
-            ${{ runner.temp }}/${{ matrix.cache_scope }}-provenance.json
+            ${{ runner.temp }}/${{ matrix.cache_scope }}-index.json
+            ${{ runner.temp }}/${{ matrix.cache_scope }}-attestations/
           if-no-files-found: error
           retention-days: 30
 
@@ -545,7 +563,8 @@ jobs:
       - name: Verify the complete release set by immutable digest
         shell: bash
         run: |
-          set -eu
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = memeloop-online/memeloop-token-center
           evidence="$RUNNER_TEMP/release-evidence"
           expected='importer plugin-installer service'
           actual="$(find "$evidence" -maxdepth 1 -name '*-image-digest.json' -printf '%f\n' |
@@ -554,13 +573,21 @@ jobs:
             echo "incomplete release evidence: expected '$expected', got '$actual'" >&2
             exit 1
           fi
-          jq -s -e --arg revision "$GITHUB_SHA" '
+          prefix="ghcr.io/${GITHUB_REPOSITORY_OWNER}"
+          expected_images="$(jq -cn --arg prefix "$prefix" '[
+            ($prefix + "/memeloop-token-center"),
+            ($prefix + "/memeloop-token-center-importer"),
+            ($prefix + "/memeloop-token-center-plugin-installer")
+          ] | sort')"
+          jq -s -e \
+            --arg revision "$GITHUB_SHA" \
+            --argjson expected_images "$expected_images" '
             select(
               length == 3 and
               (map(.revision == $revision) | all) and
               (map(.digest | test("^sha256:[0-9a-f]{64}$")) | all) and
               (map(.reference == (.image + "@" + .digest)) | all) and
-              (map(.image) | unique | length == 3)
+              ((map(.image) | sort) == $expected_images)
             )
           ' "$evidence"/*-image-digest.json >"$RUNNER_TEMP/release-manifest.json"
           while IFS= read -r reference; do

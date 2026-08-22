@@ -13,6 +13,8 @@ attestation_manifest=ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 sbom_layer=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 provenance_layer=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 wrong=9999999999999999999999999999999999999999999999999999999999999999
+image=registry.example.test/mtc/service
+subject_name="pkg:docker/$image@sha-test?platform=linux%2Famd64"
 
 mkdir -p "$fixture/bin" "$fixture/evidence"
 cat >"$fixture/bin/crane" <<'SH'
@@ -44,16 +46,16 @@ EOF
 ]}
 EOF
   cat >"$fixture/blob-$sbom_layer.json" <<EOF
-{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"image","digest":{"sha256":"$subject"}}],"predicateType":"https://spdx.dev/Document","predicate":{"SPDXID":"SPDXRef-DOCUMENT"}}
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://spdx.dev/Document","predicate":{"SPDXID":"SPDXRef-DOCUMENT"}}
 EOF
   cat >"$fixture/blob-$provenance_layer.json" <<EOF
-{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"image","digest":{"sha256":"$subject"}}],"predicateType":"https://slsa.dev/provenance/v1","predicate":{"buildDefinition":{}}}
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://slsa.dev/provenance/v1","predicate":{"buildDefinition":{}}}
 EOF
 }
 
 verify() {
   PATH="$fixture/bin:$PATH" FIXTURE_ROOT="$fixture" \
-    "$verifier" registry.example.test/mtc/service "sha256:$index" \
+    "$verifier" "$image" "sha256:$index" \
     "$fixture/index-output.json" "$fixture/evidence"
 }
 
@@ -71,15 +73,23 @@ verify >/dev/null
 # A valid predicate attached to a different subject must never be credited to
 # the image that was just built.
 cat >"$fixture/blob-$sbom_layer.json" <<EOF
-{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"image","digest":{"sha256":"$wrong"}}],"predicateType":"https://spdx.dev/Document","predicate":{}}
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$wrong"}}],"predicateType":"https://spdx.dev/Document","predicate":{}}
 EOF
 expect_rejected wrong-subject
+
+# A digest match cannot bind evidence to a different repository. The package
+# URL name must identify the dynamic image and the selected linux/amd64 result.
+write_good
+cat >"$fixture/blob-$sbom_layer.json" <<EOF
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"pkg:docker/registry.example.test/other/service@sha-test?platform=linux%2Famd64","digest":{"sha256":"$subject"}}],"predicateType":"https://spdx.dev/Document","predicate":{}}
+EOF
+expect_rejected wrong-subject-name
 
 # Descriptor annotations cannot substitute for the predicate type inside the
 # in-toto statement.
 write_good
 cat >"$fixture/blob-$sbom_layer.json" <<EOF
-{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"image","digest":{"sha256":"$subject"}}],"predicateType":"https://example.test/not-spdx","predicate":{}}
+{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"$subject_name","digest":{"sha256":"$subject"}}],"predicateType":"https://example.test/not-spdx","predicate":{}}
 EOF
 expect_rejected predicate-mismatch
 
@@ -128,5 +138,20 @@ payload["subject"]["digest"] = "sha256:" + sys.argv[2]
 path.write_text(json.dumps(payload))
 PY
 expect_rejected manifest-subject-mismatch
+
+# An attested single-platform release must not hide another runnable image.
+write_good
+python3 - "$fixture/manifest-$index.json" "$wrong" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text())
+payload["manifests"].append({
+    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    "digest": "sha256:" + sys.argv[2],
+    "platform": {"os": "linux", "architecture": "arm64"},
+})
+path.write_text(json.dumps(payload))
+PY
+expect_rejected extra-runnable-manifest
 
 echo 'Forgejo attestation malicious fixtures OK'

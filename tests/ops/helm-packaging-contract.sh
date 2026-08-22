@@ -108,8 +108,8 @@ grep -q "memeloop.io/schema-generation: \"v${latest_migration}\"" "$workspace/de
 grep -q 'kind: PodDisruptionBudget' "$workspace/default.yaml"
 grep -q 'kind: HorizontalPodAutoscaler' "$workspace/observed.yaml"
 grep -q 'kind: ServiceMonitor' "$workspace/observed.yaml"
-test "$(grep -c 'image: \"ghcr.io/linonetwo/memeloop-token-center:0.1.0\"' "$workspace/default.yaml")" -eq 4
-test "$(grep -c "image: \"ghcr.io/linonetwo/memeloop-token-center@$reviewed_digest\"" "$workspace/digest.yaml")" -eq 4
+test "$(grep -c 'image: \"ghcr.io/memeloop-online/memeloop-token-center:0.1.0\"' "$workspace/default.yaml")" -eq 4
+test "$(grep -c "image: \"ghcr.io/memeloop-online/memeloop-token-center@$reviewed_digest\"" "$workspace/digest.yaml")" -eq 4
 if grep -Fq 'must-not-render' "$workspace/digest.yaml"; then
   echo 'A reviewed image digest must take precedence over the mutable tag' >&2
   exit 1
@@ -126,7 +126,7 @@ fi
 grep -q 'configMap:' "$workspace/configmap-plugin.yaml"
 grep -q 'persistentVolumeClaim:' "$workspace/pvc-plugin.yaml"
 test "$(grep -c 'name: install-plugin-0' "$workspace/oci-plugin.yaml")" -eq 3
-test "$(grep -c "image: \"ghcr.io/linonetwo/memeloop-token-center-plugin-installer@$installer_digest\"" "$workspace/oci-plugin.yaml")" -eq 3
+test "$(grep -c "image: \"ghcr.io/memeloop-online/memeloop-token-center-plugin-installer@$installer_digest\"" "$workspace/oci-plugin.yaml")" -eq 3
 test "$(grep -c -- '- --registry-username-file' "$workspace/oci-plugin.yaml")" -eq 3
 test "$(grep -c -- '- --registry-password-file' "$workspace/oci-plugin.yaml")" -eq 3
 test "$(grep -c -- '- --cosign-public-key' "$workspace/oci-plugin.yaml")" -eq 3

@@ -38,7 +38,23 @@ crane manifest "$image@$index_digest" >"$index_file"
 jq -e '
   .schemaVersion == 2 and
   .mediaType == "application/vnd.oci.image.index.v1+json" and
-  (.manifests | type == "array" and length >= 2)
+  (.manifests | type == "array" and length >= 2) and
+  ([.manifests[] |
+    select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")] |
+    length == 1) and
+  ([.manifests[] |
+    select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")][0] |
+    .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+    .platform.os == "linux" and
+    .platform.architecture == "amd64") and
+  all(.manifests[];
+    if ((.annotations["vnd.docker.reference.type"] // "") == "attestation-manifest") then
+      .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+      .platform.os == "unknown" and
+      .platform.architecture == "unknown"
+    else
+      true
+    end)
 ' "$index_file" >/dev/null || fail "published digest is not a valid attested OCI index"
 
 subject_digests=$(jq -r '
@@ -107,17 +123,21 @@ while IFS="$tab" read -r attestation_digest referenced_digest; do
     layer_hex=${layer_digest#sha256:}
     statement="$evidence_dir/in-toto-$layer_hex.json"
     crane blob "$image@$layer_digest" >"$statement"
-    jq -e --arg predicate "$predicate_type" --arg subject "$subject_hex" '
+    jq -e --arg predicate "$predicate_type" --arg subject "$subject_hex" --arg image "$image" '
       ((.["_type"] == "https://in-toto.io/Statement/v0.1") or
        (.["_type"] == "https://in-toto.io/Statement/v1")) and
       .predicateType == $predicate and
       (.subject | type == "array" and length > 0) and
       all(.subject[];
+        (.name | type == "string") and
+        ((.name == $image) or
+         ((.name | startswith("pkg:docker/" + $image + "@")) and
+          (.name | endswith("?platform=linux%2Famd64")))) and
         (.digest | type == "object") and
         ((.digest | keys) == ["sha256"]) and
         (.digest.sha256 == $subject))
     ' "$statement" >/dev/null || \
-      fail "in-toto statement type, predicate, or exact sha256 subject is invalid"
+      fail "in-toto statement type, predicate, image name, or exact sha256 subject is invalid"
     : >"$marker"
   done <<EOF
 $layer_rows
