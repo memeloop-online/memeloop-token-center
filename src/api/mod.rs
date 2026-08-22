@@ -137,7 +137,7 @@ use crate::{
         resolve_managed_oauth_refresh_adapter, start_cursor_login,
     },
     plugin::{PreparedProviderRequest, memeloop::token_center::types::RequestContext},
-    provider::{UpstreamCredential, validate_config},
+    provider::{ResolvedUpstream, UpstreamCredential, validate_config},
     proxy_lifecycle::{
         MAX_DOWNSTREAM_SEND_WAIT, MAX_PROXY_LIFETIME, MAX_PROXY_STREAM_LIFETIME,
         MAX_UNCONFIRMED_DELIVERY_BYTES, abandon_proxy_archive_attempt,

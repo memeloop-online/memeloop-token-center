@@ -136,6 +136,63 @@ impl Database {
         Ok(reservation)
     }
 
+    /// Moves an admitted but unfinished request to the next authorized route
+    /// after a pre-delivery upstream failure. The expected assignment makes
+    /// this a tenant-scoped CAS; completed requests and concurrent changes are
+    /// never overwritten.
+    pub async fn reassign_pending_proxy_upstream(
+        &self,
+        request_id: Uuid,
+        tenant_id: Uuid,
+        reservation_id: Uuid,
+        expected_assignment: (Uuid, Uuid),
+        next_assignment: (Uuid, Uuid),
+    ) -> Result<(), AppError> {
+        let (expected_upstream_account_id, expected_model_route_id) = expected_assignment;
+        let (next_upstream_account_id, next_model_route_id) = next_assignment;
+        let updated = sqlx::query(
+            "UPDATE request_records
+             SET upstream_account_id = $1, model_route_id = $2
+             WHERE id = $3 AND tenant_id = $4 AND reservation_id = $5
+               AND upstream_account_id = $6 AND model_route_id = $7
+               AND completed_at IS NULL",
+        )
+        .bind(next_upstream_account_id.to_string())
+        .bind(next_model_route_id.to_string())
+        .bind(request_id.to_string())
+        .bind(tenant_id.to_string())
+        .bind(reservation_id.to_string())
+        .bind(expected_upstream_account_id.to_string())
+        .bind(expected_model_route_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 1 {
+            return Ok(());
+        }
+        let current = sqlx::query(
+            "SELECT upstream_account_id, model_route_id, completed_at
+             FROM request_records
+             WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3",
+        )
+        .bind(request_id.to_string())
+        .bind(tenant_id.to_string())
+        .bind(reservation_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(current) = current
+            && current.try_get::<Option<i64>, _>("completed_at")?.is_none()
+            && current.try_get::<Option<String>, _>("upstream_account_id")?
+                == Some(next_upstream_account_id.to_string())
+            && current.try_get::<Option<String>, _>("model_route_id")?
+                == Some(next_model_route_id.to_string())
+        {
+            return Ok(());
+        }
+        Err(AppError::Conflict(
+            "proxy upstream assignment changed before failover".into(),
+        ))
+    }
+
     /// Legacy split attachment retained only for pre-v35 unit fixtures. The
     /// production proxy path has no untracked/CAS attachment writer; historical
     /// locators remain accepted by the request-detail compatibility path and

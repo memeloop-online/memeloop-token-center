@@ -18,6 +18,22 @@ use crate::{
 
 static PLUGIN_EXECUTION_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_COMPONENT_PREPARE_COUNTER: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+}
+
+#[cfg(test)]
+pub(super) async fn with_test_component_prepare_counter<F>(
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    TEST_COMPONENT_PREPARE_COUNTER.scope(counter, future).await
+}
+
 pub(super) async fn proxy_openai_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -335,6 +351,10 @@ pub(super) async fn prepare_component_provider(
     config: Value,
     request_json: Value,
 ) -> Result<PreparedProviderRequest, AppError> {
+    #[cfg(test)]
+    let _ = TEST_COMPONENT_PREPARE_COUNTER.try_with(|counter| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
     let permit = tokio::time::timeout(Duration::from_secs(1), PLUGIN_EXECUTION_PERMITS.acquire())

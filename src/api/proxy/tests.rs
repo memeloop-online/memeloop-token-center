@@ -333,6 +333,509 @@ async fn send_response_usage_request(fixture: &CodexRouteFixture, body: &Value) 
         .unwrap()
 }
 
+struct ResilientRouteFixture {
+    state: AppState,
+    database_url: String,
+    key: String,
+    key_id: Uuid,
+    model: String,
+    accounts: Vec<Uuid>,
+    _directory: tempfile::TempDir,
+}
+
+async fn resilient_route_fixture(
+    label: &str,
+    upstreams: &[(String, i64)],
+) -> ResilientRouteFixture {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join(format!("resilient-{label}.db"))
+            .display()
+    );
+    let mut config = Config::for_test(database_url.clone());
+    config.archive_backend = ArchiveBackend::Filesystem;
+    config.archive_path = Some(directory.path().join("archive").display().to_string());
+    let state = AppState::initialize(config).await.unwrap();
+    let tenant = format!("resilient-{label}");
+    let model = format!("resilient-model-{label}");
+    let mut routes = Vec::new();
+    let mut accounts = Vec::new();
+    for (index, (upstream_uri, priority)) in upstreams.iter().enumerate() {
+        let account = state
+            .db
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.clone(),
+                    name: format!("resilient-{label}-{index}"),
+                    driver: "http-json".to_owned(),
+                    config: json!({
+                        "base_url": upstream_uri,
+                        "network_scope": "public"
+                    }),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let route = state
+            .db
+            .create_model_route(CreateModelRouteInput {
+                tenant_external_id: tenant.clone(),
+                public_model: model.clone(),
+                upstream_account_id: account.id,
+                upstream_model: format!("upstream-{index}"),
+                protocol: "openai".to_owned(),
+                priority: *priority,
+            })
+            .await
+            .unwrap();
+        accounts.push(account.id);
+        routes.push(route.id);
+    }
+    let issued = state
+        .db
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: tenant,
+                principal_external_id: "member".to_owned(),
+                alias: format!("resilient-{label}"),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    allowed_models: vec![model.clone()],
+                    max_concurrency: 8,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::from(100),
+                idempotency_key: None,
+            },
+            &routes,
+            &[],
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    ResilientRouteFixture {
+        state,
+        database_url,
+        key: issued.key,
+        key_id: issued.key_id,
+        model,
+        accounts,
+        _directory: directory,
+    }
+}
+
+async fn send_resilient_chat(
+    fixture: &ResilientRouteFixture,
+    session_id: Option<&str>,
+    stream: bool,
+) -> Response {
+    let mut request = Request::post("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key));
+    if let Some(session_id) = session_id {
+        request = request.header("x-mtc-conversation-id", session_id);
+    }
+    router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
+        .oneshot(
+            request
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "model": fixture.model,
+                        "messages": [{"role": "user", "content": "probe"}],
+                        "stream": stream
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+fn successful_chat_response() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "id": "chatcmpl-resilient",
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+    }))
+}
+
+#[tokio::test]
+async fn stable_session_keeps_the_same_candidate_when_the_set_is_unchanged() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    for upstream in [&first, &second] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(successful_chat_response())
+            .mount(upstream)
+            .await;
+    }
+    let fixture = resilient_route_fixture("sticky", &[(first.uri(), 0), (second.uri(), 0)]).await;
+    for _ in 0..2 {
+        let response = send_resilient_chat(&fixture, Some("logical-session-42"), false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    }
+    let counts = [
+        first.received_requests().await.unwrap().len(),
+        second.received_requests().await.unwrap().len(),
+    ];
+    assert!(counts == [2, 0] || counts == [0, 2], "counts={counts:?}");
+}
+
+#[tokio::test]
+async fn rate_limit_response_fails_over_and_records_the_actual_upstream() {
+    let unavailable = MockServer::start().await;
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&unavailable)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_chat_response())
+        .expect(1)
+        .mount(&healthy)
+        .await;
+    let fixture =
+        resilient_route_fixture("failover", &[(unavailable.uri(), 0), (healthy.uri(), 10)]).await;
+    let response = send_resilient_chat(&fixture, Some("failover-session"), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    unavailable.verify().await;
+    healthy.verify().await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let actual: String = sqlx::query_scalar(
+        "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(fixture.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(actual, fixture.accounts[1].to_string());
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn refused_connection_fails_over_to_the_next_authorized_candidate() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unavailable_uri = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_chat_response())
+        .expect(1)
+        .mount(&healthy)
+        .await;
+    let fixture = resilient_route_fixture(
+        "connect-failover",
+        &[(unavailable_uri, 0), (healthy.uri(), 10)],
+    )
+    .await;
+    let response = send_resilient_chat(&fixture, Some("connect-failover-session"), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    healthy.verify().await;
+}
+
+#[tokio::test]
+async fn connection_closed_after_accept_is_not_replayed_to_a_standby() {
+    use tokio::io::AsyncReadExt as _;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let accepted_uri = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request_prefix = [0_u8; 4096];
+        let read = stream.read(&mut request_prefix).await.unwrap();
+        assert!(
+            read > 0,
+            "the upstream must receive request bytes before closing"
+        );
+        // Drop without an HTTP response. reqwest classifies this as a transport
+        // failure after connection establishment, not as a connect failure.
+    });
+    let standby = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(successful_chat_response())
+        .expect(0)
+        .mount(&standby)
+        .await;
+    let fixture = resilient_route_fixture(
+        "accepted-no-replay",
+        &[(accepted_uri, 0), (standby.uri(), 10)],
+    )
+    .await;
+    let response = send_resilient_chat(&fixture, Some("accepted-no-replay-session"), false).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    accepted.await.unwrap();
+    standby.verify().await;
+}
+
+#[tokio::test]
+async fn server_errors_are_not_replayed_to_a_standby() {
+    for status in [500, 502, 503, 504] {
+        let first = MockServer::start().await;
+        let standby = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&first)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(successful_chat_response())
+            .expect(0)
+            .mount(&standby)
+            .await;
+        let fixture = resilient_route_fixture(
+            &format!("no-replay-{status}"),
+            &[(first.uri(), 0), (standby.uri(), 10)],
+        )
+        .await;
+        let response = send_resilient_chat(&fixture, Some("server-error-session"), false).await;
+        assert_eq!(response.status().as_u16(), status);
+        first.verify().await;
+        standby.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn secondary_component_does_not_consume_the_healthy_standby_budget() {
+    let primary = MockServer::start().await;
+    let component_a = MockServer::start().await;
+    let component_b = MockServer::start().await;
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&component_a)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&component_b)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_chat_response())
+        .expect(1)
+        .mount(&healthy)
+        .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("secondary-component.db").display()
+    );
+    let mut config = Config::for_test(database_url);
+    config.archive_backend = ArchiveBackend::Filesystem;
+    config.archive_path = Some(directory.path().join("archive").display().to_string());
+    config.plugin_dir = Some("examples/plugins".to_owned());
+    let state = AppState::initialize(config).await.unwrap();
+    let tenant = "secondary-component";
+    let requested_model = "requested-model";
+    let rewritten_model = "example-rewritten";
+    let primary_account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.to_owned(),
+                name: "primary-http-json".to_owned(),
+                driver: "http-json".to_owned(),
+                config: json!({"base_url": primary.uri(), "network_scope": "public"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let component_a_account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.to_owned(),
+                name: "secondary-component-a".to_owned(),
+                driver: "example-oauth-http".to_owned(),
+                config: json!({"base_url": component_a.uri(), "network_scope": "public"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let component_b_account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.to_owned(),
+                name: "secondary-component-b".to_owned(),
+                driver: "example-oauth-http".to_owned(),
+                config: json!({"base_url": component_b.uri(), "network_scope": "public"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let healthy_account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.to_owned(),
+                name: "healthy-http-json".to_owned(),
+                driver: "http-json".to_owned(),
+                config: json!({"base_url": healthy.uri(), "network_scope": "public"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut route_ids = Vec::new();
+    for (public_model, account, priority) in [
+        (requested_model, primary_account.id, 0),
+        (rewritten_model, primary_account.id, 0),
+        (rewritten_model, component_a_account.id, 10),
+        (rewritten_model, component_b_account.id, 20),
+        (rewritten_model, healthy_account.id, 30),
+    ] {
+        route_ids.push(
+            state
+                .db
+                .create_model_route(CreateModelRouteInput {
+                    tenant_external_id: tenant.to_owned(),
+                    public_model: public_model.to_owned(),
+                    upstream_account_id: account,
+                    upstream_model: "upstream-model".to_owned(),
+                    protocol: "openai".to_owned(),
+                    priority,
+                })
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    let issued = state
+        .db
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: tenant.to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "secondary-component".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    allowed_models: vec![requested_model.to_owned(), rewritten_model.to_owned()],
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::from(100),
+                idempotency_key: None,
+            },
+            &route_ids,
+            &[],
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .upsert_model_price(rewritten_model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let request = Request::post("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {}", issued.key))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": requested_model,
+                "messages": [{"role": "user", "content": "probe"}],
+                "stream": false
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = super::super::traffic::with_test_component_prepare_counter(
+        counter.clone(),
+        router_for_role(state, RuntimeRole::Gateway).oneshot(request),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    primary.verify().await;
+    component_a.verify().await;
+    component_b.verify().await;
+    healthy.verify().await;
+}
+
+#[tokio::test]
+async fn successful_stream_is_never_replayed_after_downstream_delivery_can_start() {
+    let streaming = MockServer::start().await;
+    let standby = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&streaming)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(successful_chat_response())
+        .expect(0)
+        .mount(&standby)
+        .await;
+    let fixture = resilient_route_fixture(
+        "stream-no-retry",
+        &[(streaming.uri(), 0), (standby.uri(), 10)],
+    )
+    .await;
+    let response = send_resilient_chat(&fixture, Some("stream-session"), true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(body.windows(2).any(|window| window == b"ok"));
+    streaming.verify().await;
+    standby.verify().await;
+}
+
 #[tokio::test]
 async fn exhausted_proxy_lifecycle_budget_rejects_before_upstream_or_reservation() {
     let upstream = MockServer::start().await;

@@ -13,6 +13,227 @@ mod tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
+const MAX_UPSTREAM_ATTEMPTS: usize = 3;
+
+struct PreparedProxyRoute {
+    route: ResolvedUpstream,
+    forwarded_body: Vec<u8>,
+    output_token_ceiling: i64,
+    codex_downstream_stream: bool,
+    component_request: Option<(PreparedProviderRequest, RequestContext)>,
+}
+
+impl PreparedProxyRoute {
+    fn is_codex(&self) -> bool {
+        codex_transport::is_driver(&self.route.driver)
+    }
+
+    fn is_component(&self, state: &AppState) -> bool {
+        state
+            .providers
+            .get(&self.route.driver)
+            .and_then(|provider| provider.component_adapter.as_ref())
+            .is_some()
+    }
+
+    fn request_body_ceiling(&self, original_body_length: usize) -> usize {
+        original_body_length.max(self.forwarded_body.len()).max(
+            self.component_request
+                .as_ref()
+                .map(|(request, _)| request.body.len())
+                .unwrap_or_default(),
+        )
+    }
+}
+
+async fn prepare_proxy_route(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    model: &str,
+    protocol: Protocol,
+    request_json: &Value,
+    route: ResolvedUpstream,
+) -> Result<PreparedProxyRoute, AppError> {
+    if !state.providers.contains(&route.driver) {
+        return Err(AppError::Upstream(format!(
+            "provider driver {} is not loaded",
+            route.driver
+        )));
+    }
+    route.credential.validate(unix_millis())?;
+    let is_codex = codex_transport::is_driver(&route.driver);
+    if is_codex {
+        codex_transport::validate_protocol(protocol)?;
+        if route.base_url != codex_transport::BASE_URL {
+            return Err(AppError::BadRequest(
+                "OpenAI Codex account has an invalid fixed base URL".into(),
+            ));
+        }
+        codex_transport::validate_credential_contract(&route.credential)?;
+        codex_transport::validate_route_config(&route.config)?;
+    }
+    let mut forwarded_json = request_json.clone();
+    if let Some(value) = forwarded_json.get_mut("model") {
+        *value = Value::String(route.upstream_model.clone());
+    }
+    let codex_plan = if is_codex {
+        Some(codex_transport::prepare_request(
+            &mut forwarded_json,
+            &route.upstream_model,
+            &route.config,
+        )?)
+    } else {
+        None
+    };
+    let output_token_ceiling = match codex_plan.as_ref() {
+        Some(plan) => plan.output_token_ceiling,
+        None => inject_controlled_output_ceiling(protocol, &mut forwarded_json)?,
+    };
+    let component_adapter = state
+        .providers
+        .get(&route.driver)
+        .and_then(|provider| provider.component_adapter.as_ref());
+    let component_request = if component_adapter.is_some() {
+        match forwarded_json.get("stream") {
+            Some(Value::Bool(false)) | None => {}
+            Some(Value::Bool(true)) => {
+                return Err(AppError::BadRequest(
+                    "component providers support buffered requests only; stream=true is unavailable"
+                        .into(),
+                ));
+            }
+            Some(_) => return Err(AppError::BadRequest("stream must be a boolean".into())),
+        }
+        let context = RequestContext {
+            tenant_id: key.tenant_id.to_string(),
+            principal_id: key.principal_id.to_string(),
+            key_id: key.key_id.to_string(),
+            protocol: protocol.name().to_owned(),
+            model: model.to_owned(),
+            config_json: serde_json::to_string(&route.config).map_err(|_| AppError::Internal)?,
+        };
+        let prepared = prepare_component_provider(
+            state,
+            &route.driver,
+            context.clone(),
+            route.config.clone(),
+            forwarded_json.clone(),
+        )
+        .await?;
+        Some((prepared, context))
+    } else {
+        None
+    };
+    let forwarded_body = serde_json::to_vec(&forwarded_json).map_err(|_| AppError::Internal)?;
+    Ok(PreparedProxyRoute {
+        route,
+        forwarded_body,
+        output_token_ceiling,
+        codex_downstream_stream: codex_plan
+            .as_ref()
+            .is_some_and(|plan| plan.downstream_stream),
+        component_request,
+    })
+}
+
+enum ProxySendError {
+    RetryableConnection,
+    CandidateUnavailable,
+    NonRetryableTransport,
+    Credential,
+}
+
+async fn send_proxy_route(
+    state: &AppState,
+    headers: &HeaderMap,
+    protocol: Protocol,
+    request_id: Uuid,
+    route: &PreparedProxyRoute,
+) -> Result<reqwest::Response, ProxySendError> {
+    let is_codex = route.is_codex();
+    let request_path = if is_codex {
+        codex_transport::RESPONSES_PATH
+    } else {
+        protocol.path()
+    };
+    let outbound_base_url = if is_codex {
+        codex_transport::outbound_base_url(&route.route.base_url)
+    } else {
+        route.route.base_url.clone()
+    };
+    let outbound_http = network::client_for_config_url(
+        &state.http,
+        &outbound_base_url,
+        &route.route.config,
+        state.config.allow_oauth_loopback,
+    )
+    .await
+    .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    let mut request = outbound_http
+        .post(format!(
+            "{}{}",
+            outbound_base_url.trim_end_matches('/'),
+            request_path
+        ))
+        .body(route.forwarded_body.clone());
+    if is_codex {
+        request = codex_transport::apply_wire_headers(request, &route.route.credential, request_id)
+            .map_err(|_| ProxySendError::Credential)?;
+    } else {
+        request = request
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                header::ACCEPT,
+                headers
+                    .get(header::ACCEPT)
+                    .cloned()
+                    .unwrap_or(HeaderValue::from_static("application/json")),
+            );
+        request = route
+            .route
+            .credential
+            .apply(request, unix_millis())
+            .map_err(|_| ProxySendError::Credential)?;
+    }
+    if !is_codex {
+        if route.route.driver == crate::oauth::copilot::PROVIDER_DRIVER {
+            let product = format!("memeloop-token-center/{}", env!("CARGO_PKG_VERSION"));
+            request = request
+                .header(header::USER_AGENT, &product)
+                .header("X-GitHub-Api-Version", "2026-06-01")
+                .header("X-Request-Id", request_id.to_string())
+                .header("Editor-Version", &product)
+                .header("Editor-Plugin-Version", &product);
+        }
+        if let Some(version) = headers.get("anthropic-version") {
+            request = request.header("anthropic-version", version);
+        }
+        if route.route.driver == crate::oauth::claude::PROVIDER_DRIVER {
+            request = request.header("anthropic-beta", crate::oauth::claude::OAUTH_BETA_HEADER);
+        } else if let Some(beta) = headers.get("anthropic-beta") {
+            request = request.header("anthropic-beta", beta);
+        }
+    }
+    let upstream_started = Instant::now();
+    let upstream_result = request.send().await;
+    state.metrics.observe_upstream(
+        &route.route.driver,
+        "proxy",
+        upstream_result.as_ref().ok().map(reqwest::Response::status),
+        upstream_started.elapsed(),
+    );
+    match upstream_result {
+        Ok(response) => Ok(response),
+        Err(error) if error.is_connect() => Err(ProxySendError::RetryableConnection),
+        // A timeout or body/write error can happen after the upstream accepted
+        // the POST. Replaying it could duplicate non-idempotent model work.
+        Err(_) => Err(ProxySendError::NonRetryableTransport),
+    }
+}
+
+fn retryable_upstream_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+}
 
 pub(super) async fn proxy(
     state: AppState,
@@ -32,6 +253,7 @@ pub(super) async fn proxy(
     let request_id = Uuid::now_v7();
     let original_request_json: Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
+    let conversation_hints = conversation_hints(&headers, &original_request_json);
     let applied = apply_traffic_policy(
         &state,
         &key,
@@ -41,153 +263,79 @@ pub(super) async fn proxy(
     .await?;
     let request_json = applied.request_json;
     let model = applied.model;
-    let resolved_route = state
+    let selection_seed = routing_selection_seed(&key, request_id, &conversation_hints);
+    let resolved_routes = state
         .db
-        .resolve_authorized_upstream_with_hint(
+        .resolve_authorized_upstream_candidates_with_hint(
             key.key_id,
             key.tenant_id,
             &model,
             protocol.name(),
             RouteSelectionOptions {
                 upstream_account_hint: applied.upstream_account_hint,
-                selection_seed: request_id,
+                selection_seed,
             },
             state.config.key_pepper.as_bytes(),
         )
         .await?;
-    let (
-        base_url,
-        upstream_credential,
-        upstream_model,
-        upstream_account_id,
-        model_route_id,
-        route_driver,
-        route_config,
-    ) = if let Some(route) = resolved_route {
-        if !state.providers.contains(&route.driver) {
-            return Err(AppError::Upstream(format!(
-                "provider driver {} is not loaded",
-                route.driver
-            )));
-        }
-        route.credential.validate(unix_millis())?;
-        (
-            route.base_url,
-            Some(route.credential),
-            route.upstream_model,
-            Some(route.account_id),
-            Some(route.route_id),
-            Some(route.driver),
-            Some(route.config),
-        )
-    } else {
+    let mut resolved_routes = resolved_routes.into_iter();
+    let Some(primary_route) = resolved_routes.next() else {
         // Normalized grants are the sole downstream authorization source.
         // A missing route must never fall back to process-wide legacy secrets.
         return Err(AppError::Forbidden);
     };
-    let is_codex_route = route_driver
-        .as_deref()
-        .is_some_and(codex_transport::is_driver);
-    if is_codex_route {
-        codex_transport::validate_protocol(protocol)?;
-        if base_url != codex_transport::BASE_URL {
-            return Err(AppError::BadRequest(
-                "OpenAI Codex account has an invalid fixed base URL".into(),
-            ));
-        }
-        let credential = upstream_credential
-            .as_ref()
-            .ok_or_else(|| AppError::BadRequest("OpenAI Codex account has no credential".into()))?;
-        codex_transport::validate_credential_contract(credential)?;
-        codex_transport::validate_route_config(route_config.as_ref().ok_or_else(|| {
-            AppError::BadRequest("OpenAI Codex account has no configuration".into())
-        })?)?;
-    }
-    let mut forwarded_json = request_json.clone();
-    if let Some(value) = forwarded_json.get_mut("model") {
-        *value = Value::String(upstream_model.clone());
-    }
-    let codex_plan = if is_codex_route {
-        Some(codex_transport::prepare_request(
-            &mut forwarded_json,
-            &upstream_model,
-            route_config.as_ref().ok_or_else(|| {
-                AppError::BadRequest("OpenAI Codex account has no configuration".into())
-            })?,
-        )?)
-    } else {
-        None
-    };
-    let output_token_ceiling = match codex_plan.as_ref() {
-        Some(plan) => plan.output_token_ceiling,
-        None => inject_controlled_output_ceiling(protocol, &mut forwarded_json)?,
-    };
-    let forwarded_body = serde_json::to_vec(&forwarded_json).map_err(|_| AppError::Internal)?;
-    let component_adapter = route_driver.as_deref().and_then(|driver| {
-        state
-            .providers
-            .get(driver)
-            .and_then(|provider| provider.component_adapter.as_ref())
-    });
-    let component_request = if component_adapter.is_some() {
-        match forwarded_json.get("stream") {
-            Some(Value::Bool(false)) | None => {}
-            Some(Value::Bool(true)) => {
-                return Err(AppError::BadRequest(
-                    "component providers support buffered requests only; stream=true is unavailable"
-                        .into(),
-                ));
+    let primary =
+        prepare_proxy_route(&state, &key, &model, protocol, &request_json, primary_route).await?;
+    let primary_is_component = primary.is_component(&state);
+    let mut prepared_routes = vec![primary];
+    if !primary_is_component {
+        for route in resolved_routes {
+            if prepared_routes.len() == MAX_UPSTREAM_ATTEMPTS {
+                break;
             }
-            Some(_) => {
-                return Err(AppError::BadRequest("stream must be a boolean".into()));
+            if state
+                .providers
+                .get(&route.driver)
+                .and_then(|provider| provider.component_adapter.as_ref())
+                .is_some()
+            {
+                // Plugin prepare may perform HTTP/KV side effects and component
+                // requests may use arbitrary methods. A standby component route
+                // must be rejected before its prepare hook sees the request.
+                continue;
+            }
+            match prepare_proxy_route(&state, &key, &model, protocol, &request_json, route).await {
+                Ok(prepared) => prepared_routes.push(prepared),
+                Err(error) => {
+                    tracing::warn!(%request_id, error = %error, stage = "candidate_prepare", "proxy failover candidate is unusable");
+                }
             }
         }
-        let driver = route_driver.as_deref().ok_or(AppError::Internal)?;
-        let config = route_config.clone().ok_or_else(|| {
-            AppError::Upstream("component provider route has no account configuration".into())
-        })?;
-        let component_context = RequestContext {
-            tenant_id: key.tenant_id.to_string(),
-            principal_id: key.principal_id.to_string(),
-            key_id: key.key_id.to_string(),
-            protocol: protocol.name().to_owned(),
-            model: model.clone(),
-            config_json: serde_json::to_string(&config).map_err(|_| AppError::Internal)?,
-        };
-        let prepared = prepare_component_provider(
-            &state,
-            driver,
-            component_context.clone(),
-            config,
-            forwarded_json.clone(),
-        )
-        .await?;
-        Some((prepared, component_context))
-    } else {
-        None
-    };
+    }
+    let primary = prepared_routes.first().ok_or(AppError::Internal)?;
+    let upstream_account_id = Some(primary.route.account_id);
+    let model_route_id = Some(primary.route.route_id);
     let price = state.db.model_price(&model, &key.currency).await?;
-    let request_body_ceiling = i64::try_from(
-        body.len().max(forwarded_body.len()).max(
-            component_request
-                .as_ref()
-                .map(|(request, _)| request.body.len())
-                .unwrap_or_default(),
-        ),
-    )
-    .unwrap_or(i64::MAX);
-    let input_token_ceiling = request_body_ceiling
-        .checked_add(trusted_input_token_overhead_ceiling(
-            route_driver.as_deref(),
-            route_config.as_ref(),
-        )?)
-        .filter(|ceiling| *ceiling <= MAX_REPORTED_TOKENS)
-        .ok_or_else(|| {
-            AppError::Upstream(
-                "upstream input token reservation is outside the supported range".into(),
-            )
-        })?;
-    let requested_service_tier = match forwarded_json.get("service_tier") {
+    let mut input_token_ceiling = 0_i64;
+    let mut output_token_ceiling = 0_i64;
+    for route in &prepared_routes {
+        let body_ceiling =
+            i64::try_from(route.request_body_ceiling(body.len())).unwrap_or(i64::MAX);
+        let candidate_ceiling = body_ceiling
+            .checked_add(trusted_input_token_overhead_ceiling(
+                Some(&route.route.driver),
+                Some(&route.route.config),
+            )?)
+            .filter(|ceiling| *ceiling <= MAX_REPORTED_TOKENS)
+            .ok_or_else(|| {
+                AppError::Upstream(
+                    "upstream input token reservation is outside the supported range".into(),
+                )
+            })?;
+        input_token_ceiling = input_token_ceiling.max(candidate_ceiling);
+        output_token_ceiling = output_token_ceiling.max(route.output_token_ceiling);
+    }
+    let requested_service_tier = match request_json.get("service_tier") {
         None => None,
         Some(Value::String(tier)) if is_supported_service_tier(tier) => Some(tier.clone()),
         Some(_) => {
@@ -235,7 +383,6 @@ pub(super) async fn proxy(
             return Err(error);
         }
     };
-    let conversation_hints = conversation_hints(&headers, &original_request_json);
     let client_name = client_name(&headers);
     let conversation = matches!(
         protocol,
@@ -308,140 +455,77 @@ pub(super) async fn proxy(
         tracing::warn!(%request_id, stage = "request_archive_attach", "proxy archive failed");
         return finish_proxy_failure(&buffered_request, "request_archive").await;
     }
-    if let Some((prepared, component_context)) = component_request {
-        let Some(driver) = route_driver.as_deref() else {
-            return finish_proxy_failure(&buffered_request, "provider_configuration").await;
-        };
-        let Some(config) = route_config.as_ref() else {
-            return finish_proxy_failure(&buffered_request, "provider_configuration").await;
-        };
-        let Some(credential) = upstream_credential.as_ref() else {
-            return finish_proxy_failure(&buffered_request, "provider_credential").await;
-        };
+    let mut route_attempts = prepared_routes.into_iter();
+    let mut active_route = route_attempts.next().ok_or(AppError::Internal)?;
+    if let Some((prepared, component_context)) = active_route.component_request.take() {
         return execute_component_provider(
             buffered_request,
-            driver,
-            &base_url,
-            config,
-            credential,
+            &active_route.route.driver,
+            &active_route.route.base_url,
+            &active_route.route.config,
+            &active_route.route.credential,
             prepared,
             component_context,
         )
         .await;
     }
-    let codex_downstream_stream = codex_plan
-        .as_ref()
-        .is_some_and(|plan| plan.downstream_stream);
-    let (request_path, request_body) = if is_codex_route {
-        (codex_transport::RESPONSES_PATH, forwarded_body)
-    } else {
-        (protocol.path(), forwarded_body)
-    };
-    let outbound_base_url = if is_codex_route {
-        codex_transport::outbound_base_url(&base_url)
-    } else {
-        base_url.clone()
-    };
-    let outbound_http = match route_config.as_ref() {
-        Some(config) => match network::client_for_config_url(
-            &state.http,
-            &outbound_base_url,
-            config,
-            state.config.allow_oauth_loopback,
-        )
-        .await
-        {
-            Ok(client) => client,
-            Err(_) => {
-                tracing::warn!(%request_id, stage = "network_client", "proxy setup failed");
-                return finish_proxy_failure(&buffered_request, "upstream_connection").await;
-            }
-        },
-        // Legacy environment configuration is cluster-administrator owned and
-        // may intentionally name an internal CPA service.
-        None => state.http.clone(),
-    };
-    let mut request = outbound_http
-        .post(format!(
-            "{}{}",
-            outbound_base_url.trim_end_matches('/'),
-            request_path
-        ))
-        .body(request_body);
-    if is_codex_route {
-        let Some(credential) = upstream_credential.as_ref() else {
-            return finish_proxy_failure(&buffered_request, "provider_credential").await;
+    let upstream = loop {
+        let result = send_proxy_route(&state, &headers, protocol, request_id, &active_route).await;
+        let retry = match &result {
+            Ok(response) => retryable_upstream_status(response.status()),
+            Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => true,
+            Err(ProxySendError::NonRetryableTransport | ProxySendError::Credential) => false,
         };
-        request = match codex_transport::apply_wire_headers(request, credential, request_id) {
-            Ok(request) => request,
-            Err(_) => {
-                tracing::warn!(%request_id, stage = "codex_headers", "proxy setup failed");
-                return finish_proxy_failure(&buffered_request, "provider_credential").await;
+        if retry && let Some(next_route) = route_attempts.next() {
+            if let Ok(response) = result {
+                drop(response);
             }
-        };
-    } else if let Some(credential) = upstream_credential.as_ref() {
-        request = request
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(
-                header::ACCEPT,
-                headers
-                    .get(header::ACCEPT)
-                    .cloned()
-                    .unwrap_or(HeaderValue::from_static("application/json")),
-            );
-        request = match credential.apply(request, unix_millis()) {
-            Ok(request) => request,
-            Err(_) => {
-                tracing::warn!(%request_id, stage = "credential_apply", "proxy setup failed");
-                return finish_proxy_failure(&buffered_request, "provider_credential").await;
+            if state
+                .db
+                .reassign_pending_proxy_upstream(
+                    request_id,
+                    key.tenant_id,
+                    buffered_request.reservation.id,
+                    (active_route.route.account_id, active_route.route.route_id),
+                    (next_route.route.account_id, next_route.route.route_id),
+                )
+                .await
+                .is_err()
+            {
+                return finish_proxy_failure(&buffered_request, "upstream_failover_state").await;
             }
-        };
-    }
-    if !is_codex_route {
-        if route_driver.as_deref() == Some(crate::oauth::copilot::PROVIDER_DRIVER) {
-            let product = format!("memeloop-token-center/{}", env!("CARGO_PKG_VERSION"));
-            request = request
-                .header(header::USER_AGENT, &product)
-                .header("X-GitHub-Api-Version", "2026-06-01")
-                .header("X-Request-Id", request_id.to_string())
-                .header("Editor-Version", &product)
-                .header("Editor-Plugin-Version", &product);
-        }
-        if let Some(version) = headers.get("anthropic-version") {
-            request = request.header("anthropic-version", version);
-        }
-        if route_driver.as_deref() == Some(crate::oauth::claude::PROVIDER_DRIVER) {
-            request = request.header("anthropic-beta", crate::oauth::claude::OAUTH_BETA_HEADER);
-        } else if let Some(beta) = headers.get("anthropic-beta") {
-            request = request.header("anthropic-beta", beta);
-        }
-    }
-
-    let upstream_result = request.send().await;
-    state.metrics.observe_upstream(
-        route_driver.as_deref().unwrap_or("legacy"),
-        "proxy",
-        upstream_result.as_ref().ok().map(reqwest::Response::status),
-        started.elapsed(),
-    );
-    let upstream = match upstream_result {
-        Ok(response) => response,
-        Err(error) => {
             tracing::warn!(
                 %request_id,
-                stage = "send",
-                is_timeout = error.is_timeout(),
-                is_connect = error.is_connect(),
-                "proxy upstream request failed"
+                failed_upstream_account_id = %active_route.route.account_id,
+                next_upstream_account_id = %next_route.route.account_id,
+                stage = "upstream_failover",
+                "proxy is switching to the next authorized upstream before downstream delivery"
             );
-            return finish_proxy_failure(&buffered_request, "upstream_connection").await;
+            active_route = next_route;
+            continue;
+        }
+        match result {
+            Ok(response) => break response,
+            Err(ProxySendError::Credential) => {
+                return finish_proxy_failure(&buffered_request, "provider_credential").await;
+            }
+            Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => {
+                return finish_proxy_failure(&buffered_request, "upstream_connection").await;
+            }
+            Err(ProxySendError::NonRetryableTransport) => {
+                return finish_proxy_failure(&buffered_request, "upstream_transport").await;
+            }
         }
     };
+    let is_codex_route = active_route.is_codex();
+    let codex_downstream_stream = active_route.codex_downstream_stream;
+    let upstream_account_id = Some(active_route.route.account_id);
+    let route_driver = Some(active_route.route.driver.as_str());
     let status = upstream.status();
     if !status.is_success() {
         crate::api::trigger_copilot_remint_on_auth_failure(
             &state,
-            route_driver.as_deref(),
+            route_driver,
             upstream_account_id,
             request_id,
             status,
@@ -1577,6 +1661,23 @@ fn append_bounded(capture: &mut Vec<u8>, chunk: &[u8], maximum: usize) {
         capture.drain(..overflow);
     }
     capture.extend_from_slice(chunk);
+}
+
+fn routing_selection_seed(
+    key: &AuthenticatedKey,
+    request_id: Uuid,
+    hints: &crate::conversation::ConversationHints,
+) -> Uuid {
+    let Some(session_id) = hints.session_id.as_deref() else {
+        return request_id;
+    };
+    let mut hasher = blake3::Hasher::new_derive_key("memeloop routing session affinity v1");
+    hasher.update(key.tenant_id.as_bytes());
+    hasher.update(key.key_id.as_bytes());
+    hasher.update(session_id.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 fn conversation_hints(headers: &HeaderMap, body: &Value) -> crate::conversation::ConversationHints {

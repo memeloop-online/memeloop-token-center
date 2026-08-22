@@ -63,6 +63,33 @@ impl Database {
         selection: RouteSelectionOptions,
         key_material: &[u8],
     ) -> Result<Option<ResolvedUpstream>, AppError> {
+        Ok(self
+            .resolve_authorized_upstream_candidates_with_hint(
+                key_id,
+                tenant_id,
+                public_model,
+                protocol,
+                selection,
+                key_material,
+            )
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Returns every currently authorized candidate in deterministic failover
+    /// order. Lower route priorities are exhausted first; candidates at the
+    /// same priority use weighted rendezvous ordering so a stable selection
+    /// seed remains sticky while the candidate set is unchanged.
+    pub async fn resolve_authorized_upstream_candidates_with_hint(
+        &self,
+        key_id: Uuid,
+        tenant_id: Uuid,
+        public_model: &str,
+        protocol: &str,
+        selection: RouteSelectionOptions,
+        key_material: &[u8],
+    ) -> Result<Vec<ResolvedUpstream>, AppError> {
         let RouteSelectionOptions {
             upstream_account_hint,
             selection_seed,
@@ -117,35 +144,34 @@ impl Database {
                 }
             }
         }
-        let Some(min_priority) = candidates
-            .values()
-            .map(|candidate| candidate.priority)
-            .min()
-        else {
-            return Ok(None);
-        };
-        let selected = candidates
-            .into_values()
-            .filter(|candidate| candidate.priority == min_priority)
-            .min_by(|left, right| {
-                weighted_rendezvous_score(key_id, selection_seed, left)
-                    .total_cmp(&weighted_rendezvous_score(key_id, selection_seed, right))
-                    .then_with(|| left.route_id.cmp(&right.route_id))
-                    .then_with(|| left.account_id.cmp(&right.account_id))
+        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| {
+                    weighted_rendezvous_score(key_id, selection_seed, left)
+                        .total_cmp(&weighted_rendezvous_score(key_id, selection_seed, right))
+                })
+                .then_with(|| left.route_id.cmp(&right.route_id))
+                .then_with(|| left.account_id.cmp(&right.account_id))
+        });
+        candidates
+            .into_iter()
+            .map(|candidate| {
+                let config: serde_json::Value =
+                    serde_json::from_str(&candidate.config_json).map_err(|_| AppError::Internal)?;
+                let base_url = validate_config(&config)?;
+                Ok(ResolvedUpstream {
+                    route_id: candidate.route_id,
+                    account_id: candidate.account_id,
+                    driver: candidate.driver,
+                    base_url,
+                    config,
+                    upstream_model: candidate.upstream_model,
+                    credential: open_credential(&candidate.credential_ciphertext, key_material)?,
+                })
             })
-            .ok_or(AppError::Internal)?;
-        let config: serde_json::Value =
-            serde_json::from_str(&selected.config_json).map_err(|_| AppError::Internal)?;
-        let base_url = validate_config(&config)?;
-        Ok(Some(ResolvedUpstream {
-            route_id: selected.route_id,
-            account_id: selected.account_id,
-            driver: selected.driver,
-            base_url,
-            config,
-            upstream_model: selected.upstream_model,
-            credential: open_credential(&selected.credential_ciphertext, key_material)?,
-        }))
+            .collect()
     }
 
     pub async fn granted_available_models(

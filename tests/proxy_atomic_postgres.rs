@@ -5,17 +5,138 @@ use memeloop_token_center::{
         BeginArchiveStagingResult,
     },
     db::{
-        CreateKeyInput, Database, FinishProxyRequest, FinishProxyRequestResult,
-        FinishSynchronousImageRequest, FinishSynchronousImageResult, StartProxyRequest,
-        StartSynchronousImageRequest, StartSynchronousImageResult, StatsFilter, unix_millis,
+        CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput, Database,
+        FinishProxyRequest, FinishProxyRequestResult, FinishSynchronousImageRequest,
+        FinishSynchronousImageResult, StartProxyRequest, StartSynchronousImageRequest,
+        StartSynchronousImageResult, StatsFilter, unix_millis,
     },
     model::{ArchivedGenerationAsset, KeyPolicy, TokenUsage},
+    provider::UpstreamCredential,
 };
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 static POSTGRES_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+async fn postgres_pending_proxy_failover_assignment_is_tenant_scoped_and_idempotent() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
+    let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+    database.migrate().await.unwrap();
+    let unique = Uuid::now_v7();
+    let tenant = format!("proxy-failover-{unique}");
+    let model = format!("proxy-failover-model-{unique}");
+    let pepper = b"postgres proxy failover pepper value";
+    let mut accounts = Vec::new();
+    let mut routes = Vec::new();
+    for index in 0..2 {
+        let account = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.clone(),
+                    name: format!("proxy-failover-{index}"),
+                    driver: "http-json".to_owned(),
+                    config: serde_json::json!({"base_url": format!("https://upstream-{index}.example.test")}),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        let route = database
+            .create_model_route(CreateModelRouteInput {
+                tenant_external_id: tenant.clone(),
+                public_model: model.clone(),
+                upstream_account_id: account.id,
+                upstream_model: model.clone(),
+                protocol: "openai".to_owned(),
+                priority: index,
+            })
+            .await
+            .unwrap();
+        accounts.push(account.id);
+        routes.push(route.id);
+    }
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: tenant,
+                principal_external_id: "member".to_owned(),
+                alias: "proxy-failover".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 1,
+            output_token_ceiling: 1,
+            protocol: "openai",
+            model: &model,
+            request_object: "gap://postgres-failover/request",
+            upstream_account_id: Some(accounts[0]),
+            model_route_id: Some(routes[0]),
+        })
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        database
+            .reassign_pending_proxy_upstream(
+                request_id,
+                key.tenant_id,
+                reservation.id,
+                (accounts[0], routes[0]),
+                (accounts[1], routes[1]),
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        database
+            .reassign_pending_proxy_upstream(
+                request_id,
+                Uuid::now_v7(),
+                reservation.id,
+                (accounts[1], routes[1]),
+                (accounts[0], routes[0]),
+            )
+            .await
+            .is_err()
+    );
+    let inspection = PgPool::connect(&database_url).await.unwrap();
+    let row: (String, String) = sqlx::query_as(
+        "SELECT upstream_account_id, model_route_id FROM request_records WHERE id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(row, (accounts[1].to_string(), routes[1].to_string()));
+}
 
 #[tokio::test]
 async fn postgres_proxy_terminal_owner_is_exactly_once() {
