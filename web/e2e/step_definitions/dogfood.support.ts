@@ -72,10 +72,21 @@ export async function submitPortalGeneration(
   parameters: Record<string, string> = {},
 ): Promise<void> {
   const panel = page.locator('.generation-create');
-  await panel.getByLabel('生成类型').selectOption(kind);
-  await panel.getByLabel('模型').fill(generationModel);
-  await panel.getByLabel('提示词').fill(prompt);
-  if (kind === 'video') await panel.getByLabel('时长（秒）').fill(duration);
+  const kindSelect = panel.getByLabel('生成类型');
+  await kindSelect.selectOption(kind);
+  await assertValue(kindSelect, kind);
+  if (kind === 'video') await assertVisible(panel.getByLabel('时长（秒）'));
+  const modelInput = panel.getByLabel('模型');
+  const promptInput = panel.getByLabel('提示词');
+  await modelInput.fill(generationModel);
+  await assertValue(modelInput, generationModel);
+  await promptInput.fill(prompt);
+  await assertValue(promptInput, prompt);
+  if (kind === 'video') {
+    const durationInput = panel.getByLabel('时长（秒）');
+    await durationInput.fill(duration);
+    await assertValue(durationInput, duration);
+  }
   if (Object.keys(parameters).length) await assertVisible(panel.getByRole('heading', { name: '工作流参数', exact: true }));
   for (const [label, value] of Object.entries(parameters)) {
     const schemaProperty = label === '宽度' ? 'width' : label === '高度' ? 'height' : '';
@@ -83,8 +94,18 @@ export async function submitPortalGeneration(
     await field.fill(value);
   }
   const endpoint = kind === 'video' ? '/v1/videos/generations' : '/v1/images/generations';
+  const submit = panel.getByRole('button', { name: '开始生成', exact: true });
+  await eventually(async () => {
+    assert.equal(await submit.isEnabled(), true, `${kind} generation submit must be enabled`);
+  });
+  const requestPromise = page.waitForRequest(
+    (request) => request.url().endsWith(endpoint) && request.method() === 'POST',
+    { timeout: 10_000 },
+  );
   const responsePromise = page.waitForResponse((response) => response.url().endsWith(endpoint) && response.request().method() === 'POST');
-  await panel.getByRole('button', { name: '开始生成', exact: true }).click();
+  await submit.click();
+  const request = await requestPromise;
+  assert.equal(new URL(request.url()).pathname, endpoint);
   const response = await responsePromise;
   assert.equal(response.status(), 202);
   await assertContains(panel.getByRole('status'), '任务已提交');
@@ -166,7 +187,10 @@ export async function assertCount(locator: Locator, expected: number): Promise<v
 }
 
 export async function assertNoCount(locator: Locator): Promise<void> {
-  await assertCount(locator, 0);
+  await eventually(async () => {
+    const count = await locator.count();
+    assert.equal(count, 0, `expected no matches, found: ${JSON.stringify(await locator.allTextContents())}`);
+  });
 }
 
 export async function assertValue(locator: Locator, expected: string): Promise<void> {

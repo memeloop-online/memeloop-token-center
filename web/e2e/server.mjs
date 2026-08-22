@@ -38,6 +38,7 @@ let application;
 let stopping = false;
 let stopPromise;
 let comfySequence = 0;
+let seedanceCreateCount = 0;
 let blockerActive = false;
 
 function directoryContains(root, needle) {
@@ -76,6 +77,11 @@ const upstream = createServer((request, response) => {
       response.end(JSON.stringify({ active: blockerActive }));
       return;
     }
+    if (request.method === 'GET' && requestUrl.pathname === '/__e2e/generation-counts') {
+      response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      response.end(JSON.stringify({ image: comfySequence, video: seedanceCreateCount }));
+      return;
+    }
     if (request.method === 'GET' && requestUrl.pathname === '/__e2e/never-persist-state') {
       const needle = Buffer.from('never-persist');
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -97,6 +103,7 @@ const upstream = createServer((request, response) => {
         response.end(JSON.stringify({ error: { message: 'invalid browser Seedance request' } }));
         return;
       }
+      seedanceCreateCount += 1;
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ id: 'browser-seedance-video' }));
       return;

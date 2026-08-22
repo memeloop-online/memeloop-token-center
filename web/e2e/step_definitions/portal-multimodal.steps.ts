@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { Given, Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
-import { baseURL, eventually, model, requestJson, runtime, tenant } from '../support/runtime.js';
+import { baseURL, eventually, generationMockCounts, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { assertAttribute, assertContains, assertCount, assertExactText, assertGenerationDownload, assertNoCount, assertNoHorizontalOverflow, assertValue, assertVisible, connectOperator, generationTableFor, metric, multimodalObservations, requestEventFixture, realtimeReconnectObservations, requireMultimodalObservation, sseRequestEvent, submitPortalGeneration, uuidPattern, waitForGenerationStatus } from './dogfood.support.js';
 
@@ -420,6 +420,9 @@ When('普通凭据用户通过中文亮色门户创建图片和视频任务', as
   await assertVisible(page.getByRole('heading', { name: '创建多模态任务', exact: true }));
   await submitPortalGeneration(page, 'image', observation.imageModel, '画一个明亮的橙色圆形', '5', { 宽度: '512', 高度: '512' });
   await waitForGenerationStatus(page, observation.imageModel, '已成功');
+  await eventually(async () => {
+    assert.deepEqual(await generationMockCounts(), { image: 1, video: 0 });
+  }, 10_000, 'mock upstream did not receive exactly one image generation');
   await submitPortalGeneration(page, 'video', observation.videoModel, '一只狐狸跑过草地', '5');
 });
 
@@ -434,6 +437,7 @@ Then('门户自动轮询到图片和视频成功并显示准确计费', async fu
   await assertContains(videoRow, '5');
   await assertContains(metric(page, '可用余额 (USD)'), '$9.3');
   await assertContains(metric(page, '总费用'), '$0.7');
+  assert.deepEqual(await generationMockCounts(), { image: 1, video: 1 });
   await assertAttribute(page.locator('html'), 'data-theme', 'light');
 });
 

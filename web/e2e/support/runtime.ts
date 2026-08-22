@@ -12,6 +12,19 @@ export const baseURL = new URL(process.env.MTC_E2E_BASE_URL ?? 'http://127.0.0.1
 export const tenant = 'browser-e2e-tenant';
 export const model = 'browser-e2e-model';
 
+export interface GenerationMockCounts {
+  image: number;
+  video: number;
+}
+
+export async function generationMockCounts(): Promise<GenerationMockCounts> {
+  const response = await fetch(`http://127.0.0.1:${mockPort}/__e2e/generation-counts`, {
+    signal: AbortSignal.timeout(2_000),
+  });
+  assert.equal(response.status, 200, 'generation mock count endpoint must be available');
+  return await response.json() as GenerationMockCounts;
+}
+
 export interface SeedState {
   clientCredential: string;
   clientKeyId: string;
