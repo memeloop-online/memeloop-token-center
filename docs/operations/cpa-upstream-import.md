@@ -33,8 +33,8 @@ Opaque Copilot and Cursor handle records cannot be used as native credentials.
 The importer never sends their handle, login, label or source document to Token
 Center and never creates an upstream for them. Dry-run and apply instead include
 each record in `native_reauthorization_required` with only its provider,
-disabled state and deterministic `source_stable_id`. Connect those accounts
-again through their native or plugin-provided authorization flow.
+disabled state and keyed `source_stable_id`. Connect those accounts again
+through their native or plugin-provided authorization flow.
 
 ## Secret and transport boundary
 
@@ -42,16 +42,16 @@ Before starting, make an immutable CPA volume snapshot and stage only its
 `config.yaml` and declared auth directory for the importer UID. The importer
 requires:
 
-- `config.yaml`, every auth JSON and the target service token to be owner-owned,
-  single-link, regular mode-`0600` files;
+- `config.yaml`, every auth JSON, the target service token and source identity
+  key to be owner-owned, single-link, regular mode-`0600` files;
 - the auth root and every nested directory to be owner-owned mode `0700`;
 - no symlink or non-JSON file anywhere below the auth root; and
 - source and target sizes to remain within the built-in bounded-read limits.
 
-Do not pass a credential or service token in argv, an environment variable, a
-ConfigMap or a shell substitution. Normal output is one JSON inventory object.
-Errors do not include filenames, URLs, response bodies, credential values or
-secret-derived hashes. Core dumps are disabled.
+Do not pass a credential, service token or source identity key in argv, an
+environment variable, a ConfigMap or a shell substitution. Normal output is one
+JSON inventory object. Errors do not include filenames, URLs, response bodies,
+credential values or secret-derived hashes. Core dumps are disabled.
 
 Every target and provider URL must use HTTPS. The
 `--allow-http-loopback` option permits only `localhost`, `127.0.0.0/8` or `::1`
@@ -73,14 +73,23 @@ requirements above:
 /usr/local/bin/import-cpa-upstreams \
   --config /source/config.yaml \
   --auth-dir /source/auth \
+  --source-identity-key-file /secrets/migration/source-identity.key \
   --tenant cpa-dogfood-import
 ```
+
+`--source-identity-key-file` is required only when the snapshot contains opaque
+Copilot/Cursor records. It must be an absolute path to a mode-`0600` regular,
+non-symlink file owned by the importer UID. Generate at least 32 random bytes;
+for example, stage the output of `openssl rand -hex 32` through the
+secret-management system. The importer accepts one final LF and removes exactly
+that byte. It does not trim spaces or any other key material. A short or
+detectably low-entropy key is rejected before any target request.
 
 A successful dry-run returns counts and the non-secret native-authorization
 worklist:
 
 ```json
-{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"e1cb8f48726b00eef821d76f53fe8951260310c0a2b04146e44eff7e6c7ecc78"},{"provider":"cursor","source_disabled":false,"source_stable_id":"2b0ea8959bcc075d2d14b5264b02c4a52d040702106a2debe239587e3efd456e"}],"native_reauthorization_required_count":2,"replayed_count":0,"replayed_managed_oauth_count":0}
+{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"62ca3bea649404d4601f84f9544bc24ff49a78baa246141c72b9902269ad2b7d"},{"provider":"cursor","source_disabled":false,"source_stable_id":"4a3bf1c716cc68dc43f53e3cc5f5095407e677802111d931d2c77df5132a59d6"}],"native_reauthorization_required_count":2,"replayed_count":0,"replayed_managed_oauth_count":0}
 ```
 
 Preserve the source snapshot and inventory output for review. Do not reorder API
@@ -89,10 +98,15 @@ list ordinal, or auth relative path, is the stable CPA source identity.
 
 Preserve `native_reauthorization_required` alongside the migration ledger. Its
 `source_stable_id` is derived from the non-secret source identity, not the opaque
-handle, and is the durable join key for historical account/request mapping and
-the later native reauthorization record. Replaying the same immutable snapshot
-produces the same worklist. Renaming an auth file changes its source identity, so
-never rename or reorganize the reviewed snapshot between runs.
+handle, using domain-separated HMAC-SHA256 and the source identity key. This
+prevents common auth filenames from being recovered with an offline dictionary.
+The ID is the durable join key for historical account/request mapping and the
+later native reauthorization record. Replaying the same immutable snapshot with
+the same key produces the same worklist; another key intentionally produces
+different IDs. Preserve the key in the migration secret store and use the same
+key for every dry-run, apply and recovery. Renaming an auth file changes its
+source identity, so never rename or reorganize the reviewed snapshot between
+runs.
 
 After approval, mount a least-privilege Token Center token as a mode-`0600` file
 and add:
@@ -104,9 +118,9 @@ and add:
 ```
 
 If the snapshot contains only Copilot/Cursor opaque handles, `--apply` remains a
-report-only operation: it needs no target URL or service token and performs no
-HTTP request. This is intentional because those records require a fresh native
-authorization.
+report-only operation: it still requires the source identity key, but needs no
+target URL or service token and performs no HTTP request. This is intentional
+because those records require a fresh native authorization.
 
 For API accounts, the target name includes a deterministic hash of the non-secret
 source identity. Apply first lists the tenant and rejects any same-name account

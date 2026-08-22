@@ -117,6 +117,8 @@ docker run --rm \
   --entrypoint /bin/sh \
   "$image" -ec '
     cp -R /fixture/. /source/
+    umask 077
+    head -c 32 /dev/urandom > /source/source-identity.key
     find /source -type d -exec chmod 0700 {} +
     find /source -type f -exec chmod 0600 {} +
     chown -R 10001:10001 /source
@@ -131,6 +133,7 @@ docker run --rm \
   "$image" \
   --config /source/config.yaml \
   --auth-dir /source/auth \
+  --source-identity-key-file /source/source-identity.key \
   >"$workspace/cpa-upstream-dry-run.json"
 grep -Fq '"mode":"dry-run"' "$workspace/cpa-upstream-dry-run.json"
 grep -Fq '"api_account_count":6' "$workspace/cpa-upstream-dry-run.json"

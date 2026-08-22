@@ -25,6 +25,8 @@ IMPORTER = REPOSITORY / "ops" / "cpa-upstreams" / "import-cpa-upstreams.py"
 FIXTURES = REPOSITORY / "tests" / "fixtures" / "cpa-upstreams"
 SANITIZER = REPOSITORY / "tests" / "ops" / "sanitize-cpa-upstream-fixtures.py"
 TARGET_TOKEN = "fixture-only-target-service-token"
+SOURCE_IDENTITY_KEY = b"9f284ec3d871b05aa7c649de2138f470d5bca91e68f72403"
+OTHER_SOURCE_IDENTITY_KEY = b"b6e031a8c497f25d70be8164ac239df80a57e3469cb812fd"
 
 
 def account_view(
@@ -333,6 +335,12 @@ class SecureSource:
         path.chmod(0o600)
         return path
 
+    def secret_bytes_file(self, name: str, value: bytes) -> pathlib.Path:
+        path = pathlib.Path(self.temp.name) / name
+        path.write_bytes(value)
+        path.chmod(0o600)
+        return path
+
     def close(self) -> None:
         self.temp.cleanup()
 
@@ -380,11 +388,16 @@ class CpaUpstreamImportTests(unittest.TestCase):
         self.assertEqual(sanitizer.returncode, 0, sanitizer.stderr)
         source = SecureSource("supported")
         self.addCleanup(source.close)
+        source_identity_key_file = source.secret_bytes_file(
+            "source-identity-key", SOURCE_IDENTITY_KEY + b"\n"
+        )
         result = run_importer(
             "--config",
             source.config,
             "--auth-dir",
             source.auth,
+            "--source-identity-key-file",
+            source_identity_key_file,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         summary = json.loads(result.stdout)
@@ -417,6 +430,9 @@ class CpaUpstreamImportTests(unittest.TestCase):
         source = SecureSource("supported")
         self.addCleanup(source.close)
         token_file = source.secret_file("target-token", TARGET_TOKEN)
+        source_identity_key_file = source.secret_bytes_file(
+            "source-identity-key", SOURCE_IDENTITY_KEY
+        )
         with mock_target() as (base_url, state):
             arguments = (
                 "--config",
@@ -425,6 +441,8 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 source.auth,
                 "--tenant",
                 "fixture-tenant",
+                "--source-identity-key-file",
+                source_identity_key_file,
                 "--target-api-base-url",
                 base_url,
                 "--service-token-file",
@@ -478,6 +496,9 @@ class CpaUpstreamImportTests(unittest.TestCase):
         source = SecureSource("supported")
         self.addCleanup(source.close)
         token_file = source.secret_file("target-token", TARGET_TOKEN)
+        source_identity_key_file = source.secret_bytes_file(
+            "source-identity-key", SOURCE_IDENTITY_KEY
+        )
         with mock_target() as (base_url, state):
             arguments = (
                 "--config",
@@ -486,6 +507,8 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 source.auth,
                 "--tenant",
                 "fixture-recovery",
+                "--source-identity-key-file",
+                source_identity_key_file,
                 "--target-api-base-url",
                 base_url,
                 "--service-token-file",
@@ -582,6 +605,9 @@ class CpaUpstreamImportTests(unittest.TestCase):
         )
         source.config.chmod(0o600)
         (source.auth / "private-api-account.json").unlink()
+        source_identity_key_file = source.secret_bytes_file(
+            "source-identity-key", SOURCE_IDENTITY_KEY
+        )
         importer_source = IMPORTER.read_text(encoding="utf-8")
         self.assertNotIn(
             "/internal/v1/imports/cpa/subscription-accounts", importer_source
@@ -590,10 +616,21 @@ class CpaUpstreamImportTests(unittest.TestCase):
 
         with mock_target() as (_, state):
             dry_run = run_importer(
-                "--config", source.config, "--auth-dir", source.auth
+                "--config",
+                source.config,
+                "--auth-dir",
+                source.auth,
+                "--source-identity-key-file",
+                source_identity_key_file,
             )
             apply = run_importer(
-                "--config", source.config, "--auth-dir", source.auth, "--apply"
+                "--config",
+                source.config,
+                "--auth-dir",
+                source.auth,
+                "--source-identity-key-file",
+                source_identity_key_file,
+                "--apply",
             )
 
         self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
@@ -615,6 +652,148 @@ class CpaUpstreamImportTests(unittest.TestCase):
             self.assertNotIn("FixtureCopilotHandle01", output)
             self.assertNotIn("FixtureCursorHandle01", output)
             self.assertNotIn("@example.test", output)
+
+    def test_opaque_source_ids_are_keyed_stable_and_not_dictionary_hashes(self) -> None:
+        source = SecureSource("supported")
+        self.addCleanup(source.close)
+        source.config.write_text(
+            'auth-dir: "/root/.cli-proxy-api/auth"\n', encoding="utf-8"
+        )
+        source.config.chmod(0o600)
+        (source.auth / "private-api-account.json").unlink()
+        key_file = source.secret_bytes_file(
+            "fixture-private-source-identity-key", SOURCE_IDENTITY_KEY
+        )
+        newline_key_file = source.secret_bytes_file(
+            "fixture-private-source-identity-key-newline", SOURCE_IDENTITY_KEY + b"\n"
+        )
+        other_key_file = source.secret_bytes_file(
+            "fixture-private-source-identity-key-other", OTHER_SOURCE_IDENTITY_KEY
+        )
+        spaced_key_file = source.secret_bytes_file(
+            "fixture-private-source-identity-key-spaced",
+            b" " + SOURCE_IDENTITY_KEY + b" ",
+        )
+
+        def inventory(key_path: pathlib.Path) -> dict[str, object]:
+            result = run_importer(
+                "--config",
+                source.config,
+                "--auth-dir",
+                source.auth,
+                "--source-identity-key-file",
+                key_path,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for forbidden in (
+                SOURCE_IDENTITY_KEY.decode("ascii"),
+                OTHER_SOURCE_IDENTITY_KEY.decode("ascii"),
+                "fixture-private-source-identity-key",
+            ):
+                self.assertNotIn(forbidden, result.stdout + result.stderr)
+            return json.loads(result.stdout)
+
+        first = inventory(key_file)
+        replay = inventory(newline_key_file)
+        different_key = inventory(other_key_file)
+        spaced_key = inventory(spaced_key_file)
+        first_entries = first["native_reauthorization_required"]
+        replay_entries = replay["native_reauthorization_required"]
+        different_entries = different_key["native_reauthorization_required"]
+        spaced_entries = spaced_key["native_reauthorization_required"]
+        self.assertEqual(first_entries, replay_entries)
+        self.assertNotEqual(first_entries, different_entries)
+        self.assertNotEqual(first_entries, spaced_entries)
+
+        unkeyed_candidates: set[str] = set()
+        for relative_path in (
+            "copilot-account.json",
+            "cursor-account.json",
+            "github-copilot.json",
+            "cursor.json",
+            "auth/copilot-account.json",
+        ):
+            for record_type in ("copilot", "cursor"):
+                for provider in ("copilot", "cursor"):
+                    identity = "\0".join(
+                        (
+                            "cpa-upstream-import-v1",
+                            "auth",
+                            relative_path,
+                            record_type,
+                            provider,
+                        )
+                    )
+                    unkeyed_candidates.add(
+                        hashlib.sha256(identity.encode("utf-8")).hexdigest()
+                    )
+        self.assertTrue(
+            all(
+                entry["source_stable_id"] not in unkeyed_candidates
+                for entry in first_entries
+            )
+        )
+
+    def test_opaque_source_identity_key_file_security_is_fail_closed(self) -> None:
+        source = SecureSource("supported")
+        self.addCleanup(source.close)
+        secret_path_marker = "fixture-private-source-key-path-marker"
+        strong_key = source.secret_bytes_file(
+            f"{secret_path_marker}-strong", SOURCE_IDENTITY_KEY
+        )
+        weak_key = source.secret_bytes_file(f"{secret_path_marker}-weak", b"too-short")
+        low_entropy_key = source.secret_bytes_file(
+            f"{secret_path_marker}-low-entropy", b"x" * 64
+        )
+        wide_key = source.secret_bytes_file(
+            f"{secret_path_marker}-wide", SOURCE_IDENTITY_KEY
+        )
+        wide_key.chmod(0o640)
+        symlink_key = pathlib.Path(source.temp.name) / f"{secret_path_marker}-symlink"
+        symlink_key.symlink_to(strong_key)
+
+        cases: tuple[tuple[str, tuple[object, ...], str], ...] = (
+            (
+                "missing",
+                (),
+                "source identity key file is required",
+            ),
+            (
+                "relative",
+                ("--source-identity-key-file", secret_path_marker),
+                "path must be absolute",
+            ),
+            (
+                "short",
+                ("--source-identity-key-file", weak_key),
+                "at least 32 random bytes",
+            ),
+            (
+                "low-entropy",
+                ("--source-identity-key-file", low_entropy_key),
+                "enough entropy",
+            ),
+            (
+                "wide-permissions",
+                ("--source-identity-key-file", wide_key),
+                "mode-0600",
+            ),
+            (
+                "symlink",
+                ("--source-identity-key-file", symlink_key),
+                "not a readable owner-only regular file",
+            ),
+        )
+        for label, extra, expected in cases:
+            with self.subTest(label=label):
+                result = run_importer(
+                    "--config", source.config, "--auth-dir", source.auth, *extra
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn(secret_path_marker, result.stderr)
+                self.assertNotIn(SOURCE_IDENTITY_KEY.decode("ascii"), result.stderr)
 
     def test_managed_oauth_apply_and_replay_use_capabilities_and_exact_requests(self) -> None:
         source = SecureSource("oauth-blocked")
@@ -718,6 +897,9 @@ class CpaUpstreamImportTests(unittest.TestCase):
             shutil.copy2(FIXTURES / "supported" / "auth" / filename, copied)
             copied.chmod(0o600)
         token_file = source.secret_file("target-token", TARGET_TOKEN)
+        source_identity_key_file = source.secret_bytes_file(
+            "source-identity-key", SOURCE_IDENTITY_KEY
+        )
         with mock_target() as (base_url, state):
             result = run_importer(
                 "--config",
@@ -726,6 +908,8 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 source.auth,
                 "--tenant",
                 "mixed-preflight",
+                "--source-identity-key-file",
+                source_identity_key_file,
                 "--target-api-base-url",
                 base_url,
                 "--service-token-file",
@@ -1029,12 +1213,17 @@ class CpaUpstreamImportTests(unittest.TestCase):
         source = SecureSource("supported")
         self.addCleanup(source.close)
         token_file = source.secret_file("target-token", TARGET_TOKEN)
+        source_identity_key_file = source.secret_bytes_file(
+            "source-identity-key", SOURCE_IDENTITY_KEY
+        )
         with mock_target() as (base_url, state):
             insecure = run_importer(
                 "--config",
                 source.config,
                 "--auth-dir",
                 source.auth,
+                "--source-identity-key-file",
+                source_identity_key_file,
                 "--target-api-base-url",
                 base_url,
                 "--service-token-file",
@@ -1050,6 +1239,8 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 source.config,
                 "--auth-dir",
                 source.auth,
+                "--source-identity-key-file",
+                source_identity_key_file,
                 "--target-api-base-url",
                 f"{base_url}/redirect",
                 "--service-token-file",
@@ -1065,6 +1256,9 @@ class CpaUpstreamImportTests(unittest.TestCase):
         source = SecureSource("supported")
         self.addCleanup(source.close)
         token_file = source.secret_file("target-token", TARGET_TOKEN)
+        source_identity_key_file = source.secret_bytes_file(
+            "source-identity-key", SOURCE_IDENTITY_KEY
+        )
         with mock_target() as (base_url, state):
             arguments = (
                 "--config",
@@ -1073,6 +1267,8 @@ class CpaUpstreamImportTests(unittest.TestCase):
                 source.auth,
                 "--tenant",
                 "fixture-conflict",
+                "--source-identity-key-file",
+                source_identity_key_file,
                 "--target-api-base-url",
                 base_url,
                 "--service-token-file",

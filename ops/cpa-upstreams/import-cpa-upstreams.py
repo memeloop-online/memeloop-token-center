@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import ipaddress
 import json
+import math
 import os
 import pathlib
 import re
@@ -98,7 +100,7 @@ class DirectAccount:
 
 @dataclass(frozen=True)
 class NativeReauthorization:
-    stable_id: str
+    source_id: str
     provider: str
     source_disabled: bool
 
@@ -175,6 +177,29 @@ def read_owner_only_file(path_value: str, label: str, limit: int) -> bytes:
             return bounded_read(stream, limit, label)
     finally:
         os.close(descriptor)
+
+
+def read_source_identity_key(path_value: str) -> bytearray:
+    path = pathlib.Path(path_value)
+    if not path.is_absolute():
+        raise ImportFailure("source identity key file path must be absolute")
+    value = bytearray(
+        read_owner_only_file(path_value, "source identity key file", MAX_SECRET_BYTES)
+    )
+    if value.endswith(b"\n"):
+        del value[-1]
+    if len(value) < 32:
+        value.clear()
+        raise ImportFailure("source identity key must contain at least 32 random bytes")
+    frequencies = {byte: value.count(byte) for byte in set(value)}
+    entropy = -sum(
+        (count / len(value)) * math.log2(count / len(value))
+        for count in frequencies.values()
+    )
+    if len(frequencies) < 12 or entropy < 3.0:
+        value.clear()
+        raise ImportFailure("source identity key does not contain enough entropy")
+    return value
 
 
 def validate_auth_directory(path_value: str) -> pathlib.Path:
@@ -636,7 +661,7 @@ def inventory_auth_accounts(
             record_source = source_identity("auth", relative_path, record_type, upstream)
             native_reauthorization_required.append(
                 NativeReauthorization(
-                    stable_id=source_digest(record_source),
+                    source_id=record_source,
                     provider=str(upstream),
                     source_disabled=disabled,
                 )
@@ -750,9 +775,7 @@ def build_inventory(
     ):
         raise ImportFailure("CPA source contains too many upstream accounts")
     source_ids = [record.source_id for record in direct]
-    source_ids.extend(
-        record.stable_id for record in native_reauthorization_required
-    )
+    source_ids.extend(record.source_id for record in native_reauthorization_required)
     source_ids.extend(record.stable_id for record in managed_oauth)
     names = [record.name for record in direct]
     if len(source_ids) != len(set(source_ids)) or len(names) != len(set(names)):
@@ -1129,9 +1152,28 @@ def read_token(path: str, label: str) -> str:
     return secret_string(value, label)
 
 
+def native_reauthorization_manifest(
+    inventory: Inventory, source_identity_key: bytearray
+) -> tuple[dict[str, object], ...]:
+    domain = b"memeloop-token-center\0cpa-native-reauthorization-source-id\0v1\0"
+    return tuple(
+        {
+            "provider": record.provider,
+            "source_disabled": record.source_disabled,
+            "source_stable_id": hmac.new(
+                source_identity_key,
+                domain + record.source_id.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest(),
+        }
+        for record in inventory.native_reauthorization_required
+    )
+
+
 def summary(
     mode: str,
     inventory: Inventory,
+    native_reauthorization_required: tuple[dict[str, object], ...],
     *,
     created_count: int = 0,
     replayed_count: int = 0,
@@ -1154,17 +1196,8 @@ def summary(
         "managed_oauth_account_count": len(inventory.managed_oauth),
         "managed_oauth_source_type_counts": managed_oauth_source_type_counts,
         "mode": mode,
-        "native_reauthorization_required": [
-            {
-                "provider": record.provider,
-                "source_disabled": record.source_disabled,
-                "source_stable_id": record.stable_id,
-            }
-            for record in inventory.native_reauthorization_required
-        ],
-        "native_reauthorization_required_count": len(
-            inventory.native_reauthorization_required
-        ),
+        "native_reauthorization_required": native_reauthorization_required,
+        "native_reauthorization_required_count": len(native_reauthorization_required),
         "replayed_count": replayed_count,
         "replayed_managed_oauth_count": replayed_managed_oauth_count,
     }
@@ -1180,6 +1213,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true", help="Perform control API writes.")
     parser.add_argument("--target-api-base-url", help="Private Token Center control base URL.")
     parser.add_argument("--service-token-file", help="Mode-0600 target service token file.")
+    parser.add_argument(
+        "--source-identity-key-file",
+        help="Absolute mode-0600 key file protecting opaque migration source IDs.",
+    )
     parser.add_argument("--ca-file", help="Optional CA bundle for the target control endpoint.")
     parser.add_argument(
         "--allow-http-loopback",
@@ -1196,11 +1233,36 @@ def run(argv: list[str]) -> int:
     inventory, secrets = build_inventory(
         args.config, args.auth_dir, args.allow_http_loopback
     )
+    reauthorization_manifest: tuple[dict[str, object], ...] = ()
+    if inventory.native_reauthorization_required:
+        if not args.source_identity_key_file:
+            raise ImportFailure(
+                "source identity key file is required for opaque reauthorization records"
+            )
+        source_identity_key = read_source_identity_key(args.source_identity_key_file)
+        try:
+            reauthorization_manifest = native_reauthorization_manifest(
+                inventory, source_identity_key
+            )
+        finally:
+            source_identity_key.clear()
     if not args.apply:
-        print(json.dumps(summary("dry-run", inventory), separators=(",", ":"), sort_keys=True))
+        print(
+            json.dumps(
+                summary("dry-run", inventory, reauthorization_manifest),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
         return 0
     if not inventory.direct and not inventory.managed_oauth:
-        print(json.dumps(summary("apply", inventory), separators=(",", ":"), sort_keys=True))
+        print(
+            json.dumps(
+                summary("apply", inventory, reauthorization_manifest),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
         return 0
     if not args.target_api_base_url or not args.service_token_file:
         raise ImportFailure("apply requires target API base URL and service token file")
@@ -1234,6 +1296,7 @@ def run(argv: list[str]) -> int:
             summary(
                 "apply",
                 inventory,
+                reauthorization_manifest,
                 created_count=created_count,
                 replayed_count=replayed_count,
                 created_managed_oauth_count=created_managed_oauth_count,
