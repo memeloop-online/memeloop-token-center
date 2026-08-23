@@ -7,7 +7,7 @@ mod lifecycle;
 mod routing;
 mod streaming;
 
-use lifecycle::{AbortTaskOnDrop, run_bounded_proxy_lifecycle};
+use lifecycle::{AbortTaskOnDrop, begin_streaming_response_archive, run_bounded_proxy_lifecycle};
 use routing::{
     MAX_UPSTREAM_ATTEMPTS, ProxySendError, prepare_proxy_route, retryable_upstream_status,
     send_proxy_route,
