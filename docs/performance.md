@@ -12,7 +12,7 @@ ops/benchmark-memory.sh --profile acceptance \
   --output tests/load/results/memory-$(git rev-parse --short HEAD).json
 ```
 
-The harness needs Linux `/proc`, Python 3 and the Rust binary; it does not need k6, Docker, PostgreSQL, curl or jq. It creates a temporary SQLite database and filesystem archive, starts separate control, gateway and worker processes, provisions routes and a credential through HTTP, and removes all temporary data and processes on exit. No real upstream or secret is used.
+The harness needs Linux `/proc`, Node.js 24 and the Rust binary; it does not need k6, Docker, PostgreSQL, curl or jq. It creates a temporary SQLite database and filesystem archive, starts separate control, gateway and worker processes, provisions routes and a credential through HTTP, and removes all temporary data and processes on exit. No real upstream or secret is used.
 
 The acceptance profile performs all of the following:
 

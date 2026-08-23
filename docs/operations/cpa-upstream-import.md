@@ -1,6 +1,6 @@
 # CPA upstream account import
 
-`ops/cpa-upstreams/import-cpa-upstreams.py` inventories a mounted CPA v7
+`ops/cpa-upstreams/import-cpa-upstreams.ts` inventories a mounted CPA v7
 `config.yaml` and its real `auth-dir`, then imports the supported accounts through
 the Token Center control API. It is dry-run by default. It does not read CPA
 through its management API and never mutates the source snapshot.
@@ -91,7 +91,7 @@ name, and fsyncs the parent. A failed run never unlinks the public target name
 and produces no key material on stdout.
 
 The file format is a fixed magic and version followed by exactly 32 bytes from
-Python's operating-system-backed `secrets.token_bytes`. The importer accepts
+Node.js' operating-system-backed `randomBytes`. The importer accepts
 only that exact binary format; passwords, raw keys, hex/base64 text, a trailing
 LF, wrong versions and wrong lengths fail before any target request. Format
 validation is not presented as proof that arbitrary caller-written bytes are

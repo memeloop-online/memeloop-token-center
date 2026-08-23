@@ -174,6 +174,98 @@ fn terminal_stats_do_not_scan_wide_request_or_generation_history() {
 }
 
 #[tokio::test]
+async fn sqlite_complete_session_usage_migration_backfills_all_usage_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("session-usage-v54.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 1, 53)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    sqlx::query(
+        r#"INSERT INTO request_stats_facts (
+               request_id, tenant_id, key_id, created_at, model, protocol,
+               status_class, error_code, upstream_account_id, model_route_id,
+               duration_ms, input_tokens, output_tokens, cached_input_tokens,
+               cache_write_tokens, service_tier, currency, cost_micros, session_id)
+           VALUES ('request-v54', 'tenant-v54', 'key-v54', 100, 'text-model',
+                   'openai-responses', 'success', '', '', '', 30, 100, 7,
+                   30, 20, 'default', 'USD', 100, 'unlinked:key-v54')"#,
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO generation_stats_facts (
+               job_id, tenant_id, key_id, created_at, model, status_class,
+               error_code, upstream_account_id, duration_ms, cost_micros,
+               billed_units, currency, modality, billing_unit, model_route_id)
+           VALUES ('generation-v54', 'tenant-v54', 'key-v54', 200,
+                   'image-model', 'success', '', '', 40, 200, 8, 'USD',
+                   'image', 'job', '')"#,
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+
+    for _ in 0..2 {
+        let mut transaction = database.pool.begin().await.unwrap();
+        apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 54, 54)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+    }
+
+    let totals = sqlx::query(
+        r#"SELECT last_activity_at, requests, errors, input_tokens, output_tokens,
+                  cached_input_tokens, cache_write_tokens, generation_units,
+                  duration_count, duration_sum_ms, cost_micros
+             FROM session_usage_totals
+            WHERE tenant_id = 'tenant-v54' AND key_id = 'key-v54'
+              AND session_id = 'unlinked:key-v54' AND currency = 'USD'"#,
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(totals.get::<i64, _>("last_activity_at"), 200);
+    assert_eq!(totals.get::<i64, _>("requests"), 2);
+    assert_eq!(totals.get::<i64, _>("errors"), 0);
+    assert_eq!(totals.get::<i64, _>("input_tokens"), 50);
+    assert_eq!(totals.get::<i64, _>("output_tokens"), 7);
+    assert_eq!(totals.get::<i64, _>("cached_input_tokens"), 30);
+    assert_eq!(totals.get::<i64, _>("cache_write_tokens"), 20);
+    assert_eq!(totals.get::<i64, _>("generation_units"), 8);
+    assert_eq!(totals.get::<i64, _>("duration_count"), 2);
+    assert_eq!(totals.get::<i64, _>("duration_sum_ms"), 70);
+    assert_eq!(totals.get::<i64, _>("cost_micros"), 300);
+    for table in ["session_usage_hourly", "session_usage_daily"] {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT SUM(requests) AS requests, SUM(input_tokens) AS input_tokens, SUM(cached_input_tokens) AS cached_input_tokens, SUM(cache_write_tokens) AS cache_write_tokens, SUM(generation_units) AS generation_units, SUM(cost_micros) AS cost_micros FROM {table} WHERE tenant_id = 'tenant-v54' AND key_id = 'key-v54' AND session_id = 'unlinked:key-v54'"
+        )))
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("requests"), 2, "{table}");
+        assert_eq!(row.get::<i64, _>("input_tokens"), 50, "{table}");
+        assert_eq!(row.get::<i64, _>("cached_input_tokens"), 30, "{table}");
+        assert_eq!(row.get::<i64, _>("cache_write_tokens"), 20, "{table}");
+        assert_eq!(row.get::<i64, _>("generation_units"), 8, "{table}");
+        assert_eq!(row.get::<i64, _>("cost_micros"), 300, "{table}");
+    }
+}
+
+#[tokio::test]
 async fn sqlite_generation_aggregate_migration_backfills_once() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

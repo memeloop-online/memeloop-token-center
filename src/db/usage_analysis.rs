@@ -906,9 +906,9 @@ impl UsageMetricsAccumulator {
             failed: self.failed_requests,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
-            cached_input_tokens: 0,
-            cache_write_tokens: 0,
-            generation_units: 0,
+            cached_input_tokens: self.cached_input_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            generation_units: self.generation_units,
             avg_duration_ms,
             p95_duration_ms: None,
             costs: self

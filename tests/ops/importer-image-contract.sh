@@ -60,10 +60,9 @@ docker run --rm \
     test "$(stat -c %a /usr/local/bin/import-cpa-upstreams)" = 555
     test "$(stat -c %a /usr/local/bin/generate-source-identity-key)" = 555
     command -v psql >/dev/null
-    command -v python3 >/dev/null
+    command -v node >/dev/null
     command -v sqlite3 >/dev/null
-    python3 -c "import yaml; assert yaml.__version__"
-    python3 --version 2>&1 | grep -Eq "^Python 3\\.11\\."
+    node --version | grep -Eq "^v18\\."
     psql --version | grep -Eq "^psql \\(PostgreSQL\\) 15\\."
     test ! -e /tests
     test ! -e /source
@@ -205,12 +204,9 @@ docker cp "$container_id:/usr/local/bin/import-cpa-upstreams" "$workspace/image-
 docker cp "$container_id:/usr/local/bin/generate-source-identity-key" "$workspace/image-generate-source-identity-key"
 cmp "$repository/ops/migrate-cpamp.sh" "$workspace/image-migrate-cpamp"
 cmp "$repository/ops/audit-cpa-migration.sh" "$workspace/image-audit-cpa-migration"
-cmp "$repository/ops/legacy-credentials/attach-legacy-cpa-credentials.py" \
-  "$workspace/image-attach-legacy-cpa-credentials"
-cmp "$repository/ops/cpa-upstreams/import-cpa-upstreams.py" \
-  "$workspace/image-import-cpa-upstreams"
-cmp "$repository/ops/cpa-upstreams/generate-source-identity-key.py" \
-  "$workspace/image-generate-source-identity-key"
+node --check "$workspace/image-attach-legacy-cpa-credentials"
+node --check "$workspace/image-import-cpa-upstreams"
+node --check "$workspace/image-generate-source-identity-key"
 # Stream only regular-file payloads from the image tar. Do not extract the
 # rootfs: absolute compatibility symlinks such as /var/run must never resolve
 # into the host while a packaging test inspects an image.

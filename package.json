@@ -1,0 +1,22 @@
+{
+  "name": "memeloop-token-center-operations",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": "24.18.0"
+  },
+  "scripts": {
+    "build:importer-scripts": "esbuild ops/legacy-credentials/attach-legacy-cpa-credentials.ts ops/cpa-upstreams/import-cpa-upstreams.ts ops/cpa-upstreams/generate-source-identity-key.ts --bundle --platform=node --target=node18 --format=cjs --out-extension:.js=.cjs --outdir=dist/operator-scripts",
+    "typecheck": "tsc -p tsconfig.scripts.json --pretty false"
+  },
+  "dependencies": {
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@apidevtools/swagger-parser": "12.1.0",
+    "@types/node": "24.10.13",
+    "esbuild": "0.25.12",
+    "typescript": "7.0.2"
+  }
+}

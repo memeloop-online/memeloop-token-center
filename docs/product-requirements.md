@@ -261,6 +261,9 @@ and rollback are in [CPA to Token Center cutover](operations/cutover-runbook.md)
   `github.com/memeloop-online/memeloop-token-center`.
 - Development uses `master`, GitHub Actions and GHCR. Releases are immutable
   digest references produced from the exact accepted `master` commit.
+- Repository automation and operational helper scripts use TypeScript on Node.js.
+  Python scripts, Python-only test harnesses and Python runtime dependencies are
+  not part of the supported development, migration or release toolchain.
 - There is no maintained Forgejo mirror, Forgejo Actions workflow or Harbor
   release path for this product.
 - Rust development and builds must not consume the Westlake physical root disk.

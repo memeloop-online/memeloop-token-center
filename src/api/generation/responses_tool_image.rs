@@ -3,7 +3,7 @@ use std::{fmt, ops::Range};
 use bytes::Bytes;
 use serde::{
     Deserializer, Serialize,
-    de::{MapAccess, SeqAccess, Visitor},
+    de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::value::RawValue;
 
@@ -89,10 +89,22 @@ impl std::error::Error for ParseError {}
 pub(super) fn parse_responses_tool_image(
     bytes: &Bytes,
 ) -> Result<ParsedResponsesToolImage, ResponsesToolImageParseError> {
-    let root: &RawValue =
-        serde_json::from_slice(bytes).map_err(|_| ResponsesToolImageParseError::InvalidJson)?;
     let mut scan = ImageScan { image: None };
-    scan_raw_value(root, &mut scan, 0).map_err(|_| ResponsesToolImageParseError::InvalidPayload)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let usage = RootSeed { scan: &mut scan }
+        .deserialize(&mut deserializer)
+        .and_then(|usage| {
+            deserializer.end()?;
+            Ok(usage)
+        })
+        .map_err(|error| match error.classify() {
+            serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
+                ResponsesToolImageParseError::InvalidJson
+            }
+            serde_json::error::Category::Data | serde_json::error::Category::Io => {
+                ResponsesToolImageParseError::InvalidPayload
+            }
+        })?;
     let image = scan
         .image
         .ok_or(ResponsesToolImageParseError::InvalidPayload)?;
@@ -101,117 +113,32 @@ pub(super) fn parse_responses_tool_image(
         .checked_sub(base)
         .filter(|start| start.saturating_add(image.len()) <= bytes.len())
         .ok_or(ResponsesToolImageParseError::InvalidPayload)?;
-    let usage = parse_root_usage(root).map_err(|_| ResponsesToolImageParseError::InvalidPayload)?;
     Ok(ParsedResponsesToolImage {
         image_range: start..start + image.len(),
         usage,
     })
 }
 
-fn scan_raw_value<'input>(
-    raw: &'input RawValue,
-    scan: &mut ImageScan<'input>,
-    depth: usize,
-) -> Result<(), ParseError> {
-    if depth > MAX_JSON_DEPTH {
-        return Err(ParseError);
-    }
-    match raw.get().as_bytes().first().copied() {
-        Some(b'{') => {
-            let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-            deserializer
-                .deserialize_map(ObjectScanVisitor { scan, depth })
-                .map_err(|_| ParseError)
-        }
-        Some(b'[') => {
-            let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-            deserializer
-                .deserialize_seq(ArrayScanVisitor { scan, depth })
-                .map_err(|_| ParseError)
-        }
-        Some(_) => Ok(()),
-        None => Err(ParseError),
-    }
-}
-
-struct ObjectScanVisitor<'state, 'input> {
+struct RootSeed<'state, 'input> {
     scan: &'state mut ImageScan<'input>,
-    depth: usize,
 }
 
-impl<'input, 'state> Visitor<'input> for ObjectScanVisitor<'state, 'input> {
-    type Value = ();
+impl<'input, 'state> DeserializeSeed<'input> for RootSeed<'state, 'input> {
+    type Value = Option<SanitizedImageUsage>;
 
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
-        A: MapAccess<'input>,
+        D: serde::Deserializer<'input>,
     {
-        let mut object_type = None;
-        let mut result = None;
-        while let Some(key) = map.next_key::<&'input str>()? {
-            let value = map.next_value::<&'input RawValue>()?;
-            match key {
-                "type" => object_type = Some(value),
-                "result" => result = Some(value),
-                _ => {}
-            }
-            scan_raw_value(value, self.scan, self.depth + 1).map_err(serde::de::Error::custom)?;
-        }
-        let is_image_call = object_type
-            .and_then(|value| serde_json::from_str::<&'input str>(value.get()).ok())
-            .is_some_and(|value| value == "image_generation_call");
-        if is_image_call {
-            // Base64 never needs JSON escaping. Requiring a borrowed string is
-            // fail-closed and retains only the ingress allocation.
-            let image = result
-                .and_then(|value| serde_json::from_str::<&'input str>(value.get()).ok())
-                .ok_or_else(|| serde::de::Error::custom(ParseError))?;
-            self.scan.record(image).map_err(serde::de::Error::custom)?;
-        }
-        Ok(())
+        deserializer.deserialize_map(RootVisitor { scan: self.scan })
     }
 }
 
-struct ArrayScanVisitor<'state, 'input> {
+struct RootVisitor<'state, 'input> {
     scan: &'state mut ImageScan<'input>,
-    depth: usize,
 }
 
-impl<'input, 'state> Visitor<'input> for ArrayScanVisitor<'state, 'input> {
-    type Value = ();
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON array")
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<(), A::Error>
-    where
-        A: SeqAccess<'input>,
-    {
-        while let Some(value) = sequence.next_element::<&'input RawValue>()? {
-            scan_raw_value(value, self.scan, self.depth + 1).map_err(serde::de::Error::custom)?;
-        }
-        Ok(())
-    }
-}
-
-fn parse_root_usage(raw: &RawValue) -> Result<Option<SanitizedImageUsage>, ParseError> {
-    if !raw.get().starts_with('{') {
-        return Err(ParseError);
-    }
-    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
-    deserializer
-        .deserialize_map(RootUsageVisitor)
-        .map_err(|_| ParseError)
-}
-
-struct RootUsageVisitor;
-
-impl<'de> Visitor<'de> for RootUsageVisitor {
+impl<'input, 'state> Visitor<'input> for RootVisitor<'state, 'input> {
     type Value = Option<SanitizedImageUsage>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -220,16 +147,132 @@ impl<'de> Visitor<'de> for RootUsageVisitor {
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
     where
-        A: MapAccess<'de>,
+        A: MapAccess<'input>,
     {
         let mut usage = None;
-        while let Some(key) = map.next_key::<&'de str>()? {
-            let value = map.next_value::<&'de RawValue>()?;
-            if key == "usage" {
-                usage = parse_usage(value).map_err(serde::de::Error::custom)?;
+        while let Some(key) = map.next_key::<&'input str>()? {
+            match key {
+                "output" => {
+                    map.next_value_seed(ValueScanSeed {
+                        scan: self.scan,
+                        depth: 1,
+                    })?;
+                }
+                "usage" => {
+                    let raw = map.next_value::<&'input RawValue>()?;
+                    usage = parse_usage(raw).map_err(serde::de::Error::custom)?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
             }
         }
         Ok(usage)
+    }
+}
+
+struct ValueScanSeed<'state, 'input> {
+    scan: &'state mut ImageScan<'input>,
+    depth: usize,
+}
+
+impl<'input, 'state> DeserializeSeed<'input> for ValueScanSeed<'state, 'input> {
+    type Value = Option<&'input str>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'input>,
+    {
+        if self.depth > MAX_JSON_DEPTH {
+            return Err(serde::de::Error::custom(ParseError));
+        }
+        deserializer.deserialize_any(ValueScanVisitor {
+            scan: self.scan,
+            depth: self.depth,
+        })
+    }
+}
+
+struct ValueScanVisitor<'state, 'input> {
+    scan: &'state mut ImageScan<'input>,
+    depth: usize,
+}
+
+impl<'input, 'state> Visitor<'input> for ValueScanVisitor<'state, 'input> {
+    type Value = Option<&'input str>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'input str) -> Result<Self::Value, E> {
+        Ok(Some(value))
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'input>,
+    {
+        while sequence
+            .next_element_seed(ValueScanSeed {
+                scan: self.scan,
+                depth: self.depth + 1,
+            })?
+            .is_some()
+        {}
+        Ok(None)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'input>,
+    {
+        let mut object_type = None;
+        let mut result = None;
+        while let Some(key) = map.next_key::<&'input str>()? {
+            let value = map.next_value_seed(ValueScanSeed {
+                scan: self.scan,
+                depth: self.depth + 1,
+            })?;
+            match key {
+                "type" => object_type = value,
+                "result" => result = value,
+                _ => {}
+            }
+        }
+        if object_type == Some("image_generation_call") {
+            let image = result.ok_or_else(|| serde::de::Error::custom(ParseError))?;
+            self.scan.record(image).map_err(serde::de::Error::custom)?;
+        }
+        Ok(None)
     }
 }
 
@@ -366,12 +409,16 @@ mod tests {
         let encoded = STANDARD.encode(b"png");
         for response in [
             body(json!({"output": []})),
-            body(json!({"type": "image_generation_call", "result": "not-base64"})),
+            body(json!({"output": [{"type": "image_generation_call", "result": "not-base64"}]})),
             body(json!({
-                "a": {"type": "image_generation_call", "result": encoded},
-                "b": {"type": "image_generation_call", "result": encoded}
+                "output": [
+                    {"type": "image_generation_call", "result": encoded},
+                    {"type": "image_generation_call", "result": encoded}
+                ]
             })),
-            Bytes::from_static(br#"{"type":"image_generation_call","result":"cG\u0035n"}"#),
+            Bytes::from_static(
+                br#"{"output":[{"type":"image_generation_call","result":"cG\u0035n"}]}"#,
+            ),
         ] {
             assert!(parse_responses_tool_image(&response).is_err());
         }
@@ -403,9 +450,11 @@ mod tests {
     fn ancestor_and_descendant_candidates_are_duplicates() {
         let response = Bytes::from_static(
             br#"{
-                "type":"image_generation_call",
-                "result":"cG5n",
-                "nested":{"type":"image_generation_call","result":"cG5n"}
+                "output":[{
+                    "type":"image_generation_call",
+                    "result":"cG5n",
+                    "nested":{"type":"image_generation_call","result":"cG5n"}
+                }]
             }"#,
         );
         assert_eq!(
@@ -438,5 +487,20 @@ mod tests {
                 "input_tokens_details": {"image_tokens": 2}
             })
         );
+    }
+
+    #[test]
+    fn skips_unrelated_root_subtrees_without_scanning_or_linking_images() {
+        let response = body(json!({
+            "ignored": {
+                "padding": "x".repeat(1024 * 1024),
+                "type": "image_generation_call",
+                "result": "ZmFrZQ=="
+            },
+            "output": [{"type": "image_generation_call", "result": "cG5n"}]
+        }));
+        let parsed = parse_responses_tool_image(&response)
+            .expect("only the normative root output participates in image extraction");
+        assert_eq!(&response[parsed.image_range], b"cG5n");
     }
 }

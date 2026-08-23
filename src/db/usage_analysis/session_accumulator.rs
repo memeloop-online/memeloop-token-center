@@ -44,6 +44,15 @@ pub(super) fn accumulate_session_usage_row(
     accumulator.output_tokens = accumulator
         .output_tokens
         .saturating_add(row.try_get("output_tokens")?);
+    accumulator.cached_input_tokens = accumulator
+        .cached_input_tokens
+        .saturating_add(row.try_get("cached_input_tokens")?);
+    accumulator.cache_write_tokens = accumulator
+        .cache_write_tokens
+        .saturating_add(row.try_get("cache_write_tokens")?);
+    accumulator.generation_units = accumulator
+        .generation_units
+        .saturating_add(row.try_get("generation_units")?);
     accumulator.duration_count = accumulator
         .duration_count
         .saturating_add(row.try_get("duration_count")?);

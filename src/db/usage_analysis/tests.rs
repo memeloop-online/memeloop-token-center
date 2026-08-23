@@ -119,8 +119,10 @@ fn session_dimension_uses_time_indexes_and_never_sums_cost_across_currencies() {
             sql.contains(&format!("rollup.{bucket_column} >= $3")),
             "{sql}"
         );
-        assert_eq!(sql.matches("fact.created_at >=").count(), 2, "{sql}");
-        assert_eq!(sql.matches("fact.tenant_id = $1").count(), 2, "{sql}");
+        // Both request facts and asynchronous generation facts contribute
+        // bounded leading/trailing edge rows around the materialized bucket.
+        assert_eq!(sql.matches("fact.created_at >=").count(), 4, "{sql}");
+        assert_eq!(sql.matches("fact.tenant_id = $1").count(), 4, "{sql}");
         assert!(
             sql.contains("GROUP BY key_id, key_alias, session_id, currency"),
             "{sql}"

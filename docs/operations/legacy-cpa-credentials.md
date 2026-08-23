@@ -67,7 +67,7 @@ bodies. Error handling also refuses to echo input or peer response bodies.
 Build the existing [importer Dockerfile](../../Dockerfile.importer), scan it,
 publish it to the private registry, and record its immutable digest. Its default
 entrypoint remains the CPAMP importer; this one-shot Job explicitly selects the
-legacy attachment command. The image also contains Python's standard library,
+legacy attachment command. The image also contains the Node.js runtime,
 `psql` and CA certificates and runs as UID 10001.
 
 ```sh
@@ -158,7 +158,7 @@ Codex credential specifically verify:
 The automated fixture coverage in
 `tests/legacy_credential_continuity.rs` proves attach/replay authentication and
 unchanged history, policy and balance against the real API. The operator suite
-in `tests/ops/test_legacy_credentials_bulk.py` proves strict matching,
+in `tests/ops/test-legacy-credentials-bulk.ts` proves strict matching,
 read-only CPA export, dry-run, apply/replay and absence of credential/hash
 material from stdout and stderr. When `MTC_TEST_POSTGRES_URL` is present,
 `tests/legacy_credentials_bulk_postgres.rs` also creates and removes an isolated

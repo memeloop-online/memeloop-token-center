@@ -469,9 +469,9 @@ fn assert_multibucket_metrics(body: &Value) {
         "{body}"
     );
     assert!(
-        by_session
-            .iter()
-            .any(|bucket| bucket["requests"] == 1 && bucket["costs"][0]["currency"] == "CNY"),
+        by_session.iter().any(|bucket| bucket["requests"] == 3
+            && bucket["generation_units"] == 8
+            && bucket["costs"][0]["currency"] == "CNY"),
         "{body}"
     );
 }
@@ -893,6 +893,32 @@ async fn sqlite_usage_analysis_keeps_currency_cache_scope_and_prefix_filters_exa
     assert_eq!(body["summary"]["costs"][1]["currency"], "USD");
     assert_eq!(body["summary"]["costs"][1]["cost"], "1");
     assert_eq!(body["by_key"].as_array().unwrap().len(), 2);
+    let by_session = body["by_session"].as_array().unwrap();
+    assert_eq!(by_session.len(), 2, "{body}");
+    assert_eq!(
+        by_session
+            .iter()
+            .map(|bucket| bucket["input_tokens"].as_i64().unwrap())
+            .sum::<i64>(),
+        115,
+        "{body}"
+    );
+    assert_eq!(
+        by_session
+            .iter()
+            .map(|bucket| bucket["cached_input_tokens"].as_i64().unwrap())
+            .sum::<i64>(),
+        40,
+        "{body}"
+    );
+    assert_eq!(
+        by_session
+            .iter()
+            .map(|bucket| bucket["cache_write_tokens"].as_i64().unwrap())
+            .sum::<i64>(),
+        25,
+        "{body}"
+    );
     assert!(
         body["by_status"]
             .as_array()

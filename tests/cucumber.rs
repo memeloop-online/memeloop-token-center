@@ -79,6 +79,8 @@ struct TokenCenterWorld {
     status: Option<StatusCode>,
     response_retry_after: Option<String>,
     response: Value,
+    synchronous_response_body: Vec<u8>,
+    synchronous_response_content_length: Option<usize>,
 }
 
 impl Default for TokenCenterWorld {
@@ -123,6 +125,8 @@ impl Default for TokenCenterWorld {
             status: None,
             response_retry_after: None,
             response: Value::Null,
+            synchronous_response_body: Vec::new(),
+            synchronous_response_content_length: None,
         }
     }
 }
@@ -2502,7 +2506,16 @@ async fn create_openai_compatible_image(world: &mut TokenCenterWorld) {
         .get("x-mtc-request-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| Uuid::parse_str(value).ok());
-    world.response = response.json().await.expect("Images response JSON");
+    world.synchronous_response_content_length = response
+        .content_length()
+        .map(|value| usize::try_from(value).expect("Images Content-Length fits the platform"));
+    world.synchronous_response_body = response
+        .bytes()
+        .await
+        .expect("Images response body")
+        .to_vec();
+    world.response =
+        serde_json::from_slice(&world.synchronous_response_body).expect("Images response JSON");
 }
 
 #[when("the client creates an OpenAI-compatible image without an idempotency key")]
@@ -2596,6 +2609,10 @@ async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
     assert_eq!(world.response["data"][0]["b64_json"], "bW9jay1wbmc=");
     let replay = replay_openai_compatible_image(world).await;
     assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        world.synchronous_response_content_length,
+        Some(world.synchronous_response_body.len())
+    );
     let expected_request_id = world
         .synchronous_request_id
         .expect("synchronous image request id")
@@ -2608,8 +2625,36 @@ async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
         Some(expected_request_id.as_str())
     );
     assert_eq!(
-        replay.json::<Value>().await.expect("replayed image JSON"),
-        world.response
+        replay
+            .content_length()
+            .and_then(|value| usize::try_from(value).ok()),
+        Some(world.synchronous_response_body.len())
+    );
+    assert_eq!(
+        replay.bytes().await.expect("replayed image body").as_ref(),
+        world.synchronous_response_body.as_slice()
+    );
+    let state = world.state.clone().expect("test application state");
+    let archived_response = state
+        .db
+        .request_archive_refs(
+            world.stable_key_id.expect("stable image key id"),
+            world
+                .synchronous_request_id
+                .expect("synchronous image request id"),
+        )
+        .await
+        .expect("OpenAI image archive references")
+        .response_object
+        .expect("OpenAI image response object");
+    assert_eq!(
+        state
+            .archive
+            .get(&archived_response)
+            .await
+            .expect("read OpenAI image response archive")
+            .as_ref(),
+        world.synchronous_response_body.as_slice()
     );
     let mismatch = world
         .client
@@ -3412,7 +3457,16 @@ async fn create_codex_backed_openai_image(world: &mut TokenCenterWorld) {
         .get("x-mtc-request-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| Uuid::parse_str(value).ok());
-    world.response = response.json().await.expect("Codex Images response JSON");
+    world.synchronous_response_content_length = response.content_length().map(|value| {
+        usize::try_from(value).expect("Codex Images Content-Length fits the platform")
+    });
+    world.synchronous_response_body = response
+        .bytes()
+        .await
+        .expect("Codex Images response body")
+        .to_vec();
+    world.response = serde_json::from_slice(&world.synchronous_response_body)
+        .expect("Codex Images response JSON");
 }
 
 #[then("the Codex-backed image response is archived and costs 0.4")]
@@ -3420,6 +3474,63 @@ async fn codex_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
     assert_eq!(
         world.response["data"][0]["b64_json"],
         "Y29kZXgtbW9jay1wbmc="
+    );
+    assert_eq!(
+        world.synchronous_response_content_length,
+        Some(world.synchronous_response_body.len())
+    );
+    let replay = world
+        .client
+        .post(format!("{}/v1/images/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .header("idempotency-key", "codex-image-stable-1")
+        .json(&json!({
+            "model": "codex-image-public",
+            "prompt": "a compact token loop icon",
+            "n": 1,
+            "size": "1024x1024",
+            "quality": "medium",
+            "output_format": "png"
+        }))
+        .send()
+        .await
+        .expect("replay Codex-backed image");
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        replay
+            .content_length()
+            .and_then(|value| usize::try_from(value).ok()),
+        Some(world.synchronous_response_body.len())
+    );
+    assert_eq!(
+        replay
+            .bytes()
+            .await
+            .expect("replayed Codex image body")
+            .as_ref(),
+        world.synchronous_response_body.as_slice()
+    );
+    let state = world.state.clone().expect("test application state");
+    let archived_response = state
+        .db
+        .request_archive_refs(
+            world.stable_key_id.expect("stable Codex image key id"),
+            world
+                .synchronous_request_id
+                .expect("synchronous Codex image request id"),
+        )
+        .await
+        .expect("Codex image archive references")
+        .response_object
+        .expect("Codex image response object");
+    assert_eq!(
+        state
+            .archive
+            .get(&archived_response)
+            .await
+            .expect("read Codex image response archive")
+            .as_ref(),
+        world.synchronous_response_body.as_slice()
     );
     let stats: Value = world
         .client

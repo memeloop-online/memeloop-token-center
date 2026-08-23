@@ -35,7 +35,7 @@ writes.
 ## Acquiring incremental source deltas
 
 `cpa-session-archive` exposes whole-session export tickets, not a record-level
-`since` cursor. `ops/export-cpa-session-archive-delta.py` turns its bounded
+`since` cursor. `ops/export-cpa-session-archive-delta.ts` turns its bounded
 session projection into a conservative source-side cursor. Prefer the native
 0.8 collector contract described in
 [`operations/collector-direct-archive-runbook.md`](operations/collector-direct-archive-runbook.md).
@@ -76,7 +76,7 @@ export. The first post-baseline delta starts at that fence and subtracts the
 configured overlap once more:
 
 ```sh
-python3 ops/export-cpa-session-archive-delta.py \
+node ops/export-cpa-session-archive-delta.ts \
   --base-url https://REPLACE_API2_ORIGIN \
   --token-file /run/secrets/cpa-management-token \
   --checkpoint /private-evidence/archive-source-checkpoint.json \

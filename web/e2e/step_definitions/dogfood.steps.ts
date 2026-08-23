@@ -371,7 +371,9 @@ Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', as
   await assertAttribute(metric(page, '总 Token').locator('span'), 'title', '1,000,100,111,227');
   await assertExactText(metric(page, '生成计费单位'), '1.23万');
   await assertAttribute(metric(page, '生成计费单位').locator('span'), 'title', '12,345');
-  await assertAttribute(page.locator('.usage-dimension').filter({ has: page.getByRole('heading', { name: '协议', exact: true }) }).locator('tbody td').nth(3), 'title', '12345');
+  const protocolGenerationUnits = page.locator('.usage-dimension').filter({ has: page.getByRole('heading', { name: '协议', exact: true }) }).locator('tbody td').nth(3);
+  await assertExactText(protocolGenerationUnits, '1.23万');
+  await assertAttribute(protocolGenerationUnits, 'title', '12,345');
   const costs = page.locator('.usage-cost-lines');
   await assertContains(costs, '¥2.5');
   await assertContains(costs, 'US$1.25');
@@ -380,10 +382,12 @@ Then('中文指标显示万、亿、万亿、USD 与 CNY 并保留精确值', as
   const trendMetric = page.getByLabel('趋势指标', { exact: true });
   await trendMetric.selectOption('tokens');
   await assertVisible(page.getByRole('img', { name: '总 Token · 时间趋势图', exact: true }));
-  await assertContains(page.locator('.usage-trend-points'), '1,000,100,111,227');
+  await assertContains(page.locator('.usage-trend-points'), '1万亿');
+  await assertAttribute(page.locator('.usage-trend-points button span').first(), 'title', '1,000,100,111,227');
   await trendMetric.selectOption('generation_units');
   await assertVisible(page.getByRole('img', { name: '生成计费单位 · 时间趋势图', exact: true }));
-  await assertContains(page.locator('.usage-trend-points'), '12,345');
+  await assertContains(page.locator('.usage-trend-points'), '1.23万');
+  await assertAttribute(page.locator('.usage-trend-points button span').first(), 'title', '12,345');
 
   await trendMetric.selectOption('cost');
   const trendCurrency = page.getByLabel('成本币种', { exact: true });

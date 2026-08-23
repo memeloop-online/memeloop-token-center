@@ -34,8 +34,8 @@ test('application rail uses localized product labels instead of OP or SELF abbre
 test('usage copy accurately names stable upstream accounts and documents session scope', () => {
   assert.equal(translationCatalogs['zh-CN']['usage.tab.upstreams'], '上游账户分析');
   assert.equal(translationCatalogs.en['usage.tab.upstreams'], 'Upstream account analysis');
-  assert.match(translationCatalogs['zh-CN']['usage.sessionScope'], /前 100 个会话.*不提供会话 P95.*缓存 Token.*多模态生成任务/);
-  assert.match(translationCatalogs.en['usage.sessionScope'], /top 100 sessions.*session P95.*cache-token.*multimodal generation jobs/i);
+  assert.match(translationCatalogs['zh-CN']['usage.sessionScope'], /前 100 个会话.*缓存读取.*缓存写入.*多模态生成.*未关联.*不提供会话 P95/);
+  assert.match(translationCatalogs.en['usage.sessionScope'], /top 100 sessions.*cache-read.*cache-write.*multimodal generation.*unlinked.*session P95/i);
 });
 
 test('routing copy consistently names provider, route, and credential groups', () => {

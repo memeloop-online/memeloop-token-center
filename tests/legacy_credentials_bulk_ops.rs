@@ -3,12 +3,12 @@ use std::{path::PathBuf, process::Command};
 #[test]
 fn legacy_credential_bulk_operator_tests_pass() {
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let suite = repository.join("tests/ops/test_legacy_credentials_bulk.py");
-    let output = Command::new("python3")
+    let suite = repository.join("tests/ops/test-legacy-credentials-bulk.ts");
+    let output = Command::new("node")
+        .arg("--test")
         .arg(suite)
-        .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
-        .expect("run Python standard-library operator tests");
+        .expect("run TypeScript operator tests");
     assert!(
         output.status.success(),
         "legacy credential operator suite failed:\n{}",

@@ -14,5 +14,5 @@ web/test-results/
 web/playwright-report/
 /tests/load/results/*-latest.json
 /tests/load/results/local-*.json
-__pycache__/
-*.py[cod]
+node_modules/
+dist/

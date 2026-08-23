@@ -1,6 +1,6 @@
 \set ON_ERROR_STOP on
 
--- Deterministic, synthetic, secret-free scale fixture for postgres_explain.py.
+-- Deterministic, synthetic, secret-free scale fixture for postgres-explain.ts.
 -- Run only against a disposable database after all application migrations.
 SET synchronous_commit = off;
 

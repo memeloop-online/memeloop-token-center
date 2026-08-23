@@ -56,13 +56,12 @@ fn importer_command(database_url: &str, schema: &str, input_file: &Path) -> Comm
     );
 
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut command = Command::new("python3");
+    let mut command = Command::new("node");
     command
-        .arg(repository.join("ops/legacy-credentials/attach-legacy-cpa-credentials.py"))
+        .arg(repository.join("ops/legacy-credentials/attach-legacy-cpa-credentials.ts"))
         .args(["--tenant-external-id", "fixture-tenant"])
         .arg("--input-file")
         .arg(input_file)
-        .env("PYTHONDONTWRITEBYTECODE", "1")
         // libpq does not expand a URI supplied only through the PGDATABASE
         // environment default. Keep credentials out of argv while giving psql
         // the same discrete connection parameters as the production Job.

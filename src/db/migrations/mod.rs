@@ -288,6 +288,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "distinct durable OAuth flow kinds",
         sql: include_str!("../../../migrations/sqlite/0053_oauth_flow_kinds.sql"),
     },
+    Migration {
+        version: 54,
+        name: "complete logical session usage dimensions",
+        sql: include_str!("../../../migrations/common/0054_complete_session_usage_dimensions.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -561,6 +566,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 53,
         name: "distinct durable OAuth flow kinds",
         sql: include_str!("../../../migrations/postgres/0053_oauth_flow_kinds.sql"),
+    },
+    Migration {
+        version: 54,
+        name: "complete logical session usage dimensions",
+        sql: include_str!("../../../migrations/common/0054_complete_session_usage_dimensions.sql"),
     },
 ];
 

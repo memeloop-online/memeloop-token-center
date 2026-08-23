@@ -45,7 +45,7 @@ set -eu
 umask 077
 SOURCE_HOST=cpa-session-archive-migration.cpa.svc.cluster.local
 SOURCE_URL=http://${SOURCE_HOST}:8080
-python3 ops/export-cpa-session-archive-delta.py \
+node ops/export-cpa-session-archive-delta.ts \
   --collector-direct \
   --offline-full \
   --base-url "${SOURCE_URL}" \
@@ -79,7 +79,7 @@ set -eu
 umask 077
 SOURCE_HOST=cpa-session-archive-migration.cpa.svc.cluster.local
 SOURCE_URL=http://${SOURCE_HOST}:8080
-python3 ops/export-cpa-session-archive-delta.py \
+node ops/export-cpa-session-archive-delta.ts \
   --collector-direct \
   --base-url "${SOURCE_URL}" \
   --private-http-host "${SOURCE_HOST}" \

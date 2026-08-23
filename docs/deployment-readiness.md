@@ -8,13 +8,14 @@ the product deployment itself and does not depend on another gateway service.
 - Deploy an immutable image digest built from the exact `master` commit.
 - The image, Helm chart, OpenAPI document, web assets, and database migrations
   must come from the same commit.
-- The current schema generation is **v53**. The chart renders
-  `memeloop.io/schema-generation: "v53"` on its migration Job, and the Helm
+- The current schema generation is **v54**. The chart renders
+  `memeloop.io/schema-generation: "v54"` on its migration Job, and the Helm
   packaging contract rejects drift from the greatest file in
   `migrations/common/`.
 - v49 adds MemeLoop Cloud event-query indexes, v50 adds generation modality and
   billing dimensions, v51 adds logical-session usage rollups, v52 retires
-  legacy model allowlists, and v53 persists distinct OAuth flow kinds.
+  legacy model allowlists, v53 persists distinct OAuth flow kinds, and v54
+  completes cache-token and asynchronous-generation session projections.
 
 ## Required pre-deployment gates
 
@@ -24,7 +25,7 @@ the product deployment itself and does not depend on another gateway service.
 2. Rehearse the complete migration sequence against a fresh PostgreSQL database
    and the supported SQLite test database. For an upgrade, restore a recent
    production snapshot into an isolated PostgreSQL database and apply every
-   pending migration through v53 while recording lock duration.
+   pending migration through v54 while recording lock duration.
 3. Run the PostgreSQL query-plan gates for request, error, usage, and session
    aggregation at imported-data scale. SQLite evidence does not replace this.
 4. Exercise the S3-compatible archive contract against a disposable bucket and
@@ -42,7 +43,7 @@ the product deployment itself and does not depend on another gateway service.
    and target image digest.
 3. Run the Helm migration Job once. Do not allow application Pods to run schema
    migrations on startup.
-4. Require the Job to finish at v53 before rolling gateway, control, or worker
+4. Require the Job to finish at v54 before rolling gateway, control, or worker
    Pods. A failed or timed-out Job stops the rollout.
 5. Roll control and worker first, then gateway replicas with readiness gates.
    Verify `/version`, request forwarding, credential authorization, live request

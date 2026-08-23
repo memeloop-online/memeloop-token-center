@@ -17,6 +17,9 @@ remaining acceptance gates as of 2026-08-22.
   `/home/token-center-dev/worktrees/completion-p0-p1`.
 - GitHub Actions and GHCR are the only maintained release path. There is no
   Forgejo mirror, Forgejo Actions or Token Center Harbor publisher.
+- All repository automation and operational helper scripts must be TypeScript
+  on Node.js. Remove Python scripts, Python-only test harnesses and their runtime
+  dependencies while preserving their CLI contracts and security properties.
 - Do not build on the Westlake physical root disk. Source, Cargo state, temporary
   files and build cache belong on the Longhorn-backed Coder workspace.
 - Do not run Kubernetes, GitOps, data migration, storage cleanup, rollout or

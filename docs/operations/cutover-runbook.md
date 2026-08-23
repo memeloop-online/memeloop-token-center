@@ -84,7 +84,7 @@ observed collector/CPAMP queue delay.
    output filename:
 
    ```sh
-   python3 ops/export-cpa-session-archive-delta.py \
+   node ops/export-cpa-session-archive-delta.ts \
      --base-url https://REPLACE_API2_ORIGIN \
      --token-file /run/secrets/cpa-management-token \
      --checkpoint /private-evidence/archive-source-checkpoint.json \

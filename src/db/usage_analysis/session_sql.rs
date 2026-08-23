@@ -13,12 +13,27 @@ pub(super) fn session_usage_dimension_sql(
     } else {
         "AND CAST($1 AS TEXT) = ''"
     };
-    let filters = |alias: &str| {
+    let filters = |alias: &str, raw_fact_protocol: bool| {
+        let protocol_filter = if raw_fact_protocol {
+            format!(
+                r#"AND ($6 = ''
+                   OR ($6 = 'anthropic'
+                       AND ({alias}.protocol = 'anthropic'
+                            OR {alias}.protocol LIKE 'anthropic-%'))
+                   OR ($6 = 'openai-image' AND {alias}.protocol = 'openai-image')
+                   OR ($6 = 'openai'
+                       AND {alias}.protocol <> 'openai-image'
+                       AND {alias}.protocol <> 'anthropic'
+                       AND {alias}.protocol NOT LIKE 'anthropic-%'))"#,
+            )
+        } else {
+            format!("AND ($6 = '' OR {alias}.protocol = $6)")
+        };
         format!(
             r#"{tenant_predicate}
               AND ($2 = '' OR {alias}.key_id = $2)
               AND ($5 = '' OR {alias}.model = $5)
-              AND ($6 = '' OR {alias}.protocol = $6)
+              {protocol_filter}
               AND ($7 = ''
                    OR ($7 = 'success' AND {alias}.status_class = 'success')
                    OR ($7 = 'error' AND {alias}.status_class = 'failure'))
@@ -30,8 +45,23 @@ pub(super) fn session_usage_dimension_sql(
             tenant_predicate = tenant_predicate.replace("{alias}", alias),
         )
     };
-    let rollup_filters = filters("rollup");
-    let fact_filters = filters("fact");
+    let rollup_filters = filters("rollup", false);
+    let fact_filters = filters("fact", true);
+    let generation_filters = format!(
+        r#"{tenant_predicate}
+              AND ($2 = '' OR fact.key_id = $2)
+              AND ($5 = '' OR fact.model = $5)
+              AND ($6 = '' OR $6 = 'generation')
+              AND ($7 = ''
+                   OR ($7 = 'success' AND fact.status_class = 'success')
+                   OR ($7 = 'error' AND fact.status_class = 'failure'))
+              AND ($8 = '' OR fact.error_code = $8)
+              AND ($9 = ''
+                   OR ($9 = 'unassigned' AND fact.upstream_account_id = '')
+                   OR fact.upstream_account_id = $9)
+              AND ($10 = '' OR fact.model_route_id = $10)"#,
+        tenant_predicate = tenant_predicate.replace("{alias}", "fact"),
+    );
     format!(
         r#"WITH session_activity AS (
                SELECT rollup.tenant_id, rollup.key_id, rollup.session_id,
@@ -39,6 +69,8 @@ pub(super) fn session_usage_dimension_sql(
                       rollup.error_code, rollup.upstream_account_id,
                       rollup.model_route_id, rollup.currency, rollup.requests,
                       rollup.input_tokens, rollup.output_tokens,
+                      rollup.cached_input_tokens, rollup.cache_write_tokens,
+                      rollup.generation_units,
                       rollup.duration_count, rollup.duration_sum_ms,
                       rollup.cost_micros
                  FROM {table} rollup
@@ -52,8 +84,12 @@ pub(super) fn session_usage_dimension_sql(
                            WHEN fact.protocol = 'openai-image' THEN 'openai-image'
                            ELSE 'openai' END,
                       fact.status_class, fact.error_code, fact.upstream_account_id,
-                      fact.model_route_id, fact.currency, 1, fact.input_tokens,
-                      fact.output_tokens, 1, fact.duration_ms, fact.cost_micros
+                      fact.model_route_id, fact.currency, 1,
+                      CASE WHEN fact.input_tokens >= fact.cached_input_tokens + fact.cache_write_tokens
+                           THEN fact.input_tokens - fact.cached_input_tokens - fact.cache_write_tokens
+                           ELSE 0 END,
+                      fact.output_tokens, fact.cached_input_tokens,
+                      fact.cache_write_tokens, 0, 1, fact.duration_ms, fact.cost_micros
                  FROM request_stats_facts fact
                 WHERE $13 <= $14 AND fact.created_at >= $13 AND fact.created_at <= $14
                   {fact_filters}
@@ -65,11 +101,33 @@ pub(super) fn session_usage_dimension_sql(
                            WHEN fact.protocol = 'openai-image' THEN 'openai-image'
                            ELSE 'openai' END,
                       fact.status_class, fact.error_code, fact.upstream_account_id,
-                      fact.model_route_id, fact.currency, 1, fact.input_tokens,
-                      fact.output_tokens, 1, fact.duration_ms, fact.cost_micros
+                      fact.model_route_id, fact.currency, 1,
+                      CASE WHEN fact.input_tokens >= fact.cached_input_tokens + fact.cache_write_tokens
+                           THEN fact.input_tokens - fact.cached_input_tokens - fact.cache_write_tokens
+                           ELSE 0 END,
+                      fact.output_tokens, fact.cached_input_tokens,
+                      fact.cache_write_tokens, 0, 1, fact.duration_ms, fact.cost_micros
                  FROM request_stats_facts fact
                 WHERE $15 <= $16 AND fact.created_at >= $15 AND fact.created_at <= $16
                   {fact_filters}
+               UNION ALL
+               SELECT fact.tenant_id, fact.key_id, 'unlinked:' || fact.key_id,
+                      fact.model, 'generation', fact.status_class, fact.error_code,
+                      fact.upstream_account_id, fact.model_route_id, fact.currency,
+                      1, 0, 0, 0, 0, fact.billed_units, 1, fact.duration_ms,
+                      fact.cost_micros
+                 FROM generation_stats_facts fact
+                WHERE $13 <= $14 AND fact.created_at >= $13 AND fact.created_at <= $14
+                  {generation_filters}
+               UNION ALL
+               SELECT fact.tenant_id, fact.key_id, 'unlinked:' || fact.key_id,
+                      fact.model, 'generation', fact.status_class, fact.error_code,
+                      fact.upstream_account_id, fact.model_route_id, fact.currency,
+                      1, 0, 0, 0, 0, fact.billed_units, 1, fact.duration_ms,
+                      fact.cost_micros
+                 FROM generation_stats_facts fact
+                WHERE $15 <= $16 AND fact.created_at >= $15 AND fact.created_at <= $16
+                  {generation_filters}
            ),
            filtered_sessions AS (
                SELECT activity.*, key_record.alias AS key_alias
@@ -92,6 +150,9 @@ pub(super) fn session_usage_dimension_sql(
                           AS failed_requests,
                       SUM(input_tokens) AS input_tokens,
                       SUM(output_tokens) AS output_tokens,
+                      SUM(cached_input_tokens) AS cached_input_tokens,
+                      SUM(cache_write_tokens) AS cache_write_tokens,
+                      SUM(generation_units) AS generation_units,
                       SUM(duration_count) AS duration_count,
                       SUM(duration_sum_ms) AS duration_sum_ms,
                       SUM(cost_micros) AS cost_micros
@@ -121,6 +182,9 @@ pub(super) fn session_usage_dimension_sql(
                   CAST(failed_requests AS BIGINT) AS failed_requests,
                   CAST(input_tokens AS BIGINT) AS input_tokens,
                   CAST(output_tokens AS BIGINT) AS output_tokens,
+                  CAST(cached_input_tokens AS BIGINT) AS cached_input_tokens,
+                  CAST(cache_write_tokens AS BIGINT) AS cache_write_tokens,
+                  CAST(generation_units AS BIGINT) AS generation_units,
                   CAST(duration_count AS BIGINT) AS duration_count,
                   CAST(duration_sum_ms AS BIGINT) AS duration_sum_ms,
                   CAST(cost_micros AS BIGINT) AS cost_micros

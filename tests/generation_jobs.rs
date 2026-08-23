@@ -1683,7 +1683,7 @@ async fn running_cancellation_fences_the_polling_lease_and_refunds_only_after_co
 
 #[tokio::test]
 async fn terminal_generation_stats_are_idempotent_and_keep_exact_filters() {
-    let (_directory, database, key, upstream_id, price) = fixture().await;
+    let (directory, database, key, upstream_id, price) = fixture().await;
     let reservation = reserve(&database, &key, &price).await;
     let job = database
         .create_generation_job(input(&key, upstream_id, reservation.clone(), &price))
@@ -1739,6 +1739,42 @@ async fn terminal_generation_stats_are_idempotent_and_keep_exact_filters() {
         .filter(|entry| entry.kind == "usage" && entry.source == reservation.id.to_string())
         .count();
     assert_eq!(usage_entries, 1);
+    let inspection = AnyPool::connect(&format!(
+        "sqlite://{}?mode=rw",
+        directory.path().join("generation.db").display()
+    ))
+    .await
+    .unwrap();
+    let session = sqlx::query(
+        r#"SELECT requests, generation_units, input_tokens, output_tokens,
+                  cached_input_tokens, cache_write_tokens, cost_micros
+             FROM session_usage_totals
+            WHERE key_id = $1 AND session_id = $2"#,
+    )
+    .bind(key.key_id.to_string())
+    .bind(format!("unlinked:{}", key.key_id))
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(session.get::<i64, _>("requests"), 1);
+    assert_eq!(session.get::<i64, _>("generation_units"), 1);
+    assert_eq!(session.get::<i64, _>("input_tokens"), 0);
+    assert_eq!(session.get::<i64, _>("output_tokens"), 0);
+    assert_eq!(session.get::<i64, _>("cached_input_tokens"), 0);
+    assert_eq!(session.get::<i64, _>("cache_write_tokens"), 0);
+    assert_eq!(session.get::<i64, _>("cost_micros"), cost_micros);
+    for table in ["session_usage_hourly", "session_usage_daily"] {
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE key_id = $1 AND session_id = $2 AND generation_units = 1"
+        )))
+        .bind(key.key_id.to_string())
+        .bind(format!("unlinked:{}", key.key_id))
+        .fetch_one(&inspection)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "{table} must contain one idempotent projection");
+    }
+    inspection.close().await;
     let finished = database
         .generation_job(key.key_id, job.job_id)
         .await

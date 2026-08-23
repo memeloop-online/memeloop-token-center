@@ -59,6 +59,63 @@ pub(super) async fn aggregate_terminal_generation_job(
         return Err(AppError::Internal);
     }
 
+    sqlx::query(
+        r#"INSERT INTO session_usage_totals (
+               tenant_id, key_id, session_id, currency, last_activity_at,
+               requests, errors, input_tokens, output_tokens, cached_input_tokens,
+               cache_write_tokens, generation_units, duration_count,
+               duration_sum_ms, cost_micros)
+           SELECT tenant_id, key_id, 'unlinked:' || key_id, currency, created_at,
+                  1, CASE WHEN status_class = 'failure' THEN 1 ELSE 0 END,
+                  0, 0, 0, 0, billed_units, 1, duration_ms, cost_micros
+             FROM generation_stats_facts WHERE job_id = $1
+           ON CONFLICT (tenant_id, key_id, session_id, currency) DO UPDATE SET
+               last_activity_at = CASE
+                   WHEN session_usage_totals.last_activity_at < excluded.last_activity_at
+                   THEN excluded.last_activity_at ELSE session_usage_totals.last_activity_at END,
+               requests = session_usage_totals.requests + 1,
+               errors = session_usage_totals.errors + excluded.errors,
+               generation_units = session_usage_totals.generation_units + excluded.generation_units,
+               duration_count = session_usage_totals.duration_count + 1,
+               duration_sum_ms = session_usage_totals.duration_sum_ms + excluded.duration_sum_ms,
+               cost_micros = session_usage_totals.cost_micros + excluded.cost_micros"#,
+    )
+    .bind(job_id)
+    .execute(&mut **transaction)
+    .await?;
+
+    for (table, bucket_column, divisor) in [
+        ("session_usage_hourly", "hour_bucket", 3_600_000_i64),
+        ("session_usage_daily", "day_bucket", 86_400_000_i64),
+    ] {
+        let statement = format!(
+            r#"INSERT INTO {table} (
+                   tenant_id, key_id, session_id, {bucket_column}, model, protocol,
+                   status_class, error_code, upstream_account_id, model_route_id,
+                   currency, requests, input_tokens, output_tokens, cached_input_tokens,
+                   cache_write_tokens, generation_units, duration_count,
+                   duration_sum_ms, cost_micros)
+               SELECT tenant_id, key_id, 'unlinked:' || key_id,
+                      created_at / {divisor}, model, 'generation', status_class,
+                      error_code, upstream_account_id, model_route_id, currency,
+                      1, 0, 0, 0, 0, billed_units, 1, duration_ms, cost_micros
+                 FROM generation_stats_facts WHERE job_id = $1
+               ON CONFLICT (
+                   tenant_id, key_id, session_id, {bucket_column}, model, protocol,
+                   status_class, error_code, upstream_account_id, model_route_id, currency)
+               DO UPDATE SET
+                   requests = {table}.requests + 1,
+                   generation_units = {table}.generation_units + excluded.generation_units,
+                   duration_count = {table}.duration_count + 1,
+                   duration_sum_ms = {table}.duration_sum_ms + excluded.duration_sum_ms,
+                   cost_micros = {table}.cost_micros + excluded.cost_micros"#,
+        );
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind(job_id)
+            .execute(&mut **transaction)
+            .await?;
+    }
+
     let aggregated = sqlx::query(
         "INSERT INTO generation_daily_aggregates (tenant_id, key_id, day_bucket, model, status_class, error_code, upstream_account_id, requests, billed_units, cost_micros, currency) SELECT f.tenant_id, f.key_id, f.created_at / 86400000, f.model, f.status_class, f.error_code, f.upstream_account_id, 1, f.billed_units, f.cost_micros, f.currency FROM generation_stats_facts f WHERE f.job_id = $1 ON CONFLICT (tenant_id, key_id, day_bucket, model, status_class, error_code, upstream_account_id, currency) DO UPDATE SET requests = generation_daily_aggregates.requests + excluded.requests, billed_units = generation_daily_aggregates.billed_units + excluded.billed_units, cost_micros = generation_daily_aggregates.cost_micros + excluded.cost_micros",
     )

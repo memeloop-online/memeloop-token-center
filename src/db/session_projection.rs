@@ -19,6 +19,8 @@ struct RequestSessionDelta {
     duration_ms: i64,
     input_tokens: i64,
     output_tokens: i64,
+    cached_input_tokens: i64,
+    cache_write_tokens: i64,
     cost_micros: i64,
 }
 
@@ -29,11 +31,15 @@ pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
     sqlx::query(
         r#"INSERT INTO session_usage_totals (
                tenant_id, key_id, session_id, currency, last_activity_at,
-               requests, errors, input_tokens, output_tokens, duration_count,
+               requests, errors, input_tokens, output_tokens, cached_input_tokens,
+               cache_write_tokens, generation_units, duration_count,
                duration_sum_ms, cost_micros)
            SELECT tenant_id, key_id, session_id, currency, created_at, 1,
                   CASE WHEN status_class = 'failure' THEN 1 ELSE 0 END,
-                  input_tokens, output_tokens, 1, duration_ms, cost_micros
+                  CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
+                       THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
+                  output_tokens, cached_input_tokens, cache_write_tokens, 0,
+                  1, duration_ms, cost_micros
              FROM request_stats_facts WHERE request_id = $1
            ON CONFLICT (tenant_id, key_id, session_id, currency) DO UPDATE SET
                last_activity_at = CASE
@@ -43,6 +49,8 @@ pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
                errors = session_usage_totals.errors + excluded.errors,
                input_tokens = session_usage_totals.input_tokens + excluded.input_tokens,
                output_tokens = session_usage_totals.output_tokens + excluded.output_tokens,
+               cached_input_tokens = session_usage_totals.cached_input_tokens + excluded.cached_input_tokens,
+               cache_write_tokens = session_usage_totals.cache_write_tokens + excluded.cache_write_tokens,
                duration_count = session_usage_totals.duration_count + 1,
                duration_sum_ms = session_usage_totals.duration_sum_ms + excluded.duration_sum_ms,
                cost_micros = session_usage_totals.cost_micros + excluded.cost_micros"#,
@@ -59,14 +67,19 @@ pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
             r#"INSERT INTO {table} (
                    tenant_id, key_id, session_id, {bucket_column}, model, protocol,
                    status_class, error_code, upstream_account_id, model_route_id,
-                   currency, requests, input_tokens, output_tokens, duration_count,
+                   currency, requests, input_tokens, output_tokens, cached_input_tokens,
+                   cache_write_tokens, generation_units, duration_count,
                    duration_sum_ms, cost_micros)
                SELECT tenant_id, key_id, session_id, created_at / {divisor}, model,
                       CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%'
                            THEN 'anthropic' WHEN protocol = 'openai-image' THEN 'openai-image'
                            ELSE 'openai' END,
                       status_class, error_code, upstream_account_id, model_route_id,
-                      currency, 1, input_tokens, output_tokens, 1, duration_ms, cost_micros
+                      currency, 1,
+                      CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
+                           THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
+                      output_tokens, cached_input_tokens, cache_write_tokens, 0,
+                      1, duration_ms, cost_micros
                  FROM request_stats_facts WHERE request_id = $1
                ON CONFLICT (
                    tenant_id, key_id, session_id, {bucket_column}, model, protocol,
@@ -75,6 +88,8 @@ pub(crate) async fn add_request_fact_to_session_projection_in_transaction(
                    requests = {table}.requests + 1,
                    input_tokens = {table}.input_tokens + excluded.input_tokens,
                    output_tokens = {table}.output_tokens + excluded.output_tokens,
+                   cached_input_tokens = {table}.cached_input_tokens + excluded.cached_input_tokens,
+                   cache_write_tokens = {table}.cache_write_tokens + excluded.cache_write_tokens,
                    duration_count = {table}.duration_count + 1,
                    duration_sum_ms = {table}.duration_sum_ms + excluded.duration_sum_ms,
                    cost_micros = {table}.cost_micros + excluded.cost_micros"#,
@@ -97,6 +112,7 @@ pub(crate) async fn reclassify_request_session_in_transaction(
                   fact.model, fact.protocol, fact.status_class, fact.error_code,
                   fact.upstream_account_id, fact.model_route_id, fact.currency,
                   fact.duration_ms, fact.input_tokens, fact.output_tokens,
+                  fact.cached_input_tokens, fact.cache_write_tokens,
                   fact.cost_micros,
                   COALESCE(record.conversation_cluster_id,
                            'unlinked:' || fact.key_id) AS authoritative_session_id
@@ -127,8 +143,15 @@ pub(crate) async fn reclassify_request_session_in_transaction(
         model_route_id: row.try_get("model_route_id")?,
         currency: row.try_get("currency")?,
         duration_ms: row.try_get("duration_ms")?,
-        input_tokens: row.try_get("input_tokens")?,
+        input_tokens: {
+            let input_tokens: i64 = row.try_get("input_tokens")?;
+            let cached_input_tokens: i64 = row.try_get("cached_input_tokens")?;
+            let cache_write_tokens: i64 = row.try_get("cache_write_tokens")?;
+            input_tokens.saturating_sub(cached_input_tokens.saturating_add(cache_write_tokens))
+        },
         output_tokens: row.try_get("output_tokens")?,
+        cached_input_tokens: row.try_get("cached_input_tokens")?,
+        cache_write_tokens: row.try_get("cache_write_tokens")?,
         cost_micros: row.try_get("cost_micros")?,
     };
     if delta.previous_session_id == delta.authoritative_session_id {
@@ -160,6 +183,15 @@ async fn remove_request_fact_from_session_projection_in_transaction(
     tx: &mut Transaction<'_, Any>,
     delta: &RequestSessionDelta,
 ) -> Result<(), AppError> {
+    if delta.previous_session_id == format!("unlinked:{}", delta.key_id) {
+        return rebuild_request_session_projection_in_transaction(
+            tx,
+            &delta.tenant_id,
+            &delta.key_id,
+            &delta.previous_session_id,
+        )
+        .await;
+    }
     let error_delta = i64::from(delta.status_class == "failure");
     let totals = sqlx::query(
         r#"UPDATE session_usage_totals SET
@@ -167,17 +199,22 @@ async fn remove_request_fact_from_session_projection_in_transaction(
                errors = errors - $1,
                input_tokens = input_tokens - $2,
                output_tokens = output_tokens - $3,
+               cached_input_tokens = cached_input_tokens - $4,
+               cache_write_tokens = cache_write_tokens - $5,
                duration_count = duration_count - 1,
-               duration_sum_ms = duration_sum_ms - $4,
-               cost_micros = cost_micros - $5
-           WHERE tenant_id = $6 AND key_id = $7 AND session_id = $8 AND currency = $9
+               duration_sum_ms = duration_sum_ms - $6,
+               cost_micros = cost_micros - $7
+           WHERE tenant_id = $8 AND key_id = $9 AND session_id = $10 AND currency = $11
              AND requests >= 1 AND errors >= $1 AND input_tokens >= $2
-             AND output_tokens >= $3 AND duration_count >= 1
-             AND duration_sum_ms >= $4 AND cost_micros >= $5"#,
+             AND output_tokens >= $3 AND cached_input_tokens >= $4
+             AND cache_write_tokens >= $5 AND duration_count >= 1
+             AND duration_sum_ms >= $6 AND cost_micros >= $7"#,
     )
     .bind(error_delta)
     .bind(delta.input_tokens)
     .bind(delta.output_tokens)
+    .bind(delta.cached_input_tokens)
+    .bind(delta.cache_write_tokens)
     .bind(delta.duration_ms)
     .bind(delta.cost_micros)
     .bind(&delta.tenant_id)
@@ -250,20 +287,25 @@ async fn remove_request_fact_from_session_projection_in_transaction(
                    requests = requests - 1,
                    input_tokens = input_tokens - $1,
                    output_tokens = output_tokens - $2,
+                   cached_input_tokens = cached_input_tokens - $3,
+                   cache_write_tokens = cache_write_tokens - $4,
                    duration_count = duration_count - 1,
-                   duration_sum_ms = duration_sum_ms - $3,
-                   cost_micros = cost_micros - $4
-               WHERE tenant_id = $5 AND key_id = $6 AND session_id = $7
-                 AND {bucket_column} = $8 AND model = $9 AND protocol = $10
-                 AND status_class = $11 AND error_code = $12
-                 AND upstream_account_id = $13 AND model_route_id = $14
-                 AND currency = $15 AND requests >= 1 AND input_tokens >= $1
-                 AND output_tokens >= $2 AND duration_count >= 1
-                 AND duration_sum_ms >= $3 AND cost_micros >= $4"#,
+                   duration_sum_ms = duration_sum_ms - $5,
+                   cost_micros = cost_micros - $6
+               WHERE tenant_id = $7 AND key_id = $8 AND session_id = $9
+                 AND {bucket_column} = $10 AND model = $11 AND protocol = $12
+                 AND status_class = $13 AND error_code = $14
+                 AND upstream_account_id = $15 AND model_route_id = $16
+                 AND currency = $17 AND requests >= 1 AND input_tokens >= $1
+                 AND output_tokens >= $2 AND cached_input_tokens >= $3
+                 AND cache_write_tokens >= $4 AND duration_count >= 1
+                 AND duration_sum_ms >= $5 AND cost_micros >= $6"#,
         );
         let updated = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(delta.input_tokens)
             .bind(delta.output_tokens)
+            .bind(delta.cached_input_tokens)
+            .bind(delta.cache_write_tokens)
             .bind(delta.duration_ms)
             .bind(delta.cost_micros)
             .bind(&delta.tenant_id)
@@ -393,15 +435,50 @@ async fn rebuild_request_session_projection_in_transaction(
     sqlx::query(
         r#"INSERT INTO session_usage_totals (
                tenant_id, key_id, session_id, currency, last_activity_at,
-               requests, errors, input_tokens, output_tokens, duration_count,
+               requests, errors, input_tokens, output_tokens, cached_input_tokens,
+               cache_write_tokens, generation_units, duration_count,
                duration_sum_ms, cost_micros)
            SELECT tenant_id, key_id, session_id, currency, MAX(created_at), COUNT(*),
                   SUM(CASE WHEN status_class = 'failure' THEN 1 ELSE 0 END),
-                  SUM(input_tokens), SUM(output_tokens), COUNT(*), SUM(duration_ms),
-                  SUM(cost_micros)
+                  SUM(CASE
+                          WHEN input_tokens >= cached_input_tokens + cache_write_tokens
+                          THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END),
+                  SUM(output_tokens), SUM(cached_input_tokens), SUM(cache_write_tokens),
+                  0, COUNT(*), SUM(duration_ms), SUM(cost_micros)
              FROM request_stats_facts
             WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3
             GROUP BY tenant_id, key_id, session_id, currency"#,
+    )
+    .bind(tenant_id)
+    .bind(key_id)
+    .bind(session_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"INSERT INTO session_usage_totals (
+               tenant_id, key_id, session_id, currency, last_activity_at,
+               requests, errors, input_tokens, output_tokens, cached_input_tokens,
+               cache_write_tokens, generation_units, duration_count,
+               duration_sum_ms, cost_micros)
+           SELECT tenant_id, key_id, 'unlinked:' || key_id, currency,
+                  MAX(created_at), COUNT(*),
+                  SUM(CASE WHEN status_class = 'failure' THEN 1 ELSE 0 END),
+                  0, 0, 0, 0, SUM(billed_units), COUNT(*), SUM(duration_ms),
+                  SUM(cost_micros)
+             FROM generation_stats_facts
+            WHERE tenant_id = $1 AND key_id = $2
+              AND $3 = 'unlinked:' || key_id
+            GROUP BY tenant_id, key_id, currency
+           ON CONFLICT (tenant_id, key_id, session_id, currency) DO UPDATE SET
+               last_activity_at = CASE
+                   WHEN session_usage_totals.last_activity_at < excluded.last_activity_at
+                   THEN excluded.last_activity_at ELSE session_usage_totals.last_activity_at END,
+               requests = session_usage_totals.requests + excluded.requests,
+               errors = session_usage_totals.errors + excluded.errors,
+               generation_units = session_usage_totals.generation_units + excluded.generation_units,
+               duration_count = session_usage_totals.duration_count + excluded.duration_count,
+               duration_sum_ms = session_usage_totals.duration_sum_ms + excluded.duration_sum_ms,
+               cost_micros = session_usage_totals.cost_micros + excluded.cost_micros"#,
     )
     .bind(tenant_id)
     .bind(key_id)
@@ -416,7 +493,8 @@ async fn rebuild_request_session_projection_in_transaction(
             r#"INSERT INTO {table} (
                    tenant_id, key_id, session_id, {bucket_column}, model, protocol,
                    status_class, error_code, upstream_account_id, model_route_id,
-                   currency, requests, input_tokens, output_tokens, duration_count,
+                   currency, requests, input_tokens, output_tokens, cached_input_tokens,
+                   cache_write_tokens, generation_units, duration_count,
                    duration_sum_ms, cost_micros)
                SELECT tenant_id, key_id, session_id, created_at / {divisor}, model,
                       CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%'
@@ -424,8 +502,12 @@ async fn rebuild_request_session_projection_in_transaction(
                            WHEN protocol = 'openai-image' THEN 'openai-image'
                            ELSE 'openai' END,
                       status_class, error_code, upstream_account_id, model_route_id,
-                      currency, COUNT(*), SUM(input_tokens), SUM(output_tokens),
-                      COUNT(*), SUM(duration_ms), SUM(cost_micros)
+                      currency, COUNT(*),
+                      SUM(CASE
+                              WHEN input_tokens >= cached_input_tokens + cache_write_tokens
+                              THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END),
+                      SUM(output_tokens), SUM(cached_input_tokens), SUM(cache_write_tokens),
+                      0, COUNT(*), SUM(duration_ms), SUM(cost_micros)
                  FROM request_stats_facts
                 WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3
                 GROUP BY tenant_id, key_id, session_id, created_at / {divisor}, model,
@@ -437,6 +519,31 @@ async fn rebuild_request_session_projection_in_transaction(
                       currency"#
         );
         sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind(tenant_id)
+            .bind(key_id)
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await?;
+        let generation_statement = format!(
+            r#"INSERT INTO {table} (
+                   tenant_id, key_id, session_id, {bucket_column}, model, protocol,
+                   status_class, error_code, upstream_account_id, model_route_id,
+                   currency, requests, input_tokens, output_tokens, cached_input_tokens,
+                   cache_write_tokens, generation_units, duration_count,
+                   duration_sum_ms, cost_micros)
+               SELECT tenant_id, key_id, 'unlinked:' || key_id,
+                      created_at / {divisor}, model, 'generation', status_class,
+                      error_code, upstream_account_id, model_route_id, currency,
+                      COUNT(*), 0, 0, 0, 0, SUM(billed_units), COUNT(*),
+                      SUM(duration_ms), SUM(cost_micros)
+                 FROM generation_stats_facts
+                WHERE tenant_id = $1 AND key_id = $2
+                  AND $3 = 'unlinked:' || key_id
+                GROUP BY tenant_id, key_id, created_at / {divisor}, model,
+                         status_class, error_code, upstream_account_id,
+                         model_route_id, currency"#,
+        );
+        sqlx::query(sqlx::AssertSqlSafe(generation_statement))
             .bind(tenant_id)
             .bind(key_id)
             .bind(session_id)

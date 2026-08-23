@@ -107,13 +107,16 @@ function GenerationUnitsValue({ modalityValues = [], billingUnitValues = [], leg
     ...(mode !== 'modality' ? billingUnitValues.map((item) => ({ kind: 'billing_unit' as const, value: item.billing_unit, currency: item.currency, units: item.units })) : []),
   ].sort((left, right) => `${left.kind}:${left.value}:${left.currency}`.localeCompare(`${right.kind}:${right.value}:${right.currency}`));
   if (!rows.length) {
-    return legacyUnits > 0
-      ? <span title={String(legacyUnits)}>{formatNumber(legacyUnits, locale)} · {t('usage.legacyGenerationUnits')}</span>
-      : <span>—</span>;
+    if (legacyUnits <= 0) return <span>—</span>;
+    const formatted = formatMetricNumber(legacyUnits, locale);
+    return <span title={formatted.title ?? String(legacyUnits)}>{formatted.text} · {t('usage.legacyGenerationUnits')}</span>;
   }
-  return <span className="usage-unit-lines">{rows.map((row) => <span key={`${row.kind}:${row.value}:${row.currency}`} title={`${row.units} ${row.currency}`}>
-    {generationUnitLabel(row.kind, row.value, t)} · {row.currency} · {formatNumber(row.units, locale)}
-  </span>)}</span>;
+  return <span className="usage-unit-lines">{rows.map((row) => {
+    const formatted = formatMetricNumber(row.units, locale);
+    return <span key={`${row.kind}:${row.value}:${row.currency}`} title={`${formatted.title ?? row.units} ${row.currency}`}>
+      {generationUnitLabel(row.kind, row.value, t)} · {row.currency} · {formatted.text}
+    </span>;
+  })}</span>;
 }
 
 function successRate(metrics: UsageAnalysisMetrics) {
@@ -130,11 +133,15 @@ function DimensionTable<T extends UsageAnalysisBucket>({ title, values, onSelect
   return <article className="panel usage-dimension"><div className="panel-title"><h2>{title}</h2><span>{formatNumber(values.length, locale)}</span></div>
     {values.length === 0 ? <div className="empty">{t('usage.noDimensionData')}</div> : <div className="table-scroll"><table><thead><tr><th>{title}</th><th>{t('usage.requests')}</th><th>{t('usage.tokens')}</th><th>{t('usage.generationUnits')}</th><th>{t('usage.cost')}</th><th>{t('usage.successRate')}</th></tr></thead><tbody>{values.map((value) => {
       const label = labelForValue?.(value) || value.label || t('common.none');
+      const tokens = value.input_tokens + value.output_tokens + value.cached_input_tokens + value.cache_write_tokens;
+      const formattedRequests = formatMetricNumber(value.requests, locale);
+      const formattedTokens = formatMetricNumber(tokens, locale);
+      const formattedGenerationUnits = formatMetricNumber(value.generation_units, locale);
       return <tr key={value.id}>
       <td>{onSelect ? <button type="button" className="table-link usage-filter-link" onClick={() => onSelect(value)} aria-label={t('usage.filterByDimension', { name: label })}>{label}</button> : label}</td>
-      <td title={String(value.requests)}>{formatNumber(value.requests, locale)}</td>
-      <td title={String(value.input_tokens + value.output_tokens + value.cached_input_tokens + value.cache_write_tokens)}>{formatNumber(value.input_tokens + value.output_tokens + value.cached_input_tokens + value.cache_write_tokens, locale)}</td>
-      <td title={String(value.generation_units)}>{formatNumber(value.generation_units, locale)}</td>
+      <td title={formattedRequests.title ?? String(value.requests)}>{formattedRequests.text}</td>
+      <td title={formattedTokens.title ?? String(tokens)}>{formattedTokens.text}</td>
+      <td title={formattedGenerationUnits.title ?? String(value.generation_units)}>{formattedGenerationUnits.text}</td>
       <td><CostValue costs={value.costs} /></td>
       <td>{formatPercent(successRate(value), locale)}</td>
     </tr>;
@@ -153,9 +160,11 @@ function pointLabel(point: UsageAnalysisTimeBucket, locale: 'zh-CN' | 'en', gran
 }
 
 function trendFormattedValue(value: number, metric: TrendMetric, currency: string, locale: 'zh-CN' | 'en') {
-  if (metric === 'cost') return formatCurrency(value, currency, locale);
-  if (metric === 'avg_latency' || metric === 'p95_latency') return formatMilliseconds(value, locale);
-  return formatNumber(value, locale, metric === 'tokens' ? 0 : 2);
+  if (metric === 'cost') return { text: formatCurrency(value, currency, locale), title: `${value} ${currency}` };
+  if (metric === 'avg_latency' || metric === 'p95_latency') {
+    return { text: formatMilliseconds(value, locale), title: `${value} ms` };
+  }
+  return formatMetricNumber(value, locale);
 }
 
 function TrendChart({ points, granularity, metric, currency, onSelectBucket }: {
@@ -194,11 +203,14 @@ function TrendChart({ points, granularity, metric, currency, onSelectBucket }: {
     <line className="usage-chart-axis" x1={paddingX} y1={height - paddingY} x2={width - paddingX} y2={height - paddingY} />
     <path className="usage-chart-line" d={path} />
     {coordinates.map(({ point, value, x, y }, index) => <g key={point.bucket_start}>
-      {value !== null && y !== null && <circle className="usage-chart-point" cx={x} cy={y} r="4"><title>{`${pointLabel(point, locale, granularity)}: ${trendFormattedValue(value, metric, currency, locale)}`}</title></circle>}
+      {value !== null && y !== null && <circle className="usage-chart-point" cx={x} cy={y} r="4"><title>{(() => { const formatted = trendFormattedValue(value, metric, currency, locale); return `${pointLabel(point, locale, granularity)}: ${formatted.text}${formatted.title && formatted.title !== formatted.text ? ` (${formatted.title})` : ''}`; })()}</title></circle>}
       {(index % labelStep === 0 || index === coordinates.length - 1) && <text className="usage-chart-label" x={x} y={height - 6} textAnchor={index === 0 ? 'start' : index === coordinates.length - 1 ? 'end' : 'middle'}>{pointLabel(point, locale, granularity)}</text>}
     </g>)}
   </svg><div className="usage-trend-points" aria-label={t('usage.trendData')}>
-    {coordinates.map(({ point, value }) => <button type="button" className="secondary" key={point.bucket_start} onClick={() => onSelectBucket(point)}>{pointLabel(point, locale, granularity)} · {value === null ? '—' : trendFormattedValue(value, metric, currency, locale)}</button>)}
+    {coordinates.map(({ point, value }) => {
+      const formatted = value === null ? undefined : trendFormattedValue(value, metric, currency, locale);
+      return <button type="button" className="secondary" key={point.bucket_start} onClick={() => onSelectBucket(point)}>{pointLabel(point, locale, granularity)} · <span title={formatted?.title}>{formatted?.text ?? '—'}</span></button>;
+    })}
   </div></div>;
 }
 

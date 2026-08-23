@@ -40,6 +40,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm audit --audit-level=high
+      - run: npm run typecheck
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.95.0
@@ -134,6 +141,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.95.0
@@ -153,13 +163,9 @@ jobs:
             -o DPkg::Lock::Timeout=60 \
             install --yes --no-install-recommends postgresql-client sqlite3
       - name: Run legacy credential operator failure-mode acceptance
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
-        run: python3 tests/ops/test_legacy_credentials_bulk.py
+        run: node --test tests/ops/test-legacy-credentials-bulk.ts
       - name: Verify memory harness seed contract
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
-        run: python3 tests/load/test_benchmark_memory.py
+        run: node --test tests/load/test-benchmark-memory.ts
       - name: Run isolated legacy credential PostgreSQL operator acceptance
         id: isolated_legacy_pg
         env:
@@ -252,6 +258,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.95.0
@@ -307,7 +316,7 @@ jobs:
         env:
           MTC_BENCH_DATABASE_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
         run: |
-          python3 tests/load/postgres_explain.py \
+          node tests/load/postgres_explain.ts \
             --output /tmp/postgres-explain-${GITHUB_SHA}.json
       - name: Retain PostgreSQL scale-plan evidence
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
@@ -317,7 +326,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Validate resumable CPA session-archive delta export
-        run: python3 tests/ops/test-session-archive-delta-export.py
+        run: node --test tests/ops/test-session-archive-delta-export.ts
       - name: Exercise CPAMP initial, overlap, incremental, and replay imports
         env:
           PGHOST: 127.0.0.1
@@ -365,12 +374,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Install pinned OpenAPI validation dependencies
-        run: python3 -m pip install --requirement tests/ops/requirements-openapi.txt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          cache: npm
+      - name: Install pinned TypeScript operator dependencies
+        run: npm ci
       - name: Compare Axum source routes, role boundaries, and OpenAPI
         run: |
-          python3 tests/ops/test-openapi-contract.py
-          python3 tests/ops/check-openapi-contract.py \
+          node --test tests/ops/test-openapi-contract.ts
+          node tests/ops/check-openapi-contract.ts \
             --output /tmp/memeloop-token-center-route-contract.json
       - name: Retain the resolved route contract
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
