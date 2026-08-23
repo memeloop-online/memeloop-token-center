@@ -206,10 +206,16 @@ the existing buffered-only ABI.
 
 The default production deployment is Kubernetes through the maintained Helm
 chart, with separate gateway, control and worker roles. PostgreSQL and S3 are
-external production dependencies. The target topology eventually exposes one
-cluster-internal address and two separately controlled external addresses. A new
-candidate is first deployed to a cluster-internal/API3 trial address and must
-pass dogfood before any production traffic change.
+external production dependencies. The target topology exposes one
+cluster-internal address and two separately controlled external addresses.
+
+**2026-08-23 release-order override:** API3 is the production target. One exact
+source SHA and its immutable service, importer and plugin-installer digests must
+first be deployed to the CPA/API2 trial slot for the user and release agent to
+exercise. The previous CPA revision, data backup and routing configuration must
+remain an immediately usable rollback point. Only the exact same digests may be
+promoted to API3, and only after the CPA/API2 trial evidence below is complete.
+This explicitly supersedes the earlier API3-first trial sequence.
 
 The public service must be checked for injection, privilege escalation, IDOR,
 tenant isolation, SSRF/DNS rebinding, credential or body leakage in logs,
@@ -227,8 +233,14 @@ Release acceptance requires, for one exact source SHA:
 - migration replay, archive replay, permission isolation and security gates;
 - imported-scale query plans and bounded-memory/load evidence;
 - immutable GitHub Container Registry image digests; and
-- deployed browser dogfood for operator, legacy client credential, Chinese,
-  English, light, dark, statistics, archives and multimodal accounting.
+- deployed browser dogfood covering existing CPA accounts, subscriptions and
+  history; unified upstreams and OAuth; provider, route and credential groups;
+  credentials and price synchronization; all usage/session views; Chinese,
+  English, light and dark presentation; archives; and multimodal accounting;
+- Codex CLI requests routed through the CPA/API2 trial endpoint for both text
+  and image generation; and
+- promotion of the same immutable digests to API3 only after every trial check
+  is green.
 
 See [Deployment readiness](deployment-readiness.md),
 [Production deployment](operations/production-deployment.md),
@@ -248,12 +260,15 @@ duplicate facts or aggregates, and uses a reviewed overlap window for late
 writes. Session archives are dry-run, apply and exact-replay checked. Exact and
 unlinked counts, object digests, source totals and target totals must reconcile.
 
-API3 trial imports are disposable and may be overwritten by the final approved
-baseline. A complete migration and write barrier are forbidden during ordinary
-development or trial. The final delta, barrier and traffic shift happen only in
-a user-declared maintenance window and only after the user explicitly approves
-formal cutover. CPA remains the production service until then. Detailed steps
-and rollback are in [CPA to Token Center cutover](operations/cutover-runbook.md).
+The CPA/API2 trial deployment must preserve the old CPA revision and a verified
+route-back operation. Trial-scoped writes must be identifiable and reversible;
+existing accounts, subscriptions, credentials and history must be validated in
+place without destructive resets. A complete migration, final write barrier or
+irreversible traffic shift remains forbidden outside a user-declared
+maintenance window. Passing trial evidence authorizes promotion of the same
+digests to the API3 production target, but it does not by itself authorize data
+destruction or removal of the CPA rollback point. Detailed steps and rollback
+are in [CPA to Token Center cutover](operations/cutover-runbook.md).
 
 ## Repository and operational ownership
 
@@ -270,9 +285,11 @@ and rollback are in [CPA to Token Center cutover](operations/cutover-runbook.md)
   Source and caches belong in the Longhorn-backed Coder workspace; release
   compilation belongs in GitHub Actions.
 - Kubernetes, GitOps, migration execution, storage cleanup, rollout and cluster
-  validation must be delegated to the infrastructure task
-  `codex://threads/01a00a1e-3a18-7b82-8a36-a663c0ab6adc`. Product development
-  must not create ad-hoc `k3s-gitops` branches or modify old CPA/API2 traffic.
+  validation are coordinated with the infrastructure task
+  `codex://threads/01a00a1e-3a18-7b82-8a36-a663c0ab6adc`. The CPA/API2 trial
+  rollout is authorized only with a recorded old-CPA rollback point; API3 must
+  remain unchanged until the release agent records complete browser and Codex
+  CLI evidence and explicitly releases the same digests.
 
 ## Explicitly rejected or removed designs
 
@@ -288,4 +305,4 @@ The following are not requirements and must not be reintroduced:
 - presenting SQLite, filesystem storage or in-memory storage as production
   defaults;
 - guessing archive/session associations when evidence is ambiguous; and
-- a full production migration or traffic cutover during the API3 trial period.
+- an irreversible migration or traffic cutover during the CPA/API2 trial.

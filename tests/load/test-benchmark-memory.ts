@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assetGatewayRssEvidence, chatPayload, createMockServer, MockState, seed } from "./benchmark-memory.ts";
+import { assetGatewayRssEvidence, chatPayload, createMockServer, MockState, seed, smallChat } from "./benchmark-memory.ts";
 
 test("asset gateway gate uses elevated phase start, not original idle", () => {
   const evidence = assetGatewayRssEvidence(180, 150, 40); assert.equal(evidence.gateway_phase_delta_rss_mib, 30); assert.equal(evidence.gateway_cumulative_delta_from_original_idle_mib, 140); assert.ok(evidence.gateway_phase_delta_rss_mib <= 96); assert.ok(evidence.gateway_cumulative_delta_from_original_idle_mib > 96);
@@ -17,4 +17,8 @@ test("every benchmark route explicitly confirms its custom model", async () => {
 
 test("stream fixture exercises the streaming proxy path", async () => {
   const server = createMockServer(new MockState()); await new Promise<void>((done) => server.listen(0, "127.0.0.1", done)); try { const address = server.address(); assert.ok(address && typeof address !== "string"); const response = await fetch(`http://127.0.0.1:${address.port}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(chatPayload("stream", 4096)) }); assert.equal(response.status, 200); assert.equal(response.headers.get("content-type"), "text/event-stream"); assert.equal((await response.arrayBuffer()).byteLength, 4096); } finally { await new Promise<void>((done) => server.close(() => done())); }
+});
+
+test("soak chat uses bounded node:http requests instead of Undici fetch", async () => {
+  const server = createMockServer(new MockState()); await new Promise<void>((done) => server.listen(0, "127.0.0.1", done)); const originalFetch = globalThis.fetch; globalThis.fetch = () => { throw new Error("Undici fetch must not be used by soak chat"); }; try { const address = server.address(); assert.ok(address && typeof address !== "string"); for (let index = 0; index < 25; index += 1) assert.ok(await smallChat(`http://127.0.0.1:${address.port}`, "test-key") > 0); } finally { globalThis.fetch = originalFetch; await new Promise<void>((done) => server.close(() => done())); }
 });

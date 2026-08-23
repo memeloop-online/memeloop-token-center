@@ -37,20 +37,25 @@ the product deployment itself and does not depend on another gateway service.
 
 ## Upgrade sequence
 
-1. Keep the existing serving revision healthy while the new image and chart are
-   staged.
+1. Record the exact old CPA image, database/archive backup identifiers and
+   routing configuration. Keep that revision healthy and immediately routable
+   while the same-SHA candidate images and chart are staged in CPA/API2.
 2. Back up PostgreSQL and the archive bucket. Record the exact backup identifiers
    and target image digest.
 3. Run the Helm migration Job once. Do not allow application Pods to run schema
    migrations on startup.
 4. Require the Job to finish at v54 before rolling gateway, control, or worker
    Pods. A failed or timed-out Job stops the rollout.
-5. Roll control and worker first, then gateway replicas with readiness gates.
+5. Roll the CPA/API2 trial control and worker first, then gateway replicas with
+   readiness gates. Keep API3 unchanged.
    Verify `/version`, request forwarding, credential authorization, live request
    monitoring, usage analysis, and session-level monitoring before increasing
    traffic.
-6. Preserve the prior image digest and routing configuration for rollback. Do
+6. Complete the required browser matrix and real Codex CLI text/image requests.
+   Preserve the prior image digest and routing configuration for rollback. Do
    not start an older binary against a schema version it does not support.
+7. Promote the exact same immutable digests to production API3 only after every
+   CPA/API2 trial check is green; never rebuild or substitute a tag.
 
 ## Credential access
 

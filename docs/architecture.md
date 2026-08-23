@@ -201,11 +201,14 @@ The migration Job is the only production schema migrator. Application roles do
 not migrate on startup. Non-backward-compatible write barriers require all old
 writers to drain before the new schema and binary start.
 
-API3 is a disposable candidate environment. It must first pass cluster-internal
-smoke and browser dogfood. Old CPA/API2 remains production until a user-approved
-maintenance window. Formal traffic movement follows
-[CPA to Token Center cutover](operations/cutover-runbook.md), never an ordinary
-development rollout.
+The 2026-08-23 release-order override makes API3 the production target. The
+candidate's exact SHA and three immutable digests first run in the CPA/API2
+trial slot while the old CPA revision, backup and routing configuration remain
+ready for immediate rollback. The trial must pass cluster smoke, the full live
+browser matrix and real Codex CLI text/image requests. Only those same digests
+may then be promoted to API3. Formal migration barriers and destructive traffic
+movement still follow [CPA to Token Center cutover](operations/cutover-runbook.md)
+and require their own explicit maintenance approval.
 
 All cluster, GitOps, migration execution, storage and rollout work belongs to the
 designated infrastructure task. Product work supplies immutable inputs and
