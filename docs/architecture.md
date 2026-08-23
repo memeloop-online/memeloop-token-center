@@ -141,6 +141,11 @@ conditions. A partial stream never returns to routing.
 Asynchronous generation separates admission from provider polling. Worker claims
 are fenced; cancellation and retry cannot settle or refund twice. Large assets
 are streamed into object storage rather than materialized in gateway memory.
+Streaming proxy responses preserve the 16-request/upstream lifecycle budget,
+while at most four gateway responses may simultaneously own a 5 MiB multipart
+archive buffer. Additional streams apply bounded backpressure until a buffer is
+released; this prevents S3 multipart memory from multiplying by every admitted
+lifecycle without reducing upstream routing concurrency.
 
 ## Observability and logical conversations
 

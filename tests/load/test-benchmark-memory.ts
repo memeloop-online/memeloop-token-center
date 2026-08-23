@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assetGatewayRssEvidence, chatPayload, createMockServer, MockState, seed, smallChat } from "./benchmark-memory.ts";
+import { assetGatewayRssEvidence, chatPayload, createMockServer, MockState, seed, smallChat, streamChat } from "./benchmark-memory.ts";
 
 test("asset gateway gate uses elevated phase start, not original idle", () => {
   const evidence = assetGatewayRssEvidence(180, 150, 40); assert.equal(evidence.gateway_phase_delta_rss_mib, 30); assert.equal(evidence.gateway_cumulative_delta_from_original_idle_mib, 140); assert.ok(evidence.gateway_phase_delta_rss_mib <= 96); assert.ok(evidence.gateway_cumulative_delta_from_original_idle_mib > 96);
@@ -21,4 +21,8 @@ test("stream fixture exercises the streaming proxy path", async () => {
 
 test("soak chat uses bounded node:http requests instead of Undici fetch", async () => {
   const server = createMockServer(new MockState()); await new Promise<void>((done) => server.listen(0, "127.0.0.1", done)); const originalFetch = globalThis.fetch; globalThis.fetch = () => { throw new Error("Undici fetch must not be used by soak chat"); }; try { const address = server.address(); assert.ok(address && typeof address !== "string"); for (let index = 0; index < 25; index += 1) assert.ok(await smallChat(`http://127.0.0.1:${address.port}`, "test-key") > 0); } finally { globalThis.fetch = originalFetch; await new Promise<void>((done) => server.close(() => done())); }
+});
+
+test("large stream is counted incrementally without Undici or body aggregation", async () => {
+  const server = createMockServer(new MockState()); await new Promise<void>((done) => server.listen(0, "127.0.0.1", done)); const originalFetch = globalThis.fetch; globalThis.fetch = () => { throw new Error("Undici fetch must not be used by stream chat"); }; try { const address = server.address(); assert.ok(address && typeof address !== "string"); assert.equal(await streamChat(`http://127.0.0.1:${address.port}`, "test-key", 4 * 1024 * 1024), 4 * 1024 * 1024); } finally { globalThis.fetch = originalFetch; await new Promise<void>((done) => server.close(() => done())); }
 });

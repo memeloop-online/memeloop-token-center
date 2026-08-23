@@ -28,7 +28,23 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         buffered_request,
         proxy_lifecycle_permit,
     } = input;
-    let mut response_archive_attempt =
+    // The upstream response already exists, so this limits only multipart
+    // archive buffers; it does not reduce admitted request/upstream
+    // concurrency. Holding the permit through terminal finalization keeps the
+    // memory bound simple even when object-store completion is slow.
+    let mut archive_stream_permit = match tokio::time::timeout(
+        MAX_DOWNSTREAM_SEND_WAIT,
+        state.proxy_archive_stream_permits.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => Some(permit),
+        Ok(Err(_)) | Err(_) => {
+            tracing::warn!(%request_id, stage = "response_archive_capacity", "proxy archive gap");
+            None
+        }
+    };
+    let mut response_archive_attempt = if archive_stream_permit.is_some() {
         match begin_proxy_archive_attempt(&state.db, request_id, ArchiveStagingPurpose::Response)
             .await
         {
@@ -37,7 +53,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 tracing::warn!(%request_id, stage = "response_archive_begin", "proxy archive gap");
                 None
             }
-        };
+        }
+    } else {
+        None
+    };
     let archive_writer = if let Some(attempt) = response_archive_attempt.as_ref() {
         match state.archive.start_writer(&attempt.object_locator).await {
             Ok(writer) => Some(writer),
@@ -51,6 +70,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
     } else {
         None
     };
+    if archive_writer.is_none() {
+        archive_stream_permit = None;
+    }
     let (body_sender, body_receiver) = tokio::sync::mpsc::channel(PROXY_BODY_CHANNEL_CAPACITY);
     let background_state = state.clone();
     let status_code = i64::from(status.as_u16());
@@ -68,6 +90,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         // Streaming responses outlive the handler response. Keep the workload
         // permit inside this task until archive and billing finalization end.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
+        let _archive_stream_permit = archive_stream_permit;
         let lifecycle_started = tokio::time::Instant::now();
         let stream_deadline = lifecycle_started + MAX_PROXY_STREAM_LIFETIME;
         let lifecycle_deadline = lifecycle_started + MAX_PROXY_LIFETIME;

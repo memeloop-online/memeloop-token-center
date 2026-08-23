@@ -87,9 +87,16 @@ retains a zero-failure gate and records bounded error categories. Its dirty-tree
 300-second diagnostic completed 5,538 soak requests with zero failures at
 18.449 RPS; every functional and resource check passed, with a 126.359 MiB
 gateway lifetime high-water mark against the 224 MiB process budget. This is
-root-cause evidence, not exact release evidence: the final clean 900-second /
-500 MiB acceptance profile still must pass on the fixed candidate SHA. No
-release digests or rollout exist for `92e23e8`.
+root-cause evidence, not exact release evidence. Clean candidate `5cbeaede59b8121165cfcddfecff4ff16774020f`
+then passed every functional, 500 MiB asset and 900-second soak check with zero
+soak failures, but correctly failed the unchanged 128 MiB stage gates: 12 × 16
+MiB streams reached 151.714 MiB and the following two-image phase reached
+160.515 MiB. The next fix bounds simultaneously owned 5 MiB proxy multipart
+archive buffers to four without reducing observed upstream concurrency. A
+12-stream dirty-tree diagnostic then measured 68.007 MiB for streams, 103.699
+MiB for images and 130.945 MiB process high water, all green. The final clean
+900-second / 500 MiB acceptance profile still must pass on the resulting fixed
+candidate SHA. No release digests or rollout exist for `92e23e8` or `5cbeaed`.
 
 The implementation at `92e23e8` already includes the single-pass Responses
 visitor, exact HTTP/archive/idempotent-replay image bytes, schema v54 accounting,

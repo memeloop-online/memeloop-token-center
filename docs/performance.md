@@ -85,6 +85,12 @@ The output has `schema_version`, raw measurements, thresholds as individual chec
 
 The asset test uses filesystem object storage so the worker's RSS result is not confused by the intentionally in-memory test archive. Production S3 should additionally be tested for multipart retry and latency, but the bounded-memory property is exercised here. The GitHub-hosted binary digest is not assumed to equal the GHCR image's binary digest: compare the report with the extracted release image binary, and retain the separate in-Pod cgroup acceptance evidence before cutover.
 
+Each proxy archive writer uses S3's 5 MiB multipart part size. The gateway keeps
+request/upstream concurrency at 16 but permits only four streaming responses to
+own those multipart buffers simultaneously. Do not increase that archive-buffer
+concurrency without rerunning the 12-stream and synchronous-image gates under
+the 256 MiB deployment limit.
+
 ## PostgreSQL large-history query plans
 
 Run the plan suite read-only against an imported, analyzed PostgreSQL snapshot with at least 100,000 request rows:
