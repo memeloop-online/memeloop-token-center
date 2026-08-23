@@ -1,12 +1,9 @@
 //! Durable archive-staging state machine.
 //!
-//! PostgreSQL workers claim rows with `FOR UPDATE SKIP LOCKED`. SQLite uses a
-//! process mutex and is intentionally a single-process test/development mode.
-
-use std::sync::OnceLock;
+//! PostgreSQL workers claim rows with `FOR UPDATE SKIP LOCKED`. SQLite uses WAL
+//! plus `BEGIN IMMEDIATE` and remains a lightweight test/development backend.
 
 use sqlx::{Any, Row, Transaction, any::AnyRow};
-use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 use crate::archive_staging::{
@@ -23,8 +20,6 @@ use crate::model::GenerationStagedAssets;
 
 use super::{AppError, Database, DatabaseBackend};
 
-static SQLITE_ARCHIVE_STAGING_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::new();
-
 impl Database {
     /// Creates a writing attempt or returns the exact idempotent replay.
     ///
@@ -34,8 +29,7 @@ impl Database {
         &self,
         input: BeginArchiveStagingInput,
     ) -> Result<BeginArchiveStagingResult, AppError> {
-        let _sqlite_guard = self.sqlite_archive_staging_guard().await;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let expires_at = now
             .checked_add(ARCHIVE_STAGING_WRITE_LEASE_MILLIS)
@@ -105,8 +99,7 @@ impl Database {
         &self,
         lease: &mut ArchiveStagingWriteLease,
     ) -> Result<bool, AppError> {
-        let _sqlite_guard = self.sqlite_archive_staging_guard().await;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let expires_at = now
             .checked_add(ARCHIVE_STAGING_WRITE_LEASE_MILLIS)
@@ -139,8 +132,7 @@ impl Database {
         lease: &ArchiveStagingWriteLease,
         locator: &str,
     ) -> Result<bool, AppError> {
-        let _sqlite_guard = self.sqlite_archive_staging_guard().await;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let bound = bind_archive_staging_attempt_in_transaction(
             &mut transaction,
             self.backend,
@@ -160,8 +152,7 @@ impl Database {
         key: ArchiveStagingKey,
         locator: &str,
     ) -> Result<bool, AppError> {
-        let _sqlite_guard = self.sqlite_archive_staging_guard().await;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let released = release_bound_archive_staging_attempt_in_transaction(
             &mut transaction,
             self.backend,
@@ -179,8 +170,7 @@ impl Database {
         &self,
         lease: &ArchiveStagingWriteLease,
     ) -> Result<bool, AppError> {
-        let _sqlite_guard = self.sqlite_archive_staging_guard().await;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let updated = sqlx::query(
             "UPDATE archive_staging_attempts SET state = 'cleanup_pending', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, next_cleanup_at = $1, updated_at = $2 WHERE attempt_id = $3 AND state = 'writing' AND lease_owner = $4 AND lease_token = $5 AND lease_expires_at > $6",
@@ -198,10 +188,10 @@ impl Database {
     }
 
     /// Promotes at most a bounded batch of expired writers. PostgreSQL locks
-    /// candidates with `SKIP LOCKED`; SQLite is serialized by the process guard.
+    /// candidates with `SKIP LOCKED`; SQLite serializes competing writers when
+    /// the immediate transaction begins.
     pub async fn promote_stale_archive_staging_attempts(&self) -> Result<u64, AppError> {
-        let _sqlite_guard = self.sqlite_archive_staging_guard().await;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let next_cleanup_at = now
             .checked_add(ARCHIVE_STAGING_STALE_DELETE_GRACE_MILLIS)
@@ -244,8 +234,7 @@ impl Database {
         &self,
         owner: ArchiveStagingLeaseOwner,
     ) -> Result<Option<ArchiveStagingCleanupLease>, AppError> {
-        let _sqlite_guard = self.sqlite_archive_staging_guard().await;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let query = match self.backend {
             DatabaseBackend::PostgreSql => {
@@ -299,8 +288,7 @@ impl Database {
         &self,
         lease: &mut ArchiveStagingCleanupLease,
     ) -> Result<bool, AppError> {
-        let _sqlite_guard = self.sqlite_archive_staging_guard().await;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let expires_at = now
             .checked_add(ARCHIVE_STAGING_CLEANUP_LEASE_MILLIS)
@@ -334,8 +322,7 @@ impl Database {
         &self,
         lease: ArchiveStagingCleanupLease,
     ) -> Result<ArchiveStagingReferenceProof, AppError> {
-        let _sqlite_guard = self.sqlite_archive_staging_guard().await;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let locked =
             lock_and_verify_cleanup_lease(&mut transaction, self.backend, &lease, now).await?;
@@ -389,8 +376,7 @@ impl Database {
         &self,
         proof: ArchiveStagingUnreferencedLease,
     ) -> Result<ArchiveStagingEmptyResult, AppError> {
-        let _sqlite_guard = self.sqlite_archive_staging_guard().await;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let row = lock_and_verify_cleanup_lease(&mut transaction, self.backend, &proof.lease, now)
             .await?;
@@ -465,8 +451,7 @@ impl Database {
         lease: &ArchiveStagingCleanupLease,
         code: ArchiveStagingCleanupErrorCode,
     ) -> Result<i64, AppError> {
-        let _sqlite_guard = self.sqlite_archive_staging_guard().await;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let row = lock_and_verify_cleanup_lease(&mut transaction, self.backend, lease, now).await?;
         let old_failures: i64 = row.try_get("cleanup_failures")?;
@@ -528,18 +513,6 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         Ok(())
-    }
-
-    async fn sqlite_archive_staging_guard(&self) -> Option<MutexGuard<'static, ()>> {
-        match self.backend {
-            DatabaseBackend::PostgreSql => None,
-            DatabaseBackend::Sqlite => Some(
-                SQLITE_ARCHIVE_STAGING_TRANSACTION
-                    .get_or_init(|| Mutex::new(()))
-                    .lock()
-                    .await,
-            ),
-        }
     }
 }
 

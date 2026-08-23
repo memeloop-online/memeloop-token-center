@@ -206,9 +206,12 @@ candidate's exact SHA and three immutable digests first run in the CPA/API2
 trial slot while the old CPA revision, backup and routing configuration remain
 ready for immediate rollback. The trial must pass cluster smoke, the full live
 browser matrix and real Codex CLI text/image requests. Only those same digests
-may then be promoted to API3. Formal migration barriers and destructive traffic
-movement still follow [CPA to Token Center cutover](operations/cutover-runbook.md)
-and require their own explicit maintenance approval.
+may then be promoted to API3, and only after the user explicitly declares a
+production window open. The 2026-08-23 state is outside that window, so API3 is
+an immutable boundary even if the reversible CPA/API2 trial passes. Formal
+migration barriers and destructive traffic movement still follow
+[CPA to Token Center cutover](operations/cutover-runbook.md) and require their
+own explicit maintenance approval.
 
 All cluster, GitOps, migration execution, storage and rollout work belongs to the
 designated infrastructure task. Product work supplies immutable inputs and

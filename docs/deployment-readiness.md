@@ -37,6 +37,10 @@ the product deployment itself and does not depend on another gateway service.
 
 ## Upgrade sequence
 
+As of 2026-08-23 this sequence may advance only through the reversible CPA/API2
+trial and evidence collection. API3 must remain unchanged until the user
+explicitly declares the next production deployment window open.
+
 1. Record the exact old CPA image, database/archive backup identifiers and
    routing configuration. Keep that revision healthy and immediately routable
    while the same-SHA candidate images and chart are staged in CPA/API2.
@@ -55,7 +59,8 @@ the product deployment itself and does not depend on another gateway service.
    Preserve the prior image digest and routing configuration for rollback. Do
    not start an older binary against a schema version it does not support.
 7. Promote the exact same immutable digests to production API3 only after every
-   CPA/API2 trial check is green; never rebuild or substitute a tag.
+   CPA/API2 trial check is green **and** the user explicitly opens the production
+   window; never rebuild or substitute a tag.
 
 ## Credential access
 

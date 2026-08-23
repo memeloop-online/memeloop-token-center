@@ -1,6 +1,82 @@
 use super::super::*;
 
 #[tokio::test]
+async fn concurrent_proxy_starts_serialize_in_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("proxy-start-race.db").display()
+    );
+    let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+    database.migrate().await.unwrap();
+    let pepper = b"proxy start race test pepper value";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "proxy-start-race".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "proxy-start-race".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    requests_per_minute: 100_000,
+                    tokens_per_minute: 100_000_000,
+                    max_concurrency: 32,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::from(1_000),
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price("start-race-model", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let database = database.clone();
+        let key = key.clone();
+        let price = price.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            let request_id = Uuid::now_v7();
+            barrier.wait().await;
+            database
+                .start_proxy_request(StartProxyRequest {
+                    request_id,
+                    key: &key,
+                    price: &price,
+                    input_token_ceiling: 100,
+                    output_token_ceiling: 100,
+                    protocol: "openai",
+                    model: "start-race-model",
+                    request_object: "objects/blake3/start-race-request",
+                    upstream_account_id: None,
+                    model_route_id: None,
+                })
+                .await
+        }));
+    }
+    for result in futures_util::future::join_all(tasks).await {
+        result.unwrap().unwrap();
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_reservations")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap(),
+        16
+    );
+}
+
+#[tokio::test]
 async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

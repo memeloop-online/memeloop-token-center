@@ -8,6 +8,10 @@ remaining acceptance gates, updated on 2026-08-23.
 
 ## Active 2026-08-23 release override
 
+- As of 2026-08-23 the production deployment window is closed. A reversible
+  CPA/API2 trial is allowed, but API3 changes are explicitly forbidden until
+  the user declares the next production window open. Trial success prepares a
+  release; it does not implicitly open that window.
 - API3 is the production target. Deploy one exact SHA and the same immutable
   service/importer/plugin-installer digests to CPA/API2 first.
 - Record the old CPA image, data backup and route configuration before the
@@ -18,8 +22,9 @@ remaining acceptance gates, updated on 2026-08-23.
   light/dark, Chinese/English, archives and multimodal accounting.
 - The release agent must also send real text and image requests through the
   CPA/API2 trial endpoint with Codex CLI.
-- Only after all evidence is green may the same digests be released to API3.
-  This order supersedes every API3-first trial instruction later in this file.
+- Only after all evidence is green and the user explicitly opens the production
+  window may the same digests be released to API3. This order and window gate
+  supersede every API3-first trial instruction later in this file.
 
 ## Repository and safety boundary
 
@@ -43,7 +48,8 @@ remaining acceptance gates, updated on 2026-08-23.
   impact, read-only baseline and rollback first.
 - The CPA/API2 trial rollout is authorized under the active override above, but
   irreversible migration barriers and removal of the old CPA rollback point are
-  not. API3 remains unchanged until trial approval.
+  not. API3 remains unchanged until both trial approval and a later explicit
+  production-window declaration.
 
 No secret, client credential, service token or OAuth material belongs in this
 document, commits, logs or test fixtures.
@@ -73,10 +79,17 @@ GitHub Actions run `32639275451` tested
 release verification were correctly skipped. A local exact-SHA full run kept
 all memory/resource measurements inside their limits but counted two failed soak
 requests. Diagnostic reproduction identified a Node.js 24.18.0 Undici internal
-parser assertion under long-lived `fetch` plus `Connection: close`, not a
-gateway HTTP failure. The pending harness fix moves soak traffic to bounded
-`node:http`, retains a zero-failure gate and records bounded error categories.
-No release digests or rollout exist for `92e23e8`.
+parser assertion under long-lived `fetch` plus `Connection: close`; a subsequent
+fully native-HTTP diagnostic also exposed real cross-process SQLite lock waits.
+The pending candidate removes Undici from every harness HTTP phase, waits for
+child shutdown, uses WAL snapshots plus immediate SQLite write transactions,
+retains a zero-failure gate and records bounded error categories. Its dirty-tree
+300-second diagnostic completed 5,538 soak requests with zero failures at
+18.449 RPS; every functional and resource check passed, with a 126.359 MiB
+gateway lifetime high-water mark against the 224 MiB process budget. This is
+root-cause evidence, not exact release evidence: the final clean 900-second /
+500 MiB acceptance profile still must pass on the fixed candidate SHA. No
+release digests or rollout exist for `92e23e8`.
 
 The implementation at `92e23e8` already includes the single-pass Responses
 visitor, exact HTTP/archive/idempotent-replay image bytes, schema v54 accounting,

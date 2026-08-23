@@ -102,7 +102,7 @@ impl Database {
         input: StartProxyRequest<'_>,
     ) -> Result<UsageReservation, AppError> {
         let now = unix_millis();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let reservation = reserve_usage_in_transaction(
             &mut transaction,
             input.key,
@@ -224,7 +224,7 @@ impl Database {
         let request_id = request_id.to_string();
         let tenant_id = tenant_id.to_string();
         let reservation_id = reservation_id.to_string();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let attached = sqlx::query(
             "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND reservation_id = $4 AND request_object = $5 AND completed_at IS NULL",
         )
@@ -286,7 +286,7 @@ impl Database {
         let request_id = request_id.to_string();
         let tenant_id = tenant_id.to_string();
         let reservation_id = reservation_id.to_string();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let attached = sqlx::query(
             "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND reservation_id = $4 AND request_object = $5 AND completed_at IS NULL",
         )
@@ -436,7 +436,7 @@ impl Database {
         let tenant_id = input.tenant_id.to_string();
         let key_id = input.reservation.key_id.to_string();
         let reservation_id = input.reservation.id.to_string();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
 
         // This no-op update is the portable owner CAS. PostgreSQL takes a row
         // lock and rechecks the pending predicate after a concurrent owner
@@ -693,7 +693,7 @@ impl Database {
 
     pub async fn record_request_started(&self, request: NewRequest) -> Result<(), AppError> {
         let now = unix_millis();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let request_id = request.request_id.to_string();
         let tenant_id = request.tenant_id.to_string();
         let key_id = request.key_id.to_string();
@@ -777,7 +777,7 @@ impl Database {
     }
 
     pub async fn record_request_finished(&self, request: FinishRequest) -> Result<(), AppError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let completed_at = unix_millis();
         record_request_finished_in_transaction(&mut tx, &request, completed_at).await?;
         tx.commit().await?;

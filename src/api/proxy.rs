@@ -143,8 +143,19 @@ pub(super) async fn proxy(
     }
     let request_digest = blake3::hash(&body).to_hex();
     let admitted_request_object = format!("gap://{request_id}/request");
-    let request_archive_attempt =
-        begin_proxy_archive_attempt(&state.db, request_id, ArchiveStagingPurpose::Request).await?;
+    let request_archive_attempt = match begin_proxy_archive_attempt(
+        &state.db,
+        request_id,
+        ArchiveStagingPurpose::Request,
+    )
+    .await
+    {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            tracing::error!(%request_id, stage = "request_archive_admission", "proxy request admission failed");
+            return Err(error);
+        }
+    };
     let reservation = match state
         .db
         .start_proxy_request(StartProxyRequest {
@@ -163,6 +174,7 @@ pub(super) async fn proxy(
     {
         Ok(reservation) => reservation,
         Err(error) => {
+            tracing::error!(%request_id, stage = "request_transaction_admission", "proxy request admission failed");
             abandon_proxy_archive_attempt(&state.db, &request_archive_attempt).await;
             return Err(error);
         }
@@ -830,6 +842,9 @@ async fn finish_buffered_request(
         && let Some(attempt) = response_archive_attempt.as_ref()
     {
         abandon_proxy_archive_attempt(&request.state.db, attempt).await;
+    }
+    if result.is_err() {
+        tracing::error!(%request_id, stage = "buffered_terminal_transaction", "proxy request finalization failed");
     }
     let result = result?;
     if matches!(result, FinishProxyRequestResult::AlreadyFinished { .. }) {

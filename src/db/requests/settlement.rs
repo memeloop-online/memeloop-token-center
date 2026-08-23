@@ -18,7 +18,7 @@ impl Database {
         let cutoff_day = unix_millis().saturating_sub(7 * 86_400_000) / 86_400_000;
         let cutoff_at = cutoff_day.saturating_mul(86_400_000);
         let limit = limit.clamp(1, 100_000);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let events = sqlx::query(
             "DELETE FROM key_budget_usage_events WHERE usage_entry_id IN (SELECT usage_entry_id FROM key_budget_usage_events WHERE settled_at < $1 ORDER BY settled_at ASC, usage_entry_id ASC LIMIT $2)",
         )
@@ -44,7 +44,7 @@ impl Database {
         input_token_ceiling: i64,
         output_token_ceiling: i64,
     ) -> Result<UsageReservation, AppError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let reservation = reserve_usage_in_transaction(
             &mut tx,
             key,
@@ -80,7 +80,7 @@ impl Database {
         reservation: &UsageReservation,
         usage: &TokenUsage,
     ) -> Result<i64, AppError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let actual_micros =
             settle_token_usage_in_transaction(&mut tx, reservation, usage, unix_millis()).await?;
         tx.commit().await?;

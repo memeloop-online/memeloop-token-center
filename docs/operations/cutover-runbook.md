@@ -3,8 +3,10 @@
 This runbook keeps CPA available until the new gateway and its imported history
 have been validated. It assumes a full CPAMP and session-archive baseline was
 imported after recording a trusted UTC fence immediately before that baseline
-started. No command below writes CPA/API2; only the approved write barrier may
-change source availability.
+started. A 2026-08-23 override permits a temporary, reversible CPA/API2 trial,
+but no command below authorizes API3 mutation or a final source write barrier.
+API3 remains unchanged until the user explicitly declares a production window
+open; only that later approved barrier may change source availability.
 
 ## Preconditions
 

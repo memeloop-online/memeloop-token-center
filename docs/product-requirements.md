@@ -265,8 +265,10 @@ route-back operation. Trial-scoped writes must be identifiable and reversible;
 existing accounts, subscriptions, credentials and history must be validated in
 place without destructive resets. A complete migration, final write barrier or
 irreversible traffic shift remains forbidden outside a user-declared
-maintenance window. Passing trial evidence authorizes promotion of the same
-digests to the API3 production target, but it does not by itself authorize data
+maintenance window. The 2026-08-23 instruction explicitly records that the
+production window is closed: passing trial evidence prepares the same digests
+for the API3 production target, but does not authorize API3 mutation until the
+user separately declares the next window open. It also does not authorize data
 destruction or removal of the CPA rollback point. Detailed steps and rollback
 are in [CPA to Token Center cutover](operations/cutover-runbook.md).
 

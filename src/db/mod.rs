@@ -284,6 +284,17 @@ impl Database {
             });
         }
         let pool = pool_options.connect(database_url).await?;
+        if matches!(backend, DatabaseBackend::Sqlite) {
+            // The control, gateway, and worker roles may be separate processes
+            // over the same lightweight/test database. WAL keeps readers on a
+            // stable snapshot while one process owns the single writer slot;
+            // BEGIN IMMEDIATE below then serializes only competing writers.
+            // The pragma is file-scoped and idempotent. In-memory databases
+            // retain their SQLite-selected journal mode.
+            sqlx::query("PRAGMA journal_mode = WAL")
+                .fetch_one(&pool)
+                .await?;
+        }
         Ok(Self { pool, backend })
     }
 
