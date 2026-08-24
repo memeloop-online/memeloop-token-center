@@ -4,11 +4,11 @@ This is the resume point for the next Token Center development agent. Read
 [Product requirements](product-requirements.md) first, then
 [Architecture](architecture.md). Those documents preserve the agreed product
 scope and rejected designs; this document preserves the implementation state and
-remaining acceptance gates, updated on 2026-08-23.
+remaining acceptance gates, updated on 2026-08-24.
 
-## Active 2026-08-23 release override
+## Active 2026-08-24 release override
 
-- As of 2026-08-23 the production deployment window is closed. A reversible
+- The production deployment window remains closed on 2026-08-24. A reversible
   CPA/API2 trial is allowed, but API3 changes are explicitly forbidden until
   the user declares the next production window open. Trial success prepares a
   release; it does not implicitly open that window.
@@ -73,6 +73,27 @@ always record the exact source and complete binary/image digest.
 
 ## CI and verification state
 
+GitHub Actions run `32671474947` tested clean source
+`69a23aa4d8e72669b97904e9ecc70dce750f7f1b`. Every pre-publication job passed,
+including Rust, web/E2E, API contracts, migrations, dependency and repository
+security, packaging, and the formal 15-minute memory acceptance. The exact-SHA
+memory report passed all functional and resource gates: stream RSS delta
+50.891 MiB, synchronous-image delta 77.637 MiB, 500 MiB asset gateway delta
+0.223 MiB, soak failures zero, soak slope 0.863 MiB/hour, retained delta
+15.395 MiB, and process high-water mark 108.332 MiB.
+
+Publication did not complete. The Debian-based importer candidate
+`sha256:cad3c27966324bc92580443fda501648ef9c7497d16f69e12c5202f090f52ea9`
+failed its HIGH/CRITICAL Trivy gate, so the service and plugin-installer jobs
+were cancelled to conserve CI time and no combined release manifest exists.
+That partial digest is forbidden for deployment. The importer runtime is now
+pinned to Alpine 3.23.5; equivalent-rootfs validation reported zero
+HIGH/CRITICAL findings while preserving Node.js 24, PostgreSQL 18 and SQLite
+operator contracts. See
+[the importer runtime scan evidence](operations/2026-08-24-importer-runtime-scan.md).
+The final image build, contract, scan and three-image manifest still require one
+new exact-SHA GitHub Actions run.
+
 GitHub Actions run `32639275451` tested
 `92e23e882771b69be587732eb31eb02ba0a92cc3`. Every job except
 `memory-acceptance / optimized-15-minute-harness` passed; GHCR publication and
@@ -81,7 +102,7 @@ all memory/resource measurements inside their limits but counted two failed soak
 requests. Diagnostic reproduction identified a Node.js 24.18.0 Undici internal
 parser assertion under long-lived `fetch` plus `Connection: close`; a subsequent
 fully native-HTTP diagnostic also exposed real cross-process SQLite lock waits.
-The pending candidate removes Undici from every harness HTTP phase, waits for
+Commit `54fd84f` removed Undici from every harness HTTP phase, waits for
 child shutdown, uses WAL snapshots plus immediate SQLite write transactions,
 retains a zero-failure gate and records bounded error categories. Its dirty-tree
 300-second diagnostic completed 5,538 soak requests with zero failures at
@@ -91,12 +112,13 @@ root-cause evidence, not exact release evidence. Clean candidate `5cbeaede59b812
 then passed every functional, 500 MiB asset and 900-second soak check with zero
 soak failures, but correctly failed the unchanged 128 MiB stage gates: 12 × 16
 MiB streams reached 151.714 MiB and the following two-image phase reached
-160.515 MiB. The next fix bounds simultaneously owned 5 MiB proxy multipart
+160.515 MiB. Commit `7210184` bounds simultaneously owned 5 MiB proxy multipart
 archive buffers to four without reducing observed upstream concurrency. A
 12-stream dirty-tree diagnostic then measured 68.007 MiB for streams, 103.699
-MiB for images and 130.945 MiB process high water, all green. The final clean
-900-second / 500 MiB acceptance profile still must pass on the resulting fixed
-candidate SHA. No release digests or rollout exist for `92e23e8` or `5cbeaed`.
+MiB for images and 130.945 MiB process high water, all green. Commit `69a23aa`
+then passed the final clean 900-second / 500 MiB acceptance profile in run
+`32671474947`, as recorded above. No release digests or rollout exist for
+`92e23e8` or `5cbeaed`.
 
 The implementation at `92e23e8` already includes the single-pass Responses
 visitor, exact HTTP/archive/idempotent-replay image bytes, schema v54 accounting,
@@ -138,15 +160,16 @@ The standard OpenAI Images path also still needs the short and full concurrent
 memory harness. Keep the 128 MiB limit; do not raise it to make the gate pass.
 
 All items in this historical section are now implemented. The 128 MiB image gate
-was retained and passed locally; only the soak harness runner defect described
-above remains before a new exact-SHA release run.
+was retained and the final clean acceptance run passed at `69a23aa`; the current
+release blocker is the importer runtime image attestation described above.
 
 ## Current release resume order
 
-1. Validate the bounded `node:http` soak runner with its unit contract and a
-   clean exact-SHA 15-minute local acceptance run; do not change any threshold.
+1. Validate the pinned Alpine importer runtime contracts and TypeScript operator
+   suite locally. Do not change security or memory thresholds.
 2. Push that exact master SHA once and inspect the one GitHub Actions run. GHCR
-   publication is allowed only when every required job is green.
+   publication is allowed only when every required job and final-image security
+   scan is green.
 3. Record and verify the three immutable GHCR digests and the combined release
    manifest; never deploy the SHA tag.
 4. Coordinate

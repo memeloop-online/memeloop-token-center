@@ -62,8 +62,8 @@ docker run --rm \
     command -v psql >/dev/null
     command -v node >/dev/null
     command -v sqlite3 >/dev/null
-    node --version | grep -Eq "^v18\\."
-    psql --version | grep -Eq "^psql \\(PostgreSQL\\) 15\\."
+    node --version | grep -Eq "^v24\\."
+    psql --version | grep -Eq "^psql \\(PostgreSQL\\) 18\\."
     test ! -e /tests
     test ! -e /source
     test ! -e /work

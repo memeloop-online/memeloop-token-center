@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-ARG RUNTIME_IMAGE=debian:bookworm-slim
+ARG RUNTIME_IMAGE=alpine:3.23.5
 ARG NODE_IMAGE=node:24.18.0-bookworm-slim
 
 FROM ${NODE_IMAGE} AS scripts
@@ -15,15 +15,8 @@ RUN npm run build:importer-scripts
 
 FROM ${RUNTIME_IMAGE}
 USER root
-ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian
-ENV DEBIAN_FRONTEND=noninteractive
-RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-      -o Dpkg::Options::="--force-confnew" \
-      ca-certificates nodejs postgresql-client sqlite3 \
-    && rm -rf /var/lib/apt/lists/* \
-    && (getent passwd 10001 >/dev/null || useradd --system --uid 10001 --create-home importer)
+RUN apk add --no-cache ca-certificates nodejs postgresql-client sqlite \
+    && adduser -S -D -u 10001 importer
 COPY ops/migrate-cpamp.sh /usr/local/bin/migrate-cpamp
 COPY ops/audit-cpa-migration.sh /usr/local/bin/audit-cpa-migration
 COPY --from=scripts /source/dist/operator-scripts/legacy-credentials/attach-legacy-cpa-credentials.cjs /usr/local/bin/attach-legacy-cpa-credentials
