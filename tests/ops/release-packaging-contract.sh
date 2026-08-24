@@ -90,10 +90,10 @@ grep -Fq 'ARG NODE_IMAGE=node:24.18.0-bookworm-slim' "$dockerfile"
 grep -Fq 'ARG RUST_IMAGE=rust:1.95.0-bookworm' "$dockerfile"
 grep -Fq 'ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot' "$dockerfile"
 grep -Fq 'ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot' "$plugin_installer_dockerfile"
-test "$(grep -Fc 'ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian' "$dockerfile")" -eq 1
-test "$(grep -Fc 'ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian' "$plugin_installer_dockerfile")" -eq 2
-! grep -Fq 'ARG DEBIAN_MIRROR=http://' "$dockerfile"
-! grep -Fq 'ARG DEBIAN_MIRROR=http://' "$plugin_installer_dockerfile"
+! grep -Fq 'DEBIAN_MIRROR' "$dockerfile"
+! grep -Fq 'DEBIAN_MIRROR' "$plugin_installer_dockerfile"
+! grep -Fq 'mirrors.tuna.tsinghua.edu.cn' "$dockerfile"
+! grep -Fq 'mirrors.tuna.tsinghua.edu.cn' "$plugin_installer_dockerfile"
 grep -Fq 'ARG RUNTIME_IMAGE=alpine:3.23.5' "$importer_dockerfile"
 grep -Fq 'apk add --no-cache ca-certificates nodejs postgresql-client sqlite' \
   "$importer_dockerfile"

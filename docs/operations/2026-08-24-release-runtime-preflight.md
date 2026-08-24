@@ -14,10 +14,13 @@ build stopped before publication because the TUNA Debian mirror rejected plain
 HTTP with status 403. The service build was cancelled immediately because a
 complete release was no longer possible.
 
-The replacement build defaults use
-`https://mirrors.tuna.tsinghua.edu.cn/debian`; the Bookworm `InRelease` endpoint
-was fetched successfully over TLS before the change was committed. A packaging
-contract now rejects any plain-HTTP Debian mirror default.
+An initial replacement attempted to use the TUNA HTTPS mirror, but the
+build-only Debian slim stage did not yet contain a CA bundle and correctly
+refused the certificate. Run `32684971435` exposed this in its plugin image
+contract and was cancelled after about one minute. The final replacement
+removes the custom mirror override and retains the signed repository
+configuration supplied by the official Debian build images. A packaging
+contract rejects restoration of the custom mirror.
 
 ## Minimal final runtime
 

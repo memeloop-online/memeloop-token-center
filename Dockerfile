@@ -12,10 +12,8 @@ COPY web ./
 RUN npm run build
 
 FROM ${RUST_IMAGE} AS builder
-ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian
 ARG CARGO_REGISTRY=sparse+https://rsproxy.cn/index/
-RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
-    && apt-get update \
+RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake clang perl pkg-config \
     && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /usr/local/cargo \

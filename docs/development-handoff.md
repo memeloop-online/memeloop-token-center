@@ -103,9 +103,12 @@ The plugin-installer publish failed before producing an image because its
 Debian mirror default used plain HTTP and the runner received HTTP 403 responses
 from TUNA; the service publish was cancelled immediately to conserve CI time.
 No combined manifest exists and every partial digest remains forbidden for
-deployment. The next candidate changes both Debian-based Dockerfiles to the
-verified HTTPS mirror for build-only stages and adds a packaging regression
-contract that rejects an HTTP default. Their final runtime stages use the
+deployment. Candidate `3144183` removed the vulnerable final Debian utility
+layer, but its packaging run `32684971435` exposed a certificate bootstrap
+error: Debian slim had no CA bundle before the custom HTTPS apt mirror was
+contacted. That run was cancelled after about one minute. The next candidate
+removes the custom mirror override and uses the signed repository configuration
+supplied by the official Debian build images. Its final runtime stages keep the
 supported distroless Debian 13 C runtime: the locally built release binaries
 depend only on glibc/libgcc, and the checksum-verified Cosign 3.1.3 asset is
 statically linked. This removes the package manager and unneeded Debian utility
