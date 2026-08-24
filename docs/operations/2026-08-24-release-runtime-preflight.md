@@ -22,13 +22,31 @@ removes the custom mirror override and retains the signed repository
 configuration supplied by the official Debian build images. A packaging
 contract rejects restoration of the custom mirror.
 
-## Minimal final runtime
+## First final-runtime attempt and scan result
+
+Run `32686030562` for clean SHA `16e46820645c2a8b37ae660fed1fde488ff4b330`
+proved that all source, packaging and formal memory gates pass. It also proved
+that the importer publishes and scans successfully and that the plugin image
+builds. The plugin final-image scan then correctly rejected two independent
+runtime vulnerability sources:
+
+- `libssl3t64` from `gcr.io/distroless/cc-debian13:nonroot` had deferred
+  `CVE-2026-14456` remediation even though neither product binary uses OpenSSL;
+- the official Cosign 3.1.3 binary was built with Go 1.26.4 and contained fixed
+  HIGH findings in the standard library, `golang.org/x/mod`,
+  `golang.org/x/text`, and `google.golang.org/grpc`.
+
+The service publication was cancelled immediately and the partial importer and
+plugin digests remain forbidden. There is no combined release manifest.
+
+## Minimal final runtime and Cosign security backport
 
 The final service and plugin-installer stages now use
-`gcr.io/distroless/cc-debian13:nonroot`. The upstream Distroless project
-documents this image as the minimal glibc and libgcc runtime for Rust and other
-mostly statically compiled programs, includes CA certificates, and publishes a
-supported `nonroot` tag without a shell or package manager:
+`gcr.io/distroless/base-nossl-debian13:nonroot`, which keeps glibc and CA
+certificates but excludes the unused OpenSSL runtime. The Rust builder copies
+only its resolved `libgcc_s.so.1` into `/usr/local/lib`; `LD_LIBRARY_PATH` is
+fixed to that directory. The upstream Distroless project documents the image
+contents and supported `nonroot` tags at
 `https://github.com/GoogleContainerTools/distroless`.
 
 All three locally built release binaries requested only these shared objects:
@@ -40,15 +58,29 @@ libc.so.6
 /lib64/ld-linux-x86-64.so.2
 ```
 
-The official Cosign 3.1.3 linux-amd64 asset was downloaded over TLS and matched
-its checked-in SHA-256
-`4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71`.
-`ldd` reported `not a dynamic executable`, so it adds no system-library
-requirement beyond the Rust installer.
+Cosign had no release newer than 3.1.3 when checked on 2026-08-24. Its annotated
+`v3.1.3` tag is GitHub-verified and resolves to commit
+`11926fa5bbbbde47e88fc006b625a17769b743b2`. The image build pins that commit's
+source archive SHA-256
+`3a718446bac51466efff6853639e1ca108b456ecbf07cd92938f548715d22d6b`, applies
+the checked-in `packaging/cosign/v3.1.3-security.patch`, verifies `go.sum`, and
+builds `v3.1.3-mtc.1` with fixed Go 1.26.7. The locally used official Go archive
+matched SHA-256
+`ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca`.
+The patch moves only the related Go dependency family and gRPC to versions
+needed by the fixes; it is not described as an official upstream binary.
 
-Local registry access timed out while attempting an independent remote Trivy
-scan of public base images. No pass is inferred from that timeout. The next
-exact-SHA GitHub Actions run must build and execute both Docker image contracts,
-then scan the exact three published digests with the unchanged
+The locally rebuilt amd64 binary reported the expected tag commit, clean tree,
+and Go 1.26.7 and had SHA-256
+`5651806b982c4cb91f954845faabaea741a3c5e3c1558cc92f0395528ab07403`.
+A local password-protected key generation, blob sign and public-key verify smoke
+test completed successfully. Trivy 0.70.0, vulnerability DB v2 updated at
+`2026-08-23T19:09:39Z`, reported zero HIGH/CRITICAL findings for that rebuilt
+binary at `2026-08-24T05:28:03Z`. This is local preflight evidence only.
+
+The current host has no Docker client, and a direct Trivy remote scan of the
+public base timed out connecting to `gcr.io`; no pass is inferred for the
+assembled base-nossl images. The next exact-SHA GitHub Actions run must build and execute
+both Docker image contracts, then scan the exact three published digests with the unchanged
 HIGH/CRITICAL `exit-code: 1` policy. No image is deployable until the combined
 release manifest is verified.

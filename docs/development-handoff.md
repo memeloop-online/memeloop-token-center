@@ -106,14 +106,26 @@ No combined manifest exists and every partial digest remains forbidden for
 deployment. Candidate `3144183` removed the vulnerable final Debian utility
 layer, but its packaging run `32684971435` exposed a certificate bootstrap
 error: Debian slim had no CA bundle before the custom HTTPS apt mirror was
-contacted. That run was cancelled after about one minute. The next candidate
-removes the custom mirror override and uses the signed repository configuration
-supplied by the official Debian build images. Its final runtime stages keep the
-supported distroless Debian 13 C runtime: the locally built release binaries
-depend only on glibc/libgcc, and the checksum-verified Cosign 3.1.3 asset is
-statically linked. This removes the package manager and unneeded Debian utility
-packages from both final images; the real Docker contracts and final-image
-Trivy scans remain mandatory CI gates.
+contacted. That run was cancelled after about one minute.
+
+Run `32686030562` then tested clean SHA
+`16e46820645c2a8b37ae660fed1fde488ff4b330`. Every source, packaging and formal
+memory gate passed, the importer published/scanned successfully, and the plugin
+image built. Its unchanged final-image Trivy policy correctly rejected
+`libssl3t64` from the distroless `cc` base and fixed HIGH findings in the
+official Cosign 3.1.3 binary's Go 1.26.4 standard library, x/mod, x/text and
+gRPC. The service build was cancelled immediately. Partial plugin digest
+`sha256:c490747f83c926218db357419b193d63b11abcfd43fb3238803374d8c6a41238`
+and all other partial outputs remain forbidden.
+
+The current candidate uses the distroless Debian 13 `base-nossl` runtime and
+copies only the Rust binaries' required `libgcc_s.so.1`. Because upstream has no
+post-3.1.3 release, it reproducibly rebuilds the GitHub-verified v3.1.3 tag
+commit as `v3.1.3-mtc.1` using fixed Go 1.26.7 and a checked-in dependency
+security patch. A clean-source replay verified the module sums and the resulting
+amd64 binary has zero HIGH/CRITICAL findings under the same local Trivy 0.70.0
+database. The host has no Docker client, so the real Docker contracts and exact
+three final-image Trivy scans remain mandatory in one new exact-SHA CI run.
 See [the service and plugin runtime preflight](operations/2026-08-24-release-runtime-preflight.md)
 for the exact local linkage and Cosign evidence.
 
@@ -188,8 +200,9 @@ release blocker is the importer runtime image attestation described above.
 
 ## Current release resume order
 
-1. Validate the pinned Alpine importer runtime contracts and TypeScript operator
-   suite locally. Do not change security or memory thresholds.
+1. Validate the pinned Alpine importer, base-nossl service/plugin runtime,
+   patched Cosign and TypeScript operator contracts locally. Do not change
+   security or memory thresholds.
 2. Push that exact master SHA once and inspect the one GitHub Actions run. GHCR
    publication is allowed only when every required job and final-image security
    scan is green.

@@ -45,7 +45,7 @@ const MAX_PUBLIC_KEY_BYTES: u64 = 64 * 1024;
 const MAX_COSIGN_OUTPUT_BYTES: u64 = 64 * 1024;
 const COSIGN_TIMEOUT: Duration = Duration::from_secs(60);
 pub const COSIGN_VERIFIER_PATH: &str = "/usr/local/bin/cosign";
-pub const COSIGN_VERIFIER_VERSION: &str = "v3.1.3";
+pub const COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.1";
 
 #[derive(Clone, Default)]
 pub enum RegistryCredentials {

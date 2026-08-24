@@ -88,8 +88,10 @@ test "$(find "$bundle" -maxdepth 1 -type f -name '*.sql' ! -perm 0444 -print -qu
 
 grep -Fq 'ARG NODE_IMAGE=node:24.18.0-bookworm-slim' "$dockerfile"
 grep -Fq 'ARG RUST_IMAGE=rust:1.95.0-bookworm' "$dockerfile"
-grep -Fq 'ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot' "$dockerfile"
-grep -Fq 'ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot' "$plugin_installer_dockerfile"
+grep -Fq 'ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot' "$dockerfile"
+grep -Fq 'ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot' "$plugin_installer_dockerfile"
+grep -Fq 'COPY --from=builder /tmp/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1' "$dockerfile"
+grep -Fq 'ENV LD_LIBRARY_PATH=/usr/local/lib' "$dockerfile"
 ! grep -Fq 'DEBIAN_MIRROR' "$dockerfile"
 ! grep -Fq 'DEBIAN_MIRROR' "$plugin_installer_dockerfile"
 ! grep -Fq 'mirrors.tuna.tsinghua.edu.cn' "$dockerfile"

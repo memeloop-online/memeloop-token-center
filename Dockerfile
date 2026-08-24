@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 ARG NODE_IMAGE=node:24.18.0-bookworm-slim
 ARG RUST_IMAGE=rust:1.95.0-bookworm
-ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot
+ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
 
 FROM ${NODE_IMAGE} AS web-builder
 ARG NPM_REGISTRY=https://registry.npmmirror.com
@@ -48,9 +48,12 @@ RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA_INPUT}" \
     cargo build --locked --release --bin memeloop-token-center --bin import-cpa-session-archive \
     && cp target/release/memeloop-token-center /tmp/memeloop-token-center \
     && cp target/release/import-cpa-session-archive /tmp/import-cpa-session-archive \
+    && cp "$(gcc -print-file-name=libgcc_s.so.1)" /tmp/libgcc_s.so.1 \
     && rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
 
 FROM ${RUNTIME_IMAGE}
+ENV LD_LIBRARY_PATH=/usr/local/lib
+COPY --from=builder /tmp/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
 COPY --from=builder /tmp/memeloop-token-center /usr/local/bin/memeloop-token-center
 COPY --from=builder /tmp/import-cpa-session-archive /usr/local/bin/import-cpa-session-archive
 COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web

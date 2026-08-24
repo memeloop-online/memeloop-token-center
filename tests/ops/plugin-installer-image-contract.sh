@@ -11,18 +11,28 @@ fail() {
 }
 
 test -f "${dockerfile}" || fail "Dockerfile.plugin-installer is missing"
-grep -Fq 'https://github.com/sigstore/cosign/releases/download/v3.1.3/' "${dockerfile}" \
-  || fail "Cosign release is not fixed to v3.1.3"
-grep -Fq '4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71' \
-  "${dockerfile}" || fail "official linux-amd64 Cosign digest is missing"
-grep -Fq 'c5d324e091826b0d7a78eb16fef316450b4eb9aaec045611c08ba06f5e73220a' \
-  "${dockerfile}" || fail "official linux-arm64 Cosign digest is missing"
-! grep -Eq '^ARG[[:space:]]+COSIGN_(VERSION|SHA|DIGEST)' "${dockerfile}" \
-  || fail "Cosign version and digests must not be caller-overridable build arguments"
-grep -Fq 'sha256sum --check --strict' "${dockerfile}" \
-  || fail "downloaded Cosign asset is not verified"
-grep -Fq 'ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot' "${dockerfile}" \
-  || fail "installer runtime must use the minimal supported distroless C runtime"
+grep -Fq 'ARG GO_IMAGE=golang:1.26.7-bookworm' "${dockerfile}" \
+  || fail "patched Cosign must use the fixed Go 1.26.7 toolchain"
+grep -Fq 'https://codeload.github.com/sigstore/cosign/tar.gz/11926fa5bbbbde47e88fc006b625a17769b743b2' \
+  "${dockerfile}" || fail "Cosign source is not fixed to the signed v3.1.3 tag commit"
+grep -Fq 'sha256:3a718446bac51466efff6853639e1ca108b456ecbf07cd92938f548715d22d6b' \
+  "${dockerfile}" || fail "Cosign source archive checksum is missing"
+grep -Fq 'COPY packaging/cosign/v3.1.3-security.patch' "${dockerfile}" \
+  || fail "reviewed Cosign security backport is not applied"
+grep -Fq 'git apply --unidiff-zero --check /tmp/v3.1.3-security.patch' "${dockerfile}" \
+  || fail "Cosign security backport is not preflighted against the pinned source"
+grep -Fq 'GOTOOLCHAIN=local go mod verify' "${dockerfile}" \
+  || fail "patched Cosign dependencies are not verified"
+! grep -Fq 'github.com/sigstore/cosign/releases/download/' "${dockerfile}" \
+  || fail "vulnerable upstream release binary must not enter the runtime"
+! grep -Eq '^ARG[[:space:]]+COSIGN_(VERSION|SHA|DIGEST|COMMIT)' "${dockerfile}" \
+  || fail "Cosign identity must not be caller-overridable"
+grep -Fq 'ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot' "${dockerfile}" \
+  || fail "installer runtime must exclude the unused OpenSSL runtime"
+grep -Fq 'COPY --from=builder /tmp/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1' \
+  "${dockerfile}" || fail "installer runtime must receive only its required libgcc runtime"
+grep -Fq 'ENV LD_LIBRARY_PATH=/usr/local/lib' "${dockerfile}" \
+  || fail "installer runtime must resolve its copied libgcc"
 grep -Fq 'USER 10001:10001' "${dockerfile}" \
   || fail "installer runtime must be non-root"
 grep -Fq 'ENTRYPOINT ["/usr/local/bin/install-plugin-oci"]' "${dockerfile}" \
@@ -32,14 +42,7 @@ grep -Fq 'ENTRYPOINT ["/usr/local/bin/install-plugin-oci"]' "${dockerfile}" \
 ! grep -Eq '^sigstore[[:space:]]*=' "${repository_root}/Cargo.toml" \
   || fail "Rust Sigstore must not remain in the product dependency graph"
 
-case "$(docker info --format '{{.Architecture}}')" in
-  amd64 | x86_64) target_arch='amd64' ;;
-  arm64 | aarch64) target_arch='arm64' ;;
-  *) fail "Docker daemon architecture must be amd64 or arm64" ;;
-esac
-
 docker build --pull \
-  --build-arg "TARGETARCH=${target_arch}" \
   --file "${dockerfile}" \
   --tag "${image}" \
   "${repository_root}"
@@ -58,8 +61,10 @@ test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "${image}")"
 version_json="$(docker run --rm \
   --entrypoint /usr/local/bin/cosign \
   "${image}" version --json)"
-test "$(printf '%s' "${version_json}" | jq -r '.gitVersion')" = 'v3.1.3' \
-  || fail "runtime Cosign version is not exactly v3.1.3"
+test "$(printf '%s' "${version_json}" | jq -r '.gitVersion')" = 'v3.1.3-mtc.1' \
+  || fail "runtime Cosign version is not exactly v3.1.3-mtc.1"
+test "$(printf '%s' "${version_json}" | jq -r '.goVersion')" = 'go1.26.7' \
+  || fail "runtime Cosign was not built with fixed Go 1.26.7"
 docker run --rm "${image}" --help >/dev/null
 
 echo "plugin installer image contract: passed"
