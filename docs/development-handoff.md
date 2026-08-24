@@ -94,6 +94,26 @@ operator contracts. See
 The final image build, contract, scan and three-image manifest still require one
 new exact-SHA GitHub Actions run.
 
+Run `32678530047` then tested clean TypeScript-only source `79d2b08`. Every
+pre-publication gate passed, including the formal exact-SHA memory acceptance,
+and the hardened Alpine importer publish/scan/provenance verification succeeded
+at partial digest
+`sha256:3584b438e242ebf9d3879c18cea357855e61de64f3d3cc0a8440f3d8d42e1a6b`.
+The plugin-installer publish failed before producing an image because its
+Debian mirror default used plain HTTP and the runner received HTTP 403 responses
+from TUNA; the service publish was cancelled immediately to conserve CI time.
+No combined manifest exists and every partial digest remains forbidden for
+deployment. The next candidate changes both Debian-based Dockerfiles to the
+verified HTTPS mirror for build-only stages and adds a packaging regression
+contract that rejects an HTTP default. Their final runtime stages use the
+supported distroless Debian 13 C runtime: the locally built release binaries
+depend only on glibc/libgcc, and the checksum-verified Cosign 3.1.3 asset is
+statically linked. This removes the package manager and unneeded Debian utility
+packages from both final images; the real Docker contracts and final-image
+Trivy scans remain mandatory CI gates.
+See [the service and plugin runtime preflight](operations/2026-08-24-release-runtime-preflight.md)
+for the exact local linkage and Cosign evidence.
+
 GitHub Actions run `32639275451` tested
 `92e23e882771b69be587732eb31eb02ba0a92cc3`. Every job except
 `memory-acceptance / optimized-15-minute-harness` passed; GHCR publication and

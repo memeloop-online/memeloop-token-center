@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 ARG NODE_IMAGE=node:24.18.0-bookworm-slim
 ARG RUST_IMAGE=rust:1.95.0-bookworm
-ARG RUNTIME_IMAGE=debian:bookworm-slim
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot
 
 FROM ${NODE_IMAGE} AS web-builder
 ARG NPM_REGISTRY=https://registry.npmmirror.com
@@ -12,7 +12,7 @@ COPY web ./
 RUN npm run build
 
 FROM ${RUST_IMAGE} AS builder
-ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian
+ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian
 ARG CARGO_REGISTRY=sparse+https://rsproxy.cn/index/
 RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
@@ -53,12 +53,6 @@ RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA_INPUT}" \
     && rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
 
 FROM ${RUNTIME_IMAGE}
-ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/debian
-RUN sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --create-home token-center
 COPY --from=builder /tmp/memeloop-token-center /usr/local/bin/memeloop-token-center
 COPY --from=builder /tmp/import-cpa-session-archive /usr/local/bin/import-cpa-session-archive
 COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web

@@ -9,6 +9,7 @@ workflow_policy_fixtures="$repository/tests/ops/github-workflow-policy-fixtures.
 shared_contracts="$repository/ops/ci/run-release-source-contracts.sh"
 dockerfile="$repository/Dockerfile"
 importer_dockerfile="$repository/Dockerfile.importer"
+plugin_installer_dockerfile="$repository/Dockerfile.plugin-installer"
 importer_contract="$repository/tests/ops/importer-image-contract.sh"
 bundle_preparer="$repository/ops/ci/prepare-cpamp-acceptance-bundle.sh"
 cargo_config="$repository/.cargo/config.toml"
@@ -23,6 +24,7 @@ test -f "$workflow"
 test -f "$workflow_directory/memory-acceptance.yml"
 test -f "$dockerfile"
 test -f "$importer_dockerfile"
+test -f "$plugin_installer_dockerfile"
 test -f "$importer_contract"
 test -x "$bundle_preparer"
 grep -Fq '[ -f "$source_file" ] && [ ! -L "$source_file" ]' "$bundle_preparer"
@@ -86,6 +88,12 @@ test "$(find "$bundle" -maxdepth 1 -type f -name '*.sql' ! -perm 0444 -print -qu
 
 grep -Fq 'ARG NODE_IMAGE=node:24.18.0-bookworm-slim' "$dockerfile"
 grep -Fq 'ARG RUST_IMAGE=rust:1.95.0-bookworm' "$dockerfile"
+grep -Fq 'ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot' "$dockerfile"
+grep -Fq 'ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot' "$plugin_installer_dockerfile"
+test "$(grep -Fc 'ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian' "$dockerfile")" -eq 1
+test "$(grep -Fc 'ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian' "$plugin_installer_dockerfile")" -eq 2
+! grep -Fq 'ARG DEBIAN_MIRROR=http://' "$dockerfile"
+! grep -Fq 'ARG DEBIAN_MIRROR=http://' "$plugin_installer_dockerfile"
 grep -Fq 'ARG RUNTIME_IMAGE=alpine:3.23.5' "$importer_dockerfile"
 grep -Fq 'apk add --no-cache ca-certificates nodejs postgresql-client sqlite' \
   "$importer_dockerfile"

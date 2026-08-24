@@ -21,6 +21,8 @@ grep -Fq 'c5d324e091826b0d7a78eb16fef316450b4eb9aaec045611c08ba06f5e73220a' \
   || fail "Cosign version and digests must not be caller-overridable build arguments"
 grep -Fq 'sha256sum --check --strict' "${dockerfile}" \
   || fail "downloaded Cosign asset is not verified"
+grep -Fq 'ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot' "${dockerfile}" \
+  || fail "installer runtime must use the minimal supported distroless C runtime"
 grep -Fq 'USER 10001:10001' "${dockerfile}" \
   || fail "installer runtime must be non-root"
 grep -Fq 'ENTRYPOINT ["/usr/local/bin/install-plugin-oci"]' "${dockerfile}" \
