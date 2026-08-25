@@ -11,6 +11,7 @@ COPY tsconfig.scripts.json ./
 COPY ops/cpa-upstreams ./ops/cpa-upstreams
 COPY ops/legacy-credentials ./ops/legacy-credentials
 COPY ops/lib ./ops/lib
+COPY ops/export-cpa-session-archive-delta.ts ./ops/export-cpa-session-archive-delta.ts
 RUN npm run build:importer-scripts
 
 FROM ${RUNTIME_IMAGE}

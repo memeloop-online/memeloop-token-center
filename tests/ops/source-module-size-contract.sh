@@ -22,12 +22,14 @@ assert_range() {
 # the old hotspots from silently absorbing their extracted responsibilities,
 # while the lower bounds make deleting or bypassing the focused modules fail.
 assert_range src/api/proxy.rs 1 1700
+assert_range src/api/proxy/conversation_hints.rs 180 280
 assert_range src/api/proxy/routing.rs 190 280
 assert_range src/api/proxy/streaming.rs 400 550
 assert_range src/db/generation/jobs.rs 1 1550
 assert_range src/db/generation/jobs/finish.rs 300 450
 
 grep -Fq 'mod streaming;' "$repository/src/api/proxy.rs"
+grep -Fq 'mod conversation_hints;' "$repository/src/api/proxy.rs"
 grep -Fq 'mod routing;' "$repository/src/api/proxy.rs"
 grep -Fq 'prepare_proxy_route(' "$repository/src/api/proxy.rs"
 grep -Fq 'send_proxy_route(' "$repository/src/api/proxy.rs"

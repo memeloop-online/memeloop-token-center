@@ -97,6 +97,10 @@ grep -Fq 'ENV LD_LIBRARY_PATH=/usr/local/lib' "$dockerfile"
 ! grep -Fq 'mirrors.tuna.tsinghua.edu.cn' "$dockerfile"
 ! grep -Fq 'mirrors.tuna.tsinghua.edu.cn' "$plugin_installer_dockerfile"
 grep -Fq 'ARG RUNTIME_IMAGE=alpine:3.23.5' "$importer_dockerfile"
+grep -Fq 'COPY ops/export-cpa-session-archive-delta.ts ./ops/export-cpa-session-archive-delta.ts' \
+  "$importer_dockerfile"
+grep -Fq 'COPY --from=scripts /source/dist/operator-scripts/export-cpa-session-archive-delta.mjs /usr/local/bin/export-cpa-session-archive-delta' \
+  "$importer_dockerfile"
 grep -Fq 'apk add --no-cache ca-certificates nodejs postgresql-client sqlite' \
   "$importer_dockerfile"
 ! grep -Fq 'apt-get' "$importer_dockerfile"
