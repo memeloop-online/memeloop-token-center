@@ -11,6 +11,40 @@ Given('dogfood 服务已有隔离租户、统一上游、请求记录和多模�
   runtime.requireSeed();
 });
 
+When('管理员和下游用户验证凭据记忆与手动清空', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const seed = runtime.requireSeed();
+  await connectOperator(this, 'dark');
+  await page.reload();
+  await assertValue(page.locator('input[type="password"]'), seed.serviceCredential);
+  await assertContains(page.locator('.tenant-picker'), tenant);
+  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
+  await assertValue(page.locator('input[type="password"]'), '');
+  await page.reload();
+  await assertValue(page.locator('input[type="password"]'), '');
+
+  await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 375, height: 812 } });
+  const credential = page.getByLabel('客户端凭据', { exact: true });
+  await credential.fill(seed.clientCredential);
+  await page.getByRole('button', { name: '载入', exact: true }).click();
+  await assertContains(page.locator('.console-context'), 'Browser E2E credential');
+  await page.reload();
+  await assertValue(credential, seed.clientCredential);
+  await assertContains(page.locator('.console-context'), 'Browser E2E credential');
+  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
+  await assertValue(credential, '');
+  await page.reload();
+  await assertValue(page.getByLabel('客户端凭据', { exact: true }), '');
+  assert.deepEqual(await page.evaluate(() => ({
+    operator: localStorage.getItem('mtc.operator.service-credential.v1'),
+    self: localStorage.getItem('mtc.self.client-credential.v1'),
+  })), { operator: null, self: null });
+});
+
+Then('刷新页面不会要求重复输入且清空后不会自动恢复', function (this: DogfoodWorld) {
+  this.assertNoBrowserFailures();
+});
+
 When('管理员以中文暗色主题连接控制台', async function (this: DogfoodWorld) {
   await connectOperator(this, 'dark');
 });
@@ -18,7 +52,9 @@ When('管理员以中文暗色主题连接控制台', async function (this: Dogf
 Then('下游凭据表单使用本地化校验且模型计费可见', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.getByRole('tab', { name: '凭据管理', exact: true }).click();
-  await assertVisible(page.getByRole('heading', { name: '创建客户端凭据', exact: true }));
+  const createPanel = page.locator('details.create-resource').filter({ hasText: '创建客户端凭据' });
+  await assertVisible(createPanel.locator('summary'));
+  await createPanel.locator('summary').click();
   const createButton = page.getByRole('button', { name: '创建凭据', exact: true });
   await assertVisible(createButton);
   await createButton.click();

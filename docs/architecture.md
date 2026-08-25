@@ -160,6 +160,14 @@ Session construction has two evidence levels:
   upstream-response identifiers can form reliable relations; and
 - bounded semantic/Merkle-prefix similarity can form candidate evidence.
 
+Schema v55 keeps explicitly declared session name, W3C trace/span context,
+agent ancestry, task kind and bounded non-secret metadata on the observation.
+These fields are a visualization/audit projection, not identity evidence. The
+request timeline can therefore render agent lanes and task distributions while
+older Codex traffic still benefits from session headers, Responses parent IDs
+and the Merkle prefix tree without receiving invented semantic attributes. See
+[Semantic execution metadata](semantic-execution-metadata.md).
+
 Candidate evidence is visible for operator review but cannot silently merge
 identities. Conversation queries remain scoped by tenant, principal and stable
 key. Imported archive records with stable ownership but ambiguous request

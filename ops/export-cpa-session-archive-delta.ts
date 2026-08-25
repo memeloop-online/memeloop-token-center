@@ -771,6 +771,20 @@ async function runExport(args: Arguments): Promise<JsonObject> {
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
+  if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
+    process.stdout.write(
+      "Usage: export-cpa-session-archive-delta --base-url URL --checkpoint FILE --output FILE [options]\n" +
+      "  --collector-direct             use the collector snapshot/ticket API\n" +
+      "  --offline-full                 export a sealed offline collector snapshot\n" +
+      "  --token-file FILE              read the legacy CPA token from a protected file\n" +
+      "  --token-env NAME               read the legacy CPA token from the named environment variable\n" +
+      "  --private-http-host HOST       allow one exact private HTTP collector host\n" +
+      "  --client-cert-file FILE        mTLS client certificate for collector-direct\n" +
+      "  --client-key-file FILE         mTLS client key for collector-direct\n" +
+      "  --resume                       resume from the sealed checkpoint\n",
+    );
+    return 0;
+  }
   const args = parseCli(argv);
   const manifest = await withCheckpointLock(args.checkpoint, args.deadline, () => runExport(args));
   process.stdout.write(`${canonicalize({ sequence: manifest.sequence, sessions: manifest.session_count, records: manifest.record_count, watermark_completed_at: manifest.watermark_completed_at, source_records: manifest.source_records_after, output_sha256: manifest.output_sha256 })}\n`);

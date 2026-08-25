@@ -454,6 +454,8 @@ pub struct ConversationRequestView {
     pub archive_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<crate::conversation::ExecutionMetadata>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -469,6 +471,8 @@ pub struct ConversationClusterDetail {
 #[derive(Clone, Debug, Serialize)]
 pub struct LogicalSessionSummary {
     pub session_id: String,
+    pub session_name: Option<String>,
+    pub task_kind: Option<String>,
     pub cluster_id: Option<Uuid>,
     pub unlinked: bool,
     pub key_id: Uuid,

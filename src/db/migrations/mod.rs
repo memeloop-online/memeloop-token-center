@@ -293,6 +293,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "complete logical session usage dimensions",
         sql: include_str!("../../../migrations/common/0054_complete_session_usage_dimensions.sql"),
     },
+    Migration {
+        version: 55,
+        name: "semantic execution metadata",
+        sql: include_str!("../../../migrations/common/0055_semantic_execution_metadata.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -571,6 +576,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 54,
         name: "complete logical session usage dimensions",
         sql: include_str!("../../../migrations/common/0054_complete_session_usage_dimensions.sql"),
+    },
+    Migration {
+        version: 55,
+        name: "semantic execution metadata",
+        sql: include_str!("../../../migrations/common/0055_semantic_execution_metadata.sql"),
     },
 ];
 

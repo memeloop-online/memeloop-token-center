@@ -333,8 +333,11 @@ impl Database {
             id
         };
 
+        let execution_metadata = hints.execution_metadata();
+        let labels_json = serde_json::to_string(&hints.labels).map_err(|_| AppError::Internal)?;
+
         sqlx::query(
-            "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, leaf_node_hash, atom_hashes_json, explicit_session_id, client_name, created_at, inference_version, turn_id, parent_turn_id, branch_id, compaction) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 2, $10, $11, $12, $13)",
+            "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, leaf_node_hash, atom_hashes_json, explicit_session_id, client_name, created_at, inference_version, turn_id, parent_turn_id, branch_id, compaction, session_name, trace_id, span_id, parent_span_id, agent_id, parent_agent_id, task_kind, labels_json, metadata_source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 2, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
         )
         .bind(observation_id.to_string())
         .bind(cluster_id.to_string())
@@ -349,6 +352,15 @@ impl Database {
         .bind(hints.parent_turn_id.as_deref())
         .bind(hints.branch_id.as_deref())
         .bind(i64::from(hints.compaction))
+        .bind(hints.session_name.as_deref())
+        .bind(hints.trace_id.as_deref())
+        .bind(hints.span_id.as_deref())
+        .bind(hints.parent_span_id.as_deref())
+        .bind(hints.agent_id.as_deref())
+        .bind(hints.parent_agent_id.as_deref())
+        .bind(hints.task_kind.as_deref())
+        .bind(labels_json)
+        .bind(execution_metadata.as_ref().map(|metadata| metadata.source.as_str()))
         .execute(&mut **transaction)
         .await?;
 
@@ -505,7 +517,7 @@ impl Database {
             (filter.before_created_at, filter.before_request_id)
         {
             sqlx::query(
-                "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, source_kind, provenance_kind, unlinked, archive_source, external_request_id FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests WHERE created_at < $3 OR (created_at = $3 AND id < $4) ORDER BY created_at DESC, id DESC LIMIT $5",
+                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 WHERE requests.created_at < $3 OR (requests.created_at = $3 AND requests.id < $4) ORDER BY requests.created_at DESC, requests.id DESC LIMIT $5",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -516,7 +528,7 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, source_kind, provenance_kind, unlinked, archive_source, external_request_id FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests ORDER BY created_at DESC, id DESC LIMIT $3",
+                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 ORDER BY requests.created_at DESC, requests.id DESC LIMIT $3",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -646,9 +658,31 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                 currency: row.try_get("currency")?,
                 archive_source: row.try_get("archive_source")?,
                 external_request_id: row.try_get("external_request_id")?,
+                execution: execution_metadata_from_row(&row)?,
             })
         })
         .collect()
+}
+
+fn execution_metadata_from_row(
+    row: &AnyRow,
+) -> Result<Option<crate::conversation::ExecutionMetadata>, AppError> {
+    let source: Option<String> = row.try_get("metadata_source")?;
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let labels_json: String = row.try_get("labels_json")?;
+    Ok(Some(crate::conversation::ExecutionMetadata {
+        session_name: row.try_get("session_name")?,
+        trace_id: row.try_get("trace_id")?,
+        span_id: row.try_get("span_id")?,
+        parent_span_id: row.try_get("parent_span_id")?,
+        agent_id: row.try_get("agent_id")?,
+        parent_agent_id: row.try_get("parent_agent_id")?,
+        task_kind: row.try_get("task_kind")?,
+        labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+        source,
+    }))
 }
 
 fn infer_hash_relation(previous: &[String], current: &[String]) -> (RelationKind, i64) {

@@ -41,15 +41,17 @@ export async function connectOperator(world: DogfoodWorld, theme: 'dark' | 'ligh
   await page.getByRole('button', { name: '连接', exact: true }).click();
   const tenantPicker = page.locator('.tenant-picker select');
   await assertContains(tenantPicker, tenant);
-  const scopedReload = page.waitForResponse((response) => {
-    const url = new URL(response.url());
-    return response.request().method() === 'GET'
-      && url.pathname === '/internal/v1/upstreams'
-      && url.searchParams.get('tenant_external_id') === tenant;
-  });
-  await tenantPicker.selectOption(tenant);
+  if (await tenantPicker.inputValue() !== tenant) {
+    const scopedReload = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.request().method() === 'GET'
+        && url.pathname === '/internal/v1/upstreams'
+        && url.searchParams.get('tenant_external_id') === tenant;
+    });
+    await tenantPicker.selectOption(tenant);
+    assert.equal((await scopedReload).status(), 200);
+  }
   await assertValue(tenantPicker, tenant);
-  assert.equal((await scopedReload).status(), 200);
   await assertNoCount(page.locator('.notice.error'));
 }
 

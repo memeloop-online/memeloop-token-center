@@ -2039,3 +2039,80 @@ fn subagent_hint_accepts_only_the_restricted_header_or_typed_metadata_marker() {
         );
     }
 }
+
+#[test]
+fn execution_metadata_accepts_bounded_declared_values_and_w3c_trace_context() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-codex-session-id", "codex-session-7".parse().unwrap());
+    headers.insert("x-mtc-session-name", "release dogfood".parse().unwrap());
+    headers.insert(
+        "traceparent",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert("x-mtc-span-id", "7f6e5d4c3b2a1908".parse().unwrap());
+    headers.insert("x-mtc-agent-id", "codex-root".parse().unwrap());
+    headers.insert(
+        "x-mtc-parent-agent-id",
+        "release-controller".parse().unwrap(),
+    );
+    headers.insert("x-mtc-task-kind", "interactive".parse().unwrap());
+    headers.insert(
+        "x-mtc-session-labels",
+        r#"{"workflow":"release","environment":"api2-trial","token":"must-drop","numeric":7}"#
+            .parse()
+            .unwrap(),
+    );
+
+    let hints = conversation_hints(&headers, &json!({}));
+    assert_eq!(hints.session_id.as_deref(), Some("codex-session-7"));
+    assert_eq!(hints.session_name.as_deref(), Some("release dogfood"));
+    assert_eq!(
+        hints.trace_id.as_deref(),
+        Some("4bf92f3577b34da6a3ce929d0e0e4736")
+    );
+    assert_eq!(hints.parent_span_id.as_deref(), Some("00f067aa0ba902b7"));
+    assert_eq!(hints.span_id.as_deref(), Some("7f6e5d4c3b2a1908"));
+    assert_eq!(hints.agent_id.as_deref(), Some("codex-root"));
+    assert_eq!(hints.parent_agent_id.as_deref(), Some("release-controller"));
+    assert_eq!(hints.task_kind.as_deref(), Some("interactive"));
+    assert_eq!(
+        hints.labels.get("workflow").map(String::as_str),
+        Some("release")
+    );
+    assert_eq!(
+        hints.labels.get("environment").map(String::as_str),
+        Some("api2-trial")
+    );
+    assert!(!hints.labels.contains_key("token"));
+    assert!(!hints.labels.contains_key("numeric"));
+}
+
+#[test]
+fn execution_metadata_fails_closed_for_invalid_trace_and_secret_like_labels() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "traceparent",
+        "00-00000000000000000000000000000000-0000000000000000-01"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert("x-mtc-span-id", "not-a-w3c-span".parse().unwrap());
+    headers.insert("x-mtc-trace-id", "short".parse().unwrap());
+    headers.insert(
+        "x-mtc-session-labels",
+        r#"{"api-key":"no","password_hint":"no","valid.label":"yes"}"#
+            .parse()
+            .unwrap(),
+    );
+    let hints = conversation_hints(&headers, &json!({}));
+    assert!(hints.trace_id.is_none());
+    assert!(hints.span_id.is_none());
+    assert!(hints.parent_span_id.is_none());
+    assert_eq!(hints.labels.len(), 1);
+    assert_eq!(
+        hints.labels.get("valid.label").map(String::as_str),
+        Some("yes")
+    );
+}

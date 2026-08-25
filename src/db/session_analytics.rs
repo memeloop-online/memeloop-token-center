@@ -22,6 +22,8 @@ pub struct LogicalSessionListFilter {
 #[derive(Default)]
 struct SessionAccumulator {
     session_id: String,
+    session_name: Option<String>,
+    task_kind: Option<String>,
     key_id: String,
     key_alias: String,
     model: String,
@@ -216,7 +218,12 @@ impl Database {
                            OR ($6 = 'has_errors' AND
                                COALESCE(completed.errors, 0) + COALESCE(archived.errors, 0) > 0))
                       AND ($8 = '' OR LOWER(ranked.session_id) LIKE $8 ESCAPE '\'
-                           OR LOWER(filter_key.alias) LIKE $8 ESCAPE '\')
+                           OR LOWER(filter_key.alias) LIKE $8 ESCAPE '\'
+                           OR EXISTS (
+                              SELECT 1 FROM conversation_observations named_observation
+                               WHERE named_observation.key_id = ranked.key_id
+                                 AND named_observation.cluster_id = ranked.session_id
+                                 AND LOWER(named_observation.session_name) LIKE $8 ESCAPE '\'))
                       AND ($7 = '' OR EXISTS (
                               SELECT 1 FROM session_usage_hourly model_usage
                                WHERE model_usage.tenant_id = ranked.tenant_id
@@ -247,37 +254,53 @@ impl Database {
                ), recent_activity AS (
                    SELECT recent.key_id, recent.session_id, request.model,
                           request.protocol, request.status_code, request.created_at,
-                          request.id, 1 AS live
+                          request.id, 1 AS live, observation.session_name,
+                          observation.task_kind
                      FROM recent
                      JOIN request_records request
                        ON request.key_id = recent.key_id
                       AND request.conversation_cluster_id = recent.session_id
+                     LEFT JOIN conversation_observations observation
+                       ON observation.request_id = request.id
+                      AND observation.key_id = request.key_id
                    UNION ALL
                    SELECT recent.key_id, recent.session_id, request.model,
                           request.protocol, request.status_code, request.created_at,
-                          request.id, 1
+                          request.id, 1, observation.session_name,
+                          observation.task_kind
                      FROM recent
                      JOIN request_records request
                        ON request.key_id = recent.key_id
                       AND request.conversation_cluster_id IS NULL
                       AND recent.session_id = 'unlinked:' || recent.key_id
+                     LEFT JOIN conversation_observations observation
+                       ON observation.request_id = request.id
+                      AND observation.key_id = request.key_id
                    UNION ALL
                    SELECT recent.key_id, recent.session_id, archive.model,
                           archive.protocol, archive.status_code,
-                          archive.source_started_at, archive.archive_request_id, 0
+                          archive.source_started_at, archive.archive_request_id, 0,
+                          observation.session_name, observation.task_kind
                      FROM recent
                      JOIN session_archive_unlinked_requests archive
                        ON archive.key_id = recent.key_id
                       AND archive.conversation_cluster_id = recent.session_id
+                     LEFT JOIN conversation_observations observation
+                       ON observation.request_id = archive.archive_request_id
+                      AND observation.key_id = archive.key_id
                    UNION ALL
                    SELECT recent.key_id, recent.session_id, archive.model,
                           archive.protocol, archive.status_code,
-                          archive.source_started_at, archive.archive_request_id, 0
+                          archive.source_started_at, archive.archive_request_id, 0,
+                          observation.session_name, observation.task_kind
                      FROM recent
                      JOIN session_archive_unlinked_requests archive
                        ON archive.key_id = recent.key_id
                       AND archive.conversation_cluster_id IS NULL
                       AND recent.session_id = 'unlinked:' || recent.key_id
+                     LEFT JOIN conversation_observations observation
+                       ON observation.request_id = archive.archive_request_id
+                      AND observation.key_id = archive.key_id
                ), latest_activity AS (
                    SELECT recent_activity.*,
                           ROW_NUMBER() OVER (
@@ -304,6 +327,8 @@ impl Database {
                       COALESCE(active.active_requests, 0) AS active_requests,
                       COALESCE(latest_activity.model, '') AS model,
                       COALESCE(latest_activity.protocol, '') AS protocol,
+                      latest_activity.session_name,
+                      latest_activity.task_kind,
                       CASE WHEN latest_activity.status_code IS NULL AND
                                      latest_activity.live = 1 THEN 'active'
                            WHEN latest_activity.status_code IS NULL THEN 'unknown'
@@ -359,6 +384,8 @@ impl Database {
                 .or_default();
             if accumulator.session_id.is_empty() {
                 accumulator.session_id = session_id;
+                accumulator.session_name = row.try_get("session_name")?;
+                accumulator.task_kind = row.try_get("task_kind")?;
                 accumulator.key_id = row_key_id;
                 accumulator.key_alias = row.try_get("key_alias")?;
                 accumulator.model = row.try_get("model")?;
@@ -493,6 +520,7 @@ impl Database {
                     currency: row.try_get("currency")?,
                     archive_source: row.try_get("archive_source")?,
                     external_request_id: row.try_get("external_request_id")?,
+                    execution: None,
                 })
             })
             .collect::<Result<Vec<_>, AppError>>()?;
@@ -533,6 +561,8 @@ impl SessionAccumulator {
         };
         Ok(LogicalSessionSummary {
             session_id: self.session_id,
+            session_name: self.session_name,
+            task_kind: self.task_kind,
             cluster_id,
             unlinked,
             key_id: parse_uuid(self.key_id)?,

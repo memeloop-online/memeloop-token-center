@@ -120,6 +120,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
 
   await page.getByRole('tab', { name: '上游提供商', exact: true }).click();
   const onboarding = page.locator('.provider-onboarding');
+  await onboarding.locator('summary').click();
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
   await assertVisible(onboarding.getByRole('button', { name: '账户授权', exact: true }));
   await assertVisible(page.getByText('Browser mock upstream', { exact: true }));
@@ -178,6 +179,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   const page = this.requirePage();
   await page.getByRole('tab', { name: '上游提供商', exact: true }).click();
   const onboarding = page.locator('.provider-onboarding');
+  await onboarding.locator('summary').click();
   await assertVisible(page.getByRole('heading', { name: '上游服务', exact: true }));
   await assertContains(page.locator('.provider-list'), '连接并管理模型服务。');
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
@@ -260,7 +262,8 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
   await assertContains(reloadedProviderGroups, '主力提供商');
   await assertContains(reloadedProviderGroups.locator('.selection-chip'), 'Browser mock upstream');
 
-  const routeEditor = page.locator('article.form-panel').filter({ has: page.getByRole('heading', { name: '创建模型路由', exact: true }) });
+  const routeEditor = page.locator('details.create-resource').filter({ hasText: '创建模型路由' });
+  await routeEditor.locator('summary').click();
   await routeEditor.getByLabel('公开模型').fill(groupedModel);
   const includeProviders = routeEditor.getByRole('combobox', { name: '包含提供商组', exact: true });
   await includeProviders.fill('主力');

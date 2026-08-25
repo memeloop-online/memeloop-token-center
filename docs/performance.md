@@ -21,9 +21,11 @@ The acceptance profile performs all of the following:
 - seeds 100,000 tenants, upstreams, routes and managed service credentials,
   then requires 16 concurrent control-list reads to remain at 100 rows and
   below 1 MiB per response while sampling control RSS;
-- runs two concurrent Responses-tool image generations whose decoded images
-  are 11 MiB each, enforces the 16 MiB final JSON response cap, and samples
-  gateway RSS;
+- independently runs two concurrent standard OpenAI Images generations and two
+  concurrent Codex Responses-tool image generations, each with 11 MiB of
+  decoded image bytes per response; both phases enforce the 16 MiB final JSON
+  cap, exact `Content-Length`, byte-identical idempotent replay with the same
+  request ID, no replay request to the upstream, and the 128 MiB RSS gate;
 - closes downstream connections early and requires the requests to become
   `downstream_disconnected` failures;
 - sends 65 MiB from the upstream, proves the gateway delivers between 63 and
@@ -46,7 +48,8 @@ Default release thresholds are deliberately well below the historical 1 GiB CPA 
 | Gateway idle RSS | at most 96 MiB |
 | Concurrent-stream gateway RSS increase | at most 128 MiB |
 | 100k-row concurrent control-list RSS increase | at most 64 MiB |
-| Two concurrent 11 MiB synchronous-image RSS increase | at most 128 MiB |
+| Two concurrent 11 MiB standard OpenAI Images RSS increase | at most 128 MiB |
+| Two concurrent 11 MiB Codex Responses-tool Images RSS increase | at most 128 MiB |
 | 100–500 MiB asset gateway RSS increase | at most 96 MiB |
 | 100–500 MiB asset worker RSS increase | at most 192 MiB |
 | Gateway RSS retained after cooldown | at most 64 MiB over idle |

@@ -7,7 +7,7 @@
     "node": "24.18.0"
   },
   "scripts": {
-    "build:importer-scripts": "esbuild ops/legacy-credentials/attach-legacy-cpa-credentials.ts ops/cpa-upstreams/import-cpa-upstreams.ts ops/cpa-upstreams/generate-source-identity-key.ts --bundle --platform=node --target=node18 --format=cjs --out-extension:.js=.cjs --outdir=dist/operator-scripts",
+    "build:importer-scripts": "esbuild ops/legacy-credentials/attach-legacy-cpa-credentials.ts ops/cpa-upstreams/import-cpa-upstreams.ts ops/cpa-upstreams/generate-source-identity-key.ts --bundle --platform=node --target=node24.18 --format=cjs --out-extension:.js=.cjs --outdir=dist/operator-scripts && esbuild ops/export-cpa-session-archive-delta.ts --bundle --platform=node --target=node24.18 --format=esm --out-extension:.js=.mjs --outdir=dist/operator-scripts",
     "typecheck": "tsc -p tsconfig.scripts.json --pretty false"
   },
   "dependencies": {

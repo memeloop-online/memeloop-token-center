@@ -162,6 +162,16 @@ semantic evidence may infer bounded continuation/retry/edit/branch candidates;
 low-confidence candidates remain visible without being guessed into a reliable
 cluster. Compression remains explicitly related to the conversation it replaces.
 
+Downstream AI applications may additionally declare a session name, W3C
+trace/span context, agent and parent-agent identities, task kind, and bounded
+non-secret string metadata. These declarations are stored on the same
+conversation observations and exposed for request timelines, agent flame views,
+task-type distributions and per-task cost analysis. They are diagnostic only:
+they cannot grant access, change routing or billing identity, or turn candidate
+evidence into a confirmed relationship. When Codex or another client does not
+report them, the service uses only its existing protocol and Merkle-prefix
+evidence and must not fabricate a name or classification from prompt contents.
+
 Historical archive rows that cannot be matched uniquely must be marked
 `unlinked`. They must not be attached to an arbitrary nearby request and must
 not become duplicate billable requests.

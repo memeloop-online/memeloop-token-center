@@ -3,6 +3,7 @@ import type { RJSFSchema } from '@rjsf/utils';
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from 'react';
 import { ApiError, api, streamSse } from '../api';
 import { DrawerFrame, RequestTable, Shell } from '../components';
+import { clearRememberedCredential, readRememberedCredential, rememberCredential } from '../credentialStorage';
 import { formatCurrency, formatNumber } from '../format';
 import { localizeSchema, useI18n } from '../i18n';
 import { LimitSnapshot } from '../LimitSnapshot';
@@ -169,7 +170,7 @@ function enumLabel(t: Translate, prefix: string, value: string) {
 function WriteScopeNotice({ tenant }: { tenant: string }) {
   const { t } = useI18n();
   if (tenant) return null;
-  return <div className="notice warning" role="status">{t('operator.selectTenantToWrite')}</div>;
+  return <div className="scope-context"><span aria-hidden="true">◎</span><p>{t('operator.selectTenantToWrite')}</p></div>;
 }
 
 function OneTimeSecret({ value, message }: { value: string; message: string }) {
@@ -186,7 +187,7 @@ function OneTimeSecret({ value, message }: { value: string; message: string }) {
 
 export function Operator() {
   const { locale, t } = useI18n();
-  const [token, setToken] = useState('');
+  const [token, setToken] = useState(() => readRememberedCredential('operator'));
   const [tab, setTab] = useState<Tab>('traffic');
   const [trafficMode, setTrafficMode] = useState<'requests' | 'sessions'>('requests');
   const [sessionRevision, setSessionRevision] = useState(0);
@@ -209,8 +210,10 @@ export function Operator() {
   const requestEventScope = useRef<RequestEventScope | undefined>(undefined);
   const liveRequestEvents = useRef(new Map<string, RequestEvent>());
   const sessionEventKeyIds = useRef(new Set<string>());
+  const refreshSequence = useRef(0);
 
   async function refresh() {
+    const sequence = ++refreshSequence.current;
     const refreshCredential = token;
     const refreshTenant = tenant;
     const refreshFilters = requestFilters;
@@ -227,10 +230,13 @@ export function Operator() {
         api<RequestView[]>(`/internal/v1/requests${requestQuery(tenant, requestFilters)}`, credential),
         api<ConfigurationSchemas>('/internal/v1/schemas', credential),
       ]);
+      if (sequence !== refreshSequence.current) return;
       const failures = results.filter((result) => result.status === 'rejected');
       if (failures.length === results.length) throw failures[0].reason;
       const [nextTenants, nextProviders, nextPlugins, nextUpstreams, nextRequests, nextSchemas] = results;
-      setTenants(nextTenants.status === 'fulfilled' ? nextTenants.value : []);
+      const loadedTenants = nextTenants.status === 'fulfilled' ? nextTenants.value : [];
+      setTenants(loadedTenants);
+      if (!refreshTenant && loadedTenants.length === 1) setTenant(loadedTenants[0].external_id);
       setProviders(nextProviders.status === 'fulfilled' ? nextProviders.value : []);
       setPlugins(nextPlugins.status === 'fulfilled' ? nextPlugins.value : []);
       setUpstreams(nextUpstreams.status === 'fulfilled' ? nextUpstreams.value : []);
@@ -241,8 +247,10 @@ export function Operator() {
         setHasOlderRequests(nextRequests.status === 'fulfilled' && nextRequests.value.length === 100);
       }
       setSchemas(nextSchemas.status === 'fulfilled' ? nextSchemas.value : undefined);
+      rememberCredential('operator', credential);
       if (failures.length) setError(t('common.scopeWarning', { count: formatNumber(failures.length, locale) }));
     } catch (reason) {
+      if (sequence !== refreshSequence.current) return;
       if (!scopeMatches(requestEventScope.current, refreshCredential, refreshTenant, refreshFilters)) return;
       setTenants([]); setProviders([]); setPlugins([]); setUpstreams([]); setRequests([]);
       setSchemas(undefined); setHasOlderRequests(false);
@@ -370,15 +378,25 @@ export function Operator() {
     requestAnimationFrame(() => document.getElementById(`operator-tab-${tabIds[nextIndex]}`)?.focus());
   };
 
+  const clearCredential = () => {
+    refreshSequence.current += 1;
+    requestEventScope.current = { credential: '', tenant: '', filters: requestFilters };
+    clearRememberedCredential('operator');
+    setToken(''); setTenant(''); setTenants([]); setProviders([]); setPlugins([]); setUpstreams([]); setRequests([]); setSchemas(undefined);
+    setError(''); setStreamError(''); setStreamState('idle');
+  };
+
   return <Shell operator>
     <header className="hero compact">
-      <div><span className="eyebrow">{t('operator.eyebrow')}</span><h1>Token Center</h1><p>{t('operator.subtitle')}</p></div>
+      <div><span className="eyebrow">{t('operator.eyebrow')}</span><h1>Token Center</h1><p>{t('operator.subtitle')}</p><a className="button secondary portal-link" href="/portal">{t('operator.openPortal')}</a></div>
       <div className="credential operator-credential">
         {tenants.length > 0 && <label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={tenant} onChange={(event) => setTenant(event.target.value)}><option value="">{t('operator.allTenants')}</option>{tenants.map((value) => <option key={value.external_id} value={value.external_id}>{value.external_id}</option>)}</select></label>}
         <input aria-label={t('operator.serviceCredential')} autoComplete="off" type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder={t('operator.tokenPlaceholder')} />
         <button type="button" onClick={() => void refresh()}>{t('common.connect')}</button>
+        {token && <button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button>}
       </div>
     </header>
+    {token && <div className="console-context"><div><b>{tenant || t('operator.allTenants')}</b><span>{tenants.length === 0 ? t('operator.noTenants') : tenant ? t('common.rememberedCredential') : t('operator.selectTenantToWrite')}</span></div><small>{t('operator.bootstrapCredentialHint')}</small></div>}
     <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{tabIds.map((id) => <button id={`operator-tab-${id}`} role="tab" aria-selected={tab === id} aria-controls={`operator-panel-${id}`} tabIndex={tab === id ? 0 : -1} key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)} onKeyDown={(event) => changeTabByKeyboard(event, id)}>{t(`nav.${id}`)}</button>)}</nav>
     {error && <div className="notice error" role="alert">{error}</div>}
     {streamError && <div className="notice error" role="alert">{streamError}</div>}
@@ -581,16 +599,16 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
       {editing && editSchema && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.editFor', { name: editing.name })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><Form key={`${editing.id}-${locale}`} schema={editSchema} uiSchema={{ config: { oauth: { 'ui:disabled': true } } }} formData={{ name: editing.name, config: editing.config }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!formData) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: tenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(editing) || Boolean(busy)}>{t('common.save')}</button></Form></div>}
       {rotating && rotateProvider && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.rotateFor', { name: rotating.name })}</h3><button type="button" className="secondary" onClick={() => setRotating(undefined)}>{t('common.cancel')}</button></div><Form key={`${rotating.id}-${locale}`} schema={localizeSchema(rotateProvider.credential_schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { setBusy(`rotate-${rotating.id}`); try { await api(`/internal/v1/upstreams/${rotating.id}/credential`, token, { method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ credential: formData }) }); setRotating(undefined); setMessage(t('providers.rotated', { name: rotating.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(rotating) || Boolean(busy)}>{t('providers.confirmRotate')}</button></Form></div>}
     </article>
-    <article className="panel form-panel provider-onboarding">{reauthorizing ? <>
+    <details key={reauthorizing?.id ?? 'provider-create'} className="panel create-resource provider-onboarding" open={reauthorizing ? true : undefined}><summary><span><b>{reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')}</b><small>{t('providers.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{reauthorizing ? <>
       <div className="panel-title"><h2>{t('providers.reauthorizeFor', { name: reauthorizing.name })}</h2><button type="button" className="secondary" onClick={() => setReauthorizing(undefined)}>{t('common.cancel')}</button></div>
       <AuthorizationConnection key={`reauthorize-${reauthorizing.id}`} token={token} tenant={tenant} providers={providers} existing={reauthorizing} onChanged={async () => { setReauthorizing(undefined); setMessage(t('providers.reauthorized', { name: reauthorizing.name })); await onChanged(); }} />
-    </> : <><h2>{t('providers.add')}</h2>
+    </> : <>
       <div className="segmented" role="group" aria-label={t('providers.method')}><button type="button" aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</button><button type="button" aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</button></div>
       {method === 'direct' ? <>
         <label>{t('providers.provider')}<select value={provider?.id ?? ''} onChange={(event) => setDriver(event.target.value)}>{directProviders.map((value) => <option key={value.id} value={value.id}>{value.display_name} · {value.source}</option>)}</select></label>
         {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant }) }); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
-      </> : <AuthorizationConnection token={token} tenant={tenant} providers={providers} onChanged={onChanged} />}</>}
-    </article>
+      </> : <AuthorizationConnection token={token} tenant={tenant} providers={providers} onChanged={onChanged} />}</>}</div>
+    </details>
   </section></>;
 }
 
@@ -711,7 +729,7 @@ function Pricing({ token, tenant, schemas }: { token: string; tenant: string; sc
     finally { setSyncing(false); }
   };
   return <div className="pricing-page"><WriteScopeNotice tenant={tenant} />
-    <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><div className="pricing-heading-actions"><label>{t('pricing.viewCurrency')}<select aria-label={t('pricing.viewCurrency')} value={displayCurrency} onChange={(event) => { const next = event.target.value; setDisplayCurrency(next); setCurrency(next); }}><option value="USD">USD</option><option value="CNY">CNY</option></select></label><button type="button" onClick={() => void sync()} disabled={!tenant || syncing}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</button></div></div>
+    <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><div className="pricing-heading-actions"><label>{t('pricing.viewCurrency')}<select aria-label={t('pricing.viewCurrency')} value={displayCurrency} onChange={(event) => { const next = event.target.value; setDisplayCurrency(next); setCurrency(next); }}><option value="USD">USD</option><option value="CNY">CNY</option></select></label><div className="disabled-action"><button type="button" onClick={() => void sync()} disabled={!tenant || syncing} title={!tenant ? t('pricing.syncNeedsTenant') : undefined}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</button>{!tenant && <small>{t('pricing.syncNeedsTenant')}</small>}</div></div></div>
       <div className="pricing-summary"><span>{t('pricing.usedModels', { count: formatNumber(usage.models.length, locale) })}</span><span>{t('pricing.saved', { count: formatNumber(prices.length, locale) })}</span><span>{t('pricing.sourceOrder')}: models.dev → LiteLLM → OpenRouter</span></div>
       {error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}
       {syncResult && <><div className="source-status">{syncResult.sourceResults.map((source) => <div className={`source-card ${source.error ? 'failed' : 'healthy'}`} key={source.source}><b>{source.source}</b><span>{source.error ? t('pricing.sourceFailed') : t('pricing.sourceHealthy', { count: formatNumber(source.models, locale) })}</span>{source.error && <small>{source.error}</small>}</div>)}</div><div className="notice success"><b>{t('pricing.result')}</b> · {t('pricing.imported', { count: formatNumber(syncResult.imported, locale) })} · {t('pricing.candidates', { count: formatNumber(syncResult.candidates.length, locale) })} · {t('pricing.unmatched', { count: formatNumber(syncResult.unmatched.length, locale) })} · {t('pricing.preserved', { count: formatNumber(syncResult.preserved.length, locale) })}</div>
@@ -883,7 +901,7 @@ function RouteWorkspace({ token, tenant, upstreams, providers }: { token: string
     <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><span>{formatNumber(routes.length, locale)}</span></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="table-scroll"><table><thead><tr><th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{routes.map((route) => <tr key={route.id}><td><code>{route.public_model}</code></td><td><div className="table-chip-list">{(route.upstream_account_ids ?? (route.upstream_account_id ? [route.upstream_account_id] : [])).map((id) => <span key={id}>{scopedUpstreams.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code>{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !tenant} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !tenant} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !tenant || route.enabled} onClick={() => void remove(route)}>{t('common.remove')}</button></div></td></tr>)}</tbody></table>{routes.length === 0 && <div className="empty">{t('routes.empty')}</div>}</div>
       {editing && <div className="inline-editor form-panel"><div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><RouteFields token={token} tenant={tenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} /><button type="button" disabled={busy === editing.id || !canSubmit(editForm, editCatalog.valid)} onClick={() => void saveEdit()}>{t('common.save')}</button></div>}
     </article>
-    <article className="panel form-panel"><h2>{t('routes.createTitle')}</h2><RouteFields token={token} tenant={tenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: tenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></article>
+    <details className="panel create-resource"><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel"><RouteFields token={token} tenant={tenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: tenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></div></details>
   </section><section className="routing-group-managers">
     <GroupManager kind="provider" token={token} tenant={tenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
     <GroupManager kind="route" token={token} tenant={tenant} groups={routeGroups.groups} resources={routes.map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }))} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
@@ -971,14 +989,14 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
           </div>}
           {granting === value.key_id && value.account_id && <div className="inline-editor form-panel"><h3>{t('credentials.grantFor', { alias: value.alias })}</h3><label>{t('credentials.grantAmount')}<input inputMode="decimal" value={grant.amount} onChange={(event) => setGrant({ ...grant, amount: event.target.value })} /></label><label>{t('credentials.grantSource')}<input value={grant.source} onChange={(event) => setGrant({ ...grant, source: event.target.value })} /></label><button type="button" disabled={!grant.amount || !grant.source.trim()} onClick={async () => { try { await api(`/internal/v1/accounts/${value.account_id}/grants`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify(grant) }); setGranting(undefined); setGrant({ amount: '', source: 'operator-console' }); setMessage(t('credentials.granted')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('credentials.confirmGrant')}</button></div>}
         </div>})}</div></article>
-    <article className="panel form-panel"><h2>{t('credentials.createTitle')}</h2><p className="muted">{t('credentials.createRoutingHint')}</p>
+    <details className="panel create-resource"><summary><span><b>{t('credentials.createTitle')}</b><small>{t('credentials.createRoutingHint')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">
       <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(newRouteIds, routeOptions)} onChange={(selected) => setNewRouteIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
       <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(newRouteGroupIds, routeGroupOptions)} onChange={(selected) => setNewRouteGroupIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
       {createFormSchema ? <Form key={`${tenant}-${locale}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try {
         const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }) });
         setNewRouteIds([]); setNewRouteGroupIds([]); setSecret(created.key); setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
       } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant}>{t('credentials.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
-    </article>
+    </div></details>
   </section><GroupManager kind="credential" token={token} tenant={tenant} groups={credentialGroups.groups} resources={values.map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} /></>;
 }
 
@@ -996,9 +1014,9 @@ function ServiceCredentialWorkspace({ token, tenant, schema }: { token: string; 
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
   };
   useEffect(() => { void load(); }, [token, tenant]);
-  return <>{!tenant && <div className="notice warning" role="status">{t('services.allTenantNotice')}</div>}{secret && <OneTimeSecret value={secret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><span>{formatNumber(values.length, locale)}</span></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{values.length === 0 && <div className="empty">{t('services.empty')}</div>}{values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={value.status === 'revoked'} onClick={async () => { try { const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); setSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
-    <article className="panel form-panel"><h2>{t('services.createTitle')}</h2>{schema ? <Form key={`${tenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { const created = await api<{ token: string }>('/internal/v1/service-tokens', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant }) }); setSecret(created.token); setMessage(t('services.created')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant}>{t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</article>
+  return <>{!tenant && <div className="scope-context"><span aria-hidden="true">◎</span><p>{t('services.allTenantNotice')}</p></div>}{secret && <OneTimeSecret value={secret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
+    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><span>{formatNumber(values.length, locale)}</span></div><p className="credential-kind-note">{t('services.bootstrapDifference')}</p>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{values.length === 0 && <div className="empty">{t('services.empty')}</div>}{values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={value.status === 'revoked'} onClick={async () => { try { const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); setSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
+    <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { const created = await api<{ token: string }>('/internal/v1/service-tokens', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant }) }); setSecret(created.token); setMessage(t('services.created')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant}>{t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
   </section></>;
 }
 

@@ -30,6 +30,17 @@ function conversationRequest(index: number, currency: 'USD' | 'CNY') {
     source: 'live',
     provenance: 'native',
     unlinked: false,
+    execution: {
+      session_name: '发布试用',
+      trace_id: '4bf92f3577b34da6a3ce929d0e0e4736',
+      span_id: `span-${index}`,
+      parent_span_id: index === 1 ? null : `span-${index - 1}`,
+      agent_id: index % 3 === 0 ? 'research-worker' : 'codex-root',
+      parent_agent_id: index % 3 === 0 ? 'codex-root' : null,
+      task_kind: index % 2 ? 'interactive' : 'background',
+      labels: { workflow: 'release', environment: 'api2-trial' },
+      source: 'declared',
+    },
   };
 }
 
@@ -119,10 +130,16 @@ Then('同时间戳会话详情分页无重复遗漏且 USD 与 CNY 分行', asyn
   assert.equal(new Set(rows).size, 8, 'same-timestamp cursor must not duplicate or omit requests');
 });
 
-Then('六类可靠关系、候选关系和未关联请求被明确区分', async function (this: DogfoodWorld) {
+Then('六类可靠关系、候选关系、未关联请求和语义执行图被明确区分', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const drawer = page.getByRole('dialog');
   const text = await drawer.textContent() ?? '';
+  assert.match(text, /语义执行图.*发布试用/s);
+  assert.match(text, /codex-root.*research-worker/s);
+  assert.match(text, /interactive.*background/s);
+  assert.match(text, /代理费用/);
+  assert.match(text, /US\$|\$/);
+  assert.match(text, /CN¥|¥/);
   for (const relation of ['继续', '重试', '编辑', '分支', '压缩', '子代理']) assert.match(text, new RegExp(relation));
   for (const sentence of ['延续了', '是对', '修改了', '创建了分支', '上下文后继续', '派生的子代理请求']) {
     assert.match(text, new RegExp(sentence), `missing natural-language relationship: ${sentence}`);
@@ -179,7 +196,17 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
   observation.baselineSessionListRequests = observation.sessionListRequests.length;
   const calls = Array.from({ length: 4 }, (_, index) => fetch(new URL('/v1/chat/completions', page.url()), {
     method: 'POST',
-    headers: { Authorization: `Bearer ${seed.clientCredential}`, 'Content-Type': 'application/json' },
+    headers: {
+      Authorization: `Bearer ${seed.clientCredential}`,
+      'Content-Type': 'application/json',
+      'X-Codex-Session-Id': 'browser-codex-semantic-session',
+      'X-MTC-Session-Name': 'Codex release dogfood',
+      'X-MTC-Agent-Id': index === 3 ? 'codex-worker' : 'codex-root',
+      ...(index === 3 ? { 'X-MTC-Parent-Agent-Id': 'codex-root' } : {}),
+      'X-MTC-Task-Kind': index % 2 ? 'background' : 'interactive',
+      'X-MTC-Session-Labels': JSON.stringify({ workflow: 'release', environment: 'browser-e2e' }),
+      traceparent: `00-4bf92f3577b34da6a3ce929d0e0e4736-${String(index + 1).padStart(16, '0')}-01`,
+    },
     body: JSON.stringify({
       model,
       messages: [{ role: 'user', content: `force session active ${index % 2 ? 'error' : 'success'} ${index}` }],
@@ -191,6 +218,27 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
     await visible(page.locator('.session-card').first());
     assert.match(await page.locator('.session-card').first().textContent() ?? '', /活跃/);
   }, 5_000, 'active session was not visible');
+});
+
+Then('Codex 上报的会话名称、代理层级和任务分类进入真实语义视图', async function (this: DogfoodWorld) {
+  const page = this.requirePage();
+  const controls = page.locator('.session-controls');
+  await controls.getByLabel('会话状态').selectOption('');
+  await controls.getByLabel('搜索').fill('Codex release dogfood');
+  await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
+  const card = page.locator('.session-card').filter({ hasText: 'Codex release dogfood' }).first();
+  await visible(card);
+  await card.getByRole('button', { name: /^打开 / }).click();
+  const drawer = page.getByRole('dialog');
+  await visible(drawer);
+  const text = await drawer.textContent() ?? '';
+  assert.match(text, /语义执行图.*Codex release dogfood/s);
+  assert.match(text, /codex-root/);
+  assert.match(text, /codex-worker/);
+  assert.match(text, /interactive.*background/s);
+  assert.match(text, /4bf92f3577b34da6a3ce929d0e0e4736/);
+  assert.match(text, /browser-e2e/);
+  await drawer.getByRole('button', { name: '关闭', exact: true }).click();
 });
 
 Then('连续事件期间会话计数有界前进且活跃筛选移除已完成会话', async function (this: DogfoodWorld) {

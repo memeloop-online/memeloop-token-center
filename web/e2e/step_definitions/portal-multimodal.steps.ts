@@ -246,6 +246,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await connectOperator(this, 'light', seed.globalServiceCredential);
   await page.getByRole('tab', { name: '上游提供商', exact: true }).click();
   const onboarding = page.locator('.provider-onboarding');
+  await onboarding.locator('summary').click();
   await onboarding.getByLabel('服务提供商').selectOption('comfyui');
   const comfyForm = onboarding.locator('form');
   await comfyForm.locator('#root_name').fill('Browser UI ComfyUI');
@@ -307,7 +308,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await assertContains(page.getByRole('status'), '上游服务已添加');
 
   await page.getByRole('tab', { name: '模型路由', exact: true }).click();
-  const routeForm = page.locator('article.form-panel').filter({ has: page.getByRole('heading', { name: '创建模型路由', exact: true }) });
+  const routeForm = page.locator('details.create-resource').filter({ hasText: '创建模型路由' });
+  await routeForm.locator('summary').click();
   await routeForm.getByLabel('公开模型').fill(imageModel);
   const imageUpstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
   await imageUpstreamPicker.fill('Browser UI ComfyUI');
@@ -359,7 +361,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await assertContains(page.getByRole('status'), '价格已保存');
 
   await page.getByRole('tab', { name: '凭据管理', exact: true }).click();
-  const credentialPanel = page.locator('article.form-panel').filter({ has: page.getByRole('heading', { name: '创建客户端凭据', exact: true }) });
+  const credentialPanel = page.locator('details.create-resource').filter({ hasText: '创建客户端凭据' });
+  await credentialPanel.locator('summary').click();
   const credentialForm = credentialPanel.locator('form');
   await credentialForm.locator('#root_principal_external_id').fill('browser-multimodal-user');
   await credentialForm.locator('#root_alias').fill('Browser multimodal credential');
@@ -535,7 +538,7 @@ Then('普通凭据在英文暗色主题下仍无法访问管理端', async funct
   await assertAttribute(operatorPage.locator('html'), 'lang', 'en');
   await assertAttribute(operatorPage.locator('html'), 'data-theme', 'dark');
   await operatorPage.locator('input[type="password"]').fill(observation.clientCredential);
-  await operatorPage.locator('.operator-credential button').click();
+  await operatorPage.getByRole('button', { name: 'Connect', exact: true }).click();
   await eventually(async () => {
     const messages = (await operatorPage.getByRole('alert').allTextContents()).join(' ');
     assert.match(messages, /unauthorized|authentication required|HTTP 401|invalid|credential|permission denied/i);

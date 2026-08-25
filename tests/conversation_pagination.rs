@@ -170,6 +170,92 @@ async fn observe_request(
     (request_id, cluster_id)
 }
 
+#[tokio::test]
+async fn declared_execution_metadata_is_bounded_persisted_and_projected() {
+    let fixture = Fixture::new("execution-metadata").await;
+    let hints = ConversationHints {
+        session_id: Some("codex-session-7".into()),
+        session_name: Some("API2 release dogfood".into()),
+        trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".into()),
+        span_id: Some("request-span".into()),
+        parent_span_id: Some("caller-span".into()),
+        agent_id: Some("codex-root".into()),
+        parent_agent_id: Some("release-controller".into()),
+        task_kind: Some("interactive".into()),
+        labels: [("environment".into(), "api2-trial".into())]
+            .into_iter()
+            .collect(),
+        ..ConversationHints::default()
+    };
+    let (request_id, cluster_id) = observe_request(
+        &fixture.state,
+        &fixture.key,
+        &json!({"input": "dogfood the release"}),
+        &hints,
+        "Codex",
+    )
+    .await;
+
+    let sessions = fixture
+        .state
+        .db
+        .self_recent_sessions(
+            fixture.key.tenant_id,
+            memeloop_token_center::db::LogicalSessionListFilter {
+                limit: 10,
+                state: "all".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("load semantic session summary");
+    let summary = sessions
+        .iter()
+        .find(|session| session.cluster_id == Some(cluster_id))
+        .expect("semantic session summary");
+    assert_eq!(
+        summary.session_name.as_deref(),
+        Some("API2 release dogfood")
+    );
+    assert_eq!(summary.task_kind.as_deref(), Some("interactive"));
+
+    let detail = fixture
+        .state
+        .db
+        .conversation_cluster_detail(
+            fixture.key.key_id,
+            cluster_id,
+            memeloop_token_center::db::ConversationDetailFilter {
+                limit: 10,
+                before_created_at: None,
+                before_request_id: None,
+            },
+        )
+        .await
+        .expect("load projected conversation");
+    let request = detail
+        .requests
+        .iter()
+        .find(|request| request.request.request_id == request_id)
+        .expect("observed request");
+    let execution = request.execution.as_ref().expect("execution metadata");
+    assert_eq!(
+        execution.session_name.as_deref(),
+        Some("API2 release dogfood")
+    );
+    assert_eq!(execution.agent_id.as_deref(), Some("codex-root"));
+    assert_eq!(
+        execution.parent_agent_id.as_deref(),
+        Some("release-controller")
+    );
+    assert_eq!(execution.task_kind.as_deref(), Some("interactive"));
+    assert_eq!(execution.source, "declared");
+    assert_eq!(
+        execution.labels.get("environment").map(String::as_str),
+        Some("api2-trial")
+    );
+}
+
 async fn assert_subagent_relation_contract(state: &AppState, database_url: &str, tenant: &str) {
     let create = |alias: &str| CreateKeyInput {
         tenant_external_id: tenant.to_owned(),

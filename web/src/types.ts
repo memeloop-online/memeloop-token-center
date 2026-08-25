@@ -325,6 +325,19 @@ export interface ConversationRequest extends RequestView {
   unlinked: boolean;
   archive_source?: string;
   external_request_id?: string;
+  execution?: ExecutionMetadata;
+}
+
+export interface ExecutionMetadata {
+  session_name: string | null;
+  trace_id: string | null;
+  span_id: string | null;
+  parent_span_id: string | null;
+  agent_id: string | null;
+  parent_agent_id: string | null;
+  task_kind: string | null;
+  labels: Record<string, string>;
+  source: 'declared';
 }
 
 export interface ConversationDetail {
@@ -338,6 +351,8 @@ export interface ConversationDetail {
 
 export interface LogicalSessionSummary {
   session_id: string;
+  session_name: string | null;
+  task_kind: string | null;
   cluster_id: string | null;
   unlinked: boolean;
   key_id: string;

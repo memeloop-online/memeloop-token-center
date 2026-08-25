@@ -42,6 +42,13 @@ session projection into a conservative source-side cursor. Prefer the native
 The CPA plugin endpoint remains only as an input adapter for migrations from an
 older deployment:
 
+Release importer images install this reviewed TypeScript exporter as
+`/usr/local/bin/export-cpa-session-archive-delta`, so an isolated migration Job
+does not need an untracked script copied into the cluster. The sealed JSONL is
+then consumed by `/usr/local/bin/import-cpa-session-archive` from the matching
+service image. Do not confuse these image roles or substitute the final audit
+command for either stage.
+
 1. read the exact indexed-record count and the `last_at`-ordered session list;
 2. select every session at or after `checkpoint - overlap`;
 3. export each selected session and reject a count mismatch. Legacy mode retains

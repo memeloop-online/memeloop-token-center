@@ -16,6 +16,7 @@
 - [HTTP API 契约](openapi/openapi.yaml)
 - [部署就绪条件](docs/deployment-readiness.md)
 - [验收矩阵](docs/acceptance-matrix.md)
+- [语义执行元信息与 Codex 纳入方式](docs/semantic-execution-metadata.md)
 
 `docs/product-requirements.md` 是产品范围的权威入口；实现、测试或运维文档如与其冲突，必须先更新并评审产品需求，而不是静默改变范围。
 
@@ -43,7 +44,7 @@
 
 模型请求先按正文 token 上界与最大输出做余额预留，同时原子执行 RPM 限流；响应返回 usage 后结算实际费用并释放差额。生成任务按秒或任务等单位预留，worker 使用 PostgreSQL `FOR UPDATE SKIP LOCKED` 租约领取任务并幂等结算。daily、rolling-weekly 与 lifetime budget 均在调用上游前检查；崩溃窗口遗留且没有请求/任务引用的额度预留会由 worker 有界回收。
 
-逻辑对话会优先识别 `X-MTC-Conversation-Id`、`X-MTC-Turn-Id`、`X-MTC-Parent-Turn-Id`、`X-MTC-Branch-Id`、`X-MTC-Compaction` 和 `X-Claude-Code-Session-Id` 等显式元信息。结构化 parent/branch/compaction 会保存为版本化关系证据；缺少元信息时使用语义原子和 tenant-scoped Merkle 前缀树推断 continuation、retry、edit、branch 或 candidate。低置信度只进入候选会话簇，不强制合并。
+逻辑对话会优先识别 `X-MTC-Conversation-Id`、`X-MTC-Turn-Id`、`X-MTC-Parent-Turn-Id`、`X-MTC-Branch-Id`、`X-MTC-Compaction` 和 `X-Claude-Code-Session-Id` 等显式元信息。结构化 parent/branch/compaction 会保存为版本化关系证据；缺少元信息时使用语义原子和 tenant-scoped Merkle 前缀树推断 continuation、retry、edit、branch 或 candidate。低置信度只进入候选会话簇，不强制合并。下游应用还可明确上报 session 名称、W3C trace/span、代理父子、任务类型和非敏感分类信息，以绘制时序、代理耗时与任务分布；这些诊断字段不参与鉴权、路由或会话强制合并。
 
 ## 快速开始
 
@@ -76,7 +77,7 @@ Cucumber 端到端测试会启动 SQLite、内存对象存储和 Mock 上游，�
 
 memeloop web 的服务端应以稳定用户、订阅和计费周期身份调用 `PUT /internal/v1/entitlements`，用单调 `version` 对账该周期应有的信用额度；取消使用 `/internal/v1/entitlements/cancel`，只有订阅身份确实更换时才使用 `/internal/v1/entitlements/replace`。每个注册或 webhook 事件必须使用可持久恢复的确定性 `Idempotency-Key`。旧的 account grant/reversal API 只适合一次性人工调整，不应用来表达会员订阅生命周期；服务凭据只能保存在 memeloop web 后端，不能下发到浏览器。
 
-数据库 DDL 位于 `migrations/`，当前工作树 schema 版本为 v54；每个版本都在同一事务和 PostgreSQL advisory transaction lock 下应用。PostgreSQL 的请求与事件表按天分区，v21 的非分区 locator 为全局请求/事件 ID 提供唯一所有权和叶分区时间坐标；v22 用事务化状态、UTC 日桶和滚动周边界明细避免预算热路径扫描完整账本；v23–v27 增加生成与请求 facts/日聚合、按凭据分页的会话投影、生成资产元数据和 CPAMP 来源摘要；v28–v35 增加可证明的 session-archive exact/unlinked 投影、生成 worker 持久状态、稳定凭据会话修复、上游 OAuth 生命周期、CPA 原凭据映射和归档 staging fence；v36–v42 增加归档隔离区、MemeLoop Cloud entitlement 事件、凭据/账本与控制面 keyset 分页、多币种可观测性、生成取消及插件配置；v43–v48 增加提供商组、路由组、仅用于列表分类的凭据组、归一化路由授权、上游模型目录、原生 Codex OAuth 会话、目录约束、异步生成路由快照和路由关系 CAS revision；v49–v51 增加 Cloud 事件查询索引、多模态生成用量维度和逻辑会话用量汇总；v52–v53 移除旧模型白名单写入入口，并持久化 Claude Code、Copilot 和 Cursor 的独立 OAuth 流类型；v54 补齐会话维度中的缓存读写 Token 和异步多模态生成用量，无法可靠关联的生成任务保留在稳定的 `unlinked:<key_id>` 会话。SQLite 保留等价的小型测试 schema。连接池默认每进程最多 4 个连接且不预热，HTTP 上游连接池也有严格空闲上限；同步生图响应限制为 16 MiB、每副本最多两个并发缓冲，其他大对象继续流式归档。fresh PostgreSQL 16/17 的 v1–v42 历史门禁及 fresh PostgreSQL 17 的 v1–v51 门禁已通过；v52–v54 尚需 fresh PostgreSQL 发布门禁。真实 MinIO、10 万级索引计划和并发内存门禁也有独立证据。生产快照升级锁时和 live 部署门禁仍不能用 SQLite/Cucumber 结果替代。
+数据库 DDL 位于 `migrations/`，当前工作树 schema 版本为 v55；每个版本都在同一事务和 PostgreSQL advisory transaction lock 下应用。PostgreSQL 的请求与事件表按天分区，v21 的非分区 locator 为全局请求/事件 ID 提供唯一所有权和叶分区时间坐标；v22 用事务化状态、UTC 日桶和滚动周边界明细避免预算热路径扫描完整账本；v23–v27 增加生成与请求 facts/日聚合、按凭据分页的会话投影、生成资产元数据和 CPAMP 来源摘要；v28–v35 增加可证明的 session-archive exact/unlinked 投影、生成 worker 持久状态、稳定凭据会话修复、上游 OAuth 生命周期、CPA 原凭据映射和归档 staging fence；v36–v42 增加归档隔离区、MemeLoop Cloud entitlement 事件、凭据/账本与控制面 keyset 分页、多币种可观测性、生成取消及插件配置；v43–v48 增加提供商组、路由组、仅用于列表分类的凭据组、归一化路由授权、上游模型目录、原生 Codex OAuth 会话、目录约束、异步生成路由快照和路由关系 CAS revision；v49–v51 增加 Cloud 事件查询索引、多模态生成用量维度和逻辑会话用量汇总；v52–v53 移除旧模型白名单写入入口，并持久化 Claude Code、Copilot 和 Cursor 的独立 OAuth 流类型；v54 补齐会话维度中的缓存读写 Token 和异步多模态生成用量；v55 增加明确上报的 session/trace/span/代理/任务语义元信息，无法可靠关联的生成任务保留在稳定的 `unlinked:<key_id>` 会话。SQLite 保留等价的小型测试 schema。连接池默认每进程最多 4 个连接且不预热，HTTP 上游连接池也有严格空闲上限；同步生图响应限制为 16 MiB、每副本最多两个并发缓冲，其他大对象继续流式归档。fresh PostgreSQL 16/17 的 v1–v42 历史门禁及 fresh PostgreSQL 17 的 v1–v51 门禁已通过；v52–v55 尚需 fresh PostgreSQL 发布门禁。真实 MinIO、10 万级索引计划和并发内存门禁也有独立证据。生产快照升级锁时和 live 部署门禁仍不能用 SQLite/Cucumber 结果替代。
 
 `ops/migrate-cpamp.sh` 是 PostgreSQL 增量导入器：首次导入所有 CPAMP usage/alias/price，之后从 checkpoint watermark 回看默认 24 小时，只把尚未存在的 event hash 写入请求明细、facts、请求日聚合及用量小时/日聚合。导入行会快照 USD、默认服务档位、协议、错误与时延桶；这些聚合只从本次成功取得 locator 的新 facts 产生，因此完整重放不会重复累计。回看窗口用于覆盖 CPAMP 延迟刷盘；确定性 UUID 与幂等插入保证周末切换前可以反复运行。`ops/kubernetes/cpamp-import-job.yaml` 提供了只读挂载 CPA Manager Plus PVC 的 K8s Job 模板，默认就是增量模式。`CPAMP_RESET_IMPORT=true` 仅用于重建 dogfood 导入租户，不应在生产增量切换中使用。
 

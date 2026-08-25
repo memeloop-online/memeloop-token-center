@@ -112,7 +112,66 @@ pub(super) fn conversation_hints(record: &ArchiveRecord) -> ConversationHints {
         branch_id,
         compaction,
         subagent,
+        session_name: metadata_string(record, "session_name").and_then(safe_execution_metadata),
+        trace_id: metadata_string(record, "trace_id").and_then(safe_execution_metadata),
+        span_id: metadata_string(record, "span_id").and_then(safe_execution_metadata),
+        parent_span_id: metadata_string(record, "parent_span_id").and_then(safe_execution_metadata),
+        agent_id: metadata_string(record, "agent_id").and_then(safe_execution_metadata),
+        parent_agent_id: metadata_string(record, "parent_agent_id")
+            .and_then(safe_execution_metadata),
+        task_kind: metadata_string(record, "task_kind").and_then(safe_execution_metadata),
+        labels: archive_execution_labels(record),
     }
+}
+
+fn safe_execution_metadata(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+fn archive_execution_labels(record: &ArchiveRecord) -> std::collections::BTreeMap<String, String> {
+    record
+        .metadata
+        .get("session_labels")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|labels| labels.iter())
+        .filter_map(|(key, value)| {
+            let normalized = key.to_ascii_lowercase().replace('-', "_");
+            let secret_like = [
+                "authorization",
+                "bearer",
+                "cookie",
+                "credential",
+                "password",
+                "private",
+                "secret",
+                "token",
+                "api_key",
+            ]
+            .iter()
+            .any(|needle| normalized.contains(needle));
+            if key.is_empty()
+                || key.len() > 64
+                || secret_like
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            {
+                return None;
+            }
+            let value = value.as_str()?.trim();
+            if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+                return None;
+            }
+            Some((key.clone(), value.to_owned()))
+        })
+        .take(16)
+        .collect()
 }
 
 pub(super) fn first_facet<'a>(record: &'a ArchiveRecord, name: &str) -> Option<&'a str> {
@@ -277,5 +336,33 @@ mod tests {
         ] {
             assert!(!conversation_hints(&candidate).subagent);
         }
+    }
+
+    #[test]
+    fn archive_execution_metadata_keeps_only_bounded_non_secret_declarations() {
+        let hints = conversation_hints(&record(
+            json!({
+                "session_name": "nightly fulfilment",
+                "trace_id": "trace-7",
+                "agent_id": "worker-2",
+                "parent_agent_id": "scheduler",
+                "task_kind": "background",
+                "session_labels": {
+                    "workflow": "fulfilment",
+                    "environment": "production",
+                    "access-token": "must-drop",
+                    "numeric": 7
+                }
+            }),
+            json!({}),
+        ));
+        assert_eq!(hints.session_name.as_deref(), Some("nightly fulfilment"));
+        assert_eq!(hints.trace_id.as_deref(), Some("trace-7"));
+        assert_eq!(hints.agent_id.as_deref(), Some("worker-2"));
+        assert_eq!(hints.parent_agent_id.as_deref(), Some("scheduler"));
+        assert_eq!(hints.task_kind.as_deref(), Some("background"));
+        assert_eq!(hints.labels.len(), 2);
+        assert!(!hints.labels.contains_key("access-token"));
+        assert!(!hints.labels.contains_key("numeric"));
     }
 }

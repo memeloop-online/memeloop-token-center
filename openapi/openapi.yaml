@@ -5797,6 +5797,25 @@ components:
             currency: { type: [string, 'null'], description: Billing currency for live requests; null for non-billable archive-only records. }
             archive_source: { type: string }
             external_request_id: { type: string, maxLength: 512 }
+            execution: { $ref: '#/components/schemas/ExecutionMetadata' }
+    ExecutionMetadata:
+      type: object
+      additionalProperties: false
+      required: [session_name, trace_id, span_id, parent_span_id, agent_id, parent_agent_id, task_kind, labels, source]
+      properties:
+        session_name: { type: [string, 'null'], maxLength: 256 }
+        trace_id: { type: [string, 'null'], maxLength: 256 }
+        span_id: { type: [string, 'null'], maxLength: 256 }
+        parent_span_id: { type: [string, 'null'], maxLength: 256 }
+        agent_id: { type: [string, 'null'], maxLength: 256 }
+        parent_agent_id: { type: [string, 'null'], maxLength: 256 }
+        task_kind: { type: [string, 'null'], maxLength: 256 }
+        labels:
+          type: object
+          maxProperties: 16
+          propertyNames: { type: string, pattern: '^[A-Za-z0-9_.-]{1,64}$' }
+          additionalProperties: { type: string, maxLength: 128 }
+        source: { type: string, enum: [declared] }
     ConversationDetail:
       type: object
       required: [cluster, requests, edges, has_more, next_cursor, edges_truncated]
@@ -5821,9 +5840,11 @@ components:
     LogicalSessionSummary:
       type: object
       additionalProperties: false
-      required: [session_id, cluster_id, unlinked, key_id, key_alias, model, protocol, last_status, last_activity_at, active_requests, requests, errors, input_tokens, output_tokens, avg_duration_ms, costs, archived_only_requests, archived_only_errors, archived_only_input_tokens, archived_only_output_tokens, archived_only_avg_duration_ms]
+      required: [session_id, session_name, task_kind, cluster_id, unlinked, key_id, key_alias, model, protocol, last_status, last_activity_at, active_requests, requests, errors, input_tokens, output_tokens, avg_duration_ms, costs, archived_only_requests, archived_only_errors, archived_only_input_tokens, archived_only_output_tokens, archived_only_avg_duration_ms]
       properties:
         session_id: { type: string, minLength: 1, maxLength: 80 }
+        session_name: { type: [string, 'null'], maxLength: 256 }
+        task_kind: { type: [string, 'null'], maxLength: 256 }
         cluster_id: { type: [string, 'null'], format: uuid }
         unlinked: { type: boolean }
         key_id: { type: string, format: uuid }

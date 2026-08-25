@@ -200,6 +200,53 @@ release blocker is the importer runtime image attestation described above.
 
 ## Current release resume order
 
+### 2026-08-25 continuation
+
+The working tree after release `84f768e` adds schema v55 semantic execution
+metadata and a responsive console pass. Clients can declare session names,
+W3C trace/span context, agent ancestry, task kinds and bounded non-secret
+metadata; existing Codex session/parent/Merkle evidence remains available when
+those declarations are absent. Session detail renders agent-duration lanes,
+request-count task distribution and currency-separated per-agent billed cost.
+Operator and self-service credentials are remembered in browser-local storage
+until the user explicitly clears the corresponding role. Single-tenant service
+credentials select their only tenant automatically; creation/onboarding forms
+are collapsed until requested and the ordinary-user portal is linked from the
+operator header. These changes are local and tested directionally; they are not
+yet a pushed release, immutable image, migrated live trial or API2/API3 change.
+
+The isolated API2 candidate built from `84f768e` remains the runtime baseline
+while current CPA/CPAMP Longhorn snapshots are imported. API3 is explicitly
+outside the current window and must remain unchanged until the user separately
+opens the production window. Do not reuse the earlier v54 images for the v55 UI
+or schema, and do not trigger CI until the complete local Rust/TypeScript,
+fresh-PostgreSQL, browser and migration gates are green.
+
+The importer image now bundles the reviewed TypeScript session-archive exporter
+as `/usr/local/bin/export-cpa-session-archive-delta` and installs its `flock`
+runtime dependency. The sealed JSONL is still consumed by
+`/usr/local/bin/import-cpa-session-archive` from the matching service image.
+This closes the observed packaging gap without introducing Python or turning
+`audit-cpa-migration` into an importer.
+
+Current local release evidence after these changes: rustfmt, Clippy with
+`-D warnings`, and `cargo test --locked --all-targets --all-features` pass; the
+Rust Cucumber suite reports 69/69 scenarios and 373/373 steps. Root TypeScript,
+the OpenAPI route contract (106 paths/126 operations), the eight archive-export
+contracts, web typecheck/localization/build, and the browser suite (19/19
+scenarios, 140/140 steps) pass. The browser suite sends a real Codex-style
+semantic request through HTTP and reads it back through the session API/UI. The
+credential-reload/manual-clear scenario covers both operator and ordinary-user
+portals. A dirty-working-tree short optimized-memory run also passed both
+independent 128 MiB image gates: standard OpenAI Images measured 91.289 MiB and
+Codex Responses-tool Images measured 75.617 MiB; both proved exact
+`Content-Length`, byte-identical replay with the same request ID and no replay
+upstream call. This is local regression evidence only: rerun from the exact
+committed release SHA before retaining the report. The local host has neither
+Docker/Podman nor PostgreSQL/Helm, so container, fresh PostgreSQL v1→v55 and
+Helm gates remain for the single fixed-SHA CI run rather than being represented
+as local evidence.
+
 1. Validate the pinned Alpine importer, base-nossl service/plugin runtime,
    patched Cosign and TypeScript operator contracts locally. Do not change
    security or memory thresholds.

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -14,6 +16,71 @@ pub struct ConversationHints {
     /// principal, and stable key.
     #[serde(default)]
     pub subagent: bool,
+    /// Human-readable and explicitly reported execution metadata. These
+    /// values are diagnostic labels only; they never participate in tenant,
+    /// credential, routing, or billing authorization.
+    #[serde(default)]
+    pub session_name: Option<String>,
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub span_id: Option<String>,
+    #[serde(default)]
+    pub parent_span_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub parent_agent_id: Option<String>,
+    #[serde(default)]
+    pub task_kind: Option<String>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+impl ConversationHints {
+    pub fn execution_metadata(&self) -> Option<ExecutionMetadata> {
+        let metadata = ExecutionMetadata {
+            session_name: self.session_name.clone(),
+            trace_id: self.trace_id.clone(),
+            span_id: self.span_id.clone(),
+            parent_span_id: self.parent_span_id.clone(),
+            agent_id: self.agent_id.clone(),
+            parent_agent_id: self.parent_agent_id.clone(),
+            task_kind: self.task_kind.clone(),
+            labels: self.labels.clone(),
+            source: "declared".to_owned(),
+        };
+        metadata.has_values().then_some(metadata)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionMetadata {
+    pub session_name: Option<String>,
+    pub trace_id: Option<String>,
+    pub span_id: Option<String>,
+    pub parent_span_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub parent_agent_id: Option<String>,
+    pub task_kind: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    /// `declared` means the downstream application supplied these values.
+    /// Prefix-tree and relationship inference remains separately represented
+    /// by conversation edges and their confidence/evidence.
+    pub source: String,
+}
+
+impl ExecutionMetadata {
+    fn has_values(&self) -> bool {
+        self.session_name.is_some()
+            || self.trace_id.is_some()
+            || self.span_id.is_some()
+            || self.parent_span_id.is_some()
+            || self.agent_id.is_some()
+            || self.parent_agent_id.is_some()
+            || self.task_kind.is_some()
+            || !self.labels.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

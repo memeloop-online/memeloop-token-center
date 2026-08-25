@@ -49,25 +49,44 @@ docker run --rm \
     test -x /usr/local/bin/attach-legacy-cpa-credentials
     test -x /usr/local/bin/import-cpa-upstreams
     test -x /usr/local/bin/generate-source-identity-key
+    test -x /usr/local/bin/export-cpa-session-archive-delta
     test ! -w /usr/local/bin/migrate-cpamp
     test ! -w /usr/local/bin/audit-cpa-migration
     test ! -w /usr/local/bin/attach-legacy-cpa-credentials
     test ! -w /usr/local/bin/import-cpa-upstreams
     test ! -w /usr/local/bin/generate-source-identity-key
+    test ! -w /usr/local/bin/export-cpa-session-archive-delta
     test "$(stat -c %a /usr/local/bin/migrate-cpamp)" = 555
     test "$(stat -c %a /usr/local/bin/audit-cpa-migration)" = 555
     test "$(stat -c %a /usr/local/bin/attach-legacy-cpa-credentials)" = 555
     test "$(stat -c %a /usr/local/bin/import-cpa-upstreams)" = 555
     test "$(stat -c %a /usr/local/bin/generate-source-identity-key)" = 555
+    test "$(stat -c %a /usr/local/bin/export-cpa-session-archive-delta)" = 555
     command -v psql >/dev/null
     command -v node >/dev/null
     command -v sqlite3 >/dev/null
+    command -v flock >/dev/null
     node --version | grep -Eq "^v24\\."
     psql --version | grep -Eq "^psql \\(PostgreSQL\\) 18\\."
     test ! -e /tests
     test ! -e /source
     test ! -e /work
   '
+
+docker run --rm \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+  --security-opt no-new-privileges \
+  --cap-drop ALL \
+  --entrypoint /usr/local/bin/export-cpa-session-archive-delta \
+  "$image" --help >"$workspace/archive-export-help.txt"
+grep -Fq -- '--output' "$workspace/archive-export-help.txt"
+grep -Fq -- '--checkpoint' "$workspace/archive-export-help.txt"
+if grep -Eqi -- '(token|credential|ticket).*(argument|value)' \
+  "$workspace/archive-export-help.txt"; then
+  echo 'archive exporter must obtain secrets from protected files or environment, not arguments' >&2
+  exit 1
+fi
 
 docker run --rm \
   --read-only \
