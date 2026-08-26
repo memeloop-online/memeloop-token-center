@@ -163,9 +163,13 @@ Session construction has two evidence levels:
 Schema v55 keeps explicitly declared session name, W3C trace/span context,
 agent ancestry, task kind and bounded non-secret metadata on the observation.
 These fields are a visualization/audit projection, not identity evidence. The
-request timeline can therefore render agent lanes and task distributions while
-older Codex traffic still benefits from session headers, Responses parent IDs
-and the Merkle prefix tree without receiving invented semantic attributes. See
+session detail additionally projects explicit session/turn/parent/response,
+branch, compaction and client-name protocol evidence as a separate `structure`
+object. The request timeline, duration flame view, task distribution and
+currency-separated agent/task cost views can therefore include older Codex
+traffic while visually distinguishing inferred structure from declared human
+semantics. Missing names and types remain missing rather than being generated
+from prompts. See
 [Semantic execution metadata](semantic-execution-metadata.md).
 
 Candidate evidence is visible for operator review but cannot silently merge

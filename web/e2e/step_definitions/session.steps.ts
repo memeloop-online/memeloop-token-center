@@ -30,7 +30,7 @@ function conversationRequest(index: number, currency: 'USD' | 'CNY') {
     source: 'live',
     provenance: 'native',
     unlinked: false,
-    execution: {
+    execution: index === 8 ? undefined : {
       session_name: '发布试用',
       trace_id: '4bf92f3577b34da6a3ce929d0e0e4736',
       span_id: `span-${index}`,
@@ -40,6 +40,16 @@ function conversationRequest(index: number, currency: 'USD' | 'CNY') {
       task_kind: index % 2 ? 'interactive' : 'background',
       labels: { workflow: 'release', environment: 'api2-trial' },
       source: 'declared',
+    },
+    structure: {
+      session_id: 'codex-session-browser',
+      turn_id: `codex-turn-${index}`,
+      parent_turn_id: index === 1 ? null : `codex-turn-${index - 1}`,
+      response_id: `resp-${index}`,
+      branch_id: index === 6 ? 'research-branch' : null,
+      compaction: index === 7,
+      client_name: 'Codex CLI',
+      source: 'client_protocol',
     },
   };
 }
@@ -137,6 +147,11 @@ Then('六类可靠关系、候选关系、未关联请求和语义执行图被�
   assert.match(text, /语义执行图.*发布试用/s);
   assert.match(text, /codex-root.*research-worker/s);
   assert.match(text, /interactive.*background/s);
+  assert.match(text, /协议\/前缀树结构证据/);
+  assert.match(text, /codex-session-browser/);
+  assert.match(text, /执行耗时火焰视图/);
+  assert.match(text, /任务类型费用/);
+  assert.ok(await drawer.locator('.execution-lane.inferred').count() > 0, 'protocol-only Codex request must remain visible as inferred structure');
   assert.match(text, /代理费用/);
   assert.match(text, /US\$|\$/);
   assert.match(text, /CN¥|¥/);
@@ -200,6 +215,8 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
       Authorization: `Bearer ${seed.clientCredential}`,
       'Content-Type': 'application/json',
       'X-Codex-Session-Id': 'browser-codex-semantic-session',
+      'X-MTC-Turn-Id': `browser-turn-${index}`,
+      ...(index > 0 ? { 'X-MTC-Parent-Turn-Id': `browser-turn-${index - 1}` } : {}),
       'X-MTC-Session-Name': 'Codex release dogfood',
       'X-MTC-Agent-Id': index === 3 ? 'codex-worker' : 'codex-root',
       ...(index === 3 ? { 'X-MTC-Parent-Agent-Id': 'codex-root' } : {}),
@@ -238,6 +255,8 @@ Then('Codex 上报的会话名称、代理层级和任务分类进入真实语�
   assert.match(text, /interactive.*background/s);
   assert.match(text, /4bf92f3577b34da6a3ce929d0e0e4736/);
   assert.match(text, /browser-e2e/);
+  assert.match(text, /browser-codex-semantic-session/);
+  assert.match(text, /执行耗时火焰视图/);
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
 });
 

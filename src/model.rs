@@ -456,6 +456,8 @@ pub struct ConversationRequestView {
     pub external_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution: Option<crate::conversation::ExecutionMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structure: Option<crate::conversation::ExecutionStructure>,
 }
 
 #[derive(Clone, Debug, Serialize)]

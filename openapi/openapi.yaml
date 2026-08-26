@@ -5798,6 +5798,7 @@ components:
             archive_source: { type: string }
             external_request_id: { type: string, maxLength: 512 }
             execution: { $ref: '#/components/schemas/ExecutionMetadata' }
+            structure: { $ref: '#/components/schemas/ExecutionStructure' }
     ExecutionMetadata:
       type: object
       additionalProperties: false
@@ -5816,6 +5817,19 @@ components:
           propertyNames: { type: string, pattern: '^[A-Za-z0-9_.-]{1,64}$' }
           additionalProperties: { type: string, maxLength: 128 }
         source: { type: string, enum: [declared] }
+    ExecutionStructure:
+      type: object
+      additionalProperties: false
+      required: [session_id, turn_id, parent_turn_id, response_id, branch_id, compaction, client_name, source]
+      properties:
+        session_id: { type: [string, 'null'], maxLength: 256 }
+        turn_id: { type: [string, 'null'], maxLength: 256 }
+        parent_turn_id: { type: [string, 'null'], maxLength: 256 }
+        response_id: { type: [string, 'null'], maxLength: 256 }
+        branch_id: { type: [string, 'null'], maxLength: 256 }
+        compaction: { type: boolean }
+        client_name: { type: [string, 'null'], maxLength: 256 }
+        source: { type: string, enum: [client_protocol] }
     ConversationDetail:
       type: object
       required: [cluster, requests, edges, has_more, next_cursor, edges_truncated]

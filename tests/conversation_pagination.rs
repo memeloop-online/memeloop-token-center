@@ -175,6 +175,9 @@ async fn declared_execution_metadata_is_bounded_persisted_and_projected() {
     let fixture = Fixture::new("execution-metadata").await;
     let hints = ConversationHints {
         session_id: Some("codex-session-7".into()),
+        turn_id: Some("codex-turn-12".into()),
+        parent_turn_id: Some("codex-turn-11".into()),
+        branch_id: Some("release-branch".into()),
         session_name: Some("API2 release dogfood".into()),
         trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".into()),
         span_id: Some("request-span".into()),
@@ -254,6 +257,65 @@ async fn declared_execution_metadata_is_bounded_persisted_and_projected() {
         execution.labels.get("environment").map(String::as_str),
         Some("api2-trial")
     );
+    let structure = request.structure.as_ref().expect("protocol structure");
+    assert_eq!(structure.session_id.as_deref(), Some("codex-session-7"));
+    assert_eq!(structure.turn_id.as_deref(), Some("codex-turn-12"));
+    assert_eq!(structure.parent_turn_id.as_deref(), Some("codex-turn-11"));
+    assert_eq!(structure.branch_id.as_deref(), Some("release-branch"));
+    assert_eq!(structure.client_name.as_deref(), Some("Codex"));
+    assert_eq!(structure.source, "client_protocol");
+    assert!(!structure.compaction);
+}
+
+#[tokio::test]
+async fn codex_protocol_structure_is_projected_without_invented_semantics() {
+    let fixture = Fixture::new("codex-protocol-structure").await;
+    let hints = ConversationHints {
+        session_id: Some("codex-native-session".into()),
+        turn_id: Some("codex-native-turn".into()),
+        parent_turn_id: Some("resp_previous".into()),
+        ..ConversationHints::default()
+    };
+    let (request_id, cluster_id) = observe_request(
+        &fixture.state,
+        &fixture.key,
+        &json!({"input": "native Codex request without semantic labels"}),
+        &hints,
+        "Codex CLI",
+    )
+    .await;
+
+    let detail = fixture
+        .state
+        .db
+        .conversation_cluster_detail(
+            fixture.key.key_id,
+            cluster_id,
+            memeloop_token_center::db::ConversationDetailFilter {
+                limit: 10,
+                before_created_at: None,
+                before_request_id: None,
+            },
+        )
+        .await
+        .expect("load Codex protocol structure");
+    let request = detail
+        .requests
+        .iter()
+        .find(|request| request.request.request_id == request_id)
+        .expect("Codex request");
+    assert!(
+        request.execution.is_none(),
+        "semantic labels must not be invented"
+    );
+    let structure = request.structure.as_ref().expect("protocol structure");
+    assert_eq!(
+        structure.session_id.as_deref(),
+        Some("codex-native-session")
+    );
+    assert_eq!(structure.turn_id.as_deref(), Some("codex-native-turn"));
+    assert_eq!(structure.parent_turn_id.as_deref(), Some("resp_previous"));
+    assert_eq!(structure.client_name.as_deref(), Some("Codex CLI"));
 }
 
 async fn assert_subagent_relation_contract(state: &AppState, database_url: &str, tenant: &str) {

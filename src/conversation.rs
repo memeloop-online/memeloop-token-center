@@ -70,6 +70,34 @@ pub struct ExecutionMetadata {
     pub source: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionStructure {
+    /// Stable session/thread identifier supplied by a compatible client (for
+    /// example `X-Codex-Session-Id` or Responses `prompt_cache_key`).
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub parent_turn_id: Option<String>,
+    pub response_id: Option<String>,
+    pub branch_id: Option<String>,
+    pub compaction: bool,
+    pub client_name: Option<String>,
+    /// Structural values originate in client/protocol hints. Prefix-tree and
+    /// relationship inference remains represented by edges with confidence.
+    pub source: String,
+}
+
+impl ExecutionStructure {
+    pub fn has_values(&self) -> bool {
+        self.session_id.is_some()
+            || self.turn_id.is_some()
+            || self.parent_turn_id.is_some()
+            || self.response_id.is_some()
+            || self.branch_id.is_some()
+            || self.compaction
+            || self.client_name.is_some()
+    }
+}
+
 impl ExecutionMetadata {
     fn has_values(&self) -> bool {
         self.session_name.is_some()

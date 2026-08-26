@@ -71,7 +71,69 @@ Current Codex-compatible traffic is incorporated as far as evidence permits:
   timeline and relationship graph but is not assigned fabricated semantics.
 
 The session detail API returns declared execution metadata alongside each
-request. The web console renders agent-duration lanes and a request-count task
-distribution. Request cost and currency stay attached to the same request, so
-future cost pies/flame aggregations can reuse authoritative billing facts
-without reparsing prompts or mixing currencies.
+request. It also returns a separate `structure` projection containing bounded
+client/protocol evidence: explicit session, turn, parent turn, upstream
+response, branch, compaction and client name. `structure.source` is
+`client_protocol`; it is never labelled as a human declaration. Confirmed and
+candidate prefix-tree relations remain separate edges with their own evidence
+and confidence.
+
+The web console combines those evidence classes without collapsing them:
+
+- solid lanes are client-declared agents/tasks; dashed lanes are protocol or
+  confirmed-prefix-tree structure whose human meaning is unknown;
+- the aligned request timeline shows wall-clock start and elapsed time;
+- the execution-duration flame view uses declared agent ancestry or confirmed
+  request edges for depth and request elapsed time for width. It is explicitly
+  not represented as a CPU-sampling flame graph;
+- the task pie includes every visible request and retains missing types as
+  `Unclassified`; and
+- per-agent and per-task costs use the authoritative billed request fact and
+  always split currencies.
+
+This is deliberately analogous to `Server-Timing`: the application can report
+semantics that only it knows, while the gateway validates, stores and visualizes
+them without letting those diagnostics alter authorization or billing.
+
+## Codex CLI configuration
+
+Codex custom model providers support an API `base_url`, an environment-backed
+credential, environment-backed HTTP headers and static headers. A user-level
+Codex configuration can therefore attach one stable semantic context to every
+request in a Codex process without placing secrets in the file:
+
+```toml
+model_provider = "memeloop-token-center"
+
+[model_providers.memeloop-token-center]
+name = "MemeLoop Token Center"
+base_url = "https://token-center-api2-trial-portal.k3s.onetwo.website/v1"
+env_key = "MTC_CLIENT_CREDENTIAL"
+wire_api = "responses"
+
+[model_providers.memeloop-token-center.env_http_headers]
+"X-Codex-Session-Id" = "MTC_SESSION_ID"
+"X-MTC-Session-Name" = "MTC_SESSION_NAME"
+"X-MTC-Agent-Id" = "MTC_AGENT_ID"
+"X-MTC-Parent-Agent-Id" = "MTC_PARENT_AGENT_ID"
+"X-MTC-Task-Kind" = "MTC_TASK_KIND"
+"X-MTC-Session-Labels" = "MTC_SESSION_LABELS"
+"traceparent" = "MTC_TRACEPARENT"
+```
+
+The launcher or host application should set those variables immediately before
+spawning each root or child Codex process. This makes root/child agent IDs,
+interactive/background type, workflow labels and trace context explicit. A
+plain Codex invocation that cannot set per-session values still contributes
+Responses parent IDs, prompt-cache/session hints when present, request timing,
+cost and Merkle-prefix relations.
+
+Codex also supports OTLP log, metric and trace exporters in user-level
+configuration. Token Center does not currently pretend to be an OTLP collector:
+model-provider requests are billable request facts, while Codex tool/turn spans
+are non-billing execution events. A future collector adapter may ingest those
+events into a separate execution-event table, but may join them to requests only
+through a stable opaque session/turn/request/trace identifier. Raw prompt export
+must remain disabled (`otel.log_user_prompt = false`) unless a separate explicit
+content-retention approval exists. See the official
+[Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).

@@ -326,6 +326,7 @@ export interface ConversationRequest extends RequestView {
   archive_source?: string;
   external_request_id?: string;
   execution?: ExecutionMetadata;
+  structure?: ExecutionStructure;
 }
 
 export interface ExecutionMetadata {
@@ -338,6 +339,17 @@ export interface ExecutionMetadata {
   task_kind: string | null;
   labels: Record<string, string>;
   source: 'declared';
+}
+
+export interface ExecutionStructure {
+  session_id: string | null;
+  turn_id: string | null;
+  parent_turn_id: string | null;
+  response_id: string | null;
+  branch_id: string | null;
+  compaction: boolean;
+  client_name: string | null;
+  source: 'client_protocol';
 }
 
 export interface ConversationDetail {

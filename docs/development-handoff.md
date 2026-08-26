@@ -206,8 +206,13 @@ The working tree after release `84f768e` adds schema v55 semantic execution
 metadata and a responsive console pass. Clients can declare session names,
 W3C trace/span context, agent ancestry, task kinds and bounded non-secret
 metadata; existing Codex session/parent/Merkle evidence remains available when
-those declarations are absent. Session detail renders agent-duration lanes,
-request-count task distribution and currency-separated per-agent billed cost.
+those declarations are absent. The current continuation additionally projects
+session/turn/parent/response/branch/compaction/client evidence as a separate
+`structure` object. Session detail renders declared versus inferred request
+lanes, an elapsed-request flame view, request-count task distribution and
+currency-separated per-agent/per-task billed cost. The Codex custom-provider
+configuration and the separate future OTLP event boundary are documented in
+`docs/semantic-execution-metadata.md`.
 Operator and self-service credentials are remembered in browser-local storage
 until the user explicitly clears the corresponding role. Single-tenant service
 credentials select their only tenant automatically; creation/onboarding forms

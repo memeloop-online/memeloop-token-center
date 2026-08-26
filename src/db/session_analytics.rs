@@ -521,6 +521,7 @@ impl Database {
                     archive_source: row.try_get("archive_source")?,
                     external_request_id: row.try_get("external_request_id")?,
                     execution: None,
+                    structure: None,
                 })
             })
             .collect::<Result<Vec<_>, AppError>>()?;

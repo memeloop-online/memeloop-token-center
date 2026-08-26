@@ -134,6 +134,13 @@ Schema v16 stores the successful upstream OpenAI Responses `id` on its conversat
 
 Schema v55 adds diagnostic execution metadata without changing the grouping trust boundary. Clients may send `X-MTC-Session-Name`, `X-MTC-Trace-Id`, `X-MTC-Span-Id`, `X-MTC-Parent-Span-Id`, `X-MTC-Agent-Id`, `X-MTC-Parent-Agent-Id`, `X-MTC-Task-Kind`, bounded JSON `X-MTC-Session-Labels`, and standard W3C `traceparent`. Snake-case fields under request `metadata` are equivalent, with headers taking precedence. Secret-like label keys, non-string values, malformed W3C context and over-limit data are discarded. Session detail responses attach accepted declarations to the corresponding request as `execution`; absence is omitted rather than inferred. Full bounds and Codex coverage are defined in `docs/semantic-execution-metadata.md`.
 
+Session request rows independently attach `structure` when client/protocol
+evidence exists: `session_id`, `turn_id`, `parent_turn_id`, `response_id`,
+`branch_id`, `compaction`, `client_name`, and source `client_protocol`.
+Structural absence is omitted. This object does not claim a human session name,
+agent role or task type; prefix-tree relationships and confidence remain in the
+separate `edges` array.
+
 Logical-conversation self service is bounded at both levels. `GET /self/v1/conversations` returns at most 100 stable-key projections and pages backwards with the exclusive `(before_updated_at, before_cluster_id)` cursor. Session labels, prefix/parent inference, candidate edges and candidate counts are scoped to that same stable `key_id`; two credentials for one principal cannot infer from or expose each other's conversation metadata. Detail authorization is a point lookup on `(key_id, cluster_id)`, not an in-memory search through the list. `GET /self/v1/conversations/{cluster_id}` returns the newest 100 requests by default (at most 200), exposes `has_more` and `next_cursor`, and pages backwards with `(before_created_at, before_request_id)`; relationship edges are restricted to targets in that request page and have an explicit hard bound reported through `edges_truncated`. The portal prepends earlier pages with request/edge de-duplication. A transactionally maintained projection supplies totals without recounting observations. Empty semantic histories never create prefix evidence. Recent low-confidence same-client similarity is exposed as a `candidate` edge on a separate cluster and therefore never forces a merge.
 
 Archive rehydration writes its observation, relation edge, key/cluster projection, request references, import record and checkpoint in one database transaction. A failed post-observation write rolls the entire record back; overlap replay cannot increment projection counters or duplicate edges.

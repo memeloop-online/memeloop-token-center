@@ -517,7 +517,7 @@ impl Database {
             (filter.before_created_at, filter.before_request_id)
         {
             sqlx::query(
-                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 WHERE requests.created_at < $3 OR (requests.created_at = $3 AND requests.id < $4) ORDER BY requests.created_at DESC, requests.id DESC LIMIT $5",
+                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 WHERE requests.created_at < $3 OR (requests.created_at = $3 AND requests.id < $4) ORDER BY requests.created_at DESC, requests.id DESC LIMIT $5",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -528,7 +528,7 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 ORDER BY requests.created_at DESC, requests.id DESC LIMIT $3",
+                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, currency, error_code, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 ORDER BY requests.created_at DESC, requests.id DESC LIMIT $3",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -659,9 +659,29 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                 archive_source: row.try_get("archive_source")?,
                 external_request_id: row.try_get("external_request_id")?,
                 execution: execution_metadata_from_row(&row)?,
+                structure: execution_structure_from_row(&row)?,
             })
         })
         .collect()
+}
+
+fn execution_structure_from_row(
+    row: &AnyRow,
+) -> Result<Option<crate::conversation::ExecutionStructure>, AppError> {
+    let structure = crate::conversation::ExecutionStructure {
+        session_id: row.try_get("explicit_session_id")?,
+        turn_id: row.try_get("turn_id")?,
+        parent_turn_id: row.try_get("parent_turn_id")?,
+        response_id: row.try_get("upstream_response_id")?,
+        branch_id: row.try_get("branch_id")?,
+        compaction: row
+            .try_get::<Option<i64>, _>("compaction")?
+            .unwrap_or_default()
+            != 0,
+        client_name: row.try_get("client_name")?,
+        source: "client_protocol".to_owned(),
+    };
+    Ok(structure.has_values().then_some(structure))
 }
 
 fn execution_metadata_from_row(

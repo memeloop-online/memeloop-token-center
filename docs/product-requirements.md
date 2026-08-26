@@ -171,6 +171,14 @@ they cannot grant access, change routing or billing identity, or turn candidate
 evidence into a confirmed relationship. When Codex or another client does not
 report them, the service uses only its existing protocol and Merkle-prefix
 evidence and must not fabricate a name or classification from prompt contents.
+Session detail must expose that structural evidence separately from declared
+semantics, including its provenance and relationship confidence. Visualizations
+must show wall-clock timing, relationship/agent depth, task request share and
+currency-separated agent/task cost; they must label elapsed-request flame views
+as such rather than implying CPU samples. Codex should be integrated through
+native session/Responses parent evidence plus environment-backed custom-provider
+headers. OTLP tool/turn telemetry is a later non-billing event stream and may be
+joined only through stable opaque identifiers, never prompt-content similarity.
 
 Historical archive rows that cannot be matched uniquely must be marked
 `unlinked`. They must not be attached to an arbitrary nearby request and must
