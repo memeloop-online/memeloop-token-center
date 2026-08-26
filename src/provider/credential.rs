@@ -9,6 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
+use crate::network::OutboundScope;
 
 const CURRENT_ENVELOPE_VERSION: &str = "v2";
 pub(super) const LEGACY_ENVELOPE_VERSION: &str = "v1";
@@ -27,6 +28,20 @@ pub enum UpstreamCredential {
         header: String,
         #[serde(default = "bearer_prefix")]
         prefix: String,
+    },
+    /// An API credential whose account is intentionally routed through one
+    /// operator-approved proxy. The complete proxy URL stays inside the same
+    /// encrypted envelope as the API key, because it may contain proxy
+    /// authentication and private topology.
+    #[serde(rename = "api_key_proxy")]
+    ProxiedApiKey {
+        value: String,
+        #[serde(default = "authorization_header")]
+        header: String,
+        #[serde(default = "bearer_prefix")]
+        prefix: String,
+        proxy_url: String,
+        proxy_network_scope: OutboundScope,
     },
     #[serde(rename = "oauth")]
     OAuth {
@@ -53,6 +68,15 @@ impl std::fmt::Debug for UpstreamCredential {
                 .debug_struct("UpstreamCredential::ApiKey")
                 .field("credential_material", &"[redacted]")
                 .finish(),
+            Self::ProxiedApiKey {
+                proxy_network_scope,
+                ..
+            } => formatter
+                .debug_struct("UpstreamCredential::ProxiedApiKey")
+                .field("credential_material", &"[redacted]")
+                .field("proxy_url", &"[redacted]")
+                .field("proxy_network_scope", proxy_network_scope)
+                .finish(),
             Self::OAuth {
                 refresh_token,
                 expires_at,
@@ -74,13 +98,13 @@ impl UpstreamCredential {
         match self {
             Self::None => "none",
             Self::OAuth { .. } => "oauth",
-            Self::ApiKey { .. } => "api_key",
+            Self::ApiKey { .. } | Self::ProxiedApiKey { .. } => "api_key",
         }
     }
 
     pub fn expires_at(&self) -> Option<i64> {
         match self {
-            Self::None | Self::ApiKey { .. } => None,
+            Self::None | Self::ApiKey { .. } | Self::ProxiedApiKey { .. } => None,
             Self::OAuth { expires_at, .. } => *expires_at,
         }
     }
@@ -97,6 +121,12 @@ impl UpstreamCredential {
                 value,
                 header,
                 prefix,
+            } => (value, header, prefix),
+            Self::ProxiedApiKey {
+                value,
+                header,
+                prefix,
+                ..
             } => (value, header, prefix),
             Self::OAuth {
                 access_token,
@@ -120,6 +150,21 @@ impl UpstreamCredential {
                 header,
                 prefix,
             } => (value, header, prefix),
+            Self::ProxiedApiKey {
+                value,
+                header,
+                prefix,
+                proxy_url,
+                proxy_network_scope,
+            } => {
+                validate_proxy_url(proxy_url)?;
+                if *proxy_network_scope != OutboundScope::Private {
+                    return Err(AppError::BadRequest(
+                        "upstream SOCKS5 proxy must use private network scope".into(),
+                    ));
+                }
+                (value, header, prefix)
+            }
             Self::OAuth {
                 access_token,
                 expires_at,
@@ -173,6 +218,64 @@ impl UpstreamCredential {
             _ => None,
         }
     }
+
+    pub fn proxy(&self) -> Option<(&str, OutboundScope)> {
+        match self {
+            Self::ProxiedApiKey {
+                proxy_url,
+                proxy_network_scope,
+                ..
+            } => Some((proxy_url.as_str(), *proxy_network_scope)),
+            _ => None,
+        }
+    }
+
+    /// Preserve an imported account proxy when an ordinary API-key rotation
+    /// supplies only replacement key material. A caller that needs to change
+    /// the proxy must use the explicit proxied credential form. Removing it
+    /// requires a future dedicated transport operation, so a routine rotation
+    /// cannot silently bypass required egress routing.
+    pub fn preserve_proxy_from(self, current: &Self) -> Self {
+        match (self, current) {
+            (
+                Self::ApiKey {
+                    value,
+                    header,
+                    prefix,
+                },
+                Self::ProxiedApiKey {
+                    proxy_url,
+                    proxy_network_scope,
+                    ..
+                },
+            ) => Self::ProxiedApiKey {
+                value,
+                header,
+                prefix,
+                proxy_url: proxy_url.clone(),
+                proxy_network_scope: *proxy_network_scope,
+            },
+            (replacement, _) => replacement,
+        }
+    }
+}
+
+fn validate_proxy_url(value: &str) -> Result<(), AppError> {
+    if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
+        return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
+    }
+    let parsed = url::Url::parse(value)
+        .map_err(|_| AppError::BadRequest("upstream proxy URL is invalid".into()))?;
+    if parsed.scheme() != "socks5"
+        || parsed.host_str().is_none()
+        || parsed.port() == Some(0)
+        || (parsed.path() != "" && parsed.path() != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
+    }
+    Ok(())
 }
 
 fn deserialize_adapter_state<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
@@ -360,4 +463,84 @@ pub(super) fn legacy_encryption_key(key_material: &[u8]) -> [u8; 32] {
     hash.update(b"memeloop-token-center/upstream-encryption-key/v1\0");
     hash.update(key_material);
     hash.finalize().into()
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    fn proxied() -> UpstreamCredential {
+        UpstreamCredential::ProxiedApiKey {
+            value: "api-secret".into(),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            proxy_url: "socks5://proxy-user:proxy-secret@10.20.30.40:1080".into(),
+            proxy_network_scope: OutboundScope::Private,
+        }
+    }
+
+    #[test]
+    fn proxied_api_key_is_encrypted_redacted_and_round_trips() {
+        let credential = proxied();
+        credential.validate(0).unwrap();
+        let debug = format!("{credential:?}");
+        assert!(!debug.contains("api-secret"));
+        assert!(!debug.contains("proxy-secret"));
+        assert!(!debug.contains("10.20.30.40"));
+
+        let envelope = seal_credential(&credential, b"test-key-material").unwrap();
+        assert!(!envelope.contains("api-secret"));
+        assert!(!envelope.contains("proxy-secret"));
+        let opened = open_credential(&envelope, b"test-key-material").unwrap();
+        assert_eq!(
+            opened.proxy(),
+            Some((
+                "socks5://proxy-user:proxy-secret@10.20.30.40:1080",
+                OutboundScope::Private
+            ))
+        );
+    }
+
+    #[test]
+    fn ordinary_rotation_preserves_proxy_and_invalid_proxy_shapes_fail() {
+        let rotated = UpstreamCredential::ApiKey {
+            value: "replacement".into(),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+        }
+        .preserve_proxy_from(&proxied());
+        assert_eq!(
+            rotated.proxy(),
+            Some((
+                "socks5://proxy-user:proxy-secret@10.20.30.40:1080",
+                OutboundScope::Private
+            ))
+        );
+        for proxy_url in [
+            "socks5h://10.20.30.40:1080",
+            "https://10.20.30.40:8443",
+            "socks5://10.20.30.40:1080/path",
+            "socks5://10.20.30.40:1080?secret=value",
+            "socks5://10.20.30.40:0",
+            "file:///tmp/proxy",
+        ] {
+            let mut credential = proxied();
+            if let UpstreamCredential::ProxiedApiKey {
+                proxy_url: value, ..
+            } = &mut credential
+            {
+                *value = proxy_url.into();
+            }
+            assert!(credential.validate(0).is_err(), "{proxy_url}");
+        }
+        let mut public_scope = proxied();
+        if let UpstreamCredential::ProxiedApiKey {
+            proxy_network_scope,
+            ..
+        } = &mut public_scope
+        {
+            *proxy_network_scope = OutboundScope::Public;
+        }
+        assert!(public_scope.validate(0).is_err());
+    }
 }

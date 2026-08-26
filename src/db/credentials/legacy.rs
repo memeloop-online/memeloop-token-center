@@ -44,7 +44,12 @@ impl Database {
                 "legacy credential does not match source_hash".into(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
+        // This flow reads the target and existing mappings before inserting.
+        // On SQLite, a deferred transaction can lose the writer race after
+        // those reads and fail its lock upgrade immediately with SQLITE_BUSY.
+        // Claim the writer slot up front so the configured busy timeout can
+        // serialize this migration write with request/background activity.
+        let mut transaction = self.begin_write_transaction().await?;
         let target_sql = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT credential_generation, status FROM key_records WHERE id = $1 FOR UPDATE"
@@ -136,6 +141,8 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::super::super::*;
 
     #[tokio::test]
@@ -214,5 +221,54 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_legacy_attachment_waits_for_a_competing_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("legacy-writer-race.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"legacy writer race pepper longer than thirty-two bytes";
+        let key = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "legacy-writer-race".to_owned(),
+                    principal_external_id: "principal".to_owned(),
+                    alias: "legacy".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::ONE,
+                    idempotency_key: None,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+
+        let blocker = database.begin_write_transaction().await.unwrap();
+        let secret = "legacy-writer-race-credential".to_owned();
+        let source_hash = format!("{:x}", Sha256::digest(secret.as_bytes()));
+        let attaching_database = database.clone();
+        let attaching = tokio::spawn(async move {
+            attaching_database
+                .register_legacy_key_credential(key.key_id, &secret, &source_hash, pepper)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !attaching.is_finished(),
+            "legacy attachment must wait instead of failing a deferred lock upgrade"
+        );
+        blocker.rollback().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), attaching)
+            .await
+            .expect("legacy attachment did not resume after writer release")
+            .expect("legacy attachment task panicked")
+            .expect("legacy attachment failed after writer release");
     }
 }

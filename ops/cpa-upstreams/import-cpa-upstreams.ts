@@ -5,6 +5,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readdirSync, lstatSync, openSync, closeSync, fstatSync, readSync, constants } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { isIP } from "node:net";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { parseDocument } from "yaml";
 import { parseStrictJson } from "../lib/strict-json.ts";
@@ -24,7 +25,8 @@ const MANAGED_OAUTH_SOURCE_TYPES: Readonly<Record<string, string>> = { codex: "c
 
 class ImportFailure extends Error {}
 type JsonObject = Record<string, unknown>;
-type DirectAccount = { sourceId: string; name: string; driver: "http-json"; config: JsonObject; header: string; prefix: string; secretRef: string; disabled: boolean };
+type ProxyNetworkScope = "private";
+type DirectAccount = { sourceId: string; name: string; driver: "http-json"; config: JsonObject; header: string; prefix: string; secretRef: string; proxySecretRef?: string; proxyNetworkScope?: ProxyNetworkScope; disabled: boolean };
 type NativeReauthorization = { sourceId: string; provider: string; sourceDisabled: boolean };
 type ManagedOAuth = { stableId: string; sourceType: string; payloadRef: string };
 type Inventory = { direct: DirectAccount[]; native: NativeReauthorization[]; managed: ManagedOAuth[]; disabledSourceCount: number };
@@ -147,29 +149,65 @@ function publicUrl(value: unknown, label: string, allowHttpLoopback: boolean): s
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 const sourceIdentity = (...parts: unknown[]): string => [SOURCE_VERSION, ...parts.map(String)].join("\0");
 const accountName = (label: string, sourceId: string): string => `cpa-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || "upstream"}-${digest(sourceId).slice(0, 16)}`;
-function rejectTransport(entry: JsonObject, label: string): void {
-  if (entry["proxy-url"] !== undefined && entry["proxy-url"] !== "") throw new ImportFailure(`${label} uses a per-account proxy unsupported by the target API`);
+function rejectUnsupportedTransport(entry: JsonObject, label: string): void {
   if (entry.headers !== undefined && JSON.stringify(entry.headers) !== "{}") throw new ImportFailure(`${label} uses custom headers unsupported by the target API`);
   if (entry.cloak !== undefined && JSON.stringify(entry.cloak) !== "{}") throw new ImportFailure(`${label} uses request cloaking unsupported by the target API`);
 }
-function addDirect(records: DirectAccount[], secrets: SecretStore, sourceId: string, label: string, baseUrl: string, credential: string, header: string, prefix: string, disabled: boolean): void {
+function privateAddress(host: string): boolean {
+  const address = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  if (isIP(address) === 4) {
+    const octets = address.split(".").map(Number);
+    return octets[0] === 10 || (octets[0] === 172 && octets[1]! >= 16 && octets[1]! <= 31)
+      || (octets[0] === 192 && octets[1] === 168);
+  }
+  if (isIP(address) === 6) {
+    const normalized = address.toLowerCase().split("%")[0]!;
+    return normalized.startsWith("fc") || normalized.startsWith("fd");
+  }
+  const normalized = address.toLowerCase().replace(/\.$/, "");
+  return (!normalized.includes(".") && !normalized.includes(":")) || normalized === "localhost" || normalized.endsWith(".localhost") || normalized.endsWith(".local")
+    || normalized.endsWith(".internal") || normalized.endsWith(".lan") || normalized.endsWith(".cluster.local");
+}
+function proxyUrl(value: unknown, label: string): { value: string; scope: ProxyNetworkScope } | undefined {
+  if (value === undefined || value === "") return undefined;
+  const raw = secretString(value, label);
+  if (Buffer.byteLength(raw) > 2_048) throw new ImportFailure(`${label} is invalid`);
+  let parsed: URL;
+  try { parsed = new URL(raw); } catch { throw new ImportFailure(`${label} is invalid`); }
+  if (parsed.protocol !== "socks5:" || !parsed.hostname
+    || parsed.port === "0" || (parsed.pathname !== "" && parsed.pathname !== "/") || parsed.search || parsed.hash) throw new ImportFailure(`${label} is invalid`);
+  if (!privateAddress(parsed.hostname)) throw new ImportFailure(`${label} must use a private SOCKS5 endpoint`);
+  return { value: raw, scope: "private" };
+}
+function effectiveProxy(provider: unknown, account: unknown, label: string): { value: string; scope: ProxyNetworkScope } | undefined {
+  const inherited = proxyUrl(provider, `${label} provider proxy URL`), direct = proxyUrl(account, `${label} account proxy URL`);
+  if (inherited !== undefined && direct !== undefined && inherited.value !== direct.value) throw new ImportFailure(`${label} declares conflicting proxy URLs`);
+  return direct ?? inherited;
+}
+function addDirect(records: DirectAccount[], secrets: SecretStore, sourceId: string, label: string, baseUrl: string, credential: string, header: string, prefix: string, disabled: boolean, proxy?: { value: string; scope: ProxyNetworkScope }): void {
   const secretRef = `direct:${digest(sourceId)}`; secrets.put(secretRef, credential);
-  records.push({ sourceId, name: accountName(label, sourceId), driver: "http-json", config: { base_url: baseUrl, network_scope: "public" }, header, prefix, secretRef, disabled });
+  let proxyFields: Pick<DirectAccount, "proxySecretRef" | "proxyNetworkScope"> = {};
+  if (proxy !== undefined) {
+    const proxySecretRef = `proxy:${digest(sourceId)}`;
+    secrets.put(proxySecretRef, proxy.value);
+    proxyFields = { proxySecretRef, proxyNetworkScope: proxy.scope };
+  }
+  records.push({ sourceId, name: accountName(label, sourceId), driver: "http-json", config: { base_url: baseUrl, network_scope: "public" }, header, prefix, secretRef, ...proxyFields, disabled });
 }
 function inventoryConfig(config: JsonObject, secrets: SecretStore, allowHttp: boolean): [DirectAccount[], number] {
   const records: DirectAccount[] = []; let disabledCount = 0; const names = new Set<string>();
   for (const raw of list(config["openai-compatibility"], "CPA openai-compatibility")) {
     const provider = mapping(raw, "CPA openai-compatibility entry");
-    exact(provider, ["name", "disabled", "prefix", "base-url", "headers", "api-key-entries", "models", "excluded-models"], "CPA openai-compatibility entry");
+    exact(provider, ["name", "disabled", "prefix", "base-url", "headers", "proxy-url", "api-key-entries", "models", "excluded-models"], "CPA openai-compatibility entry");
     const name = provider.name;
     if (typeof name !== "string" || !name.trim() || name.length > 200) throw new ImportFailure("CPA openai-compatibility provider name is invalid");
     if (names.has(name)) throw new ImportFailure("CPA openai-compatibility provider name is duplicated"); names.add(name);
     const disabled = provider.disabled ?? false; if (typeof disabled !== "boolean") throw new ImportFailure("CPA openai-compatibility disabled flag is invalid");
-    rejectTransport(provider, "CPA openai-compatibility entry");
+    rejectUnsupportedTransport(provider, "CPA openai-compatibility entry");
     const baseUrl = publicUrl(provider["base-url"], "CPA openai-compatibility base URL", allowHttp);
     list(provider["api-key-entries"], "CPA openai-compatibility api-key-entries").forEach((rawEntry, index) => {
-      const entry = mapping(rawEntry, "CPA openai-compatibility API key entry"); exact(entry, ["api-key", "proxy-url"], "CPA openai-compatibility API key entry"); rejectTransport(entry, "CPA openai-compatibility API key entry");
-      addDirect(records, secrets, sourceIdentity("config", "openai-compatibility", name, index), name, baseUrl, secretString(entry["api-key"], "CPA upstream API key"), "authorization", "Bearer ", disabled); disabledCount += Number(disabled);
+      const entry = mapping(rawEntry, "CPA openai-compatibility API key entry"); exact(entry, ["api-key", "proxy-url"], "CPA openai-compatibility API key entry"); rejectUnsupportedTransport(entry, "CPA openai-compatibility API key entry");
+      addDirect(records, secrets, sourceIdentity("config", "openai-compatibility", name, index), name, baseUrl, secretString(entry["api-key"], "CPA upstream API key"), "authorization", "Bearer ", disabled, effectiveProxy(provider["proxy-url"], entry["proxy-url"], "CPA openai-compatibility entry")); disabledCount += Number(disabled);
     });
   }
   const sections: Array<[string, string, string | undefined, string, string]> = [
@@ -179,10 +217,10 @@ function inventoryConfig(config: JsonObject, secrets: SecretStore, allowHttp: bo
   ];
   const allowed = ["api-key", "prefix", "base-url", "headers", "proxy-url", "models", "excluded-models", "cloak", "disabled"];
   for (const [section, label, defaultUrl, header, prefix] of sections) list(config[section], `CPA ${section}`).forEach((raw, index) => {
-    const entry = mapping(raw, `CPA ${section} entry`); exact(entry, allowed, `CPA ${section} entry`); rejectTransport(entry, `CPA ${section} entry`);
+    const entry = mapping(raw, `CPA ${section} entry`); exact(entry, allowed, `CPA ${section} entry`); rejectUnsupportedTransport(entry, `CPA ${section} entry`);
     const disabled = entry.disabled ?? false; if (typeof disabled !== "boolean") throw new ImportFailure(`CPA ${section} disabled flag is invalid`);
     const rawUrl = entry["base-url"] ?? defaultUrl; if (rawUrl === undefined) throw new ImportFailure("CPA codex-api-key entry requires an explicit base-url for lossless import");
-    addDirect(records, secrets, sourceIdentity("config", section, index), label, publicUrl(rawUrl, `CPA ${section} base URL`, allowHttp), secretString(entry["api-key"], "CPA upstream API key"), header, prefix, disabled); disabledCount += Number(disabled);
+    addDirect(records, secrets, sourceIdentity("config", section, index), label, publicUrl(rawUrl, `CPA ${section} base URL`, allowHttp), secretString(entry["api-key"], "CPA upstream API key"), header, prefix, disabled, proxyUrl(entry["proxy-url"], `CPA ${section} proxy URL`)); disabledCount += Number(disabled);
   });
   return [records, disabledCount];
 }
@@ -303,7 +341,10 @@ async function apply(baseUrl: string, token: string, tenant: string, inventory: 
   }
   let created = 0, replayed = 0;
   for (const record of inventory.direct) {
-    const credential = { type: "api_key", value: secrets.string(record.secretRef), header: record.header, prefix: record.prefix }; let account = existing.get(record.name);
+    const credential = record.proxySecretRef === undefined
+      ? { type: "api_key", value: secrets.string(record.secretRef), header: record.header, prefix: record.prefix }
+      : { type: "api_key_proxy", value: secrets.string(record.secretRef), header: record.header, prefix: record.prefix, proxy_url: secrets.string(record.proxySecretRef), proxy_network_scope: record.proxyNetworkScope };
+    let account = existing.get(record.name);
     if (!account) {
       account = validateAccount((await requestJson("POST", `${baseUrl}/internal/v1/upstreams`, token, "target upstream creation", [201], { tenant_external_id: tenant, name: record.name, driver: record.driver, config: record.config, credential }, undefined, caFile)).value, tenant, "target upstream creation");
       if (account.name !== record.name || account.driver !== record.driver || JSON.stringify(account.config) !== JSON.stringify(record.config)) throw new ImportFailure("target upstream creation returned another account");
@@ -325,7 +366,7 @@ function readSourceKey(path: string): Buffer {
 }
 function summary(mode: string, inventory: Inventory, native: JsonObject[], counts = [0, 0, 0, 0]): JsonObject {
   const sourceCounts: Record<string, number> = {}; for (const record of inventory.managed) sourceCounts[record.sourceType] = (sourceCounts[record.sourceType] ?? 0) + 1;
-  return { api_account_count: inventory.direct.length, created_count: counts[0], created_managed_oauth_count: counts[2], disabled_source_count: inventory.disabledSourceCount, managed_oauth_account_count: inventory.managed.length, managed_oauth_source_type_counts: Object.fromEntries(Object.entries(sourceCounts).sort()), mode, native_reauthorization_required: native, native_reauthorization_required_count: native.length, replayed_count: counts[1], replayed_managed_oauth_count: counts[3] };
+  return { api_account_count: inventory.direct.length, created_count: counts[0], created_managed_oauth_count: counts[2], disabled_source_count: inventory.disabledSourceCount, managed_oauth_account_count: inventory.managed.length, managed_oauth_source_type_counts: Object.fromEntries(Object.entries(sourceCounts).sort()), mode, native_reauthorization_required: native, native_reauthorization_required_count: native.length, proxied_api_account_count: inventory.direct.filter((record) => record.proxySecretRef !== undefined).length, replayed_count: counts[1], replayed_managed_oauth_count: counts[3] };
 }
 type Options = { config?: string; authDir?: string; tenant: string; apply: boolean; target?: string; token?: string; sourceKey?: string; ca?: string; allowHttp: boolean };
 function args(argv: string[]): Options {

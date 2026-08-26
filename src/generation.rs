@@ -1145,6 +1145,7 @@ async fn route_http(
         &state.http,
         url,
         &route.config,
+        route.credential.proxy(),
         state.config.allow_oauth_loopback,
     )
     .await

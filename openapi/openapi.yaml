@@ -4252,6 +4252,17 @@ components:
         value: { type: string, minLength: 1, writeOnly: true }
         header: { type: string, default: authorization }
         prefix: { type: string, default: 'Bearer ' }
+    ProxiedApiKeyCredential:
+      type: object
+      additionalProperties: false
+      required: [type, value, proxy_url, proxy_network_scope]
+      properties:
+        type: { const: api_key_proxy }
+        value: { type: string, minLength: 1, writeOnly: true }
+        header: { type: string, default: authorization }
+        prefix: { type: string, default: 'Bearer ' }
+        proxy_url: { type: string, pattern: '^socks5://', minLength: 1, maxLength: 2048, writeOnly: true }
+        proxy_network_scope: { type: string, const: private }
     OAuthCredential:
       type: object
       additionalProperties: false
@@ -4273,12 +4284,14 @@ components:
       oneOf:
         - $ref: '#/components/schemas/NoAuthCredential'
         - $ref: '#/components/schemas/ApiKeyCredential'
+        - $ref: '#/components/schemas/ProxiedApiKeyCredential'
         - $ref: '#/components/schemas/OAuthCredential'
       discriminator:
         propertyName: type
         mapping:
           none: '#/components/schemas/NoAuthCredential'
           api_key: '#/components/schemas/ApiKeyCredential'
+          api_key_proxy: '#/components/schemas/ProxiedApiKeyCredential'
           oauth: '#/components/schemas/OAuthCredential'
     CreateUpstreamProviderRequest:
       type: object

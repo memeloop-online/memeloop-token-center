@@ -188,6 +188,16 @@ Until the source implements this complete contract, a saturated legacy window
 remains a hard gate; client-side time splitting cannot prove an upper fence or a
 complete equal-timestamp boundary.
 
+The legacy CPA plugin projection (before its stable-snapshot contract) is a
+separate compatibility boundary. Its RFC3339 timestamps may carry a numeric
+offset and 1–9 fractional digits. The exporter compares them at nanosecond
+precision so equal-microsecond ordering cannot collapse, then writes the
+artifact's canonical UTC value with exactly six digits and `Z`. This
+normalization is allowed only after the stable-cursor request has explicitly
+fallen back to the unsaturated legacy projection. Stable-cursor responses still
+fail closed unless their original timestamp strings are already canonical
+six-digit UTC `Z` values and their projection digest matches.
+
 New artifacts use manifest and checkpoint contract version 2. The reader accepts
 legacy version-1 artifacts for a one-way upgrade, but version 2 stores the
 projection protocol and optional ingest fence so an older exporter rejects the

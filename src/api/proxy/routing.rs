@@ -152,6 +152,7 @@ pub(super) async fn send_proxy_route(
         &state.http,
         &outbound_base_url,
         &route.route.config,
+        route.route.credential.proxy(),
         state.config.allow_oauth_loopback,
     )
     .await

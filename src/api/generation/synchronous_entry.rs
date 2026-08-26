@@ -151,6 +151,7 @@ async fn proxy_openai_image_generation(
             &state.http,
             &route.base_url,
             &route.config,
+            route.credential.proxy(),
             state.config.allow_oauth_loopback,
         )
         .await?;

@@ -266,6 +266,7 @@ async fn discover_models(
         &state.http,
         &base_url,
         &account.config,
+        credential.proxy(),
         state.config.allow_oauth_loopback,
     )
     .await
@@ -331,6 +332,7 @@ async fn discover_codex_models(
         &state.http,
         &base_url,
         &account.config,
+        credential.proxy(),
         state.config.allow_oauth_loopback,
     )
     .await

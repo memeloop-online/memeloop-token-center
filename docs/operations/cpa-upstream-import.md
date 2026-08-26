@@ -11,8 +11,8 @@ separate reviewed routing migration.
 
 ## Supported source records
 
-The parser uses PyYAML `SafeLoader`, rejects duplicate mapping keys and YAML
-aliases, and accepts these CPA configuration sections:
+The TypeScript parser uses `yaml` in strict unique-key/no-alias mode and accepts
+these CPA configuration sections:
 
 - `openai-compatibility[].api-key-entries[]`;
 - `gemini-api-key[]`, using `x-goog-api-key`;
@@ -23,8 +23,14 @@ aliases, and accepts these CPA configuration sections:
 - Codex and legacy Gemini OAuth documents, imported into the matching managed
   OAuth provider supplied by Token Center.
 
-Custom upstream headers, per-account proxies and Claude request cloaking stop the
-entire import because the current `http-json` account cannot preserve them.
+Per-account private `socks5` proxy URLs are preserved in
+the same encrypted credential envelope as the API key. The URL is write-only and
+may contain proxy authentication; inventory, account views and errors expose only
+the proxied-account count. Proxied accounts require a global service credential.
+The target and proxy addresses are resolved and checked independently; only
+local-DNS `socks5` is accepted so the target uses the client's pinned resolution,
+while `socks5h`, HTTP(S) proxies and public SOCKS endpoints fail closed. Custom
+upstream headers and Claude request cloaking still stop the entire import.
 Unknown `*-api-key`/`*-compatibility` sections and unknown auth JSON types also
 stop the import. No supported accounts are written before source inventory and
 target metadata conflict checks finish.
@@ -61,8 +67,9 @@ The HTTP client never follows redirects. Use `--ca-file` for a private control
 plane CA instead of disabling TLS verification.
 
 The apply service credential needs `providers:read`, `providers:write` and, for
-managed OAuth documents, `imports:cpa:write`. Route it only to the private
-control Service.
+managed OAuth documents, `imports:cpa:write`. A private per-account proxy also
+requires a global (not tenant-bound) service credential. Route it only to the
+private control Service.
 
 ## Dry-run and apply
 
@@ -114,7 +121,7 @@ A successful dry-run returns counts and the non-secret native-authorization
 worklist:
 
 ```json
-{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"3e37cd527b6365313440b4be4df9184b4dbe06c2aeb4c80628134bd38cb0ea38"},{"provider":"cursor","source_disabled":false,"source_stable_id":"2a8d8d1ee60dad9b93c5f8a479fb24fd38f48095da0c1e9cde5a00fc7ad650b3"}],"native_reauthorization_required_count":2,"replayed_count":0,"replayed_managed_oauth_count":0}
+{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"3e37cd527b6365313440b4be4df9184b4dbe06c2aeb4c80628134bd38cb0ea38"},{"provider":"cursor","source_disabled":false,"source_stable_id":"2a8d8d1ee60dad9b93c5f8a479fb24fd38f48095da0c1e9cde5a00fc7ad650b3"}],"native_reauthorization_required_count":2,"proxied_api_account_count":1,"replayed_count":0,"replayed_managed_oauth_count":0}
 ```
 
 Preserve the source snapshot and inventory output for review. Do not reorder API

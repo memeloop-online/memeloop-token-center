@@ -283,6 +283,16 @@ duplicate facts or aggregates, and uses a reviewed overlap window for late
 writes. Session archives are dry-run, apply and exact-replay checked. Exact and
 unlinked counts, object digests, source totals and target totals must reconcile.
 
+Legacy CPA upstream migration must preserve its private SOCKS5 account proxy
+rather than silently bypassing it. Proxy credentials/topology are encrypted
+write-only material; dry-run output is count-only, and proxy creation or change
+is restricted to a global service credential. The local-DNS SOCKS5 form is
+required so the validated target address remains pinned through the handshake.
+Legacy CPA archive timestamps with
+explicit offsets and up to nanosecond precision may be normalized to canonical
+six-digit UTC only in the pre-stable legacy projection. The stable snapshot
+protocol remains strict and must reject non-canonical source timestamps.
+
 The CPA/API2 trial deployment must preserve the old CPA revision and a verified
 route-back operation. Trial-scoped writes must be identifiable and reversible;
 existing accounts, subscriptions, credentials and history must be validated in

@@ -244,6 +244,20 @@ impl ProviderCatalog {
                     }
                 },
                 {
+                    "title": "API key through an account proxy",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["type", "value", "proxy_url", "proxy_network_scope"],
+                    "properties": {
+                        "type": {"const": "api_key_proxy", "title": "Credential type"},
+                        "value": {"type": "string", "minLength": 1, "writeOnly": true, "title": "Credential value"},
+                        "header": {"type": "string", "default": "authorization"},
+                        "prefix": {"type": "string", "default": "Bearer "},
+                        "proxy_url": {"type": "string", "pattern": "^socks5://", "minLength": 1, "maxLength": 2048, "writeOnly": true, "title": "Proxy URL"},
+                        "proxy_network_scope": {"type": "string", "const": "private"}
+                    }
+                },
+                {
                     "title": "OAuth",
                     "type": "object",
                     "additionalProperties": false,

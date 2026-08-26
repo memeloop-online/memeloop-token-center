@@ -1104,6 +1104,118 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
 }
 
 #[tokio::test]
+async fn private_proxy_requires_global_operator_and_never_appears_in_account_view() {
+    let mock = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("upstream-private-proxy.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .unwrap();
+    let tenant_service = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "tenant-proxy-manager".into(),
+                scopes: vec!["providers:write".into()],
+                tenant_external_id: Some("proxied-tenant".into()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let body = json!({
+        "tenant_external_id": "proxied-tenant",
+        "name": "private-proxied-account",
+        "driver": "http-json",
+        "config": {"base_url": mock.uri(), "network_scope": "public"},
+        "credential": {
+            "type": "api_key_proxy",
+            "value": "never-return-api-secret",
+            "header": "authorization",
+            "prefix": "Bearer ",
+            "proxy_url": "socks5://proxy-user:never-return-proxy-secret@10.20.30.40:1080",
+            "proxy_network_scope": "private"
+        }
+    });
+
+    let (status, denied) = json_request(
+        &state,
+        "POST",
+        "/internal/v1/upstreams",
+        &tenant_service.token,
+        None,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!denied.to_string().contains("never-return"));
+
+    let (status, created) = json_request(
+        &state,
+        "POST",
+        "/internal/v1/upstreams",
+        &state.config.service_token,
+        None,
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let serialized = created.to_string();
+    assert!(!serialized.contains("never-return"));
+    assert!(!serialized.contains("10.20.30.40"));
+    assert_eq!(created["auth_kind"], "api_key");
+
+    let account_id = created["id"].as_str().unwrap();
+    let (status, rotated) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{account_id}/credential"),
+        &tenant_service.token,
+        Some("tenant-key-only-rotation"),
+        Some(json!({"credential": {
+            "type": "api_key", "value": "replacement-secret"
+        }})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rotated["credential_generation"], 2);
+    assert!(!rotated.to_string().contains("replacement-secret"));
+
+    let (status, denied_change) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{account_id}/credential"),
+        &tenant_service.token,
+        Some("tenant-proxy-change"),
+        Some(json!({"credential": {
+            "type": "api_key_proxy",
+            "value": "another-secret",
+            "proxy_url": "socks5://10.20.30.41:1080",
+            "proxy_network_scope": "private"
+        }})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!denied_change.to_string().contains("10.20.30.41"));
+
+    let (status, _) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{account_id}/credential"),
+        &state.config.service_token,
+        Some("proxied-account-oauth-bypass"),
+        Some(json!({"credential": {
+            "type": "oauth", "access_token": "must-not-remove-proxy"
+        }})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn global_operator_update_still_requires_the_resource_tenant_and_supported_schema() {
     let mock = MockServer::start().await;
     let directory = tempfile::tempdir().unwrap();

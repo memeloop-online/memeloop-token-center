@@ -43,6 +43,7 @@ pub(in crate::api) async fn create_upstream(
     }
     validate_upstream_destination(&body.driver, &body.config, &service, &state).await?;
     credential.validate(unix_millis())?;
+    validate_upstream_proxy(&body.config, &credential, &service, &state, true).await?;
     let account = state
         .db
         .create_upstream_account(
@@ -142,6 +143,31 @@ pub(super) async fn validate_upstream_destination(
     .await?;
     validate_secondary_outbound_urls(config, scope, state).await?;
     validate_provider_config(driver, config)
+}
+
+async fn validate_upstream_proxy(
+    config: &Value,
+    credential: &UpstreamCredential,
+    service: &AuthenticatedService,
+    state: &AppState,
+    require_proxy_authority: bool,
+) -> Result<(), AppError> {
+    let Some((_, scope)) = credential.proxy() else {
+        return Ok(());
+    };
+    if require_proxy_authority && scope == OutboundScope::Private {
+        require_global_service(service)?;
+    }
+    let base_url = validate_config(config)?;
+    let _ = network::client_for_config_url(
+        &state.http,
+        &base_url,
+        config,
+        credential.proxy(),
+        state.config.allow_oauth_loopback,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn validate_secondary_outbound_urls(
@@ -383,7 +409,26 @@ pub(in crate::api) async fn rotate_upstream_credential(
     crate::schema::validate_instance(&provider.credential_schema, &body.credential)?;
     let credential: UpstreamCredential = serde_json::from_value(body.credential)
         .map_err(|error| AppError::BadRequest(format!("invalid upstream credential: {error}")))?;
+    let changes_proxy = credential.proxy().is_some();
+    let (account_before_rotation, current_credential) = state
+        .db
+        .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
+        .await?;
+    if current_credential.proxy().is_some() && credential.auth_kind() != "api_key" {
+        return Err(AppError::BadRequest(
+            "a proxied upstream must retain an API-key credential".into(),
+        ));
+    }
+    let credential = credential.preserve_proxy_from(&current_credential);
     credential.validate(unix_millis())?;
+    validate_upstream_proxy(
+        &account_before_rotation.config,
+        &credential,
+        &service,
+        &state,
+        changes_proxy,
+    )
+    .await?;
     let (account, changed) = state
         .db
         .rotate_upstream_credential_with_outcome(

@@ -61,6 +61,7 @@ describe("CPA upstream TypeScript operators", () => {
     const summary = JSON.parse(result.stdout) as Record<string, unknown>;
     assert.equal(summary.mode, "dry-run");
     assert.equal(summary.api_account_count, 6);
+    assert.equal(summary.proxied_api_account_count, 1);
     assert.equal(summary.native_reauthorization_required_count, 2);
     assert.doesNotMatch(result.stdout + result.stderr, /fixture-only-|Fixture(Copilot|Cursor)Handle/);
   });
@@ -75,6 +76,20 @@ describe("CPA upstream TypeScript operators", () => {
     assert.equal(result.status, 2);
     assert.match(result.stderr, /owner-only regular file/);
     assert.doesNotMatch(result.stderr, /fixture-only-/);
+  });
+
+  it("rejects remote-DNS and public proxy endpoints without echoing them", () => {
+    for (const rejectedProxy of ["socks5h://fixture-proxy.internal:1080", "socks5://[2001:4860:4860::8888]:1080"]) {
+      const root = mkdtempSync(join(tmpdir(), "mtc-cpa-proxy-reject-"));
+      const source = join(root, "source");
+      cpSync(join(fixtures, "supported"), source, { recursive: true });
+      const config = join(source, "config.yaml");
+      writeFileSync(config, readFileSync(config, "utf8").replace("socks5://fixture-proxy.internal:1080", rejectedProxy));
+      privateTree(source);
+      const result = spawnSync(process.execPath, [importer, "--config", config, "--auth-dir", join(source, "auth")], { encoding: "utf8" });
+      assert.equal(result.status, 2);
+      assert.doesNotMatch(result.stderr, /fixture-proxy|2001:4860/);
+    }
   });
 
   it("preflights every direct conflict before any managed OAuth write", async () => {
@@ -115,7 +130,7 @@ describe("CPA upstream TypeScript operators", () => {
     const source = join(root, "source"); cpSync(join(fixtures, "supported"), source, { recursive: true }); privateTree(source);
     const key = join(source, "source-identity.key"); assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
     const token = join(root, "service-token"); writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
-    const accounts = new Map<string, Record<string, unknown>>(); let rotations = 0;
+    const accounts = new Map<string, Record<string, unknown>>(); const credentials: Record<string, unknown>[] = []; let rotations = 0;
     const server = createServer(async (request, response) => {
       const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
       const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown> : undefined;
@@ -124,10 +139,11 @@ describe("CPA upstream TypeScript operators", () => {
       if (request.method === "GET" && request.url === "/internal/v1/provider-types") response.end(JSON.stringify([{ id: "http-json" }]));
       else if (request.method === "GET" && request.url?.startsWith("/internal/v1/upstreams?")) response.end(JSON.stringify([...accounts.values()]));
       else if (request.method === "POST" && request.url === "/internal/v1/upstreams") {
+        credentials.push(body?.credential as Record<string, unknown>);
         const name = String(body?.name); const account = { id: `10000000-0000-4000-8000-${String(accounts.size + 1).padStart(12, "0")}`, tenant_external_id: body?.tenant_external_id, name, driver: body?.driver, config: body?.config, status: "active", updated_at: 1 };
         accounts.set(name, account); response.statusCode = 201; response.end(JSON.stringify(account));
       } else if (request.method === "PUT" && request.url?.endsWith("/credential")) {
-        rotations += 1; const id = request.url.split("/")[4]; const account = [...accounts.values()].find((item) => item.id === id); response.end(JSON.stringify(account));
+        rotations += 1; credentials.push(body?.credential as Record<string, unknown>); const id = request.url.split("/")[4]; const account = [...accounts.values()].find((item) => item.id === id); response.end(JSON.stringify(account));
       } else { response.statusCode = 404; response.end("{}"); }
     });
     await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
@@ -140,6 +156,12 @@ describe("CPA upstream TypeScript operators", () => {
       assert.equal(firstSummary.created_count, 6); assert.equal(firstSummary.replayed_count, 0);
       assert.equal(secondSummary.created_count, 0); assert.equal(secondSummary.replayed_count, 6);
       assert.equal(accounts.size, 6); assert.equal(rotations, 12);
+      const proxied = credentials.filter((credential) => credential.type === "api_key_proxy");
+      assert.equal(proxied.length, 3);
+      for (const credential of proxied) {
+        assert.equal(credential.proxy_url, "socks5://fixture-proxy.internal:1080");
+        assert.equal(credential.proxy_network_scope, "private");
+      }
       assert.doesNotMatch(firstRun.stdout + firstRun.stderr + secondRun.stdout + secondRun.stderr, /fixture-only-/);
     } finally { await new Promise<void>((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())); }
   });

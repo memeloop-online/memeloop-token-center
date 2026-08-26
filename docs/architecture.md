@@ -122,6 +122,18 @@ handles cannot become credentials and are reported for native reauthorization.
 Historical retired connection rows may remain readable for attribution, but are
 never routable or refreshable.
 
+An imported API-key account may carry one operator-approved private SOCKS5
+proxy. The proxy URL—including optional proxy authentication and private
+topology—is sealed inside the credential envelope, never copied to account
+configuration or response views. The control plane independently resolves and
+classifies the final target and proxy endpoint, disables environment proxy
+inheritance, pins both resolutions for the operation and requires a global
+service authority to create or change it. Only local-DNS `socks5` is accepted,
+so the SOCKS handshake receives the already pinned target address; `socks5h`,
+HTTP(S) proxies and public SOCKS endpoints fail closed. A tenant-scoped key-only
+rotation may preserve an already-approved proxy but cannot replace or remove its
+transport boundary.
+
 ## Request lifecycle and accounting
 
 Before contacting an upstream, the gateway:

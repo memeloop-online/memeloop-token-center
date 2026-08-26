@@ -4,7 +4,7 @@ This is the resume point for the next Token Center development agent. Read
 [Product requirements](product-requirements.md) first, then
 [Architecture](architecture.md). Those documents preserve the agreed product
 scope and rejected designs; this document preserves the implementation state and
-remaining acceptance gates, updated on 2026-08-24.
+remaining acceptance gates, updated on 2026-08-26.
 
 ## Active 2026-08-24 release override
 
@@ -242,23 +242,62 @@ is added and must prove the request fact and daily aggregate remain failures
 after exact replay. Do not use an older importer digest for the real candidate
 apply.
 
+GitHub Actions run
+[`32924611225`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/32924611225)
+tested clean SHA `888f60fc01780dcddb13738434d32c461ddacede` and completed
+successfully. All source, packaging, migration, security, 900-second memory and
+three-image publication/verification jobs passed. Its immutable digests are
+service `sha256:f2a6fd9f0e228e98e586f333e24028f4b963d458d4847c3e16826d7f5eeb9ffc`,
+importer `sha256:d04ef67a310ae490cace21e56079148087011035aeaeade04b56ae2c86dbbec2`
+and plugin-installer
+`sha256:eef9cedb69ee66db1241d402193ba7853daf2b14cf9e8445684995104a0d35a1`.
+The memory gate measured 111.098 MiB lifetime HWM, 70.499 MiB standard Images
+delta, 69.719 MiB Responses-tool Images delta, 8.226 MiB for the exact 500 MiB
+download and 17,783/17,783 successful soak requests. The packages are
+anonymously pullable, but these digests are not deployable: the subsequent real
+source dry-run found two lossless-compatibility gaps absent from the synthetic
+fixtures.
+
+The real source has one API-key-entry-level private SOCKS5 proxy without proxy
+authentication. The current local continuation adds a write-only
+`api_key_proxy` credential, encrypted proxy URL, independently pinned target and
+proxy endpoints, local-DNS-only SOCKS5 (no `socks5h`/HTTP proxy resolution
+bypass), global authority for private-proxy creation/change, ordinary
+key rotation that preserves the approved route, OpenAPI/catalog support and a
+count-only TypeScript importer migration. The real v0.7.21 archive source also
+returns RFC3339 numeric offsets with 5–9 fractional digits, while the later
+stable contract requires canonical six-digit UTC `Z`. The exporter now compares
+legacy timestamps at nanosecond precision and normalizes only the legacy
+projection; stable responses remain byte-form strict.
+
 Current local release evidence after these changes: rustfmt, Clippy with
-`-D warnings`, and `cargo test --locked --all-targets --all-features` pass; the
-Rust Cucumber suite reports 69/69 scenarios and 373/373 steps. Root TypeScript,
-the OpenAPI route contract (106 paths/126 operations), the eight archive-export
-contracts, web typecheck/localization/build, and the browser suite (19/19
-scenarios, 140/140 steps) pass. The browser suite sends a real Codex-style
-semantic request through HTTP and reads it back through the session API/UI. The
-credential-reload/manual-clear scenario covers both operator and ordinary-user
-portals. A dirty-working-tree short optimized-memory run also passed both
-independent 128 MiB image gates: standard OpenAI Images measured 91.289 MiB and
-Codex Responses-tool Images measured 75.617 MiB; both proved exact
-`Content-Length`, byte-identical replay with the same request ID and no replay
-upstream call. This is local regression evidence only: rerun from the exact
-committed release SHA before retaining the report. The local host has neither
-Docker/Podman nor PostgreSQL/Helm, so container, fresh PostgreSQL v1→v55 and
-Helm gates remain for the single fixed-SHA CI run rather than being represented
-as local evidence.
+`-D warnings`, and `cargo test --locked --all-targets --all-features` pass,
+including 370 library tests and every integration binary; Rust Cucumber reports
+69/69 scenarios and 373/373 steps. Root TypeScript and all five Node files report
+45/45 tests, and the OpenAPI route contract remains 106 paths/126 operations.
+Web typecheck, 24/24 localization/security contracts, production build and the
+Chromium suite (19/19 scenarios, 140/140 steps) pass. The browser suite sends a
+real Codex-style semantic request through HTTP and reads it back through the
+session API/UI; credential reload/manual clear covers both portals.
+
+A dirty-working-tree short optimized-memory run passed the two unchanged
+128 MiB image gates at 95.879 MiB for standard Images and 61.719 MiB for Codex
+Responses-tool Images. Both proved exact `Content-Length`, byte-identical replay
+and no replay upstream call. The 100 MiB archive download added 0.277 MiB at the
+gateway, soak failures were zero, and process lifetime HWM was 123.641 MiB
+against the 224 MiB process budget. Root/web npm audits report zero
+vulnerabilities and tracked Python remains zero. See
+[the retained compatibility evidence](operations/2026-08-26-legacy-source-compatibility.md).
+The full test run also exposed a real SQLite deferred-transaction lock-upgrade
+race in legacy credential attachment. That path now claims the writer slot at
+transaction start, has a deterministic competing-writer regression, and the
+formerly intermittent end-to-end scenario passed five focused repetitions plus
+both complete Cucumber executions.
+This is local regression evidence only. One final exact-SHA CI is still required
+before any upstream/archive target write, digest rollout or browser/CLI trial.
+The local host has neither Docker/Podman nor PostgreSQL/Helm, so final-image,
+fresh PostgreSQL v1→v55 and Helm gates remain for that single run rather than
+being represented as local evidence.
 
 1. Validate the pinned Alpine importer, base-nossl service/plugin runtime,
    patched Cosign and TypeScript operator contracts locally. Do not change

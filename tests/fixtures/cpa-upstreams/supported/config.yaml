@@ -5,6 +5,7 @@ openai-compatibility:
     base-url: "https://openai-compatible.example.test/v1"
     api-key-entries:
       - api-key: "fixture-only-cpa-openai-key-a"
+        proxy-url: "socks5://fixture-proxy.internal:1080"
       - api-key: "fixture-only-cpa-openai-key-b"
     models:
       - name: "fixture-model"

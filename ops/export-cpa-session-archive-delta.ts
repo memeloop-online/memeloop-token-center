@@ -61,7 +61,7 @@ const COLLECTOR_PATHS = {
 
 type JsonObject = Record<string, unknown>;
 type SourcePaths = typeof CPA_PATHS | typeof COLLECTOR_PATHS;
-type Time = { micros: bigint };
+type Time = { nanos: bigint };
 type SessionSummary = JsonObject & {
   session_id: string;
   requests: number;
@@ -112,10 +112,10 @@ export function canonicalBytes(value: unknown): Buffer { return Buffer.from(cano
 export function sha256Bytes(value: Buffer | string): string { return createHash("sha256").update(value).digest("hex"); }
 function isSha256(value: unknown): value is string { return typeof value === "string" && /^[0-9a-f]{64}$/.test(value); }
 
-/** Parse RFC3339 into integer microseconds, rejecting absent timezones. */
+/** Parse RFC3339 into integer nanoseconds, rejecting absent timezones. */
 export function parseTime(value: unknown, label: string): Time {
   if (typeof value !== "string" || value.trim() !== value || value.length === 0) throw new DeltaError(`${label} is missing`);
-  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/);
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/);
   if (match === null) throw new DeltaError(`${label} is not RFC3339`);
   const [, year, month, day, hour, minute, second, fraction = "", zone] = match;
   const base = Date.parse(`${year}-${month}-${day}T${hour}:${minute}:${second}${zone}`);
@@ -128,17 +128,22 @@ export function parseTime(value: unknown, label: string): Time {
   if (calendar.getUTCFullYear() !== Number(year) || calendar.getUTCMonth() + 1 !== Number(month) || calendar.getUTCDate() !== Number(day)
       || calendar.getUTCHours() !== Number(hour) || calendar.getUTCMinutes() !== Number(minute) || calendar.getUTCSeconds() !== Number(second)
       || Number.isNaN(reconstructed.valueOf())) throw new DeltaError(`${label} is not RFC3339`);
-  return { micros: BigInt(base) * 1000n + BigInt(fraction.padEnd(6, "0")) };
+  return { nanos: BigInt(base) * 1_000_000n + BigInt(fraction.padEnd(9, "0")) };
 }
 
 export function formatTime(value: Time): string {
-  const millis = value.micros / 1000n;
-  const micros = ((value.micros % 1_000_000n) + 1_000_000n) % 1_000_000n;
+  const millis = value.nanos / 1_000_000n;
+  const micros = (((value.nanos % 1_000_000_000n) + 1_000_000_000n) % 1_000_000_000n) / 1000n;
   const secondMillis = millis - (millis % 1000n);
   return `${new Date(Number(secondMillis)).toISOString().slice(0, 19)}.${micros.toString().padStart(6, "0")}Z`;
 }
-function compareTime(left: Time, right: Time): number { return left.micros < right.micros ? -1 : left.micros > right.micros ? 1 : 0; }
-function addSeconds(value: Time, seconds: number): Time { return { micros: value.micros + BigInt(seconds) * 1_000_000n }; }
+function parseCanonicalTime(value: unknown, label: string): Time {
+  const parsed = parseTime(value, label);
+  if (value !== formatTime(parsed)) throw new DeltaError(`${label} is not canonical six-digit UTC`);
+  return parsed;
+}
+function compareTime(left: Time, right: Time): number { return left.nanos < right.nanos ? -1 : left.nanos > right.nanos ? 1 : 0; }
+function addSeconds(value: Time, seconds: number): Time { return { nanos: value.nanos + BigInt(seconds) * 1_000_000_000n }; }
 
 function ensurePrivateRegular(path: string, label: string): void {
   let metadata;
@@ -548,7 +553,7 @@ function loadCheckpoint(path: string, fingerprint: string): JsonObject | undefin
       || !Number.isSafeInteger(value.sequence) || (value.sequence as number) < 0 || !isSha256(value.last_output_sha256)
       || !Number.isSafeInteger(value.last_output_records) || (value.last_output_records as number) < 0
       || !Number.isSafeInteger(value.last_source_records) || (value.last_source_records as number) < 0) throw new DeltaError("checkpoint does not match this source or version");
-  parseTime(value.watermark_completed_at, "checkpoint watermark");
+  parseCanonicalTime(value.watermark_completed_at, "checkpoint watermark");
   if (value.version === CHECKPOINT_VERSION) {
     if (![LEGACY_PROJECTION_PROTOCOL, STABLE_CURSOR_PROTOCOL].includes(value.session_projection_protocol as string)) throw new DeltaError("checkpoint session projection protocol is invalid");
     if (value.session_projection_protocol === STABLE_CURSOR_PROTOCOL) SourceClient.ingestFence(value.source_ingest_fence, "checkpoint ingest fence");
@@ -584,10 +589,10 @@ function validateManifest(manifest: unknown, fingerprint: string, output: string
   const protocol = (manifest.session_projection_protocol ?? LEGACY_PROJECTION_PROTOCOL) as string;
   if (![LEGACY_PROJECTION_PROTOCOL, STABLE_CURSOR_PROTOCOL].includes(protocol)) throw new DeltaError("delta manifest session projection protocol is invalid");
   if (protocol === STABLE_CURSOR_PROTOCOL) { if (!Number.isSafeInteger(manifest.source_projection_requests) || !isSha256(manifest.source_snapshot_sha256)) throw new DeltaError("delta manifest stable snapshot metadata is invalid"); SourceClient.ingestFence(manifest.source_ingest_fence, "manifest ingest fence"); }
-  const prior = parseTime(manifest.prior_watermark_completed_at, "delta manifest prior watermark");
-  const lower = parseTime(manifest.lower_bound_completed_at, "delta manifest lower bound");
-  const watermark = parseTime(manifest.watermark_completed_at, "delta manifest watermark");
-  const observed = parseTime(manifest.observed_at, "delta manifest observation time");
+  const prior = parseCanonicalTime(manifest.prior_watermark_completed_at, "delta manifest prior watermark");
+  const lower = parseCanonicalTime(manifest.lower_bound_completed_at, "delta manifest lower bound");
+  const watermark = parseCanonicalTime(manifest.watermark_completed_at, "delta manifest watermark");
+  const observed = parseCanonicalTime(manifest.observed_at, "delta manifest observation time");
   if (compareTime(lower, addSeconds(prior, -(manifest.overlap_seconds as number))) !== 0 || compareTime(prior, watermark) > 0 || compareTime(watermark, addSeconds(observed, manifest.max_future_skew_seconds as number)) > 0) throw new DeltaError("delta manifest watermarks are inconsistent");
   return manifest;
 }
@@ -662,7 +667,7 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
   else { if (args.since !== undefined) throw new DeltaError("--since cannot replace an existing checkpoint"); prior = parseTime(checkpoint.watermark_completed_at, "checkpoint watermark"); priorFence = checkpoint.source_ingest_fence === null ? undefined : checkpoint.source_ingest_fence as string | undefined; sequence = (checkpoint.sequence as number) + 1; }
   if (args.collectorDirect && priorFence === undefined) { if (!args.offlineFull) throw new DeltaError("the first collector-direct snapshot requires --offline-full"); await client.verifyOfflineFull(); }
   else if (args.offlineFull) throw new DeltaError("--offline-full is only valid for the first collector-direct snapshot");
-  const lower = addSeconds(prior, -args.overlapSeconds); const observed: Time = { micros: BigInt(Date.now()) * 1000n }; const maximum = addSeconds(observed, args.maxFutureSkewSeconds);
+  const lower = addSeconds(prior, -args.overlapSeconds); const observed: Time = { nanos: BigInt(Date.now()) * 1_000_000n }; const maximum = addSeconds(observed, args.maxFutureSkewSeconds);
   if (compareTime(prior, maximum) > 0) throw new DeltaError("source checkpoint timestamp exceeds the future-skew limit");
   const before = await client.statsRecords();
   if (checkpoint !== undefined && before < (checkpoint.last_source_records as number)) throw new DeltaError("source record count moved backwards since the checkpoint");
@@ -681,17 +686,23 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
         let item: unknown; try { item = parseStrictJson(rawLine.toString("utf8")); } catch { throw new DeltaError("source archive stream contains invalid JSON"); }
         if (!isObject(item) || ![1, 2].includes(item.schema_version as number)) throw new DeltaError("source archive record schema is unsupported");
         if (typeof item.request_id !== "string" || item.request_id.length === 0) throw new DeltaError("source archive request identity is invalid");
+        const requestId = item.request_id;
         if (item.session_id !== session.session_id) throw new DeltaError("source session export returned a foreign session record");
+        let record = item;
         const started = parseTime(item.started_at, "archive started_at"), completed = parseTime(item.completed_at, "archive completed_at");
         if (compareTime(completed, started) < 0) throw new DeltaError("source archive record time range is invalid");
         if (compareTime(started, maximum) > 0 || compareTime(completed, maximum) > 0) throw new DeltaError("source archive timestamp exceeds the future-skew limit");
-        const encoded = Buffer.concat([canonicalBytes(item), Buffer.from("\n")]); const digest = sha256Bytes(encoded);
-        const existing = seen.get(item.request_id) as { session_id: string; digest: string } | undefined;
+        if (first.protocol === STABLE_CURSOR_PROTOCOL && (item.started_at !== formatTime(started) || item.completed_at !== formatTime(completed))) throw new DeltaError("source stable archive timestamps are not canonical");
+        if (first.protocol === LEGACY_PROJECTION_PROTOCOL) {
+          record = { ...item, started_at: formatTime(started), completed_at: formatTime(completed) };
+        }
+        const encoded = Buffer.concat([canonicalBytes(record), Buffer.from("\n")]); const digest = sha256Bytes(encoded);
+        const existing = seen.get(requestId) as { session_id: string; digest: string } | undefined;
         if (existing !== undefined) { if (existing.session_id !== session.session_id || existing.digest !== digest) throw new DeltaError("one source request id has conflicting archive records"); continue; }
-        addSeen.run(item.request_id, session.session_id, digest, encoded); exported += 1;
+        addSeen.run(requestId, session.session_id, digest, encoded); exported += 1;
         if (first.protocol === LEGACY_PROJECTION_PROTOCOL && compareTime(started, lower) < 0 && compareTime(completed, lower) < 0) continue;
         selectedBytes += encoded.length; if (selectedBytes > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
-        addRecord.run(item.request_id, formatTime(started), formatTime(completed), digest, encoded);
+        addRecord.run(requestId, formatTime(started), formatTime(completed), digest, encoded);
         if (compareTime(completed, maximumCompleted) > 0) maximumCompleted = completed;
         if (maximumStarted === undefined || compareTime(started, maximumStarted) > 0) maximumStarted = started;
       }

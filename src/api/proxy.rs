@@ -522,6 +522,7 @@ async fn execute_component_provider(
         &request.state.http,
         &target,
         config,
+        credential.proxy(),
         request.state.config.allow_oauth_loopback,
     )
     .await

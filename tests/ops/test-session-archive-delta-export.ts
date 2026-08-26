@@ -163,6 +163,8 @@ function baseArguments(paths: ReturnType<typeof fixture>): string[] {
 
 test("canonical helpers preserve six-digit UTC timestamps and deterministic keys", () => {
   assert.equal(formatTime(parseTime("2025-01-02T03:04:05.1234+00:00", "time")), "2025-01-02T03:04:05.123400Z");
+  assert.equal(formatTime(parseTime("2025-01-02T11:04:05.123456789+08:00", "legacy time")), "2025-01-02T03:04:05.123456Z");
+  assert.notDeepEqual(parseTime("2025-01-02T03:04:05.123456001Z", "time"), parseTime("2025-01-02T03:04:05.123456999Z", "time"));
   assert.equal(canonicalBytes({ z: 1, a: { y: 2, x: 3 } }).toString(), '{"a":{"x":3,"y":2},"z":1}');
 });
 
@@ -185,16 +187,34 @@ test("legacy source fingerprint remains version-one compatible and plugin envelo
   assert.throws(() => unwrapJson({ StatusCode: 200, Body: "%%%" }), /body is invalid/);
 });
 
+test("stable snapshot contract still rejects non-canonical nanosecond timestamps", async () => {
+  state.stable = true;
+  state.records.set("session-stable-nanos", [record(
+    "request-stable-nanos",
+    "session-stable-nanos",
+    "2025-01-02T01:00:00.123456789Z",
+    "2025-01-02T01:00:01.123456789Z",
+  )]);
+  const base = `http://127.0.0.1:${port}`;
+  const client = new SourceClient(base, base, TOKEN, 5, true, new Set());
+  await assert.rejects(
+    client.stableSessions(10, parseTime("2025-01-01T00:00:00.000000Z", "lower bound")),
+    /stable session timestamps or record digest are invalid/,
+  );
+});
+
 test("legacy export is canonical, private, checkpointed, and incrementally replay-safe", async () => {
   const paths = fixture();
   try {
     state.records.set("session-b", [record("request-2", "session-b", "2025-01-03T01:00:00Z", "2025-01-03T01:00:01Z")]);
-    state.records.set("session-a", [record("request-1", "session-a", "2025-01-02T01:00:00Z", "2025-01-02T01:00:01Z")]);
+    state.records.set("session-a", [record("request-1", "session-a", "2025-01-02T09:00:00.123456789+08:00", "2025-01-02T09:00:01.987654321+08:00")]);
     const first = await run(baseArguments(paths));
     assert.equal(first.code, 0, first.stderr); assert(!first.stderr.includes(TOKEN)); assert(!first.stderr.includes("payload-secret"));
     assert.equal(state.authorizationOnTicket, false, "ticket download must not receive management authorization");
     const lines = readFileSync(paths.output, "utf8").trim().split("\n").map((line) => JSON.parse(line) as RecordValue);
     assert.deepEqual(lines.map((row) => row.request_id), ["request-1", "request-2"]);
+    assert.equal(lines[0]!.started_at, "2025-01-02T01:00:00.123456Z");
+    assert.equal(lines[0]!.completed_at, "2025-01-02T01:00:01.987654Z");
     const checkpoint = JSON.parse(readFileSync(paths.checkpoint, "utf8")) as Record<string, unknown>; assert.equal(checkpoint.sequence, 1);
     const manifest = JSON.parse(readFileSync(`${paths.output}.manifest.json`, "utf8")) as Record<string, unknown>; assert.equal(manifest.session_projection_protocol, "legacy-last-at-limit-v1");
 

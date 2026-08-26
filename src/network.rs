@@ -156,15 +156,112 @@ pub async fn client_for_config_url(
     shared_private_client: &reqwest::Client,
     value: &str,
     config: &Value,
+    proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
-    client_for_url(
-        shared_private_client,
-        value,
-        scope_from_config(config),
-        allow_test_loopback,
-    )
-    .await
+    let target_scope = scope_from_config(config);
+    let Some((proxy_url, proxy_scope)) = proxy else {
+        return client_for_url(
+            shared_private_client,
+            value,
+            target_scope,
+            allow_test_loopback,
+        )
+        .await;
+    };
+
+    // A proxy is an explicit global-operator trust boundary. Only `socks5`
+    // (never `socks5h`) is accepted: reqwest resolves its destination through
+    // this client's pinned resolver before the SOCKS handshake. Validate the
+    // final target exactly as for a direct request, then independently resolve,
+    // classify and pin the proxy endpoint. Environment proxy inheritance is
+    // disabled by the base builder.
+    let target = checked_http_url(value)?;
+    let (target_host, target_addresses, target_test_loopback) =
+        validated_endpoint(&target, target_scope, allow_test_loopback).await?;
+    validate_transport_security(
+        target.scheme(),
+        &target_addresses,
+        target_scope,
+        target_test_loopback,
+    )?;
+
+    let proxy = checked_proxy_url(proxy_url)?;
+    let (proxy_host, proxy_addresses, proxy_test_loopback) =
+        validated_endpoint(&proxy, proxy_scope, allow_test_loopback).await?;
+    let private_proxy = proxy_scope == OutboundScope::Private
+        && proxy_addresses
+            .iter()
+            .all(|address| is_safe_private_upstream_ip(address.ip()));
+    if !private_proxy && !proxy_test_loopback {
+        return Err(AppError::BadRequest(
+            "upstream SOCKS5 proxies must use an explicitly private endpoint".into(),
+        ));
+    }
+
+    let mut pins: Vec<(&str, &[SocketAddr])> = Vec::new();
+    if let Some(host) = target_host.as_deref() {
+        pins.push((host, &target_addresses));
+    }
+    if let Some(host) = proxy_host.as_deref() {
+        pins.push((host, &proxy_addresses));
+    }
+    crate::build_explicit_proxy_http_client(proxy_url, &pins).map_err(|_| AppError::Internal)
+}
+
+async fn validated_endpoint(
+    url: &Url,
+    scope: OutboundScope,
+    allow_test_loopback: bool,
+) -> Result<(Option<String>, Vec<SocketAddr>, bool), AppError> {
+    let host = url
+        .host()
+        .ok_or_else(|| AppError::BadRequest("outbound URL must include a host".into()))?;
+    let port = url
+        .port_or_known_default()
+        .or_else(|| (url.scheme() == "socks5").then_some(1080))
+        .ok_or_else(|| {
+            AppError::BadRequest("outbound URL must use a known or explicit port".into())
+        })?;
+    let (host_name, addresses, loopback_name) = match host {
+        Host::Domain(name) => {
+            let values = resolve_once(name, port).await?;
+            (Some(name.to_owned()), values, is_loopback_name(name))
+        }
+        Host::Ipv4(address) => (
+            None,
+            vec![SocketAddr::new(IpAddr::V4(address), port)],
+            address.is_loopback(),
+        ),
+        Host::Ipv6(address) => (
+            None,
+            vec![SocketAddr::new(IpAddr::V6(address), port)],
+            address.is_loopback(),
+        ),
+    };
+    let test_loopback = allow_test_loopback
+        && loopback_name
+        && addresses.iter().all(|address| address.ip().is_loopback());
+    validate_addresses(&addresses, scope, test_loopback)?;
+    Ok((host_name, addresses, test_loopback))
+}
+
+fn checked_proxy_url(value: &str) -> Result<Url, AppError> {
+    if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
+        return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
+    }
+    let url = Url::parse(value)
+        .map_err(|_| AppError::BadRequest("upstream proxy URL is invalid".into()))?;
+    if url.scheme() != "socks5"
+        || url.host_str().is_none()
+        || url.port() == Some(0)
+        || (url.path() != "" && url.path() != "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
+    }
+    Ok(url)
 }
 
 pub fn checked_http_url(value: &str) -> Result<Url, AppError> {
@@ -387,6 +484,50 @@ mod tests {
                 "private scope accepted {endpoint}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_proxy_validates_target_and_proxy_scopes_independently() {
+        let shared = crate::build_http_client().unwrap();
+        let config = serde_json::json!({
+            "base_url": "https://1.1.1.1/v1",
+            "network_scope": "public"
+        });
+        assert!(
+            client_for_config_url(
+                &shared,
+                "https://1.1.1.1/v1/models",
+                &config,
+                Some(("socks5://10.20.30.40:1080", OutboundScope::Private)),
+                false,
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            client_for_config_url(
+                &shared,
+                "https://1.1.1.1/v1/models",
+                &config,
+                Some(("socks5://8.8.8.8:1080", OutboundScope::Public)),
+                false,
+            )
+            .await
+            .is_err(),
+            "a cleartext public SOCKS proxy must fail closed"
+        );
+        assert!(
+            client_for_config_url(
+                &shared,
+                "https://169.254.169.254/latest/meta-data",
+                &config,
+                Some(("socks5://10.20.30.40:1080", OutboundScope::Private)),
+                false,
+            )
+            .await
+            .is_err(),
+            "an approved proxy must not bypass final-target SSRF checks"
+        );
     }
 
     #[test]

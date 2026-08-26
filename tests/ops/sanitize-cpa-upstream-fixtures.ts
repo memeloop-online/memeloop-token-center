@@ -42,6 +42,13 @@ function inspect(value: unknown, key?: string): void {
   if ((key === "base-url" || key === "base_url") && !value.includes(".example.test")) {
     throw new Error("fixture contains a non-example upstream URL");
   }
+  if (key === "proxy-url") {
+    let proxy: URL;
+    try { proxy = new URL(value); } catch { throw new Error("fixture contains an invalid proxy URL"); }
+    if (proxy.protocol !== "socks5:" || proxy.hostname !== "fixture-proxy.internal" || proxy.username || proxy.password) {
+      throw new Error("fixture contains a non-synthetic proxy URL");
+    }
+  }
 }
 
 export function main(): void {

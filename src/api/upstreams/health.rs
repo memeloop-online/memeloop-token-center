@@ -65,6 +65,7 @@ pub(in crate::api) async fn probe_upstream_health(
         &state.http,
         &base_url,
         &account.config,
+        credential.proxy(),
         state.config.allow_oauth_loopback,
     )
     .await

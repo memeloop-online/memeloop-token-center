@@ -151,15 +151,34 @@ pub(crate) fn build_pinned_http_client(
         .build()
 }
 
+pub(crate) fn build_explicit_proxy_http_client(
+    proxy_url: &str,
+    pinned_hosts: &[(&str, &[std::net::SocketAddr])],
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = base_http_client_builder()
+        .pool_max_idle_per_host(0)
+        .proxy(reqwest::Proxy::all(proxy_url)?);
+    for (hostname, addresses) in pinned_hosts {
+        builder = builder.resolve_to_addrs(hostname, addresses);
+    }
+    builder.build()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, SocketAddr};
+
     use reqwest::StatusCode;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{header, path},
     };
 
-    use super::{build_http_client, build_pinned_http_client};
+    use super::{build_explicit_proxy_http_client, build_http_client, build_pinned_http_client};
 
     #[tokio::test]
     async fn shared_http_client_does_not_follow_redirects() {
@@ -202,5 +221,89 @@ mod tests {
             .expect("pinned request");
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn socks5_proxy_receives_the_locally_pinned_target_address() {
+        let target = MockServer::start().await;
+        let expected_host = format!("pin-target.invalid:{}", target.address().port());
+        Mock::given(path("/through-proxy"))
+            .and(header("host", expected_host))
+            .respond_with(ResponseTemplate::new(204).insert_header("connection", "close"))
+            .expect(1)
+            .mount(&target)
+            .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let target_address = *target.address();
+        let proxy = tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut greeting = [0_u8; 2];
+            client.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0_u8; usize::from(greeting[1])];
+            client.read_exact(&mut methods).await.unwrap();
+            assert!(methods.contains(&0));
+            client.write_all(&[5, 0]).await.unwrap();
+
+            let mut request = [0_u8; 4];
+            client.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..3], &[5, 1, 0]);
+            let ip = match request[3] {
+                1 => {
+                    let mut bytes = [0_u8; 4];
+                    client.read_exact(&mut bytes).await.unwrap();
+                    IpAddr::from(bytes)
+                }
+                4 => {
+                    let mut bytes = [0_u8; 16];
+                    client.read_exact(&mut bytes).await.unwrap();
+                    IpAddr::from(bytes)
+                }
+                3 => panic!("socks5 proxy received a hostname instead of the pinned target IP"),
+                value => panic!("unexpected SOCKS5 address type {value}"),
+            };
+            let mut port = [0_u8; 2];
+            client.read_exact(&mut port).await.unwrap();
+            let requested = SocketAddr::new(ip, u16::from_be_bytes(port));
+            assert_eq!(requested, target_address);
+
+            let mut upstream = TcpStream::connect(requested).await.unwrap();
+            client
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .unwrap();
+        });
+
+        let target_addresses = [*target.address()];
+        let proxy_addresses = [proxy_address];
+        let pins = [
+            ("pin-target.invalid", &target_addresses[..]),
+            ("proxy-test.invalid", &proxy_addresses[..]),
+        ];
+        let client = build_explicit_proxy_http_client(
+            &format!("socks5://proxy-test.invalid:{}", proxy_address.port()),
+            &pins,
+        )
+        .unwrap();
+        let response = client
+            .get(format!(
+                "http://pin-target.invalid:{}/through-proxy",
+                target.address().port()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        drop(response);
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(2), proxy)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
