@@ -273,6 +273,11 @@ credential, stable identity, policy, balances and history. CPAMP usage, aliases
 and prices are reconciled separately from session-archive bodies; a nonzero usage
 checkpoint never proves body migration.
 
+The CPAMP failure flag is authoritative during normalization. Failed rows with
+a real 4xx/5xx code preserve it; failed rows carrying zero, missing, 1xx, 2xx,
+3xx or invalid codes become sanitized `502`/`upstream_error` failures. Such
+rows must never inflate successful-request statistics.
+
 Each import records source identity, digest and checkpoint, replays without
 duplicate facts or aggregates, and uses a reviewed overlap window for late
 writes. Session archives are dry-run, apply and exact-replay checked. Exact and

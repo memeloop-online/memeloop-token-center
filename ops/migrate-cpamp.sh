@@ -526,13 +526,17 @@ SELECT substr(r.value,1,8)||'-'||substr(r.value,9,4)||'-5'||substr(r.value,14,3)
        t.id, i.key_id, u.timestamp_ms,
        u.timestamp_ms + GREATEST(COALESCE(u.latency_ms, 0), 0),
        COALESCE(NULLIF(u.provider, ''), 'openai'), COALESCE(NULLIF(u.model, ''), '-'),
-       CASE WHEN u.failed <> 0 THEN NULLIF(u.fail_status_code, 0) ELSE 200 END,
+       CASE WHEN u.failed = 0 THEN 200
+            WHEN u.fail_status_code BETWEEN 400 AND 599 THEN u.fail_status_code
+            ELSE 502 END,
        GREATEST(COALESCE(u.latency_ms, 0), 0), GREATEST(COALESCE(u.input_tokens, 0), 0),
        GREATEST(COALESCE(u.output_tokens, 0), 0),
        round((GREATEST(COALESCE(u.input_tokens, 0), 0) * COALESCE(p.input_micros_per_million, 0)
             + GREATEST(COALESCE(u.output_tokens, 0), 0) * COALESCE(p.output_micros_per_million, 0)) / 1000000.0)::bigint,
-       CASE WHEN u.failed <> 0 THEN CASE WHEN u.fail_status_code > 0
-            THEN 'http_' || u.fail_status_code::text ELSE 'upstream_error' END END,
+       CASE WHEN u.failed <> 0 THEN
+            CASE WHEN u.fail_status_code BETWEEN 400 AND 599
+                 THEN 'http_' || u.fail_status_code::text
+                 ELSE 'upstream_error' END END,
        'gap://cpamp/' || u.event_hash || '/request',
        'gap://cpamp/' || u.event_hash || '/response',
        'cpamp-import:' || u.event_hash,

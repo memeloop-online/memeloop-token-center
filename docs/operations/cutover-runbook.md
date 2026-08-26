@@ -81,6 +81,11 @@ observed collector/CPAMP queue delay.
 1. Take an approved consistent CPAMP SQLite snapshot and run
    `ops/migrate-cpamp.sh`. The CPAMP importer must complete before the matching
    archive delta so key identities and request links exist first.
+   The source `failed` bit is authoritative: a failed row keeps an actual
+   4xx/5xx status, while a missing, zero, 1xx, 2xx, 3xx or out-of-range failure
+   code is normalized to `502`/`upstream_error`. It must never enter target
+   facts or aggregates as a success merely because the legacy collector stored
+   an HTTP-success code next to a failed outcome.
 2. Acquire an archive delta through API2. The first post-baseline invocation uses
    the recorded fence; every later invocation omits `--since` and uses a new
    output filename:

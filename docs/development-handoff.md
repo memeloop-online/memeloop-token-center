@@ -234,6 +234,14 @@ runtime dependency. The sealed JSONL is still consumed by
 This closes the observed packaging gap without introducing Python or turning
 `audit-cpa-migration` into an importer.
 
+The live scratch dry-run later exposed legacy CPAMP rows whose `failed` flag was
+true while `fail_status_code` was 2xx/3xx. The importer must treat the flag as
+authoritative: preserve only failed 4xx/5xx codes and normalize every other
+failed code to `502`/`upstream_error`. A dedicated PostgreSQL acceptance fixture
+is added and must prove the request fact and daily aggregate remain failures
+after exact replay. Do not use an older importer digest for the real candidate
+apply.
+
 Current local release evidence after these changes: rustfmt, Clippy with
 `-D warnings`, and `cargo test --locked --all-targets --all-features` pass; the
 Rust Cucumber suite reports 69/69 scenarios and 373/373 steps. Root TypeScript,

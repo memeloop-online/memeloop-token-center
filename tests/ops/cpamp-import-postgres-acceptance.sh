@@ -28,11 +28,13 @@ source_db="$work_dir/source.sqlite"
 unmapped_db="$work_dir/unmapped.sqlite"
 same_duplicate_db="$work_dir/same-duplicate.sqlite"
 conflicting_duplicate_db="$work_dir/conflicting-duplicate.sqlite"
+failed_success_code_db="$work_dir/failed-success-code.sqlite"
 tenant="cpamp-$ACCEPTANCE_RUN_ID-main"
 other_tenant="cpamp-$ACCEPTANCE_RUN_ID-tenant"
 unmapped_tenant="cpamp-$ACCEPTANCE_RUN_ID-unmapped"
 same_duplicate_tenant="cpamp-$ACCEPTANCE_RUN_ID-same-duplicate"
 conflicting_duplicate_tenant="cpamp-$ACCEPTANCE_RUN_ID-conflicting-duplicate"
+failed_success_code_tenant="cpamp-$ACCEPTANCE_RUN_ID-failed-success-code"
 source="cpamp-acceptance:$ACCEPTANCE_RUN_ID"
 other_source="cpamp-acceptance:$ACCEPTANCE_RUN_ID:source"
 duplicate_source="cpamp-acceptance:$ACCEPTANCE_RUN_ID:duplicates"
@@ -149,6 +151,35 @@ SQL
 assert_equal "$conflicting_duplicate_state" "0|0" \
   "same event hash with different payload fails closed"
 echo "phase=conflicting-payload-duplicate exit=nonzero tenant_rows=0 checkpoints=0"
+
+sqlite3 "$failed_success_code_db" < "$work_root/initial.sql"
+sqlite3 "$failed_success_code_db" <<'SQL'
+DELETE FROM usage_events;
+INSERT INTO usage_events VALUES
+  ('fixture-event-failed-http-200', 'legacy-request-failed-http-200', 100000000,
+   'openai', 'fixture-model', '/v1/responses',
+   'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+   5, 2, 40, 1, 200, 'provider returned an unusable success envelope');
+SQL
+run_import "$failed_success_code_tenant" "$duplicate_source" "$failed_success_code_db"
+run_import "$failed_success_code_tenant" "$duplicate_source" "$failed_success_code_db"
+failed_success_code_state=$(psql_scalar \
+  -v tenant="$failed_success_code_tenant" <<'SQL'
+SELECT
+  (SELECT count(*) FROM request_records r JOIN tenants t ON t.id = r.tenant_id
+    WHERE t.external_id = :'tenant' AND r.status_code = 502
+      AND r.error_code = 'upstream_error') || '|' ||
+  (SELECT count(*) FROM request_stats_facts f JOIN tenants t ON t.id = f.tenant_id
+    WHERE t.external_id = :'tenant' AND f.status_class = 'failure'
+      AND f.error_code = 'upstream_error') || '|' ||
+  (SELECT COALESCE(sum(a.requests), 0) FROM request_daily_aggregates a
+    JOIN tenants t ON t.id = a.tenant_id WHERE t.external_id = :'tenant'
+      AND a.status_class = 'failure' AND a.error_code = 'upstream_error');
+SQL
+)
+assert_equal "$failed_success_code_state" "1|1|1" \
+  "source failure with HTTP success code remains a failure after replay"
+echo "phase=failed-http-success-normalization requests=1 facts=1 aggregates=1 status=502 error=upstream_error replay=stable"
 
 sqlite3 "$source_db" < "$work_root/initial.sql"
 run_import "$tenant" "$source" "$source_db"
