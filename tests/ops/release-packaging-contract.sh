@@ -101,6 +101,7 @@ grep -Fq 'COPY ops/export-cpa-session-archive-delta.ts ./ops/export-cpa-session-
   "$importer_dockerfile"
 grep -Fq 'COPY --from=scripts /source/dist/operator-scripts/export-cpa-session-archive-delta.mjs /usr/local/bin/export-cpa-session-archive-delta' \
   "$importer_dockerfile"
+grep -Fq 'apk upgrade --no-cache libcrypto3 libssl3' "$importer_dockerfile"
 grep -Fq 'apk add --no-cache ca-certificates nodejs postgresql-client sqlite' \
   "$importer_dockerfile"
 ! grep -Fq 'apt-get' "$importer_dockerfile"

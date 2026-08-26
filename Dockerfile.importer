@@ -16,7 +16,8 @@ RUN npm run build:importer-scripts
 
 FROM ${RUNTIME_IMAGE}
 USER root
-RUN apk add --no-cache ca-certificates nodejs postgresql-client sqlite util-linux \
+RUN apk upgrade --no-cache libcrypto3 libssl3 \
+    && apk add --no-cache ca-certificates nodejs postgresql-client sqlite util-linux \
     && adduser -S -D -u 10001 importer
 COPY ops/migrate-cpamp.sh /usr/local/bin/migrate-cpamp
 COPY ops/audit-cpa-migration.sh /usr/local/bin/audit-cpa-migration

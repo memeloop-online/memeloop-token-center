@@ -299,6 +299,16 @@ The local host has neither Docker/Podman nor PostgreSQL/Helm, so final-image,
 fresh PostgreSQL v1→v55 and Helm gates remain for that single run rather than
 being represented as local evidence.
 
+Run `32943606008` subsequently passed every pre-publication job and the full
+memory acceptance for `f3c342027e52c21f455b7c17d201bd8d133b858e`, but the
+importer publish job discovered the newly disclosed/fixed CVE-2026-14456 in the
+Alpine 3.23.5 base's `libcrypto3`/`libssl3` `3.5.7-r0`. Its partial importer
+digest is forbidden and the run produced no complete release manifest. The
+current continuation explicitly upgrades those two packages to the v3.23
+repository's fixed `3.5.8-r0` before installing runtime tools; the release
+contract requires the upgrade and no scanner waiver was added. One new
+exact-SHA run must scan the resulting image and produce a complete manifest.
+
 1. Validate the pinned Alpine importer, base-nossl service/plugin runtime,
    patched Cosign and TypeScript operator contracts locally. Do not change
    security or memory thresholds.

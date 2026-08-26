@@ -52,3 +52,23 @@ this is reproducible equivalent-rootfs evidence, not the immutable image
 attestation. The next exact-SHA GitHub Actions run must still build the image,
 execute `tests/ops/importer-image-contract.sh`, scan the final image, publish all
 three images, and verify the combined digest manifest before any deployment.
+
+## 2026-08-26 OpenSSL security refresh
+
+GitHub Actions run `32943606008` tested source
+`f3c342027e52c21f455b7c17d201bd8d133b858e`. Every pre-publication job and the
+exact-SHA memory acceptance passed. The importer publish job then correctly
+failed its unchanged HIGH/CRITICAL Trivy gate: Alpine 3.23.5 contained
+`libcrypto3` and `libssl3` `3.5.7-r0`, while CVE-2026-14456 is fixed in
+`3.5.8-r0`. The partial importer image
+`sha256:cad6780cbb78d18b18a0baa804be81ddb9dc9d482df871685a3c7cf88e64b951`
+is not deployable and no complete release manifest was produced.
+
+The Dockerfile retains the reproducible Alpine 3.23.5 base but now upgrades the
+two base OpenSSL runtime packages from the signed v3.23 repository before
+installing the existing runtime dependency set. On 2026-08-26 the official
+x86_64 v3.23 APK index resolved `libcrypto3` to `3.5.8-r0` from OpenSSL commit
+`2b4b2590f782b95276d31dcaaf41554b1a597a0b`. The packaging contract requires
+the explicit upgrade. No CVE waiver, Trivy ignore, severity reduction or
+`ignore-unfixed` relaxation was introduced. A new exact-SHA final-image scan is
+still mandatory.
