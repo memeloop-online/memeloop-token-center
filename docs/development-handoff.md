@@ -10,6 +10,22 @@ remaining acceptance gates, updated on 2026-08-27.
 
 This section supersedes the older release-truth snapshots below.
 
+- Clean master `495733326a72ff6b97cafa4316f91bdf7eb1508f` passed
+  GitHub Actions run
+  [`33085491007`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33085491007),
+  including every functional, migration, browser, packaging, security, image
+  scan, SBOM/provenance and immutable-release verification gate. The unchanged
+  15-minute memory gate completed 18,013 requests with zero failures, a 1.936
+  MiB/min RSS slope and 22.653 MiB retained delta. It published verified
+  immutable digests: service
+  `sha256:17ffc25076d43beea236de3fe7d0af37bd677a90e1e2b50150af43d5aed1b3e4`,
+  importer
+  `sha256:996a51702ba1231f45222f0327942ce616beaa9cda7384b8f67821a0eda5e37a`
+  and plugin-installer
+  `sha256:fe88a7eb1994ab577ce1d5ac01b5bcb6647234806880aa7940e55337d8155ec1`.
+  Do not promote these interim digests: post-run dogfood exposed the worker
+  scheduling defect described below, whose replacement SHA must pass the same
+  release workflow.
 - Clean master parent `3f648975892e61751bbda44b47053b82a134dff9` passed
   GitHub Actions run
   [`33065339748`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33065339748),
@@ -47,6 +63,17 @@ This section supersedes the older release-truth snapshots below.
   retaining the `/v1` de-duplication contract; it does not raise or round the
   threshold. Its URL/proxy tests and strict Clippy pass locally. Do not use the
   failed run as a release source; its GHCR jobs were skipped.
+- A client-disconnected synchronous image execution proved that the database
+  correctly made an expired image lease eligible for orphan settlement, but
+  the worker invoked that settlement only from the six-hour partition
+  maintenance timer. This could leave a pending request and reserved balance
+  stranded for up to six hours. The current change gives orphan settlement its
+  own five-minute timer while preserving the 30-minute age cutoff, active-lease
+  exclusion and 100-row batch bound. All six synchronous-image recovery tests,
+  the orphan-settlement test, formatting and strict library Clippy pass locally.
+  The live stale row must become a terminal `request_expired` record with a
+  released reservation after the replacement worker starts; do not repair it
+  manually before that rollout proof.
 - After applying the exact reviewed asset origin to the trial, a real image
   completed with HTTP 200, produced one 591,296-byte archived asset, replayed
   the same idempotency key without a second generation, and settled exactly

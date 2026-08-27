@@ -9,6 +9,7 @@ use crate::{
 };
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const ORPHANED_RESERVATION_REAPER_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const GENERATION_INTERVAL: Duration = Duration::from_millis(500);
 const OAUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const OAUTH_REFRESH_AHEAD_MILLIS: i64 = 5 * 60 * 1_000;
@@ -36,6 +37,9 @@ pub async fn run_until_shutdown(state: AppState, mut shutdown: watch::Receiver<b
     }));
     let mut maintenance = tokio::time::interval(MAINTENANCE_INTERVAL);
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut orphaned_reservation_reaper =
+        tokio::time::interval(ORPHANED_RESERVATION_REAPER_INTERVAL);
+    orphaned_reservation_reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut generations = tokio::time::interval(GENERATION_INTERVAL);
     generations.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut oauth_refresh = tokio::time::interval(OAUTH_REFRESH_INTERVAL);
@@ -50,15 +54,6 @@ pub async fn run_until_shutdown(state: AppState, mut shutdown: watch::Receiver<b
             _ = maintenance.tick() => {
                 if let Err(error) = state.db.maintain_partitions().await {
                     tracing::error!(%error, "worker failed to maintain PostgreSQL partitions");
-                }
-                match state.db.release_orphaned_reservations(100).await {
-                    Ok(released) if released > 0 => {
-                        tracing::warn!(released, "worker released orphaned usage reservations");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::error!(%error, "worker failed to release orphaned usage reservations");
-                    }
                 }
                 match state.db.expire_key_provisioning_responses(1_000).await {
                     Ok(expired) if expired > 0 => {
@@ -85,6 +80,17 @@ pub async fn run_until_shutdown(state: AppState, mut shutdown: watch::Receiver<b
                     Ok(_) => {}
                     Err(error) => {
                         tracing::error!(%error, "worker failed to delete expired budget rollup detail");
+                    }
+                }
+            }
+            _ = orphaned_reservation_reaper.tick() => {
+                match state.db.release_orphaned_reservations(100).await {
+                    Ok(released) if released > 0 => {
+                        tracing::warn!(released, "worker released orphaned usage reservations");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "worker failed to release orphaned usage reservations");
                     }
                 }
             }
