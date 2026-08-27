@@ -214,6 +214,10 @@ ingress:
 
 podAnnotations: {}
 podLabels: {}
+# Optional trial-only static name mappings for upstreams whose authoritative
+# DNS is available only outside the cluster resolver. Prefer normal DNS; keep
+# each mapping explicit and narrowly reviewed when this escape hatch is used.
+hostAliases: []
 nodeSelector: {}
 tolerations: []
 affinity: {}

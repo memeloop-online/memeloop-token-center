@@ -94,6 +94,12 @@ artifact_digest=sha256:ddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
   --namespace token-center \
   --show-only templates/service.yaml \
   --set roles.gateway.service.type=LoadBalancer >"$workspace/gateway-load-balancer.yaml"
+"$helm_binary" template token-center-host-alias "$chart" \
+  --namespace token-center \
+  --show-only templates/deployment.yaml \
+  --set-string hostAliases[0].ip=10.28.0.22 \
+  --set-string hostAliases[0].hostnames[0]=private-upstream.example.test \
+  >"$workspace/host-alias.yaml"
 
 grep -q 'kind: NetworkPolicy' "$workspace/default.yaml"
 latest_sqlite_migration=$(find "$repository/migrations/common" "$repository/migrations/sqlite" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]_*.sql' -exec basename {} \; | sed 's/_.*//' | sed 's/^0*//' | sort -n | tail -n 1)
@@ -205,6 +211,12 @@ test "$(grep -c 'marker: control-only' "$workspace/both-ingresses.yaml")" -eq 1
 test "$(grep -c 'nginx.ingress.kubernetes.io/whitelist-source-range: 100.64.0.2/32' "$workspace/both-ingresses.yaml")" -eq 1
 test "$(grep -c 'nginx.ingress.kubernetes.io/whitelist-source-range: 10.0.0.0/8' "$workspace/both-ingresses.yaml")" -eq 1
 grep -Fq 'type: LoadBalancer' "$workspace/gateway-load-balancer.yaml"
+test "$(grep -c 'ip: 10.28.0.22' "$workspace/host-alias.yaml")" -eq 3
+test "$(grep -c -- '- private-upstream.example.test' "$workspace/host-alias.yaml")" -eq 3
+if grep -q '^      hostAliases:' "$workspace/default.yaml"; then
+  echo 'Default deployments must not render static host aliases' >&2
+  exit 1
+fi
 if grep -Eq 'type:[[:space:]]*(NodePort|LoadBalancer)' "$workspace/default.yaml"; then
   echo 'Control-bearing Services must remain ClusterIP by default' >&2
   exit 1
@@ -413,6 +425,8 @@ assert_invalid misspelled-service-account-field \
   --set serviceAccount.automount=true
 assert_invalid misspelled-plugin-field \
   --set plugins.mountpath=/plugins
+assert_invalid host-alias-without-hostname \
+  --set-string hostAliases[0].ip=10.28.0.22
 assert_invalid misspelled-affinity-field \
   --set affinity.nodeAffinty.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=kubernetes.io/arch
 assert_invalid misspelled-topology-field \
@@ -436,6 +450,7 @@ if [ -n "$kubeconform_binary" ]; then
     "$workspace/control-ingress.yaml" \
     "$workspace/both-ingresses.yaml" \
     "$workspace/gateway-load-balancer.yaml" \
+    "$workspace/host-alias.yaml" \
     | "$kubeconform_binary" -strict -summary -ignore-missing-schemas
 fi
 

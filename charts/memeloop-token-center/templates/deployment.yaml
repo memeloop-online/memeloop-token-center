@@ -47,6 +47,10 @@ spec:
         runAsGroup: 10001
         fsGroup: 10001
         seccompProfile: { type: RuntimeDefault }
+      {{- with $.Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- if $.Values.plugins.ociInstaller.enabled }}
       initContainers:
         {{- range $index, $artifact := $.Values.plugins.ociInstaller.artifacts }}

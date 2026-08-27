@@ -16,6 +16,7 @@
     "ingress",
     "podAnnotations",
     "podLabels",
+    "hostAliases",
     "nodeSelector",
     "tolerations",
     "affinity",
@@ -435,6 +436,23 @@
     },
     "podAnnotations": { "$ref": "#/definitions/stringMap" },
     "podLabels": { "$ref": "#/definitions/stringMap" },
+    "hostAliases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ip", "hostnames"],
+        "properties": {
+          "ip": { "type": "string", "minLength": 3 },
+          "hostnames": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
     "nodeSelector": { "$ref": "#/definitions/stringMap" },
     "tolerations": {
       "type": "array",
