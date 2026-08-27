@@ -168,7 +168,7 @@ async fn proxy_openai_image_generation(
         let reservation_price = price
             .reservation_price()
             .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
-        let target_url = network::upstream_api_url(&route.base_url, upstream_path)?;
+        let target_url = network::upstream_api_url(&route.base_url, upstream_path);
         let mut request = outbound_http.post(target_url).json(&forwarded);
         if let Some(upstream_idempotency) = upstream_idempotency.as_deref() {
             request = request.header("idempotency-key", upstream_idempotency);

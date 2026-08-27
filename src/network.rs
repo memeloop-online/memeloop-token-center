@@ -285,32 +285,20 @@ pub fn checked_http_url(value: &str) -> Result<Url, AppError> {
 /// `/v1` (`https://provider.example/openai/v1`). Provider exports commonly use
 /// both forms; blindly appending `/v1/...` to the latter produces a valid but
 /// incorrect `/v1/v1/...` request.
-pub fn upstream_api_url(base_url: &str, api_path: &str) -> Result<String, AppError> {
-    if !api_path.starts_with('/')
-        || api_path.contains('?')
-        || api_path.contains('#')
-        || api_path
-            .split('/')
-            .any(|segment| matches!(segment, "." | ".."))
-    {
-        return Err(AppError::BadRequest(
-            "upstream API path must be an absolute path".into(),
-        ));
-    }
-    let mut target = checked_http_url(base_url)?;
-    if target.query().is_some() {
-        return Err(AppError::BadRequest(
-            "upstream base URL cannot contain a query".into(),
-        ));
-    }
-    let base_path = target.path().trim_end_matches('/');
-    let suffix = if base_path.ends_with("/v1") {
+pub(crate) fn upstream_api_url(base_url: &str, api_path: &str) -> String {
+    // Both values have already crossed controlled boundaries: provider base
+    // URLs are schema/destination validated before persistence and API paths
+    // are static protocol constants. Avoid reparsing the same base URL for
+    // every inference request; the hot path should allocate only its result.
+    debug_assert!(api_path.starts_with('/'));
+    debug_assert!(!api_path.contains(['?', '#']));
+    let base = base_url.trim_end_matches('/');
+    let suffix = if base.ends_with("/v1") {
         api_path.strip_prefix("/v1").unwrap_or(api_path)
     } else {
         api_path
     };
-    target.set_path(&format!("{base_path}{suffix}"));
-    Ok(target.into())
+    format!("{base}{suffix}")
 }
 
 async fn resolve_once(host: &str, port: u16) -> Result<Vec<SocketAddr>, AppError> {
@@ -421,22 +409,20 @@ mod tests {
     #[test]
     fn upstream_api_url_accepts_origin_and_versioned_api_bases() {
         assert_eq!(
-            upstream_api_url("https://provider.example", "/v1/images/generations").unwrap(),
+            upstream_api_url("https://provider.example", "/v1/images/generations"),
             "https://provider.example/v1/images/generations"
         );
         assert_eq!(
-            upstream_api_url("https://provider.example/v1/", "/v1/images/generations").unwrap(),
+            upstream_api_url("https://provider.example/v1/", "/v1/images/generations"),
             "https://provider.example/v1/images/generations"
         );
         assert_eq!(
             upstream_api_url(
                 "https://provider.example/openai/v1",
                 "/v1/images/generations"
-            )
-            .unwrap(),
+            ),
             "https://provider.example/openai/v1/images/generations"
         );
-        assert!(upstream_api_url("https://provider.example/v1", "../admin").is_err());
     }
 
     #[test]

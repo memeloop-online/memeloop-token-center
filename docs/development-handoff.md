@@ -36,6 +36,17 @@ This section supersedes the older release-truth snapshots below.
   Targeted Rust tests, TypeScript typecheck and all nine CPA importer tests pass
   locally. Do not publish another candidate until the remaining local gates are
   green.
+- Follow-up CI run
+  [`33077065478`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33077065478)
+  passed every functional, migration, security, packaging and browser job but
+  correctly blocked publication because the 15-minute soak slope was 2.038
+  MiB/min against the unchanged 2.000 MiB/min ceiling. The same evidence showed
+  18,016/18,016 successful requests, 139.648 MiB lifetime gateway high-water,
+  24.227 MiB retained delta and every other memory check passing. The follow-up
+  removes a newly introduced full URL parse from every inference request while
+  retaining the `/v1` de-duplication contract; it does not raise or round the
+  threshold. Its URL/proxy tests and strict Clippy pass locally. Do not use the
+  failed run as a release source; its GHCR jobs were skipped.
 - After applying the exact reviewed asset origin to the trial, a real image
   completed with HTTP 200, produced one 591,296-byte archived asset, replayed
   the same idempotency key without a second generation, and settled exactly

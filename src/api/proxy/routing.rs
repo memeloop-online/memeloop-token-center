@@ -157,8 +157,7 @@ pub(super) async fn send_proxy_route(
     )
     .await
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
-    let target_url = network::upstream_api_url(&outbound_base_url, request_path)
-        .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    let target_url = network::upstream_api_url(&outbound_base_url, request_path);
     let mut request = outbound_http
         .post(target_url)
         .body(route.forwarded_body.clone());
