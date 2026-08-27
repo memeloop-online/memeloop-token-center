@@ -207,6 +207,13 @@ impl ProviderCatalog {
                     "minLength": 1,
                     "description": "Responses model used to invoke image_generation when image_api_mode is responses-tool."
                 },
+                "result_origins": {
+                    "title": "Generated asset origins",
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {"type": "string", "format": "uri"},
+                    "description": "Exact origins allowed for generated asset archival."
+                },
                 "oauth": {
                     "type": "object",
                     "readOnly": true,

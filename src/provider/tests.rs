@@ -258,6 +258,21 @@ fn cloned_provider_catalog_shares_frozen_schemas_and_extends_copy_on_write() {
 }
 
 #[test]
+fn http_json_provider_schema_accepts_exact_generation_result_origins() {
+    let catalog = ProviderCatalog::builtins();
+    let provider = catalog.get("http-json").expect("built-in provider");
+    crate::schema::validate_instance(
+        &provider.config_schema,
+        &json!({
+            "base_url": "https://provider.example/v1",
+            "network_scope": "public",
+            "result_origins": ["https://assets.provider.example"]
+        }),
+    )
+    .expect("http-json image providers need an explicit asset-origin allowlist");
+}
+
+#[test]
 fn managed_oauth_source_types_are_extensible_but_unique_and_controlled() {
     let mut catalog = ProviderCatalog::builtins();
     catalog

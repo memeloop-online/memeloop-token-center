@@ -157,12 +157,10 @@ pub(super) async fn send_proxy_route(
     )
     .await
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    let target_url = network::upstream_api_url(&outbound_base_url, request_path)
+        .map_err(|_| ProxySendError::CandidateUnavailable)?;
     let mut request = outbound_http
-        .post(format!(
-            "{}{}",
-            outbound_base_url.trim_end_matches('/'),
-            request_path
-        ))
+        .post(target_url)
         .body(route.forwarded_body.clone());
     if is_codex {
         request = codex_transport::apply_wire_headers(request, &route.route.credential, request_id)

@@ -27,9 +27,9 @@ function privateTree(path: string): void {
 function readFileNames(path: string): string[] {
   return readdirSync(path);
 }
-function writeTransportPolicy(root: string, privateTargetBaseUrls: string[]): string {
+function writeTransportPolicy(root: string, privateTargetBaseUrls: string[], resultOriginsByBaseUrl: Record<string, string[]> = {}): string {
   const path = join(root, "transport-policy.json");
-  writeFileSync(path, `${JSON.stringify({ contract_version: 1, private_target_base_urls: privateTargetBaseUrls })}\n`, { mode: 0o600 });
+  writeFileSync(path, `${JSON.stringify({ contract_version: 1, private_target_base_urls: privateTargetBaseUrls, result_origins_by_base_url: resultOriginsByBaseUrl })}\n`, { mode: 0o600 });
   return path;
 }
 
@@ -110,6 +110,8 @@ describe("CPA upstream TypeScript operators", () => {
       { contract_version: 1, private_target_base_urls: ["https://absent.example.test"] },
       { contract_version: 2, private_target_base_urls: [] },
       { contract_version: 1, private_target_base_urls: [], extra: true },
+      { contract_version: 1, private_target_base_urls: [], result_origins_by_base_url: { "https://absent.example.test/v1": ["https://assets.example.test"] } },
+      { contract_version: 1, private_target_base_urls: [], result_origins_by_base_url: { "https://openai-compatible.example.test/v1": ["https://assets.example.test/path"] } },
     ];
     for (const [index, document] of cases.entries()) {
       const policy = join(root, `rejected-${index}.json`);
@@ -185,7 +187,9 @@ describe("CPA upstream TypeScript operators", () => {
     const source = join(root, "source"); cpSync(join(fixtures, "supported"), source, { recursive: true }); privateTree(source);
     const key = join(source, "source-identity.key"); assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
     const token = join(root, "service-token"); writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
-    const policy = writeTransportPolicy(root, ["https://openai-compatible.example.test/v1"]);
+    const policy = writeTransportPolicy(root, ["https://openai-compatible.example.test/v1"], {
+      "https://openai-compatible.example.test/v1": ["https://assets.example.test"],
+    });
     const accounts = new Map<string, Record<string, unknown>>(); const credentials: Record<string, unknown>[] = []; let rotations = 0;
     const server = createServer(async (request, response) => {
       const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -214,6 +218,7 @@ describe("CPA upstream TypeScript operators", () => {
       assert.equal(accounts.size, 6); assert.equal(rotations, 12);
       assert.equal([...accounts.values()].filter((account) => (account.config as Record<string, unknown>).network_scope === "private").length, 2);
       assert.equal([...accounts.values()].filter((account) => (account.config as Record<string, unknown>).network_scope === "public").length, 4);
+      assert.equal([...accounts.values()].filter((account) => Array.isArray((account.config as Record<string, unknown>).result_origins)).length, 2);
       await assert.rejects(
         execFileAsync(process.execPath, arguments_.filter((value, index, values) => value !== "--transport-policy-file" && values[index - 1] !== "--transport-policy-file"), { timeout: 20_000 }),
         /target account conflicts with a stable CPA source identity/,

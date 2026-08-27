@@ -17,6 +17,7 @@
 - [部署就绪条件](docs/deployment-readiness.md)
 - [验收矩阵](docs/acceptance-matrix.md)
 - [语义执行元信息与 Codex 纳入方式](docs/semantic-execution-metadata.md)
+- [API2 试用入口与两类凭据取得方式](docs/operations/api2-trial-dogfood.md)
 
 `docs/product-requirements.md` 是产品范围的权威入口；实现、测试或运维文档如与其冲突，必须先更新并评审产品需求，而不是静默改变范围。
 

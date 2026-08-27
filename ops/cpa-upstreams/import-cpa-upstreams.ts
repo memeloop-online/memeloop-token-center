@@ -31,7 +31,12 @@ type DirectAccount = { sourceId: string; name: string; driver: "http-json"; conf
 type NativeReauthorization = { sourceId: string; provider: string; sourceDisabled: boolean };
 type ManagedOAuth = { stableId: string; sourceType: string; payloadRef: string };
 type Inventory = { direct: DirectAccount[]; native: NativeReauthorization[]; managed: ManagedOAuth[]; disabledSourceCount: number };
-type TransportPolicy = { privateTargetBaseUrls: Set<string>; matchedPrivateTargetBaseUrls: Set<string> };
+type TransportPolicy = {
+  privateTargetBaseUrls: Set<string>;
+  matchedPrivateTargetBaseUrls: Set<string>;
+  resultOriginsByBaseUrl: Map<string, string[]>;
+  matchedResultOriginBaseUrls: Set<string>;
+};
 
 class SecretStore {
   readonly values = new Map<string, unknown>();
@@ -116,7 +121,7 @@ function parseTransportPolicy(raw: Buffer, allowHttpLoopback: boolean): Transpor
   let document: JsonObject;
   try { document = mapping(parseStrictJson(decodeUtf8(raw, "CPA transport policy")), "CPA transport policy"); }
   catch { throw new ImportFailure("CPA transport policy is invalid JSON"); }
-  exact(document, ["contract_version", "private_target_base_urls"], "CPA transport policy");
+  exact(document, ["contract_version", "private_target_base_urls", "result_origins_by_base_url"], "CPA transport policy");
   if (document.contract_version !== 1) throw new ImportFailure("CPA transport policy has an unsupported contract version");
   const values = document.private_target_base_urls;
   if (!Array.isArray(values) || values.length > MAX_ACCOUNTS) throw new ImportFailure("CPA transport policy private targets must be a bounded list");
@@ -126,7 +131,24 @@ function parseTransportPolicy(raw: Buffer, allowHttpLoopback: boolean): Transpor
     if (privateTargetBaseUrls.has(normalized)) throw new ImportFailure("CPA transport policy contains a duplicate private target");
     privateTargetBaseUrls.add(normalized);
   }
-  return { privateTargetBaseUrls, matchedPrivateTargetBaseUrls: new Set<string>() };
+  const resultOriginsByBaseUrl = new Map<string, string[]>();
+  const resultOriginEntries = Object.entries(mapping(document.result_origins_by_base_url ?? {}, "CPA transport policy result origins"));
+  if (resultOriginEntries.length > MAX_ACCOUNTS) throw new ImportFailure("CPA transport policy contains too many result-origin entries");
+  for (const [rawBaseUrl, rawOrigins] of resultOriginEntries) {
+    const baseUrl = upstreamUrl(rawBaseUrl, "CPA transport policy result-origin base URL", allowHttpLoopback, "private");
+    const origins = list(rawOrigins, "CPA transport policy result origins");
+    if (origins.length === 0 || origins.length > 64) throw new ImportFailure("CPA transport policy result origins must be a bounded non-empty list");
+    const normalized = origins.map((value) => upstreamOrigin(value, "CPA transport policy result origin", allowHttpLoopback));
+    if (new Set(normalized).size !== normalized.length) throw new ImportFailure("CPA transport policy contains a duplicate result origin");
+    if (resultOriginsByBaseUrl.has(baseUrl)) throw new ImportFailure("CPA transport policy contains a duplicate result-origin base URL");
+    resultOriginsByBaseUrl.set(baseUrl, normalized);
+  }
+  return {
+    privateTargetBaseUrls,
+    matchedPrivateTargetBaseUrls: new Set<string>(),
+    resultOriginsByBaseUrl,
+    matchedResultOriginBaseUrls: new Set<string>(),
+  };
 }
 function validateAuthDirectory(path: string): string {
   try {
@@ -164,6 +186,12 @@ function upstreamUrl(value: unknown, label: string, allowHttpLoopback: boolean, 
   if (url.protocol === "http:" && scope !== "private" && !testLoopback) throw new ImportFailure(`${label} must use HTTPS`);
   url.pathname = url.pathname.replace(/\/+$/, "");
   return url.toString().replace(/\/$/, "");
+}
+function upstreamOrigin(value: unknown, label: string, allowHttpLoopback: boolean): string {
+  const normalized = upstreamUrl(value, label, allowHttpLoopback);
+  const url = new URL(normalized);
+  if (url.pathname !== "/") throw new ImportFailure(`${label} must be an exact origin`);
+  return url.origin;
 }
 function targetNetworkScope(baseUrl: string, policy: TransportPolicy): TargetNetworkScope {
   if (!policy.privateTargetBaseUrls.has(baseUrl)) return "public";
@@ -221,7 +249,11 @@ function addDirect(records: DirectAccount[], secrets: SecretStore, policy: Trans
     secrets.put(proxySecretRef, proxy.value);
     proxyFields = { proxySecretRef, proxyNetworkScope: proxy.scope };
   }
-  records.push({ sourceId, name: accountName(label, sourceId), driver: "http-json", config: { base_url: baseUrl, network_scope: targetNetworkScope(baseUrl, policy) }, header, prefix, secretRef, ...proxyFields, disabled });
+  const resultOrigins = policy.resultOriginsByBaseUrl.get(baseUrl);
+  if (resultOrigins !== undefined) policy.matchedResultOriginBaseUrls.add(baseUrl);
+  const config: JsonObject = { base_url: baseUrl, network_scope: targetNetworkScope(baseUrl, policy) };
+  if (resultOrigins !== undefined) config.result_origins = resultOrigins;
+  records.push({ sourceId, name: accountName(label, sourceId), driver: "http-json", config, header, prefix, secretRef, ...proxyFields, disabled });
 }
 function inventoryConfig(config: JsonObject, secrets: SecretStore, policy: TransportPolicy, allowHttp: boolean): [DirectAccount[], number] {
   const records: DirectAccount[] = []; let disabledCount = 0; const names = new Set<string>();
@@ -300,6 +332,7 @@ function buildInventory(configPath: string, authDirectory: string, policy: Trans
   const identities = [...direct.map((item) => item.sourceId), ...native.map((item) => item.sourceId), ...managed.map((item) => item.stableId)], names = direct.map((item) => item.name);
   if (new Set(identities).size !== identities.length || new Set(names).size !== names.length) throw new ImportFailure("CPA source contains a stable identity conflict");
   if (policy.matchedPrivateTargetBaseUrls.size !== policy.privateTargetBaseUrls.size) throw new ImportFailure("CPA transport policy contains a private target absent from the source");
+  if (policy.matchedResultOriginBaseUrls.size !== policy.resultOriginsByBaseUrl.size) throw new ImportFailure("CPA transport policy contains a result-origin target absent from the source");
   if (identities.length === 0) throw new ImportFailure("CPA source contains no active supported upstream accounts");
   return [{ direct, native, managed, disabledSourceCount: disabledConfig + disabledAuth }, secrets];
 }
@@ -411,7 +444,12 @@ async function main(): Promise<void> {
   if (options.transportPolicy && !isAbsolute(options.transportPolicy)) throw new ImportFailure("transport policy file path must be absolute");
   const policy = options.transportPolicy
     ? parseTransportPolicy(readOwnerOnly(options.transportPolicy, "CPA transport policy file", MAX_CONFIG_BYTES), options.allowHttp)
-    : { privateTargetBaseUrls: new Set<string>(), matchedPrivateTargetBaseUrls: new Set<string>() };
+    : {
+      privateTargetBaseUrls: new Set<string>(),
+      matchedPrivateTargetBaseUrls: new Set<string>(),
+      resultOriginsByBaseUrl: new Map<string, string[]>(),
+      matchedResultOriginBaseUrls: new Set<string>(),
+    };
   const [inventory, secrets] = buildInventory(options.config!, options.authDir!, policy, options.allowHttp);
   let native: JsonObject[] = []; if (inventory.native.length > 0) { if (!options.sourceKey) throw new ImportFailure("source identity key file is required for opaque reauthorization records"); const key = readSourceKey(options.sourceKey); native = inventory.native.map((record) => ({ provider: record.provider, source_disabled: record.sourceDisabled, source_stable_id: createHmac("sha256", key).update(Buffer.concat([Buffer.from("memeloop-token-center\0cpa-native-reauthorization-source-id\0v1\0"), Buffer.from(record.sourceId)])).digest("hex") })); key.fill(0); }
   if (!options.apply || (inventory.direct.length === 0 && inventory.managed.length === 0)) { process.stdout.write(`${JSON.stringify(summary(options.apply ? "apply" : "dry-run", inventory, native))}\n`); return; }

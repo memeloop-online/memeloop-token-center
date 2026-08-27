@@ -6,6 +6,50 @@ This is the resume point for the next Token Center development agent. Read
 scope and rejected designs; this document preserves the implementation state and
 remaining acceptance gates, updated on 2026-08-27.
 
+## Current 2026-08-27 API2 trial evidence
+
+This section supersedes the older release-truth snapshots below.
+
+- Clean master parent `3f648975892e61751bbda44b47053b82a134dff9` passed
+  GitHub Actions run
+  [`33065339748`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33065339748),
+  including the optimized 15-minute memory gate, and published verified
+  immutable digests: service
+  `sha256:15398a1d0a722dc38c7cfdc8860260e0aa880020eaea54e8d00fbbc009f3ce5f`,
+  importer
+  `sha256:d6f1e1bbeb5a7b6d9d78e3e5712be1ce9b8b606d911db364248e792c9da7a25f`
+  and plugin-installer
+  `sha256:849f3f8ae1d20fbb418c535254616b96e8af933bb970d2d3de9d8864adcf22a0`.
+- Those digests are deployed only to the reversible API2 trial. Control,
+  gateway and worker report the exact source revision and remain Ready with no
+  restarts. The old CPA rollback point and API3 remain untouched.
+- Real Chat Completions and Responses requests returned the requested exact
+  marker strings. A real Codex CLI request used the Responses wire protocol and
+  captured controlled session name, task kind, agent ID and labels in the
+  session/request structure. The current dynamic subagent/parent relationship
+  still depends on applications sending the documented metadata headers.
+- A live standard Images request exposed two configuration defects: `/v1` API
+  bases were receiving a duplicated `/v1` path, and the built-in `http-json`
+  schema rejected the exact generated-asset origin allowlist already enforced
+  by the archive layer. The current source change fixes both and extends the
+  versioned CPA transport policy with exact `result_origins_by_base_url`.
+  Targeted Rust tests, TypeScript typecheck and all nine CPA importer tests pass
+  locally. Do not publish another candidate until the remaining local gates are
+  green.
+- After applying the exact reviewed asset origin to the trial, a real image
+  completed with HTTP 200, produced one 591,296-byte archived asset, replayed
+  the same idempotency key without a second generation, and settled exactly
+  USD 0.01. The request and result staging attempts are both bound. No wildcard
+  origin or private-network relaxation was used.
+- Credential acquisition and the distinction between service and client
+  credentials are recorded in
+  [API2 trial dogfood access](operations/api2-trial-dogfood.md). The browser must
+  remember either credential until the user manually clears it.
+- Legacy CPA credential attachment, complete session-archive delta import,
+  failed OAuth/API upstream remediation, browser UI acceptance and final
+  rollback rehearsal remain release gates. API3 is forbidden until the user
+  explicitly opens the production window.
+
 ## Current 2026-08-27 release truth
 
 - GitHub Actions run

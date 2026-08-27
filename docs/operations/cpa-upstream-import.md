@@ -100,14 +100,28 @@ requirements above:
 The optional transport policy is strict JSON with exactly this versioned shape:
 
 ```json
-{"contract_version":1,"private_target_base_urls":["https://reviewed-private.example/v1"]}
+{
+  "contract_version": 1,
+  "private_target_base_urls": ["https://reviewed-private.example/v1"],
+  "result_origins_by_base_url": {
+    "https://reviewed-image-provider.example/v1": [
+      "https://reviewed-image-assets.example"
+    ]
+  }
+}
 ```
 
-Omit the option when every target is public. Duplicate or unmatched entries,
-unknown fields and unsupported versions stop the complete inventory before any
-target request. The path must be absolute. Preserve the approved file and its
-SHA-256 digest with the migration ledger; changing the scope on a replay keeps
-the same stable source identity and fails as an account configuration conflict.
+`private_target_base_urls` classifies exact provider targets. The optional
+`result_origins_by_base_url` maps an exact source provider base URL to the exact
+HTTPS origins from which its generated assets may be archived. It is an SSRF
+allowlist, not a URL-prefix or wildcard mechanism; paths, duplicate origins and
+entries for providers absent from the source are rejected. Omit the option when
+every target is public and no provider returns asset URLs from another origin.
+Duplicate or unmatched entries, unknown fields and unsupported versions stop
+the complete inventory before any target request. The path must be absolute.
+Preserve the approved file and its SHA-256 digest with the migration ledger;
+changing transport configuration on replay keeps the same stable source
+identity and fails as an account configuration conflict.
 
 `--source-identity-key-file` is required only when the snapshot contains opaque
 Copilot/Cursor records. It must be an absolute path to a mode-`0600` regular,

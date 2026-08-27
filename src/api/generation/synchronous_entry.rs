@@ -168,13 +168,8 @@ async fn proxy_openai_image_generation(
         let reservation_price = price
             .reservation_price()
             .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
-        let mut request = outbound_http
-            .post(format!(
-                "{}{}",
-                route.base_url.trim_end_matches('/'),
-                upstream_path
-            ))
-            .json(&forwarded);
+        let target_url = network::upstream_api_url(&route.base_url, upstream_path)?;
+        let mut request = outbound_http.post(target_url).json(&forwarded);
         if let Some(upstream_idempotency) = upstream_idempotency.as_deref() {
             request = request.header("idempotency-key", upstream_idempotency);
         }
@@ -529,7 +524,7 @@ mod tests {
                     name: "image replay upstream".to_owned(),
                     driver: "http-json".to_owned(),
                     config: json!({
-                        "base_url": upstream.uri(),
+                        "base_url": format!("{}/v1", upstream.uri()),
                         "network_scope": "private"
                     }),
                     credential: UpstreamCredential::None,

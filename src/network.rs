@@ -280,6 +280,39 @@ pub fn checked_http_url(value: &str) -> Result<Url, AppError> {
     Ok(url)
 }
 
+/// Append an OpenAI-compatible API path to either an origin-style base URL
+/// (`https://provider.example`) or an API-base URL whose path already ends in
+/// `/v1` (`https://provider.example/openai/v1`). Provider exports commonly use
+/// both forms; blindly appending `/v1/...` to the latter produces a valid but
+/// incorrect `/v1/v1/...` request.
+pub fn upstream_api_url(base_url: &str, api_path: &str) -> Result<String, AppError> {
+    if !api_path.starts_with('/')
+        || api_path.contains('?')
+        || api_path.contains('#')
+        || api_path
+            .split('/')
+            .any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err(AppError::BadRequest(
+            "upstream API path must be an absolute path".into(),
+        ));
+    }
+    let mut target = checked_http_url(base_url)?;
+    if target.query().is_some() {
+        return Err(AppError::BadRequest(
+            "upstream base URL cannot contain a query".into(),
+        ));
+    }
+    let base_path = target.path().trim_end_matches('/');
+    let suffix = if base_path.ends_with("/v1") {
+        api_path.strip_prefix("/v1").unwrap_or(api_path)
+    } else {
+        api_path
+    };
+    target.set_path(&format!("{base_path}{suffix}"));
+    Ok(target.into())
+}
+
 async fn resolve_once(host: &str, port: u16) -> Result<Vec<SocketAddr>, AppError> {
     let resolved = tokio::time::timeout(
         Duration::from_secs(3),
@@ -384,6 +417,27 @@ fn embedded_ipv4(high: u16, low: u16) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_api_url_accepts_origin_and_versioned_api_bases() {
+        assert_eq!(
+            upstream_api_url("https://provider.example", "/v1/images/generations").unwrap(),
+            "https://provider.example/v1/images/generations"
+        );
+        assert_eq!(
+            upstream_api_url("https://provider.example/v1/", "/v1/images/generations").unwrap(),
+            "https://provider.example/v1/images/generations"
+        );
+        assert_eq!(
+            upstream_api_url(
+                "https://provider.example/openai/v1",
+                "/v1/images/generations"
+            )
+            .unwrap(),
+            "https://provider.example/openai/v1/images/generations"
+        );
+        assert!(upstream_api_url("https://provider.example/v1", "../admin").is_err());
+    }
 
     #[test]
     fn private_reserved_and_embedded_addresses_are_not_public() {
