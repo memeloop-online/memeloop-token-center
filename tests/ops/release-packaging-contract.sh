@@ -21,6 +21,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 test -f "$workflow"
+grep -Fq 'node --test tests/ops/test-cpa-upstream-import.ts' "$workflow"
 test -f "$workflow_directory/memory-acceptance.yml"
 test -f "$dockerfile"
 test -f "$importer_dockerfile"

@@ -35,6 +35,15 @@ Unknown `*-api-key`/`*-compatibility` sections and unknown auth JSON types also
 stop the import. No supported accounts are written before source inventory and
 target metadata conflict checks finish.
 
+Target reachability is approved separately from proxy reachability. Targets are
+public by default. A reviewed owner-only transport-policy file may classify an
+exact normalized base URL as private; the importer then writes
+`network_scope: "private"` for every source account using that URL. It never
+infers a private target merely because an account has a proxy, and a private
+target need not have a proxy when the cluster has an approved direct private
+route. The control plane still resolves, classifies and pins the target and any
+proxy independently and requires global authority for private transport.
+
 Opaque Copilot and Cursor handle records cannot be used as native credentials.
 The importer never sends their handle, login, label or source document to Token
 Center and never creates an upstream for them. Dry-run and apply instead include
@@ -48,28 +57,30 @@ Before starting, make an immutable CPA volume snapshot and stage only its
 `config.yaml` and declared auth directory for the importer UID. The importer
 requires:
 
-- `config.yaml`, every auth JSON, the target service token and, when opaque
-  records exist, the source identity key to be owner-owned, single-link,
-  regular mode-`0600` files;
+- `config.yaml`, every auth JSON, the target service token, the optional
+  transport policy and, when opaque records exist, the source identity key to
+  be owner-owned, single-link, regular mode-`0600` files;
 - the auth root and every nested directory to be owner-owned mode `0700`;
 - no symlink or non-JSON file anywhere below the auth root; and
 - source and target sizes to remain within the built-in bounded-read limits.
 
-Do not pass a credential, service token or source identity key in argv, an
-environment variable, a ConfigMap or a shell substitution. Normal output is one
-JSON inventory object. Errors do not include filenames, URLs, response bodies,
-credential values or secret-derived hashes. Core dumps are disabled.
+Do not pass a credential, service token, source identity key or private target
+URL in argv, an environment variable, a ConfigMap or a shell substitution.
+Normal output is one JSON inventory object. Errors do not include filenames,
+URLs, response bodies, credential values or secret-derived hashes. Core dumps
+are disabled.
 
-Every target and provider URL must use HTTPS. The
-`--allow-http-loopback` option permits only `localhost`, `127.0.0.0/8` or `::1`
-and exists for black-box tests. It does not permit cluster DNS or private IP HTTP.
-The HTTP client never follows redirects. Use `--ca-file` for a private control
-plane CA instead of disabling TLS verification.
+Every public target and provider URL must use HTTPS. A URL explicitly listed in
+the private transport policy may use HTTP, but the server independently rejects
+it unless DNS and every resolved IP satisfy the private-destination policy. The
+`--allow-http-loopback` option permits only loopback HTTP and exists for
+black-box tests. The importer HTTP client never follows redirects. Use
+`--ca-file` for a private control-plane CA instead of disabling TLS verification.
 
 The apply service credential needs `providers:read`, `providers:write` and, for
-managed OAuth documents, `imports:cpa:write`. A private per-account proxy also
-requires a global (not tenant-bound) service credential. Route it only to the
-private control Service.
+managed OAuth documents, `imports:cpa:write`. A private target or private
+per-account proxy also requires a global (not tenant-bound) service credential.
+Route it only to the private control Service.
 
 ## Dry-run and apply
 
@@ -82,8 +93,21 @@ requirements above:
   --config /source/config.yaml \
   --auth-dir /source/auth \
   --source-identity-key-file /secrets/migration/source-identity.key \
+  --transport-policy-file /secrets/migration/transport-policy.json \
   --tenant cpa-dogfood-import
 ```
+
+The optional transport policy is strict JSON with exactly this versioned shape:
+
+```json
+{"contract_version":1,"private_target_base_urls":["https://reviewed-private.example/v1"]}
+```
+
+Omit the option when every target is public. Duplicate or unmatched entries,
+unknown fields and unsupported versions stop the complete inventory before any
+target request. The path must be absolute. Preserve the approved file and its
+SHA-256 digest with the migration ledger; changing the scope on a replay keeps
+the same stable source identity and fails as an account configuration conflict.
 
 `--source-identity-key-file` is required only when the snapshot contains opaque
 Copilot/Cursor records. It must be an absolute path to a mode-`0600` regular,
@@ -110,18 +134,20 @@ Do not point the importer at a Kubernetes Secret projected-volume path. The
 projection uses root-owned symbolic links, while the importer deliberately
 requires a real current-UID-owned, single-link regular file. Use the checked-in
 [`ops/kubernetes/cpa-upstream-import-dry-run-job.yaml`](../../ops/kubernetes/cpa-upstream-import-dry-run-job.yaml)
-example: its least-privilege init container copies the binary Secret entry into
-a memory-backed private `emptyDir`, sets owner `10001:10001` and mode `0600`, and
-verifies the resulting file. The importer mounts that `emptyDir` read-only and
-never mounts the Secret itself. Replace every explicit placeholder, stage the
-immutable CPA snapshot for UID `10001` as described above, inspect the manifest,
+example: its least-privilege init container copies the source key and reviewed
+transport-policy Secret entries into a memory-backed private `emptyDir`, sets
+owner `10001:10001` and mode `0600`, and verifies both files. The importer mounts
+that `emptyDir` read-only and never mounts either Secret itself. Even an all-public
+run supplies the version-1 policy with an empty list. Replace every explicit
+placeholder, record the policy digest and approval reference in the immutable
+Job annotations, stage the CPA snapshot for UID `10001`, inspect the manifest,
 and keep the example in dry-run mode until its output is approved.
 
 A successful dry-run returns counts and the non-secret native-authorization
 worklist:
 
 ```json
-{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"3e37cd527b6365313440b4be4df9184b4dbe06c2aeb4c80628134bd38cb0ea38"},{"provider":"cursor","source_disabled":false,"source_stable_id":"2a8d8d1ee60dad9b93c5f8a479fb24fd38f48095da0c1e9cde5a00fc7ad650b3"}],"native_reauthorization_required_count":2,"proxied_api_account_count":1,"replayed_count":0,"replayed_managed_oauth_count":0}
+{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"3e37cd527b6365313440b4be4df9184b4dbe06c2aeb4c80628134bd38cb0ea38"},{"provider":"cursor","source_disabled":false,"source_stable_id":"2a8d8d1ee60dad9b93c5f8a479fb24fd38f48095da0c1e9cde5a00fc7ad650b3"}],"native_reauthorization_required_count":2,"private_target_api_account_count":2,"proxied_api_account_count":1,"replayed_count":0,"replayed_managed_oauth_count":0}
 ```
 
 Preserve the source snapshot and inventory output for review. Do not reorder API

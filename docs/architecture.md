@@ -122,6 +122,14 @@ handles cannot become credentials and are reported for native reauthorization.
 Historical retired connection rows may remain readable for attribution, but are
 never routable or refreshable.
 
+Imported direct targets default to the public destination policy. Migration may
+select `network_scope: private` only through a separate versioned owner-only
+policy listing exact normalized base URLs. This decision is independent of
+whether the account uses a proxy; it remains subject to the server's global
+authority check and independent DNS/IP validation. Stable source identity does
+not include scope, so changing an approved scope conflicts with the existing
+account instead of creating a duplicate.
+
 An imported API-key account may carry one operator-approved private SOCKS5
 proxy. The proxy URL—including optional proxy authentication and private
 topology—is sealed inside the credential envelope, never copied to account

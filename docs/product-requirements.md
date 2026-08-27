@@ -216,6 +216,9 @@ the existing buffered-only ABI.
   available to the user.
 - Product copy is mature user-facing language, not implementation notes or task
   reports. Terms such as “create key” are presented as “create credential”.
+- Operator and self-service credentials are remembered separately by the
+  browser across reloads and restarts, and are removed only through the user's
+  explicit clear action. The raw remembered value is never rendered back.
 - The application ships appropriately sized website icons.
 - HTTP APIs have a versioned OpenAPI contract, bounded pagination, explicit
   idempotency behavior and generic secret-safe error envelopes.
@@ -288,6 +291,10 @@ rather than silently bypassing it. Proxy credentials/topology are encrypted
 write-only material; dry-run output is count-only, and proxy creation or change
 is restricted to a global service credential. The local-DNS SOCKS5 form is
 required so the validated target address remains pinned through the handshake.
+Target and proxy scope are independent: public is the target default, while an
+exact private target requires a separate, versioned, owner-only operator policy
+approved before dry-run. Scope is never inferred from proxy presence, and the
+server must still independently validate target DNS/IP and operator authority.
 Legacy CPA archive timestamps with
 explicit offsets and up to nanosecond precision may be normalized to canonical
 six-digit UTC only in the pre-stable legacy projection. The stable snapshot

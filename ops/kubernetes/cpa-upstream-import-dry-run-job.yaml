@@ -2,6 +2,10 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: cpa-upstream-import-dry-run
+  annotations:
+    memeloop-token-center/import-mode: dry-run
+    memeloop-token-center/transport-policy-sha256: REPLACE_REVIEWED_POLICY_SHA256
+    memeloop-token-center/transport-policy-approval: REPLACE_APPROVAL_REFERENCE
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 86400
@@ -25,10 +29,15 @@ spec:
             - |
               umask 077
               cp -- /secret-source/source-identity.key /key-runtime/source-identity.key
+              cp -- /transport-policy-source/transport-policy.json /key-runtime/transport-policy.json
               chmod 0600 /key-runtime/source-identity.key
+              chmod 0600 /key-runtime/transport-policy.json
               chown 10001:10001 /key-runtime/source-identity.key
+              chown 10001:10001 /key-runtime/transport-policy.json
               test -f /key-runtime/source-identity.key
+              test -f /key-runtime/transport-policy.json
               test "$(stat -c %u:%g:%a:%h /key-runtime/source-identity.key)" = "10001:10001:600:1"
+              test "$(stat -c %u:%g:%a:%h /key-runtime/transport-policy.json)" = "10001:10001:600:1"
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -48,6 +57,9 @@ spec:
             - name: source-identity-key-secret
               mountPath: /secret-source
               readOnly: true
+            - name: transport-policy-secret
+              mountPath: /transport-policy-source
+              readOnly: true
             - name: source-identity-key-runtime
               mountPath: /key-runtime
       containers:
@@ -62,6 +74,8 @@ spec:
             - /source/auth
             - --source-identity-key-file
             - /key-runtime/source-identity.key
+            - --transport-policy-file
+            - /key-runtime/transport-policy.json
             - --tenant
             - REPLACE_TENANT_EXTERNAL_ID
           securityContext:
@@ -97,6 +111,13 @@ spec:
             items:
               - key: source-identity.key
                 path: source-identity.key
+        - name: transport-policy-secret
+          secret:
+            secretName: REPLACE_TRANSPORT_POLICY_SECRET
+            defaultMode: 0400
+            items:
+              - key: transport-policy.json
+                path: transport-policy.json
         - name: source-identity-key-runtime
           emptyDir:
             medium: Memory

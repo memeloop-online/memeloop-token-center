@@ -27,6 +27,11 @@ function privateTree(path: string): void {
 function readFileNames(path: string): string[] {
   return readdirSync(path);
 }
+function writeTransportPolicy(root: string, privateTargetBaseUrls: string[]): string {
+  const path = join(root, "transport-policy.json");
+  writeFileSync(path, `${JSON.stringify({ contract_version: 1, private_target_base_urls: privateTargetBaseUrls })}\n`, { mode: 0o600 });
+  return path;
+}
 
 describe("CPA upstream TypeScript operators", () => {
   it("sanitizes every checked-in synthetic fixture", () => {
@@ -56,12 +61,14 @@ describe("CPA upstream TypeScript operators", () => {
     privateTree(source);
     const key = join(source, "source-identity.key");
     assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
-    const result = spawnSync(process.execPath, [importer, "--config", join(source, "config.yaml"), "--auth-dir", join(source, "auth"), "--source-identity-key-file", key], { encoding: "utf8" });
+    const policy = writeTransportPolicy(root, ["https://openai-compatible.example.test/v1"]);
+    const result = spawnSync(process.execPath, [importer, "--config", join(source, "config.yaml"), "--auth-dir", join(source, "auth"), "--source-identity-key-file", key, "--transport-policy-file", policy], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     const summary = JSON.parse(result.stdout) as Record<string, unknown>;
     assert.equal(summary.mode, "dry-run");
     assert.equal(summary.api_account_count, 6);
     assert.equal(summary.proxied_api_account_count, 1);
+    assert.equal(summary.private_target_api_account_count, 2);
     assert.equal(summary.native_reauthorization_required_count, 2);
     assert.doesNotMatch(result.stdout + result.stderr, /fixture-only-|Fixture(Copilot|Cursor)Handle/);
   });
@@ -90,6 +97,54 @@ describe("CPA upstream TypeScript operators", () => {
       assert.equal(result.status, 2);
       assert.doesNotMatch(result.stderr, /fixture-proxy|2001:4860/);
     }
+  });
+
+  it("requires a strict owner-only policy and rejects unmatched or duplicate private targets", () => {
+    const root = mkdtempSync(join(tmpdir(), "mtc-cpa-policy-reject-"));
+    const source = join(root, "source");
+    cpSync(join(fixtures, "supported"), source, { recursive: true });
+    privateTree(source);
+    const baseArguments = [importer, "--config", join(source, "config.yaml"), "--auth-dir", join(source, "auth")];
+    const cases = [
+      { contract_version: 1, private_target_base_urls: ["https://absent.example.test", "https://absent.example.test"] },
+      { contract_version: 1, private_target_base_urls: ["https://absent.example.test"] },
+      { contract_version: 2, private_target_base_urls: [] },
+      { contract_version: 1, private_target_base_urls: [], extra: true },
+    ];
+    for (const [index, document] of cases.entries()) {
+      const policy = join(root, `rejected-${index}.json`);
+      writeFileSync(policy, JSON.stringify(document), { mode: 0o600 });
+      const result = spawnSync(process.execPath, [...baseArguments, "--transport-policy-file", policy], { encoding: "utf8" });
+      assert.equal(result.status, 2);
+      assert.doesNotMatch(result.stderr, /absent\.example\.test/);
+    }
+    const unsafe = writeTransportPolicy(root, []);
+    chmodSync(unsafe, 0o644);
+    const result = spawnSync(process.execPath, [...baseArguments, "--transport-policy-file", unsafe], { encoding: "utf8" });
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /owner-only regular file/);
+    const relative = spawnSync(process.execPath, [...baseArguments, "--transport-policy-file", "transport-policy.json"], { encoding: "utf8" });
+    assert.equal(relative.status, 2);
+    assert.match(relative.stderr, /path must be absolute/);
+  });
+
+  it("permits cleartext only for an explicitly reviewed private target", () => {
+    const root = mkdtempSync(join(tmpdir(), "mtc-cpa-private-http-"));
+    const source = join(root, "source");
+    cpSync(join(fixtures, "supported"), source, { recursive: true });
+    const config = join(source, "config.yaml");
+    writeFileSync(config, readFileSync(config, "utf8").replace("https://openai-compatible.example.test/v1", "http://10.20.30.40/v1"));
+    privateTree(source);
+    const key = join(source, "source-identity.key");
+    assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
+    const baseArguments = [importer, "--config", config, "--auth-dir", join(source, "auth"), "--source-identity-key-file", key];
+    const withoutPolicy = spawnSync(process.execPath, baseArguments, { encoding: "utf8" });
+    assert.equal(withoutPolicy.status, 2);
+    const policy = writeTransportPolicy(root, ["http://10.20.30.40/v1"]);
+    const reviewed = spawnSync(process.execPath, [...baseArguments, "--transport-policy-file", policy], { encoding: "utf8" });
+    assert.equal(reviewed.status, 0, reviewed.stderr);
+    assert.equal(JSON.parse(reviewed.stdout).private_target_api_account_count, 2);
+    assert.doesNotMatch(reviewed.stdout + reviewed.stderr, /10\.20\.30\.40/);
   });
 
   it("preflights every direct conflict before any managed OAuth write", async () => {
@@ -130,6 +185,7 @@ describe("CPA upstream TypeScript operators", () => {
     const source = join(root, "source"); cpSync(join(fixtures, "supported"), source, { recursive: true }); privateTree(source);
     const key = join(source, "source-identity.key"); assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
     const token = join(root, "service-token"); writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
+    const policy = writeTransportPolicy(root, ["https://openai-compatible.example.test/v1"]);
     const accounts = new Map<string, Record<string, unknown>>(); const credentials: Record<string, unknown>[] = []; let rotations = 0;
     const server = createServer(async (request, response) => {
       const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -149,13 +205,21 @@ describe("CPA upstream TypeScript operators", () => {
     await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
     try {
       const address = server.address(); assert(address && typeof address === "object");
-      const arguments_ = [importer, "--config", join(source, "config.yaml"), "--auth-dir", join(source, "auth"), "--source-identity-key-file", key, "--apply", "--allow-http-loopback", "--target-api-base-url", `http://127.0.0.1:${address.port}`, "--service-token-file", token];
+      const arguments_ = [importer, "--config", join(source, "config.yaml"), "--auth-dir", join(source, "auth"), "--source-identity-key-file", key, "--transport-policy-file", policy, "--apply", "--allow-http-loopback", "--target-api-base-url", `http://127.0.0.1:${address.port}`, "--service-token-file", token];
       const firstRun = await execFileAsync(process.execPath, arguments_, { timeout: 20_000 });
       const secondRun = await execFileAsync(process.execPath, arguments_, { timeout: 20_000 });
       const firstSummary = JSON.parse(firstRun.stdout) as Record<string, unknown>, secondSummary = JSON.parse(secondRun.stdout) as Record<string, unknown>;
       assert.equal(firstSummary.created_count, 6); assert.equal(firstSummary.replayed_count, 0);
       assert.equal(secondSummary.created_count, 0); assert.equal(secondSummary.replayed_count, 6);
       assert.equal(accounts.size, 6); assert.equal(rotations, 12);
+      assert.equal([...accounts.values()].filter((account) => (account.config as Record<string, unknown>).network_scope === "private").length, 2);
+      assert.equal([...accounts.values()].filter((account) => (account.config as Record<string, unknown>).network_scope === "public").length, 4);
+      await assert.rejects(
+        execFileAsync(process.execPath, arguments_.filter((value, index, values) => value !== "--transport-policy-file" && values[index - 1] !== "--transport-policy-file"), { timeout: 20_000 }),
+        /target account conflicts with a stable CPA source identity/,
+      );
+      assert.equal(accounts.size, 6);
+      assert.equal(rotations, 12);
       const proxied = credentials.filter((credential) => credential.type === "api_key_proxy");
       assert.equal(proxied.length, 3);
       for (const credential of proxied) {

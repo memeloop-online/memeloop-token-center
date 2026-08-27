@@ -4,7 +4,37 @@ This is the resume point for the next Token Center development agent. Read
 [Product requirements](product-requirements.md) first, then
 [Architecture](architecture.md). Those documents preserve the agreed product
 scope and rejected designs; this document preserves the implementation state and
-remaining acceptance gates, updated on 2026-08-26.
+remaining acceptance gates, updated on 2026-08-27.
+
+## Current 2026-08-27 release truth
+
+- GitHub Actions run
+  [`32947649161`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/32947649161)
+  passed for clean master SHA
+  `312adf5289fea7cf2bc9a8e3548f7dcc07f0f30a`, including publication and
+  verification. Its immutable digests are service
+  `sha256:ab6f0ce0288b6322af97565d3bb84eb873ab85fa26b2e5e21e0633b2bd574003`,
+  importer
+  `sha256:ed6cdbec0f9a0820193be14a47fabf81f331a8297474abfbded19702e7f3d022`
+  and plugin-installer
+  `sha256:66da0edbe7aa56cd5bf6a1cbd70ba1aa5f0c329c2e71e1ed8c6304c5c735359f`.
+- Those digests are not a completed trial. The live source dry-run proved the
+  Westlake upstream target is private while the importer emitted
+  `network_scope: public`; apply correctly stopped and its temporary migration
+  credential was revoked. The current continuation adds a separate strict
+  owner-only version-1 transport policy for exact private target base URLs.
+  Target and proxy scopes remain independent, URLs remain write-only, the server
+  still revalidates DNS/IP and global authority, and changing scope on replay
+  conflicts instead of duplicating an account.
+- External probes of the claimed trial operator URL alternated between HTTP 403
+  and 200 over six consecutive requests. No upstream apply/exact replay,
+  archive apply/exact replay, stable three-role ingress, live browser dogfood or
+  Codex CLI text/image evidence has been supplied. Therefore the operations
+  task's broad “complete” statement is rejected as release evidence.
+- The private-target continuation is local until its TypeScript, image and Job
+  contracts pass and one new exact-SHA CI publishes replacement immutable
+  digests. Conserve CI by completing every local gate before that single push.
+  API3 remains forbidden.
 
 ## Active 2026-08-24 release override
 

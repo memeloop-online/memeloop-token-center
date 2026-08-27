@@ -109,6 +109,7 @@ docker run --rm \
   --entrypoint /usr/local/bin/import-cpa-upstreams \
   "$image" --help >"$workspace/cpa-upstream-help.txt"
 grep -Fq 'dry-run by default' "$workspace/cpa-upstream-help.txt"
+grep -Fq -- '--transport-policy-file' "$workspace/cpa-upstream-help.txt"
 if grep -Eq -- '--(credential|api-key|service-token)([ =]|$)' \
   "$workspace/cpa-upstream-help.txt"; then
   echo 'CPA upstream importer must not accept a plaintext secret argument' >&2
@@ -140,6 +141,8 @@ docker run --rm \
     cp -R /fixture/. /source/
     find /source -type d -exec chmod 0700 {} +
     find /source -type f -exec chmod 0600 {} +
+    printf "%s\n" "{\"contract_version\":1,\"private_target_base_urls\":[\"https://openai-compatible.example.test/v1\"]}" > /source/transport-policy.json
+    chmod 0600 /source/transport-policy.json
     chown -R 10001:10001 /source
   '
 docker run --rm \
@@ -161,12 +164,15 @@ docker run --rm \
   --config /source/config.yaml \
   --auth-dir /source/auth \
   --source-identity-key-file /source/source-identity.key \
+  --transport-policy-file /source/transport-policy.json \
   >"$workspace/cpa-upstream-dry-run.json"
 grep -Fq '"mode":"dry-run"' "$workspace/cpa-upstream-dry-run.json"
 grep -Fq '"api_account_count":6' "$workspace/cpa-upstream-dry-run.json"
+grep -Fq '"private_target_api_account_count":2' "$workspace/cpa-upstream-dry-run.json"
+grep -Fq '"proxied_api_account_count":1' "$workspace/cpa-upstream-dry-run.json"
 grep -Fq '"native_reauthorization_required_count":2' \
   "$workspace/cpa-upstream-dry-run.json"
-if grep -Eq 'fixture-only-|Fixture(Copilot|Cursor)Handle' \
+if grep -Eq 'fixture-only-|Fixture(Copilot|Cursor)Handle|example\.test|fixture-proxy\.internal' \
   "$workspace/cpa-upstream-dry-run.json"; then
   echo 'CPA upstream dry-run leaked fixture credential material' >&2
   exit 1
@@ -178,6 +184,9 @@ grep -A1 -F 'imagePullSecrets:' "$key_staging_job" \
   | grep -Fq 'name: REPLACE_IMAGE_PULL_SECRET'
 test "$(grep -c 'image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center-importer@sha256:REPLACE_DIGEST' "$key_staging_job")" -eq 2
 grep -Fq 'name: stage-source-identity-key' "$key_staging_job"
+grep -Fq 'memeloop-token-center/import-mode: dry-run' "$key_staging_job"
+grep -Fq 'memeloop-token-center/transport-policy-sha256: REPLACE_REVIEWED_POLICY_SHA256' "$key_staging_job"
+grep -Fq 'memeloop-token-center/transport-policy-approval: REPLACE_APPROVAL_REFERENCE' "$key_staging_job"
 grep -Fq 'cp -- /secret-source/source-identity.key /key-runtime/source-identity.key' "$key_staging_job"
 grep -Fq 'chown 10001:10001 /key-runtime/source-identity.key' "$key_staging_job"
 grep -Fq 'chmod 0600 /key-runtime/source-identity.key' "$key_staging_job"
@@ -190,6 +199,10 @@ test -n "$chown_line"
 test "$chmod_line" -lt "$chown_line"
 grep -Fq 'test -f /key-runtime/source-identity.key' "$key_staging_job"
 grep -Fq '10001:10001:600:1' "$key_staging_job"
+grep -Fq 'cp -- /transport-policy-source/transport-policy.json /key-runtime/transport-policy.json' "$key_staging_job"
+grep -Fq 'chown 10001:10001 /key-runtime/transport-policy.json' "$key_staging_job"
+grep -Fq 'chmod 0600 /key-runtime/transport-policy.json' "$key_staging_job"
+grep -Fq 'name: REPLACE_TRANSPORT_POLICY_SECRET' "$key_staging_job"
 grep -Fq 'defaultMode: 0400' "$key_staging_job"
 grep -Fq 'medium: Memory' "$key_staging_job"
 grep -Fq 'sizeLimit: 1Mi' "$key_staging_job"
@@ -198,6 +211,8 @@ test "$(grep -c 'mountPath: /key-runtime' "$key_staging_job")" -eq 2
 grep -A2 -F 'mountPath: /key-runtime' "$key_staging_job" | grep -Fq 'readOnly: true'
 grep -A1 -F -- '- --source-identity-key-file' "$key_staging_job" \
   | grep -Fq -- '- /key-runtime/source-identity.key'
+grep -A1 -F -- '- --transport-policy-file' "$key_staging_job" \
+  | grep -Fq -- '- /key-runtime/transport-policy.json'
 if grep -Eq '^[[:space:]]*-[[:space:]]*--apply[[:space:]]*$' "$key_staging_job"; then
   echo 'checked-in CPA upstream import Job must remain a dry-run' >&2
   exit 1

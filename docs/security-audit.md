@@ -71,6 +71,11 @@ downloads, image forwarding, and plugin HTTP calls.
 
 `network_scope: "private"` is deliberately a different authority: it uses the
 shared cluster-aware client and can be persisted only by a global operator.
+The CPA importer defaults targets to public and accepts private scope only from
+a strict owner-only versioned policy of exact normalized base URLs. Its output
+reports only total/private-target/proxied counts. Target and proxy approval are
+independent, and the server still resolves, classifies and pins both endpoints;
+an importer policy is not an SSRF bypass.
 Installed provider-adapter plugins are also administrator-owned and may use
 their declared internal OAuth endpoints. Plugin HTTP contributions themselves
 currently have no equivalent per-capability approval record and therefore fail
@@ -83,17 +88,19 @@ ambient proxy inheritance.
 
 ## Browser and deployment requirements
 
-The operator and self-service UIs keep bearer credentials only in React/process
-memory. Reloading or closing the page requires another paste, and a token is not
-recoverable from browser storage after the page is gone. The CSP reduces the
-XSS attack surface, but memory-only storage does not stop an active same-origin
-script compromise from inspecting runtime state or intercepting authenticated
-requests.
+At the user's explicit product requirement, the operator and self-service UIs
+remember their credentials separately in same-origin browser local storage
+across reloads and restarts until the user presses the corresponding clear
+action. They never display or return the stored bearer value. This is a
+deliberate usability/security tradeoff: any process or script with access to the
+origin profile can recover it, and CSP does not stop an active same-origin
+script compromise. Operator use therefore requires a trusted browser profile
+and the restricted control ingress below.
 
 An `HttpOnly; Secure; SameSite=Strict` cookie would provide the stronger browser
 boundary, but the service currently has no server-side operator session. That
-design requires short session expiry, rotation/revocation, origin and CSRF
-controls, and must not translate the current long-lived bootstrap bearer
+future design requires short session expiry, rotation/revocation, origin and
+CSRF controls, and must not translate the current long-lived bootstrap bearer
 directly into a persistent cookie.
 
 ### Control-plane ingress boundary

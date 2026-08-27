@@ -24,6 +24,10 @@ state of its successor. It is not rollout or production evidence.
   versioned encrypted upstream-credential envelope. Account views, errors and
   dry-run output expose no URL; the importer reports only
   `proxied_api_account_count`.
+- The importer defaults direct targets to public. A separate strict owner-only
+  versioned policy may approve exact target base URLs as private; output adds
+  only `private_target_api_account_count`. Target and proxy scopes remain
+  independent and the server revalidates both.
 - Only private local-DNS `socks5` is accepted. `socks5h`, HTTP(S) proxies and
   public SOCKS endpoints fail closed. MTC resolves and classifies the target and
   proxy independently, pins both for the one operation, and disables inherited
