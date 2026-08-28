@@ -13,6 +13,12 @@ test('importer bundles execute as native ESM without dynamic CommonJS bridges', 
   const localUpstreamHelp = run(process.execPath, [upstreamBundle, '--help']);
   assert.match(localUpstreamHelp, /dry-run by default/);
   assert.match(localUpstreamHelp, /--transport-policy-file/);
+  const rollbackBundle = join(repository, 'dist/operator-scripts/api2-target-rollback.mjs');
+  assert.doesNotMatch(readFileSync(rollbackBundle, 'utf8'), /Dynamic require of/);
+  assert.match(run(process.execPath, [rollbackBundle, '--help']), /Outputs and receipts are never overwritten/);
+  const dockerfile = read('Dockerfile.importer');
+  assert.match(dockerfile, /apk add --no-cache[^\n]*minio-client/);
+  assert.match(dockerfile, /ln -s \/usr\/bin\/mcli \/usr\/local\/bin\/mc/);
 });
 
 test('importer image and migration Jobs are hardened and contain only production assets', (context) => {
@@ -45,6 +51,9 @@ test('importer image and migration Jobs are hardened and contain only production
     assert.match(legacyHelp, /dry-run by default/); assert.doesNotMatch(legacyHelp, /--credential(?:[ =]|$)/);
     const upstreamHelp = help('/usr/local/bin/import-cpa-upstreams');
     assert.match(upstreamHelp, /dry-run by default/); assert.match(upstreamHelp, /--transport-policy-file/); assert.doesNotMatch(upstreamHelp, /--(?:credential|api-key|service-token)(?:[ =]|$)/); assert.doesNotMatch(upstreamHelp, /bridge|subscription-accounts/i);
+    const rollbackHelp = help('/usr/local/bin/api2-target-rollback');
+    assert.match(rollbackHelp, /restore.*empty new PostgreSQL target/); assert.match(rollbackHelp, /MC_HOST_<alias>/); assert.doesNotMatch(rollbackHelp, /--(?:password|secret|access-key)(?:[ =]|$)/i);
+    assert.match(help('/usr/local/bin/mc'), /COMMANDS|USAGE/i);
 
     const fixture = join(workspace, 'cpa-upstream-source');
     cpSync(join(repository, 'tests/fixtures/cpa-upstreams/supported'), fixture, { recursive: true });
@@ -57,7 +66,7 @@ test('importer image and migration Jobs are hardened and contain only production
     assert.doesNotMatch(dryRun, /fixture-only-|Fixture(?:Copilot|Cursor)Handle|example\.test|fixture-proxy\.internal/);
 
     container = run('docker', ['create','--entrypoint','/bin/true',image]).trim();
-    const binaries = ['migrate-cpamp','audit-cpa-migration','import-cpa-session-archive-wrapper','attach-legacy-cpa-credentials','import-cpa-upstreams','generate-source-identity-key','export-cpa-session-archive-delta'];
+    const binaries = ['migrate-cpamp','audit-cpa-migration','import-cpa-session-archive-wrapper','attach-legacy-cpa-credentials','import-cpa-upstreams','generate-source-identity-key','export-cpa-session-archive-delta','api2-target-rollback'];
     for (const binary of binaries) {
       const destination = join(workspace, binary);
       run('docker', ['cp',`${container}:/usr/local/bin/${binary}`,destination]);

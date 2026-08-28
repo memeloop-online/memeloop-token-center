@@ -15,12 +15,14 @@ COPY ops/lib ./ops/lib
 COPY ops/sql ./ops/sql
 COPY ops/migrate-cpamp.ts ops/audit-cpa-migration.ts ops/import-cpa-session-archive.ts ./ops/
 COPY ops/export-cpa-session-archive-delta.ts ./ops/export-cpa-session-archive-delta.ts
+COPY ops/api2-target-rollback.ts ./ops/api2-target-rollback.ts
 RUN npm run build:importer-scripts
 
 FROM ${RUNTIME_IMAGE}
 USER root
 RUN apk upgrade --no-cache libcrypto3 libssl3 \
-    && apk add --no-cache ca-certificates nodejs postgresql-client sqlite util-linux \
+    && apk add --no-cache ca-certificates minio-client nodejs postgresql-client sqlite util-linux \
+    && ln -s /usr/bin/mcli /usr/local/bin/mc \
     && adduser -S -D -u 10001 importer
 COPY --from=scripts /source/dist/operator-scripts/migrate-cpamp.mjs /usr/local/bin/migrate-cpamp
 COPY --from=scripts /source/dist/operator-scripts/audit-cpa-migration.mjs /usr/local/bin/audit-cpa-migration
@@ -29,6 +31,7 @@ COPY --from=scripts /source/dist/operator-scripts/legacy-credentials/attach-lega
 COPY --from=scripts /source/dist/operator-scripts/cpa-upstreams/import-cpa-upstreams.mjs /usr/local/bin/import-cpa-upstreams
 COPY --from=scripts /source/dist/operator-scripts/cpa-upstreams/generate-source-identity-key.mjs /usr/local/bin/generate-source-identity-key
 COPY --from=scripts /source/dist/operator-scripts/export-cpa-session-archive-delta.mjs /usr/local/bin/export-cpa-session-archive-delta
+COPY --from=scripts /source/dist/operator-scripts/api2-target-rollback.mjs /usr/local/bin/api2-target-rollback
 COPY --from=scripts /source/dist/operator-scripts/sql /usr/local/bin/sql
 RUN chmod 0555 /usr/local/bin/migrate-cpamp /usr/local/bin/audit-cpa-migration \
     /usr/local/bin/import-cpa-session-archive-wrapper \
@@ -36,6 +39,7 @@ RUN chmod 0555 /usr/local/bin/migrate-cpamp /usr/local/bin/audit-cpa-migration \
     /usr/local/bin/import-cpa-upstreams \
     /usr/local/bin/generate-source-identity-key \
     /usr/local/bin/export-cpa-session-archive-delta \
+    /usr/local/bin/api2-target-rollback \
     && find /usr/local/bin/sql -type d -exec chmod 0555 {} + \
     && find /usr/local/bin/sql -type f -exec chmod 0444 {} +
 USER 10001:10001

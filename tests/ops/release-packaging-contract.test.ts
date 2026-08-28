@@ -33,7 +33,9 @@ test('release workflow and Docker packaging remain immutable and attested', () =
     'COPY --from=scripts /source/dist/operator-scripts/audit-cpa-migration.mjs /usr/local/bin/audit-cpa-migration',
     'COPY --from=scripts /source/dist/operator-scripts/sql /usr/local/bin/sql',
     'COPY --from=scripts /source/dist/operator-scripts/export-cpa-session-archive-delta.mjs /usr/local/bin/export-cpa-session-archive-delta',
-    'apk upgrade --no-cache libcrypto3 libssl3', 'apk add --no-cache ca-certificates nodejs postgresql-client sqlite',
+    'apk upgrade --no-cache libcrypto3 libssl3',
+    'apk add --no-cache ca-certificates minio-client nodejs postgresql-client sqlite util-linux',
+    'ln -s /usr/bin/mcli /usr/local/bin/mc',
   ]) assert.ok(importer.includes(needle), `Dockerfile.importer lacks ${needle}`);
   assert.ok(!importer.includes('apt-get'));
   const buildLine = dockerfile.indexOf('cargo build --locked');

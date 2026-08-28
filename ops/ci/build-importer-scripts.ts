@@ -16,6 +16,7 @@ await build({
     'ops/cpa-upstreams/import-cpa-upstreams.ts',
     'ops/cpa-upstreams/generate-source-identity-key.ts',
     'ops/export-cpa-session-archive-delta.ts',
+    'ops/api2-target-rollback.ts',
   ],
   bundle: true,
   platform: 'node',
