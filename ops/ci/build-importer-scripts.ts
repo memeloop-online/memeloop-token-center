@@ -21,6 +21,9 @@ await build({
   platform: 'node',
   target: 'node24.18',
   format: 'esm',
+  // yaml's Node export is CommonJS. Bundle its maintained ESM distribution so
+  // the importer remains a native ESM executable without a createRequire shim.
+  alias: { yaml: resolve(repository, 'node_modules/yaml/browser/index.js') },
   outExtension: { '.js': '.mjs' },
   outdir: output,
   logLevel: 'info',

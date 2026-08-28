@@ -32,7 +32,7 @@ remains forbidden until the user explicitly opens the production window.
 - All repository-owned automation and operational scripts are TypeScript on the
   fixed Node.js 24 runtime. No tracked Python, shell or CommonJS script remains;
   importer packaging builds seven ESM entries plus their SQL assets. The root
-  operator suite passed 21 tests with three explicit environment-only skips, and
+  operator suite passed 22 tests with three explicit environment-only skips, and
   the targeted exporter, CPA transport, importer-image, legacy and memory
   contract suites passed 36/36 before the final GHCR workflow-contract rerun.
 - Fixed Rust 1.95 passed `cargo check --locked --all-targets --all-features`,
@@ -76,9 +76,29 @@ remains forbidden until the user explicitly opens the production window.
   and sources all green; fixed-toolchain check, strict Clippy, 386 library tests,
   every integration binary and 70/70 Cucumber scenarios with 379/379 steps pass
   after the update.
-- The next gate is one follow-up GitHub Actions run for the exact fix commit. Do
-  not spend CI minutes on an intermediate revision and do not tag archive v0.8.0
-  before that exact MTC release is green.
+- Exact follow-up SHA `616156352ae6f6c7b47f1d8bf8e6824444e72e0d`
+  was pushed only after those local gates passed. GitHub Actions run
+  [`33140294297`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33140294297)
+  confirmed the repository-security and API-contract fixes, then packaging
+  stopped in the importer image runtime contract: esbuild had embedded the
+  `yaml` package's CommonJS Node export in an ESM executable, which failed with
+  `Dynamic require of "process" is not supported`. Publication was skipped and
+  the remaining jobs were cancelled immediately to conserve CI minutes; this
+  run is not release evidence.
+- The importer build now aliases `yaml` to the package's maintained browser ESM
+  entry and the always-runnable contract rejects dynamic CommonJS bridges and
+  executes the resulting upstream importer. An isolated privileged DinD pod in
+  the temporary `mtc-ci-preflight-6161563` namespace built the exact importer
+  Dockerfile from the tracked source snapshot and passed both full image
+  contracts, including the real fixture dry-run, non-root user, read-only root
+  filesystem, dropped capabilities, production-only assets and SQL equality.
+  That run also exposed and fixed a test-only ownership-order bug: nested files
+  are now secured before their parent directory becomes owner-only. The
+  temporary namespace, pod, images, volumes and local transfer archive were all
+  deleted; no application namespace, ingress, PVC or API3 resource was changed.
+- The next gate is one follow-up GitHub Actions run for the exact native-ESM fix
+  commit. Do not spend CI minutes on an intermediate revision and do not tag
+  archive v0.8.0 before that exact MTC release is green.
 
 ## Current 2026-08-27 API2 trial evidence
 

@@ -6,6 +6,15 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { occurrences, read, repository, run } from './contract-helpers.ts';
 
+test('importer bundles execute as native ESM without dynamic CommonJS bridges', () => {
+  run(process.execPath, ['ops/ci/build-importer-scripts.ts']);
+  const upstreamBundle = join(repository, 'dist/operator-scripts/cpa-upstreams/import-cpa-upstreams.mjs');
+  assert.doesNotMatch(readFileSync(upstreamBundle, 'utf8'), /Dynamic require of/);
+  const localUpstreamHelp = run(process.execPath, [upstreamBundle, '--help']);
+  assert.match(localUpstreamHelp, /dry-run by default/);
+  assert.match(localUpstreamHelp, /--transport-policy-file/);
+});
+
 test('importer image and migration Jobs are hardened and contain only production assets', (context) => {
   const docker = spawnSync('docker', ['version', '--format', '{{.Client.Version}}'], { encoding: 'utf8', shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
   if (docker.status !== 0) {
