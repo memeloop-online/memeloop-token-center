@@ -1269,7 +1269,11 @@ async fn codex_buffered_route_rewrites_wire_and_archives_final_json_once() {
 async fn codex_streaming_route_preserves_sse_and_settles_usage_once() {
     let fixture = codex_route_fixture("streaming").await;
     let upstream = MockServer::start().await;
-    let sse = completed_codex_sse("streamed answer");
+    let sse = completed_codex_sse("streamed answer").replacen(
+        "\"object\":\"response\",",
+        "\"object\":\"response\",\"service_tier\":\"auto\",",
+        1,
+    );
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .respond_with(
@@ -1281,7 +1285,8 @@ async fn codex_streaming_route_preserves_sse_and_settles_usage_once() {
     let original = json!({
         "model": fixture.model,
         "input": [{"role": "system", "content": "stream"}],
-        "stream": true
+        "stream": true,
+        "service_tier": "default"
     });
     let response = send_codex_route(&fixture, &upstream, "/v1/responses", original.clone()).await;
     let status = response.status();
@@ -1314,6 +1319,8 @@ async fn codex_streaming_route_preserves_sse_and_settles_usage_once() {
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;

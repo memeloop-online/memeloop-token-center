@@ -11,19 +11,19 @@ remaining acceptance gates, updated on 2026-08-28.
 This section supersedes every older API2 and release-status section below.
 API3 is still outside the production window and has not been changed.
 
-- Clean master `fb29097c396da74082c19299266e833d9618d813` passed GitHub
+- Clean master `a381be00d7f77dac236334e06ebe2900566cb34a` passed GitHub
   Actions run
-  [`33141979411`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33141979411),
+  [`33153204682`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33153204682),
   including all functional, migration, browser, security, packaging and 35/35
   memory checks. The complete immutable release is service
-  `sha256:48e6353fe01072e15c931c101b87c271151763eb2fc0c1d58b76b394b1dba50a`,
+  `sha256:acabfe144a5b953767fbb42fb6de0223abd21d4d9daa6d396518f65c0cc8bc75`,
   importer
-  `sha256:8e25527753759577e22328cde61e2ab101a48cf99150e261388c0457866cc9c9`
+  `sha256:1c1d30cfc8e47bc35a6e52731b8102a9d3febdac5aaf18b5b967d234a8135ff3`
   and plugin-installer
-  `sha256:80684fd2748ea9be5b90605f3c9b88f5b8ad4f1cf9d2f976dcfbdd3f6d4e9028`.
+  `sha256:a2369993327ca2faceb4c8c65200a001053cc4ca999a1f73d1d1611a2b61316d`.
 - The reversible API2 trial is migrated to schema v58 and runs the exact service
-  digest in gateway, control and worker with one ready replica and zero restarts
-  each. A pre-v58 PostgreSQL backup remains on the dedicated
+  digest above in gateway, control and worker with one ready replica and zero
+  restarts each. A pre-v58 PostgreSQL backup remains on the dedicated
   `mtc-api2-pre-v58-backup-fb29097` PVC; its dump is 107,885,667 bytes with
   SHA-256
   `ce51853143fcd653d7f79a5cf98dd177b48cde7b095d3757cbd5643a7289536b`.
@@ -34,23 +34,28 @@ API3 is still outside the production window and has not been changed.
   credential reload/manual-clear semantics passed, and a 375-pixel viewport had
   no horizontal overflow.
 - Codex CLI 0.150.0 used the API2 Responses endpoint through a custom provider
-  and returned the exact text marker `MTC-CODEX-TEXT-OK`. The separately exposed
-  `qwen3-coder` route correctly failed closed because it has no price in the key
-  currency; the priced `Qwen` route is usable. Do not invent a price for the
-  unmatched route.
+  and returned exact requested text from both `Qwen` and `deepseek`. The
+  separately exposed `qwen3-coder` route correctly failed closed because it has
+  no price in the key currency; do not invent a price for that unmatched route.
+  The streamed terminal events reported valid usage but used the Responses
+  `auto` tier alias while Codex admitted `default`, so the live a381be0 request
+  audit conservatively recorded `upstream_invalid_usage`. The current source
+  fixes only the official `default`/omitted-to-`auto` alias and normalizes billing
+  back to the admitted default price. Other tier mismatches still fail closed.
 - A real `qwen-image` request returned HTTP 200, settled exactly 10,000 USD
-  micros, archived a 637,059-byte PNG and returned only an internal Token Center
+  micros, archived a 596,247-byte PNG and returned only an internal Token Center
   asset URL. Exact idempotent replay preserved the request ID, response length
   and response bytes without a second charge. The archived bytes have SHA-256
-  `1446587d688d95a9565c2e2277d917ee843cf022b1af8ce2b6822a6fc56540df`.
-- Live dogfood exposed one final metadata defect: the signed SiliconFlow object
-  sends `application/octet-stream`, so the valid PNG was stored as `.bin`.
-  The current local continuation performs a bounded, single-pass 16-byte magic
-  check only when the provider MIME is generic and maps known image/video
-  signatures to the existing safe allowlist. It does not buffer an asset or
-  weaken origin/size controls. A replacement exact-SHA CI, immutable digest
-  rollout to API2 and one real recheck of `image/png`/`.png` are required before
-  calling this the final launch candidate.
+  `8a18716bf635073f7bdde41f91293df0a53cc05af5ee8a7cc6d0a281beba3527`.
+  The a381be0 bounded generic-MIME classifier was verified live as `image/png`,
+  `asset-0.png`, exact Content-Length and byte-identical replay; it does not
+  buffer the asset or weaken origin/size controls.
+- The service-tier alias fix adds no migration and changes no image, archive,
+  routing or authorization surface. It passed its streaming settlement
+  integration test, all 374 library tests, strict library Clippy, TypeScript
+  typecheck and all seven release contracts locally. One exact-SHA CI and API2
+  immutable-digest recheck are still required before this fix supersedes the
+  a381be0 candidate.
 
 ## Current 2026-08-28 local convergence evidence
 

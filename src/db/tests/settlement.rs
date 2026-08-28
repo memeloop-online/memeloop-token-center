@@ -1,5 +1,25 @@
 use super::super::*;
 
+#[test]
+fn responses_auto_tier_alias_settles_against_the_admitted_default_contract() {
+    let usage = TokenUsage {
+        input_tokens: 10_008,
+        output_tokens: 13,
+        service_tier: Some("auto".to_owned()),
+        ..TokenUsage::default()
+    };
+
+    let omitted = normalize_proxy_usage(&usage, 44_471, 4_096, None).unwrap();
+    assert_eq!(omitted.service_tier, None);
+
+    let default = normalize_proxy_usage(&usage, 44_471, 4_096, Some("default")).unwrap();
+    assert_eq!(default.service_tier.as_deref(), Some("default"));
+
+    assert!(normalize_proxy_usage(&usage, 44_471, 4_096, Some("flex")).is_err());
+    let explicit_auto = normalize_proxy_usage(&usage, 44_471, 4_096, Some("auto")).unwrap();
+    assert_eq!(explicit_auto.service_tier.as_deref(), Some("auto"));
+}
+
 #[tokio::test]
 async fn rate_window_cleanup_is_composite_keyed_and_bounded() {
     let directory = tempfile::tempdir().unwrap();

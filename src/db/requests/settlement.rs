@@ -230,7 +230,13 @@ pub fn normalize_proxy_usage(
     }
     let reported = usage.service_tier.as_deref();
     let tier_matches = match requested_service_tier {
-        None => reported.is_none() || reported == Some("default"),
+        // The Responses contract defaults an omitted tier to `auto`, and a
+        // compatible upstream may report that alias even when the caller's
+        // admitted and priced contract is the standard/default tier. Keep the
+        // narrow alias compatible without accepting a different paid tier.
+        None | Some("default") => {
+            reported.is_none() || matches!(reported, Some("default" | "auto"))
+        }
         Some("auto") => true,
         Some("standard_only") => {
             reported.is_none() || matches!(reported, Some("default" | "standard_only"))
@@ -243,7 +249,9 @@ pub fn normalize_proxy_usage(
         ));
     }
     let mut normalized = usage.clone();
-    if normalized.service_tier.is_none() {
+    if normalized.service_tier.is_none()
+        || reported == Some("auto") && matches!(requested_service_tier, None | Some("default"))
+    {
         normalized.service_tier = requested_service_tier.map(str::to_owned);
     }
     Ok(normalized)
