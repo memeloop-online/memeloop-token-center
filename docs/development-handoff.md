@@ -60,9 +60,25 @@ remains forbidden until the user explicitly opens the production window.
   and writes one no-overwrite release manifest. Typecheck, 21/21 runnable ops
   tests, four focused release/language contracts, structured workflow policy and
   `git diff --check` passed; three Docker/PostgreSQL environment tests remain
-  explicit CI-required skips locally. The next gate is one GitHub Actions run
-  for this exact convergence commit. Do not spend CI minutes on an intermediate
-  revision and do not tag archive v0.8.0 before that exact MTC release is green.
+  explicit CI-required skips locally.
+- The first exact continuation SHA
+  `795c791b4cd6129942892cbf356413dccc3b0974` was pushed once and correctly
+  blocked publication in GitHub Actions run
+  [`33139376566`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33139376566).
+  Packaging found that the malicious-owner policy fixture itself contained the
+  complete retired repository literal, which a clean tracked-snapshot scan
+  rejected; dependency security independently found that `chacha20` 0.10.1 had
+  just been yanked. The doomed run was cancelled instead of consuming the Rust,
+  browser and memory minutes, and it must not be rerun or used as release
+  evidence. The fixture now constructs its negative-test value without storing
+  the forbidden literal, and the lockfile selects Rust-1.95-compatible
+  `chacha20` 0.10.2. Fixed cargo-deny 0.20.2 reports advisories, bans, licenses
+  and sources all green; fixed-toolchain check, strict Clippy, 386 library tests,
+  every integration binary and 70/70 Cucumber scenarios with 379/379 steps pass
+  after the update.
+- The next gate is one follow-up GitHub Actions run for the exact fix commit. Do
+  not spend CI minutes on an intermediate revision and do not tag archive v0.8.0
+  before that exact MTC release is green.
 
 ## Current 2026-08-27 API2 trial evidence
 

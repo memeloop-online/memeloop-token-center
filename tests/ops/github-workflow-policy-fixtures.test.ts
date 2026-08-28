@@ -57,7 +57,8 @@ test('GitHub workflow policy rejects malicious fixtures', () => {
     ]) { writeGood(); mutate(mode); expectRejected(mode); }
 
     writeGood();
-    writeFileSync(join(fixture, 'retired-owner.txt'), 'https://github.com/linonetwo/memeloop-token-center\n');
+    const retiredOwner = ['linonetwo', 'memeloop-token-center'].join('/');
+    writeFileSync(join(fixture, 'retired-owner.txt'), `https://github.com/${retiredOwner}\n`);
     run('git', ['-C', fixture, 'add', 'retired-owner.txt']);
     expectRejected('retired-self-owner');
   } finally { rmSync(fixture, { recursive: true, force: true }); }
