@@ -20,6 +20,13 @@ test('product copy does not expose legacy migration or adapter terminology', () 
   }
 });
 
+test('credential and empty-state copy does not infer bootstrap or candidate-environment context', () => {
+  for (const [locale, catalog] of Object.entries(translationCatalogs)) {
+    const exposed = Object.values(catalog).filter((value) => /部署引导凭据|候选环境|deployment bootstrap credential|candidate (?:data|environment)/i.test(value));
+    assert.deepEqual(exposed, [], `${locale} must not infer credential provenance or deployment workflow context`);
+  }
+});
+
 test('Chinese copy does not leak English plural Tokens', () => {
   const exposed = Object.values(translationCatalogs['zh-CN']).filter((value) => /\bTokens\b/.test(value));
   assert.deepEqual(exposed, []);

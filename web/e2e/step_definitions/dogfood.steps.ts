@@ -15,33 +15,48 @@ When('管理员和下游用户验证凭据记忆与手动清空', async function
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   await connectOperator(this, 'dark');
+  await assertValue(page.getByLabel('服务凭据', { exact: true }), '');
+  await assertContains(page.locator('.console-context'), '已保存的凭据正在使用');
   await page.reload();
-  await assertValue(page.locator('input[type="password"]'), seed.serviceCredential);
+  await assertValue(page.getByLabel('服务凭据', { exact: true }), '');
+  await assertContains(page.locator('.console-context'), '已保存的凭据正在使用');
   await assertContains(page.locator('.tenant-picker'), tenant);
-  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
-  await assertValue(page.locator('input[type="password"]'), '');
-  await page.reload();
-  await assertValue(page.locator('input[type="password"]'), '');
 
   await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 375, height: 812 } });
-  const credential = page.getByLabel('客户端凭据', { exact: true });
-  await credential.fill(seed.clientCredential);
+  await page.getByLabel('客户端凭据', { exact: true }).fill(seed.clientCredential);
   await page.getByRole('button', { name: '载入', exact: true }).click();
+  await assertValue(page.getByLabel('客户端凭据', { exact: true }), '');
   await assertContains(page.locator('.console-context'), 'Browser E2E credential');
-  await page.reload();
-  await assertValue(credential, seed.clientCredential);
-  await assertContains(page.locator('.console-context'), 'Browser E2E credential');
-  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
-  await assertValue(credential, '');
+  await assertContains(page.locator('.console-context'), '已保存的凭据正在使用');
   await page.reload();
   await assertValue(page.getByLabel('客户端凭据', { exact: true }), '');
+  await assertContains(page.locator('.console-context'), 'Browser E2E credential');
+  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
+  await assertValue(page.getByLabel('客户端凭据', { exact: true }), '');
+  await assertNoCount(page.locator('.console-context'));
+  assert.deepEqual(await page.evaluate(() => ({
+    operator: localStorage.getItem('mtc.operator.service-credential.v1'),
+    self: localStorage.getItem('mtc.self.client-credential.v1'),
+  })), { operator: seed.serviceCredential, self: null });
+  await page.reload();
+  await assertValue(page.getByLabel('客户端凭据', { exact: true }), '');
+  await assertNoCount(page.locator('.console-context'));
+
+  await this.open('/operator', { theme: 'dark', locale: 'zh-CN' });
+  await assertValue(page.getByLabel('服务凭据', { exact: true }), '');
+  await assertContains(page.locator('.tenant-picker'), tenant);
+  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
+  await assertNoCount(page.locator('.console-context'));
+  await page.reload();
+  await assertValue(page.getByLabel('服务凭据', { exact: true }), '');
+  await assertNoCount(page.locator('.console-context'));
   assert.deepEqual(await page.evaluate(() => ({
     operator: localStorage.getItem('mtc.operator.service-credential.v1'),
     self: localStorage.getItem('mtc.self.client-credential.v1'),
   })), { operator: null, self: null });
 });
 
-Then('刷新页面不会要求重复输入且清空后不会自动恢复', function (this: DogfoodWorld) {
+Then('凭据不回显但刷新会自动恢复认证且清空后不再恢复', function (this: DogfoodWorld) {
   this.assertNoBrowserFailures();
 });
 

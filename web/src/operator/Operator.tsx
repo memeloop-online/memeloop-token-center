@@ -188,6 +188,7 @@ function OneTimeSecret({ value, message }: { value: string; message: string }) {
 export function Operator() {
   const { locale, t } = useI18n();
   const [token, setToken] = useState(() => readRememberedCredential('operator'));
+  const [credentialInput, setCredentialInput] = useState('');
   const [tab, setTab] = useState<Tab>('traffic');
   const [trafficMode, setTrafficMode] = useState<'requests' | 'sessions'>('requests');
   const [sessionRevision, setSessionRevision] = useState(0);
@@ -212,12 +213,12 @@ export function Operator() {
   const sessionEventKeyIds = useRef(new Set<string>());
   const refreshSequence = useRef(0);
 
-  async function refresh() {
+  async function refresh(credentialOverride = token, replaceCredential = false) {
     const sequence = ++refreshSequence.current;
-    const refreshCredential = token;
+    const refreshCredential = credentialOverride.trim();
     const refreshTenant = tenant;
     const refreshFilters = requestFilters;
-    const credential = token.trim();
+    const credential = refreshCredential;
     if (!credential) return;
     setError('');
     const scope = queryForTenant(tenant);
@@ -240,7 +241,7 @@ export function Operator() {
       setProviders(nextProviders.status === 'fulfilled' ? nextProviders.value : []);
       setPlugins(nextPlugins.status === 'fulfilled' ? nextPlugins.value : []);
       setUpstreams(nextUpstreams.status === 'fulfilled' ? nextUpstreams.value : []);
-      if (scopeMatches(requestEventScope.current, refreshCredential, refreshTenant, refreshFilters)) {
+      if (replaceCredential || scopeMatches(requestEventScope.current, refreshCredential, refreshTenant, refreshFilters)) {
         setRequests(nextRequests.status === 'fulfilled'
           ? mergeLiveRequestEvents(nextRequests.value, liveRequestEvents.current)
           : []);
@@ -248,10 +249,14 @@ export function Operator() {
       }
       setSchemas(nextSchemas.status === 'fulfilled' ? nextSchemas.value : undefined);
       rememberCredential('operator', credential);
+      if (replaceCredential) {
+        setToken(credential);
+        setCredentialInput((current) => current.trim() === credential ? '' : current);
+      }
       if (failures.length) setError(t('common.scopeWarning', { count: formatNumber(failures.length, locale) }));
     } catch (reason) {
       if (sequence !== refreshSequence.current) return;
-      if (!scopeMatches(requestEventScope.current, refreshCredential, refreshTenant, refreshFilters)) return;
+      if (!replaceCredential && !scopeMatches(requestEventScope.current, refreshCredential, refreshTenant, refreshFilters)) return;
       setTenants([]); setProviders([]); setPlugins([]); setUpstreams([]); setRequests([]);
       setSchemas(undefined); setHasOlderRequests(false);
       setError(messageOf(reason, t('common.connectionFailed')));
@@ -382,7 +387,8 @@ export function Operator() {
     refreshSequence.current += 1;
     requestEventScope.current = { credential: '', tenant: '', filters: requestFilters };
     clearRememberedCredential('operator');
-    setToken(''); setTenant(''); setTenants([]); setProviders([]); setPlugins([]); setUpstreams([]); setRequests([]); setSchemas(undefined);
+    setToken(''); setCredentialInput(''); setTenant(''); setTenants([]); setProviders([]); setPlugins([]); setUpstreams([]); setRequests([]); setSchemas(undefined);
+    setHasOlderRequests(false); setDetail(undefined); setSessionFocus(undefined);
     setError(''); setStreamError(''); setStreamState('idle');
   };
 
@@ -391,12 +397,12 @@ export function Operator() {
       <div><span className="eyebrow">{t('operator.eyebrow')}</span><h1>Token Center</h1><p>{t('operator.subtitle')}</p><a className="button secondary portal-link" href="/portal">{t('operator.openPortal')}</a></div>
       <div className="credential operator-credential">
         {tenants.length > 0 && <label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={tenant} onChange={(event) => setTenant(event.target.value)}><option value="">{t('operator.allTenants')}</option>{tenants.map((value) => <option key={value.external_id} value={value.external_id}>{value.external_id}</option>)}</select></label>}
-        <input aria-label={t('operator.serviceCredential')} autoComplete="off" type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder={t('operator.tokenPlaceholder')} />
-        <button type="button" onClick={() => void refresh()}>{t('common.connect')}</button>
+        <input aria-label={t('operator.serviceCredential')} autoComplete="off" type="password" value={credentialInput} onChange={(event) => setCredentialInput(event.target.value)} placeholder={t('operator.tokenPlaceholder')} />
+        <button type="button" disabled={!credentialInput.trim()} onClick={() => void refresh(credentialInput, true)}>{t('common.connect')}</button>
         {token && <button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button>}
       </div>
     </header>
-    {token && <div className="console-context"><div><b>{tenant || t('operator.allTenants')}</b><span>{tenants.length === 0 ? t('operator.noTenants') : tenant ? t('common.rememberedCredential') : t('operator.selectTenantToWrite')}</span></div><small>{t('operator.bootstrapCredentialHint')}</small></div>}
+    {token && <div className="console-context"><div><b>{tenant || t('operator.allTenants')}</b><span>{t('common.savedCredentialInUse')}</span></div>{(tenants.length === 0 || !tenant) && <small>{t(tenants.length === 0 ? 'operator.noTenants' : 'operator.selectTenantToWrite')}</small>}</div>}
     <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{tabIds.map((id) => <button id={`operator-tab-${id}`} role="tab" aria-selected={tab === id} aria-controls={`operator-panel-${id}`} tabIndex={tab === id ? 0 : -1} key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)} onKeyDown={(event) => changeTabByKeyboard(event, id)}>{t(`nav.${id}`)}</button>)}</nav>
     {error && <div className="notice error" role="alert">{error}</div>}
     {streamError && <div className="notice error" role="alert">{streamError}</div>}
@@ -1015,7 +1021,7 @@ function ServiceCredentialWorkspace({ token, tenant, schema }: { token: string; 
   };
   useEffect(() => { void load(); }, [token, tenant]);
   return <>{!tenant && <div className="scope-context"><span aria-hidden="true">◎</span><p>{t('services.allTenantNotice')}</p></div>}{secret && <OneTimeSecret value={secret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><span>{formatNumber(values.length, locale)}</span></div><p className="credential-kind-note">{t('services.bootstrapDifference')}</p>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{values.length === 0 && <div className="empty">{t('services.empty')}</div>}{values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={value.status === 'revoked'} onClick={async () => { try { const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); setSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
+    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><span>{formatNumber(values.length, locale)}</span></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{values.length === 0 && <div className="empty">{t('services.empty')}</div>}{values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={value.status === 'revoked'} onClick={async () => { try { const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); setSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
     <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { const created = await api<{ token: string }>('/internal/v1/service-tokens', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant }) }); setSecret(created.token); setMessage(t('services.created')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant}>{t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
   </section></>;
 }

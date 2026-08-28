@@ -122,6 +122,7 @@ function SelfNumberMetric({ label, value, tone }: { label: string; value: number
 export function SelfPortal() {
   const { locale, t } = useI18n();
   const [credential, setCredential] = useState(() => readRememberedCredential('self'));
+  const [credentialInput, setCredentialInput] = useState('');
   const [stats, setStats] = useState<SelfStats>();
   const [credentialView, setCredentialView] = useState<KeyView>();
   const [availableModels, setAvailableModels] = useState<ModelCatalogItem[]>([]);
@@ -154,11 +155,11 @@ export function SelfPortal() {
   const sessionListSequence = useRef(0);
   const sessionDetailSequence = useRef(0);
 
-  async function load() {
+  async function load(credentialOverride = credential, replaceCredential = false) {
     const sequence = ++loadSequence.current;
     sessionListSequence.current += 1;
     sessionDetailSequence.current += 1;
-    const value = credential.trim();
+    const value = credentialOverride.trim();
     if (!value) return;
     setError(''); setLoading(true);
     try {
@@ -173,6 +174,10 @@ export function SelfPortal() {
       const failures = results.filter((result) => result.status === 'rejected');
       if (failures.length === results.length) throw failures[0].reason;
       rememberCredential('self', value);
+      if (replaceCredential) {
+        setCredential(value);
+        setCredentialInput((current) => current.trim() === value ? '' : current);
+      }
       const [nextCredential, nextLimits, nextStats, nextRequests, nextGenerations, nextSessions, nextModels] = results;
       setCredentialView(nextCredential.status === 'fulfilled' ? nextCredential.value : undefined);
       setLimitSnapshot(nextLimits.status === 'fulfilled' ? nextLimits.value : undefined);
@@ -422,8 +427,10 @@ export function SelfPortal() {
     sessionListSequence.current += 1;
     sessionDetailSequence.current += 1;
     clearRememberedCredential('self');
-    setCredential(''); setStats(undefined); setCredentialView(undefined); setAvailableModels([]); setLimitSnapshot(undefined);
+    setCredential(''); setCredentialInput(''); setStats(undefined); setCredentialView(undefined); setAvailableModels([]); setLimitSnapshot(undefined);
     setRequests([]); setGenerations([]); setSessions([]); setDetail(undefined); setGenerationDetail(undefined); setSessionDetail(undefined); setSelectedSession(undefined);
+    setHasOlderRequests(false); setHasOlderSessions(false); setSessionNextCursor(null); setSessionsGeneratedAt(0);
+    setLoading(false); setRequestLoading(false); setSessionLoading(false);
     setError(''); setGenerationMessage('');
   };
   useEffect(() => { if (credential) void load(); }, []);
@@ -438,8 +445,8 @@ export function SelfPortal() {
     return () => { cancelled = true; window.clearTimeout(timer); };
   }, [credential, hasPendingGenerations]);
   return <Shell>
-    <header className="hero"><div><span className="eyebrow">{t('self.eyebrow')}</span><h1>{t('self.title')}</h1><p>{t('self.subtitle')}</p></div><form className="credential" onSubmit={(event) => { event.preventDefault(); void load(); }}><input aria-label={t('self.credential')} autoComplete="off" type="password" value={credential} onChange={(event) => setCredential(event.target.value)} placeholder={t('self.placeholder')} /><button type="submit" disabled={loading || !credential.trim()}>{loading ? t('common.loading') : t('common.load')}</button>{credential && <button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button>}</form></header>
-    {credentialView && <div className="console-context"><div><b>{credentialView.alias}</b><span>{t('common.rememberedCredential')}</span></div><small>{credentialView.key_id}</small></div>}
+    <header className="hero"><div><span className="eyebrow">{t('self.eyebrow')}</span><h1>{t('self.title')}</h1><p>{t('self.subtitle')}</p></div><form className="credential" onSubmit={(event) => { event.preventDefault(); void load(credentialInput, true); }}><input aria-label={t('self.credential')} autoComplete="off" type="password" value={credentialInput} onChange={(event) => setCredentialInput(event.target.value)} placeholder={t('self.placeholder')} /><button type="submit" disabled={loading || !credentialInput.trim()}>{loading ? t('common.loading') : t('common.load')}</button>{credential && <button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button>}</form></header>
+    {credential && <div className="console-context"><div><b>{credentialView?.alias ?? t('self.credential')}</b><span>{t('common.savedCredentialInUse')}</span></div>{credentialView && <small>{credentialView.key_id}</small>}</div>}
     {error && <div className="notice error" role="alert">{error}</div>}
     {stats && <>
       <section className="metrics"><Metric label={t('self.balance', { currency: credentialView?.currency ?? '' })} value={credentialView ? <span title={`${credentialView.available_balance} ${credentialView.currency}`}>{formatCurrency(credentialView.available_balance, credentialView.currency, locale)}</span> : '—'} tone="positive" /><SelfNumberMetric label={t('traffic.total')} value={stats.summary.total_requests} /><SelfNumberMetric label={t('traffic.success')} value={stats.summary.successful_requests} tone="positive" /><SelfNumberMetric label={t('traffic.failure')} value={stats.summary.failed_requests} tone="negative" /><SelfNumberMetric label={t('request.tokens')} value={stats.summary.input_tokens + stats.summary.output_tokens} /><Metric label={t('traffic.cost')} value={credentialView ? <span title={`${stats.summary.total_cost} ${credentialView.currency}`}>{formatCurrency(stats.summary.total_cost, credentialView.currency, locale)}</span> : '—'} /></section>
