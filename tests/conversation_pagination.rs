@@ -1578,6 +1578,7 @@ fn archive_commit_input<'a>(
         tenant_external_id: "conversation-archive-atomic",
         archive_source: "atomic-fixture",
         external_request_id: "archive-child",
+        source_session_id: "archive-session",
         target,
         record_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         request_digest: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -1592,6 +1593,7 @@ fn archive_commit_input<'a>(
         identity_proof_kind: "test-exact-proof-v1",
         identity_proof_digest: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         correlation_proof_digest: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        defer_checkpoint: false,
     }
 }
 

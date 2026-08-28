@@ -125,8 +125,11 @@ overrides.
 
 ## Multimodal generation and billing
 
-OpenAI Images, Codex Responses image generation, Volcengine Seedance video and
-ComfyUI image/video workflows are first-class routes. The same credential,
+OpenAI Images, Codex Responses image generation, Volcengine Seedance video,
+SiliconFlow text-to-video and ComfyUI image/video workflows are first-class
+routes. A SiliconFlow-capable HTTP JSON account reuses its existing encrypted
+API credential through the fixed `siliconflow-v1` profile; it is not duplicated
+into a second account merely to add video. The same credential,
 route, provider-group, quota, rate-limit, archive and tenant boundaries apply to
 text and generation requests.
 
@@ -293,8 +296,10 @@ is restricted to a global service credential. The local-DNS SOCKS5 form is
 required so the validated target address remains pinned through the handshake.
 Target and proxy scope are independent: public is the target default, while an
 exact private target requires a separate, versioned, owner-only operator policy
-approved before dry-run. Scope is never inferred from proxy presence, and the
-server must still independently validate target DNS/IP and operator authority.
+approved before dry-run. Scope is never inferred from proxy presence, but every
+private target must also have an approved private local-DNS SOCKS5 proxy; a
+missing proxy fails inventory before any target request. The server must still
+independently validate target DNS/IP and operator authority.
 Legacy CPA archive timestamps with
 explicit offsets and up to nanosecond precision may be normalized to canonical
 six-digit UTC only in the pre-stable legacy projection. The stable snapshot
@@ -318,9 +323,12 @@ are in [CPA to Token Center cutover](operations/cutover-runbook.md).
   `github.com/memeloop-online/memeloop-token-center`.
 - Development uses `master`, GitHub Actions and GHCR. Releases are immutable
   digest references produced from the exact accepted `master` commit.
-- Repository automation and operational helper scripts use TypeScript on Node.js.
-  Python scripts, Python-only test harnesses and Python runtime dependencies are
-  not part of the supported development, migration or release toolchain.
+- Repository automation and operational helper scripts use TypeScript on the
+  exact Node.js 24 runtime. Tracked Python, shell and CommonJS scripts, their
+  shebangs or subprocess launchers, Python-only test harnesses and Python runtime
+  dependencies are not part of the supported development, migration or release
+  toolchain. GitHub Actions `run` blocks remain runner orchestration only and
+  invoke reviewed TypeScript entry points for repository logic.
 - There is no maintained Forgejo mirror, Forgejo Actions workflow or Harbor
   release path for this product.
 - Rust development and builds must not consume the Westlake physical root disk.

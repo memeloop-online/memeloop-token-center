@@ -8,15 +8,18 @@ the product deployment itself and does not depend on another gateway service.
 - Deploy an immutable image digest built from the exact `master` commit.
 - The image, Helm chart, OpenAPI document, web assets, and database migrations
   must come from the same commit.
-- The current schema generation is **v55**. The chart renders
-  `memeloop.io/schema-generation: "v55"` on its migration Job, and the Helm
+- The current schema generation is **v58**. The chart renders
+  `memeloop.io/schema-generation: "v58"` on its migration Job, and the Helm
   packaging contract rejects drift from the greatest file in
   `migrations/common/`.
 - v49 adds MemeLoop Cloud event-query indexes, v50 adds generation modality and
   billing dimensions, v51 adds logical-session usage rollups, v52 retires
   legacy model allowlists, v53 persists distinct OAuth flow kinds, v54
   completes cache-token and asynchronous-generation session projections, and
-  v55 stores bounded declared semantic execution metadata.
+  v55 stores bounded declared semantic execution metadata, v56 adds stable
+  schema-v2 archive snapshot checkpoints and tombstones, v57 preserves
+  immutable quarantine evidence versions, and v58 adds bounded transactional
+  archive snapshot staging plus reversible exact-record provenance.
 
 ## Required pre-deployment gates
 
@@ -26,7 +29,7 @@ the product deployment itself and does not depend on another gateway service.
 2. Rehearse the complete migration sequence against a fresh PostgreSQL database
    and the supported SQLite test database. For an upgrade, restore a recent
    production snapshot into an isolated PostgreSQL database and apply every
-   pending migration through v55 while recording lock duration.
+   pending migration through v58 while recording lock duration.
 3. Run the PostgreSQL query-plan gates for request, error, usage, and session
    aggregation at imported-data scale. SQLite evidence does not replace this.
 4. Exercise the S3-compatible archive contract against a disposable bucket and
@@ -49,7 +52,7 @@ explicitly declares the next production deployment window open.
    and target image digest.
 3. Run the Helm migration Job once. Do not allow application Pods to run schema
    migrations on startup.
-4. Require the Job to finish at v55 before rolling gateway, control, or worker
+4. Require the Job to finish at v58 before rolling gateway, control, or worker
    Pods. A failed or timed-out Job stops the rollout.
 5. Roll the CPA/API2 trial control and worker first, then gateway replicas with
    readiness gates. Keep API3 unchanged.

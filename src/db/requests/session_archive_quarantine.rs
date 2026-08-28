@@ -15,6 +15,7 @@ pub struct SessionArchiveImportMatchInput<'a> {
     pub cpamp_source: &'a str,
     pub archive_source: &'a str,
     pub external_request_id: &'a str,
+    pub source_session_id: &'a str,
     pub started_at: i64,
     pub requested_model: Option<&'a str>,
     pub resolved_model: Option<&'a str>,
@@ -23,6 +24,7 @@ pub struct SessionArchiveImportMatchInput<'a> {
     pub output_tokens: Option<i64>,
     pub record_digest: &'a str,
     pub time_tolerance_ms: i64,
+    pub allow_stable_replacement: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +63,7 @@ pub struct SessionArchiveQuarantineCommitInput<'a> {
     pub sequence: i64,
     pub target: &'a SessionArchiveQuarantineTarget,
     pub external_request_id: &'a str,
+    pub source_session_id: &'a str,
     pub record_digest: &'a str,
     pub source_started_at: i64,
     pub source_completed_at: Option<i64>,
@@ -75,6 +78,7 @@ pub struct SessionArchiveQuarantineCommitInput<'a> {
     pub response_digest: Option<&'a str>,
     pub request_object: Option<&'a str>,
     pub response_object: Option<&'a str>,
+    pub defer_checkpoint: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +144,7 @@ impl Database {
             || !valid_archive_identifier(input.cpamp_source, 256)
             || !valid_archive_identifier(input.archive_source, 256)
             || !valid_archive_identifier(input.external_request_id, 512)
+            || !valid_archive_identifier(input.source_session_id, 512)
         {
             return Err(AppError::BadRequest(
                 "archive quarantine proof input is invalid".into(),
@@ -153,11 +158,34 @@ impl Database {
             })?),
         };
 
-        // Once admitted to quarantine, the immutable quarantine record and its
-        // final resolution remain authoritative. A later CPAMP key mapping must
-        // not silently bypass a dismissal or operator association.
+        let reason_code = if normalized_hash.is_some() {
+            QUARANTINE_REASON_UNPROVEN
+        } else {
+            QUARANTINE_REASON_MISSING
+        };
+        let identity_claim_digest = normalized_hash.as_deref().map(|value| {
+            archive_proof_digest(
+                "memeloop-session-archive-quarantine-identity-v1",
+                &[input.tenant_external_id, input.archive_source, value],
+            )
+        });
+        let proof_digest = archive_proof_digest(
+            "memeloop-session-archive-quarantine-v1",
+            &[
+                input.tenant_external_id,
+                input.archive_source,
+                input.external_request_id,
+                reason_code,
+                identity_claim_digest.as_deref().unwrap_or("none"),
+                input.record_digest,
+            ],
+        );
+
+        // Once an external request enters quarantine, later versions remain in
+        // quarantine even if a CPAMP mapping appears.  The immutable prior
+        // version and its resolution continue to be independently addressable.
         if let Some(existing) = sqlx::query(
-            "SELECT id,record_digest,identity_claim_digest,reason_code,proof_digest FROM session_archive_quarantine_records WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3",
+            "SELECT version.id,version.record_digest,version.source_session_id,version.identity_claim_digest,version.reason_code,version.proof_digest FROM session_archive_quarantine_record_heads head JOIN session_archive_quarantine_record_versions version ON version.id=head.quarantine_id WHERE head.tenant_id=$1 AND head.source=$2 AND head.external_request_id=$3",
         )
         .bind(tenant_id.to_string())
         .bind(input.archive_source)
@@ -165,34 +193,34 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?
         {
-            let record_digest: String = existing.try_get("record_digest")?;
-            let reason_code: String = existing.try_get("reason_code")?;
-            let identity_claim_digest: Option<String> = normalized_hash.as_deref().map(|value| {
-                archive_proof_digest(
-                    "memeloop-session-archive-quarantine-identity-v1",
-                    &[input.tenant_external_id, input.archive_source, value],
+            let same_evidence = existing.try_get::<String, _>("record_digest")?
+                == input.record_digest
+                && existing.try_get::<String, _>("source_session_id")?
+                    == input.source_session_id;
+            let historical = if same_evidence {
+                None
+            } else {
+                sqlx::query(
+                    "SELECT id,identity_claim_digest,reason_code,proof_digest FROM session_archive_quarantine_record_versions WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3 AND record_digest=$4 AND source_session_id=$5",
                 )
-            });
-            let expected_proof = archive_proof_digest(
-                "memeloop-session-archive-quarantine-v1",
-                &[
-                    input.tenant_external_id,
-                    input.archive_source,
-                    input.external_request_id,
-                    &reason_code,
-                    identity_claim_digest.as_deref().unwrap_or("none"),
-                    input.record_digest,
-                ],
-            );
-            let quarantine_id = parse_uuid(existing.try_get("id")?)?;
-            if record_digest != input.record_digest
-                || existing.try_get::<Option<String>, _>("identity_claim_digest")?
+                .bind(tenant_id.to_string())
+                .bind(input.archive_source)
+                .bind(input.external_request_id)
+                .bind(input.record_digest)
+                .bind(input.source_session_id)
+                .fetch_optional(&self.pool)
+                .await?
+            };
+            let replay = if same_evidence {
+                Some(&existing)
+            } else {
+                historical.as_ref()
+            };
+            if let Some(replay) = replay
+                && (replay.try_get::<Option<String>, _>("identity_claim_digest")?
                     != identity_claim_digest
-                || existing.try_get::<String, _>("proof_digest")? != expected_proof
-                || !matches!(
-                    reason_code.as_str(),
-                    QUARANTINE_REASON_MISSING | QUARANTINE_REASON_UNPROVEN
-                )
+                    || replay.try_get::<String, _>("proof_digest")? != proof_digest
+                    || replay.try_get::<String, _>("reason_code")? != reason_code)
             {
                 return Err(AppError::Conflict(
                     "quarantined archive record changed on replay".into(),
@@ -201,10 +229,22 @@ impl Database {
             return Ok(SessionArchiveImportMatch::Quarantine(
                 SessionArchiveQuarantineTarget {
                     tenant_id,
-                    quarantine_id,
-                    reason_code,
+                    quarantine_id: if same_evidence {
+                        parse_uuid(existing.try_get("id")?)?
+                    } else if let Some(historical) = historical {
+                        parse_uuid(historical.try_get("id")?)?
+                    } else {
+                        deterministic_quarantine_version_id(
+                            input.tenant_external_id,
+                            input.archive_source,
+                            input.external_request_id,
+                            input.record_digest,
+                            input.source_session_id,
+                        )
+                    },
+                    reason_code: reason_code.to_owned(),
                     identity_claim_digest,
-                    proof_digest: expected_proof,
+                    proof_digest,
                 },
             ));
         }
@@ -233,6 +273,7 @@ impl Database {
                     output_tokens: input.output_tokens,
                     record_digest: input.record_digest,
                     time_tolerance_ms: input.time_tolerance_ms,
+                    allow_stable_replacement: input.allow_stable_replacement,
                 })
                 .await
                 .map(Box::new)
@@ -243,28 +284,6 @@ impl Database {
             input.tenant_external_id,
             input.archive_source,
             input.external_request_id,
-        );
-        let reason_code = if normalized_hash.is_some() {
-            QUARANTINE_REASON_UNPROVEN
-        } else {
-            QUARANTINE_REASON_MISSING
-        };
-        let identity_claim_digest = normalized_hash.as_deref().map(|value| {
-            archive_proof_digest(
-                "memeloop-session-archive-quarantine-identity-v1",
-                &[input.tenant_external_id, input.archive_source, value],
-            )
-        });
-        let proof_digest = archive_proof_digest(
-            "memeloop-session-archive-quarantine-v1",
-            &[
-                input.tenant_external_id,
-                input.archive_source,
-                input.external_request_id,
-                reason_code,
-                identity_claim_digest.as_deref().unwrap_or("none"),
-                input.record_digest,
-            ],
         );
         Ok(SessionArchiveImportMatch::Quarantine(
             SessionArchiveQuarantineTarget {
@@ -281,16 +300,41 @@ impl Database {
         &self,
         input: SessionArchiveQuarantineCommitInput<'_>,
     ) -> Result<bool, AppError> {
+        let mut tx = self.begin_write_transaction().await?;
+        let result = self
+            .commit_session_archive_quarantine_in_transaction(&mut tx, input)
+            .await;
+        match result {
+            Ok(value) => {
+                tx.commit().await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn commit_session_archive_quarantine_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Any>,
+        input: SessionArchiveQuarantineCommitInput<'_>,
+    ) -> Result<bool, AppError> {
         validate_quarantine_commit(&input)?;
-        let expected_tenant = tenant_id(self, input.batch.tenant_external_id).await?;
+        let expected_tenant = parse_uuid(
+            sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE external_id=$1")
+                .bind(input.batch.tenant_external_id)
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or(AppError::NotFound)?,
+        )?;
         if expected_tenant != input.target.tenant_id {
             return Err(AppError::NotFound);
         }
         let checkpoint_ms =
             session_archive_checkpoint_ms(input.source_started_at, input.source_completed_at)?;
         let now = unix_millis();
-        let mut tx = self.begin_write_transaction().await?;
-
         let batch_inserted = sqlx::query(
             "INSERT INTO session_archive_quarantine_batches (id, tenant_id, source, cpamp_source, source_digest, source_size_bytes, eligible_records, quarantine_records, tenant_binding_kind, tenant_binding_proof, approved_by_service_id, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(id) DO NOTHING",
         )
@@ -306,12 +350,12 @@ impl Database {
         .bind(input.batch.tenant_binding_proof)
         .bind(input.batch.approved_by_service_id.map(|id| id.to_string()))
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if batch_inserted.rows_affected() == 0 {
             let row = sqlx::query("SELECT tenant_id,source,cpamp_source,source_digest,source_size_bytes,eligible_records,quarantine_records,tenant_binding_kind,tenant_binding_proof,approved_by_service_id FROM session_archive_quarantine_batches WHERE id=$1")
                 .bind(input.batch.batch_id.to_string())
-                .fetch_one(&mut *tx).await?;
+                .fetch_one(&mut **tx).await?;
             let compatible = row.try_get::<String, _>("tenant_id")? == expected_tenant.to_string()
                 && row.try_get::<String, _>("source")? == input.batch.archive_source
                 && row.try_get::<String, _>("cpamp_source")? == input.batch.cpamp_source
@@ -332,14 +376,65 @@ impl Database {
             }
         }
 
-        let inserted = sqlx::query(
-            "INSERT INTO session_archive_quarantine_records (id,tenant_id,source,cpamp_source,external_request_id,record_digest,identity_claim_digest,reason_code,proof_digest,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,request_digest,response_digest,request_object,response_object,quarantined_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) ON CONFLICT(tenant_id,source,external_request_id) DO NOTHING",
+        let head = sqlx::query(
+            "SELECT quarantine_id,record_digest,source_session_id FROM session_archive_quarantine_record_heads WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3",
         )
-        .bind(input.target.quarantine_id.to_string())
+        .bind(expected_tenant.to_string())
+        .bind(input.batch.archive_source)
+        .bind(input.external_request_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let historical_quarantine_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM session_archive_quarantine_record_versions WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3 AND record_digest=$4 AND source_session_id=$5",
+        )
+        .bind(expected_tenant.to_string())
+        .bind(input.batch.archive_source)
+        .bind(input.external_request_id)
+        .bind(input.record_digest)
+        .bind(input.source_session_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(parse_uuid)
+        .transpose()?;
+        let expected_quarantine_id = match head.as_ref() {
+            None => deterministic_archive_request_id(
+                input.batch.tenant_external_id,
+                input.batch.archive_source,
+                input.external_request_id,
+            ),
+            Some(row)
+                if row.try_get::<String, _>("record_digest")? == input.record_digest
+                    && row.try_get::<String, _>("source_session_id")?
+                        == input.source_session_id =>
+            {
+                parse_uuid(row.try_get("quarantine_id")?)?
+            }
+            Some(_) if historical_quarantine_id.is_some() => {
+                historical_quarantine_id.expect("historical quarantine ID presence was checked")
+            }
+            Some(_) => deterministic_quarantine_version_id(
+                input.batch.tenant_external_id,
+                input.batch.archive_source,
+                input.external_request_id,
+                input.record_digest,
+                input.source_session_id,
+            ),
+        };
+        if input.target.quarantine_id != expected_quarantine_id {
+            return Err(AppError::Conflict(
+                "quarantine head changed after import planning".into(),
+            ));
+        }
+
+        let inserted = sqlx::query(
+            "INSERT INTO session_archive_quarantine_record_versions (id,tenant_id,source,cpamp_source,external_request_id,source_session_id,record_digest,identity_claim_digest,reason_code,proof_digest,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,request_digest,response_digest,request_object,response_object,quarantined_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(expected_quarantine_id.to_string())
         .bind(expected_tenant.to_string())
         .bind(input.batch.archive_source)
         .bind(input.batch.cpamp_source)
         .bind(input.external_request_id)
+        .bind(input.source_session_id)
         .bind(input.record_digest)
         .bind(input.target.identity_claim_digest.as_deref())
         .bind(&input.target.reason_code)
@@ -358,40 +453,119 @@ impl Database {
         .bind(input.request_object)
         .bind(input.response_object)
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if inserted.rows_affected() == 0 {
-            ensure_quarantine_replay(&mut tx, &input).await?;
+            ensure_quarantine_replay(tx, &input).await?;
         }
-        let membership = sqlx::query("INSERT INTO session_archive_quarantine_batch_records (tenant_id,batch_id,quarantine_id,sequence,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(batch_id,quarantine_id) DO NOTHING")
+
+        // Preserve the v1 canonical row and membership for existing readers,
+        // but never mutate them when a corrected version or session move is
+        // observed.
+        let legacy_quarantine_id = deterministic_archive_request_id(
+            input.batch.tenant_external_id,
+            input.batch.archive_source,
+            input.external_request_id,
+        );
+        if expected_quarantine_id == legacy_quarantine_id {
+            sqlx::query(
+                "INSERT INTO session_archive_quarantine_records (id,tenant_id,source,cpamp_source,external_request_id,record_digest,identity_claim_digest,reason_code,proof_digest,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,request_digest,response_digest,request_object,response_object,quarantined_at,source_session_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) ON CONFLICT(tenant_id,source,external_request_id) DO NOTHING",
+            )
+            .bind(expected_quarantine_id.to_string())
             .bind(expected_tenant.to_string())
-            .bind(input.batch.batch_id.to_string())
-            .bind(input.target.quarantine_id.to_string())
-            .bind(input.sequence)
+            .bind(input.batch.archive_source)
+            .bind(input.batch.cpamp_source)
+            .bind(input.external_request_id)
+            .bind(input.record_digest)
+            .bind(input.target.identity_claim_digest.as_deref())
+            .bind(&input.target.reason_code)
+            .bind(&input.target.proof_digest)
+            .bind(input.source_started_at)
+            .bind(input.source_completed_at)
+            .bind(input.protocol)
+            .bind(input.model)
+            .bind(input.status_code)
+            .bind(input.duration_ms)
+            .bind(input.input_tokens)
+            .bind(input.output_tokens)
+            .bind(input.error_code)
+            .bind(input.request_digest)
+            .bind(input.response_digest)
+            .bind(input.request_object)
+            .bind(input.response_object)
             .bind(now)
-            .execute(&mut *tx).await?;
-        if membership.rows_affected() == 0 {
-            let existing: i64 = sqlx::query_scalar("SELECT sequence FROM session_archive_quarantine_batch_records WHERE batch_id=$1 AND quarantine_id=$2")
+            .bind(input.source_session_id)
+            .execute(&mut **tx)
+            .await?;
+            let membership = sqlx::query("INSERT INTO session_archive_quarantine_batch_records (tenant_id,batch_id,quarantine_id,sequence,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
+                .bind(expected_tenant.to_string())
                 .bind(input.batch.batch_id.to_string())
-                .bind(input.target.quarantine_id.to_string())
-                .fetch_one(&mut *tx).await?;
-            if existing != input.sequence {
-                return Err(AppError::Conflict(
-                    "quarantine batch membership changed on replay".into(),
-                ));
+                .bind(expected_quarantine_id.to_string())
+                .bind(input.sequence)
+                .bind(now)
+                .execute(&mut **tx).await?;
+            if membership.rows_affected() == 0 {
+                let row = sqlx::query("SELECT quarantine_id,sequence FROM session_archive_quarantine_batch_records WHERE batch_id=$1 AND sequence=$2")
+                    .bind(input.batch.batch_id.to_string())
+                    .bind(input.sequence)
+                    .fetch_one(&mut **tx).await?;
+                if row.try_get::<String, _>("quarantine_id")? != expected_quarantine_id.to_string()
+                    || row.try_get::<i64, _>("sequence")? != input.sequence
+                {
+                    return Err(AppError::Conflict(
+                        "quarantine legacy batch membership changed on replay".into(),
+                    ));
+                }
             }
         }
-        advance_session_archive_checkpoint(
-            &mut tx,
-            expected_tenant,
-            input.batch.archive_source,
-            checkpoint_ms,
-            input.external_request_id,
-            inserted.rows_affected() == 1,
-            now,
-        )
-        .await?;
-        tx.commit().await?;
+
+        let occurrence = sqlx::query("INSERT INTO session_archive_quarantine_occurrences (tenant_id,batch_id,sequence,quarantine_id,record_digest,source_session_id,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING")
+            .bind(expected_tenant.to_string())
+            .bind(input.batch.batch_id.to_string())
+            .bind(input.sequence)
+            .bind(expected_quarantine_id.to_string())
+            .bind(input.record_digest)
+            .bind(input.source_session_id)
+            .bind(now)
+            .execute(&mut **tx).await?;
+        if occurrence.rows_affected() == 0 {
+            let existing = sqlx::query("SELECT tenant_id,quarantine_id,record_digest,source_session_id FROM session_archive_quarantine_occurrences WHERE batch_id=$1 AND sequence=$2")
+                .bind(input.batch.batch_id.to_string())
+                .bind(input.sequence)
+                .fetch_one(&mut **tx).await?;
+            if existing.try_get::<String, _>("tenant_id")? != expected_tenant.to_string()
+                || existing.try_get::<String, _>("quarantine_id")?
+                    != expected_quarantine_id.to_string()
+                || existing.try_get::<String, _>("record_digest")? != input.record_digest
+                || existing.try_get::<String, _>("source_session_id")? != input.source_session_id
+            {
+                return Err(AppError::Conflict(
+                    "quarantine batch occurrence changed on replay".into(),
+                ));
+            }
+        } else {
+            sqlx::query("INSERT INTO session_archive_quarantine_record_heads (tenant_id,source,external_request_id,quarantine_id,record_digest,source_session_id,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,source,external_request_id) DO UPDATE SET quarantine_id=excluded.quarantine_id,record_digest=excluded.record_digest,source_session_id=excluded.source_session_id,updated_at=excluded.updated_at")
+                .bind(expected_tenant.to_string())
+                .bind(input.batch.archive_source)
+                .bind(input.external_request_id)
+                .bind(expected_quarantine_id.to_string())
+                .bind(input.record_digest)
+                .bind(input.source_session_id)
+                .bind(now)
+                .execute(&mut **tx).await?;
+        }
+        if !input.defer_checkpoint {
+            advance_session_archive_checkpoint(
+                tx,
+                expected_tenant,
+                input.batch.archive_source,
+                checkpoint_ms,
+                input.external_request_id,
+                inserted.rows_affected() == 1,
+                now,
+            )
+            .await?;
+        }
         Ok(inserted.rows_affected() == 1)
     }
 
@@ -408,7 +582,7 @@ impl Database {
         let before_started_at = filter.before_started_at.unwrap_or(i64::MAX);
         let before_id = filter.before_id.unwrap_or(Uuid::max()).to_string();
         let rows = sqlx::query(
-            "SELECT q.id,t.external_id AS tenant_external_id,q.source,q.external_request_id,q.record_digest,q.reason_code,q.source_started_at,q.source_completed_at,q.protocol,q.model,q.status_code,q.duration_ms,q.input_tokens,q.output_tokens,q.error_code,CASE WHEN r.action='dismiss' THEN 'dismissed' WHEN r.id IS NOT NULL THEN 'resolved' ELSE 'pending' END AS state FROM session_archive_quarantine_records q JOIN tenants t ON t.id=q.tenant_id LEFT JOIN session_archive_quarantine_resolutions r ON r.quarantine_id=q.id WHERE t.external_id=$1 AND ($2='' OR CASE WHEN r.action='dismiss' THEN 'dismissed' WHEN r.id IS NOT NULL THEN 'resolved' ELSE 'pending' END=$2) AND (q.source_started_at<$3 OR (q.source_started_at=$3 AND q.id<$4)) ORDER BY q.source_started_at DESC,q.id DESC LIMIT $5",
+            "SELECT q.id,t.external_id AS tenant_external_id,q.source,q.external_request_id,q.record_digest,q.reason_code,q.source_started_at,q.source_completed_at,q.protocol,q.model,q.status_code,q.duration_ms,q.input_tokens,q.output_tokens,q.error_code,CASE WHEN r.action='dismiss' THEN 'dismissed' WHEN r.id IS NOT NULL THEN 'resolved' ELSE 'pending' END AS state FROM session_archive_quarantine_record_heads h JOIN session_archive_quarantine_record_versions q ON q.id=h.quarantine_id JOIN tenants t ON t.id=q.tenant_id LEFT JOIN session_archive_quarantine_resolutions r ON r.quarantine_id=q.id WHERE t.external_id=$1 AND ($2='' OR CASE WHEN r.action='dismiss' THEN 'dismissed' WHEN r.id IS NOT NULL THEN 'resolved' ELSE 'pending' END=$2) AND (q.source_started_at<$3 OR (q.source_started_at=$3 AND q.id<$4)) ORDER BY q.source_started_at DESC,q.id DESC LIMIT $5",
         )
         .bind(filter.tenant_external_id)
         .bind(filter.state.unwrap_or_default())
@@ -429,7 +603,7 @@ impl Database {
         quarantine_id: Uuid,
     ) -> Result<SessionArchiveQuarantineRecordView, AppError> {
         let row = sqlx::query(
-            "SELECT q.id,t.external_id AS tenant_external_id,q.source,q.external_request_id,q.record_digest,q.reason_code,q.source_started_at,q.source_completed_at,q.protocol,q.model,q.status_code,q.duration_ms,q.input_tokens,q.output_tokens,q.error_code,CASE WHEN r.action='dismiss' THEN 'dismissed' WHEN r.id IS NOT NULL THEN 'resolved' ELSE 'pending' END AS state FROM session_archive_quarantine_records q JOIN tenants t ON t.id=q.tenant_id LEFT JOIN session_archive_quarantine_resolutions r ON r.quarantine_id=q.id WHERE t.external_id=$1 AND q.id=$2",
+            "SELECT q.id,t.external_id AS tenant_external_id,q.source,q.external_request_id,q.record_digest,q.reason_code,q.source_started_at,q.source_completed_at,q.protocol,q.model,q.status_code,q.duration_ms,q.input_tokens,q.output_tokens,q.error_code,CASE WHEN r.action='dismiss' THEN 'dismissed' WHEN r.id IS NOT NULL THEN 'resolved' ELSE 'pending' END AS state FROM session_archive_quarantine_record_versions q JOIN tenants t ON t.id=q.tenant_id LEFT JOIN session_archive_quarantine_resolutions r ON r.quarantine_id=q.id WHERE t.external_id=$1 AND q.id=$2",
         )
         .bind(tenant_external_id)
         .bind(quarantine_id.to_string())
@@ -447,7 +621,7 @@ impl Database {
         let tenant_id = tenant_id(self, input.tenant_external_id).await?;
         let now = unix_millis();
         let mut tx = self.begin_write_transaction().await?;
-        let quarantine = sqlx::query("SELECT source,external_request_id,record_digest,proof_digest,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,request_digest,response_digest,request_object,response_object FROM session_archive_quarantine_records WHERE id=$1 AND tenant_id=$2")
+        let quarantine = sqlx::query("SELECT source,external_request_id,source_session_id,record_digest,proof_digest,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,request_digest,response_digest,request_object,response_object FROM session_archive_quarantine_record_versions WHERE id=$1 AND tenant_id=$2")
             .bind(input.quarantine_id.to_string()).bind(tenant_id.to_string())
             .fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
         if quarantine.try_get::<String, _>("record_digest")? != input.expected_record_digest {
@@ -523,7 +697,7 @@ impl Database {
                 .bind(key_id.to_string()).bind(principal_id.to_string()).bind(&record_digest)
                 .bind(&correlation_proof_digest).bind(&identity_proof_digest).bind(&model)
                 .bind(source_started_at).bind(now).execute(&mut *tx).await?;
-            sqlx::query("INSERT INTO session_archive_unlinked_requests (tenant_id,source,external_request_id,archive_request_id,key_id,principal_id,conversation_cluster_id,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,request_digest,response_digest,request_object,response_object,imported_at) VALUES ($1,$2,$3,$4,$5,$6,NULL,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)")
+            sqlx::query("INSERT INTO session_archive_unlinked_requests (tenant_id,source,external_request_id,archive_request_id,key_id,principal_id,conversation_cluster_id,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,request_digest,response_digest,request_object,response_object,imported_at,source_session_id) VALUES ($1,$2,$3,$4,$5,$6,NULL,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)")
                 .bind(tenant_id.to_string()).bind(&source).bind(&external_request_id)
                 .bind(input.quarantine_id.to_string()).bind(key_id.to_string()).bind(principal_id.to_string())
                 .bind(source_started_at).bind(quarantine.try_get::<Option<i64>,_>("source_completed_at")?)
@@ -533,7 +707,7 @@ impl Database {
                 .bind(quarantine.try_get::<Option<String>,_>("error_code")?)
                 .bind(quarantine.try_get::<Option<String>,_>("request_digest")?).bind(quarantine.try_get::<Option<String>,_>("response_digest")?)
                 .bind(quarantine.try_get::<Option<String>,_>("request_object")?).bind(quarantine.try_get::<Option<String>,_>("response_object")?)
-                .bind(now)
+                .bind(now).bind(quarantine.try_get::<String,_>("source_session_id")?)
                 .execute(&mut *tx).await?;
             add_archive_record_to_session_projection_in_transaction(
                 &mut tx,
@@ -568,6 +742,21 @@ async fn tenant_id(db: &Database, external_id: &str) -> Result<Uuid, AppError> {
 fn validate_quarantine_commit(
     input: &SessionArchiveQuarantineCommitInput<'_>,
 ) -> Result<(), AppError> {
+    let expected_proof_digest = archive_proof_digest(
+        "memeloop-session-archive-quarantine-v1",
+        &[
+            input.batch.tenant_external_id,
+            input.batch.archive_source,
+            input.external_request_id,
+            &input.target.reason_code,
+            input
+                .target
+                .identity_claim_digest
+                .as_deref()
+                .unwrap_or("none"),
+            input.record_digest,
+        ],
+    );
     let hashes = [
         input.batch.source_digest,
         input.batch.tenant_binding_proof,
@@ -590,6 +779,10 @@ fn validate_quarantine_commit(
             input.target.reason_code.as_str(),
             QUARANTINE_REASON_MISSING | QUARANTINE_REASON_UNPROVEN
         )
+        || (input.target.reason_code == QUARANTINE_REASON_MISSING
+            && input.target.identity_claim_digest.is_some())
+        || (input.target.reason_code == QUARANTINE_REASON_UNPROVEN
+            && input.target.identity_claim_digest.is_none())
         || !valid_archive_identifier(input.batch.archive_source, 256)
         || !valid_archive_identifier(input.batch.cpamp_source, 256)
         || !valid_archive_identifier(input.external_request_id, 512)
@@ -604,22 +797,32 @@ fn validate_quarantine_commit(
         || input.model.len() > 512
         || input.input_tokens < 0
         || input.output_tokens < 0
+        || !valid_archive_identifier(input.source_session_id, 512)
     {
         return Err(AppError::BadRequest(
             "quarantine metadata or proof is invalid".into(),
+        ));
+    }
+    if input.target.proof_digest != expected_proof_digest {
+        return Err(AppError::Conflict(
+            "quarantine proof changed after import planning".into(),
         ));
     }
     Ok(())
 }
 
 async fn ensure_quarantine_replay(
-    tx: &mut Transaction<'static, Any>,
+    tx: &mut Transaction<'_, Any>,
     input: &SessionArchiveQuarantineCommitInput<'_>,
 ) -> Result<(), AppError> {
-    let row = sqlx::query("SELECT id,record_digest,identity_claim_digest,reason_code,proof_digest,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,request_digest,response_digest,request_object,response_object FROM session_archive_quarantine_records WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3")
-        .bind(input.target.tenant_id.to_string()).bind(input.batch.archive_source).bind(input.external_request_id)
+    let row = sqlx::query("SELECT id,tenant_id,source,cpamp_source,external_request_id,record_digest,identity_claim_digest,reason_code,proof_digest,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,request_digest,response_digest,request_object,response_object,source_session_id FROM session_archive_quarantine_record_versions WHERE id=$1")
+        .bind(input.target.quarantine_id.to_string())
         .fetch_one(&mut **tx).await?;
     let compatible = row.try_get::<String, _>("id")? == input.target.quarantine_id.to_string()
+        && row.try_get::<String, _>("tenant_id")? == input.target.tenant_id.to_string()
+        && row.try_get::<String, _>("source")? == input.batch.archive_source
+        && row.try_get::<String, _>("cpamp_source")? == input.batch.cpamp_source
+        && row.try_get::<String, _>("external_request_id")? == input.external_request_id
         && row.try_get::<String, _>("record_digest")? == input.record_digest
         && row.try_get::<Option<String>, _>("identity_claim_digest")?
             == input.target.identity_claim_digest
@@ -649,7 +852,8 @@ async fn ensure_quarantine_replay(
         && row
             .try_get::<Option<String>, _>("response_object")?
             .as_deref()
-            == input.response_object;
+            == input.response_object
+        && row.try_get::<String, _>("source_session_id")? == input.source_session_id;
     if compatible {
         Ok(())
     } else {
@@ -697,6 +901,30 @@ fn resolution_request_digest(
             input.idempotency_key,
             &service_id,
         ],
+    )
+}
+
+fn deterministic_quarantine_version_id(
+    tenant_external_id: &str,
+    source: &str,
+    external_request_id: &str,
+    record_digest: &str,
+    source_session_id: &str,
+) -> Uuid {
+    let evidence_identity = archive_proof_digest(
+        "memeloop-session-archive-quarantine-version-v2",
+        &[
+            tenant_external_id,
+            source,
+            external_request_id,
+            record_digest,
+            source_session_id,
+        ],
+    );
+    deterministic_archive_request_id(
+        tenant_external_id,
+        "session-archive-quarantine-version-v2",
+        &evidence_identity,
     )
 }
 

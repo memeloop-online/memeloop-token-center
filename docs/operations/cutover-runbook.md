@@ -79,7 +79,7 @@ upper-fence guarantee. In either mode, choose an overlap longer than the maximum
 observed collector/CPAMP queue delay.
 
 1. Take an approved consistent CPAMP SQLite snapshot and run
-   `ops/migrate-cpamp.sh`. The CPAMP importer must complete before the matching
+   `node ops/migrate-cpamp.ts`. The CPAMP importer must complete before the matching
    archive delta so key identities and request links exist first.
    The source `failed` bit is authoritative: a failed row keeps an actual
    4xx/5xx status, while a missing, zero, 1xx, 2xx, 3xx or out-of-range failure
@@ -119,7 +119,7 @@ observed collector/CPAMP queue delay.
    count. For a stable projection, also record the non-secret prior/current
    ingest fences and retain only the opaque snapshot's digest; do not copy the
    snapshot capability, payloads, session ids or tickets into operator logs.
-4. Mount the JSONL read-only and run `ops/import-cpa-session-archive.sh` in this
+4. Mount the JSONL read-only and run `node ops/import-cpa-session-archive.ts` in this
    order: dry run (`SESSION_ARCHIVE_APPLY=false`), apply
    (`SESSION_ARCHIVE_APPLY=true`), then the exact same apply once more. The
    replay must report `imported: 0`; `replayed` may be non-zero because the
@@ -129,7 +129,7 @@ observed collector/CPAMP queue delay.
    rows separately. A nonzero CPAMP checkpoint proves only usage/request
    statistics migration; it does not prove that request/response bodies entered
    object storage. Before any traffic shift, run
-   `ops/audit-cpa-migration.sh` with `EXPECTED_CPAMP_EVENTS` from the
+   `node ops/audit-cpa-migration.ts` with `EXPECTED_CPAMP_EVENTS` from the
    consistent CPAMP snapshot and `EXPECTED_ARCHIVE_RECORDS` from the verified
    API2 manifest. The command must pass and report its archive checkpoint,
    exact/unlinked correlations, unresolved quarantine, watermark, correlated

@@ -152,6 +152,14 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 202
     And the generation eventually succeeds with an archived video costing 0.5
 
+  Scenario: SiliconFlow text to video reuses the shared HTTP JSON account safely
+    Given a token center backed by SQLite and memory object storage
+    And the mock SiliconFlow upstream completes a text to video request
+    When the service creates a job-priced SiliconFlow video route and key
+    And the client creates and replays a SiliconFlow text to video generation
+    Then the response status is 202
+    And the SiliconFlow video is archived once with safe metadata and job billing
+
   Scenario: A running Seedance job is cancelled upstream and refunded exactly once
     Given a token center backed by SQLite and memory object storage
     And the mock Seedance upstream keeps a generation running until cancellation

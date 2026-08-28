@@ -7,7 +7,9 @@
     "node": "24.18.0"
   },
   "scripts": {
-    "build:importer-scripts": "esbuild ops/legacy-credentials/attach-legacy-cpa-credentials.ts ops/cpa-upstreams/import-cpa-upstreams.ts ops/cpa-upstreams/generate-source-identity-key.ts --bundle --platform=node --target=node24.18 --format=cjs --out-extension:.js=.cjs --outdir=dist/operator-scripts && esbuild ops/export-cpa-session-archive-delta.ts --bundle --platform=node --target=node24.18 --format=esm --out-extension:.js=.mjs --outdir=dist/operator-scripts",
+    "build:importer-scripts": "node ops/ci/build-importer-scripts.ts",
+    "test:ops": "node --test tests/ops/*.test.ts tests/ops/*-static.ts",
+    "test:release-contracts": "node --test tests/ops/repository-script-language-contract.test.ts tests/ops/buildkit-attestation-contract.test.ts tests/ops/github-workflow-policy-fixtures.test.ts tests/ops/release-packaging-contract.test.ts tests/ops/source-module-size-contract.test.ts tests/ops/session-archive-import-job-contract.test.ts tests/ops/rust-decimal-vendor-contract.test.ts",
     "typecheck": "tsc -p tsconfig.scripts.json --pretty false"
   },
   "dependencies": {

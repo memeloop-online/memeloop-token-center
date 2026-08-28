@@ -17,6 +17,7 @@ pub(super) async fn build_import_plan(
     lower_bound: i64,
     input: &mut ReadOnlyInput,
     source_seal: &SealedInput,
+    stable_manifest: Option<&StableDeltaManifest>,
 ) -> Result<
     (SessionArchiveImportStats, Option<SealedImportPlan>),
     Box<dyn std::error::Error + Send + Sync>,
@@ -27,12 +28,77 @@ pub(super) async fn build_import_plan(
     let mut stats = SessionArchiveImportStats::default();
     let mut source_hasher = blake3::Hasher::new();
     let mut record_count = 0_u64;
+    let mut summary_count = 0_u64;
+    let mut tombstone_count = 0_u64;
     let mut serialized_bytes = 0_u64;
+    let mut projection = stable_manifest
+        .filter(|manifest| manifest.snapshot_schema_version == 2)
+        .map(StableProjectionValidator::new)
+        .transpose()?;
 
     while let Some(line) = read_bounded_line(&mut input.reader, options.max_line_bytes).await? {
         source_hasher.update(&line);
-        let Some((record, record_digest)) = parse_record(&line)? else {
+        let Some(parsed) = parse_archive_line(&line)? else {
             continue;
+        };
+        let (record, record_digest) = match parsed {
+            ParsedArchiveLine::Record(record, digest) => {
+                if let Some(projection) = projection.as_mut() {
+                    projection.observe_record(&record, &line)?;
+                }
+                (record, digest)
+            }
+            ParsedArchiveLine::Summary(summary) => {
+                projection
+                    .as_mut()
+                    .ok_or("stable session summary is missing its schema-v2 manifest")?
+                    .observe_summary(&summary)?;
+                summary_count = summary_count
+                    .checked_add(1)
+                    .ok_or("stable session summary count overflow")?;
+                if summary_count > u64::try_from(MAX_STABLE_SESSION_COUNT)? {
+                    return Err(
+                        "stable session summary count exceeds the compiled-in session limit".into(),
+                    );
+                }
+                sqlx::query("INSERT INTO import_plan_summaries (session_id,requests,first_at_ms,last_at_ms,records_sha256,deleted,deleted_at_ms) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+                    .bind(&summary.session_id)
+                    .bind(summary.requests)
+                    .bind(summary.first_at.map(|value| value.timestamp_millis()))
+                    .bind(summary.last_at.timestamp_millis())
+                    .bind(summary.records_sha256.as_deref())
+                    .bind(i64::from(summary.deleted))
+                    .bind(summary.deleted_at.map(|value| value.timestamp_millis()))
+                    .execute(&mut *transaction).await
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("session archive summary plan is not unique: {error}")))?;
+                if summary.deleted {
+                    stats.tombstones_scanned += 1;
+                    tombstone_count = tombstone_count
+                        .checked_add(1)
+                        .ok_or("stable session tombstone count overflow")?;
+                    if tombstone_count > u64::try_from(MAX_STABLE_SESSION_COUNT)? {
+                        return Err(
+                            "stable session tombstone count exceeds the compiled-in session limit"
+                                .into(),
+                        );
+                    }
+                    sqlx::query("INSERT INTO import_plan_tombstones (sequence, session_id, deleted_at_ms) VALUES ($1, $2, $3)")
+                        .bind(i64::try_from(tombstone_count)?)
+                        .bind(summary.session_id)
+                        .bind(summary.deleted_at.expect("validated tombstone time").timestamp_millis())
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("session archive tombstone plan is not unique: {error}")))?;
+                }
+                if summary_count.is_multiple_of(PLAN_SIZE_CHECK_INTERVAL)
+                    && plan_database_bytes(&mut transaction).await? > options.max_plan_bytes
+                {
+                    return Err(
+                        "session archive import plan exceeds its configured size limit".into(),
+                    );
+                }
+                continue;
+            }
         };
         stats.scanned += 1;
         if !archive_record_inside_overlap(&record, lower_bound) {
@@ -40,7 +106,15 @@ pub(super) async fn build_import_plan(
             continue;
         }
         stats.eligible += 1;
-        let matched = match match_record(db, options, &record, &record_digest).await {
+        let matched = match match_record(
+            db,
+            options,
+            &record,
+            &record_digest,
+            stable_manifest.is_some_and(|manifest| manifest.snapshot_schema_version == 2),
+        )
+        .await
+        {
             Ok(matched) => matched,
             Err(AppError::BadRequest(_)) if options.allow_unmapped => {
                 stats.unmapped += 1;
@@ -50,7 +124,14 @@ pub(super) async fn build_import_plan(
         };
         let plan_correlation = match &matched {
             SessionArchiveImportMatch::Correlated(correlation) => {
-                preflight_gap_compatibility(db, options, &record, correlation.as_ref()).await?;
+                preflight_gap_compatibility(
+                    db,
+                    options,
+                    &record,
+                    correlation.as_ref(),
+                    stable_manifest.is_some_and(|manifest| manifest.snapshot_schema_version == 2),
+                )
+                .await?;
                 stats.mapped += 1;
                 stats.replayed += u64::from(correlation.replay());
                 ImportPlanCorrelation::from(correlation.as_ref())
@@ -94,6 +175,7 @@ pub(super) async fn build_import_plan(
         let plan_record = ImportPlanRecord {
             version: IMPORT_PLAN_VERSION,
             external_request_id: record.request_id.clone(),
+            source_session_id: record.session_id.clone(),
             correlation: plan_correlation,
             record_digest,
             request_digest,
@@ -152,9 +234,20 @@ pub(super) async fn build_import_plan(
         }
     }
 
+    if let Some(projection) = projection {
+        projection.finish()?;
+    }
     input
         .verify_seal(source_seal, source_hasher.finalize())
         .await?;
+    if tombstone_count > 0
+        && stable_manifest.is_none_or(|manifest| {
+            manifest.snapshot_schema_version != 2
+                || manifest.deleted_session_count != i64::try_from(tombstone_count).unwrap_or(-1)
+        })
+    {
+        return Err("session tombstone plan is not bound to its stable snapshot manifest".into());
+    }
     if stats.unmapped > 0 {
         transaction.rollback().await?;
         connection.close().await?;
@@ -168,6 +261,22 @@ pub(super) async fn build_import_plan(
         source_size_bytes: source_seal.identity.size,
         source_blake3: source_seal.digest.to_hex().to_string(),
         record_count,
+        tombstone_count,
+        stable_snapshot: stable_manifest.map(|manifest| ImportPlanStableSnapshot {
+            source_fingerprint: manifest.source_fingerprint.clone(),
+            sequence: manifest.sequence,
+            offline_full_snapshot: manifest.offline_full_snapshot,
+            output_sha256: manifest.expected_output_sha256.clone(),
+            prior_output_sha256: manifest.prior_output_sha256.clone(),
+            prior_source_ingest_fence: manifest.prior_source_ingest_fence,
+            snapshot_schema_version: manifest.snapshot_schema_version,
+            ingest_fence: manifest.ingest_fence,
+            tombstone_safe_after_ingest_fence: manifest.tombstone_safe_after_ingest_fence,
+            session_set_sha256: manifest.session_set_sha256.clone(),
+            session_count: manifest.session_count,
+            request_count: manifest.request_count,
+            deleted_session_count: manifest.deleted_session_count,
+        }),
         quarantine_records: stats.quarantined,
         quarantine_batch_id: (stats.quarantined > 0).then(|| {
             quarantine_batch_id(
@@ -229,7 +338,7 @@ pub(super) async fn create_import_plan_schema(
     connection: &mut SqliteConnection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     sqlx::query(
-        "CREATE TABLE import_plan_metadata (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), header_json BLOB NOT NULL); CREATE TABLE import_plan_records (sequence INTEGER PRIMARY KEY CHECK(sequence > 0), source_started_at INTEGER NOT NULL CHECK(source_started_at >= 0), source_checkpoint_ms INTEGER NOT NULL CHECK(source_checkpoint_ms >= source_started_at), external_request_id TEXT NOT NULL UNIQUE, record_json BLOB NOT NULL); CREATE INDEX import_plan_apply_order ON import_plan_records(source_checkpoint_ms, external_request_id, sequence)",
+        "CREATE TABLE import_plan_metadata (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), header_json BLOB NOT NULL); CREATE TABLE import_plan_records (sequence INTEGER PRIMARY KEY CHECK(sequence > 0), source_started_at INTEGER NOT NULL CHECK(source_started_at >= 0), source_checkpoint_ms INTEGER NOT NULL CHECK(source_checkpoint_ms >= source_started_at), external_request_id TEXT NOT NULL UNIQUE, record_json BLOB NOT NULL); CREATE INDEX import_plan_apply_order ON import_plan_records(source_checkpoint_ms, external_request_id, sequence); CREATE TABLE import_plan_tombstones (sequence INTEGER PRIMARY KEY CHECK(sequence > 0), session_id TEXT NOT NULL UNIQUE, deleted_at_ms INTEGER NOT NULL CHECK(deleted_at_ms >= 0)); CREATE TABLE import_plan_summaries (session_id TEXT PRIMARY KEY, requests INTEGER NOT NULL CHECK(requests >= 0), first_at_ms INTEGER, last_at_ms INTEGER NOT NULL CHECK(last_at_ms >= 0), records_sha256 TEXT, deleted INTEGER NOT NULL CHECK(deleted IN (0,1)), deleted_at_ms INTEGER)",
     )
     .execute(connection)
     .await?;
@@ -388,6 +497,33 @@ pub(super) async fn validate_plan_contents(
         || header.source_size_bytes != source_seal.identity.size
         || header.source_blake3 != source_seal.digest.to_hex().as_str()
         || header.record_count != expected_records
+        || header.tombstone_count > u64::try_from(MAX_STABLE_SESSION_COUNT)?
+        || header.stable_snapshot.as_ref().is_some_and(|snapshot| {
+            !matches!(snapshot.snapshot_schema_version, 1 | 2)
+                || !is_digest_hex(&snapshot.source_fingerprint)
+                || !is_digest_hex(&snapshot.output_sha256)
+                || snapshot.sequence <= 0
+                || snapshot
+                    .prior_output_sha256
+                    .as_deref()
+                    .is_some_and(|digest| !is_digest_hex(digest))
+                || snapshot.ingest_fence < 0
+                || !is_digest_hex(&snapshot.session_set_sha256)
+                || snapshot.session_count < 0
+                || snapshot.session_count > MAX_STABLE_SESSION_COUNT
+                || snapshot.request_count < 0
+                || snapshot.deleted_session_count < 0
+                || snapshot.deleted_session_count > snapshot.session_count
+                || (snapshot.snapshot_schema_version == 2
+                    && snapshot.request_count != i64::try_from(header.record_count).unwrap_or(-1))
+                || (snapshot.snapshot_schema_version == 1
+                    && (snapshot.tombstone_safe_after_ingest_fence.is_some()
+                        || snapshot.deleted_session_count != 0))
+                || (snapshot.snapshot_schema_version == 2
+                    && snapshot
+                        .tombstone_safe_after_ingest_fence
+                        .is_none_or(|fence| fence < 0 || fence > snapshot.ingest_fence))
+        })
         || header.quarantine_records > header.record_count
         || (header.quarantine_records > 0
             && (header.quarantine_batch_id.is_none()
@@ -432,7 +568,24 @@ pub(super) async fn validate_plan_contents(
             return Err(plan_changed_error().into());
         }
     }
+    drop(rows);
     if count != expected_records {
+        return Err(plan_changed_error().into());
+    }
+    let tombstone_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM import_plan_tombstones")
+        .fetch_one(&mut *connection)
+        .await?;
+    if u64::try_from(tombstone_count)? != header.tombstone_count {
+        return Err(plan_changed_error().into());
+    }
+    let summary_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM import_plan_summaries")
+        .fetch_one(&mut *connection)
+        .await?;
+    if header
+        .stable_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.session_count != summary_count)
+    {
         return Err(plan_changed_error().into());
     }
     Ok(header)
@@ -475,6 +628,9 @@ pub(super) fn validate_plan_record(record: &ImportPlanRecord) -> Result<(), io::
                 && is_digest_hex(&target.proof_digest)
         }
     };
+    if !valid_plan_text(&record.source_session_id, 512) {
+        return Err(plan_changed_error());
+    }
     let timing_valid = match (record.source_completed_at, record.duration_ms) {
         (Some(completed), Some(duration)) => completed
             .checked_sub(record.source_started_at)

@@ -116,6 +116,18 @@ The model catalog is synchronized per account and credential generation. Route
 creation resolves public/upstream model compatibility against that catalog;
 catalog changes cannot silently widen a client grant.
 
+The built-in HTTP JSON account can opt into the closed `siliconflow-v1` video
+profile while retaining the same stable account and encrypted credential used
+for its text and image routes. The profile fixes submission and polling to
+`/v1/video/submit` and `/v1/video/status`, requires a `/v1` base URL, an exact
+bounded `video_models` allowlist and at least one exact result origin, and
+accepts only a closed T2V scalar parameter schema. Other model routes on the
+same account retain their text/image capabilities. Worker downloads still pass
+DNS-pinned outbound policy and the exact
+result-origin allowlist before streaming into the job-scoped CAS staging area.
+Ambiguous submission never causes a second POST; normal polling uses bounded
+backoff, and the short-lived provider URL is never stored in job metadata.
+
 CPA is only a migration source. Importable direct accounts and reviewed managed
 OAuth documents converge into the unified account model. Opaque Copilot/Cursor
 handles cannot become credentials and are reported for native reauthorization.
@@ -125,10 +137,12 @@ never routable or refreshable.
 Imported direct targets default to the public destination policy. Migration may
 select `network_scope: private` only through a separate versioned owner-only
 policy listing exact normalized base URLs. This decision is independent of
-whether the account uses a proxy; it remains subject to the server's global
-authority check and independent DNS/IP validation. Stable source identity does
-not include scope, so changing an approved scope conflicts with the existing
-account instead of creating a duplicate.
+whether proxy presence caused the classification, but every private target must
+carry an approved private local-DNS SOCKS5 proxy. The importer validates this
+before any target request; server global-authority and independent DNS/IP checks
+still apply. Stable source identity does not include scope, so changing an
+approved scope conflicts with the existing account instead of creating a
+duplicate.
 
 An imported API-key account may carry one operator-approved private SOCKS5
 proxy. The proxy URL—including optional proxy authentication and private

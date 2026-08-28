@@ -406,7 +406,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   this.assertNoBrowserFailures();
 });
 
-When('普通凭据用户通过中文亮色门户创建图片和视频任务', async function (this: DogfoodWorld) {
+When('普通凭据用户通过中文亮色门户创建图片和两种视频任务', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const observation = requireMultimodalObservation(this);
   page.on('response', (response) => {
@@ -421,12 +421,27 @@ When('普通凭据用户通过中文亮色门户创建图片和视频任务', as
   await page.locator('input[type="password"]').fill(observation.clientCredential);
   await page.getByRole('button', { name: '载入', exact: true }).click();
   await assertVisible(page.getByRole('heading', { name: '创建多模态任务', exact: true }));
-  await submitPortalGeneration(page, 'image', observation.imageModel, '画一个明亮的橙色圆形', '5', { 宽度: '512', 高度: '512' });
+  const imageRequest = await submitPortalGeneration(page, 'image', observation.imageModel, '画一个明亮的橙色圆形', '5', { 宽度: '512', 高度: '512' });
+  assert.deepEqual(imageRequest, {
+    model: observation.imageModel,
+    input: { parameters: { width: 512, height: 512, prompt: '画一个明亮的橙色圆形' } },
+  });
   await waitForGenerationStatus(page, observation.imageModel, '已成功');
   await eventually(async () => {
     assert.deepEqual(await generationMockCounts(), { image: 1, video: 0 });
   }, 10_000, 'mock upstream did not receive exactly one image generation');
-  await submitPortalGeneration(page, 'video', observation.videoModel, '一只狐狸跑过草地', '5');
+  const seedanceRequest = await submitPortalGeneration(page, 'video', observation.videoModel, '一只狐狸跑过草地', '5');
+  assert.deepEqual(seedanceRequest, {
+    model: observation.videoModel,
+    input: { duration: 5, content: [{ type: 'text', text: '一只狐狸跑过草地' }] },
+  });
+  const comfyVideoRequest = await submitPortalGeneration(
+    page, 'video', observation.imageModel, '一只机械鸟掠过城市', '60', { 宽度: '640', 高度: '360' }, false,
+  );
+  assert.deepEqual(comfyVideoRequest, {
+    model: observation.imageModel,
+    input: { parameters: { width: 640, height: 360, prompt: '一只机械鸟掠过城市' } },
+  });
 });
 
 Then('门户自动轮询到图片和视频成功并显示准确计费', async function (this: DogfoodWorld) {
@@ -438,9 +453,9 @@ Then('门户自动轮询到图片和视频成功并显示准确计费', async fu
   await assertContains(imageRow, '1');
   await assertContains(videoRow, '$0.5');
   await assertContains(videoRow, '5');
-  await assertContains(metric(page, '可用余额 (USD)'), '$9.3');
-  await assertContains(metric(page, '总费用'), '$0.7');
-  assert.deepEqual(await generationMockCounts(), { image: 1, video: 1 });
+  await assertContains(metric(page, '可用余额 (USD)'), '$9.1');
+  await assertContains(metric(page, '总费用'), '$0.9');
+  assert.deepEqual(await generationMockCounts(), { image: 2, video: 1 });
   await assertAttribute(page.locator('html'), 'data-theme', 'light');
 });
 
@@ -509,9 +524,9 @@ When('用户通过门户创建并取消排队中的图片任务', async function
 
 Then('取消任务不扣费且请求统计反映多模态用量', async function (this: DogfoodWorld) {
   const page = this.requirePage();
-  await assertContains(metric(page, '可用余额 (USD)'), '$9.3');
-  await assertContains(metric(page, '总费用'), '$0.7');
-  await assertExactText(metric(page, '总请求'), '3');
+  await assertContains(metric(page, '可用余额 (USD)'), '$9.1');
+  await assertContains(metric(page, '总费用'), '$0.9');
+  await assertExactText(metric(page, '总请求'), '4');
   await assertContains(generationTableFor(page), '已取消');
 });
 

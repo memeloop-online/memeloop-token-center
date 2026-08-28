@@ -75,7 +75,6 @@ jobs:
           cargo -V >> "$EVIDENCE_DIR/toolchain.txt"
       - name: Build optimized service binary
         id: build
-        shell: bash
         timeout-minutes: 35
         env:
           MTC_BUILD_GIT_SHA: ${{ steps.revision.outputs.sha }}
@@ -99,11 +98,10 @@ jobs:
       - name: Run 15-minute memory, stream, and 500 MiB asset gate
         if: steps.build.outcome == 'success'
         id: benchmark
-        shell: bash
         timeout-minutes: 30
         run: |
           set +e
-          ops/benchmark-memory.sh \
+          node ops/benchmark-memory.ts \
             --profile acceptance \
             --binary target/release/memeloop-token-center \
             --gateway-limit-mib 256 \

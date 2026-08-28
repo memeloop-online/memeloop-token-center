@@ -4,7 +4,65 @@ This is the resume point for the next Token Center development agent. Read
 [Product requirements](product-requirements.md) first, then
 [Architecture](architecture.md). Those documents preserve the agreed product
 scope and rejected designs; this document preserves the implementation state and
-remaining acceptance gates, updated on 2026-08-27.
+remaining acceptance gates, updated on 2026-08-28.
+
+## Current 2026-08-28 local convergence evidence
+
+This section supersedes older local-development status below. It does not yet
+authorize a rollout: one exact-SHA GitHub Actions release must still pass and
+publish the complete immutable three-image set before API2 can be updated. API3
+remains forbidden until the user explicitly opens the production window.
+
+- This convergence commit is based on clean remote-parity master
+  `aae6d0fbd651251036a2c1588f84f95fb881f74e`. No GitHub Actions run for the
+  continuation existed when this local evidence was recorded.
+- Schema generations v56-v58 implement the archive schema-v2 stable snapshot,
+  tombstone, immutable quarantine-version and bounded staging contracts. Exact,
+  unlinked and quarantine reconciliation, semantic projection changes,
+  tombstones, legacy and stable checkpoints, and staging cleanup are committed
+  in one target transaction. The importer seals the same input and manifest file
+  descriptors, verifies size plus SHA-256/BLAKE3, enforces the delta chain and
+  offline baseline, handles replacement/move/delete-recreate lifecycles, and
+  processes up to the one-million-session protocol limit in bounded batches.
+- An isolated PostgreSQL 17 schema-only copy of the live API2 v55 database was
+  migrated through v58. The real PostgreSQL archive advisory-lock and locator
+  CAS integration gate passed. The temporary database and port-forward were
+  removed afterward; the live API2 database remained read-only, and its legacy
+  exact, unlinked and quarantine blocker counts were all zero.
+- All repository-owned automation and operational scripts are TypeScript on the
+  fixed Node.js 24 runtime. No tracked Python, shell or CommonJS script remains;
+  importer packaging builds seven ESM entries plus their SQL assets. The root
+  operator suite passed 21 tests with three explicit environment-only skips, and
+  the targeted exporter, CPA transport, importer-image, legacy and memory
+  contract suites passed 36/36 before the final GHCR workflow-contract rerun.
+- Fixed Rust 1.95 passed `cargo check --locked --all-targets --all-features`,
+  strict all-target/all-feature Clippy and the complete test suite: 386 library
+  tests, all integration binaries, and 70/70 Cucumber scenarios with 379/379
+  steps. OpenAPI tests passed 18/18 with 106 paths and 126 operations. Web
+  typecheck, production build and localization/contracts passed; real Chromium
+  passed all 19/19 scenarios and 140/140 steps. The browser run exposed and
+  verified the fix for an optional empty `video_models` schema blocking ordinary
+  HTTP upstream edits while the enabled SiliconFlow driver remains fail-closed.
+- A fixed-toolchain optimized binary passed the unchanged full memory acceptance
+  profile, 35/35 checks. The 15-minute soak had zero request failures, a 0.038
+  MiB/min RSS slope against the 2.0 ceiling and a 9.148 MiB retained delta. Twelve
+  concurrent 16 MiB streams used a 56.687 MiB gateway RSS delta; standard Images
+  and Codex Responses-tool images used 88.894 and 57.332 MiB respectively against
+  the unchanged 128 MiB ceiling. A 500 MiB asset was completely archived and
+  downloaded, and peak gateway RSS was 124.883 MiB against the 224 MiB deployment
+  budget. The binary SHA-256 remained
+  `04b0718d80cd4412715b2c5559651877cf6a198e6901c9f2bc3910ea09718dd7`.
+- The final TypeScript GHCR publication/verification review passed locally.
+  Both publishing jobs install fixed Node.js 24.18.0 before running repository
+  logic. Tested TypeScript binds each SHA tag to its build digest, validates the
+  BuildKit SBOM/provenance and OCI source/revision labels, rejects incomplete or
+  tampered evidence, verifies the complete three-image set by immutable digest,
+  and writes one no-overwrite release manifest. Typecheck, 21/21 runnable ops
+  tests, four focused release/language contracts, structured workflow policy and
+  `git diff --check` passed; three Docker/PostgreSQL environment tests remain
+  explicit CI-required skips locally. The next gate is one GitHub Actions run
+  for this exact convergence commit. Do not spend CI minutes on an intermediate
+  revision and do not tag archive v0.8.0 before that exact MTC release is green.
 
 ## Current 2026-08-27 API2 trial evidence
 
@@ -49,7 +107,7 @@ This section supersedes the older release-truth snapshots below.
   schema rejected the exact generated-asset origin allowlist already enforced
   by the archive layer. The current source change fixes both and extends the
   versioned CPA transport policy with exact `result_origins_by_base_url`.
-  Targeted Rust tests, TypeScript typecheck and all nine CPA importer tests pass
+  Targeted Rust tests, TypeScript typecheck and all ten CPA importer tests pass
   locally. Do not publish another candidate until the remaining local gates are
   green.
 - Follow-up CI run
@@ -105,9 +163,10 @@ This section supersedes the older release-truth snapshots below.
   `network_scope: public`; apply correctly stopped and its temporary migration
   credential was revoked. The current continuation adds a separate strict
   owner-only version-1 transport policy for exact private target base URLs.
-  Target and proxy scopes remain independent, URLs remain write-only, the server
-  still revalidates DNS/IP and global authority, and changing scope on replay
-  conflicts instead of duplicating an account.
+  Scope is not inferred from proxy presence, but each approved private target
+  must carry a private local-DNS SOCKS5 proxy before any target request. URLs
+  remain write-only, the server still revalidates DNS/IP and global authority,
+  and changing scope on replay conflicts instead of duplicating an account.
 - External probes of the claimed trial operator URL alternated between HTTP 403
   and 200 over six consecutive requests. No upstream apply/exact replay,
   archive apply/exact replay, stable three-role ingress, live browser dogfood or
@@ -150,8 +209,11 @@ This section supersedes the older release-truth snapshots below.
 - GitHub Actions and GHCR are the only maintained release path. There is no
   Forgejo mirror, Forgejo Actions or Token Center Harbor publisher.
 - All repository automation and operational helper scripts must be TypeScript
-  on Node.js. Remove Python scripts, Python-only test harnesses and their runtime
-  dependencies while preserving their CLI contracts and security properties.
+  on the exact Node.js 24 runtime. Remove tracked Python, shell and CommonJS
+  scripts, their shebangs/subprocess launchers, Python-only test harnesses and
+  runtime dependencies while preserving CLI contracts and security properties.
+  GitHub Actions `run` blocks are runner orchestration only; repository logic is
+  called through reviewed TypeScript entry points.
 - Do not build on the Westlake physical root disk. Source, Cargo state, temporary
   files and build cache belong on the Longhorn-backed Coder workspace.
 - Coordinate Kubernetes, GitOps, migration execution, storage cleanup, rollout
@@ -408,7 +470,7 @@ both complete Cucumber executions.
 This is local regression evidence only. One final exact-SHA CI is still required
 before any upstream/archive target write, digest rollout or browser/CLI trial.
 The local host has neither Docker/Podman nor PostgreSQL/Helm, so final-image,
-fresh PostgreSQL v1→v55 and Helm gates remain for that single run rather than
+fresh PostgreSQL v1→v58 and Helm gates remain for that single run rather than
 being represented as local evidence.
 
 Run `32943606008` subsequently passed every pre-publication job and the full

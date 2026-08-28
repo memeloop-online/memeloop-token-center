@@ -175,6 +175,7 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
             output_tokens: None,
             record_digest: &record_digest,
             time_tolerance_ms: 5_000,
+            allow_stable_replacement: false,
         })
         .await
         .expect("prove archive-only stable identity");
@@ -194,6 +195,7 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
         tenant_external_id: "archive-only-tenant",
         archive_source: "cpa-session-archive-v1",
         external_request_id: archive_external_id,
+        source_session_id: "archive-only-session",
         target: &target,
         record_digest: &record_digest,
         request_digest: Some(&record_digest),
@@ -216,6 +218,7 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
             output_tokens: 10,
             error_code: None,
         },
+        defer_checkpoint: false,
     };
     assert!(
         db.commit_session_archive_unlinked_request(commit())
@@ -354,6 +357,7 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
             output_tokens: None,
             record_digest: &mismatched_record_digest,
             time_tolerance_ms: 5_000,
+            allow_stable_replacement: false,
         })
         .await,
         Err(AppError::BadRequest(_))
@@ -383,6 +387,7 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
             output_tokens: None,
             record_digest: &exact_record_digest,
             time_tolerance_ms: 5_000,
+            allow_stable_replacement: false,
         })
         .await
         .expect("exact correlation");
@@ -402,6 +407,7 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
         tenant_external_id: "archive-only-tenant",
         archive_source: "cpa-session-archive-v1",
         external_request_id: cpamp_external_id,
+        source_session_id: "exact-session",
         target: &exact_target,
         record_digest: &exact_record_digest,
         request_digest: Some(&exact_request_digest),
@@ -420,6 +426,7 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
         identity_proof_kind: &identity_proof_kind,
         identity_proof_digest: &identity_proof_digest,
         correlation_proof_digest: &correlation_proof_digest,
+        defer_checkpoint: false,
     };
     assert!(
         db.commit_session_archive_request(exact_commit)
@@ -431,6 +438,7 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
         tenant_external_id: "archive-only-tenant",
         archive_source: "cpa-session-archive-v1",
         external_request_id: cpamp_external_id,
+        source_session_id: "exact-session",
         target: &exact_target,
         record_digest: &exact_record_digest,
         request_digest: Some(&exact_request_digest),
@@ -449,6 +457,7 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
         identity_proof_kind: &identity_proof_kind,
         identity_proof_digest: &identity_proof_digest,
         correlation_proof_digest: &correlation_proof_digest,
+        defer_checkpoint: false,
     };
     assert!(matches!(
         db.commit_session_archive_request(changed_replay).await,
@@ -495,6 +504,7 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
             output_tokens: None,
             record_digest: &conflicting_record_digest,
             time_tolerance_ms: 5_000,
+            allow_stable_replacement: false,
         })
         .await,
         Err(AppError::BadRequest(_))
@@ -528,6 +538,7 @@ async fn archive_only_without_stable_identity_fails_before_any_provenance_write(
             output_tokens: None,
             record_digest: &record_digest,
             time_tolerance_ms: 5_000,
+            allow_stable_replacement: false,
         })
         .await
         .expect_err("missing identity must fail closed");
@@ -648,6 +659,7 @@ async fn postgres_archive_only_commit_and_conversation_union_use_native_types() 
             output_tokens: None,
             record_digest: &ambiguous_record_digest,
             time_tolerance_ms: 5_000,
+            allow_stable_replacement: false,
         })
         .await
         .expect("PostgreSQL compatible ambiguity must become archive-only");
@@ -667,6 +679,7 @@ async fn postgres_archive_only_commit_and_conversation_union_use_native_types() 
             output_tokens: None,
             record_digest: &ambiguous_record_digest,
             time_tolerance_ms: 5_000,
+            allow_stable_replacement: false,
         })
         .await,
         Err(AppError::BadRequest(_))
@@ -687,6 +700,7 @@ async fn postgres_archive_only_commit_and_conversation_union_use_native_types() 
             output_tokens: None,
             record_digest: &record_digest,
             time_tolerance_ms: 5_000,
+            allow_stable_replacement: false,
         })
         .await
         .expect("correlate PostgreSQL archive-only row");
@@ -703,6 +717,7 @@ async fn postgres_archive_only_commit_and_conversation_union_use_native_types() 
             tenant_external_id: &tenant_external_id,
             archive_source: &archive_source,
             external_request_id: &external_request_id,
+            source_session_id: "postgres-unlinked-session",
             target: &target,
             record_digest: &record_digest,
             request_digest: None,
@@ -723,6 +738,7 @@ async fn postgres_archive_only_commit_and_conversation_union_use_native_types() 
                 output_tokens: 1,
                 error_code: None,
             },
+            defer_checkpoint: false,
         })
         .await
         .expect("commit PostgreSQL archive-only row")

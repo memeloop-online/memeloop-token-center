@@ -8,11 +8,16 @@ use reqwest::Response;
 use serde_json::{Map, Value};
 
 mod comfyui_schema;
+mod siliconflow_video_schema;
 pub use comfyui_schema::{
     effective_parameter_schema as comfyui_parameter_schema,
     validate_config as validate_comfyui_config, validate_parameters as validate_comfyui_parameters,
 };
 use sha2::{Digest, Sha256};
+pub(crate) use siliconflow_video_schema::{
+    parameter_schema as siliconflow_video_parameter_schema,
+    validated_submit_parameters as validate_siliconflow_video_parameters,
+};
 
 use crate::{
     AppState,
@@ -33,8 +38,21 @@ const MAX_CONTROL_BODY: usize = 4 * 1024 * 1024;
 const MAX_ASSET_BODY: usize = 512 * 1024 * 1024;
 const ASSET_ARCHIVE_LIMIT_ERROR: &str = "generation asset archive budget exceeded";
 const MAX_COMFY_ASSETS: usize = 16;
+const MAX_SILICONFLOW_VIDEO_ASSETS: usize = 1;
 const MAX_FAILURES: i64 = 20;
 const MAX_JOB_AGE_MILLIS: i64 = 24 * 60 * 60 * 1_000;
+
+pub(crate) fn is_siliconflow_video_profile(config: &Value, upstream_model: &str) -> bool {
+    config.get("video_api").and_then(Value::as_str) == Some("siliconflow-v1")
+        && config
+            .get("video_models")
+            .and_then(Value::as_array)
+            .is_some_and(|models| {
+                models
+                    .iter()
+                    .any(|model| model.as_str() == Some(upstream_model))
+            })
+}
 
 /// Begins a non-secret, uniquely tracked staging attempt. The durable digest
 /// deliberately covers only typed identities and random fencing material; it
@@ -573,6 +591,15 @@ async fn submit(
             input = Map::from_iter([("prompt".to_owned(), workflow)]);
             (format!("{prefix}/prompt"), "prompt_id")
         }
+        "http-json" if is_siliconflow_video_profile(&route.config, &job.upstream_model) => {
+            let mut parameters = validate_siliconflow_video_parameters(&Value::Object(input))?;
+            parameters.insert(
+                "model".to_owned(),
+                Value::String(job.upstream_model.clone()),
+            );
+            input = parameters;
+            ("/video/submit".to_owned(), "requestId")
+        }
         _ => return Err(AppError::Upstream("unsupported generation driver".into())),
     };
     let outbound_http = route_http(state, route, &route.base_url).await?;
@@ -671,8 +698,150 @@ async fn poll(
     match route.driver.as_str() {
         "volcengine-seedance" => poll_seedance(state, worker_id, job, route, upstream_job_id).await,
         "comfyui" => poll_comfy(state, worker_id, job, route, upstream_job_id).await,
+        "http-json" if is_siliconflow_video_profile(&route.config, &job.upstream_model) => {
+            poll_siliconflow_video(state, worker_id, job, route, upstream_job_id).await
+        }
         _ => Err(AppError::Upstream("unsupported generation driver".into())),
     }
+}
+
+async fn poll_siliconflow_video(
+    state: &AppState,
+    worker_id: &str,
+    job: &GenerationJobWork,
+    route: &ResolvedUpstream,
+    upstream_job_id: &str,
+) -> Result<(), AppError> {
+    let poll_url = generation_url(&route.base_url, &["video", "status"])?;
+    let outbound_http = route_http(state, route, &poll_url).await?;
+    let request = outbound_http
+        .post(poll_url)
+        .json(&serde_json::json!({"requestId": upstream_job_id}));
+    let upstream_started = std::time::Instant::now();
+    let response_result = route.credential.apply(request, unix_millis())?.send().await;
+    state.metrics.observe_upstream(
+        &route.driver,
+        "generation_poll",
+        response_result.as_ref().ok().map(reqwest::Response::status),
+        upstream_started.elapsed(),
+    );
+    let response = response_result
+        .map_err(|error| sanitized_http_error(&error, "SiliconFlow video poll request"))?;
+    let status = response.status();
+    let body = bounded_json(response).await?;
+    if !status.is_success() {
+        return Err(AppError::Upstream(format!(
+            "SiliconFlow video poll returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+    match body.get("status").and_then(Value::as_str) {
+        Some("InQueue" | "InProgress") => {
+            state
+                .db
+                .reschedule_generation_job(
+                    job.job_id,
+                    worker_id,
+                    siliconflow_poll_delay_millis(job.attempt_count),
+                    None,
+                )
+                .await
+        }
+        Some("Failed") => terminal_failure(state, worker_id, job, "siliconflow_video_failed").await,
+        Some("Succeed") => {
+            let Some(videos) = body.pointer("/results/videos").and_then(Value::as_array) else {
+                return terminal_failure(state, worker_id, job, "siliconflow_video_missing_asset")
+                    .await;
+            };
+            if videos.len() > MAX_SILICONFLOW_VIDEO_ASSETS {
+                return terminal_failure(
+                    state,
+                    worker_id,
+                    job,
+                    "siliconflow_video_asset_limit_exceeded",
+                )
+                .await;
+            }
+            let Some(video_url) = videos
+                .first()
+                .and_then(|video| video.get("url"))
+                .and_then(Value::as_str)
+            else {
+                return terminal_failure(state, worker_id, job, "siliconflow_video_missing_asset")
+                    .await;
+            };
+            let attempt_nonce = uuid::Uuid::now_v7();
+            let mut staging_lease = begin_generation_staging_attempt(
+                state,
+                ArchiveStagingOwner::GenerationJob(job.job_id),
+                ArchiveStagingPurpose::Assets,
+                attempt_nonce,
+            )
+            .await?;
+            let archive_budget = AssetArchiveBudget::default();
+            let archived_asset = match archive_asset_staged(
+                state,
+                route,
+                &route.credential,
+                &archive_budget,
+                &mut staging_lease,
+                0,
+                video_url,
+                None,
+            )
+            .await
+            {
+                Ok(asset) => asset,
+                Err(error) if is_asset_archive_limit_error(&error) => {
+                    state
+                        .db
+                        .abandon_archive_staging_attempt(&staging_lease)
+                        .await?;
+                    return terminal_failure(
+                        state,
+                        worker_id,
+                        job,
+                        "generation_asset_bytes_exceeded",
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    state
+                        .db
+                        .abandon_archive_staging_attempt(&staging_lease)
+                        .await?;
+                    return Err(error);
+                }
+            };
+            if !archived_asset.mime_type.starts_with("video/") {
+                state
+                    .db
+                    .abandon_archive_staging_attempt(&staging_lease)
+                    .await?;
+                return terminal_failure(state, worker_id, job, "siliconflow_video_invalid_asset")
+                    .await;
+            }
+            persist_staged_generation_success(
+                state,
+                worker_id,
+                job,
+                GenerationStagedAssets {
+                    attempt_nonce,
+                    billed_units: 1,
+                    assets: vec![archived_asset],
+                },
+                &staging_lease,
+            )
+            .await
+        }
+        Some(_) | None => Err(unknown_generation_status("siliconflow-video")),
+    }
+}
+
+fn siliconflow_poll_delay_millis(attempt_count: i64) -> i64 {
+    let exponent =
+        u32::try_from(attempt_count.saturating_sub(1).div_euclid(5).clamp(0, 4)).unwrap_or(4);
+    2_000_i64.saturating_mul(2_i64.saturating_pow(exponent))
 }
 
 async fn poll_seedance(
@@ -1296,6 +1465,9 @@ fn generation_staged_manifest_is_well_formed(
                 staged.assets.len() != 1 || !staged.assets[0].mime_type.starts_with("video/")
             }
             "comfyui" => !(1..=MAX_COMFY_ASSETS).contains(&staged.assets.len()),
+            "http-json" => {
+                staged.assets.len() != 1 || !staged.assets[0].mime_type.starts_with("video/")
+            }
             _ => true,
         }
     {
@@ -1419,6 +1591,7 @@ fn unknown_generation_status(driver: &str) -> AppError {
     let provider = match driver {
         "volcengine-seedance" => "Seedance",
         "comfyui" => "ComfyUI",
+        "siliconflow-video" => "SiliconFlow video",
         _ => "upstream",
     };
     AppError::Upstream(format!("unknown {provider} generation status"))
@@ -1540,6 +1713,16 @@ mod tests {
             generation_request_hash("image-test", &json!({"prompt": "cat"})),
             generation_request_hash("image-test", &json!({"prompt": "dog"})),
         );
+    }
+
+    #[test]
+    fn siliconflow_normal_polling_uses_bounded_exponential_backoff() {
+        assert_eq!(siliconflow_poll_delay_millis(1), 2_000);
+        assert_eq!(siliconflow_poll_delay_millis(5), 2_000);
+        assert_eq!(siliconflow_poll_delay_millis(6), 4_000);
+        assert_eq!(siliconflow_poll_delay_millis(11), 8_000);
+        assert_eq!(siliconflow_poll_delay_millis(21), 32_000);
+        assert_eq!(siliconflow_poll_delay_millis(i64::MAX), 32_000);
     }
 
     #[test]

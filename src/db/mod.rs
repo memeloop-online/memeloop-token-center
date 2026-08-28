@@ -120,11 +120,14 @@ pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter, FinishProxyRequest,
     FinishProxyRequestResult, FinishRequest, NewRequest, ProxyConversationInput, RequestListFilter,
     SessionArchiveCommitInput, SessionArchiveCorrelation, SessionArchiveImportLock,
-    SessionArchiveImportMatch, SessionArchiveImportMatchInput, SessionArchiveMatchInput,
+    SessionArchiveImportMatch, SessionArchiveImportMatchInput, SessionArchiveLegacyCheckpointInput,
+    SessionArchiveMatchInput, SessionArchivePresentSummaryInput,
     SessionArchiveQuarantineBatchInput, SessionArchiveQuarantineCommitInput,
     SessionArchiveQuarantineFilter, SessionArchiveQuarantineRecordView,
     SessionArchiveQuarantineResolutionInput, SessionArchiveQuarantineResolutionView,
-    SessionArchiveQuarantineTarget, SessionArchiveTarget, SessionArchiveUnlinkedCommitInput,
+    SessionArchiveQuarantineTarget, SessionArchiveSnapshotApplyInput,
+    SessionArchiveSnapshotApplyResult, SessionArchiveSnapshotChainInput, SessionArchiveTarget,
+    SessionArchiveTombstoneInput, SessionArchiveUnlinkedCommitInput,
     SessionArchiveUnlinkedMetadata, SessionArchiveUnlinkedTarget, StartProxyRequest, StatsFilter,
     normalize_proxy_usage,
 };
@@ -298,7 +301,9 @@ impl Database {
         Ok(Self { pool, backend })
     }
 
-    async fn begin_write_transaction(&self) -> Result<Transaction<'static, Any>, sqlx::Error> {
+    pub(crate) async fn begin_write_transaction(
+        &self,
+    ) -> Result<Transaction<'static, Any>, sqlx::Error> {
         // SQLite's default deferred transaction can fail immediately with
         // SQLITE_BUSY when a read-before-write transaction races another
         // writer: the shared lock cannot be upgraded after that writer has

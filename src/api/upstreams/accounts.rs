@@ -216,6 +216,26 @@ async fn validate_secondary_outbound_urls(
 }
 
 fn validate_provider_config(driver: &str, config: &Value) -> Result<(), AppError> {
+    if driver == "http-json"
+        && config.get("video_api").and_then(Value::as_str) == Some("siliconflow-v1")
+    {
+        let base_url = validate_config(config)?;
+        let parsed = url::Url::parse(&base_url).map_err(|_| AppError::Internal)?;
+        if parsed.path() != "/v1"
+            || config
+                .get("result_origins")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            || config
+                .get("video_models")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+        {
+            return Err(AppError::BadRequest(
+                "SiliconFlow video requires a /v1 base URL, exact video models, and at least one exact result origin".into(),
+            ));
+        }
+    }
     if driver == "comfyui"
         && (config
             .get("workflow_id")
@@ -442,4 +462,59 @@ pub(in crate::api) async fn rotate_upstream_credential(
         super::trigger_upstream_model_sync(state, account_id);
     }
     Ok(Json(account))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn siliconflow_video_profile_requires_fixed_base_path_and_result_allowlist() {
+        validate_provider_config(
+            "http-json",
+            &json!({
+                "base_url": "https://api.siliconflow.cn/v1",
+                "video_api": "siliconflow-v1",
+                "video_models": ["Wan-AI/Wan2.2-T2V-A14B"],
+                "result_origins": ["https://s3.siliconflow.cn"]
+            }),
+        )
+        .unwrap();
+        for invalid in [
+            json!({
+                "base_url": "https://api.siliconflow.cn",
+                "video_api": "siliconflow-v1",
+                "video_models": ["Wan-AI/Wan2.2-T2V-A14B"],
+                "result_origins": ["https://s3.siliconflow.cn"]
+            }),
+            json!({
+                "base_url": "https://api.siliconflow.cn/v1/arbitrary",
+                "video_api": "siliconflow-v1",
+                "video_models": ["Wan-AI/Wan2.2-T2V-A14B"],
+                "result_origins": ["https://s3.siliconflow.cn"]
+            }),
+            json!({
+                "base_url": "https://api.siliconflow.cn/v1",
+                "video_api": "siliconflow-v1",
+                "video_models": ["Wan-AI/Wan2.2-T2V-A14B"],
+                "result_origins": []
+            }),
+            json!({
+                "base_url": "https://api.siliconflow.cn/v1",
+                "video_api": "siliconflow-v1",
+                "video_models": [],
+                "result_origins": ["https://s3.siliconflow.cn"]
+            }),
+            json!({
+                "base_url": "https://api.siliconflow.cn/v1",
+                "video_api": "siliconflow-v1",
+                "result_origins": ["https://s3.siliconflow.cn"]
+            }),
+        ] {
+            assert!(
+                validate_provider_config("http-json", &invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 }

@@ -212,6 +212,15 @@ export interface ModelCatalogItem {
   owned_by: string;
   modalities?: Array<'text' | 'image' | 'video' | 'embedding' | string>;
   generation_schema?: Record<string, unknown>;
+  /** Generation transport selected by the authorized route, when it is unambiguous. */
+  driver?: string;
+  generation_driver?: string;
+  /** Capability envelope used by newer catalog responses. */
+  capabilities?: {
+    generation_driver?: string;
+    generation_input?: 'parameters' | 'content';
+    [key: string]: unknown;
+  };
 }
 
 export interface ModelCatalogResponse {

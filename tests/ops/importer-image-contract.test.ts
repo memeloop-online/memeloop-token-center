@@ -1,0 +1,82 @@
+import assert from 'node:assert/strict';
+import { cpSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import test from 'node:test';
+import { occurrences, read, repository, run } from './contract-helpers.ts';
+
+test('importer image and migration Jobs are hardened and contain only production assets', (context) => {
+  const docker = spawnSync('docker', ['version', '--format', '{{.Client.Version}}'], { encoding: 'utf8', shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+  if (docker.status !== 0) {
+    if (process.env.CI === 'true' || process.env.MTC_REQUIRE_DOCKER_CONTRACTS === '1') throw new Error('Docker is required for the importer image contract in CI');
+    context.skip('Docker is unavailable; CI requires and executes this image contract');
+    return;
+  }
+  const workspace = mkdtempSync(join(tmpdir(), 'mtc-importer-contract-'));
+  const image = process.env.IMPORTER_IMAGE ?? `memeloop-token-center-importer-contract:${process.pid}`;
+  const created = !process.env.IMPORTER_IMAGE;
+  let container = '';
+  const volume = `mtc-cpa-upstream-fixture-${process.pid}`;
+  try {
+    if (created) {
+      const args = ['build', '--file', join(repository, 'Dockerfile.importer'), '--tag', image];
+      if (process.env.IMPORTER_RUNTIME_IMAGE) args.push('--build-arg', `RUNTIME_IMAGE=${process.env.IMPORTER_RUNTIME_IMAGE}`);
+      run('docker', [...args, repository]);
+    }
+    assert.equal(run('docker', ['image', 'inspect', image, '--format', '{{.Config.User}}']).trim(), '10001:10001');
+    assert.equal(run('docker', ['image', 'inspect', image, '--format', '{{json .Config.Entrypoint}}']).trim(), '["/usr/local/bin/migrate-cpamp"]');
+    const runtimeHelper = join(repository, 'tests/ops/helpers/importer-runtime-check.ts');
+    run('docker', ['run','--rm','--read-only','--tmpfs','/tmp:rw,noexec,nosuid,size=8m','--security-opt','no-new-privileges','--cap-drop','ALL','--volume',`${runtimeHelper}:/contract/importer-runtime-check.ts:ro`,'--entrypoint','node',image,'/contract/importer-runtime-check.ts']);
+
+    const help = (entrypoint: string): string => run('docker', ['run','--rm','--read-only','--tmpfs','/tmp:rw,noexec,nosuid,size=8m','--security-opt','no-new-privileges','--cap-drop','ALL','--entrypoint',entrypoint,image,'--help']);
+    const exporterHelp = help('/usr/local/bin/export-cpa-session-archive-delta');
+    assert.match(exporterHelp, /--output/); assert.match(exporterHelp, /--checkpoint/); assert.doesNotMatch(exporterHelp, /(token|credential|ticket).*(argument|value)/i);
+    const legacyHelp = help('/usr/local/bin/attach-legacy-cpa-credentials');
+    assert.match(legacyHelp, /dry-run by default/); assert.doesNotMatch(legacyHelp, /--credential(?:[ =]|$)/);
+    const upstreamHelp = help('/usr/local/bin/import-cpa-upstreams');
+    assert.match(upstreamHelp, /dry-run by default/); assert.match(upstreamHelp, /--transport-policy-file/); assert.doesNotMatch(upstreamHelp, /--(?:credential|api-key|service-token)(?:[ =]|$)/); assert.doesNotMatch(upstreamHelp, /bridge|subscription-accounts/i);
+
+    const fixture = join(workspace, 'cpa-upstream-source');
+    cpSync(join(repository, 'tests/fixtures/cpa-upstreams/supported'), fixture, { recursive: true });
+    run('docker', ['volume','create',volume]);
+    const fixtureHelper = join(repository, 'tests/ops/helpers/prepare-cpa-upstream-fixture.ts');
+    run('docker', ['run','--rm','--user','0:0','--security-opt','no-new-privileges','--cap-drop','ALL','--cap-add','CHOWN','--volume',`${fixture}:/fixture:ro`,'--volume',`${volume}:/source`,'--volume',`${fixtureHelper}:/contract/prepare-cpa-upstream-fixture.ts:ro`,'--entrypoint','node',image,'/contract/prepare-cpa-upstream-fixture.ts']);
+    run('docker', ['run','--rm','--user','10001:10001','--read-only','--security-opt','no-new-privileges','--cap-drop','ALL','--volume',`${volume}:/source`,'--entrypoint','/usr/local/bin/generate-source-identity-key',image,'/source/source-identity.key']);
+    const dryRun = run('docker', ['run','--rm','--read-only','--tmpfs','/tmp:rw,noexec,nosuid,size=8m','--security-opt','no-new-privileges','--cap-drop','ALL','--volume',`${volume}:/source:ro`,'--entrypoint','/usr/local/bin/import-cpa-upstreams',image,'--config','/source/config.yaml','--auth-dir','/source/auth','--source-identity-key-file','/source/source-identity.key','--transport-policy-file','/source/transport-policy.json']);
+    for (const needle of ['"mode":"dry-run"','"api_account_count":6','"private_target_api_account_count":2','"proxied_api_account_count":2','"native_reauthorization_required_count":2']) assert.ok(dryRun.includes(needle));
+    assert.doesNotMatch(dryRun, /fixture-only-|Fixture(?:Copilot|Cursor)Handle|example\.test|fixture-proxy\.internal/);
+
+    container = run('docker', ['create','--entrypoint','/bin/true',image]).trim();
+    const binaries = ['migrate-cpamp','audit-cpa-migration','import-cpa-session-archive-wrapper','attach-legacy-cpa-credentials','import-cpa-upstreams','generate-source-identity-key','export-cpa-session-archive-delta'];
+    for (const binary of binaries) {
+      const destination = join(workspace, binary);
+      run('docker', ['cp',`${container}:/usr/local/bin/${binary}`,destination]);
+      run(process.execPath, ['--check', destination]);
+    }
+    for (const sql of ['prepare.sql','reset.sql','apply.sql']) {
+      const destination = join(workspace, sql); run('docker', ['cp',`${container}:/usr/local/bin/sql/cpamp/${sql}`,destination]);
+      assert.deepEqual(readFileSync(destination), readFileSync(join(repository, 'ops/sql/cpamp', sql)));
+    }
+    const rootfs = join(workspace, 'rootfs.tar'); run('docker', ['export','--output',rootfs,container]);
+    const tar = spawnSync('tar', ['-xOf', rootfs], { cwd: repository, encoding: 'buffer', maxBuffer: 512 * 1024 * 1024, shell: false });
+    assert.equal(tar.status, 0, String(tar.stderr));
+    assert.doesNotMatch(tar.stdout.toString('latin1'), /fixture-only-cpa-(?:linux-codex|claude-code)-key|fixture-service-token/);
+
+    const stage = read('ops/kubernetes/cpa-upstream-import-dry-run-job.yaml');
+    for (const needle of ['automountServiceAccountToken: false','name: REPLACE_IMAGE_PULL_SECRET','name: stage-source-identity-key','import-mode: dry-run','REPLACE_REVIEWED_POLICY_SHA256','REPLACE_APPROVAL_REFERENCE','chmod 0600 /key-runtime/source-identity.key','chown 10001:10001 /key-runtime/source-identity.key','10001:10001:600:1','secretName: REPLACE_TRANSPORT_POLICY_SECRET','medium: Memory','sizeLimit: 1Mi']) assert.ok(stage.includes(needle));
+    assert.doesNotMatch(stage, /^\s*-\s*--apply\s*$/m);
+    const jobs = ['ops/kubernetes/legacy-credential-import-job.yaml','ops/kubernetes/cpamp-import-job.yaml'];
+    for (const path of jobs) {
+      const job = read(path);
+      for (const needle of ['memeloop-token-center-importer@sha256:REPLACE_DIGEST','automountServiceAccountToken: false','name: REPLACE_IMAGE_PULL_SECRET','readOnlyRootFilesystem: true','allowPrivilegeEscalation: false','runAsUser: 10001','fsGroup: 10001','name: PGPASSFILE','initContainers:','name: prepare-database-credentials','chmod 0600 /credentials/pgpass','"10001:10001:600"','medium: Memory']) assert.ok(job.includes(needle), `${path} lacks ${needle}`);
+      assert.doesNotMatch(job, /^\s*-\s*name:\s*PGPASSWORD\s*$/m); assert.doesNotMatch(job, /memeloop_token_center_dogfood/);
+    }
+    assert.doesNotMatch(read(jobs[1]!), /image:\s+\S+@sha256:[0-9a-f]{64}/);
+  } finally {
+    if (container) spawnSync('docker', ['container','rm',container], { stdio: 'ignore', shell: false });
+    spawnSync('docker', ['volume','rm',volume], { stdio: 'ignore', shell: false });
+    if (created) spawnSync('docker', ['image','rm',image], { stdio: 'ignore', shell: false });
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});

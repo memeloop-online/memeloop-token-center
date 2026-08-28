@@ -50,7 +50,7 @@ reported zero HIGH/CRITICAL findings.
 Docker, Podman and Buildah were unavailable in this workspace. Consequently,
 this is reproducible equivalent-rootfs evidence, not the immutable image
 attestation. The next exact-SHA GitHub Actions run must still build the image,
-execute `tests/ops/importer-image-contract.sh`, scan the final image, publish all
+execute `node --test tests/ops/importer-image-contract.test.ts`, scan the final image, publish all
 three images, and verify the combined digest manifest before any deployment.
 
 ## 2026-08-26 OpenSSL security refresh

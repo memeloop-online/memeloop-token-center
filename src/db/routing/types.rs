@@ -7,6 +7,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrantedModelCapabilitySource {
     pub public_model: String,
+    pub upstream_model: String,
     pub protocol: String,
     pub driver: String,
     pub config_json: String,

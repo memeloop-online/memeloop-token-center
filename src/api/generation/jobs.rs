@@ -55,7 +55,9 @@ pub(in crate::api) async fn create_generation_for_modality(
         )
         .await?
         .ok_or_else(|| AppError::Upstream("generation route is not configured".into()))?;
-    if !matches!(route.driver.as_str(), "volcengine-seedance" | "comfyui") {
+    let siliconflow_video = route.driver == "http-json"
+        && crate::generation::is_siliconflow_video_profile(&route.config, &route.upstream_model);
+    if !matches!(route.driver.as_str(), "volcengine-seedance" | "comfyui") && !siliconflow_video {
         return Err(AppError::Upstream(format!(
             "generation driver {} cannot execute asynchronous jobs",
             route.driver
@@ -64,7 +66,10 @@ pub(in crate::api) async fn create_generation_for_modality(
     if let Some(modality) = requested_modality {
         let driver_supports_modality = match modality {
             "image" => route.driver == "comfyui",
-            "video" => matches!(route.driver.as_str(), "volcengine-seedance" | "comfyui"),
+            "video" => {
+                matches!(route.driver.as_str(), "volcengine-seedance" | "comfyui")
+                    || siliconflow_video
+            }
             _ => false,
         };
         let provider_supports_modality = state
@@ -80,6 +85,8 @@ pub(in crate::api) async fn create_generation_for_modality(
     }
     if route.driver == "volcengine-seedance" {
         normalize_seedance_duration(&mut body.input)?;
+    } else if siliconflow_video {
+        crate::generation::validate_siliconflow_video_parameters(&body.input)?;
     }
     // Hash and archive exactly the normalized request that the worker will
     // submit. This prevents alternate `duration`/`--dur` spellings from
@@ -256,12 +263,16 @@ fn estimated_generation_units(
             Ok(units)
         }
         ("comfyui", "job") => Ok(1),
+        ("http-json", "job") => Ok(1),
         ("comfyui", "megapixel") => crate::generation::comfyui_requested_pixels(input),
         ("volcengine-seedance", _) => Err(AppError::BadRequest(
             "Seedance generation price must use second billing".into(),
         )),
         ("comfyui", _) => Err(AppError::BadRequest(
             "ComfyUI generation price must use job or megapixel billing".into(),
+        )),
+        ("http-json", _) => Err(AppError::BadRequest(
+            "SiliconFlow video generation price must use job billing".into(),
         )),
         _ => Err(AppError::BadRequest("unsupported generation driver".into())),
     }

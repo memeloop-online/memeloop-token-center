@@ -8,9 +8,12 @@ WORKDIR /source
 COPY package.json package-lock.json ./
 RUN npm config set registry "${NPM_REGISTRY}" && npm ci --ignore-scripts
 COPY tsconfig.scripts.json ./
+COPY ops/ci/build-importer-scripts.ts ./ops/ci/build-importer-scripts.ts
 COPY ops/cpa-upstreams ./ops/cpa-upstreams
 COPY ops/legacy-credentials ./ops/legacy-credentials
 COPY ops/lib ./ops/lib
+COPY ops/sql ./ops/sql
+COPY ops/migrate-cpamp.ts ops/audit-cpa-migration.ts ops/import-cpa-session-archive.ts ./ops/
 COPY ops/export-cpa-session-archive-delta.ts ./ops/export-cpa-session-archive-delta.ts
 RUN npm run build:importer-scripts
 
@@ -19,16 +22,21 @@ USER root
 RUN apk upgrade --no-cache libcrypto3 libssl3 \
     && apk add --no-cache ca-certificates nodejs postgresql-client sqlite util-linux \
     && adduser -S -D -u 10001 importer
-COPY ops/migrate-cpamp.sh /usr/local/bin/migrate-cpamp
-COPY ops/audit-cpa-migration.sh /usr/local/bin/audit-cpa-migration
-COPY --from=scripts /source/dist/operator-scripts/legacy-credentials/attach-legacy-cpa-credentials.cjs /usr/local/bin/attach-legacy-cpa-credentials
-COPY --from=scripts /source/dist/operator-scripts/cpa-upstreams/import-cpa-upstreams.cjs /usr/local/bin/import-cpa-upstreams
-COPY --from=scripts /source/dist/operator-scripts/cpa-upstreams/generate-source-identity-key.cjs /usr/local/bin/generate-source-identity-key
+COPY --from=scripts /source/dist/operator-scripts/migrate-cpamp.mjs /usr/local/bin/migrate-cpamp
+COPY --from=scripts /source/dist/operator-scripts/audit-cpa-migration.mjs /usr/local/bin/audit-cpa-migration
+COPY --from=scripts /source/dist/operator-scripts/import-cpa-session-archive.mjs /usr/local/bin/import-cpa-session-archive-wrapper
+COPY --from=scripts /source/dist/operator-scripts/legacy-credentials/attach-legacy-cpa-credentials.mjs /usr/local/bin/attach-legacy-cpa-credentials
+COPY --from=scripts /source/dist/operator-scripts/cpa-upstreams/import-cpa-upstreams.mjs /usr/local/bin/import-cpa-upstreams
+COPY --from=scripts /source/dist/operator-scripts/cpa-upstreams/generate-source-identity-key.mjs /usr/local/bin/generate-source-identity-key
 COPY --from=scripts /source/dist/operator-scripts/export-cpa-session-archive-delta.mjs /usr/local/bin/export-cpa-session-archive-delta
+COPY --from=scripts /source/dist/operator-scripts/sql /usr/local/bin/sql
 RUN chmod 0555 /usr/local/bin/migrate-cpamp /usr/local/bin/audit-cpa-migration \
+    /usr/local/bin/import-cpa-session-archive-wrapper \
     /usr/local/bin/attach-legacy-cpa-credentials \
     /usr/local/bin/import-cpa-upstreams \
     /usr/local/bin/generate-source-identity-key \
-    /usr/local/bin/export-cpa-session-archive-delta
+    /usr/local/bin/export-cpa-session-archive-delta \
+    && find /usr/local/bin/sql -type d -exec chmod 0555 {} + \
+    && find /usr/local/bin/sql -type f -exec chmod 0444 {} +
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/migrate-cpamp"]

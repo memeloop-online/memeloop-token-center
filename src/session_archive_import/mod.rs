@@ -23,6 +23,7 @@ use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as ShaDigest, Sha256};
 use sqlx::{
     Connection, Row,
     sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqliteSynchronous},
@@ -35,20 +36,49 @@ use crate::{
     conversation::ConversationHints,
     db::{
         Database, SessionArchiveCommitInput, SessionArchiveCorrelation, SessionArchiveImportMatch,
-        SessionArchiveImportMatchInput, SessionArchiveQuarantineBatchInput,
-        SessionArchiveQuarantineCommitInput, SessionArchiveQuarantineTarget, SessionArchiveTarget,
-        SessionArchiveUnlinkedCommitInput, SessionArchiveUnlinkedMetadata,
-        SessionArchiveUnlinkedTarget,
+        SessionArchiveImportMatchInput, SessionArchiveLegacyCheckpointInput,
+        SessionArchivePresentSummaryInput, SessionArchiveQuarantineBatchInput,
+        SessionArchiveQuarantineCommitInput, SessionArchiveQuarantineTarget,
+        SessionArchiveSnapshotApplyInput, SessionArchiveSnapshotChainInput, SessionArchiveTarget,
+        SessionArchiveTombstoneInput, SessionArchiveUnlinkedCommitInput,
+        SessionArchiveUnlinkedMetadata, SessionArchiveUnlinkedTarget,
     },
     error::AppError,
     model::{AuthenticatedKey, KeyPolicy},
 };
 
-const IMPORT_PLAN_VERSION: i64 = 4;
+const IMPORT_PLAN_VERSION: i64 = 5;
 const MAX_PLAN_RECORD_BYTES: usize = 512 * 1024;
 const PLAN_SIZE_CHECK_INTERVAL: u64 = 32;
+const MAX_STABLE_SESSION_COUNT: i64 = 1_000_000;
 pub const MAX_SESSION_ARCHIVE_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SESSION_ARCHIVE_PLAN_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+struct StableDeltaManifest {
+    expected_output_sha256: String,
+    output_size_bytes: u64,
+    source_fingerprint: String,
+    sequence: i64,
+    offline_full_snapshot: bool,
+    prior_output_sha256: Option<String>,
+    prior_source_ingest_fence: Option<i64>,
+    snapshot_schema_version: i64,
+    ingest_fence: i64,
+    tombstone_safe_after_ingest_fence: Option<i64>,
+    session_set_sha256: String,
+    session_count: i64,
+    request_count: i64,
+    record_count: i64,
+    deleted_session_count: i64,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedDeltaManifest {
+    expected_output_sha256: String,
+    output_size_bytes: u64,
+    stable: Option<StableDeltaManifest>,
+}
 
 #[derive(Clone, Debug)]
 pub struct SessionArchiveImportOptions<'a> {
@@ -109,7 +139,195 @@ pub fn validate_session_archive_import_options(
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+async fn load_stable_delta_manifest(
+    input: &Path,
+) -> Result<Option<LoadedDeltaManifest>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut manifest_name = input.as_os_str().to_os_string();
+    manifest_name.push(".manifest.json");
+    let manifest_path = PathBuf::from(manifest_name);
+    let metadata = match tokio::fs::symlink_metadata(&manifest_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err("archive delta manifest must be a bounded regular non-symlink file".into());
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .open(&manifest_path)
+        .await?;
+    let descriptor_identity = InputIdentity::from_metadata(&file.metadata().await?);
+    let path_identity = InputIdentity::from_metadata(&tokio::fs::metadata(&manifest_path).await?);
+    if descriptor_identity != InputIdentity::from_metadata(&metadata)
+        || descriptor_identity != path_identity
+    {
+        return Err("archive delta manifest changed while it was opened".into());
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(descriptor_identity.size)?);
+    file.read_to_end(&mut bytes).await?;
+    if InputIdentity::from_metadata(&file.metadata().await?) != descriptor_identity {
+        return Err("archive delta manifest changed while it was read".into());
+    }
+    let value: Value = serde_json::from_slice(&bytes)?;
+    let object = value
+        .as_object()
+        .ok_or("archive delta manifest must be a JSON object")?;
+    let integer = |name: &str| -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        object
+            .get(name)
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| format!("archive delta manifest {name} is invalid").into())
+    };
+    let text = |name: &str| -> Result<&str, Box<dyn std::error::Error + Send + Sync>> {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("archive delta manifest {name} is invalid").into())
+    };
+    let version = integer("version")?;
+    if !matches!(version, 1..=3) {
+        return Err("unsupported archive delta manifest version".into());
+    }
+    let expected_file = input
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("archive input filename is invalid")?;
+    if text("output_file")? != expected_file {
+        return Err("archive delta manifest is bound to another input file".into());
+    }
+    let expected_sha = text("output_sha256")?;
+    if expected_sha.len() != 64
+        || !expected_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("archive delta manifest output digest is invalid".into());
+    }
+    let source_fingerprint = text("source_fingerprint")?;
+    if source_fingerprint.len() != 64
+        || !source_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("archive delta manifest source fingerprint is invalid".into());
+    }
+    let projection_protocol = text("session_projection_protocol")?;
+    if projection_protocol != "session-snapshot-cursor-v1" {
+        if projection_protocol == "legacy-last-at-limit-v1" {
+            return Ok(Some(LoadedDeltaManifest {
+                expected_output_sha256: expected_sha.to_owned(),
+                output_size_bytes: u64::try_from(integer("output_size_bytes")?)?,
+                stable: None,
+            }));
+        }
+        return Err("unsupported archive delta projection protocol".into());
+    }
+    let session_set_sha256 = text("session_set_sha256")?.to_owned();
+    if session_set_sha256.len() != 64
+        || !session_set_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("archive delta manifest session set digest is invalid".into());
+    }
+    let parse_fence = |name: &str| -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let value = text(name)?;
+        if value != "0"
+            && (value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Err(format!("archive delta manifest {name} is invalid").into());
+        }
+        value
+            .parse::<i64>()
+            .map_err(|_| format!("archive delta manifest {name} is invalid").into())
+    };
+    let snapshot_schema_version = if version == 3 {
+        integer("snapshot_schema_version")?
+    } else {
+        1
+    };
+    if !matches!(snapshot_schema_version, 1 | 2) {
+        return Err("unsupported stable snapshot schema version".into());
+    }
+    let ingest_fence = parse_fence("source_ingest_fence")?;
+    let deleted_session_count = if version == 3 {
+        integer("deleted_session_count")?
+    } else {
+        0
+    };
+    let tombstone_safe_after_ingest_fence = if snapshot_schema_version == 2 {
+        Some(parse_fence("tombstone_safe_after_ingest_fence")?)
+    } else {
+        if deleted_session_count != 0
+            || object
+                .get("tombstone_safe_after_ingest_fence")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err("stable snapshot schema v1 contains tombstone metadata".into());
+        }
+        None
+    };
+    if tombstone_safe_after_ingest_fence.is_some_and(|fence| fence > ingest_fence) {
+        return Err("stable snapshot upgrade fence exceeds its ingest fence".into());
+    }
+    let prior_output_sha256 = match object.get("prior_output_sha256") {
+        Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => return Err("archive delta manifest prior output digest is invalid".into()),
+        None => return Err("archive delta manifest prior output digest is missing".into()),
+    };
+    if prior_output_sha256.as_deref().is_some_and(|digest| {
+        digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }) {
+        return Err("archive delta manifest prior output digest is invalid".into());
+    }
+    let session_count = integer("session_count")?;
+    let request_count = integer("source_projection_requests")?;
+    let record_count = integer("record_count")?;
+    if session_count > MAX_STABLE_SESSION_COUNT
+        || deleted_session_count > session_count
+        || (snapshot_schema_version == 2 && request_count != record_count)
+    {
+        return Err("archive delta manifest stable projection counts are invalid or exceed the compiled-in session limit".into());
+    }
+    let stable = StableDeltaManifest {
+        expected_output_sha256: expected_sha.to_owned(),
+        output_size_bytes: u64::try_from(integer("output_size_bytes")?)?,
+        source_fingerprint: source_fingerprint.to_owned(),
+        sequence: integer("sequence")?,
+        offline_full_snapshot: object
+            .get("offline_full_snapshot")
+            .and_then(Value::as_bool)
+            .ok_or("archive delta manifest offline_full_snapshot is invalid")?,
+        prior_output_sha256,
+        prior_source_ingest_fence: match object.get("prior_source_ingest_fence") {
+            Some(Value::String(_)) => Some(parse_fence("prior_source_ingest_fence")?),
+            Some(Value::Null) => None,
+            Some(_) => return Err("archive delta manifest prior fence is invalid".into()),
+            None => return Err("archive delta manifest prior fence is missing".into()),
+        },
+        snapshot_schema_version,
+        ingest_fence,
+        tombstone_safe_after_ingest_fence,
+        session_set_sha256,
+        session_count,
+        request_count,
+        record_count,
+        deleted_session_count,
+    };
+    Ok(Some(LoadedDeltaManifest {
+        expected_output_sha256: stable.expected_output_sha256.clone(),
+        output_size_bytes: stable.output_size_bytes,
+        stable: Some(stable),
+    }))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImportPlanHeader {
     version: i64,
@@ -119,11 +337,31 @@ struct ImportPlanHeader {
     source_size_bytes: u64,
     source_blake3: String,
     record_count: u64,
+    tombstone_count: u64,
+    stable_snapshot: Option<ImportPlanStableSnapshot>,
     quarantine_records: u64,
     quarantine_batch_id: Option<Uuid>,
     tenant_binding_kind: Option<String>,
     tenant_binding_proof: Option<String>,
     approved_by_service_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportPlanStableSnapshot {
+    source_fingerprint: String,
+    sequence: i64,
+    offline_full_snapshot: bool,
+    output_sha256: String,
+    prior_output_sha256: Option<String>,
+    prior_source_ingest_fence: Option<i64>,
+    snapshot_schema_version: i64,
+    ingest_fence: i64,
+    tombstone_safe_after_ingest_fence: Option<i64>,
+    session_set_sha256: String,
+    session_count: i64,
+    request_count: i64,
+    deleted_session_count: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -319,6 +557,7 @@ impl From<ImportPlanUnlinkedTarget> for SessionArchiveUnlinkedTarget {
 struct ImportPlanRecord {
     version: i64,
     external_request_id: String,
+    source_session_id: String,
     correlation: ImportPlanCorrelation,
     record_digest: String,
     request_digest: Option<String>,
@@ -382,6 +621,10 @@ pub struct SessionArchiveImportStats {
     pub quarantine_replayed: u64,
     pub replayed: u64,
     pub imported: u64,
+    pub tombstones_scanned: u64,
+    pub tombstones_applied: u64,
+    pub tombstones_replayed: u64,
+    pub deleted_records: u64,
     pub input_device: u64,
     pub input_inode: u64,
     pub input_size_bytes: u64,
@@ -424,6 +667,30 @@ struct ArchiveRecord {
     request: Value,
     #[serde(default)]
     response: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionSummaryControl {
+    #[serde(rename = "_mtc_delta_type")]
+    delta_type: String,
+    schema_version: i64,
+    session_id: String,
+    requests: i64,
+    #[serde(default)]
+    first_at: Option<DateTime<Utc>>,
+    last_at: DateTime<Utc>,
+    #[serde(default)]
+    records_sha256: Option<String>,
+    #[serde(default)]
+    deleted: bool,
+    #[serde(default)]
+    deleted_at: Option<DateTime<Utc>>,
+}
+
+enum ParsedArchiveLine {
+    Record(Box<ArchiveRecord>, String),
+    Summary(SessionSummaryControl),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -567,14 +834,28 @@ pub async fn import_session_archive(
     if options.apply {
         validate_plan_directory(options.plan_directory).await?;
     }
+    let loaded_manifest = load_stable_delta_manifest(options.input).await?;
+    let stable_manifest = loaded_manifest
+        .as_ref()
+        .and_then(|manifest| manifest.stable.as_ref());
     let import_lock = db
         .acquire_session_archive_import_lock(options.tenant_external_id, options.archive_source)
         .await?;
-    let result = import_session_archive_locked(db, archive, options).await;
+    let result = import_session_archive_locked(
+        db,
+        archive,
+        options,
+        stable_manifest,
+        loaded_manifest.as_ref(),
+    )
+    .await;
     let release = import_lock.release().await;
     match (result, release) {
         (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(stats), Err(error)) => {
+            tracing::warn!(%error, "session archive import committed but advisory lock release reported an error");
+            Ok(stats)
+        }
         (Ok(stats), Ok(())) => Ok(stats),
     }
 }
@@ -583,7 +864,25 @@ async fn import_session_archive_locked(
     db: &Database,
     archive: &ArchiveStore,
     options: &SessionArchiveImportOptions<'_>,
+    stable_manifest: Option<&StableDeltaManifest>,
+    loaded_manifest: Option<&LoadedDeltaManifest>,
 ) -> Result<SessionArchiveImportStats, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(manifest) = stable_manifest {
+        db.preflight_session_archive_snapshot_chain(SessionArchiveSnapshotChainInput {
+            tenant_external_id: options.tenant_external_id,
+            archive_source: options.archive_source,
+            source_fingerprint: &manifest.source_fingerprint,
+            sequence: manifest.sequence,
+            offline_full_snapshot: manifest.offline_full_snapshot,
+            output_sha256: &manifest.expected_output_sha256,
+            prior_output_sha256: manifest.prior_output_sha256.as_deref(),
+            prior_source_ingest_fence: manifest.prior_source_ingest_fence,
+            snapshot_schema_version: manifest.snapshot_schema_version,
+            ingest_fence: manifest.ingest_fence,
+            tombstone_safe_after_ingest_fence: manifest.tombstone_safe_after_ingest_fence,
+        })
+        .await?;
+    }
     let lower_bound = db
         .session_archive_lower_bound(
             options.tenant_external_id,
@@ -591,12 +890,32 @@ async fn import_session_archive_locked(
             options.overlap_ms,
         )
         .await?;
+    // A stable schema-v2 summary binds the complete record set for every selected
+    // session. Per-record target overlap filtering would make that proven summary
+    // and its records_sha256 lie about older rows in the same selected session.
+    let lower_bound =
+        if stable_manifest.is_some_and(|manifest| manifest.snapshot_schema_version == 2) {
+            0
+        } else {
+            lower_bound
+        };
 
     // Pass one never writes. A missing/ambiguous CPAMP identity or a protected
     // request/response locator therefore stops the entire batch before any target
     // object or relational row can be changed.
     let mut input = ReadOnlyInput::open(options.input).await?;
-    let (mut stats, first_digest) = preflight_pass(db, options, lower_bound, &mut input).await?;
+    if loaded_manifest.is_some_and(|manifest| manifest.output_size_bytes != input.identity.size) {
+        return Err("archive delta manifest output size does not match the sealed input".into());
+    }
+    let (mut stats, first_digest) = preflight_pass(
+        db,
+        options,
+        lower_bound,
+        &mut input,
+        stable_manifest,
+        loaded_manifest.map(|manifest| manifest.expected_output_sha256.as_str()),
+    )
+    .await?;
     let seal = input.seal(first_digest).await?;
     record_input_seal(&mut stats, &seal);
     if stats.unmapped > 0 && !options.allow_unmapped {
@@ -615,8 +934,16 @@ async fn import_session_archive_locked(
     // the source reaches EOF with its original seal and the plan itself is sealed,
     // reopened read-only and completely validated.
     input.rewind().await?;
-    let (second_stats, sealed_plan) =
-        build_import_plan(db, archive, options, lower_bound, &mut input, &seal).await?;
+    let (second_stats, sealed_plan) = build_import_plan(
+        db,
+        archive,
+        options,
+        lower_bound,
+        &mut input,
+        &seal,
+        stable_manifest,
+    )
+    .await?;
     if second_stats.unmapped > 0 {
         return Err(format!(
             "archive import stopped before writes: {} of {} eligible records were unmapped, ambiguous, or inconsistent",
@@ -632,15 +959,55 @@ async fn import_session_archive_locked(
         &seal,
     )
     .await?;
-    let applied = apply_validated_plan(db, archive, options, &mut plan).await?;
-    stats.imported = applied.imported;
-    stats.quarantine_imported = applied.quarantine_imported;
-    stats.quarantine_replayed = applied.quarantine_replayed;
-    // The explicit read transaction is the immutable SQLite snapshot used by
-    // apply. It never contains writes and is discarded after the final row.
-    sqlx::query("ROLLBACK")
-        .execute(&mut plan.connection)
-        .await?;
-    plan.connection.close().await?;
+    preflight_validated_snapshot_tombstones(db, options, &mut plan).await?;
+    let mut target_tx = db.begin_write_transaction().await?;
+    let apply_result = async {
+        if let Some(manifest) = stable_manifest {
+            stage_validated_snapshot_projection(&mut target_tx, options, &mut plan, manifest)
+                .await?;
+            if manifest.snapshot_schema_version == 2 {
+                db.reconcile_staged_session_archive_projection_in_transaction(
+                    &mut target_tx,
+                    options.tenant_external_id,
+                    options.archive_source,
+                    &manifest.expected_output_sha256,
+                )
+                .await?;
+            }
+        }
+        let applied = apply_validated_plan(db, &mut target_tx, archive, options, &mut plan).await?;
+        stats.imported = applied.imported;
+        stats.quarantine_imported = applied.quarantine_imported;
+        stats.quarantine_replayed = applied.quarantine_replayed;
+        if let Some(manifest) = stable_manifest {
+            let snapshot = apply_validated_snapshot_tombstones(
+                db,
+                &mut target_tx,
+                options,
+                &mut plan,
+                manifest,
+                &applied,
+            )
+            .await?;
+            stats.tombstones_applied = snapshot.tombstones_applied;
+            stats.tombstones_replayed = snapshot.tombstones_replayed;
+            stats.deleted_records = snapshot.deleted_records;
+        }
+        // Close the immutable local plan before the target commit. A local
+        // cleanup failure can therefore still roll back every target write.
+        sqlx::query("ROLLBACK")
+            .execute(&mut plan.connection)
+            .await?;
+        plan.connection.close().await?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    match apply_result {
+        Ok(()) => target_tx.commit().await?,
+        Err(error) => {
+            let _ = target_tx.rollback().await;
+            return Err(error);
+        }
+    }
     Ok(stats)
 }

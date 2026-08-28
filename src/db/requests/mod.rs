@@ -29,7 +29,11 @@ pub use session_archive::{
     SessionArchiveTarget, SessionArchiveUnlinkedTarget,
 };
 pub use session_archive_commit::{
-    SessionArchiveCommitInput, SessionArchiveUnlinkedCommitInput, SessionArchiveUnlinkedMetadata,
+    SessionArchiveCommitInput, SessionArchiveLegacyCheckpointInput,
+    SessionArchivePresentSummaryInput, SessionArchiveSnapshotApplyInput,
+    SessionArchiveSnapshotApplyResult, SessionArchiveSnapshotChainInput,
+    SessionArchiveTombstoneInput, SessionArchiveUnlinkedCommitInput,
+    SessionArchiveUnlinkedMetadata,
 };
 pub use session_archive_quarantine::{
     SessionArchiveImportMatch, SessionArchiveImportMatchInput, SessionArchiveQuarantineBatchInput,

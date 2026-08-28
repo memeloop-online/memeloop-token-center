@@ -175,6 +175,27 @@ insignificant whitespace or trailing newline is present.
 This is the same canonical projection retained in the manifest and makes a
 missing page detectable independently of page boundaries.
 
+Snapshot schema v2 extends that projection with explicit deleted-session
+tombstones. The exporter writes one sealed `session_summary` control line for
+every selected present session or tombstone, followed by the complete
+request-id-bytewise record set of each present session. The importer verifies
+each record count and `records_sha256`, recomputes the Go-field-order v2 set
+digest, and rejects missing, duplicate, foreign or unknown controls. It stages
+only bounded membership metadata in the target transaction, reconciles stale
+or moved exact/unlinked/quarantine heads, verifies the resulting active heads,
+then writes present summaries, tombstone audit rows, the legacy cursor and the
+stable chain checkpoint atomically. Failure leaves locators, semantic
+projections, audit heads and both checkpoints unchanged. A same-file replay is
+idempotent and also removes its transaction-local staging rows.
+
+The stable chain begins only with `sequence=1`, null prior digest/fence and an
+offline full snapshot. Later artifacts must be non-full, use the same source
+fingerprint, increment sequence by one and name the exact prior output digest
+and ingest fence. A v1-to-v2 upgrade is accepted only when its prior fence is at
+or beyond the source's tombstone-safe fence. A v2-to-v1 downgrade or a changed
+tombstone-safe fence fails closed. Dry-run performs these target-chain and
+tombstone-locator checks as well as apply; it is not merely a source parser.
+
 The exporter verifies page order, duplicate identities, cursor loops, the total
 session and request counts, the complete projection digest, snapshot-bound
 per-session counts and record digests, and a second enumeration of the same
@@ -214,7 +235,7 @@ inconsistent. No closest-time, file-order or arbitrary tie break is permitted.
 
 ## Safe execution
 
-`ops/import-cpa-session-archive.sh` is a dry run unless
+`node ops/import-cpa-session-archive.ts` is a dry run unless
 `SESSION_ARCHIVE_APPLY=true`. The dry run scans the complete overlap batch and
 stops if a source request has no unique stable key/principal identity. Exact
 request correlation additionally uses the available request id, timestamp, model,
@@ -248,6 +269,25 @@ read-only check that every expected migration and importer relation exists; it
 never calls the migration runner and should not receive schema-owner/DDL
 privileges. Its importer-specific configuration path also does not read the
 service token, key pepper, upstream credentials, plugins or pricing sources.
+
+Migration 58 deliberately does not invent reversible provenance for exact
+imports created by older binaries, because those releases accepted arbitrary
+`gap://` locators and the original value cannot be reconstructed from an event
+hash. Before admitting any schema-v2 artifact, run this read-only rollout gate
+for every tenant/source pair:
+
+```sql
+SELECT tenant_id, source, COUNT(*) AS irreversible_legacy_exact_rows
+FROM session_archive_import_records
+WHERE previous_request_object IS NULL
+GROUP BY tenant_id, source;
+```
+
+Any nonzero row is a rollout blocker. Preserve it for investigation and obtain
+trusted old-locator provenance before an explicit repair; never synthesize a
+canonical gap or clear the row to force admission. The API2 trial baseline was
+reported empty, but trial and production must each be checked against their
+actual target database immediately before schema-v2 import.
 The standalone Kubernetes manifest includes its own default-deny NetworkPolicy
 and permits only cluster DNS, the selected PostgreSQL pods and the selected
 object-store pods. Review those selectors for the target cluster; never replace

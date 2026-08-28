@@ -298,6 +298,23 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "semantic execution metadata",
         sql: include_str!("../../../migrations/common/0055_semantic_execution_metadata.sql"),
     },
+    Migration {
+        version: 56,
+        name: "session archive stable snapshot schema v2",
+        sql: include_str!("../../../migrations/common/0056_session_archive_snapshot_v2.sql"),
+    },
+    Migration {
+        version: 57,
+        name: "immutable session archive quarantine versions",
+        sql: include_str!(
+            "../../../migrations/common/0057_session_archive_quarantine_versions.sql"
+        ),
+    },
+    Migration {
+        version: 58,
+        name: "session archive snapshot staging",
+        sql: include_str!("../../../migrations/common/0058_session_archive_snapshot_staging.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -581,6 +598,23 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 55,
         name: "semantic execution metadata",
         sql: include_str!("../../../migrations/common/0055_semantic_execution_metadata.sql"),
+    },
+    Migration {
+        version: 56,
+        name: "session archive stable snapshot schema v2",
+        sql: include_str!("../../../migrations/common/0056_session_archive_snapshot_v2.sql"),
+    },
+    Migration {
+        version: 57,
+        name: "immutable session archive quarantine versions",
+        sql: include_str!(
+            "../../../migrations/common/0057_session_archive_quarantine_versions.sql"
+        ),
+    },
+    Migration {
+        version: 58,
+        name: "session archive snapshot staging",
+        sql: include_str!("../../../migrations/common/0058_session_archive_snapshot_staging.sql"),
     },
 ];
 

@@ -24,7 +24,7 @@ To audit an update, download the exact crates.io archive, verify its published
 SHA-256 checksum, compare every file other than normalized `Cargo.toml` and this
 notice, then repeat the same manifest-only deletion.
 
-`tests/ops/rust-decimal-vendor-contract.sh` enforces the published archive
+`node --test tests/ops/rust-decimal-vendor-contract.test.ts` enforces the published archive
 checksum, the complete unmodified upstream tree digest (excluding only the
 normalized manifest, nested lock, and MemeLoop audit files), the exact
 manifest-only patch against the authenticated upstream manifest, and the

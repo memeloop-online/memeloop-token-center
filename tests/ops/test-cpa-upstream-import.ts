@@ -67,7 +67,7 @@ describe("CPA upstream TypeScript operators", () => {
     const summary = JSON.parse(result.stdout) as Record<string, unknown>;
     assert.equal(summary.mode, "dry-run");
     assert.equal(summary.api_account_count, 6);
-    assert.equal(summary.proxied_api_account_count, 1);
+    assert.equal(summary.proxied_api_account_count, 2);
     assert.equal(summary.private_target_api_account_count, 2);
     assert.equal(summary.native_reauthorization_required_count, 2);
     assert.doesNotMatch(result.stdout + result.stderr, /fixture-only-|Fixture(Copilot|Cursor)Handle/);
@@ -149,6 +149,32 @@ describe("CPA upstream TypeScript operators", () => {
     assert.doesNotMatch(reviewed.stdout + reviewed.stderr, /10\.20\.30\.40/);
   });
 
+  it("rejects a private target without a proxy before any target request", async () => {
+    const root = mkdtempSync(join(tmpdir(), "mtc-cpa-private-without-proxy-"));
+    const source = join(root, "source");
+    cpSync(join(fixtures, "supported"), source, { recursive: true });
+    const config = join(source, "config.yaml");
+    writeFileSync(config, readFileSync(config, "utf8").replace('    proxy-url: "socks5://fixture-proxy.internal:1080"\n', ""));
+    privateTree(source);
+    const key = join(source, "source-identity.key");
+    assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
+    const token = join(root, "service-token");
+    writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
+    const policy = writeTransportPolicy(root, ["https://openai-compatible.example.test/v1"]);
+    let requests = 0;
+    const server = createServer((_request, response) => { requests += 1; response.statusCode = 500; response.end("{}"); });
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    try {
+      const address = server.address(); assert(address && typeof address === "object");
+      await assert.rejects(execFileAsync(process.execPath, [importer,
+        "--config", config, "--auth-dir", join(source, "auth"), "--source-identity-key-file", key,
+        "--transport-policy-file", policy, "--apply", "--allow-http-loopback",
+        "--target-api-base-url", `http://127.0.0.1:${address.port}`, "--service-token-file", token,
+      ], { timeout: 20_000 }), /private target requires an approved private SOCKS5 proxy/);
+      assert.equal(requests, 0);
+    } finally { await new Promise<void>((resolveClose, rejectClose) => server.close((error) => error ? rejectClose(error) : resolveClose())); }
+  });
+
   it("preflights every direct conflict before any managed OAuth write", async () => {
     const root = mkdtempSync(join(tmpdir(), "mtc-cpa-preflight-"));
     const source = join(root, "source");
@@ -226,7 +252,7 @@ describe("CPA upstream TypeScript operators", () => {
       assert.equal(accounts.size, 6);
       assert.equal(rotations, 12);
       const proxied = credentials.filter((credential) => credential.type === "api_key_proxy");
-      assert.equal(proxied.length, 3);
+      assert.equal(proxied.length, 6);
       for (const credential of proxied) {
         assert.equal(credential.proxy_url, "socks5://fixture-proxy.internal:1080");
         assert.equal(credential.proxy_network_scope, "private");

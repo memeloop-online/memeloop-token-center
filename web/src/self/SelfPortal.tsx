@@ -11,6 +11,7 @@ import { schemaFormTemplates } from '../SchemaTemplates';
 import { safeValidator as validator } from '../safeValidator';
 import { SessionDrawer, SessionList } from '../SessionViews';
 import type { GenerationAsset, GenerationJob, KeyLimitSnapshot, KeyView, LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, ModelCatalogItem, ModelCatalogResponse, RequestDetail, RequestView, SelfStats } from '../types';
+import { buildGenerationInput, generationNeedsDuration } from './generationRequest';
 
 const requestPageSize = 50;
 const sessionPageSize = 50;
@@ -355,9 +356,7 @@ export function SelfPortal() {
     setGenerationSubmitting(true); setGenerationMessage(''); setError('');
     try {
       const path = generationKind === 'video' ? '/v1/videos/generations' : '/v1/images/generations';
-      const input = generationKind === 'video'
-        ? { duration: Number(generationDuration), content: [{ type: 'text', text: prompt }], ...((selectedCatalogModel?.generation_schema || Object.keys(generationParameters).length) ? { parameters: parameterPayload } : {}) }
-        : { parameters: parameterPayload };
+      const input = buildGenerationInput(generationKind, selectedCatalogModel, prompt, generationDuration, generationParameters);
       const job = await api<GenerationJob>(path, value, {
         method: 'POST',
         headers: { 'Idempotency-Key': crypto.randomUUID() },
@@ -406,6 +405,7 @@ export function SelfPortal() {
     ? availableModels.filter((item) => item.modalities?.includes(generationKind))
     : availableModels, [availableModels, catalogHasCapabilities, generationKind]);
   const selectedGenerationModel = generationModels.find((item) => item.id === generationModel);
+  const selectedGenerationNeedsDuration = generationNeedsDuration(generationKind, selectedGenerationModel);
   const selectedGenerationSchema = selectedGenerationModel?.generation_schema as RJSFSchema | undefined;
   const visibleGenerationSchema = useMemo<RJSFSchema | undefined>(() => {
     if (!selectedGenerationSchema) return undefined;
@@ -473,7 +473,7 @@ export function SelfPortal() {
         {generationModels.length === 0 ? <div className="notice warning" role="status">{t('self.noModelsForModality', { modality: t(`self.${generationKind}`) })}</div> : <form onSubmit={createGeneration}>
           <label>{t('self.generationModel')}<input list={`self-generation-models-${generationKind}`} value={generationModel} onChange={(event) => { setGenerationModel(event.target.value); setGenerationParameters({}); }} aria-describedby="self-generation-model-hint" /><datalist id={`self-generation-models-${generationKind}`}>{generationModels.map((allowedModel) => <option value={allowedModel.id} key={allowedModel.id} />)}</datalist><small id="self-generation-model-hint" className="field-description">{t('self.modelCapabilityHint', { modality: t(`self.${generationKind}`) })}</small></label>
           <label>{t('self.generationPrompt')}<textarea value={generationPrompt} onChange={(event) => setGenerationPrompt(event.target.value)} /></label>
-          {generationKind === 'video' && <label>{t('self.generationDuration')}<input type="number" min="1" max="60" step="1" value={generationDuration} onChange={(event) => setGenerationDuration(event.target.value)} /></label>}
+          {selectedGenerationNeedsDuration && <label>{t('self.generationDuration')}<input type="number" min="1" max="60" step="1" value={generationDuration} onChange={(event) => setGenerationDuration(event.target.value)} /></label>}
           {!catalogHasCapabilities && <div className="notice warning" role="status">{t('self.legacyModelCatalog')}</div>}
           {visibleGenerationSchema && <div className="generation-parameters"><h3>{t('self.workflowParameters')}</h3><p className="muted">{t('self.workflowParametersHint')}</p><RjsfForm key={`${generationKind}-${generationModel}-${locale}`} schema={localizeSchema(visibleGenerationSchema, locale)} formData={generationParameters} validator={validator} templates={schemaFormTemplates} tagName="div" noHtml5Validate onChange={({ formData }) => setGenerationParameters((formData ?? {}) as Record<string, unknown>)}><></></RjsfForm></div>}
           <button type="submit" disabled={generationSubmitting || !generationModel.trim() || !generationPrompt.trim() || generationParameterErrors.length > 0}>{generationSubmitting ? t('common.loading') : t('self.submitGeneration')}</button>

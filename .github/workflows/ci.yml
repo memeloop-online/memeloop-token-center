@@ -64,7 +64,7 @@ jobs:
         run: cargo audit --deny warnings
       - name: Reject forbidden dependency re-entry and verify vendored provenance
         run: |
-          tests/ops/rust-decimal-vendor-contract.sh
+          node --test tests/ops/rust-decimal-vendor-contract.test.ts
           default_tree="$(cargo tree --locked --target all --prefix none)"
           all_features_tree="$(cargo tree --locked --all-features --target all --prefix none)"
           for crate in rsa rkyv rkyv_derive sqlx-mysql sigstore; do
@@ -352,7 +352,7 @@ jobs:
             rm -rf -- "$acceptance"
           }
           trap cleanup EXIT HUP INT TERM
-          ops/ci/prepare-cpamp-acceptance-bundle.sh "$acceptance"
+          node ops/ci/prepare-cpamp-acceptance-bundle.ts "$acceptance"
           printf 'CREATE SCHEMA :"schema";\n' \
             | psql -X --no-psqlrc -v ON_ERROR_STOP=1 \
               -v schema="$schema"
@@ -367,8 +367,8 @@ jobs:
             --env PGDATABASE="$PGDATABASE" --env PGUSER="$PGUSER" \
             --env PGPASSWORD="$PGPASSWORD" \
             --volume "$acceptance:/acceptance:ro" \
-            --entrypoint /bin/sh "$image" \
-            /acceptance/cpamp-import-postgres-acceptance.sh
+            --entrypoint node "$image" \
+            /acceptance/cpamp-import-postgres-acceptance.test.ts
 
   api-contract:
     runs-on: ubuntu-latest
@@ -435,14 +435,14 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
       - name: Validate shared immutable release inputs
         env:
           RELEASE_REGISTRY: ghcr.io/${{ github.repository_owner }}
-        run: |
-          test "$GITHUB_REPOSITORY" = memeloop-online/memeloop-token-center
-          ops/ci/validate-release-inputs.sh "$RELEASE_REGISTRY" "$GITHUB_SHA" prefixed >/dev/null
+        run: node ops/ci/validate-release-inputs.ts "$RELEASE_REGISTRY" "$GITHUB_SHA" prefixed
       - name: Install checksum-pinned crane registry client
-        shell: bash
         run: |
           archive="$RUNNER_TEMP/go-containerregistry_Linux_x86_64.tar.gz"
           destination="$RUNNER_TEMP/crane-bin"
@@ -490,66 +490,12 @@ jobs:
           exit-code: 1
           format: table
           timeout: 15m0s
-      - name: Verify tag resolution, OCI revision, SBOM, and provenance
-        shell: bash
+      - name: Verify immutable tag, OCI labels, SBOM, provenance, and image evidence
         env:
           IMAGE: ${{ matrix.image }}
           DIGEST: ${{ steps.build.outputs.digest }}
           CACHE_SCOPE: ${{ matrix.cache_scope }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "build returned an invalid image digest: $DIGEST" >&2
-            exit 1
-          fi
-          test "$GITHUB_REPOSITORY" = memeloop-online/memeloop-token-center
-          tagged_reference="${IMAGE}:sha-${GITHUB_SHA}"
-          resolved_digest="$(crane digest "$tagged_reference")"
-          if [ "$resolved_digest" != "$DIGEST" ]; then
-            echo "immutable tag resolved to $resolved_digest instead of the build digest" >&2
-            exit 1
-          fi
-          index="$RUNNER_TEMP/${CACHE_SCOPE}-index.json"
-          attestations="$RUNNER_TEMP/${CACHE_SCOPE}-attestations"
-          mkdir -p "$attestations"
-          ops/ci/verify-buildkit-attestations.sh \
-            "$IMAGE" "$DIGEST" "$index" "$attestations"
-          platform_digest="$(jq -r '
-            [.manifests[] |
-             select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")][0].digest
-          ' "$index")"
-          if [[ ! "$platform_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "attestation verifier returned an invalid platform digest: $platform_digest" >&2
-            exit 1
-          fi
-          image_evidence="$RUNNER_TEMP/${CACHE_SCOPE}-image.json"
-          docker buildx imagetools inspect "${IMAGE}@${platform_digest}" \
-            --format '{{json .Image}}' >"$image_evidence"
-          jq -e \
-            --arg source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-            --arg revision "$GITHUB_SHA" '
-              .config.Labels["org.opencontainers.image.source"] == $source and
-              .config.Labels["org.opencontainers.image.revision"] == $revision
-            ' "$image_evidence" >/dev/null
-      - name: Record immutable image digest manifest
-        shell: bash
-        env:
-          IMAGE: ${{ matrix.image }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-          CACHE_SCOPE: ${{ matrix.cache_scope }}
-        run: |
-          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "build returned an invalid image digest: $DIGEST" >&2
-            exit 1
-          fi
-          manifest="$RUNNER_TEMP/${CACHE_SCOPE}-image-digest.json"
-          jq --null-input \
-            --arg image "$IMAGE" \
-            --arg tag "sha-$GITHUB_SHA" \
-            --arg digest "$DIGEST" \
-            --arg revision "$GITHUB_SHA" \
-            '{schema_version: 1, image: $image, tag: $tag, digest: $digest, revision: $revision, reference: ($image + "@" + $digest)}' \
-            > "$manifest"
+        run: node ops/ci/verify-published-image.ts "$IMAGE" "$DIGEST" "$CACHE_SCOPE" "$RUNNER_TEMP"
       - name: Upload immutable image digest manifest
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
@@ -571,6 +517,12 @@ jobs:
       contents: read
       packages: read
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: image-digest-*-${{ github.sha }}
@@ -583,38 +535,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Verify the complete release set by immutable digest
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$GITHUB_REPOSITORY" = memeloop-online/memeloop-token-center
-          evidence="$RUNNER_TEMP/release-evidence"
-          expected='importer plugin-installer service'
-          actual="$(find "$evidence" -maxdepth 1 -name '*-image-digest.json' -printf '%f\n' |
-            sed 's/-image-digest\.json$//' | sort | tr '\n' ' ' | sed 's/ $//')"
-          if [ "$actual" != "$expected" ]; then
-            echo "incomplete release evidence: expected '$expected', got '$actual'" >&2
-            exit 1
-          fi
-          prefix="ghcr.io/${GITHUB_REPOSITORY_OWNER}"
-          expected_images="$(jq -cn --arg prefix "$prefix" '[
-            ($prefix + "/memeloop-token-center"),
-            ($prefix + "/memeloop-token-center-importer"),
-            ($prefix + "/memeloop-token-center-plugin-installer")
-          ] | sort')"
-          jq -s -e \
-            --arg revision "$GITHUB_SHA" \
-            --argjson expected_images "$expected_images" '
-            select(
-              length == 3 and
-              (map(.revision == $revision) | all) and
-              (map(.digest | test("^sha256:[0-9a-f]{64}$")) | all) and
-              (map(.reference == (.image + "@" + .digest)) | all) and
-              ((map(.image) | sort) == $expected_images)
-            )
-          ' "$evidence"/*-image-digest.json >"$RUNNER_TEMP/release-manifest.json"
-          while IFS= read -r reference; do
-            docker buildx imagetools inspect "$reference" >/dev/null
-          done < <(jq -r '.[].reference' "$RUNNER_TEMP/release-manifest.json")
+        run: node ops/ci/verify-ghcr-release.ts "$RUNNER_TEMP/release-evidence" "$RUNNER_TEMP/release-manifest.json"
       - name: Upload the complete immutable release manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -633,9 +554,13 @@ jobs:
         with:
           node-version: 24.18.0
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
       - name: Install pinned workflow-policy parser dependencies
-        run: npm --prefix web ci --ignore-scripts
+        run: |
+          npm ci --ignore-scripts
+          npm --prefix web ci --ignore-scripts
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
       - name: Install pinned Kubernetes schema validator
         run: |
@@ -648,17 +573,23 @@ jobs:
       - name: Lint, render, reject invalid values, and validate Kubernetes resources
         env:
           KUBECONFORM_BIN: /tmp/kubeconform
-        run: tests/ops/helm-packaging-contract.sh
+        run: node --test tests/ops/helm-packaging-contract.test.ts
       - name: Validate release workflow and Docker build contracts
-        run: tests/ops/release-packaging-contract.sh
+        run: node --test tests/ops/release-packaging-contract.test.ts
+      - name: Validate fail-closed BuildKit attestation verification
+        run: node --test tests/ops/buildkit-attestation-contract.test.ts
+      - name: Validate immutable three-image GHCR release evidence
+        run: node --test tests/ops/ghcr-release-contract.test.ts
       - name: Enforce focused source-module boundaries
-        run: tests/ops/source-module-size-contract.sh
+        run: node --test tests/ops/source-module-size-contract.test.ts
       - name: Validate GitHub release contracts
-        run: ops/ci/run-release-source-contracts.sh
+        run: node ops/ci/run-release-source-contracts.ts
       - name: Build and exercise the hardened importer image
-        run: tests/ops/importer-image-contract.sh
+        run: node --test tests/ops/importer-image-contract.test.ts
       - name: Build and exercise the hardened plugin installer image
-        run: tests/ops/plugin-installer-image-contract.sh
+        run: node --test tests/ops/plugin-installer-image-contract.test.ts
       - name: Validate the hardened session archive import Job
-        run: tests/ops/session-archive-import-job-contract.sh
+        run: node --test tests/ops/session-archive-import-job-contract.test.ts
+      - name: Enforce repository TypeScript-only script policy
+        run: node --test tests/ops/repository-script-language-contract.test.ts
       - run: docker compose config --quiet

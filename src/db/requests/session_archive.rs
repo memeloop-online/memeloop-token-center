@@ -29,6 +29,7 @@ pub struct SessionArchiveMatchInput<'a> {
     pub output_tokens: Option<i64>,
     pub record_digest: &'a str,
     pub time_tolerance_ms: i64,
+    pub allow_stable_replacement: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -243,14 +244,16 @@ impl Database {
         let replay = if let Some(existing) = imported {
             let existing_target: String = existing.try_get("target_request_id")?;
             let existing_digest: String = existing.try_get("record_digest")?;
-            if existing_target != target_request_id.to_string()
-                || existing_digest != input.record_digest
+            if (existing_target != target_request_id.to_string()
+                || existing_digest != input.record_digest)
+                && !input.allow_stable_replacement
             {
                 return Err(AppError::BadRequest(
                     "archive request changed after it was imported".into(),
                 ));
             }
-            true
+            existing_target == target_request_id.to_string()
+                && existing_digest == input.record_digest
         } else {
             false
         };
@@ -450,6 +453,9 @@ impl Database {
             return Ok(None);
         };
         if row.try_get::<String, _>("record_digest")? != input.record_digest {
+            if input.allow_stable_replacement {
+                return Ok(None);
+            }
             return Err(AppError::BadRequest(
                 "archive request changed after correlation".into(),
             ));
@@ -731,7 +737,7 @@ impl Database {
         // columns. A forged or drifted schema_migrations table therefore remains
         // fail-closed before source planning or CAS writes.
         sqlx::query(
-            "SELECT l.source_digest, r.record_digest, c.watermark_ms, q.created_at, x.proof_digest, u.archive_request_id, z.tenant_binding_proof, y.proof_digest, b.sequence, s.evidence_digest FROM import_request_links l CROSS JOIN session_archive_import_records r CROSS JOIN session_archive_import_checkpoints c CROSS JOIN request_record_locators q CROSS JOIN session_archive_correlations x CROSS JOIN session_archive_unlinked_requests u CROSS JOIN session_archive_quarantine_batches z CROSS JOIN session_archive_quarantine_records y CROSS JOIN session_archive_quarantine_batch_records b CROSS JOIN session_archive_quarantine_resolutions s WHERE 1 = 0",
+            "SELECT l.source_digest, r.record_digest, r.source_session_id, c.watermark_ms, q.created_at, x.proof_digest, u.archive_request_id, u.source_session_id, z.tenant_binding_proof, y.proof_digest, y.source_session_id, b.sequence, s.evidence_digest, v.ingest_fence, d.deleted_at_ms, p.records_sha256 FROM import_request_links l CROSS JOIN session_archive_import_records r CROSS JOIN session_archive_import_checkpoints c CROSS JOIN request_record_locators q CROSS JOIN session_archive_correlations x CROSS JOIN session_archive_unlinked_requests u CROSS JOIN session_archive_quarantine_batches z CROSS JOIN session_archive_quarantine_records y CROSS JOIN session_archive_quarantine_batch_records b CROSS JOIN session_archive_quarantine_resolutions s CROSS JOIN session_archive_snapshot_checkpoints v CROSS JOIN session_archive_applied_tombstones d CROSS JOIN session_archive_source_sessions p WHERE 1 = 0",
         )
         .fetch_all(&self.pool)
         .await

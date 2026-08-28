@@ -217,7 +217,7 @@ impl Database {
         tenant_id: Uuid,
     ) -> Result<Vec<GrantedModelCapabilitySource>, AppError> {
         let rows = sqlx::query(
-            "SELECT DISTINCT r.public_model, r.protocol, account.driver, account.config_json
+            "SELECT DISTINCT r.public_model, candidate.upstream_model, r.protocol, account.driver, account.config_json
              FROM model_routes r
              JOIN model_route_eligible_upstream_accounts candidate
                ON candidate.tenant_id = r.tenant_id AND candidate.model_route_id = r.id
@@ -239,7 +239,7 @@ impl Database {
                      AND g.route_group_id IS NOT NULL AND membership.model_route_id = r.id
                  )
                )
-             ORDER BY r.public_model, r.protocol, account.driver, account.config_json
+             ORDER BY r.public_model, candidate.upstream_model, r.protocol, account.driver, account.config_json
              LIMIT 1001",
         )
         .bind(tenant_id.to_string())
@@ -255,6 +255,7 @@ impl Database {
             .map(|row| {
                 Ok(GrantedModelCapabilitySource {
                     public_model: row.try_get("public_model")?,
+                    upstream_model: row.try_get("upstream_model")?,
                     protocol: row.try_get("protocol")?,
                     driver: row.try_get("driver")?,
                     config_json: row.try_get("config_json")?,

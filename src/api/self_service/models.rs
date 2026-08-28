@@ -24,12 +24,22 @@ pub(in crate::api) async fn list_models(
         };
         let capabilities = models.entry(source.public_model).or_default();
         capabilities.modalities.extend(
-            downstream_modalities(&source.protocol, &source.driver, &provider.modalities)
-                .into_iter()
-                .map(str::to_owned),
+            downstream_modalities(
+                &source.protocol,
+                &source.driver,
+                &source.upstream_model,
+                &source.config_json,
+                &provider.modalities,
+            )
+            .into_iter()
+            .map(str::to_owned),
         );
         if source.protocol == "generation" {
-            let schema = generation_parameter_schema(&source.driver, &source.config_json);
+            let schema = generation_parameter_schema(
+                &source.driver,
+                &source.upstream_model,
+                &source.config_json,
+            );
             if capabilities.generation_schema_initialized
                 && capabilities.generation_schema != schema
             {
@@ -62,9 +72,18 @@ pub(in crate::api) async fn list_models(
 fn downstream_modalities<'a>(
     protocol: &str,
     driver: &str,
+    upstream_model: &str,
+    config_json: &str,
     provider_modalities: &'a [String],
 ) -> Vec<&'a str> {
+    let siliconflow_video = driver == "http-json"
+        && serde_json::from_str::<Value>(config_json)
+            .ok()
+            .is_some_and(|config| {
+                crate::generation::is_siliconflow_video_profile(&config, upstream_model)
+            });
     let builtin: &[&str] = match (protocol, driver) {
+        ("generation", "http-json") if siliconflow_video => &["image", "video"],
         ("generation", "http-json") => &["image"],
         ("generation", "volcengine-seedance") => &["video"],
         ("generation", "comfyui") => &["image", "video"],
@@ -90,12 +109,19 @@ fn downstream_modalities<'a>(
         .collect()
 }
 
-fn generation_parameter_schema(driver: &str, config_json: &str) -> Option<Value> {
-    if driver != "comfyui" {
-        return None;
-    }
+fn generation_parameter_schema(
+    driver: &str,
+    upstream_model: &str,
+    config_json: &str,
+) -> Option<Value> {
     let config: Value = serde_json::from_str(config_json).ok()?;
-    crate::generation::comfyui_parameter_schema(&config).ok()
+    match driver {
+        "comfyui" => crate::generation::comfyui_parameter_schema(&config).ok(),
+        "http-json" if crate::generation::is_siliconflow_video_profile(&config, upstream_model) => {
+            Some(crate::generation::siliconflow_video_parameter_schema())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -106,6 +132,7 @@ mod tests {
     fn comfyui_parameter_schema_is_bounded_and_parameters_only() {
         let schema = generation_parameter_schema(
             "comfyui",
+            "workflow",
             &json!({
                 "workflow_template": {
                     "1": {"inputs": {
@@ -137,14 +164,27 @@ mod tests {
 
     #[test]
     fn unsafe_or_non_comfyui_schema_fails_closed() {
-        assert!(generation_parameter_schema("volcengine-seedance", "{}").is_none());
+        assert!(generation_parameter_schema("volcengine-seedance", "seedance", "{}").is_none());
         assert!(
             generation_parameter_schema(
                 "comfyui",
+                "workflow",
                 r#"{"workflow_template":{"$mtc_param":"bad parameter"}}"#,
             )
             .is_none()
         );
+        let siliconflow = generation_parameter_schema(
+            "http-json",
+            "Wan-AI/Wan2.2-T2V-A14B",
+            r#"{"video_api":"siliconflow-v1","video_models":["Wan-AI/Wan2.2-T2V-A14B"]}"#,
+        )
+        .expect("fixed SiliconFlow parameter schema");
+        assert_eq!(siliconflow["additionalProperties"], false);
+        assert_eq!(
+            siliconflow["properties"]["image_size"]["enum"],
+            json!(["1280x720", "720x1280", "960x960"])
+        );
+        assert!(generation_parameter_schema("http-json", "image-model", "{}").is_none());
     }
 
     #[test]
@@ -156,15 +196,31 @@ mod tests {
             "video".to_owned(),
         ];
         assert_eq!(
-            downstream_modalities("generation", "http-json", &advertised),
+            downstream_modalities("generation", "http-json", "image-model", "{}", &advertised),
             vec!["image"]
         );
         assert_eq!(
-            downstream_modalities("generation", "volcengine-seedance", &advertised),
+            downstream_modalities(
+                "generation",
+                "http-json",
+                "Wan-AI/Wan2.2-T2V-A14B",
+                r#"{"video_api":"siliconflow-v1","video_models":["Wan-AI/Wan2.2-T2V-A14B"]}"#,
+                &advertised,
+            ),
+            vec!["image", "video"]
+        );
+        assert_eq!(
+            downstream_modalities(
+                "generation",
+                "volcengine-seedance",
+                "seedance",
+                "{}",
+                &advertised
+            ),
             vec!["video"]
         );
         assert_eq!(
-            downstream_modalities("openai", "http-json", &advertised),
+            downstream_modalities("openai", "http-json", "text-model", "{}", &advertised),
             vec!["text", "embedding"]
         );
     }

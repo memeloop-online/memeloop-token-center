@@ -1,8 +1,37 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 import test from "node:test";
-import { assetGatewayRssEvidence, chatPayload, createMockServer, MockState, seed, smallChat, streamChat } from "./benchmark-memory.ts";
+import { assetGatewayRssEvidence, chatPayload, createMockServer, MockState, seed, smallChat, streamChat } from "../../ops/benchmark-memory.ts";
+
+const benchmarkEntry = resolve(import.meta.dirname, "../../ops/benchmark-memory.ts");
+
+test("TypeScript CLI exposes the memory harness without a shell wrapper", () => {
+  const result = spawnSync(process.execPath, [benchmarkEntry, "--help"], { encoding: "utf8", shell: false });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Usage: benchmark-memory\.ts /u);
+});
+
+test("TypeScript CLI preserves prerequisite exit code and report evidence", () => {
+  const temporary = mkdtempSync(resolve(tmpdir(), "mtc-memory-cli-test-"));
+  try {
+    const output = resolve(temporary, "report.json");
+    const missingBinary = resolve(temporary, "missing-binary");
+    const result = spawnSync(process.execPath, [benchmarkEntry, "--profile", "short", "--binary", missingBinary, "--output", output], { encoding: "utf8", shell: false });
+    assert.equal(result.status, 3);
+    const report = JSON.parse(readFileSync(output, "utf8")) as Record<string, unknown>;
+    assert.equal(report.exit_code, 3);
+    assert.equal(report.error_kind, "prerequisite");
+    assert.equal(report.binary, missingBinary);
+    assert.equal(report.passed, false);
+  } finally {
+    rmSync(temporary, { force: true, recursive: true });
+  }
+});
 
 test("asset gateway gate uses elevated phase start, not original idle", () => {
   const evidence = assetGatewayRssEvidence(180, 150, 40); assert.equal(evidence.gateway_phase_delta_rss_mib, 30); assert.equal(evidence.gateway_cumulative_delta_from_original_idle_mib, 140); assert.ok(evidence.gateway_phase_delta_rss_mib <= 96); assert.ok(evidence.gateway_cumulative_delta_from_original_idle_mib > 96);

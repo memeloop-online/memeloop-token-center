@@ -1,8 +1,8 @@
 -- PostgreSQL-only, low-lock index migration used by
--- ops/backfill-postgres-history-partitions.sh.
+-- ops/backfill-postgres-history-partitions.ts.
 --
 -- ON ONLY creates partitioned-index metadata without building every leaf
--- while holding a parent-table lock.  The shell driver builds any missing leaf
+-- while holding a parent-table lock.  The TypeScript driver builds any missing leaf
 -- indexes with CREATE INDEX CONCURRENTLY, then attaches them.  Existing valid
 -- application indexes are retained and merely verified/attached.
 

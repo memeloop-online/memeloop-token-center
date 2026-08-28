@@ -26,20 +26,21 @@ import {
   rmSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest, type RequestOptions } from "node:https";
 import { isIP } from "node:net";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { parseStrictJson } from "./lib/strict-json.ts";
 
 export const SOURCE_FINGERPRINT_VERSION = 1;
 export const COLLECTOR_FINGERPRINT_VERSION = 2;
 export const CHECKPOINT_VERSION = 2;
-export const MANIFEST_VERSION = 2;
+export const MANIFEST_VERSION = 3;
 export const STABLE_CURSOR_PROTOCOL = "session-snapshot-cursor-v1";
 export const LEGACY_PROJECTION_PROTOCOL = "legacy-last-at-limit-v1";
 const MAX_SESSION_COUNT = 1_000_000;
@@ -65,9 +66,11 @@ type Time = { nanos: bigint };
 type SessionSummary = JsonObject & {
   session_id: string;
   requests: number;
-  first_at: string;
+  first_at?: string;
   last_at: string;
   records_sha256?: string;
+  deleted?: boolean;
+  deleted_at?: string;
 };
 type Projection = {
   sessions: SessionSummary[];
@@ -75,6 +78,9 @@ type Projection = {
   requestCount: number;
   snapshot?: string;
   ingestFence?: string;
+  snapshotSchemaVersion?: number;
+  tombstoneSafeAfterIngestFence?: string;
+  deletedSessionCount: number;
 };
 type TlsFiles = { cert: Buffer; key: Buffer };
 
@@ -110,6 +116,7 @@ function canonicalize(value: unknown): string {
 
 export function canonicalBytes(value: unknown): Buffer { return Buffer.from(canonicalize(value), "utf8"); }
 export function sha256Bytes(value: Buffer | string): string { return createHash("sha256").update(value).digest("hex"); }
+export function compareUtf8Bytewise(left: string, right: string): number { return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")); }
 function isSha256(value: unknown): value is string { return typeof value === "string" && /^[0-9a-f]{64}$/.test(value); }
 
 /** Parse RFC3339 into integer nanoseconds, rejecting absent timezones. */
@@ -192,8 +199,12 @@ async function withCheckpointLock<T>(checkpoint: string, deadline: number, actio
       descriptor = openSync(lockPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW, 0o600);
       const metadata = fstatSync(descriptor);
       if (!metadata.isFile() || (metadata.mode & 0o077) !== 0) throw new DeltaError("checkpoint transaction lock must be a private regular file");
-      const candidate = spawn("sh", ["-c", "flock --exclusive --nonblock 3 || exit 75; printf ready >&4; read _"], {
+      const candidate = spawn("flock", [
+        "--exclusive", "--nonblock", "--conflict-exit-code", "75", "/proc/self/fd/3",
+        process.execPath, "--experimental-strip-types", fileURLToPath(import.meta.url), "--checkpoint-lock-holder",
+      ], {
         stdio: ["pipe", "ignore", "ignore", descriptor, "pipe"],
+        shell: false,
       });
       closeSync(descriptor); descriptor = -1;
       const acquired = await new Promise<boolean>((resolve) => {
@@ -217,6 +228,20 @@ async function withCheckpointLock<T>(checkpoint: string, deadline: number, actio
       await new Promise<void>((resolve) => holder?.once("exit", () => resolve()));
     }
   }
+}
+
+async function runCheckpointLockHolder(argv: string[]): Promise<boolean> {
+  if (argv.length !== 1 || argv[0] !== "--checkpoint-lock-holder") return false;
+  try {
+    const metadata = fstatSync(3);
+    if (!metadata.isFile() || (metadata.mode & 0o077) !== 0) process.exit(76);
+    writeSync(4, Buffer.from("ready"));
+  } catch {
+    process.exit(76);
+  }
+  process.stdin.resume();
+  await new Promise<void>((resolve) => process.stdin.once("end", resolve));
+  return true;
 }
 
 function normalizeHost(value: string): string { return value.replace(/\.+$/, "").toLowerCase(); }
@@ -403,10 +428,19 @@ export class SourceClient {
       if (!isObject(raw)) throw new DeltaError("source session summary is invalid");
       const sessionId = raw.session_id;
       if (typeof sessionId !== "string" || sessionId.length === 0 || seen.has(sessionId)) throw new DeltaError("source session identity is invalid or duplicated");
-      if (strict && (sessionId.length > 512 || [...sessionId].some((character) => character.charCodeAt(0) < 0x21 || character.charCodeAt(0) > 0x7e))) throw new DeltaError("source stable session identity is not printable ASCII");
-      const last = parseTime(raw.last_at, "source session last_at"); const first = parseTime(raw.first_at, "source session first_at");
-      if (compareTime(first, last) > 0) throw new DeltaError("source session time range is invalid");
-      if (strict && (raw.first_at !== formatTime(first) || raw.last_at !== formatTime(last) || !isSha256(raw.records_sha256))) throw new DeltaError("source stable session timestamps or record digest are invalid");
+      if (strict && (sessionId.length > 512 || [...sessionId].some((character) => character.charCodeAt(0) < 0x20 || character.charCodeAt(0) > 0x7e))) throw new DeltaError("source stable session identity is not printable ASCII");
+      const deleted = raw.deleted === true;
+      const last = parseTime(raw.last_at, "source session last_at");
+      if (deleted) {
+        const deletedAt = parseTime(raw.deleted_at, "source session deleted_at");
+        if (!strict || raw.requests !== 0 || raw.first_at !== undefined || raw.records_sha256 !== undefined || raw.last_at !== formatTime(last)
+            || raw.deleted_at !== formatTime(deletedAt) || compareTime(last, deletedAt) !== 0) throw new DeltaError("source stable session tombstone is invalid");
+      } else {
+        if (raw.deleted !== undefined || raw.deleted_at !== undefined) throw new DeltaError("source session contains unsupported tombstone fields");
+        const first = parseTime(raw.first_at, "source session first_at");
+        if (compareTime(first, last) > 0) throw new DeltaError("source session time range is invalid");
+        if (strict && (raw.first_at !== formatTime(first) || raw.last_at !== formatTime(last) || !isSha256(raw.records_sha256))) throw new DeltaError("source stable session timestamps or record digest are invalid");
+      }
       if (previous !== undefined && (compareTime(last, previous[0]) > 0 || (strict && compareTime(last, previous[0]) === 0 && sessionId <= previous[1]))) throw new DeltaError("source sessions are not in stable last_at/session_id order");
       if (!Number.isSafeInteger(raw.requests) || (raw.requests as number) < 0) throw new DeltaError("source session request count is invalid");
       const item = raw as SessionSummary; output.push(item); seen.add(sessionId); previous = [last, sessionId];
@@ -430,7 +464,7 @@ export class SourceClient {
   async stableSessions(limit: number, lowerBound: Time, snapshot?: string, afterFence?: string): Promise<Projection> {
     if (afterFence !== undefined) afterFence = SourceClient.ingestFence(afterFence, "prior ingest fence");
     const sessions: SessionSummary[] = []; const seenSessions = new Set<string>(); const seenCursors = new Set<string>();
-    let cursor: string | undefined; let expected: [string, string, number, number, string] | undefined; let expectedSnapshot = snapshot;
+    let cursor: string | undefined; let expected: [string, string, number, number, string, number, string | null, number] | undefined; let expectedSnapshot = snapshot;
     let previous: [Time, string] | undefined; let pageCount = 0;
     while (true) {
       const query: Record<string, string> = { limit: String(limit), cursor_protocol: STABLE_CURSOR_PROTOCOL, lower_bound_completed_at: formatTime(lowerBound) };
@@ -445,12 +479,19 @@ export class SourceClient {
       const pageSnapshot = this.opaqueCursor(payload.snapshot, "snapshot"); const fence = SourceClient.ingestFence(payload.ingest_fence, "ingest fence");
       if (afterFence !== undefined && BigInt(fence) < BigInt(afterFence)) throw new DeltaError("source ingest fence moved backwards");
       const count = payload.session_count, requests = payload.request_count, digest = payload.session_set_sha256, complete = payload.complete;
-      if (!Number.isSafeInteger(count) || (count as number) < 0 || (count as number) > MAX_SESSION_COUNT || !Number.isSafeInteger(requests) || (requests as number) < 0 || !isSha256(digest) || typeof complete !== "boolean") throw new DeltaError("source stable session projection metadata is invalid");
-      const metadata: [string, string, number, number, string] = [pageSnapshot, fence, count as number, requests as number, digest];
+      const schemaVersion = payload.snapshot_schema_version === undefined ? 1 : payload.snapshot_schema_version;
+      if (![1, 2].includes(schemaVersion as number)) throw new DeltaError("source stable snapshot schema is unsupported");
+      const tombstoneFence = schemaVersion === 2 ? SourceClient.ingestFence(payload.tombstone_safe_after_ingest_fence, "tombstone-safe ingest fence") : undefined;
+      const deletedCount = schemaVersion === 2 ? payload.deleted_session_count : 0;
+      if (!Number.isSafeInteger(count) || (count as number) < 0 || (count as number) > MAX_SESSION_COUNT || !Number.isSafeInteger(requests) || (requests as number) < 0 || !isSha256(digest) || typeof complete !== "boolean"
+          || !Number.isSafeInteger(deletedCount) || (deletedCount as number) < 0 || (deletedCount as number) > (count as number)) throw new DeltaError("source stable session projection metadata is invalid");
+      if (schemaVersion === 2 && afterFence !== undefined && BigInt(afterFence) < BigInt(tombstoneFence!)) throw new DeltaError("source accepted a prior fence before its tombstone-safe upgrade fence");
+      const metadata: [string, string, number, number, string, number, string | null, number] = [pageSnapshot, fence, count as number, requests as number, digest, schemaVersion as number, tombstoneFence ?? null, deletedCount as number];
       if (expected === undefined) { expected = metadata; expectedSnapshot = pageSnapshot; }
       else if (canonicalize(expected) !== canonicalize(metadata)) throw new DeltaError("source stable session projection metadata changed between pages");
       if (snapshot !== undefined && pageSnapshot !== snapshot) throw new DeltaError("source stable session snapshot could not be replayed");
       const page = this.sessionItems(payload.sessions ?? payload.items, true); pageCount += 1;
+      if (schemaVersion === 1 && page.some((item) => item.deleted === true)) throw new DeltaError("source snapshot schema v1 contains tombstones");
       if (page.length > limit || (page.length === 0 && !complete)) throw new DeltaError("source stable session projection page is invalid");
       if (!complete && page.length !== limit) throw new DeltaError("source stable session projection has a short page gap");
       if (pageCount > Math.max(1, Math.ceil((count as number) / limit))) throw new DeltaError("source stable session projection has too many pages");
@@ -469,8 +510,9 @@ export class SourceClient {
     if (expected === undefined) throw new DeltaError("source stable session projection is empty without metadata");
     if (sessions.length !== expected[2]) throw new DeltaError("source stable session projection has a gap");
     if (sessions.reduce((sum, item) => sum + item.requests, 0) !== expected[3]) throw new DeltaError("source stable session projection request count disagrees");
+    if (sessions.filter((item) => item.deleted === true).length !== expected[7]) throw new DeltaError("source stable session projection tombstone count disagrees");
     if (selectionDigest(sessions) !== expected[4]) throw new DeltaError("source stable session projection digest disagrees");
-    return { sessions, protocol: STABLE_CURSOR_PROTOCOL, requestCount: expected[3], snapshot: expected[0], ingestFence: expected[1] };
+    return { sessions, protocol: STABLE_CURSOR_PROTOCOL, requestCount: expected[3], snapshot: expected[0], ingestFence: expected[1], snapshotSchemaVersion: expected[5], ...(expected[6] === null ? {} : { tombstoneSafeAfterIngestFence: expected[6] }), deletedSessionCount: expected[7] };
   }
   async statsRecords(): Promise<number> {
     const payload = await this.managementJson(this.paths.stats, {});
@@ -582,13 +624,21 @@ async function fileDigest(path: string): Promise<[number, string]> {
 function validateManifest(manifest: unknown, fingerprint: string, output: string): JsonObject {
   if (!isObject(manifest)) throw new DeltaError("delta manifest is invalid");
   const integers = ["sequence", "overlap_seconds", "max_future_skew_seconds", "session_limit", "session_count", "record_count", "source_records_before", "source_records_after", "output_size_bytes"];
-  if (![1, MANIFEST_VERSION].includes(manifest.version as number) || manifest.source_fingerprint !== fingerprint || manifest.output_file !== basename(output)
+  if (![1, 2, MANIFEST_VERSION].includes(manifest.version as number) || manifest.source_fingerprint !== fingerprint || manifest.output_file !== basename(output)
       || integers.some((key) => !Number.isSafeInteger(manifest[key]) || (manifest[key] as number) < 0) || (manifest.sequence as number) < 1
       || (manifest.overlap_seconds as number) < 1 || !isSha256(manifest.output_sha256) || !isSha256(manifest.session_set_sha256) || typeof manifest.stable_source_required !== "boolean") throw new DeltaError("delta manifest is invalid");
   if (manifest.prior_output_sha256 !== null && !isSha256(manifest.prior_output_sha256)) throw new DeltaError("delta manifest prior output digest is invalid");
   const protocol = (manifest.session_projection_protocol ?? LEGACY_PROJECTION_PROTOCOL) as string;
   if (![LEGACY_PROJECTION_PROTOCOL, STABLE_CURSOR_PROTOCOL].includes(protocol)) throw new DeltaError("delta manifest session projection protocol is invalid");
-  if (protocol === STABLE_CURSOR_PROTOCOL) { if (!Number.isSafeInteger(manifest.source_projection_requests) || !isSha256(manifest.source_snapshot_sha256)) throw new DeltaError("delta manifest stable snapshot metadata is invalid"); SourceClient.ingestFence(manifest.source_ingest_fence, "manifest ingest fence"); }
+  if (protocol === STABLE_CURSOR_PROTOCOL) {
+    if (!Number.isSafeInteger(manifest.source_projection_requests) || !isSha256(manifest.source_snapshot_sha256)) throw new DeltaError("delta manifest stable snapshot metadata is invalid");
+    SourceClient.ingestFence(manifest.source_ingest_fence, "manifest ingest fence");
+    if (manifest.version === MANIFEST_VERSION) {
+      if (![1, 2].includes(manifest.snapshot_schema_version as number) || !Number.isSafeInteger(manifest.deleted_session_count) || (manifest.deleted_session_count as number) < 0) throw new DeltaError("delta manifest snapshot schema metadata is invalid");
+      if (manifest.snapshot_schema_version === 2) SourceClient.ingestFence(manifest.tombstone_safe_after_ingest_fence, "manifest tombstone-safe ingest fence");
+      else if (manifest.tombstone_safe_after_ingest_fence !== null || manifest.deleted_session_count !== 0) throw new DeltaError("delta manifest schema v1 contains tombstone metadata");
+    }
+  }
   const prior = parseCanonicalTime(manifest.prior_watermark_completed_at, "delta manifest prior watermark");
   const lower = parseCanonicalTime(manifest.lower_bound_completed_at, "delta manifest lower bound");
   const watermark = parseCanonicalTime(manifest.watermark_completed_at, "delta manifest watermark");
@@ -619,9 +669,11 @@ async function resumeOutput(output: string, pending: string, manifestPath: strin
 }
 
 export function selectionDigest(sessions: SessionSummary[]): string {
-  const stable = sessions.map((item) => ({ session_id: item.session_id, requests: item.requests, first_at: formatTime(parseTime(item.first_at, "source session first_at")), last_at: formatTime(parseTime(item.last_at, "source session last_at")), ...(item.records_sha256 === undefined ? {} : { records_sha256: item.records_sha256 }) }));
-  stable.sort((left, right) => left.session_id.localeCompare(right.session_id, "en"));
-  return sha256Bytes(canonicalBytes(stable));
+  const stable = sessions.map((item) => item.deleted === true
+    ? ({ last_at: formatTime(parseTime(item.last_at, "source session last_at")), requests: 0, session_id: item.session_id, deleted: true, deleted_at: formatTime(parseTime(item.deleted_at, "source session deleted_at")) })
+    : ({ first_at: formatTime(parseTime(item.first_at, "source session first_at")), last_at: formatTime(parseTime(item.last_at, "source session last_at")), ...(item.records_sha256 === undefined ? {} : { records_sha256: item.records_sha256 }), requests: item.requests, session_id: item.session_id }));
+  stable.sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id));
+  return sha256Bytes(JSON.stringify(stable));
 }
 async function loadProjection(client: SourceClient, lower: Time, limit: number, sourceRecords: number, snapshot?: string, fence?: string): Promise<Projection> {
   if (snapshot !== undefined) return client.stableSessions(limit, lower, snapshot, fence);
@@ -632,10 +684,10 @@ async function loadProjection(client: SourceClient, lower: Time, limit: number, 
   if (legacy.length < limit && legacy.reduce((sum, item) => sum + item.requests, 0) !== sourceRecords) throw new DeltaError("source record count disagrees with the complete session projection");
   const selected = legacy.filter((item) => compareTime(parseTime(item.last_at, "source session last_at"), lower) >= 0);
   if (legacy.length === limit && compareTime(parseTime(legacy.at(-1)!.last_at, "source session last_at"), lower) >= 0) throw new DeltaError(`source session projection is saturated and does not implement ${STABLE_CURSOR_PROTOCOL}`);
-  return { sessions: selected, protocol: LEGACY_PROJECTION_PROTOCOL, requestCount: selected.reduce((sum, item) => sum + item.requests, 0) };
+  return { sessions: selected, protocol: LEGACY_PROJECTION_PROTOCOL, requestCount: selected.reduce((sum, item) => sum + item.requests, 0), deletedSessionCount: 0 };
 }
 function verifyClock(sessions: SessionSummary[], maximum: Time): void {
-  for (const item of sessions) if (compareTime(parseTime(item.first_at, "source session first_at"), maximum) > 0 || compareTime(parseTime(item.last_at, "source session last_at"), maximum) > 0) throw new DeltaError("source session timestamp exceeds the future-skew limit");
+  for (const item of sessions) if ((item.first_at !== undefined && compareTime(parseTime(item.first_at, "source session first_at"), maximum) > 0) || compareTime(parseTime(item.last_at, "source session last_at"), maximum) > 0) throw new DeltaError("source session timestamp exceeds the future-skew limit");
 }
 
 type Arguments = {
@@ -680,7 +732,12 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
     const seen = database.prepare("SELECT session_id, digest FROM seen_records WHERE request_id=?");
     const addSeen = database.prepare("INSERT INTO seen_records VALUES(?,?,?,?)"); const addRecord = database.prepare("INSERT INTO records VALUES(?,?,?,?,?)");
     let selectedBytes = 0;
-    for (const session of [...first.sessions].sort((left, right) => left.session_id.localeCompare(right.session_id, "en"))) {
+    for (const session of [...first.sessions].sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id))) {
+      if (session.deleted === true) {
+        const deletedAt = parseTime(session.deleted_at, "source session deleted_at");
+        if (compareTime(deletedAt, maximumCompleted) > 0) maximumCompleted = deletedAt;
+        continue;
+      }
       let exported = 0;
       for await (const rawLine of client.exportLines(session.session_id, args.maxLineBytes, first.snapshot, session.records_sha256)) {
         let item: unknown; try { item = parseStrictJson(rawLine.toString("utf8")); } catch { throw new DeltaError("source archive stream contains invalid JSON"); }
@@ -719,13 +776,35 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
     const after = await client.statsRecords(); if (args.requireStableSource && after !== before) throw new DeltaError("source record count changed despite the requested write barrier"); if (after < before) throw new DeltaError("source record count decreased during delta export");
     outputTemporary = join(dirname(args.output), `.${basename(args.output)}.${process.pid}.${Date.now()}`); const descriptor = openSync(outputTemporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
     const outputDigest = createHash("sha256"); let outputSize = 0, recordCount = 0;
-    try { for (const row of database.prepare("SELECT canonical FROM records ORDER BY started_at, request_id").iterate() as Iterable<{ canonical: Uint8Array }>) { const bytes = Buffer.from(row.canonical); writeFileSync(descriptor, bytes); outputDigest.update(bytes); outputSize += bytes.length; recordCount += 1; } fsyncSync(descriptor); } finally { closeSync(descriptor); }
+    try {
+      if (first.snapshotSchemaVersion === 2) {
+        for (const session of [...first.sessions].sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id))) {
+          const summary = session.deleted === true
+            ? { _mtc_delta_type: "session_summary", schema_version: 2, session_id: session.session_id, requests: 0, last_at: session.last_at, deleted: true, deleted_at: session.deleted_at }
+            : { _mtc_delta_type: "session_summary", schema_version: 2, session_id: session.session_id, requests: session.requests, first_at: session.first_at, last_at: session.last_at, records_sha256: session.records_sha256 };
+          const summaryBytes = Buffer.concat([canonicalBytes(summary), Buffer.from("\n")]);
+          if (outputSize + summaryBytes.length > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
+          writeFileSync(descriptor, summaryBytes); outputDigest.update(summaryBytes); outputSize += summaryBytes.length;
+          if (session.deleted !== true) {
+            for (const row of database.prepare("SELECT canonical FROM seen_records WHERE session_id=? ORDER BY request_id COLLATE BINARY").iterate(session.session_id) as Iterable<{ canonical: Uint8Array }>) {
+              const bytes = Buffer.from(row.canonical);
+              if (outputSize + bytes.length > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
+              writeFileSync(descriptor, bytes); outputDigest.update(bytes); outputSize += bytes.length; recordCount += 1;
+            }
+          }
+        }
+      } else {
+        for (const row of database.prepare("SELECT canonical FROM records ORDER BY started_at, request_id COLLATE BINARY").iterate() as Iterable<{ canonical: Uint8Array }>) { const bytes = Buffer.from(row.canonical); writeFileSync(descriptor, bytes); outputDigest.update(bytes); outputSize += bytes.length; recordCount += 1; }
+      }
+      fsyncSync(descriptor);
+    } finally { closeSync(descriptor); }
     renameSync(outputTemporary, pending); outputTemporary = undefined; fsyncDirectory(dirname(args.output));
     const manifest: JsonObject = { version: MANIFEST_VERSION, source_fingerprint: fingerprint, observed_at: formatTime(observed), max_future_skew_seconds: args.maxFutureSkewSeconds,
       sequence, prior_watermark_completed_at: formatTime(prior), prior_output_sha256: checkpoint?.last_output_sha256 ?? null, lower_bound_completed_at: formatTime(lower), overlap_seconds: args.overlapSeconds,
       watermark_completed_at: formatTime(maximumCompleted), max_started_at: maximumStarted === undefined ? null : formatTime(maximumStarted), session_limit: args.sessionLimit, session_count: first.sessions.length,
       session_projection_protocol: first.protocol, source_mode: client.paths.mode, offline_full_snapshot: args.offlineFull, source_projection_requests: first.requestCount,
       source_snapshot_sha256: first.snapshot === undefined ? null : sha256Bytes(first.snapshot), prior_source_ingest_fence: priorFence ?? null, source_ingest_fence: first.ingestFence ?? null,
+      snapshot_schema_version: first.snapshotSchemaVersion ?? null, tombstone_safe_after_ingest_fence: first.tombstoneSafeAfterIngestFence ?? null, deleted_session_count: first.deletedSessionCount,
       session_set_sha256: firstDigest, record_count: recordCount, source_records_before: before, source_records_after: after, stable_source_required: args.requireStableSource,
       output_file: basename(args.output), output_size_bytes: outputSize, output_sha256: outputDigest.digest("hex") };
     writeAtomicJson(manifestPath, manifest); renameSync(pending, args.output); fsyncDirectory(dirname(args.output)); commitCheckpoint(args.checkpoint, fingerprint, manifest); return manifest;
@@ -803,7 +882,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().then((code) => { process.exitCode = code; }).catch((error: unknown) => {
+  runCheckpointLockHolder(process.argv.slice(2)).then((held) => held ? 0 : main()).then((code) => { process.exitCode = code; }).catch((error: unknown) => {
     if (error instanceof DeltaError) process.stderr.write(`delta export refused: ${error.message}\n`);
     else if (process.env.MTC_DELTA_DEBUG === "1") process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
     else process.stderr.write("delta export failed because of a local I/O error\n");

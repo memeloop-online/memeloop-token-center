@@ -8,7 +8,7 @@ Build an optimized binary from the exact release commit, then run the 15-minute 
 
 ```bash
 cargo build --release --bin memeloop-token-center
-ops/benchmark-memory.sh --profile acceptance \
+node ops/benchmark-memory.ts --profile acceptance \
   --output tests/load/results/memory-$(git rev-parse --short HEAD).json
 ```
 
@@ -38,7 +38,7 @@ The acceptance profile performs all of the following:
 For quick local feedback, the short profile uses a 100 MiB asset and a 30-second soak. It covers the same paths, but its RSS slope is informational because such a short regression is statistically noisy:
 
 ```bash
-ops/benchmark-memory.sh --profile short --binary target/debug/memeloop-token-center
+node ops/benchmark-memory.ts --profile short --binary target/debug/memeloop-token-center
 ```
 
 Default release thresholds are deliberately well below the historical 1 GiB CPA process and leave explicit headroom under the chart's 256 MiB gateway limit:
@@ -100,7 +100,7 @@ Run the plan suite read-only against an imported, analyzed PostgreSQL snapshot w
 
 ```bash
 MTC_BENCH_DATABASE_URL='postgres://…' \
-  ops/benchmark-postgres.sh \
+  node ops/benchmark-postgres.ts \
   --max-execution-ms 250 \
   --min-request-rows 100000 \
   --output tests/load/results/postgres-explain-$(git rev-parse --short HEAD).json
@@ -129,16 +129,16 @@ On PostgreSQL, the same migration installs the parent partitioned
 `request_records_recent_idx` and `request_events_global_cursor_idx` indexes, so
 fresh Helm deployments have global history and SSE cursor paths without a
 manual operator step. Running
-`ops/backfill-postgres-history-partitions.sh --indexes-only` remains the
+`node ops/backfill-postgres-history-partitions.ts --apply --indexes-only` remains the
 low-lock repair path for databases that were created by an older build.
 
 ```bash
 PGHOST=… PGUSER=… PGDATABASE=… \
-  ops/reconcile-postgres-request-stats.sh \
+  node ops/reconcile-postgres-request-stats.ts \
   --from 2026-07-01 --before 2026-08-01 --max-days 31
 
 PGHOST=… PGUSER=… PGDATABASE=… \
-  ops/reconcile-postgres-request-stats.sh \
+  node ops/reconcile-postgres-request-stats.ts \
   --from 2026-07-01 --before 2026-08-01 --max-days 31 --apply
 ```
 

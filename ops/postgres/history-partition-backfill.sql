@@ -2,7 +2,7 @@
 --
 -- This file is deliberately not an application schema migration.  It installs
 -- a restartable operator procedure and its progress table.  Run it through
--- ops/backfill-postgres-history-partitions.sh, which defaults to a read-only
+-- ops/backfill-postgres-history-partitions.ts, which defaults to a read-only
 -- dry run and holds a session advisory lock around each CALL.
 
 CREATE TABLE IF NOT EXISTS public.mtc_history_partition_backfill_state (

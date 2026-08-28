@@ -333,6 +333,7 @@ function buildInventory(configPath: string, authDirectory: string, policy: Trans
   if (new Set(identities).size !== identities.length || new Set(names).size !== names.length) throw new ImportFailure("CPA source contains a stable identity conflict");
   if (policy.matchedPrivateTargetBaseUrls.size !== policy.privateTargetBaseUrls.size) throw new ImportFailure("CPA transport policy contains a private target absent from the source");
   if (policy.matchedResultOriginBaseUrls.size !== policy.resultOriginsByBaseUrl.size) throw new ImportFailure("CPA transport policy contains a result-origin target absent from the source");
+  if (direct.some((record) => record.config.network_scope === "private" && record.proxySecretRef === undefined)) throw new ImportFailure("CPA private target requires an approved private SOCKS5 proxy");
   if (identities.length === 0) throw new ImportFailure("CPA source contains no active supported upstream accounts");
   return [{ direct, native, managed, disabledSourceCount: disabledConfig + disabledAuth }, secrets];
 }

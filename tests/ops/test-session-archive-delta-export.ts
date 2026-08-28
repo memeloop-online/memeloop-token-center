@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -11,6 +11,7 @@ import { spawn } from "node:child_process";
 import test, { after, before, beforeEach } from "node:test";
 import {
   canonicalBytes,
+  compareUtf8Bytewise,
   formatTime,
   parseTime,
   selectionDigest,
@@ -31,7 +32,7 @@ type RecordValue = Record<string, unknown> & {
   started_at: string;
   completed_at: string;
 };
-type Session = { session_id: string; requests: number; first_at: string; last_at: string; records_sha256?: string };
+type Session = { session_id: string; requests: number; first_at?: string; last_at: string; records_sha256?: string; deleted?: boolean; deleted_at?: string };
 type State = {
   records: Map<string, RecordValue[]>;
   stable: boolean;
@@ -41,12 +42,15 @@ type State = {
   directAuthorizationSeen: boolean;
   snapshot: string;
   fence: string;
+  snapshotSchemaVersion: 1 | 2;
+  tombstoneFence: string;
+  tombstones: Session[];
 };
 
 function canonicalLine(value: unknown): Buffer { return Buffer.concat([canonicalBytes(value), Buffer.from("\n")]); }
 function digestRecords(rows: RecordValue[]): string {
   const digest = createHash("sha256");
-  for (const row of [...rows].sort((left, right) => left.request_id.localeCompare(right.request_id, "en"))) digest.update(canonicalLine(row));
+  for (const row of [...rows].sort((left, right) => compareUtf8Bytewise(left.request_id, right.request_id))) digest.update(canonicalLine(row));
   return digest.digest("hex");
 }
 function record(requestId: string, sessionId: string, startedAt: string, completedAt: string): RecordValue {
@@ -67,14 +71,15 @@ function record(requestId: string, sessionId: string, startedAt: string, complet
   };
 }
 function sessions(state: State): Session[] {
-  const result = [...state.records.entries()].map(([sessionId, rows]) => ({
+  const result: Session[] = [...state.records.entries()].map(([sessionId, rows]) => ({
     session_id: sessionId,
     requests: rows.length,
     first_at: rows.map((row) => row.started_at).sort()[0]!,
     last_at: rows.map((row) => row.completed_at).sort().at(-1)!,
     ...(state.stable ? { records_sha256: digestRecords(rows) } : {}),
   }));
-  result.sort((left, right) => right.last_at.localeCompare(left.last_at, "en") || left.session_id.localeCompare(right.session_id, "en"));
+  result.push(...state.tombstones);
+  result.sort((left, right) => right.last_at.localeCompare(left.last_at, "en") || compareUtf8Bytewise(left.session_id, right.session_id));
   return result;
 }
 function sendJson(response: ServerResponse, value: unknown, status = 200): void {
@@ -117,6 +122,7 @@ const server = createServer((request: IncomingMessage, response: ServerResponse)
       session_count: all.length,
       request_count: all.reduce((sum, item) => sum + item.requests, 0),
       session_set_sha256: selectionDigest(all),
+      ...(state.snapshotSchemaVersion === 2 ? { snapshot_schema_version: 2, tombstone_safe_after_ingest_fence: state.tombstoneFence, deleted_session_count: state.tombstones.length } : {}),
       complete,
       next_cursor: complete ? null : String(cursor + page.length),
       sessions: page,
@@ -143,7 +149,7 @@ before(async () => {
 });
 after(async () => { await new Promise<void>((resolveClose, reject) => server.close((error) => error === undefined ? resolveClose() : reject(error))); });
 beforeEach(() => {
-  state = { records: new Map(), stable: false, redirects: false, leakCalls: 0, authorizationOnTicket: false, directAuthorizationSeen: false, snapshot: "snapshot-one", fence: "7" };
+  state = { records: new Map(), stable: false, redirects: false, leakCalls: 0, authorizationOnTicket: false, directAuthorizationSeen: false, snapshot: "snapshot-one", fence: "7", snapshotSchemaVersion: 1, tombstoneFence: "0", tombstones: [] };
 });
 
 async function run(arguments_: string[], environment: NodeJS.ProcessEnv = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -168,6 +174,15 @@ test("canonical helpers preserve six-digit UTC timestamps and deterministic keys
   assert.equal(canonicalBytes({ z: 1, a: { y: 2, x: 3 } }).toString(), '{"a":{"x":3,"y":2},"z":1}');
 });
 
+test("schema-v2 set digest matches the fixed Go field order and bytewise session order", () => {
+  const projection: Session[] = [
+    { session_id: "a", requests: 0, last_at: "2026-01-03T03:04:05.000000Z", deleted: true, deleted_at: "2026-01-03T03:04:05.000000Z" },
+    { session_id: "Z", requests: 2, first_at: "2026-01-02T03:04:05.000000Z", last_at: "2026-01-02T03:05:06.000000Z", records_sha256: "1".repeat(64) },
+  ];
+  assert.equal(selectionDigest(projection), "0a0b2faaba791ab3d356fe3e143119e94f09a801c47e5c2b102912535a88505b");
+  assert.deepEqual(["_", "-", "0", "a", "A", "Z"].sort(compareUtf8Bytewise), ["-", "0", "A", "Z", "_", "a"]);
+});
+
 test("legacy source fingerprint remains version-one compatible and plugin envelopes are strict", () => {
   const base = `http://127.0.0.1:${port}`;
   const client = new SourceClient(base, base, TOKEN, 5, true, new Set());
@@ -185,6 +200,32 @@ test("legacy source fingerprint remains version-one compatible and plugin envelo
   const body = Buffer.from('{"records":3}').toString("base64");
   assert.equal(canonicalBytes(unwrapJson({ StatusCode: 200, Body: body })).toString(), '{"records":3}');
   assert.throws(() => unwrapJson({ StatusCode: 200, Body: "%%%" }), /body is invalid/);
+});
+
+test("checkpoint holder keeps the validated inode locked without a shell", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "mtc-delta-lock-"));
+  const lock = join(directory, "checkpoint.lock");
+  let descriptor = -1;
+  try {
+    writeFileSync(lock, "", { mode: 0o600 });
+    descriptor = openSync(lock, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
+    const holderArgs = ["--exclusive", "--nonblock", "--conflict-exit-code", "75", "/proc/self/fd/3", process.execPath, "--experimental-strip-types", EXPORTER, "--checkpoint-lock-holder"];
+    const first = spawn("flock", holderArgs, { stdio: ["pipe", "ignore", "pipe", descriptor, "pipe"], shell: false });
+    await new Promise<void>((resolve, reject) => {
+      first.once("error", reject);
+      first.stdio[4]?.once("data", (chunk) => String(chunk).includes("ready") ? resolve() : reject(new Error("lock holder readiness marker changed")));
+      first.once("exit", (code) => reject(new Error(`lock holder exited before readiness: ${code}`)));
+    });
+    const second = spawn("flock", holderArgs, { stdio: ["pipe", "ignore", "pipe", descriptor, "pipe"], shell: false });
+    const conflict = await new Promise<number>((resolve, reject) => { second.once("error", reject); second.once("exit", (code) => resolve(code ?? -1)); });
+    assert.equal(conflict, 75, "flock contention must use the dedicated retryable exit code");
+    first.stdin!.end();
+    assert.equal(await new Promise<number>((resolve) => first.once("exit", (code) => resolve(code ?? -1))), 0);
+    assert.doesNotMatch(readFileSync(EXPORTER, "utf8"), /spawn\(["']sh["']/);
+  } finally {
+    if (descriptor >= 0) closeSync(descriptor);
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("stable snapshot contract still rejects non-canonical nanosecond timestamps", async () => {
@@ -241,6 +282,46 @@ test("stable snapshot pages and record digests are verified", async () => {
     const manifest = JSON.parse(readFileSync(`${paths.output}.manifest.json`, "utf8")) as Record<string, unknown>;
     assert.equal(manifest.session_projection_protocol, STABLE_CURSOR_PROTOCOL); assert.equal(manifest.source_ingest_fence, "7"); assert.equal(manifest.session_count, 3);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("stable snapshot schema v2 exports tombstones without requesting archive tickets", async () => {
+  const paths = fixture();
+  try {
+    state.stable = true;
+    state.snapshotSchemaVersion = 2;
+    state.tombstoneFence = "5";
+    state.records.set("session-present", [record("request-present", "session-present", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z")]);
+    state.tombstones.push({ session_id: "session-deleted", requests: 0, last_at: "2025-01-03T01:00:00.000000Z", deleted: true, deleted_at: "2025-01-03T01:00:00.000000Z" });
+    const result = await run(baseArguments(paths));
+    assert.equal(result.code, 0, result.stderr);
+    const output = readFileSync(paths.output, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(output.length, 3);
+    assert.equal(output[0]!._mtc_delta_type, "session_summary");
+    assert.equal(output[0]!.session_id, "session-deleted");
+    assert.equal(output[0]!.deleted, true);
+    assert.equal(output[1]!._mtc_delta_type, "session_summary");
+    assert.equal(output[1]!.session_id, "session-present");
+    assert.equal(output[2]!.request_id, "request-present");
+    const manifest = JSON.parse(readFileSync(`${paths.output}.manifest.json`, "utf8")) as Record<string, unknown>;
+    assert.equal(manifest.version, 3);
+    assert.equal(manifest.snapshot_schema_version, 2);
+    assert.equal(manifest.tombstone_safe_after_ingest_fence, "5");
+    assert.equal(manifest.deleted_session_count, 1);
+    assert.equal(manifest.record_count, 1);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("stable snapshot schema and tombstone metadata fail closed", async () => {
+  state.stable = true;
+  state.snapshotSchemaVersion = 2;
+  state.tombstoneFence = "9";
+  state.fence = "10";
+  state.tombstones.push({ session_id: "session-deleted", requests: 0, last_at: "2025-01-03T01:00:00.000000Z", deleted: true, deleted_at: "2025-01-03T01:00:00.000000Z" });
+  const base = `http://127.0.0.1:${port}`;
+  const client = new SourceClient(base, base, TOKEN, 5, true, new Set());
+  await assert.rejects(client.stableSessions(10, parseTime("2025-01-01T00:00:00.000000Z", "lower bound"), undefined, "8"), /before its tombstone-safe upgrade fence/);
+  state.tombstones[0]!.records_sha256 = "a".repeat(64);
+  await assert.rejects(client.stableSessions(10, parseTime("2025-01-01T00:00:00.000000Z", "lower bound")), /tombstone is invalid/);
 });
 
 test("collector-direct offline baseline uses stable snapshots without CPA authorization", async () => {

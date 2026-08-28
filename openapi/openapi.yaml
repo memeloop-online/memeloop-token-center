@@ -3338,12 +3338,14 @@ paths:
     post:
       tags: [Multimodal generation]
       operationId: createMultimodalGeneration
-      summary: Queue a provider-native Seedance or ComfyUI generation job
+      summary: Queue a provider-native Seedance, SiliconFlow, or ComfyUI generation job
       description: |
         `Idempotency-Key` is optional. Its namespace is scoped to the authenticated stable
         client identity. The first request is accepted with 202; replaying the same key
         with the same canonical `model` and `input` returns the same job with 200 and does
         not reserve quota twice. Reusing it with different content returns 400.
+        SiliconFlow T2V routes use `input.parameters` with required `prompt` and
+        `image_size`, plus optional `negative_prompt` and integer `seed`.
       security: [{ clientBearer: [] }]
       parameters: [{ $ref: '#/components/parameters/OptionalIdempotencyKey' }]
       requestBody:
@@ -6016,7 +6018,7 @@ components:
       required: [model, input]
       properties:
         model: { type: string, minLength: 1, maxLength: 200 }
-        input: { type: object, additionalProperties: true, description: Provider-native Seedance task body or administrator-owned ComfyUI workflow inputs. }
+        input: { type: object, additionalProperties: true, description: Provider-native Seedance input, closed SiliconFlow T2V parameters, or administrator-owned ComfyUI workflow inputs. Consult the selected model's generation_schema when present. }
     OpenAIImageRequest:
       type: object
       required: [model, prompt]

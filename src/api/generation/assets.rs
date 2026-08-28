@@ -222,6 +222,18 @@ pub(in crate::api) async fn cancel_self_generation(
     Path(job_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
+    let current = state.db.generation_job(key.key_id, job_id).await?;
+    if current.driver == "http-json"
+        && current.upstream_job_id.is_some()
+        && !matches!(
+            current.status.as_str(),
+            "succeeded" | "failed" | "cancelled"
+        )
+    {
+        return Err(AppError::BadRequest(
+            "this video provider does not expose confirmed upstream cancellation".into(),
+        ));
+    }
     Ok(Json(
         state.db.cancel_generation_job(key.key_id, job_id).await?,
     ))

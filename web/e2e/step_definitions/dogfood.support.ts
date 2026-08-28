@@ -72,22 +72,25 @@ export async function submitPortalGeneration(
   prompt: string,
   duration = '5',
   parameters: Record<string, string> = {},
-): Promise<void> {
+  expectsDuration = kind === 'video',
+): Promise<unknown> {
   const panel = page.locator('.generation-create');
   const kindSelect = panel.getByLabel('生成类型');
   await kindSelect.selectOption(kind);
   await assertValue(kindSelect, kind);
-  if (kind === 'video') await assertVisible(panel.getByLabel('时长（秒）'));
   const modelInput = panel.getByLabel('模型');
   const promptInput = panel.getByLabel('提示词');
   await modelInput.fill(generationModel);
   await assertValue(modelInput, generationModel);
   await promptInput.fill(prompt);
   await assertValue(promptInput, prompt);
-  if (kind === 'video') {
-    const durationInput = panel.getByLabel('时长（秒）');
+  const durationInput = panel.getByLabel('时长（秒）');
+  if (expectsDuration) {
+    await assertVisible(durationInput);
     await durationInput.fill(duration);
     await assertValue(durationInput, duration);
+  } else {
+    await assertNoCount(durationInput);
   }
   if (Object.keys(parameters).length) await assertVisible(panel.getByRole('heading', { name: '工作流参数', exact: true }));
   for (const [label, value] of Object.entries(parameters)) {
@@ -111,6 +114,7 @@ export async function submitPortalGeneration(
   const response = await responsePromise;
   assert.equal(response.status(), 202);
   await assertContains(panel.getByRole('status'), '任务已提交');
+  return request.postDataJSON();
 }
 
 export async function waitForGenerationStatus(page: Page, generationModel: string, status: string): Promise<Locator> {

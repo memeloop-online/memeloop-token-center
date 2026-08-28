@@ -409,3 +409,46 @@ fn builtin_http_json_optionally_bounds_trusted_input_token_overhead() {
         .is_err()
     );
 }
+
+#[test]
+fn builtin_http_json_exposes_only_the_fixed_siliconflow_video_profile() {
+    let catalog = ProviderCatalog::builtins();
+    let http_json = catalog.get("http-json").unwrap();
+    let video_api = http_json
+        .config_schema
+        .pointer("/properties/video_api")
+        .expect("video API profile schema");
+    assert_eq!(video_api["enum"], json!(["siliconflow-v1"]));
+    crate::schema::validate_instance(
+        &http_json.config_schema,
+        &json!({
+            "base_url": "https://api.siliconflow.cn/v1",
+            "video_api": "siliconflow-v1",
+            "video_models": ["Wan-AI/Wan2.2-T2V-A14B"],
+            "result_origins": ["https://s3.siliconflow.cn"]
+        }),
+    )
+    .unwrap();
+    // RJSF materializes an optional array field as an empty array while an
+    // operator edits an ordinary HTTP account.  The driver-level validator
+    // below still requires a non-empty list whenever video_api is enabled.
+    crate::schema::validate_instance(
+        &http_json.config_schema,
+        &json!({
+            "base_url": "https://example.com/v1",
+            "video_models": [],
+            "result_origins": []
+        }),
+    )
+    .unwrap();
+    assert!(
+        crate::schema::validate_instance(
+            &http_json.config_schema,
+            &json!({
+                "base_url": "https://api.siliconflow.cn/v1",
+                "video_api": "/operator-chosen/path"
+            }),
+        )
+        .is_err()
+    );
+}

@@ -207,6 +207,20 @@ impl ProviderCatalog {
                     "minLength": 1,
                     "description": "Responses model used to invoke image_generation when image_api_mode is responses-tool."
                 },
+                "video_api": {
+                    "title": "Video generation API",
+                    "type": "string",
+                    "enum": ["siliconflow-v1"],
+                    "description": "Enable SiliconFlow's fixed /v1/video/submit and /v1/video/status asynchronous video contract."
+                },
+                "video_models": {
+                    "title": "Video generation models",
+                    "type": "array",
+                    "maxItems": 100,
+                    "uniqueItems": true,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "description": "Exact upstream model IDs that use the configured video API; at least one is required when a video API is enabled. Other routes on this account retain their normal text/image capabilities."
+                },
                 "result_origins": {
                     "title": "Generated asset origins",
                     "type": "array",

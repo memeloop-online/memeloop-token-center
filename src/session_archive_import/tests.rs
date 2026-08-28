@@ -3,6 +3,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use rust_decimal::Decimal;
 
     fn validation_options(
         max_line_bytes: usize,
@@ -81,6 +82,168 @@ mod tests {
                 .await
                 .expect_err("bounded reader must enforce the compiled-in hard limit");
         assert!(hard_limit_error.to_string().contains("compiled-in 16 MiB"));
+    }
+
+    #[tokio::test]
+    async fn stable_manifest_rejects_more_than_one_million_sessions_before_planning() {
+        let directory = tempfile::tempdir().expect("manifest directory");
+        let input = directory.path().join("too-many.jsonl");
+        let manifest = directory.path().join("too-many.jsonl.manifest.json");
+        std::fs::write(&input, []).expect("write empty input");
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 3,
+                "output_file": "too-many.jsonl",
+                "output_sha256": "a".repeat(64),
+                "output_size_bytes": 0,
+                "source_fingerprint": "b".repeat(64),
+                "session_projection_protocol": "session-snapshot-cursor-v1",
+                "session_set_sha256": "c".repeat(64),
+                "snapshot_schema_version": 2,
+                "source_ingest_fence": "0",
+                "tombstone_safe_after_ingest_fence": "0",
+                "deleted_session_count": 0,
+                "prior_output_sha256": null,
+                "prior_source_ingest_fence": null,
+                "sequence": 1,
+                "offline_full_snapshot": true,
+                "session_count": MAX_STABLE_SESSION_COUNT + 1,
+                "source_projection_requests": 0,
+                "record_count": 0
+            }))
+            .expect("encode manifest"),
+        )
+        .expect("write manifest");
+
+        let error = load_stable_delta_manifest(&input)
+            .await
+            .expect_err("oversized stable projection must fail before planning");
+        assert!(error.to_string().contains("compiled-in session limit"));
+    }
+
+    #[tokio::test]
+    async fn tombstone_only_plan_checks_database_size_incrementally_and_cleans_up() {
+        let directory = tempfile::tempdir().expect("plan directory");
+        let input_path = directory.path().join("tombstones.jsonl");
+        let deleted_at = "2026-01-03T03:04:05.000000Z";
+        let mut input_bytes = Vec::new();
+        let mut set_bytes = Vec::from(&b"["[..]);
+        for index in 0..PLAN_SIZE_CHECK_INTERVAL {
+            let session_id = format!("tombstone-{index:04}-{}", "x".repeat(480));
+            if index > 0 {
+                set_bytes.push(b',');
+            }
+            set_bytes.extend(
+                serde_json::to_vec(&TombstoneDigestSummary {
+                    last_at: deleted_at,
+                    requests: 0,
+                    session_id: &session_id,
+                    deleted: true,
+                    deleted_at,
+                })
+                .expect("encode tombstone digest summary"),
+            );
+            input_bytes.extend(
+                serde_json::to_vec(&serde_json::json!({
+                    "_mtc_delta_type": "session_summary",
+                    "schema_version": 2,
+                    "session_id": session_id,
+                    "requests": 0,
+                    "last_at": deleted_at,
+                    "deleted": true,
+                    "deleted_at": deleted_at
+                }))
+                .expect("encode tombstone control"),
+            );
+            input_bytes.push(b'\n');
+        }
+        set_bytes.push(b']');
+        std::fs::write(&input_path, &input_bytes).expect("write tombstone input");
+
+        let config = crate::config::Config::for_test("sqlite::memory:".to_owned());
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect planning database");
+        let archive = ArchiveStore::from_config(&config)
+            .await
+            .expect("create memory archive");
+        let manifest = StableDeltaManifest {
+            expected_output_sha256: "a".repeat(64),
+            output_size_bytes: input_bytes.len() as u64,
+            source_fingerprint: "b".repeat(64),
+            sequence: 1,
+            offline_full_snapshot: true,
+            prior_output_sha256: None,
+            prior_source_ingest_fence: None,
+            snapshot_schema_version: 2,
+            ingest_fence: 0,
+            tombstone_safe_after_ingest_fence: Some(0),
+            session_set_sha256: format!("{:x}", Sha256::digest(&set_bytes)),
+            session_count: i64::try_from(PLAN_SIZE_CHECK_INTERVAL).expect("session count"),
+            request_count: 0,
+            record_count: 0,
+            deleted_session_count: i64::try_from(PLAN_SIZE_CHECK_INTERVAL)
+                .expect("deleted session count"),
+        };
+        let mut input = ReadOnlyInput::open(&input_path).await.expect("open input");
+        let mut hasher = blake3::Hasher::new();
+        while let Some(line) = read_bounded_line(&mut input.reader, 1024 * 1024)
+            .await
+            .expect("preflight read")
+        {
+            hasher.update(&line);
+        }
+        let seal = input.seal(hasher.finalize()).await.expect("seal input");
+        input.rewind().await.expect("rewind input");
+        let options = SessionArchiveImportOptions {
+            input: &input_path,
+            plan_directory: directory.path(),
+            tenant_external_id: "archive-fixture",
+            cpamp_source: "cpamp-usage-events-v1",
+            archive_source: "cpa-session-archive-v2",
+            overlap_ms: 0,
+            time_tolerance_ms: 0,
+            max_line_bytes: 1024 * 1024,
+            // The plan schema itself exceeds this. The assertion is that a
+            // summary-only source checks during construction, not only at EOF.
+            max_plan_bytes: 1,
+            allow_unmapped: false,
+            quarantine_unknown_identities: false,
+            quarantine_tenant_binding_kind: None,
+            quarantine_tenant_binding_proof: None,
+            quarantine_approved_by_service_id: None,
+            apply: false,
+        };
+        let error = match build_import_plan(
+            &db,
+            &archive,
+            &options,
+            0,
+            &mut input,
+            &seal,
+            Some(&manifest),
+        )
+        .await
+        {
+            Ok(_) => panic!("summary-only plan must enforce its database byte budget"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("configured size limit"));
+        let leftovers = std::fs::read_dir(directory.path())
+            .expect("read plan directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".mtc-session-archive-plan-")
+            })
+            .count();
+        assert_eq!(
+            leftovers, 0,
+            "failed plan and SQLite sidecars must be cleaned"
+        );
     }
 
     #[test]
@@ -194,6 +357,263 @@ mod tests {
         }))
         .expect("invalid schema-v1 fixture");
         assert!(archived_credential_hash(&invalid_v1).is_err());
+    }
+
+    #[test]
+    fn rust_schema_v2_set_digest_matches_go_golden_and_ascii_boundaries() {
+        let present = serde_json::to_vec(&PresentDigestSummary {
+            first_at: "2026-01-02T03:04:05.000000Z",
+            last_at: "2026-01-02T03:05:06.000000Z",
+            records_sha256: "1111111111111111111111111111111111111111111111111111111111111111",
+            requests: 2,
+            session_id: "Z",
+        })
+        .unwrap();
+        let tombstone = serde_json::to_vec(&TombstoneDigestSummary {
+            last_at: "2026-01-03T03:04:05.000000Z",
+            requests: 0,
+            session_id: "a",
+            deleted: true,
+            deleted_at: "2026-01-03T03:04:05.000000Z",
+        })
+        .unwrap();
+        let mut digest = Sha256::new();
+        digest.update(b"[");
+        digest.update(present);
+        digest.update(b",");
+        digest.update(tombstone);
+        digest.update(b"]");
+        assert_eq!(
+            format!("{:x}", digest.finalize()),
+            "0a0b2faaba791ab3d356fe3e143119e94f09a801c47e5c2b102912535a88505b"
+        );
+
+        for session_id in [" ", "~", "contains space"] {
+            let line = serde_json::to_vec(&serde_json::json!({
+                "_mtc_delta_type":"session_summary","schema_version":2,"session_id":session_id,
+                "requests":0,"last_at":"2026-01-03T03:04:05.000000Z","deleted":true,
+                "deleted_at":"2026-01-03T03:04:05.000000Z"
+            }))
+            .unwrap();
+            assert!(matches!(
+                parse_archive_line(&line).unwrap(),
+                Some(ParsedArchiveLine::Summary(_))
+            ));
+        }
+        for session_id in ["\u{1f}", "\u{7f}"] {
+            let line = serde_json::to_vec(&serde_json::json!({
+                "_mtc_delta_type":"session_summary","schema_version":2,"session_id":session_id,
+                "requests":0,"last_at":"2026-01-03T03:04:05.000000Z","deleted":true,
+                "deleted_at":"2026-01-03T03:04:05.000000Z"
+            }))
+            .unwrap();
+            assert!(parse_archive_line(&line).is_err());
+        }
+    }
+
+    async fn snapshot_test_database() -> (tempfile::TempDir, Database, String, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("snapshot.sqlite").display()
+        );
+        let db = Database::connect(&database_url).await.unwrap();
+        db.migrate().await.unwrap();
+        let tenant = format!("snapshot-v2-{}", Uuid::now_v7());
+        db.create_key(
+            crate::db::CreateKeyInput {
+                tenant_external_id: tenant.clone(),
+                principal_external_id: "snapshot-principal".into(),
+                alias: "Snapshot".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ZERO,
+                idempotency_key: Some("snapshot-key".into()),
+            },
+            b"snapshot-pepper",
+        )
+        .await
+        .unwrap();
+        (directory, db, tenant, database_url)
+    }
+
+    #[tokio::test]
+    async fn snapshot_summary_and_tombstone_checkpoint_replay_atomically() {
+        let (_directory, db, tenant, database_url) = snapshot_test_database().await;
+        let present = SessionArchivePresentSummaryInput {
+            source_session_id: "present".into(),
+            requests: 1,
+            first_at_ms: 10,
+            last_at_ms: 20,
+            records_sha256: "1".repeat(64),
+        };
+        let initial = db
+            .apply_session_archive_snapshot(SessionArchiveSnapshotApplyInput {
+                tenant_external_id: &tenant,
+                archive_source: "archive-v2",
+                snapshot_schema_version: 2,
+                ingest_fence: 1,
+                source_fingerprint: &"a".repeat(64),
+                sequence: 1,
+                offline_full_snapshot: true,
+                output_sha256: &"b".repeat(64),
+                prior_output_sha256: None,
+                prior_source_ingest_fence: None,
+                tombstone_safe_after_ingest_fence: Some(0),
+                session_set_sha256: &"2".repeat(64),
+                session_count: 1,
+                request_count: 1,
+                deleted_session_count: 0,
+                staged_batch_id: None,
+                legacy_checkpoint: Some(SessionArchiveLegacyCheckpointInput {
+                    watermark_ms: 20,
+                    watermark_request_id: "request",
+                    imported_records: 1,
+                }),
+                present_summaries: std::slice::from_ref(&present),
+                tombstones: &[],
+            })
+            .await
+            .unwrap();
+        assert!(!initial.replayed);
+        let replay = db
+            .apply_session_archive_snapshot(SessionArchiveSnapshotApplyInput {
+                tenant_external_id: &tenant,
+                archive_source: "archive-v2",
+                snapshot_schema_version: 2,
+                ingest_fence: 1,
+                source_fingerprint: &"a".repeat(64),
+                sequence: 1,
+                offline_full_snapshot: true,
+                output_sha256: &"b".repeat(64),
+                prior_output_sha256: None,
+                prior_source_ingest_fence: None,
+                tombstone_safe_after_ingest_fence: Some(0),
+                session_set_sha256: &"2".repeat(64),
+                session_count: 1,
+                request_count: 1,
+                deleted_session_count: 0,
+                staged_batch_id: None,
+                legacy_checkpoint: Some(SessionArchiveLegacyCheckpointInput {
+                    watermark_ms: 20,
+                    watermark_request_id: "request",
+                    imported_records: 1,
+                }),
+                present_summaries: std::slice::from_ref(&present),
+                tombstones: &[],
+            })
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        let tombstone = SessionArchiveTombstoneInput {
+            source_session_id: "present".into(),
+            deleted_at_ms: 30,
+        };
+        let deleted = db
+            .apply_session_archive_snapshot(SessionArchiveSnapshotApplyInput {
+                tenant_external_id: &tenant,
+                archive_source: "archive-v2",
+                snapshot_schema_version: 2,
+                ingest_fence: 2,
+                source_fingerprint: &"a".repeat(64),
+                sequence: 2,
+                offline_full_snapshot: false,
+                output_sha256: &"c".repeat(64),
+                prior_output_sha256: Some(&"b".repeat(64)),
+                prior_source_ingest_fence: Some(1),
+                tombstone_safe_after_ingest_fence: Some(0),
+                session_set_sha256: &"3".repeat(64),
+                session_count: 1,
+                request_count: 0,
+                deleted_session_count: 1,
+                staged_batch_id: None,
+                legacy_checkpoint: None,
+                present_summaries: &[],
+                tombstones: std::slice::from_ref(&tombstone),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (deleted.tombstones_applied, deleted.deleted_records),
+            (1, 0)
+        );
+        let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_archive_source_sessions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let fence: i64 =
+            sqlx::query_scalar("SELECT ingest_fence FROM session_archive_snapshot_checkpoints")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((remaining, fence), (0, 2));
+    }
+
+    #[tokio::test]
+    async fn tombstone_target_conflict_rolls_back_summary_delete_ledger_and_checkpoint() {
+        let (_directory, db, tenant, database_url) = snapshot_test_database().await;
+        let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+        let tenant_id: String = sqlx::query_scalar("SELECT id FROM tenants WHERE external_id=$1")
+            .bind(&tenant)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO session_archive_import_records (tenant_id,source,external_request_id,target_request_id,external_event_hash,record_digest,source_started_at,imported_at,source_session_id) VALUES ($1,'archive-v2','external','00000000-0000-0000-0000-000000000001',$2,$3,1,1,'doomed')")
+            .bind(&tenant_id).bind("4".repeat(64)).bind("5".repeat(64)).execute(&pool).await.unwrap();
+        let tombstone = SessionArchiveTombstoneInput {
+            source_session_id: "doomed".into(),
+            deleted_at_ms: 30,
+        };
+        assert!(
+            db.apply_session_archive_snapshot(SessionArchiveSnapshotApplyInput {
+                tenant_external_id: &tenant,
+                archive_source: "archive-v2",
+                snapshot_schema_version: 2,
+                ingest_fence: 2,
+                source_fingerprint: &"a".repeat(64),
+                sequence: 1,
+                offline_full_snapshot: true,
+                output_sha256: &"d".repeat(64),
+                prior_output_sha256: None,
+                prior_source_ingest_fence: None,
+                tombstone_safe_after_ingest_fence: Some(0),
+                session_set_sha256: &"6".repeat(64),
+                session_count: 1,
+                request_count: 0,
+                deleted_session_count: 1,
+                staged_batch_id: None,
+                legacy_checkpoint: None,
+                present_summaries: &[],
+                tombstones: std::slice::from_ref(&tombstone),
+            })
+            .await
+            .is_err()
+        );
+        let checkpoints: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_archive_snapshot_checkpoints")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let tombstones: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_archive_applied_tombstones")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_archive_source_sessions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((checkpoints, tombstones, sessions), (0, 0, 0));
+        let source_record: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_archive_import_records WHERE source_session_id='doomed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(source_record, 1);
     }
 
     #[test]
@@ -431,6 +851,8 @@ mod tests {
             source_size_bytes: source_seal.identity.size,
             source_blake3: source_seal.digest.to_hex().to_string(),
             record_count: 0,
+            tombstone_count: 0,
+            stable_snapshot: None,
             quarantine_records: 0,
             quarantine_batch_id: None,
             tenant_binding_kind: None,

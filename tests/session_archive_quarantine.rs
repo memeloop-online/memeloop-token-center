@@ -89,11 +89,31 @@ async fn classify(
     source_key_hash: Option<&str>,
     record_digest: &str,
 ) -> Result<SessionArchiveImportMatch, AppError> {
+    classify_in_session(
+        db,
+        tenant,
+        external_request_id,
+        "quarantine-session",
+        source_key_hash,
+        record_digest,
+    )
+    .await
+}
+
+async fn classify_in_session(
+    db: &Database,
+    tenant: &str,
+    external_request_id: &str,
+    source_session_id: &str,
+    source_key_hash: Option<&str>,
+    record_digest: &str,
+) -> Result<SessionArchiveImportMatch, AppError> {
     db.match_session_archive_import(SessionArchiveImportMatchInput {
         tenant_external_id: tenant,
         cpamp_source: CPAMP_SOURCE,
         archive_source: ARCHIVE_SOURCE,
         external_request_id,
+        source_session_id,
         started_at: STARTED_AT,
         requested_model: Some("gpt-quarantine"),
         resolved_model: Some("gpt-quarantine"),
@@ -102,6 +122,7 @@ async fn classify(
         output_tokens: Some(7),
         record_digest,
         time_tolerance_ms: 5_000,
+        allow_stable_replacement: false,
     })
     .await
 }
@@ -129,6 +150,15 @@ async fn commit_quarantine(
     target: &SessionArchiveQuarantineTarget,
     input: CommitFixture<'_>,
 ) -> Result<bool, AppError> {
+    commit_quarantine_in_session(db, target, input, "quarantine-session").await
+}
+
+async fn commit_quarantine_in_session(
+    db: &Database,
+    target: &SessionArchiveQuarantineTarget,
+    input: CommitFixture<'_>,
+    source_session_id: &str,
+) -> Result<bool, AppError> {
     let request_digest = hex_digest(format!("{}:request", input.external_request_id));
     let response_digest = hex_digest(format!("{}:response", input.external_request_id));
     let source_digest = hex_digest(input.batch_id.as_bytes());
@@ -150,6 +180,7 @@ async fn commit_quarantine(
         sequence: input.sequence,
         target,
         external_request_id: input.external_request_id,
+        source_session_id,
         record_digest: input.record_digest,
         source_started_at: STARTED_AT + input.sequence,
         source_completed_at: Some(STARTED_AT + input.sequence + 500),
@@ -168,6 +199,7 @@ async fn commit_quarantine(
         response_object: Some(
             "objects/blake3/bb/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ),
+        defer_checkpoint: false,
     })
     .await
 }
@@ -349,6 +381,413 @@ async fn sqlite_quarantine_classification_commit_replay_and_isolation_are_fail_c
         .unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, target.quarantine_id);
+}
+
+#[tokio::test]
+async fn sqlite_quarantine_versions_preserve_changed_digest_session_move_and_resolution() {
+    let fixture = sqlite_fixture().await;
+    let tenant = format!("quarantine-version-{}", Uuid::now_v7());
+    create_key(&fixture.db, &tenant, "tenant-anchor").await;
+    let external_request_id = "archive-versioned";
+    let source_hash = hex_digest("versioned-unknown-credential");
+    let first_digest = hex_digest("versioned-record-first");
+    let corrected_digest = hex_digest("versioned-record-corrected");
+
+    let first = quarantined(
+        classify_in_session(
+            &fixture.db,
+            &tenant,
+            external_request_id,
+            "session-a",
+            Some(&source_hash),
+            &first_digest,
+        )
+        .await
+        .unwrap(),
+    );
+    let first_batch = Uuid::now_v7();
+    assert!(
+        commit_quarantine_in_session(
+            &fixture.db,
+            &first,
+            CommitFixture {
+                tenant: &tenant,
+                external_request_id,
+                record_digest: &first_digest,
+                batch_id: first_batch,
+                sequence: 1,
+                batch_records: 1,
+            },
+            "session-a",
+        )
+        .await
+        .unwrap()
+    );
+    fixture
+        .db
+        .resolve_session_archive_quarantine(SessionArchiveQuarantineResolutionInput {
+            tenant_external_id: &tenant,
+            quarantine_id: first.quarantine_id,
+            action: "dismiss",
+            key_id: None,
+            expected_record_digest: &first_digest,
+            evidence_digest: &hex_digest("versioned-first-dismissal"),
+            note: Some("preserve this version-specific decision"),
+            idempotency_key: "versioned-first-dismissal",
+            resolved_by_service_id: Uuid::now_v7(),
+        })
+        .await
+        .unwrap();
+
+    let corrected = quarantined(
+        classify_in_session(
+            &fixture.db,
+            &tenant,
+            external_request_id,
+            "session-a",
+            Some(&source_hash),
+            &corrected_digest,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_ne!(corrected.quarantine_id, first.quarantine_id);
+    let corrected_batch = Uuid::now_v7();
+    let corrected_commit = || CommitFixture {
+        tenant: &tenant,
+        external_request_id,
+        record_digest: &corrected_digest,
+        batch_id: corrected_batch,
+        sequence: 1,
+        batch_records: 1,
+    };
+    assert!(
+        commit_quarantine_in_session(&fixture.db, &corrected, corrected_commit(), "session-a",)
+            .await
+            .unwrap()
+    );
+    let corrected_replay = quarantined(
+        classify_in_session(
+            &fixture.db,
+            &tenant,
+            external_request_id,
+            "session-a",
+            Some(&source_hash),
+            &corrected_digest,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(corrected_replay.quarantine_id, corrected.quarantine_id);
+    assert!(
+        !commit_quarantine_in_session(
+            &fixture.db,
+            &corrected_replay,
+            corrected_commit(),
+            "session-a",
+        )
+        .await
+        .unwrap()
+    );
+
+    let moved = quarantined(
+        classify_in_session(
+            &fixture.db,
+            &tenant,
+            external_request_id,
+            "session-b",
+            Some(&source_hash),
+            &corrected_digest,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_ne!(moved.quarantine_id, corrected.quarantine_id);
+    let moved_batch = Uuid::now_v7();
+    let moved_commit = || CommitFixture {
+        tenant: &tenant,
+        external_request_id,
+        record_digest: &corrected_digest,
+        batch_id: moved_batch,
+        sequence: 1,
+        batch_records: 1,
+    };
+    assert!(
+        commit_quarantine_in_session(&fixture.db, &moved, moved_commit(), "session-b",)
+            .await
+            .unwrap()
+    );
+    let moved_replay = quarantined(
+        classify_in_session(
+            &fixture.db,
+            &tenant,
+            external_request_id,
+            "session-b",
+            Some(&source_hash),
+            &corrected_digest,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(moved_replay.quarantine_id, moved.quarantine_id);
+    assert!(
+        !commit_quarantine_in_session(&fixture.db, &moved_replay, moved_commit(), "session-b",)
+            .await
+            .unwrap()
+    );
+
+    let versions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_archive_quarantine_record_versions WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3",
+    )
+    .bind(first.tenant_id.to_string())
+    .bind(ARCHIVE_SOURCE)
+    .bind(external_request_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(versions, 3);
+    let legacy: (i64, String, String) = sqlx::query_as(
+        "SELECT COUNT(*),MIN(record_digest),MIN(source_session_id) FROM session_archive_quarantine_records WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3",
+    )
+    .bind(first.tenant_id.to_string())
+    .bind(ARCHIVE_SOURCE)
+    .bind(external_request_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(legacy, (1, first_digest.clone(), "session-a".to_owned()));
+    let occurrences: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT quarantine_id,record_digest,source_session_id FROM session_archive_quarantine_occurrences WHERE tenant_id=$1 ORDER BY created_at,quarantine_id",
+    )
+    .bind(first.tenant_id.to_string())
+    .fetch_all(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(occurrences.len(), 3);
+    assert!(occurrences.iter().any(|row| {
+        row.0 == first.quarantine_id.to_string() && row.1 == first_digest && row.2 == "session-a"
+    }));
+    assert!(occurrences.iter().any(|row| {
+        row.0 == corrected.quarantine_id.to_string()
+            && row.1 == corrected_digest
+            && row.2 == "session-a"
+    }));
+    assert!(occurrences.iter().any(|row| {
+        row.0 == moved.quarantine_id.to_string()
+            && row.1 == corrected_digest
+            && row.2 == "session-b"
+    }));
+    let head: (String, String, String) = sqlx::query_as(
+        "SELECT quarantine_id,record_digest,source_session_id FROM session_archive_quarantine_record_heads WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3",
+    )
+    .bind(first.tenant_id.to_string())
+    .bind(ARCHIVE_SOURCE)
+    .bind(external_request_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(head.0, moved.quarantine_id.to_string());
+    assert_eq!(head.1, corrected_digest);
+    assert_eq!(head.2, "session-b");
+
+    let preserved = fixture
+        .db
+        .get_session_archive_quarantine(&tenant, first.quarantine_id)
+        .await
+        .unwrap();
+    assert_eq!(preserved.record_digest, first_digest);
+    assert_eq!(preserved.state, "dismissed");
+    assert_eq!(
+        fixture
+            .db
+            .get_session_archive_quarantine(&tenant, corrected.quarantine_id)
+            .await
+            .unwrap()
+            .state,
+        "pending"
+    );
+    let current = fixture
+        .db
+        .list_session_archive_quarantine(SessionArchiveQuarantineFilter {
+            tenant_external_id: &tenant,
+            state: None,
+            limit: 100,
+            before_started_at: None,
+            before_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].id, moved.quarantine_id);
+
+    let returned = quarantined(
+        classify_in_session(
+            &fixture.db,
+            &tenant,
+            external_request_id,
+            "session-a",
+            Some(&source_hash),
+            &first_digest,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(returned.quarantine_id, first.quarantine_id);
+    assert!(
+        !commit_quarantine_in_session(
+            &fixture.db,
+            &returned,
+            CommitFixture {
+                tenant: &tenant,
+                external_request_id,
+                record_digest: &first_digest,
+                batch_id: Uuid::now_v7(),
+                sequence: 1,
+                batch_records: 1,
+            },
+            "session-a",
+        )
+        .await
+        .unwrap()
+    );
+    let occurrence_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_archive_quarantine_occurrences WHERE tenant_id=$1",
+    )
+    .bind(first.tenant_id.to_string())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(occurrence_count, 4);
+    let returned_head: String = sqlx::query_scalar(
+        "SELECT quarantine_id FROM session_archive_quarantine_record_heads WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3",
+    )
+    .bind(first.tenant_id.to_string())
+    .bind(ARCHIVE_SOURCE)
+    .bind(external_request_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(returned_head, first.quarantine_id.to_string());
+    let current = fixture
+        .db
+        .list_session_archive_quarantine(SessionArchiveQuarantineFilter {
+            tenant_external_id: &tenant,
+            state: None,
+            limit: 100,
+            before_started_at: None,
+            before_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].id, first.quarantine_id);
+    assert_eq!(current[0].state, "dismissed");
+}
+
+#[tokio::test]
+async fn sqlite_quarantine_v1_evidence_is_backfilled_without_changing_resolution_identity() {
+    let fixture = sqlite_fixture().await;
+    let tenant = format!("quarantine-v1-backfill-{}", Uuid::now_v7());
+    create_key(&fixture.db, &tenant, "tenant-anchor").await;
+    let external_request_id = "archive-v1-backfill";
+    let record_digest = hex_digest("v1-backfill-record");
+    let target = quarantined(
+        classify_in_session(
+            &fixture.db,
+            &tenant,
+            external_request_id,
+            "legacy-session",
+            None,
+            &record_digest,
+        )
+        .await
+        .unwrap(),
+    );
+    let batch_id = Uuid::now_v7();
+    commit_quarantine_in_session(
+        &fixture.db,
+        &target,
+        CommitFixture {
+            tenant: &tenant,
+            external_request_id,
+            record_digest: &record_digest,
+            batch_id,
+            sequence: 1,
+            batch_records: 1,
+        },
+        "legacy-session",
+    )
+    .await
+    .unwrap();
+    fixture
+        .db
+        .resolve_session_archive_quarantine(SessionArchiveQuarantineResolutionInput {
+            tenant_external_id: &tenant,
+            quarantine_id: target.quarantine_id,
+            action: "dismiss",
+            key_id: None,
+            expected_record_digest: &record_digest,
+            evidence_digest: &hex_digest("v1-backfill-resolution"),
+            note: None,
+            idempotency_key: "v1-backfill-resolution",
+            resolved_by_service_id: Uuid::now_v7(),
+        })
+        .await
+        .unwrap();
+
+    // Recreate the exact pre-0057 state inside this disposable fixture, then
+    // exercise the real migration runner and its statement splitter.
+    sqlx::query("DROP TABLE session_archive_quarantine_occurrences")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE session_archive_quarantine_record_heads")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE session_archive_quarantine_record_versions")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_migrations WHERE version=57")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    fixture.db.migrate().await.unwrap();
+
+    let version: (String, String, String) = sqlx::query_as(
+        "SELECT id,record_digest,source_session_id FROM session_archive_quarantine_record_versions WHERE id=$1",
+    )
+    .bind(target.quarantine_id.to_string())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(version.0, target.quarantine_id.to_string());
+    assert_eq!(version.1, record_digest);
+    assert_eq!(version.2, "legacy-session");
+    let head: String = sqlx::query_scalar(
+        "SELECT quarantine_id FROM session_archive_quarantine_record_heads WHERE external_request_id=$1",
+    )
+    .bind(external_request_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(head, target.quarantine_id.to_string());
+    let occurrence: (String, String) = sqlx::query_as(
+        "SELECT quarantine_id,source_session_id FROM session_archive_quarantine_occurrences WHERE batch_id=$1 AND sequence=1",
+    )
+    .bind(batch_id.to_string())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(occurrence.0, target.quarantine_id.to_string());
+    assert_eq!(occurrence.1, "legacy-session");
+    let preserved = fixture
+        .db
+        .get_session_archive_quarantine(&tenant, target.quarantine_id)
+        .await
+        .unwrap();
+    assert_eq!(preserved.state, "dismissed");
 }
 
 #[tokio::test]

@@ -39,10 +39,12 @@ Target reachability is approved separately from proxy reachability. Targets are
 public by default. A reviewed owner-only transport-policy file may classify an
 exact normalized base URL as private; the importer then writes
 `network_scope: "private"` for every source account using that URL. It never
-infers a private target merely because an account has a proxy, and a private
-target need not have a proxy when the cluster has an approved direct private
-route. The control plane still resolves, classifies and pins the target and any
-proxy independently and requires global authority for private transport.
+infers a private target merely because an account has a proxy. Every account
+classified as a private target must also carry an approved private local-DNS
+SOCKS5 proxy; the complete inventory fails before any target request if even one
+such account lacks it. The control plane still resolves, classifies and pins the
+target and proxy independently and requires global authority for private
+transport.
 
 Opaque Copilot and Cursor handle records cannot be used as native credentials.
 The importer never sends their handle, login, label or source document to Token
@@ -161,7 +163,7 @@ A successful dry-run returns counts and the non-secret native-authorization
 worklist:
 
 ```json
-{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"3e37cd527b6365313440b4be4df9184b4dbe06c2aeb4c80628134bd38cb0ea38"},{"provider":"cursor","source_disabled":false,"source_stable_id":"2a8d8d1ee60dad9b93c5f8a479fb24fd38f48095da0c1e9cde5a00fc7ad650b3"}],"native_reauthorization_required_count":2,"private_target_api_account_count":2,"proxied_api_account_count":1,"replayed_count":0,"replayed_managed_oauth_count":0}
+{"api_account_count":6,"created_count":0,"created_managed_oauth_count":0,"disabled_source_count":0,"managed_oauth_account_count":0,"managed_oauth_source_type_counts":{},"mode":"dry-run","native_reauthorization_required":[{"provider":"copilot","source_disabled":false,"source_stable_id":"3e37cd527b6365313440b4be4df9184b4dbe06c2aeb4c80628134bd38cb0ea38"},{"provider":"cursor","source_disabled":false,"source_stable_id":"2a8d8d1ee60dad9b93c5f8a479fb24fd38f48095da0c1e9cde5a00fc7ad650b3"}],"native_reauthorization_required_count":2,"private_target_api_account_count":2,"proxied_api_account_count":2,"replayed_count":0,"replayed_managed_oauth_count":0}
 ```
 
 Preserve the source snapshot and inventory output for review. Do not reorder API

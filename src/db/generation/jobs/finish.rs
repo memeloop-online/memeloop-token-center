@@ -93,6 +93,9 @@ impl Database {
                     input.assets.len() != 1 || !input.assets[0].mime_type.starts_with("video/")
                 }
                 "comfyui" => !(1..=16).contains(&input.assets.len()),
+                "http-json" => {
+                    input.assets.len() != 1 || !input.assets[0].mime_type.starts_with("video/")
+                }
                 _ => true,
             }
         {
@@ -291,6 +294,10 @@ fn is_allowed_generation_error_code(error_code: &str) -> bool {
             | "comfyui_execution_error"
             | "comfyui_missing_assets"
             | "comfyui_asset_limit_exceeded"
+            | "siliconflow_video_failed"
+            | "siliconflow_video_missing_asset"
+            | "siliconflow_video_asset_limit_exceeded"
+            | "siliconflow_video_invalid_asset"
             | "cancelled_by_user"
     )
 }
@@ -305,6 +312,7 @@ fn safe_generation_result(
             serde_json::json!({"status": "succeeded", "duration": billed_units})
         }
         "comfyui" => serde_json::json!({"status": "success"}),
+        "http-json" => serde_json::json!({"status": "Succeed"}),
         _ => serde_json::json!({"status": "succeeded"}),
     };
     let assets = assets

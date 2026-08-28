@@ -44,6 +44,7 @@ struct TokenCenterWorld {
     service_url: String,
     state: Option<AppState>,
     mock: Option<MockServer>,
+    asset_mock: Option<MockServer>,
     temp_dir: Option<TempDir>,
     server_task: Option<JoinHandle<()>>,
     worker_task: Option<JoinHandle<()>>,
@@ -90,6 +91,7 @@ impl Default for TokenCenterWorld {
             service_url: String::new(),
             state: None,
             mock: None,
+            asset_mock: None,
             temp_dir: None,
             server_task: None,
             worker_task: None,
@@ -184,6 +186,283 @@ async fn start_test_service(world: &mut TokenCenterWorld) {
     world.temp_dir = Some(temp_dir);
     world.server_task = Some(server_task);
     world.worker_task = Some(worker_task);
+}
+
+#[given("the mock SiliconFlow upstream completes a text to video request")]
+async fn mock_siliconflow_video_generation(world: &mut TokenCenterWorld) {
+    let asset_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/sf-result.mp4"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "video/mp4")
+                .set_body_bytes(b"siliconflow-video-content"),
+        )
+        .expect(1)
+        .mount(&asset_server)
+        .await;
+    let asset_url = asset_server.uri();
+    let server = world.mock.as_ref().expect("mock server");
+    Mock::given(method("POST"))
+        .and(path("/v1/video/submit"))
+        .and(header("authorization", "Bearer siliconflow-secret"))
+        .and(header_exists("idempotency-key"))
+        .and(body_partial_json(json!({
+            "model": "Wan-AI/Wan2.2-T2V-A14B",
+            "prompt": "a fox in the wind",
+            "image_size": "1280x720",
+            "negative_prompt": "blur",
+            "seed": 42
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"requestId": "sf-request-1"})),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/video/status"))
+        .and(header("authorization", "Bearer siliconflow-secret"))
+        .and(body_partial_json(json!({"requestId": "sf-request-1"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "Succeed",
+            "reason": "provider-sensitive-reason-must-not-persist",
+            "results": {
+                "videos": [{"url": format!("{asset_url}/sf-result.mp4?token=siliconflow-sensitive")}],
+                "timings": {"inference": 123},
+                "seed": 42
+            }
+        })))
+        .mount(server)
+        .await;
+    world.asset_mock = Some(asset_server);
+}
+
+#[when("the service creates a job-priced SiliconFlow video route and key")]
+async fn create_siliconflow_video_route_and_key(world: &mut TokenCenterWorld) {
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/upstreams", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "name": "siliconflow-shared-account",
+            "driver": "http-json",
+            "config": {
+                "base_url": format!("{mock_url}/v1"),
+                "network_scope": "private",
+                "video_api": "siliconflow-v1",
+                "video_models": ["Wan-AI/Wan2.2-T2V-A14B"],
+                "result_origins": [world.asset_mock.as_ref().expect("asset mock").uri()]
+            },
+            "credential": {"type": "api_key", "value": "siliconflow-secret"}
+        }))
+        .send()
+        .await
+        .expect("create SiliconFlow upstream");
+    let status = response.status();
+    let response_body = response.text().await.expect("SiliconFlow account response");
+    assert_eq!(status, StatusCode::CREATED, "{response_body}");
+    let account: Value = serde_json::from_str(&response_body).expect("SiliconFlow account JSON");
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/model-routes", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "public_model": "siliconflow-video-public",
+            "upstream_account_id": account["id"],
+            "upstream_model": "Wan-AI/Wan2.2-T2V-A14B",
+            "protocol": "generation",
+            "custom_model_confirmed": true
+        }))
+        .send()
+        .await
+        .expect("create SiliconFlow video route");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = world
+        .client
+        .post(format!(
+            "{}/internal/v1/generation-prices/USD/siliconflow-video-public",
+            world.service_url
+        ))
+        .bearer_auth("test-service-token")
+        .json(&json!({"billing_unit": "job", "price_per_unit": "0.2"}))
+        .send()
+        .await
+        .expect("create SiliconFlow video price");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = world
+        .client
+        .post(format!("{}/internal/v1/keys", world.service_url))
+        .bearer_auth("test-service-token")
+        .json(&json!({
+            "principal_external_id": "siliconflow-video-user",
+            "alias": "siliconflow-video",
+            "currency": "USD",
+            "initial_balance": "10",
+            "policy": {}
+        }))
+        .send()
+        .await
+        .expect("create SiliconFlow video key");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let key: Value = response.json().await.expect("SiliconFlow video key JSON");
+    world.stable_key_id = key["key_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok());
+    world.current_key = key["key"].as_str().expect("SiliconFlow key").to_owned();
+    grant_fixture_model(
+        world,
+        "default",
+        &key,
+        "siliconflow-video-public",
+        "generation",
+    )
+    .await;
+}
+
+#[when("the client creates and replays a SiliconFlow text to video generation")]
+async fn create_and_replay_siliconflow_video(world: &mut TokenCenterWorld) {
+    let body = json!({
+        "model": "siliconflow-video-public",
+        "input": {"parameters": {
+            "prompt": "a fox in the wind",
+            "image_size": "1280x720",
+            "negative_prompt": "blur",
+            "seed": 42
+        }}
+    });
+    let first = world
+        .client
+        .post(format!("{}/v1/videos/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .header("idempotency-key", "siliconflow-video-idempotency")
+        .json(&body)
+        .send()
+        .await
+        .expect("create SiliconFlow video");
+    world.status = Some(first.status());
+    world.response = first.json().await.expect("SiliconFlow admission JSON");
+    world.generation_job_id = world.response["job_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let replay = world
+        .client
+        .post(format!("{}/v1/videos/generations", world.service_url))
+        .bearer_auth(&world.current_key)
+        .header("idempotency-key", "siliconflow-video-idempotency")
+        .json(&body)
+        .send()
+        .await
+        .expect("replay SiliconFlow video");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay: Value = replay.json().await.expect("SiliconFlow replay JSON");
+    assert_eq!(replay["job_id"], world.response["job_id"]);
+}
+
+#[then("the SiliconFlow video is archived once with safe metadata and job billing")]
+async fn siliconflow_video_succeeds(world: &mut TokenCenterWorld) {
+    let job_id = world
+        .generation_job_id
+        .expect("SiliconFlow generation job id");
+    for _ in 0..80 {
+        let value = world
+            .client
+            .get(format!(
+                "{}/self/v1/generations/{job_id}",
+                world.service_url
+            ))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("SiliconFlow generation status")
+            .json::<Value>()
+            .await
+            .expect("SiliconFlow generation status JSON");
+        if value["status"] == "succeeded" {
+            assert_eq!(value["driver"], "http-json");
+            assert_eq!(value["billing_unit"], "job");
+            assert_eq!(value["billed_units"], 1);
+            assert_eq!(value["cost"], "0.2");
+            assert_eq!(value["assets"].as_array().map(Vec::len), Some(1));
+            assert_eq!(value["result"]["provider"], json!({"status": "Succeed"}));
+            let public = value.to_string();
+            for secret in [
+                "siliconflow-sensitive",
+                "provider-sensitive-reason",
+                "sf-result.mp4",
+                "objects/blake3/",
+            ] {
+                assert!(!public.contains(secret), "leaked {secret}");
+            }
+            let asset_id = value["assets"][0]["asset_id"]
+                .as_str()
+                .expect("SiliconFlow asset id");
+            let asset = world
+                .client
+                .get(format!(
+                    "{}/self/v1/generations/{job_id}/assets/{asset_id}",
+                    world.service_url
+                ))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("download SiliconFlow archive");
+            assert_eq!(asset.status(), StatusCode::OK);
+            assert_eq!(
+                asset.bytes().await.expect("SiliconFlow archive bytes"),
+                b"siliconflow-video-content".as_slice()
+            );
+            let requests = world
+                .mock
+                .as_ref()
+                .expect("mock server")
+                .received_requests()
+                .await
+                .expect("mock request recording");
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.url.path() == "/v1/video/submit")
+                    .count(),
+                1
+            );
+            let submit = requests
+                .iter()
+                .find(|request| request.url.path() == "/v1/video/submit")
+                .expect("one SiliconFlow submit request");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&submit.body).expect("SiliconFlow submit JSON"),
+                json!({
+                    "model": "Wan-AI/Wan2.2-T2V-A14B",
+                    "prompt": "a fox in the wind",
+                    "image_size": "1280x720",
+                    "negative_prompt": "blur",
+                    "seed": 42
+                })
+            );
+            let asset_requests = world
+                .asset_mock
+                .as_ref()
+                .expect("asset mock")
+                .received_requests()
+                .await
+                .expect("asset mock request recording");
+            assert_eq!(asset_requests.len(), 1);
+            assert!(
+                asset_requests[0].headers.get("authorization").is_none(),
+                "the API credential must not cross from the API origin to the result CDN"
+            );
+            assert_generation_stats(world, "siliconflow-video-public", "0.2").await;
+            world.response = value;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    panic!(
+        "SiliconFlow generation did not complete: {}",
+        world.response
+    );
 }
 
 #[given("the mock Seedance upstream completes a five second video")]
@@ -6163,9 +6442,9 @@ fn cpamp_importer_output(world: &TokenCenterWorld) -> std::process::Output {
         .import_sqlite_path
         .as_ref()
         .expect("CPAMP SQLite fixture path");
-    let mut command = Command::new("sh");
+    let mut command = Command::new("node");
     command
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("ops/migrate-cpamp.sh"))
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("ops/migrate-cpamp.ts"))
         .envs(postgres_command_environment(&world.import_database_url))
         .env("CPAMP_SQLITE_PATH", sqlite_path)
         .env("IMPORT_TENANT_EXTERNAL_ID", &world.import_tenant)

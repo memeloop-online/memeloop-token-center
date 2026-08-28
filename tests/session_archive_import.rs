@@ -14,6 +14,7 @@ use memeloop_token_center::{
 };
 use rust_decimal::Decimal;
 use serde_json::json;
+use sha2::{Digest as ShaDigest, Sha256};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -25,6 +26,9 @@ const TEST_CORRELATION_PROOF_DIGEST: &str =
 const TEST_RECORD_DIGEST: &str = "6666666666666666666666666666666666666666666666666666666666666666";
 const TEST_OTHER_RECORD_DIGEST: &str =
     "7777777777777777777777777777777777777777777777777777777777777777";
+type StableChainProjectionState = (i64, i64, i64, i64, i64, i64, i64);
+type StableChainCheckpointState = (i64, i64, i64, i64, Option<i64>, i64, i64, Option<String>);
+type StableChainState = (StableChainProjectionState, StableChainCheckpointState);
 
 #[tokio::test]
 async fn session_archive_schema_precondition_is_read_only() {
@@ -524,6 +528,7 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
         output_tokens,
         record_digest: &ambiguity_record_digest,
         time_tolerance_ms: 0,
+        allow_stable_replacement: false,
     };
     db.match_session_archive_request(match_input(None, None))
         .await
@@ -543,6 +548,7 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
             output_tokens: None,
             record_digest: &ambiguity_record_digest,
             time_tolerance_ms: 0,
+            allow_stable_replacement: false,
         })
         .await
         .expect("multiple compatible targets must become archive-only");
@@ -565,6 +571,7 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
             output_tokens: None,
             record_digest: &ambiguity_record_digest,
             time_tolerance_ms: 0,
+            allow_stable_replacement: false,
         })
         .await,
         Err(AppError::BadRequest(_))
@@ -587,6 +594,7 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
         tenant_external_id: "archive-fixture",
         archive_source: "stale-conflict-test",
         external_request_id: "stale-external-request",
+        source_session_id: "stale-session",
         target: &usage_match,
         record_digest,
         request_digest: None,
@@ -601,6 +609,7 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
         identity_proof_kind: TEST_IDENTITY_PROOF_KIND,
         identity_proof_digest: TEST_IDENTITY_PROOF_DIGEST,
         correlation_proof_digest: TEST_CORRELATION_PROOF_DIGEST,
+        defer_checkpoint: false,
     };
     assert!(
         db.commit_session_archive_request(commit_input(TEST_RECORD_DIGEST))
@@ -955,35 +964,64 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
     let mut recovery_options = options(&recovery_input, true);
     recovery_options.archive_source = "partial-recovery-test";
     recovery_options.overlap_ms = 0;
+    let recovery_state_query = "SELECT
+        (SELECT COUNT(*) FROM session_archive_import_records WHERE tenant_id = $1 AND source = $2),
+        (SELECT COUNT(*) FROM session_archive_correlations WHERE tenant_id = $1 AND source = $2 AND disposition = 'exact'),
+        (SELECT COUNT(*) FROM session_archive_correlations WHERE tenant_id = $1 AND source = $2 AND disposition = 'unlinked'),
+        (SELECT COUNT(*) FROM session_archive_unlinked_requests WHERE tenant_id = $1 AND source = $2),
+        ((SELECT COUNT(*) FROM session_archive_quarantine_batches WHERE tenant_id = $1 AND source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_records WHERE tenant_id = $1 AND source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_record_versions WHERE tenant_id = $1 AND source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_record_heads WHERE tenant_id = $1 AND source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_batch_records r JOIN session_archive_quarantine_batches b ON b.id = r.batch_id WHERE b.tenant_id = $1 AND b.source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_occurrences o JOIN session_archive_quarantine_batches b ON b.id = o.batch_id WHERE b.tenant_id = $1 AND b.source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_resolutions r JOIN session_archive_quarantine_record_versions q ON q.id = r.quarantine_id WHERE q.tenant_id = $1 AND q.source = $2)),
+        (SELECT COUNT(*) FROM session_archive_correlations WHERE tenant_id = $1 AND source = $2),
+        (SELECT COUNT(*) FROM conversation_observations WHERE request_id IN (
+            SELECT target_request_id FROM session_archive_correlations
+            WHERE tenant_id = $1 AND source = $2 AND target_request_id IS NOT NULL
+        ) OR request_id IN (
+            SELECT archive_request_id FROM session_archive_unlinked_requests
+            WHERE tenant_id = $1 AND source = $2
+        )),
+        (SELECT COUNT(*) FROM session_archive_import_checkpoints WHERE tenant_id = $1 AND source = $2),
+        COALESCE((SELECT watermark_ms FROM session_archive_import_checkpoints WHERE tenant_id = $1 AND source = $2), 0),
+        COALESCE((SELECT imported_records FROM session_archive_import_checkpoints WHERE tenant_id = $1 AND source = $2), 0),
+        (SELECT COUNT(*) FROM session_archive_snapshot_checkpoints WHERE tenant_id = $1 AND source = $2)";
+    let recovery_locator_query =
+        "SELECT l.id, l.created_at, l.tenant_id, l.key_id, r.request_object, r.response_object
+        FROM request_record_locators l
+        JOIN request_records r ON r.id = l.id AND r.created_at = l.created_at
+        WHERE l.id = $1 OR l.id = $2 OR l.id = $3
+        ORDER BY l.id";
+    let original_recovery_locators: Vec<(String, i64, String, String, String, Option<String>)> =
+        sqlx::query_as(recovery_locator_query)
+            .bind(recovery_fixtures[0].3.to_string())
+            .bind(recovery_fixtures[1].3.to_string())
+            .bind(recovery_fixtures[2].3.to_string())
+            .fetch_all(&pool)
+            .await
+            .expect("snapshot recovery locators before injected failure");
     import_session_archive(&db, &archive, &recovery_options)
         .await
-        .expect_err("middle commit failure must stop this attempt");
-    let first_attempt_imports: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM session_archive_import_records WHERE source = 'partial-recovery-test'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("count first recovery attempt");
-    assert_eq!(first_attempt_imports, 2);
-    let recovery_checkpoint: (i64, i64) = sqlx::query_as(
-        "SELECT watermark_ms, imported_records FROM session_archive_import_checkpoints WHERE source = 'partial-recovery-test'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("read first recovery checkpoint");
-    assert_eq!(recovery_checkpoint, (recovery_started_at + 4_000, 2));
-    let long_refs = db
-        .request_archive_refs_for_tenant("archive-fixture", recovery_fixtures[0].3)
-        .await
-        .expect("read failed long-request locator");
-    assert!(long_refs.request_object.starts_with("gap://"));
-    for fixture in &recovery_fixtures[1..] {
-        let refs = db
-            .request_archive_refs_for_tenant("archive-fixture", fixture.3)
+        .expect_err("any record failure must roll back the complete sealed batch");
+    let failed_recovery_state: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(recovery_state_query)
+            .bind(key.tenant_id.to_string())
+            .bind(recovery_options.archive_source)
+            .fetch_one(&pool)
             .await
-            .expect("read committed short-request locator");
-        assert!(refs.request_object.starts_with("objects/blake3/"));
-    }
+            .expect("read rolled-back recovery state");
+    assert_eq!(failed_recovery_state, (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    let failed_recovery_locators: Vec<(String, i64, String, String, String, Option<String>)> =
+        sqlx::query_as(recovery_locator_query)
+            .bind(recovery_fixtures[0].3.to_string())
+            .bind(recovery_fixtures[1].3.to_string())
+            .bind(recovery_fixtures[2].3.to_string())
+            .fetch_all(&pool)
+            .await
+            .expect("read recovery locators after rollback");
+    assert_eq!(failed_recovery_locators, original_recovery_locators);
 
     sqlx::query("DROP TRIGGER inject_archive_commit_failure")
         .execute(&pool)
@@ -991,40 +1029,974 @@ async fn archive_import_is_fail_closed_gap_only_and_idempotent() {
         .expect("remove deterministic commit failure");
     let recovered = import_session_archive(&db, &archive, &recovery_options)
         .await
-        .expect("same sealed source completes remaining records");
-    assert_eq!(recovered.before_overlap, 1);
-    assert_eq!(recovered.replayed, 1);
-    assert_eq!(recovered.imported, 1);
-    let final_imports: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM session_archive_import_records WHERE source = 'partial-recovery-test'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("count recovered imports");
-    let final_observations: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM conversation_observations WHERE request_id = $1 OR request_id = $2 OR request_id = $3",
-    )
-    .bind(recovery_fixtures[0].3.to_string())
-    .bind(recovery_fixtures[1].3.to_string())
-    .bind(recovery_fixtures[2].3.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("count recovered observations");
-    let final_checkpoint: (i64, i64) = sqlx::query_as(
-        "SELECT watermark_ms, imported_records FROM session_archive_import_checkpoints WHERE source = 'partial-recovery-test'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("read recovered checkpoint");
-    assert_eq!(final_imports, 3);
-    assert_eq!(final_observations, 3);
-    assert_eq!(final_checkpoint, (recovery_started_at + 100_000, 3));
+        .expect("same sealed source atomically imports all records");
+    assert_eq!(recovered.before_overlap, 0);
+    assert_eq!(recovered.replayed, 0);
+    assert_eq!(recovered.imported, 3);
+    let recovered_state: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(recovery_state_query)
+            .bind(key.tenant_id.to_string())
+            .bind(recovery_options.archive_source)
+            .fetch_one(&pool)
+            .await
+            .expect("read atomically recovered state");
+    assert_eq!(
+        recovered_state,
+        (3, 3, 0, 0, 0, 3, 3, 1, recovery_started_at + 100_000, 3, 0)
+    );
+    let recovered_locators: Vec<(String, i64, String, String, String, Option<String>)> =
+        sqlx::query_as(recovery_locator_query)
+            .bind(recovery_fixtures[0].3.to_string())
+            .bind(recovery_fixtures[1].3.to_string())
+            .bind(recovery_fixtures[2].3.to_string())
+            .fetch_all(&pool)
+            .await
+            .expect("snapshot locators after atomic recovery");
     let exact_replay = import_session_archive(&db, &archive, &recovery_options)
         .await
         .expect("exact replay remains idempotent");
     assert_eq!(exact_replay.before_overlap, 2);
     assert_eq!(exact_replay.replayed, 1);
     assert_eq!(exact_replay.imported, 0);
+    let replayed_state: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(recovery_state_query)
+            .bind(key.tenant_id.to_string())
+            .bind(recovery_options.archive_source)
+            .fetch_one(&pool)
+            .await
+            .expect("read state after exact recovery replay");
+    assert_eq!(replayed_state, recovered_state);
+    let replayed_locators: Vec<(String, i64, String, String, String, Option<String>)> =
+        sqlx::query_as(recovery_locator_query)
+            .bind(recovery_fixtures[0].3.to_string())
+            .bind(recovery_fixtures[1].3.to_string())
+            .bind(recovery_fixtures[2].3.to_string())
+            .fetch_all(&pool)
+            .await
+            .expect("read locators after exact recovery replay");
+    assert_eq!(replayed_locators, recovered_locators);
+}
+
+#[tokio::test]
+async fn stable_v2_mixed_batch_finalize_failure_is_fully_atomic() {
+    let directory = tempfile::tempdir().expect("stable v2 fixture directory");
+    let database_path = directory.path().join("stable-v2.sqlite");
+    let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+    let db = Database::connect(&database_url)
+        .await
+        .expect("connect stable v2 SQLite");
+    db.migrate().await.expect("migrate stable v2 SQLite");
+    let config = Config::for_test(database_url.clone());
+    let archive = ArchiveStore::from_config(&config)
+        .await
+        .expect("create stable v2 archive store");
+    let issued = db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "stable-v2-atomic-tenant".into(),
+                principal_external_id: "stable-v2-principal".into(),
+                alias: "Stable v2 atomic fixture".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy {
+                    allowed_models: vec!["gpt-fixture".into()],
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::new(10, 0),
+                idempotency_key: Some("stable-v2-atomic-key".into()),
+            },
+            config.key_pepper.as_bytes(),
+        )
+        .await
+        .expect("create stable v2 key");
+    let key = db
+        .authenticate_key(&issued.key, config.key_pepper.as_bytes())
+        .await
+        .expect("authenticate stable v2 key");
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::AnyPool::connect(&database_url)
+        .await
+        .expect("connect stable v2 fixture pool");
+
+    let source_key_hash = "8".repeat(64);
+    let exact_event_hash = "9".repeat(64);
+    let exact_target_id = Uuid::now_v7();
+    let base_started_at = 1_786_493_100_000_i64;
+    insert_duplicate_archive_candidate(
+        &db,
+        &pool,
+        key.key_id,
+        key.tenant_id,
+        exact_target_id,
+        &exact_event_hash,
+        "stable-exact-request",
+        &source_key_hash,
+        base_started_at,
+        0,
+        0,
+    )
+    .await;
+
+    let records = [
+        json!({
+            "schema_version": 2,
+            "session_id": "a-exact-session",
+            "request_id": "stable-exact-request",
+            "started_at": rfc3339_millis(base_started_at),
+            "completed_at": rfc3339_millis(base_started_at + 1_000),
+            "credential_hash": source_key_hash,
+            "requested_model": "gpt-fixture",
+            "model": "gpt-fixture",
+            "outcome": "succeeded",
+            "status_code": 200,
+            "facets": {"client": ["Codex"], "turn.id": ["stable-exact-turn"]},
+            "request": {"model": "gpt-fixture", "input": "stable exact prompt"},
+            "response": {"id": "stable-exact-response", "output": "stable exact answer"}
+        }),
+        json!({
+            "schema_version": 2,
+            "session_id": "b-unlinked-session",
+            "request_id": "stable-unlinked-request",
+            "started_at": rfc3339_millis(base_started_at + 2_000),
+            "completed_at": rfc3339_millis(base_started_at + 3_000),
+            "credential_hash": source_key_hash,
+            "requested_model": "gpt-fixture",
+            "model": "gpt-fixture",
+            "outcome": "succeeded",
+            "status_code": 200,
+            "facets": {"client": ["Codex"], "turn.id": ["stable-unlinked-turn"]},
+            "request": {"model": "gpt-fixture", "input": "stable unlinked prompt"},
+            "response": {"id": "stable-unlinked-response", "output": "stable unlinked answer"}
+        }),
+        json!({
+            "schema_version": 2,
+            "session_id": "c-quarantine-session",
+            "request_id": "stable-quarantine-request",
+            "started_at": rfc3339_millis(base_started_at + 4_000),
+            "completed_at": rfc3339_millis(base_started_at + 5_000),
+            "requested_model": "gpt-fixture",
+            "model": "gpt-fixture",
+            "outcome": "succeeded",
+            "status_code": 200,
+            "request": {"model": "gpt-fixture", "input": "stable quarantine prompt"},
+            "response": {"id": "stable-quarantine-response", "output": "stable quarantine answer"}
+        }),
+    ];
+    let mut input_bytes = Vec::new();
+    let mut canonical_summaries = Vec::new();
+    for record in &records {
+        let mut record_line = serde_json::to_vec(record).expect("encode stable v2 record");
+        record_line.push(b'\n');
+        let records_sha256 = format!("{:x}", Sha256::digest(&record_line));
+        let session_id = record["session_id"]
+            .as_str()
+            .expect("stable fixture session id");
+        let first_at = record["started_at"]
+            .as_str()
+            .expect("stable fixture started at");
+        let last_at = record["completed_at"]
+            .as_str()
+            .expect("stable fixture completed at");
+        let summary = json!({
+            "_mtc_delta_type": "session_summary",
+            "schema_version": 2,
+            "session_id": session_id,
+            "requests": 1,
+            "first_at": first_at,
+            "last_at": last_at,
+            "records_sha256": records_sha256
+        });
+        serde_json::to_writer(&mut input_bytes, &summary).expect("encode stable v2 summary");
+        input_bytes.push(b'\n');
+        input_bytes.extend_from_slice(&record_line);
+        let canonical_first_at = chrono::DateTime::parse_from_rfc3339(first_at)
+            .expect("parse stable fixture started at")
+            .to_utc()
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let canonical_last_at = chrono::DateTime::parse_from_rfc3339(last_at)
+            .expect("parse stable fixture completed at")
+            .to_utc()
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        canonical_summaries.push(json!({
+            "first_at": canonical_first_at,
+            "last_at": canonical_last_at,
+            "records_sha256": records_sha256,
+            "requests": 1,
+            "session_id": session_id
+        }));
+    }
+    let mut session_set_bytes = vec![b'['];
+    for (index, summary) in canonical_summaries.iter().enumerate() {
+        if index > 0 {
+            session_set_bytes.push(b',');
+        }
+        session_set_bytes.extend(
+            serde_json::to_vec(summary).expect("encode canonical stable v2 summary digest"),
+        );
+    }
+    session_set_bytes.push(b']');
+    let session_set_sha256 = format!("{:x}", Sha256::digest(&session_set_bytes));
+    let output_sha256 = format!("{:x}", Sha256::digest(&input_bytes));
+    let input_path = directory.path().join("stable-v2-mixed.jsonl");
+    std::fs::write(&input_path, &input_bytes).expect("write stable v2 input");
+    let manifest_path = directory.path().join("stable-v2-mixed.jsonl.manifest.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&json!({
+            "version": 3,
+            "output_file": "stable-v2-mixed.jsonl",
+            "output_sha256": output_sha256.clone(),
+            "output_size_bytes": input_bytes.len(),
+            "source_fingerprint": "a".repeat(64),
+            "sequence": 1,
+            "offline_full_snapshot": true,
+            "prior_output_sha256": null,
+            "prior_source_ingest_fence": null,
+            "session_projection_protocol": "session-snapshot-cursor-v1",
+            "snapshot_schema_version": 2,
+            "source_ingest_fence": "10",
+            "tombstone_safe_after_ingest_fence": "0",
+            "session_set_sha256": session_set_sha256.clone(),
+            "session_count": 3,
+            "source_projection_requests": 3,
+            "record_count": 3,
+            "deleted_session_count": 0
+        }))
+        .expect("encode stable v2 manifest"),
+    )
+    .expect("write stable v2 manifest");
+    let stable_options = SessionArchiveImportOptions {
+        input: &input_path,
+        plan_directory: directory.path(),
+        tenant_external_id: "stable-v2-atomic-tenant",
+        cpamp_source: "cpamp-usage-events-v1",
+        archive_source: "stable-v2-atomic-mixed-test",
+        overlap_ms: 0,
+        time_tolerance_ms: 5_000,
+        max_line_bytes: 1024 * 1024,
+        max_plan_bytes: 16 * 1024 * 1024,
+        allow_unmapped: false,
+        quarantine_unknown_identities: true,
+        quarantine_tenant_binding_kind: Some("sealed-offline-backup-v1"),
+        quarantine_tenant_binding_proof: Some(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+        quarantine_approved_by_service_id: None,
+        apply: true,
+    };
+    let relational_query = "SELECT
+        (SELECT COUNT(*) FROM session_archive_import_records WHERE tenant_id=$1 AND source=$2),
+        (SELECT COUNT(*) FROM session_archive_correlations WHERE tenant_id=$1 AND source=$2 AND disposition='exact'),
+        (SELECT COUNT(*) FROM session_archive_correlations WHERE tenant_id=$1 AND source=$2 AND disposition='unlinked'),
+        (SELECT COUNT(*) FROM session_archive_unlinked_requests WHERE tenant_id=$1 AND source=$2),
+        (SELECT COUNT(*) FROM session_archive_correlations WHERE tenant_id=$1 AND source=$2)";
+    let quarantine_query = "SELECT
+        (SELECT COUNT(*) FROM session_archive_quarantine_batches WHERE tenant_id=$1 AND source=$2),
+        (SELECT COUNT(*) FROM session_archive_quarantine_records WHERE tenant_id=$1 AND source=$2),
+        (SELECT COUNT(*) FROM session_archive_quarantine_record_versions WHERE tenant_id=$1 AND source=$2),
+        (SELECT COUNT(*) FROM session_archive_quarantine_record_heads WHERE tenant_id=$1 AND source=$2),
+        (SELECT COUNT(*) FROM session_archive_quarantine_batch_records r JOIN session_archive_quarantine_batches b ON b.id=r.batch_id WHERE b.tenant_id=$1 AND b.source=$2),
+        (SELECT COUNT(*) FROM session_archive_quarantine_occurrences o JOIN session_archive_quarantine_batches b ON b.id=o.batch_id WHERE b.tenant_id=$1 AND b.source=$2),
+        (SELECT COUNT(*) FROM session_archive_quarantine_resolutions r JOIN session_archive_quarantine_record_versions q ON q.id=r.quarantine_id WHERE q.tenant_id=$1 AND q.source=$2)";
+    let semantic_query = "SELECT
+        (SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id=$1),
+        (SELECT COUNT(*) FROM context_nodes WHERE tenant_id=$1),
+        (SELECT COUNT(*) FROM conversation_clusters WHERE tenant_id=$1),
+        (SELECT COUNT(*) FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE c.tenant_id=$1),
+        (SELECT COUNT(*) FROM conversation_edges e JOIN conversation_clusters c ON c.id=e.cluster_id WHERE c.tenant_id=$1),
+        (SELECT COUNT(*) FROM conversation_key_clusters WHERE key_id=$2)";
+    let checkpoint_query = "SELECT
+        (SELECT COUNT(*) FROM session_archive_import_checkpoints WHERE tenant_id=$1 AND source=$2),
+        COALESCE((SELECT watermark_ms FROM session_archive_import_checkpoints WHERE tenant_id=$1 AND source=$2),0),
+        COALESCE((SELECT watermark_request_id FROM session_archive_import_checkpoints WHERE tenant_id=$1 AND source=$2),''),
+        COALESCE((SELECT imported_records FROM session_archive_import_checkpoints WHERE tenant_id=$1 AND source=$2),0),
+        (SELECT COUNT(*) FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2),
+        COALESCE((SELECT sequence FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2),0),
+        COALESCE((SELECT request_count FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2),0),
+        COALESCE((SELECT session_count FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2),0),
+        (SELECT COUNT(*) FROM session_archive_source_sessions WHERE tenant_id=$1 AND source=$2),
+        (SELECT COUNT(*) FROM session_archive_snapshot_stage_sessions WHERE tenant_id=$1 AND source=$2),
+        (SELECT COUNT(*) FROM session_archive_snapshot_stage_records WHERE tenant_id=$1 AND source=$2)";
+    let locator_query = "SELECT l.id,l.created_at,l.tenant_id,l.key_id,r.request_object,r.response_object
+        FROM request_record_locators l JOIN request_records r ON r.id=l.id AND r.created_at=l.created_at
+        WHERE l.id=$1";
+    let original_locator: (String, i64, String, String, String, Option<String>) =
+        sqlx::query_as(locator_query)
+            .bind(exact_target_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("snapshot stable exact locator");
+
+    sqlx::query(
+        "CREATE TRIGGER inject_stable_snapshot_finalize_failure BEFORE INSERT ON session_archive_snapshot_checkpoints WHEN NEW.source='stable-v2-atomic-mixed-test' BEGIN SELECT RAISE(ABORT, 'injected stable snapshot finalize failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("install stable snapshot finalize failure");
+    import_session_archive(&db, &archive, &stable_options)
+        .await
+        .expect_err("snapshot finalize failure must roll back every mixed projection");
+    let failed_relational: (i64, i64, i64, i64, i64) = sqlx::query_as(relational_query)
+        .bind(key.tenant_id.to_string())
+        .bind(stable_options.archive_source)
+        .fetch_one(&pool)
+        .await
+        .expect("read rolled-back mixed relational state");
+    let failed_quarantine: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(quarantine_query)
+        .bind(key.tenant_id.to_string())
+        .bind(stable_options.archive_source)
+        .fetch_one(&pool)
+        .await
+        .expect("read rolled-back mixed quarantine state");
+    let failed_semantic: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(semantic_query)
+        .bind(key.tenant_id.to_string())
+        .bind(key.key_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("read rolled-back mixed semantic state");
+    let failed_checkpoints: (i64, i64, String, i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(checkpoint_query)
+            .bind(key.tenant_id.to_string())
+            .bind(stable_options.archive_source)
+            .fetch_one(&pool)
+            .await
+            .expect("read rolled-back mixed checkpoints");
+    let failed_locator: (String, i64, String, String, String, Option<String>) =
+        sqlx::query_as(locator_query)
+            .bind(exact_target_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("read stable exact locator after rollback");
+    assert_eq!(failed_relational, (0, 0, 0, 0, 0));
+    assert_eq!(failed_quarantine, (0, 0, 0, 0, 0, 0, 0));
+    assert_eq!(failed_semantic, (0, 0, 0, 0, 0, 0));
+    assert_eq!(
+        failed_checkpoints,
+        (0, 0, String::new(), 0, 0, 0, 0, 0, 0, 0, 0)
+    );
+    assert_eq!(failed_locator, original_locator);
+
+    sqlx::query("DROP TRIGGER inject_stable_snapshot_finalize_failure")
+        .execute(&pool)
+        .await
+        .expect("remove stable snapshot finalize failure");
+    let applied = import_session_archive(&db, &archive, &stable_options)
+        .await
+        .expect("atomically apply stable v2 mixed batch");
+    assert_eq!(applied.imported, 2);
+    assert_eq!(applied.quarantine_imported, 1);
+    let applied_relational: (i64, i64, i64, i64, i64) = sqlx::query_as(relational_query)
+        .bind(key.tenant_id.to_string())
+        .bind(stable_options.archive_source)
+        .fetch_one(&pool)
+        .await
+        .expect("read applied mixed relational state");
+    let applied_quarantine: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(quarantine_query)
+        .bind(key.tenant_id.to_string())
+        .bind(stable_options.archive_source)
+        .fetch_one(&pool)
+        .await
+        .expect("read applied mixed quarantine state");
+    let applied_semantic: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(semantic_query)
+        .bind(key.tenant_id.to_string())
+        .bind(key.key_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("read applied mixed semantic state");
+    let applied_checkpoints: (i64, i64, String, i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(checkpoint_query)
+            .bind(key.tenant_id.to_string())
+            .bind(stable_options.archive_source)
+            .fetch_one(&pool)
+            .await
+            .expect("read applied mixed checkpoints");
+    let applied_locator: (String, i64, String, String, String, Option<String>) =
+        sqlx::query_as(locator_query)
+            .bind(exact_target_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("read stable exact locator after apply");
+    assert_eq!(applied_relational, (1, 1, 1, 1, 2));
+    assert_eq!(applied_quarantine, (1, 1, 1, 1, 1, 1, 0));
+    assert!(applied_semantic.0 > 0);
+    assert!(applied_semantic.1 > 0);
+    assert_eq!(applied_semantic.2, 2);
+    assert_eq!(applied_semantic.3, 2);
+    assert_eq!(applied_semantic.5, 2);
+    assert_eq!(
+        applied_checkpoints,
+        (
+            1,
+            base_started_at + 5_000,
+            "stable-quarantine-request".to_owned(),
+            3,
+            1,
+            1,
+            3,
+            3,
+            3,
+            0,
+            0
+        )
+    );
+    let applied_stable_seal: (String, String, i64) = sqlx::query_as(
+        "SELECT output_sha256,session_set_sha256,ingest_fence FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(stable_options.archive_source)
+    .fetch_one(&pool)
+    .await
+    .expect("read stable checkpoint seal");
+    assert_eq!(applied_stable_seal, (output_sha256, session_set_sha256, 10));
+    assert!(applied_locator.4.starts_with("objects/blake3/"));
+
+    let replay = import_session_archive(&db, &archive, &stable_options)
+        .await
+        .expect("exactly replay stable v2 mixed batch");
+    assert_eq!(replay.imported, 0);
+    assert_eq!(replay.quarantine_imported, 0);
+    assert_eq!(replay.quarantine_replayed, 1);
+    let replayed_relational: (i64, i64, i64, i64, i64) = sqlx::query_as(relational_query)
+        .bind(key.tenant_id.to_string())
+        .bind(stable_options.archive_source)
+        .fetch_one(&pool)
+        .await
+        .expect("read replayed mixed relational state");
+    let replayed_quarantine: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(quarantine_query)
+        .bind(key.tenant_id.to_string())
+        .bind(stable_options.archive_source)
+        .fetch_one(&pool)
+        .await
+        .expect("read replayed mixed quarantine state");
+    let replayed_semantic: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(semantic_query)
+        .bind(key.tenant_id.to_string())
+        .bind(key.key_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("read replayed mixed semantic state");
+    let replayed_checkpoints: (i64, i64, String, i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(checkpoint_query)
+            .bind(key.tenant_id.to_string())
+            .bind(stable_options.archive_source)
+            .fetch_one(&pool)
+            .await
+            .expect("read replayed mixed checkpoints");
+    let replayed_locator: (String, i64, String, String, String, Option<String>) =
+        sqlx::query_as(locator_query)
+            .bind(exact_target_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("read stable exact locator after replay");
+    assert_eq!(replayed_relational, applied_relational);
+    assert_eq!(replayed_quarantine, applied_quarantine);
+    assert_eq!(replayed_semantic, applied_semantic);
+    assert_eq!(replayed_checkpoints, applied_checkpoints);
+    assert_eq!(replayed_locator, applied_locator);
+}
+
+#[tokio::test]
+async fn stable_snapshot_chain_transitions_are_fail_closed_in_preflight_and_apply() {
+    let directory = tempfile::tempdir().expect("stable chain fixture directory");
+    let database_path = directory.path().join("stable-chain.sqlite");
+    let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+    let db = Database::connect(&database_url)
+        .await
+        .expect("connect stable chain SQLite");
+    db.migrate().await.expect("migrate stable chain SQLite");
+    let config = Config::for_test(database_url.clone());
+    let archive = ArchiveStore::from_config(&config)
+        .await
+        .expect("create stable chain archive store");
+    let tenant_external_id = "stable-chain-tenant";
+    let issued = db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: tenant_external_id.into(),
+                principal_external_id: "stable-chain-principal".into(),
+                alias: "Stable chain fixture".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy {
+                    allowed_models: vec!["gpt-fixture".into()],
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::new(10, 0),
+                idempotency_key: Some("stable-chain-key".into()),
+            },
+            config.key_pepper.as_bytes(),
+        )
+        .await
+        .expect("create stable chain key");
+    let key = db
+        .authenticate_key(&issued.key, config.key_pepper.as_bytes())
+        .await
+        .expect("authenticate stable chain key");
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::AnyPool::connect(&database_url)
+        .await
+        .expect("connect stable chain fixture pool");
+    let source_key_hash = "c".repeat(64);
+    let event_hash = "d".repeat(64);
+    let exact_target_id = Uuid::now_v7();
+    let base_started_at = 1_786_493_200_000_i64;
+    insert_duplicate_archive_candidate(
+        &db,
+        &pool,
+        key.key_id,
+        key.tenant_id,
+        exact_target_id,
+        &event_hash,
+        "chain-v1-baseline-request",
+        &source_key_hash,
+        base_started_at,
+        0,
+        0,
+    )
+    .await;
+    let record = |session_id: &str, request_id: &str, started_at: i64| {
+        json!({
+            "schema_version": 2,
+            "session_id": session_id,
+            "request_id": request_id,
+            "started_at": rfc3339_millis(started_at),
+            "completed_at": rfc3339_millis(started_at + 1_000),
+            "credential_hash": source_key_hash,
+            "requested_model": "gpt-fixture",
+            "model": "gpt-fixture",
+            "outcome": "succeeded",
+            "status_code": 200,
+            "facets": {"client": ["Codex"], "turn.id": [request_id]},
+            "request": {"model": "gpt-fixture", "input": request_id},
+            "response": {"id": format!("response-{request_id}"), "output": "stable chain answer"}
+        })
+    };
+    let source_fingerprint = "e".repeat(64);
+    let main_source = "stable-chain-main";
+    let (v1_baseline_path, v1_baseline_sha) = write_stable_chain_fixture(
+        directory.path(),
+        "chain-v1-baseline.jsonl",
+        &record(
+            "chain-v1-baseline-session",
+            "chain-v1-baseline-request",
+            base_started_at,
+        ),
+        &source_fingerprint,
+        1,
+        true,
+        None,
+        None,
+        1,
+        1,
+        None,
+    );
+    let baseline = import_session_archive(
+        &db,
+        &archive,
+        &stable_chain_options(
+            &v1_baseline_path,
+            directory.path(),
+            tenant_external_id,
+            main_source,
+            true,
+        ),
+    )
+    .await
+    .expect("apply stable chain v1 baseline");
+    assert_eq!(baseline.imported, 1);
+
+    let (v1_next_path, v1_next_sha) = write_stable_chain_fixture(
+        directory.path(),
+        "chain-v1-next.jsonl",
+        &record(
+            "chain-v1-next-session",
+            "chain-v1-next-request",
+            base_started_at + 2_000,
+        ),
+        &source_fingerprint,
+        2,
+        false,
+        Some(&v1_baseline_sha),
+        Some(1),
+        1,
+        2,
+        None,
+    );
+    let v1_next = import_session_archive(
+        &db,
+        &archive,
+        &stable_chain_options(
+            &v1_next_path,
+            directory.path(),
+            tenant_external_id,
+            main_source,
+            true,
+        ),
+    )
+    .await
+    .expect("accept stable chain v1 to v1");
+    assert_eq!(v1_next.imported, 1);
+    let v1_checkpoint: (i64, i64, i64, Option<i64>, String) = sqlx::query_as(
+        "SELECT sequence,snapshot_schema_version,ingest_fence,tombstone_safe_after_ingest_fence,output_sha256 FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(main_source)
+    .fetch_one(&pool)
+    .await
+    .expect("read accepted v1 to v1 checkpoint");
+    assert_eq!(v1_checkpoint, (2, 1, 2, None, v1_next_sha.clone()));
+
+    let (v2_upgrade_path, v2_upgrade_sha) = write_stable_chain_fixture(
+        directory.path(),
+        "chain-v2-upgrade.jsonl",
+        &record(
+            "chain-v2-upgrade-session",
+            "chain-v2-upgrade-request",
+            base_started_at + 4_000,
+        ),
+        &source_fingerprint,
+        3,
+        false,
+        Some(&v1_next_sha),
+        Some(2),
+        2,
+        3,
+        Some(2),
+    );
+    let v2_upgrade = import_session_archive(
+        &db,
+        &archive,
+        &stable_chain_options(
+            &v2_upgrade_path,
+            directory.path(),
+            tenant_external_id,
+            main_source,
+            true,
+        ),
+    )
+    .await
+    .expect("accept stable chain v1 to v2 at a safe prior fence");
+    assert_eq!(v2_upgrade.imported, 1);
+    let upgraded_checkpoint: (i64, i64, i64, Option<i64>, String, i64, i64) =
+        sqlx::query_as(
+            "SELECT sequence,snapshot_schema_version,ingest_fence,tombstone_safe_after_ingest_fence,output_sha256,session_count,request_count FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2",
+        )
+        .bind(key.tenant_id.to_string())
+        .bind(main_source)
+        .fetch_one(&pool)
+        .await
+        .expect("read accepted v1 to v2 checkpoint");
+    assert_eq!(
+        upgraded_checkpoint,
+        (3, 2, 3, Some(2), v2_upgrade_sha.clone(), 1, 1)
+    );
+
+    let main_state_before_rejections = stable_chain_state(&pool, key.tenant_id, main_source).await;
+
+    let (downgrade_path, _) = write_stable_chain_fixture(
+        directory.path(),
+        "chain-v1-downgrade.jsonl",
+        &record(
+            "chain-v1-downgrade-session",
+            "chain-v1-downgrade-request",
+            base_started_at + 6_000,
+        ),
+        &source_fingerprint,
+        4,
+        false,
+        Some(&v2_upgrade_sha),
+        Some(3),
+        1,
+        4,
+        None,
+    );
+    for apply in [false, true] {
+        let error = import_session_archive(
+            &db,
+            &archive,
+            &stable_chain_options(
+                &downgrade_path,
+                directory.path(),
+                tenant_external_id,
+                main_source,
+                apply,
+            ),
+        )
+        .await
+        .expect_err("stable v2 to v1 downgrade must be rejected");
+        assert!(error.to_string().contains("fence or digest changed"));
+        let unchanged = stable_chain_state(&pool, key.tenant_id, main_source).await;
+        assert_eq!(unchanged, main_state_before_rejections);
+    }
+
+    let (safe_drift_path, _) = write_stable_chain_fixture(
+        directory.path(),
+        "chain-v2-safe-drift.jsonl",
+        &record(
+            "chain-v2-safe-drift-session",
+            "chain-v2-safe-drift-request",
+            base_started_at + 8_000,
+        ),
+        &source_fingerprint,
+        4,
+        false,
+        Some(&v2_upgrade_sha),
+        Some(3),
+        2,
+        4,
+        Some(1),
+    );
+    for apply in [false, true] {
+        let error = import_session_archive(
+            &db,
+            &archive,
+            &stable_chain_options(
+                &safe_drift_path,
+                directory.path(),
+                tenant_external_id,
+                main_source,
+                apply,
+            ),
+        )
+        .await
+        .expect_err("stable v2 safe fence drift must be rejected");
+        assert!(error.to_string().contains("fence or digest changed"));
+        let unchanged = stable_chain_state(&pool, key.tenant_id, main_source).await;
+        assert_eq!(unchanged, main_state_before_rejections);
+    }
+
+    let unsafe_source = "stable-chain-unsafe-upgrade";
+    let unsafe_fingerprint = "f".repeat(64);
+    let (unsafe_v1_path, unsafe_v1_sha) = write_stable_chain_fixture(
+        directory.path(),
+        "unsafe-chain-v1.jsonl",
+        &record(
+            "unsafe-chain-v1-session",
+            "unsafe-chain-v1-request",
+            base_started_at + 10_000,
+        ),
+        &unsafe_fingerprint,
+        1,
+        true,
+        None,
+        None,
+        1,
+        5,
+        None,
+    );
+    import_session_archive(
+        &db,
+        &archive,
+        &stable_chain_options(
+            &unsafe_v1_path,
+            directory.path(),
+            tenant_external_id,
+            unsafe_source,
+            true,
+        ),
+    )
+    .await
+    .expect("apply unsafe-upgrade branch v1 baseline");
+    let unsafe_state_before = stable_chain_state(&pool, key.tenant_id, unsafe_source).await;
+    let (unsafe_v2_path, _) = write_stable_chain_fixture(
+        directory.path(),
+        "unsafe-chain-v2.jsonl",
+        &record(
+            "unsafe-chain-v2-session",
+            "unsafe-chain-v2-request",
+            base_started_at + 12_000,
+        ),
+        &unsafe_fingerprint,
+        2,
+        false,
+        Some(&unsafe_v1_sha),
+        Some(5),
+        2,
+        6,
+        Some(6),
+    );
+    for apply in [false, true] {
+        let error = import_session_archive(
+            &db,
+            &archive,
+            &stable_chain_options(
+                &unsafe_v2_path,
+                directory.path(),
+                tenant_external_id,
+                unsafe_source,
+                apply,
+            ),
+        )
+        .await
+        .expect_err("v1 to v2 upgrade beyond the prior safe fence must be rejected");
+        assert!(error.to_string().contains("fence or digest changed"));
+        let unchanged = stable_chain_state(&pool, key.tenant_id, unsafe_source).await;
+        assert_eq!(unchanged, unsafe_state_before);
+    }
+}
+
+#[tokio::test]
+async fn stable_v2_rejects_legacy_exact_rows_without_reversible_provenance() {
+    let directory = tempfile::tempdir().expect("legacy provenance fixture directory");
+    let database_path = directory.path().join("legacy-provenance.sqlite");
+    let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+    let db = Database::connect(&database_url)
+        .await
+        .expect("connect legacy provenance SQLite");
+    db.migrate()
+        .await
+        .expect("migrate legacy provenance SQLite");
+    let config = Config::for_test(database_url.clone());
+    let archive = ArchiveStore::from_config(&config)
+        .await
+        .expect("create legacy provenance archive store");
+    let tenant_external_id = "legacy-provenance-tenant";
+    let issued = db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: tenant_external_id.into(),
+                principal_external_id: "legacy-provenance-principal".into(),
+                alias: "Legacy provenance fixture".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ZERO,
+                idempotency_key: Some("legacy-provenance-key".into()),
+            },
+            config.key_pepper.as_bytes(),
+        )
+        .await
+        .expect("create legacy provenance key");
+    let key = db
+        .authenticate_key(&issued.key, config.key_pepper.as_bytes())
+        .await
+        .expect("authenticate legacy provenance key");
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::AnyPool::connect(&database_url)
+        .await
+        .expect("connect legacy provenance fixture pool");
+    let archive_source = "legacy-provenance-source";
+    let target_request_id = Uuid::now_v7();
+    let old_request_locator = "gap://legacy/noncanonical-request";
+    let old_response_locator = "gap://legacy/noncanonical-response";
+    sqlx::query(
+        "INSERT INTO session_archive_import_records (
+            tenant_id,source,external_request_id,target_request_id,external_event_hash,
+            record_digest,request_digest,response_digest,request_object,response_object,
+            source_started_at,imported_at,source_session_id
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(archive_source)
+    .bind("legacy-external-request")
+    .bind(target_request_id.to_string())
+    .bind("a".repeat(64))
+    .bind("b".repeat(64))
+    .bind("c".repeat(64))
+    .bind("d".repeat(64))
+    .bind(old_request_locator)
+    .bind(old_response_locator)
+    .bind(1_786_493_200_000_i64)
+    .bind(1_786_493_201_000_i64)
+    .bind("legacy-session")
+    .execute(&pool)
+    .await
+    .expect("insert pre-0058 exact import row");
+
+    let input_path = directory.path().join("empty-v2-baseline.jsonl");
+    std::fs::write(&input_path, []).expect("write empty v2 baseline");
+    let output_sha256 = format!("{:x}", Sha256::digest([]));
+    let session_set_sha256 = format!("{:x}", Sha256::digest(b"[]"));
+    let mut manifest_name = input_path.as_os_str().to_os_string();
+    manifest_name.push(".manifest.json");
+    std::fs::write(
+        std::path::PathBuf::from(manifest_name),
+        serde_json::to_vec(&json!({
+            "version": 3,
+            "output_file": "empty-v2-baseline.jsonl",
+            "output_sha256": output_sha256,
+            "output_size_bytes": 0,
+            "source_fingerprint": "e".repeat(64),
+            "sequence": 1,
+            "offline_full_snapshot": true,
+            "prior_output_sha256": null,
+            "prior_source_ingest_fence": null,
+            "session_projection_protocol": "session-snapshot-cursor-v1",
+            "snapshot_schema_version": 2,
+            "source_ingest_fence": "0",
+            "tombstone_safe_after_ingest_fence": "0",
+            "session_set_sha256": session_set_sha256,
+            "session_count": 0,
+            "source_projection_requests": 0,
+            "record_count": 0,
+            "deleted_session_count": 0
+        }))
+        .expect("encode empty v2 baseline manifest"),
+    )
+    .expect("write empty v2 baseline manifest");
+
+    let before = stable_chain_state(&pool, key.tenant_id, archive_source).await;
+    let locators_before: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT request_object,response_object FROM session_archive_import_records
+         WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(archive_source)
+    .bind("legacy-external-request")
+    .fetch_one(&pool)
+    .await
+    .expect("read legacy locators before preflight");
+    assert_eq!(
+        locators_before,
+        (
+            Some(old_request_locator.into()),
+            Some(old_response_locator.into())
+        )
+    );
+
+    for apply in [false, true] {
+        let error = import_session_archive(
+            &db,
+            &archive,
+            &stable_chain_options(
+                &input_path,
+                directory.path(),
+                tenant_external_id,
+                archive_source,
+                apply,
+            ),
+        )
+        .await
+        .expect_err("schema-v2 must reject legacy exact rows without reversible provenance");
+        assert!(
+            error
+                .to_string()
+                .contains("legacy exact archive rows lack reversible locator provenance")
+        );
+        assert_eq!(
+            stable_chain_state(&pool, key.tenant_id, archive_source).await,
+            before,
+            "failed dry-run/apply must leave projections, staging, and both checkpoints unchanged"
+        );
+        let locators_after: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT request_object,response_object FROM session_archive_import_records
+             WHERE tenant_id=$1 AND source=$2 AND external_request_id=$3",
+        )
+        .bind(key.tenant_id.to_string())
+        .bind(archive_source)
+        .bind("legacy-external-request")
+        .fetch_one(&pool)
+        .await
+        .expect("read legacy locators after rejected import");
+        assert_eq!(locators_after, locators_before);
+    }
+    let plan_leftovers = std::fs::read_dir(directory.path())
+        .expect("read legacy provenance plan directory")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".mtc-session-archive-plan-")
+        })
+        .count();
+    assert_eq!(plan_leftovers, 0, "rejected imports must clean plan files");
 }
 
 #[tokio::test]
@@ -1149,6 +2121,7 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
             output_tokens: None,
             record_digest: "postgres-cas-digest",
             time_tolerance_ms: 0,
+            allow_stable_replacement: false,
         })
         .await
         .expect("match PostgreSQL CAS target");
@@ -1182,6 +2155,7 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
                 tenant_external_id: &commit_tenant_external_id,
                 archive_source: "postgres-cas-archive",
                 external_request_id: "postgres-cas-external",
+                source_session_id: "postgres-cas-session",
                 target: &target,
                 record_digest: TEST_RECORD_DIGEST,
                 request_digest: Some(TEST_OTHER_RECORD_DIGEST),
@@ -1196,6 +2170,7 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
                 identity_proof_kind: TEST_IDENTITY_PROOF_KIND,
                 identity_proof_digest: TEST_IDENTITY_PROOF_DIGEST,
                 correlation_proof_digest: TEST_CORRELATION_PROOF_DIGEST,
+                defer_checkpoint: false,
             })
             .await
     });
@@ -1272,6 +2247,7 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
         tenant_external_id: &replay_tenant_external_id,
         archive_source: "postgres-cas-archive",
         external_request_id: "postgres-cas-external",
+        source_session_id: "postgres-cas-session",
         target: &replay_target,
         record_digest: TEST_RECORD_DIGEST,
         request_digest: Some(TEST_OTHER_RECORD_DIGEST),
@@ -1286,6 +2262,7 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
         identity_proof_kind: TEST_IDENTITY_PROOF_KIND,
         identity_proof_digest: TEST_IDENTITY_PROOF_DIGEST,
         correlation_proof_digest: TEST_CORRELATION_PROOF_DIGEST,
+        defer_checkpoint: false,
     };
     assert!(
         db.commit_session_archive_request(replay_input())
@@ -1376,8 +2353,9 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
         started_at + 6_500,
         started_at + 10_000,
     );
-    // PostgreSQL verifies the same crash boundary as SQLite: source/start order
-    // puts the long record first, while checkpoint order must commit short first.
+    // PostgreSQL verifies the same batch transaction boundary as SQLite. Use a
+    // fresh source so all three planned rows must either commit together or leave
+    // every legacy and stable projection at its original value.
     let overlap_input = jsonl(&[long, late, short]);
     let overlap_options = SessionArchiveImportOptions {
         input: overlap_input.path(),
@@ -1387,7 +2365,7 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
             .expect("PostgreSQL overlap plan directory"),
         tenant_external_id: &tenant_external_id,
         cpamp_source: "cpamp-usage-events-v1",
-        archive_source: "postgres-cas-archive",
+        archive_source: "postgres-atomic-archive",
         overlap_ms: 0,
         time_tolerance_ms: 5_000,
         max_line_bytes: 1024 * 1024,
@@ -1399,8 +2377,44 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
         quarantine_approved_by_service_id: None,
         apply: true,
     };
+    let overlap_state_query = "SELECT
+        (SELECT COUNT(*) FROM session_archive_import_records WHERE tenant_id = $1 AND source = $2),
+        (SELECT COUNT(*) FROM session_archive_correlations WHERE tenant_id = $1 AND source = $2 AND disposition = 'exact'),
+        (SELECT COUNT(*) FROM session_archive_correlations WHERE tenant_id = $1 AND source = $2 AND disposition = 'unlinked'),
+        (SELECT COUNT(*) FROM session_archive_unlinked_requests WHERE tenant_id = $1 AND source = $2),
+        ((SELECT COUNT(*) FROM session_archive_quarantine_batches WHERE tenant_id = $1 AND source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_records WHERE tenant_id = $1 AND source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_record_versions WHERE tenant_id = $1 AND source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_record_heads WHERE tenant_id = $1 AND source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_batch_records r JOIN session_archive_quarantine_batches b ON b.id = r.batch_id WHERE b.tenant_id = $1 AND b.source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_occurrences o JOIN session_archive_quarantine_batches b ON b.id = o.batch_id WHERE b.tenant_id = $1 AND b.source = $2)
+            + (SELECT COUNT(*) FROM session_archive_quarantine_resolutions r JOIN session_archive_quarantine_record_versions q ON q.id = r.quarantine_id WHERE q.tenant_id = $1 AND q.source = $2)),
+        (SELECT COUNT(*) FROM session_archive_correlations WHERE tenant_id = $1 AND source = $2),
+        (SELECT COUNT(*) FROM conversation_observations WHERE request_id IN (
+            SELECT target_request_id FROM session_archive_correlations
+            WHERE tenant_id = $1 AND source = $2 AND target_request_id IS NOT NULL
+        ) OR request_id IN (
+            SELECT archive_request_id FROM session_archive_unlinked_requests
+            WHERE tenant_id = $1 AND source = $2
+        )),
+        (SELECT COUNT(*) FROM session_archive_import_checkpoints WHERE tenant_id = $1 AND source = $2),
+        COALESCE((SELECT watermark_ms FROM session_archive_import_checkpoints WHERE tenant_id = $1 AND source = $2), 0),
+        COALESCE((SELECT imported_records FROM session_archive_import_checkpoints WHERE tenant_id = $1 AND source = $2), 0),
+        (SELECT COUNT(*) FROM session_archive_snapshot_checkpoints WHERE tenant_id = $1 AND source = $2)";
+    let overlap_locator_query =
+        "SELECT l.id, l.created_at, l.tenant_id, l.key_id, r.request_object, r.response_object
+        FROM request_record_locators l
+        JOIN request_records r ON r.id = l.id AND r.created_at = l.created_at
+        WHERE l.tenant_id = $1
+        ORDER BY l.id";
+    let original_overlap_locators: Vec<(String, i64, String, String, String, Option<String>)> =
+        sqlx::query_as(overlap_locator_query)
+            .bind(key.tenant_id.to_string())
+            .fetch_all(&pool)
+            .await
+            .expect("snapshot PostgreSQL locators before injected failure");
     sqlx::query(
-        "CREATE FUNCTION inject_postgres_archive_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.source = 'postgres-cas-archive' AND NEW.external_request_id = 'postgres-long-completion' THEN RAISE EXCEPTION 'injected archive commit failure'; END IF; RETURN NEW; END $$",
+        "CREATE FUNCTION inject_postgres_archive_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.source = 'postgres-atomic-archive' AND NEW.external_request_id = 'postgres-long-completion' THEN RAISE EXCEPTION 'injected archive commit failure'; END IF; RETURN NEW; END $$",
     )
     .execute(&pool)
     .await
@@ -1413,15 +2427,22 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
     .expect("create PostgreSQL archive failure trigger");
     import_session_archive(&db, &archive, &overlap_options)
         .await
-        .expect_err("long completion failure stops after smaller checkpoint records");
-    let failed_cursor: (i64, i64, i64) = sqlx::query_as(
-        "SELECT watermark_ms, imported_records, (SELECT COUNT(*) FROM session_archive_unlinked_requests WHERE tenant_id = $1 AND source = 'postgres-cas-archive') FROM session_archive_import_checkpoints WHERE tenant_id = $1 AND source = 'postgres-cas-archive'",
-    )
-    .bind(key.tenant_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("read PostgreSQL cursor after injected failure");
-    assert_eq!(failed_cursor, (started_at + 8_000, 3, 2));
+        .expect_err("any PostgreSQL row failure must roll back the complete sealed batch");
+    let failed_overlap_state: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(overlap_state_query)
+            .bind(key.tenant_id.to_string())
+            .bind(overlap_options.archive_source)
+            .fetch_one(&pool)
+            .await
+            .expect("read rolled-back PostgreSQL batch state");
+    assert_eq!(failed_overlap_state, (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    let failed_overlap_locators: Vec<(String, i64, String, String, String, Option<String>)> =
+        sqlx::query_as(overlap_locator_query)
+            .bind(key.tenant_id.to_string())
+            .fetch_all(&pool)
+            .await
+            .expect("read PostgreSQL locators after rollback");
+    assert_eq!(failed_overlap_locators, original_overlap_locators);
     sqlx::query("DROP TRIGGER inject_postgres_archive_failure ON session_archive_correlations")
         .execute(&pool)
         .await
@@ -1433,10 +2454,27 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
 
     let overlap_applied = import_session_archive(&db, &archive, &overlap_options)
         .await
-        .expect("recover long-completed PostgreSQL record");
-    assert_eq!(overlap_applied.before_overlap, 1);
-    assert_eq!(overlap_applied.replayed, 1);
-    assert_eq!(overlap_applied.imported, 1);
+        .expect("atomically recover all PostgreSQL batch records");
+    assert_eq!(overlap_applied.before_overlap, 0);
+    assert_eq!(overlap_applied.replayed, 0);
+    assert_eq!(overlap_applied.imported, 3);
+    let applied_overlap_state: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(overlap_state_query)
+            .bind(key.tenant_id.to_string())
+            .bind(overlap_options.archive_source)
+            .fetch_one(&pool)
+            .await
+            .expect("read atomically applied PostgreSQL batch state");
+    assert_eq!(
+        applied_overlap_state,
+        (0, 0, 3, 3, 0, 3, 3, 1, started_at + 10_000, 3, 0)
+    );
+    let applied_overlap_locators: Vec<(String, i64, String, String, String, Option<String>)> =
+        sqlx::query_as(overlap_locator_query)
+            .bind(key.tenant_id.to_string())
+            .fetch_all(&pool)
+            .await
+            .expect("snapshot PostgreSQL locators after atomic apply");
 
     let final_replay = import_session_archive(&db, &archive, &overlap_options)
         .await
@@ -1444,14 +2482,21 @@ async fn postgres_archive_import_lock_and_locator_cas_are_fail_closed() {
     assert_eq!(final_replay.before_overlap, 2);
     assert_eq!(final_replay.replayed, 1);
     assert_eq!(final_replay.imported, 0);
-    let final_cursor: (i64, i64, i64) = sqlx::query_as(
-        "SELECT watermark_ms, imported_records, (SELECT COUNT(*) FROM session_archive_unlinked_requests WHERE tenant_id = $1 AND source = 'postgres-cas-archive') FROM session_archive_import_checkpoints WHERE tenant_id = $1 AND source = 'postgres-cas-archive'",
-    )
-    .bind(key.tenant_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("read final PostgreSQL completed-at cursor");
-    assert_eq!(final_cursor, (started_at + 10_000, 4, 3));
+    let replayed_overlap_state: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(overlap_state_query)
+            .bind(key.tenant_id.to_string())
+            .bind(overlap_options.archive_source)
+            .fetch_one(&pool)
+            .await
+            .expect("read PostgreSQL state after exact replay");
+    assert_eq!(replayed_overlap_state, applied_overlap_state);
+    let replayed_overlap_locators: Vec<(String, i64, String, String, String, Option<String>)> =
+        sqlx::query_as(overlap_locator_query)
+            .bind(key.tenant_id.to_string())
+            .fetch_all(&pool)
+            .await
+            .expect("read PostgreSQL locators after exact replay");
+    assert_eq!(replayed_overlap_locators, applied_overlap_locators);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1595,6 +2640,168 @@ fn rfc3339_millis(value: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value)
         .expect("fixture timestamp")
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_stable_chain_fixture(
+    directory: &std::path::Path,
+    file_name: &str,
+    record: &serde_json::Value,
+    source_fingerprint: &str,
+    sequence: i64,
+    offline_full_snapshot: bool,
+    prior_output_sha256: Option<&str>,
+    prior_source_ingest_fence: Option<i64>,
+    snapshot_schema_version: i64,
+    ingest_fence: i64,
+    tombstone_safe_after_ingest_fence: Option<i64>,
+) -> (std::path::PathBuf, String) {
+    let mut record_line = serde_json::to_vec(record).expect("encode stable chain record");
+    record_line.push(b'\n');
+    let mut input_bytes = Vec::new();
+    let session_set_sha256 = if snapshot_schema_version == 2 {
+        let records_sha256 = format!("{:x}", Sha256::digest(&record_line));
+        let session_id = record["session_id"]
+            .as_str()
+            .expect("stable chain session id");
+        let first_at = chrono::DateTime::parse_from_rfc3339(
+            record["started_at"]
+                .as_str()
+                .expect("stable chain started at"),
+        )
+        .expect("parse stable chain started at")
+        .to_utc()
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let last_at = chrono::DateTime::parse_from_rfc3339(
+            record["completed_at"]
+                .as_str()
+                .expect("stable chain completed at"),
+        )
+        .expect("parse stable chain completed at")
+        .to_utc()
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let summary = json!({
+            "_mtc_delta_type": "session_summary",
+            "schema_version": 2,
+            "session_id": session_id,
+            "requests": 1,
+            "first_at": first_at,
+            "last_at": last_at,
+            "records_sha256": records_sha256
+        });
+        serde_json::to_writer(&mut input_bytes, &summary).expect("encode stable chain summary");
+        input_bytes.push(b'\n');
+        let canonical = json!({
+            "first_at": first_at,
+            "last_at": last_at,
+            "records_sha256": records_sha256,
+            "requests": 1,
+            "session_id": session_id
+        });
+        let mut set_bytes = vec![b'['];
+        set_bytes.extend(serde_json::to_vec(&canonical).expect("encode stable chain set summary"));
+        set_bytes.push(b']');
+        format!("{:x}", Sha256::digest(&set_bytes))
+    } else {
+        format!("{:x}", Sha256::digest(b"[]"))
+    };
+    input_bytes.extend_from_slice(&record_line);
+    let output_sha256 = format!("{:x}", Sha256::digest(&input_bytes));
+    let input_path = directory.join(file_name);
+    std::fs::write(&input_path, &input_bytes).expect("write stable chain input");
+    let mut manifest_name = input_path.as_os_str().to_os_string();
+    manifest_name.push(".manifest.json");
+    std::fs::write(
+        std::path::PathBuf::from(manifest_name),
+        serde_json::to_vec(&json!({
+            "version": 3,
+            "output_file": file_name,
+            "output_sha256": output_sha256.clone(),
+            "output_size_bytes": input_bytes.len(),
+            "source_fingerprint": source_fingerprint,
+            "sequence": sequence,
+            "offline_full_snapshot": offline_full_snapshot,
+            "prior_output_sha256": prior_output_sha256,
+            "prior_source_ingest_fence": prior_source_ingest_fence.map(|value| value.to_string()),
+            "session_projection_protocol": "session-snapshot-cursor-v1",
+            "snapshot_schema_version": snapshot_schema_version,
+            "source_ingest_fence": ingest_fence.to_string(),
+            "tombstone_safe_after_ingest_fence": tombstone_safe_after_ingest_fence.map(|value| value.to_string()),
+            "session_set_sha256": session_set_sha256,
+            "session_count": i64::from(snapshot_schema_version == 2),
+            "source_projection_requests": 1,
+            "record_count": 1,
+            "deleted_session_count": 0
+        }))
+        .expect("encode stable chain manifest"),
+    )
+    .expect("write stable chain manifest");
+    (input_path, output_sha256)
+}
+
+fn stable_chain_options<'a>(
+    input: &'a std::path::Path,
+    plan_directory: &'a std::path::Path,
+    tenant_external_id: &'a str,
+    archive_source: &'a str,
+    apply: bool,
+) -> SessionArchiveImportOptions<'a> {
+    SessionArchiveImportOptions {
+        input,
+        plan_directory,
+        tenant_external_id,
+        cpamp_source: "cpamp-usage-events-v1",
+        archive_source,
+        overlap_ms: 0,
+        time_tolerance_ms: 5_000,
+        max_line_bytes: 1024 * 1024,
+        max_plan_bytes: 16 * 1024 * 1024,
+        allow_unmapped: false,
+        quarantine_unknown_identities: false,
+        quarantine_tenant_binding_kind: None,
+        quarantine_tenant_binding_proof: None,
+        quarantine_approved_by_service_id: None,
+        apply,
+    }
+}
+
+async fn stable_chain_state(
+    pool: &sqlx::AnyPool,
+    tenant_id: Uuid,
+    archive_source: &str,
+) -> StableChainState {
+    let projection: StableChainProjectionState = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM session_archive_import_records WHERE tenant_id=$1 AND source=$2),
+            (SELECT COUNT(*) FROM session_archive_unlinked_requests WHERE tenant_id=$1 AND source=$2),
+            (SELECT COUNT(*) FROM session_archive_correlations WHERE tenant_id=$1 AND source=$2),
+            (SELECT COUNT(*) FROM session_archive_quarantine_record_heads WHERE tenant_id=$1 AND source=$2),
+            (SELECT COUNT(*) FROM conversation_observations WHERE request_id IN (SELECT target_request_id FROM session_archive_correlations WHERE tenant_id=$1 AND source=$2 AND target_request_id IS NOT NULL) OR request_id IN (SELECT archive_request_id FROM session_archive_unlinked_requests WHERE tenant_id=$1 AND source=$2)),
+            (SELECT COUNT(*) FROM session_archive_import_checkpoints WHERE tenant_id=$1 AND source=$2),
+            COALESCE((SELECT imported_records FROM session_archive_import_checkpoints WHERE tenant_id=$1 AND source=$2),0)",
+    )
+    .bind(tenant_id.to_string())
+    .bind(archive_source)
+    .fetch_one(pool)
+    .await
+    .expect("read stable chain projection state");
+    let checkpoint: StableChainCheckpointState = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2),
+            COALESCE((SELECT sequence FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2),0),
+            COALESCE((SELECT snapshot_schema_version FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2),0),
+            COALESCE((SELECT ingest_fence FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2),0),
+            (SELECT tombstone_safe_after_ingest_fence FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2),
+            (SELECT COUNT(*) FROM session_archive_source_sessions WHERE tenant_id=$1 AND source=$2),
+            ((SELECT COUNT(*) FROM session_archive_snapshot_stage_sessions WHERE tenant_id=$1 AND source=$2) + (SELECT COUNT(*) FROM session_archive_snapshot_stage_records WHERE tenant_id=$1 AND source=$2)),
+            (SELECT output_sha256 FROM session_archive_snapshot_checkpoints WHERE tenant_id=$1 AND source=$2)",
+    )
+    .bind(tenant_id.to_string())
+    .bind(archive_source)
+    .fetch_one(pool)
+    .await
+    .expect("read stable chain checkpoint state");
+    (projection, checkpoint)
 }
 
 fn options(input: &NamedTempFile, apply: bool) -> SessionArchiveImportOptions<'_> {

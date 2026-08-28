@@ -2,11 +2,12 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
+import { installExecutableHelper } from "./contract-helpers.ts";
 
 const { buildPlan, ImportFailure, parseCandidates } = await import("../../ops/legacy-credentials/attach-legacy-cpa-credentials.ts");
 const { parseStrictJson, StrictJsonError } = await import("../../ops/lib/strict-json.ts");
@@ -49,20 +50,7 @@ describe("legacy credential attachment planning", () => {
     const root = mkdtempSync(join(tmpdir(), "mtc-legacy-credentials-"));
     const candidate = join(root, "api-keys.json");
     writeFileSync(candidate, readFileSync(join(repository, "tests/fixtures/legacy-credentials/cpa-api-keys.json")), { mode: 0o400 });
-    const fakePsql = join(root, "psql");
-    writeFileSync(fakePsql, `#!/usr/bin/env node
-const fs = require("node:fs");
-const readline = require("node:readline");
-const rows = fs.readFileSync(process.env.FAKE_PSQL_ROWS, "utf8").trim().split("\\n").map((line) => line.split(","));
-const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-input.on("line", (line) => {
-  if (line.includes("pg_try_advisory_lock")) process.stdout.write("1\\n");
-  else if (line.startsWith("SELECT json_build_array")) for (const row of rows) process.stdout.write(JSON.stringify(row) + "\\n");
-  else if (line.startsWith("\\\\echo __MTC_LEGACY_IDENTITIES_END__")) process.stdout.write("__MTC_LEGACY_IDENTITIES_END__\\n");
-  else if (line.includes("__MTC_LEGACY_IDENTITY_HEARTBEAT__")) process.stdout.write("__MTC_LEGACY_IDENTITY_HEARTBEAT__\\n");
-});
-`, { mode: 0o500 });
-    chmodSync(fakePsql, 0o500);
+    const fakePsql = installExecutableHelper("tests/ops/helpers/fake-psql-legacy.ts", root, "psql");
     const result = spawnSync(process.execPath, [
       join(repository, "ops/legacy-credentials/attach-legacy-cpa-credentials.ts"),
       "--tenant-external-id", "fixture-tenant",

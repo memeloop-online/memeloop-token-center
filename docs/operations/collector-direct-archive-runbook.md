@@ -20,8 +20,14 @@ Keep the source URL byte-for-byte stable for the baseline and all deltas. A
 practical layout is one migration-only Service whose selector initially targets
 the isolated offline collector and later targets the active collector. Review
 the selector change and endpoints before applying it. Never copy the archive
-database between machines: create the consistent Longhorn clone in the same
-cluster and mount it read-only into the offline collector.
+database or a live SQLite/WAL pair between machines. First enable the v0.8
+ingest clock on the active collector, then create a SQLite-online-backup or
+storage-snapshot-derived Longhorn clone in the same cluster. The clone must be
+isolated from production and writable only by the offline collector: v0.8
+creates narrow ingest/digest tables and writes prepared session digests even
+though archived request bodies are otherwise immutable. Do not mount the
+production PVC into the offline collector, and do not use a raw filesystem copy
+of an actively written database as migration evidence.
 
 The Job needs a private evidence PVC. Run these checks inside the Job pod:
 
@@ -106,9 +112,9 @@ export SESSION_ARCHIVE_FILE=/evidence/archive-delta-000002.jsonl
 export SESSION_ARCHIVE_IMPORT_SOURCE=cpa-session-archive-production
 export SESSION_ARCHIVE_OVERLAP_MS=86400000
 
-SESSION_ARCHIVE_APPLY=false ops/import-cpa-session-archive.sh
-SESSION_ARCHIVE_APPLY=true ops/import-cpa-session-archive.sh
-SESSION_ARCHIVE_APPLY=true ops/import-cpa-session-archive.sh
+SESSION_ARCHIVE_APPLY=false node ops/import-cpa-session-archive.ts
+SESSION_ARCHIVE_APPLY=true node ops/import-cpa-session-archive.ts
+SESSION_ARCHIVE_APPLY=true node ops/import-cpa-session-archive.ts
 ```
 
 The third command must report `imported: 0`; overlap records may report as

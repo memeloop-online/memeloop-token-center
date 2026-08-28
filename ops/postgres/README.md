@@ -1,6 +1,6 @@
 # PostgreSQL history partition backfill
 
-`backfill-postgres-history-partitions.sh` repairs historical rows that landed in
+`backfill-postgres-history-partitions.ts` repairs historical rows that landed in
 `request_records_default` or `request_events_default` before their UTC daily
 partitions existed. It is PostgreSQL-only; SQLite migrations and test storage
 are not touched.
@@ -43,19 +43,19 @@ export PGDATABASE=memeloop_token_center
 Inventory the default partitions:
 
 ```sh
-./ops/backfill-postgres-history-partitions.sh
+node ops/backfill-postgres-history-partitions.ts
 ```
 
 Install/verify only the access-path indexes:
 
 ```sh
-./ops/backfill-postgres-history-partitions.sh --apply --indexes-only
+node ops/backfill-postgres-history-partitions.ts --apply --indexes-only
 ```
 
 Move one oldest request day:
 
 ```sh
-./ops/backfill-postgres-history-partitions.sh \
+node ops/backfill-postgres-history-partitions.ts \
   --apply --table request_records --batch-size 5000 --max-days 1
 ```
 

@@ -20,14 +20,22 @@ state of its successor. It is not rollout or production evidence.
 
 ## Implemented boundary
 
+- CPAMP migration, archive-import wrapping, and the combined migration audit
+  run as Node 24 TypeScript (`node ops/migrate-cpamp.ts`,
+  `node ops/import-cpa-session-archive.ts`, and
+  `node ops/audit-cpa-migration.ts`). They invoke `psql`, `sqlite3`, and the Rust
+  importer with `shell:false`; database credentials remain environment/file
+  only and are never placed in argv.
 - `api_key_proxy` keeps the proxy URL and any optional authentication inside the
   versioned encrypted upstream-credential envelope. Account views, errors and
   dry-run output expose no URL; the importer reports only
   `proxied_api_account_count`.
 - The importer defaults direct targets to public. A separate strict owner-only
   versioned policy may approve exact target base URLs as private; output adds
-  only `private_target_api_account_count`. Target and proxy scopes remain
-  independent and the server revalidates both.
+  only `private_target_api_account_count`. Scope is not inferred from proxy
+  presence, but every private-target account must have a private local-DNS
+  SOCKS5 proxy or inventory fails before any target request. The server
+  revalidates both scopes.
 - Only private local-DNS `socks5` is accepted. `socks5h`, HTTP(S) proxies and
   public SOCKS endpoints fail closed. MTC resolves and classifies the target and
   proxy independently, pins both for the one operation, and disables inherited
