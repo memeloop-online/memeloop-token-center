@@ -115,6 +115,7 @@ test('release workflow and Docker packaging remain immutable and attested', () =
     'SQLite migration and replay smoke test', 'PostgreSQL migration and replay smoke test',
     'Exercise CPAMP initial, overlap, incremental, and replay imports',
     'node ops/ci/prepare-cpamp-acceptance-bundle.ts "$acceptance"',
+    'chmod -R u+w -- "$acceptance"',
     '--volume "$acceptance:/acceptance:ro"', '/acceptance/cpamp-import-postgres-acceptance.test.ts',
     'cargo fmt --all -- --check', 'cargo clippy --locked --all-targets --all-features -- -D warnings',
     'cargo test --locked --all-targets --all-features', 'npm audit --audit-level=high', 'npm run test:e2e',

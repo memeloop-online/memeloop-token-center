@@ -348,7 +348,7 @@ jobs:
               | psql -X --no-psqlrc -v ON_ERROR_STOP=1 \
                 -v schema="$schema" >/dev/null 2>&1 || true
             docker image rm "$image" >/dev/null 2>&1 || true
-            chmod 0700 -- "$acceptance" 2>/dev/null || true
+            chmod -R u+w -- "$acceptance" 2>/dev/null || true
             rm -rf -- "$acceptance"
           }
           trap cleanup EXIT HUP INT TERM

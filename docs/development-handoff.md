@@ -96,7 +96,18 @@ remains forbidden until the user explicitly opens the production window.
   are now secured before their parent directory becomes owner-only. The
   temporary namespace, pod, images, volumes and local transfer archive were all
   deleted; no application namespace, ingress, PVC or API3 resource was changed.
-- The next gate is one follow-up GitHub Actions run for the exact native-ESM fix
+- Native-ESM fix SHA `eb1df8ed1664175b26e106059668f7149551c580`
+  reached GitHub Actions run
+  [`33141674889`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33141674889).
+  The previously failing importer image contract passed. The CPAMP PostgreSQL
+  acceptance also reported PASS for its initial, overlap, incremental and replay
+  cases, but the job was marked failed afterward because its trap restored write
+  permission only on the bundle root while the deliberately read-only nested SQL
+  directories remained mode 0555. The run was cancelled immediately, before
+  memory or publication, to conserve minutes. Cleanup now recursively restores
+  owner write permission within the validated runner-temporary directory before
+  removing it; the release contract pins this exact cleanup invariant.
+- The next gate is one follow-up GitHub Actions run for the exact cleanup fix
   commit. Do not spend CI minutes on an intermediate revision and do not tag
   archive v0.8.0 before that exact MTC release is green.
 
