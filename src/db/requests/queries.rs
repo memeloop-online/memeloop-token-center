@@ -1010,6 +1010,41 @@ mod query_shape_tests {
     }
 
     #[test]
+    fn global_model_filter_is_pushed_into_each_bounded_source() {
+        let query = build_operator_request_list_query(
+            None,
+            &RequestListFilter {
+                limit: 5,
+                model: Some("deepseek".to_owned()),
+                ..RequestListFilter::default()
+            },
+        );
+
+        assert_eq!(query.statement.matches("r.model =").count(), 1);
+        assert_eq!(query.statement.matches("g.public_model =").count(), 1);
+        assert_eq!(
+            query
+                .binds
+                .iter()
+                .filter(|bind| **bind == RequestListBind::Text("deepseek".to_owned()))
+                .count(),
+            2,
+            "each independently ordered Top-N branch must bind the model"
+        );
+        assert!(!query.statement.contains("tenant_scope"));
+        assert!(
+            query
+                .statement
+                .contains("r.model = $3 ORDER BY r.created_at DESC, r.id DESC LIMIT $4")
+        );
+        assert!(
+            query
+                .statement
+                .contains("g.public_model = $7 ORDER BY g.created_at DESC, g.id DESC LIMIT $8")
+        );
+    }
+
+    #[test]
     fn identity_joins_follow_the_active_filter_dependencies() {
         let alias_query = build_operator_request_list_query(
             Some("tenant-a"),

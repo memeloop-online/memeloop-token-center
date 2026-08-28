@@ -212,98 +212,160 @@ export function Operator() {
   const liveRequestEvents = useRef(new Map<string, RequestEvent>());
   const sessionEventKeyIds = useRef(new Set<string>());
   const refreshSequence = useRef(0);
+  const loadedScope = useRef<{ credential: string; tenant: string } | undefined>(undefined);
+  const [scopeReady, setScopeReady] = useState(false);
+  const [refreshingScope, setRefreshingScope] = useState(Boolean(token));
+
+  const activeToken = scopeReady ? token : '';
+
+  function tenantForRefresh(loadedTenants: TenantView[], requestedTenant: string, replaceCredential: boolean) {
+    if (loadedTenants.length === 1) return loadedTenants[0].external_id;
+    if (replaceCredential) return '';
+    return loadedTenants.some((value) => value.external_id === requestedTenant) ? requestedTenant : '';
+  }
 
   async function refresh(credentialOverride = token, replaceCredential = false) {
     const sequence = ++refreshSequence.current;
     const refreshCredential = credentialOverride.trim();
-    const refreshTenant = tenant;
+    const requestedTenant = tenant;
     const refreshFilters = requestFilters;
     const credential = refreshCredential;
     if (!credential) return;
+    const currentScope = loadedScope.current;
+    const resolvingScope = replaceCredential
+      || currentScope?.credential !== credential
+      || currentScope.tenant !== requestedTenant;
+    if (resolvingScope) {
+      setRefreshingScope(true);
+      setScopeReady(false);
+      setRequestsLoading(false);
+      setDetail(undefined);
+    }
     setError('');
-    const scope = queryForTenant(tenant);
     try {
+      // Tenant discovery is deliberately the first and only request in this
+      // phase. A singleton credential must never issue an expensive or
+      // misleading all-tenant resource query before its scope is known.
+      const loadedTenants = await api<TenantView[]>('/internal/v1/tenants', credential);
+      if (sequence !== refreshSequence.current) return;
+      const refreshTenant = tenantForRefresh(loadedTenants, requestedTenant, replaceCredential);
+      const scope = queryForTenant(refreshTenant);
       const results = await Promise.allSettled([
-        api<TenantView[]>('/internal/v1/tenants', credential),
         api<ProviderType[]>('/internal/v1/provider-types', credential),
         api<PluginManifest[]>('/internal/v1/plugins', credential),
         api<UpstreamAccount[]>(`/internal/v1/upstreams${scope}`, credential),
-        api<RequestView[]>(`/internal/v1/requests${requestQuery(tenant, requestFilters)}`, credential),
+        api<RequestView[]>(`/internal/v1/requests${requestQuery(refreshTenant, refreshFilters)}`, credential),
         api<ConfigurationSchemas>('/internal/v1/schemas', credential),
       ]);
       if (sequence !== refreshSequence.current) return;
       const failures = results.filter((result) => result.status === 'rejected');
       if (failures.length === results.length) throw failures[0].reason;
-      const [nextTenants, nextProviders, nextPlugins, nextUpstreams, nextRequests, nextSchemas] = results;
-      const loadedTenants = nextTenants.status === 'fulfilled' ? nextTenants.value : [];
+      const [nextProviders, nextPlugins, nextUpstreams, nextRequests, nextSchemas] = results;
+      loadedScope.current = { credential, tenant: refreshTenant };
       setTenants(loadedTenants);
-      if (!refreshTenant && loadedTenants.length === 1) setTenant(loadedTenants[0].external_id);
+      setTenant(refreshTenant);
       setProviders(nextProviders.status === 'fulfilled' ? nextProviders.value : []);
       setPlugins(nextPlugins.status === 'fulfilled' ? nextPlugins.value : []);
       setUpstreams(nextUpstreams.status === 'fulfilled' ? nextUpstreams.value : []);
-      if (replaceCredential || scopeMatches(requestEventScope.current, refreshCredential, refreshTenant, refreshFilters)) {
-        setRequests(nextRequests.status === 'fulfilled'
-          ? mergeLiveRequestEvents(nextRequests.value, liveRequestEvents.current)
-          : []);
-        setHasOlderRequests(nextRequests.status === 'fulfilled' && nextRequests.value.length === 100);
-      }
+      requestEventCursor.current = undefined;
+      liveRequestEvents.current.clear();
+      sessionEventKeyIds.current.clear();
+      requestEventScope.current = { credential, tenant: refreshTenant, filters: refreshFilters };
+      setRequests(nextRequests.status === 'fulfilled' ? nextRequests.value : []);
+      setHasOlderRequests(nextRequests.status === 'fulfilled' && nextRequests.value.length === 100);
       setSchemas(nextSchemas.status === 'fulfilled' ? nextSchemas.value : undefined);
       rememberCredential('operator', credential);
       if (replaceCredential) {
         setToken(credential);
         setCredentialInput((current) => current.trim() === credential ? '' : current);
       }
+      setScopeReady(true);
+      setRefreshingScope(false);
       if (failures.length) setError(t('common.scopeWarning', { count: formatNumber(failures.length, locale) }));
     } catch (reason) {
       if (sequence !== refreshSequence.current) return;
-      if (!replaceCredential && !scopeMatches(requestEventScope.current, refreshCredential, refreshTenant, refreshFilters)) return;
-      setTenants([]); setProviders([]); setPlugins([]); setUpstreams([]); setRequests([]);
-      setSchemas(undefined); setHasOlderRequests(false);
+      if (resolvingScope && !replaceCredential) {
+        loadedScope.current = { credential, tenant: requestedTenant };
+        setTenants([]); setProviders([]); setPlugins([]); setUpstreams([]); setRequests([]);
+        setSchemas(undefined); setHasOlderRequests(false);
+      }
+      setScopeReady(!resolvingScope || (replaceCredential && Boolean(token)));
+      setRefreshingScope(false);
       setError(messageOf(reason, t('common.connectionFailed')));
     }
   }
 
-  useEffect(() => { if (token) void refresh(); }, []);
-  useEffect(() => { if (token) void refresh(); }, [tenant]);
+  useEffect(() => {
+    if (!token) return;
+    const current = loadedScope.current;
+    if (current?.credential === token && current.tenant === tenant) return;
+    void refresh();
+  }, [token, tenant]);
 
   async function loadRequests(filters: RequestFilters, older = false) {
-    if (!token) return;
-    const loadCredential = token;
+    if (!activeToken) return;
+    const sequence = refreshSequence.current;
+    const loadCredential = activeToken;
     const loadTenant = tenant;
     const before = older ? requests.at(-1) : undefined;
     setRequestsLoading(true); setError('');
     try {
-      const next = await api<RequestView[]>(`/internal/v1/requests${requestQuery(tenant, filters, before)}`, token);
-      if (scopeMatches(requestEventScope.current, loadCredential, loadTenant, filters)) {
+      const next = await api<RequestView[]>(`/internal/v1/requests${requestQuery(tenant, filters, before)}`, loadCredential);
+      if (sequence === refreshSequence.current && scopeMatches(requestEventScope.current, loadCredential, loadTenant, filters)) {
         setRequests((current) => older
           ? [...current, ...next.filter((value) => !current.some((existing) => existing.request_id === value.request_id))]
           : mergeLiveRequestEvents(next, liveRequestEvents.current));
         setHasOlderRequests(next.length === 100);
       }
-    } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
-    finally { setRequestsLoading(false); }
+    } catch (reason) {
+      if (sequence === refreshSequence.current && scopeMatches(requestEventScope.current, loadCredential, loadTenant, filters)) {
+        setError(messageOf(reason, t('common.requestFailed')));
+      }
+    } finally {
+      if (sequence === refreshSequence.current) setRequestsLoading(false);
+    }
   }
 
   async function selectRequest(request: RequestView) {
+    if (!activeToken) return;
+    const sequence = refreshSequence.current;
+    const requestCredential = activeToken;
+    const requestTenant = tenant;
     try {
       setError('');
-      setDetail(await api<RequestDetail>(`/internal/v1/requests/${request.request_id}${queryForTenant(tenant)}`, token));
+      const nextDetail = await api<RequestDetail>(`/internal/v1/requests/${request.request_id}${queryForTenant(requestTenant)}`, requestCredential);
+      if (sequence === refreshSequence.current) setDetail(nextDetail);
     } catch (reason) {
-      setError(messageOf(reason, t('traffic.detailFailed')));
+      if (sequence === refreshSequence.current) setError(messageOf(reason, t('traffic.detailFailed')));
     }
+  }
+
+  async function refreshUpstreams() {
+    if (!activeToken) return;
+    const sequence = refreshSequence.current;
+    const refreshCredential = activeToken;
+    const refreshTenant = tenant;
+    const next = await api<UpstreamAccount[]>(
+      `/internal/v1/upstreams${queryForTenant(refreshTenant)}`,
+      refreshCredential,
+    );
+    if (sequence !== refreshSequence.current) return;
+    if (loadedScope.current?.credential !== refreshCredential
+      || loadedScope.current.tenant !== refreshTenant) return;
+    setUpstreams(next);
   }
 
   useEffect(() => {
     const previousScope = requestEventScope.current;
-    if (!previousScope || previousScope.credential !== token || previousScope.tenant !== tenant
+    if (!previousScope || previousScope.credential !== activeToken || previousScope.tenant !== tenant
       || previousScope.filters !== requestFilters) {
       requestEventCursor.current = undefined;
       liveRequestEvents.current.clear();
       sessionEventKeyIds.current.clear();
-      requestEventScope.current = { credential: token, tenant, filters: requestFilters };
+      requestEventScope.current = { credential: activeToken, tenant, filters: requestFilters };
       setStreamError('');
     }
-    if (!token || tab !== 'traffic' || (trafficMode === 'requests' && filtersActive(requestFilters))) {
+    if (!activeToken || tab !== 'traffic' || (trafficMode === 'requests' && filtersActive(requestFilters))) {
       setStreamError('');
       setStreamState('idle');
       return;
@@ -317,7 +379,7 @@ export function Operator() {
         try {
           await streamSse<RequestEvent>(
             `/internal/v1/request-events${requestEventQuery(tenant, requestEventCursor.current)}`,
-            token,
+            activeToken,
             controller.signal,
             ({ id, event: eventName, data: event }) => {
               if (controller.signal.aborted || requestEventScope.current !== activeScope) return;
@@ -368,7 +430,7 @@ export function Operator() {
     };
     void connect();
     return () => controller.abort();
-  }, [token, tab, trafficMode, tenant, requestFilters]);
+  }, [activeToken, tab, trafficMode, tenant, requestFilters]);
 
   const changeTabByKeyboard = (event: KeyboardEvent<HTMLButtonElement>, current: Tab) => {
     const currentIndex = tabIds.indexOf(current);
@@ -385,9 +447,12 @@ export function Operator() {
 
   const clearCredential = () => {
     refreshSequence.current += 1;
+    loadedScope.current = undefined;
     requestEventScope.current = { credential: '', tenant: '', filters: requestFilters };
     clearRememberedCredential('operator');
     setToken(''); setCredentialInput(''); setTenant(''); setTenants([]); setProviders([]); setPlugins([]); setUpstreams([]); setRequests([]); setSchemas(undefined);
+    setScopeReady(false);
+    setRefreshingScope(false);
     setHasOlderRequests(false); setDetail(undefined); setSessionFocus(undefined);
     setError(''); setStreamError(''); setStreamState('idle');
   };
@@ -402,20 +467,23 @@ export function Operator() {
         {token && <button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button>}
       </div>
     </header>
-    {token && <div className="console-context"><div><b>{tenant || t('operator.allTenants')}</b><span>{t('common.savedCredentialInUse')}</span></div>{(tenants.length === 0 || !tenant) && <small>{t(tenants.length === 0 ? 'operator.noTenants' : 'operator.selectTenantToWrite')}</small>}</div>}
+    {refreshingScope && <div className="console-context"><div><b>{t('common.loading')}</b></div></div>}
+    {activeToken && <div className="console-context"><div><b>{tenant || t('operator.allTenants')}</b><span>{t('common.savedCredentialInUse')}</span></div>{(tenants.length === 0 || !tenant) && <small>{t(tenants.length === 0 ? 'operator.noTenants' : 'operator.selectTenantToWrite')}</small>}</div>}
     <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{tabIds.map((id) => <button id={`operator-tab-${id}`} role="tab" aria-selected={tab === id} aria-controls={`operator-panel-${id}`} tabIndex={tab === id ? 0 : -1} key={id} className={tab === id ? 'active' : ''} onClick={() => setTab(id)} onKeyDown={(event) => changeTabByKeyboard(event, id)}>{t(`nav.${id}`)}</button>)}</nav>
     {error && <div className="notice error" role="alert">{error}</div>}
     {streamError && <div className="notice error" role="alert">{streamError}</div>}
     <section id={`operator-panel-${tab}`} role="tabpanel" aria-labelledby={`operator-tab-${tab}`} tabIndex={0}>
-      {tab === 'traffic' && <Traffic token={token} tenant={tenant} mode={trafficMode} onModeChange={setTrafficMode} sessionRevision={sessionRevision} sessionEventKeyIds={sessionEventKeyIds} sessionFocus={sessionFocus} streamState={streamState} requests={requests} upstreams={upstreams} filters={requestFilters} loading={requestsLoading} hasOlder={hasOlderRequests} onApply={(filters) => { setRequestFilters(filters); void loadRequests(filters); }} onClear={() => { setRequestFilters(emptyRequestFilters); void loadRequests(emptyRequestFilters); }} onLoadOlder={() => void loadRequests(requestFilters, true)} onSelect={selectRequest} />}
-      {tab === 'usage' && <UsageAnalysis token={token} tenant={tenant} upstreams={upstreams} onOpenSession={(session: UsageAnalysisSessionBucket) => { setSessionFocus({ sessionId: session.id, keyId: session.key_id, revision: Date.now() }); setTrafficMode('sessions'); setTab('traffic'); }} />}
-      {tab === 'generations' && <GenerationWorkspace token={token} tenant={tenant} />}
-      {tab === 'providers' && <UpstreamProviders token={token} tenant={tenant} providers={providers} values={upstreams} onChanged={refresh} />}
-      {tab === 'routes' && <RouteWorkspace token={token} tenant={tenant} upstreams={upstreams} providers={providers} />}
-      {tab === 'pricing' && <Pricing token={token} tenant={tenant} schemas={schemas} />}
-      {tab === 'credentials' && <CredentialWorkspace token={token} tenant={tenant} createSchema={schemas?.key_create} policySchema={schemas?.key_policy} />}
-      {tab === 'services' && <ServiceCredentialWorkspace token={token} tenant={tenant} schema={schemas?.service_token} />}
-      {tab === 'plugins' && <Plugins token={token} tenant={tenant} values={plugins} />}
+      {refreshingScope ? <div className="empty">{t('common.loading')}</div> : <>
+        {tab === 'traffic' && <Traffic token={activeToken} tenant={tenant} mode={trafficMode} onModeChange={setTrafficMode} sessionRevision={sessionRevision} sessionEventKeyIds={sessionEventKeyIds} sessionFocus={sessionFocus} streamState={streamState} requests={requests} upstreams={upstreams} filters={requestFilters} loading={requestsLoading} hasOlder={hasOlderRequests} onApply={(filters) => { setRequestFilters(filters); void loadRequests(filters); }} onClear={() => { setRequestFilters(emptyRequestFilters); void loadRequests(emptyRequestFilters); }} onLoadOlder={() => void loadRequests(requestFilters, true)} onSelect={selectRequest} />}
+        {tab === 'usage' && <UsageAnalysis token={activeToken} tenant={tenant} upstreams={upstreams} onOpenSession={(session: UsageAnalysisSessionBucket) => { setSessionFocus({ sessionId: session.id, keyId: session.key_id, revision: Date.now() }); setTrafficMode('sessions'); setTab('traffic'); }} />}
+        {tab === 'generations' && <GenerationWorkspace token={activeToken} tenant={tenant} />}
+        {tab === 'providers' && <UpstreamProviders token={activeToken} tenant={tenant} providers={providers} values={upstreams} onChanged={refreshUpstreams} />}
+        {tab === 'routes' && <RouteWorkspace token={activeToken} tenant={tenant} upstreams={upstreams} providers={providers} />}
+        {tab === 'pricing' && <Pricing token={activeToken} tenant={tenant} schemas={schemas} />}
+        {tab === 'credentials' && <CredentialWorkspace token={activeToken} tenant={tenant} createSchema={schemas?.key_create} policySchema={schemas?.key_policy} />}
+        {tab === 'services' && <ServiceCredentialWorkspace token={activeToken} tenant={tenant} schema={schemas?.service_token} />}
+        {tab === 'plugins' && <Plugins token={activeToken} tenant={tenant} values={plugins} />}
+      </>}
     </section>
     {detail && <RequestDrawer detail={detail} onClose={() => setDetail(undefined)} />}
   </Shell>;

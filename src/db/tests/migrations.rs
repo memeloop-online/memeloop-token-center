@@ -1,6 +1,63 @@
 use super::super::*;
 
 #[tokio::test]
+async fn sqlite_global_model_history_indexes_drive_both_top_n_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("global-model-history.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+
+    for index in [
+        "request_records_global_model_time_idx",
+        "generation_jobs_global_model_time_idx",
+    ] {
+        let installed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = $1",
+        )
+        .bind(index)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(installed, 1, "missing v59 index {index}");
+    }
+
+    let request_plan: Vec<String> = sqlx::query(
+        "EXPLAIN QUERY PLAN SELECT id, created_at FROM request_records WHERE created_at >= 0 AND created_at <= 9223372036854775807 AND model = 'needle' ORDER BY created_at DESC, id DESC LIMIT 5",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get("detail").unwrap())
+    .collect();
+    assert!(
+        request_plan
+            .iter()
+            .any(|detail| detail.contains("request_records_global_model_time_idx")),
+        "request-record model Top-N must use v59 index: {request_plan:?}"
+    );
+
+    let generation_plan: Vec<String> = sqlx::query(
+        "EXPLAIN QUERY PLAN SELECT id, created_at FROM generation_jobs WHERE created_at >= 0 AND created_at <= 9223372036854775807 AND public_model = 'needle' ORDER BY created_at DESC, id DESC LIMIT 5",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get("detail").unwrap())
+    .collect();
+    assert!(
+        generation_plan
+            .iter()
+            .any(|detail| detail.contains("generation_jobs_global_model_time_idx")),
+        "generation model Top-N must use v59 index: {generation_plan:?}"
+    );
+}
+
+#[tokio::test]
 async fn durable_oauth_migration_retires_bridge_routes_without_deleting_history() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

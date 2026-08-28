@@ -70,7 +70,7 @@
       ],
       "properties": {
         "enabled": { "type": "boolean" },
-        "schemaVersion": { "type": "integer", "minimum": 1 },
+        "schemaVersion": { "type": "integer", "const": 59 },
         "backoffLimit": { "type": "integer", "minimum": 0, "maximum": 20 },
         "activeDeadlineSeconds": { "type": "integer", "minimum": 30 },
         "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },

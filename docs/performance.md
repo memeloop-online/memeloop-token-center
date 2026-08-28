@@ -132,6 +132,45 @@ manual operator step. Running
 `node ops/backfill-postgres-history-partitions.ts --apply --indexes-only` remains the
 low-lock repair path for databases that were created by an older build.
 
+Schema v59 additionally installs
+`request_records_global_model_time_idx (model, created_at DESC, id DESC)` on the
+partitioned request parent and
+`generation_jobs_global_model_time_idx (public_model, created_at DESC, id DESC)`.
+These indexes are required by the all-tenant `model` filter: each raw-request
+and generation source can stop after its own matching Top-N page before the
+bounded union. Without them, the planner walks the global time index and
+filters potentially every newer non-matching row. SQLite installs the same
+ordered definitions and its migration test requires both operator-shaped
+branches to select them under `EXPLAIN QUERY PLAN`.
+
+PostgreSQL creates the v59 partitioned parent index transactionally so that a
+successful schema version always covers every existing leaf and future
+partitions inherit the definition. That fallback takes a write-conflicting
+table lock while existing leaf indexes are built. Before applying v59 to a
+large or latency-sensitive live history, quiesce request writers or prebuild
+equivalent leaf indexes with `CREATE INDEX CONCURRENTLY` during a maintenance
+window and attach them to an `ON ONLY` parent; build the non-partitioned
+generation index concurrently as well. Verify every request leaf is attached
+and both parent/non-partitioned indexes are valid before starting the new
+binary. Do not mark v59 applied while any leaf is missing. For the approximately
+310k-row CPA trial snapshot, measure the actual build and lock duration against
+the deployment write barrier; do not infer safety from row count or hide a slow
+plan behind a longer HTTP or statement timeout.
+
+The 2026-08-28 isolated API2-snapshot rehearsal exercised that low-lock path on
+PostgreSQL 17 with 309,888 request rows, 14 request partitions and one generation
+job. Before v59, the all-tenant `deepseek` branch took 20,211.210 ms and filtered
+269,797 rows through the old time indexes. After concurrent leaf construction,
+attachment and standalone generation-index construction, every required index
+was valid/ready, zero leaves were unattached, and the same branch took 5.567 ms
+using index-only scans. The complete read-only benchmark passed its 250 ms gate;
+global model request Top-N was 84.259 ms and global newest was 128.824 ms. The
+actual migration runner then advanced the clone from v58 to v59 without changing
+the 309,888-row count. The operator's 9m46s wall time included more than 100
+remote `kubectl exec` validation round trips and must not be interpreted as an
+index-build or lock duration. The fixed-name clone and all temporary files and
+forwards were removed; neither live API2 nor API3 was migrated.
+
 ```bash
 PGHOST=… PGUSER=… PGDATABASE=… \
   node ops/reconcile-postgres-request-stats.ts \

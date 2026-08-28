@@ -6,62 +6,164 @@ This is the resume point for the next Token Center development agent. Read
 scope and rejected designs; this document preserves the implementation state and
 remaining acceptance gates, updated on 2026-08-28.
 
-## Current 2026-08-28 final-candidate convergence
+## Current schema-v59 release contract
+
+This section supersedes only older statements that call v58 the current
+working-tree or fresh-release schema. It does not rewrite the retained v55→v58
+migration evidence or the live API2 v58 state below. The isolated rehearsal
+recorded immediately below is v59 PostgreSQL evidence, but it is not a v59 API2
+deployment.
+
+- The working tree now registers schema v59 for PostgreSQL and SQLite. It adds
+  ordered `(model, created_at DESC, id DESC)` request-history and
+  `(public_model, created_at DESC, id DESC)` generation-history indexes so the
+  all-tenant model filter can take a bounded Top-N from each source before its
+  merge.
+- The release Helm values and migration Job annotation require v59 and the
+  packaging contract rejects either backend/version drift or an override back
+  to v58. Application Pods must remain behind the migration gate.
+- On 2026-08-28 UTC, the actual current migration binary applied a brand-new
+  PostgreSQL 17 database from v1 through v59. `schema_migrations` contained
+  exactly 59 distinct contiguous versions, both v59 parent indexes were
+  valid/ready, and all ten fresh request-partition leaf indexes were attached
+  and valid/ready. The fixed-name temporary database and port-forward were
+  removed after verification. This closes the fresh-sequence gate but is not a
+  live API2 migration or rollout.
+- PostgreSQL installs the v59 partitioned parent and generation indexes inside
+  the transaction migration, which can take write-conflicting locks on live
+  history. Before rollout, rehearse the real snapshot and either hold a measured
+  write barrier or use the reviewed low-lock prebuild procedure to build and
+  verify every leaf plus the generation index before applying v59. Do not raise
+  migration deadlines to hide this risk, and do not roll any v59 writer until
+  the migration and index inventory both succeed.
+
+### Isolated API2-snapshot v58→v59 rehearsal
+
+- On 2026-08-28 UTC, an exact logical clone of the live API2 database was made
+  in the same PostgreSQL 17 cluster. Source and clone both contained 309,888
+  request records and one generation job; the clone started at schema v58 with
+  14 request partitions and neither v59 index. The live source database was
+  only read by `pg_dump` and was never migrated or indexed.
+- Before v59, the real all-tenant `deepseek` request branch took 20,211.210 ms,
+  hit/read 271,979 shared blocks and filtered 269,797 non-matching rows while
+  walking the old time indexes. The default partition alone filtered 220,016
+  rows.
+- The TypeScript low-lock operator first failed closed because PostgreSQL 17's
+  column form of `pg_get_indexdef` omits sort direction. Its metadata check now
+  combines the column expression with `pg_index.indoption`, including
+  non-default NULL ordering, and the static contract pins that behavior.
+- After that fix, `--apply --indexes-only` created every request leaf with
+  `CREATE INDEX CONCURRENTLY`, attached all 14 leaves to the `ON ONLY` parent,
+  built the generation index concurrently, and verified every parent, leaf and
+  standalone index as valid and ready. It moved no rows and left
+  `schema_migrations` at 58. End-to-end operator wall time was 9m46s, dominated
+  by more than 100 `kubectl exec` verification round trips; this is not stated
+  as a database lock duration.
+- The exact post-index branch used index-only scans on all 14 leaves and fell
+  from 20,211.210 ms to 5.567 ms. The complete read-only imported-scale
+  benchmark passed every 250 ms and sequential-scan gate: global model request
+  Top-N was 84.259 ms, global newest was 128.824 ms, all required model indexes
+  were valid/ready and unattached leaves were zero.
+- The actual current migration binary then applied v59 over the prebuilt
+  indexes and recorded exactly one schema row at version 59; both model indexes
+  remained valid/ready, all 14 leaves remained attached, and the request count
+  remained 309,888. The fixed-name clone, temporary binary, wrapper, benchmark
+  file and port-forward were removed afterward. API2 remained schema v58 and
+  its gateway/control/worker Deployments stayed 1/1 ready; API3 was untouched.
+- Remaining release evidence is the unchanged final memory gate/CI and live
+  same-digest API2 re-acceptance. Writer-contention
+  timing on a larger production snapshot remains an operations observation;
+  the reviewed rollout path is the verified concurrent prebuild, not a longer
+  blocking migration timeout.
+
+## Current 2026-08-28 v59 working-tree convergence
 
 This section supersedes the local-source and release-next-step claims below.
-The API2 deployment still runs the previously released `a381be0` service image;
-API3 remains unchanged and prohibited until the user explicitly opens the
-production window.
+`master` and `origin/master` both point to clean released baseline
+`0cf5fdc2b8a8dcb50042c9f6c0893cd5f67566cc`; the v59/UI/security work described
+here is currently an uncommitted working tree on top of that baseline. API3
+remains unchanged and prohibited until the user explicitly opens the production
+window.
 
-- Local master contains two not-yet-pushed commits on top of `origin/master`:
-  `62f15fc` keeps remembered operator/self-service credentials usable after
-  reload without ever repopulating either password input, removes the
-  misleading bootstrap/candidate copy, and preserves explicit manual clearing;
-  `51d96bb` adds the TypeScript-only `api2-target-rollback` operator and its
-  importer-image entry point.
-- Web typecheck and production build pass. Localization contracts pass 29/29;
-  real Chromium passes all 19 scenarios and 140 steps, including credential
-  non-reflection, reload, isolation, manual clear and responsive views. This is
-  local final-source evidence, not deployed API2 evidence.
-- The rollback operator uses `pg_dump`/`pg_restore`/`psql`/`mc` with
-  `shell:false`, PGPASSFILE and `MC_HOST_<alias>` Secrets only. It pins the exact
-  API2 PostgreSQL/MinIO source, rejects in-place restore, requires a separately
-  administered external HTTPS failure domain and disjoint
-  `<window>/postgres`/`<window>/minio` prefixes, validates custom dump format,
-  hashes actual remote object bytes, checks complete logical inventories, and
-  seals PostgreSQL plus MinIO receipts into one no-overwrite paired evidence
-  manifest. Root ops tests pass 30 with three explicit Docker/PostgreSQL
-  environment skips; typecheck, importer bundle syntax, release contracts 7/7,
-  repository TypeScript-only scan and `git diff --check` pass.
-- GitOps `master@63df7cb` contains the reversible API2 runtime states
-  `1/1/1 -> 0/0/1 -> 0/0/0` and reverse resume, a twice-observed read-only
-  Kubernetes/PostgreSQL quiesce receipt, default-suspended PostgreSQL/MinIO
-  backup/pair/new-endpoint restore Jobs, exact `/32:443` backup egress, explicit
-  receipt schemas and archive-apply binding to the exact paired-receipt SHA.
-  Its 23 maintenance tests, 16-YAML/9-suspended-Job archive contract and
-  repository Python prohibition pass. Nothing in this tranche was synced or
-  applied to the cluster; API2/API3 were not mutated.
+- Schema v59 and both backend migrations add the ordered all-tenant model
+  history indexes. The request-list query takes a bounded Top-N from request
+  and generation history before merging. The TypeScript low-lock operator uses
+  `ON ONLY`, per-leaf `CREATE INDEX CONCURRENTLY`, partition-index attachment,
+  valid/ready checks and no forged migration row.
+- An isolated API2 snapshot clone with 309,888 requests passed concurrent
+  prebuild, actual v58→v59 migration and the full 250 ms plan gate; the real
+  `deepseek` branch improved from 20,211.210 ms to 5.567 ms. A separate fresh
+  PostgreSQL 17 database applied exactly v1→v59, with both parent indexes and
+  all ten fresh leaf indexes valid/ready. Both temporary databases and their
+  port-forwards were deleted; live API2 remains v58.
+- The operator now resolves tenants before any tenant-scoped request, selects a
+  singleton tenant immediately, keeps multi-tenant all-scope read-only, blocks
+  stale credential races, preserves the last valid session after a failed
+  replacement and keeps same-scope provider success notices through refresh.
+  The ordinary-client denial test explicitly clears the remembered operator
+  credential first, matching the required remember/manual-clear semantics.
+- Live read-only browser auditing now permits only a predeclared exact 4xx
+  navigation error. It records an HMAC URL fingerprint rather than raw browser
+  error text, paths, queries or credentials; undeclared console, page, request
+  and cross-origin failures still fail closed. Contract canaries prove the
+  evidence path cannot retain their input.
+- Local root TypeScript typecheck, 31/31 runnable operations tests (three
+  explicit environment skips), seven release contracts, repository
+  TypeScript-only enforcement and `git diff --check` pass. Web typecheck,
+  34/34 localization/security contracts, production build and real Chromium
+  20/20 scenarios with 145/145 steps pass. The targeted Rust global-model query
+  and SQLite plan tests pass 2/2. The unchanged final 15-minute optimized memory
+  gate and one exact-SHA GitHub Actions release are still required after commit;
+  do not raise thresholds or run exploratory CI.
 - No approved private, versioned external backup target or credentials are
-  recorded yet. Longhorn, another API2 PVC and API2 MinIO are the same failure
-  domain; public GHCR is for public program images and must not hold private
-  database/archive bytes. A maintenance window cannot proceed beyond dry-run
-  until operations supplies that external target and completes the paired
-  restore drill against brand-new PostgreSQL and MinIO endpoints.
-- The last complete 15-minute local memory run was on `62f15fc`: 35/35 checks,
-  0.05 MiB/min soak slope, +8.875 MiB retained RSS and 126.48 MiB peak gateway
-  RSS under the unchanged 224 MiB deployment budget. Because `51d96bb` adds the
-  importer bundle and this handoff changes the final Git revision, rebuild the
-  release binary and rerun the unchanged 15-minute gate on the final commit
-  before the single planned push/CI. Do not raise any threshold.
+  recorded yet. Public GHCR is only for public program images and must not hold
+  private database/archive bytes. Production migration still requires the
+  reviewed rollback point and writer barrier/concurrent-prebuild sequence.
 - The Codex remote-browser limitation is tracked at
-  <https://github.com/openai/codex/issues/22844#issuecomment-5447860264>:
+  <https://github.com/openai/codex/issues/34263#issuecomment-5457329806>:
   remote CLI tasks receive Desktop Tab URL/title context but no browser-control
   tool, so user-visible Tab operations cannot be claimed from that environment.
 
-## Current 2026-08-28 live API2 acceptance
+## Current deployed API2 baseline
 
-This section supersedes every older API2 and release-status section below.
-API3 is still outside the production window and has not been changed.
+- Clean source SHA `0cf5fdc2b8a8dcb50042c9f6c0893cd5f67566cc` passed every
+  release gate in GitHub Actions run
+  [`33198305605`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33198305605).
+  Its complete immutable release is service
+  `sha256:7dae1569d0a796120223083711e765b665b3b84ec1c4a00c53f51ea754f4c086`,
+  importer
+  `sha256:79ed56f37c6b7b4916fe981698efa8f904db0b79b48b03eac24b4c6fa6451636`
+  and plugin-installer
+  `sha256:24c747716b6730021ceb935c334c04e45d9c696c1163269e78b1b8df1e4a88bd`.
+- GitOps commit `a256f8d223fd8d66b48e8b739f38df5bb2daa753` pins the service
+  and plugin digests above. Read-only verification on 2026-08-28 found API2
+  gateway/control/worker all 1/1 ready on the service digest and the live
+  database still at schema v58. The new v59 working tree has not been deployed.
+- The trial URLs remain
+  `https://token-center-api2-trial-portal.k3s.onetwo.website/portal` and
+  `https://token-center-api2-trial.k3s.onetwo.website/operator`. The control
+  ingress is restricted to three exact Tailnet source addresses; the current
+  remote development workspace can load the HTML but its internal control API
+  receives ingress-layer `RBAC: access denied`. Do not misreport that as an
+  application credential failure or a completed live browser pass.
+- From the current remote workspace, real Playwright Chromium reached the
+  public portal with HTTP 200, authenticated the dogfood client, matched its
+  stable key ID, rendered 39 historical rows, restored the remembered session
+  after reload without reflecting the credential into the password input, and
+  removed it after explicit manual clear. A credential-free screenshot is
+  retained in the task visualization directory.
+- Codex CLI 0.150.0-alpha.8 then used the deployed API2 Responses endpoint with
+  model `Qwen` and returned the exact requested text `MTC_API2_TEXT_OK`. The
+  public self API subsequently exposed the supplied explicit session ID
+  `01a04b00-0000-7000-8000-000000000001` with one request and no candidate
+  edge, proving the semantic headers reached the deployed persistence path.
+- API3 is still outside the production window and has not been changed.
+
+## Retained 2026-08-28 live API2 acceptance history
+
+The evidence below records earlier same-day candidate dogfood. It is retained
+for regression context and does not supersede the current `0cf5fdc` baseline or
+the v59 working-tree status above.
 
 - Clean master `a381be00d7f77dac236334e06ebe2900566cb34a` passed GitHub
   Actions run
@@ -143,7 +245,7 @@ remains forbidden until the user explicitly opens the production window.
   tests, all integration binaries, and 70/70 Cucumber scenarios with 379/379
   steps. OpenAPI tests passed 18/18 with 106 paths and 126 operations. Web
   typecheck, production build and localization/contracts passed; real Chromium
-  passed all 19/19 scenarios and 140/140 steps. The browser run exposed and
+  passed all 20/20 scenarios and 145/145 steps. The browser run exposed and
   verified the fix for an optional empty `video_models` schema blocking ordinary
   HTTP upstream edits while the enabled SiliconFlow driver remains fail-closed.
 - A fixed-toolchain optimized binary passed the unchanged full memory acceptance
@@ -600,7 +702,7 @@ including 370 library tests and every integration binary; Rust Cucumber reports
 69/69 scenarios and 373/373 steps. Root TypeScript and all five Node files report
 45/45 tests, and the OpenAPI route contract remains 106 paths/126 operations.
 Web typecheck, 24/24 localization/security contracts, production build and the
-Chromium suite (19/19 scenarios, 140/140 steps) pass. The browser suite sends a
+Chromium suite (20/20 scenarios, 145/145 steps) pass. The browser suite sends a
 real Codex-style semantic request through HTTP and reads it back through the
 session API/UI; credential reload/manual clear covers both portals.
 
@@ -619,9 +721,10 @@ formerly intermittent end-to-end scenario passed five focused repetitions plus
 both complete Cucumber executions.
 This is local regression evidence only. One final exact-SHA CI is still required
 before any upstream/archive target write, digest rollout or browser/CLI trial.
-The local host has neither Docker/Podman nor PostgreSQL/Helm, so final-image,
-fresh PostgreSQL v1→v58 and Helm gates remain for that single run rather than
-being represented as local evidence.
+At that retained v58 checkpoint the local host had neither Docker/Podman nor
+PostgreSQL/Helm, so final-image, fresh PostgreSQL v1→v58 and Helm checks were
+still gates for the then-planned run rather than local evidence. This historical
+statement is not the current v59 readiness claim.
 
 Run `32943606008` subsequently passed every pre-publication job and the full
 memory acceptance for `f3c342027e52c21f455b7c17d201bd8d133b858e`, but the

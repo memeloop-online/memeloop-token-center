@@ -315,6 +315,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "session archive snapshot staging",
         sql: include_str!("../../../migrations/common/0058_session_archive_snapshot_staging.sql"),
     },
+    Migration {
+        version: 59,
+        name: "global model-filtered request history indexes",
+        sql: include_str!("../../../migrations/sqlite/0059_global_request_model_indexes.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -615,6 +620,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 58,
         name: "session archive snapshot staging",
         sql: include_str!("../../../migrations/common/0058_session_archive_snapshot_staging.sql"),
+    },
+    Migration {
+        version: 59,
+        name: "global model-filtered request history indexes",
+        sql: include_str!("../../../migrations/postgres/0059_global_request_model_indexes.sql"),
     },
 ];
 

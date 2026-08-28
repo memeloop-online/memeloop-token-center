@@ -144,6 +144,48 @@ interface PsqlInvocation {
   capture?: boolean;
 }
 
+interface IndexSpec {
+  table: string;
+  index: string;
+  kind: string;
+  definition: string;
+  columns: readonly string[];
+  partitioned: boolean;
+}
+
+interface IndexMetadata {
+  relation: string;
+  valid: boolean;
+  ready: boolean;
+  unique: boolean;
+  exclusion: boolean;
+  accessMethod: string;
+  hasPredicate: boolean;
+  hasExpressions: boolean;
+  keyColumns: number;
+  totalColumns: number;
+  relationKind: string;
+  columns: string[];
+}
+
+const PARTITIONED_INDEXES: readonly IndexSpec[] = [
+  { table: "request_records", index: "request_records_recent_idx", kind: "recent", definition: "created_at DESC, id DESC", columns: ["created_at DESC", "id DESC"], partitioned: true },
+  { table: "request_records", index: "request_records_tenant_time_idx", kind: "tenant_time", definition: "tenant_id, created_at DESC, id DESC", columns: ["tenant_id", "created_at DESC", "id DESC"], partitioned: true },
+  { table: "request_records", index: "request_records_key_time_idx", kind: "key_time", definition: "key_id, created_at DESC, id DESC", columns: ["key_id", "created_at DESC", "id DESC"], partitioned: true },
+  { table: "request_records", index: "request_records_global_model_time_idx", kind: "model_time", definition: "model, created_at DESC, id DESC", columns: ["model", "created_at DESC", "id DESC"], partitioned: true },
+  { table: "request_events", index: "request_events_global_cursor_idx", kind: "global_cursor", definition: "event_at ASC, event_id ASC", columns: ["event_at", "event_id"], partitioned: true },
+  { table: "request_events", index: "request_events_tenant_cursor_idx", kind: "tenant_cursor", definition: "tenant_id, event_at ASC, event_id ASC", columns: ["tenant_id", "event_at", "event_id"], partitioned: true },
+];
+
+const GENERATION_MODEL_INDEX: IndexSpec = {
+  table: "generation_jobs",
+  index: "generation_jobs_global_model_time_idx",
+  kind: "model_time",
+  definition: "public_model, created_at DESC, id DESC",
+  columns: ["public_model", "created_at DESC", "id DESC"],
+  partitioned: false,
+};
+
 class PsqlFailure extends Error {
   readonly exitCode: number;
   constructor(exitCode: number) {
@@ -243,12 +285,14 @@ function dryRun(environment: NodeJS.ProcessEnv, options: Options): void {
       });
     }
   }
-  psql(environment, { input: `SELECT index_name, installed, valid
+  psql(environment, { input: `SELECT index_name, installed, valid, ready
   FROM (
     VALUES
       ('request_records_recent_idx'),
       ('request_records_tenant_time_idx'),
       ('request_records_key_time_idx'),
+      ('request_records_global_model_time_idx'),
+      ('generation_jobs_global_model_time_idx'),
       ('request_events_global_cursor_idx'),
       ('request_events_tenant_cursor_idx')
   ) required(index_name)
@@ -257,9 +301,41 @@ function dryRun(environment: NodeJS.ProcessEnv, options: Options): void {
            COALESCE((
              SELECT indisvalid FROM pg_index
               WHERE indexrelid = to_regclass('public.' || required.index_name)
-           ), false) AS valid
+           ), false) AS valid,
+           COALESCE((
+             SELECT indisready FROM pg_index
+              WHERE indexrelid = to_regclass('public.' || required.index_name)
+           ), false) AS ready
   ) status
  ORDER BY index_name;
+
+WITH required(parent_table, parent_index) AS (
+  VALUES
+    ('request_records', 'request_records_recent_idx'),
+    ('request_records', 'request_records_tenant_time_idx'),
+    ('request_records', 'request_records_key_time_idx'),
+    ('request_records', 'request_records_global_model_time_idx'),
+    ('request_events', 'request_events_global_cursor_idx'),
+    ('request_events', 'request_events_tenant_cursor_idx')
+)
+SELECT parent_index,
+       count(table_inheritance.inhrelid) AS leaf_count,
+       count(table_inheritance.inhrelid) FILTER (WHERE attached.indexrelid IS NULL) AS unattached_or_invalid_leaves
+  FROM required
+  LEFT JOIN pg_inherits table_inheritance
+    ON table_inheritance.inhparent = to_regclass('public.' || parent_table)
+  LEFT JOIN LATERAL (
+    SELECT child_index.indexrelid
+      FROM pg_inherits index_inheritance
+      JOIN pg_index child_index ON child_index.indexrelid = index_inheritance.inhrelid
+     WHERE index_inheritance.inhparent = to_regclass('public.' || parent_index)
+       AND child_index.indrelid = table_inheritance.inhrelid
+       AND child_index.indisvalid
+       AND child_index.indisready
+     LIMIT 1
+  ) attached ON true
+ GROUP BY parent_index
+ ORDER BY parent_index;
 ` });
   console.log(`Re-run with --apply to install indexes and process at most ${options.maxDays} day(s) per selected table.`);
 }
@@ -272,19 +348,113 @@ function indexLeafName(environment: NodeJS.ProcessEnv, leaf: string, kind: strin
   return captured(environment, { leaf, kind }, "SELECT format('mtc_%s_%s_%s', left(:'leaf', 28), :'kind', substr(md5(:'leaf'), 1, 8));\n");
 }
 
-function indexIsAttached(environment: NodeJS.ProcessEnv, parentIndex: string, leaf: string): boolean {
-  return captured(environment, { parent_index: parentIndex, leaf }, `SELECT EXISTS (
-    SELECT 1
+function attachedLeafIndex(environment: NodeJS.ProcessEnv, parentIndex: string, leaf: string): string | undefined {
+  const name = captured(environment, { parent_index: parentIndex, leaf }, `SELECT child_index_class.relname
       FROM pg_inherits inheritance
       JOIN pg_index child_index ON child_index.indexrelid = inheritance.inhrelid
+      JOIN pg_class child_index_class ON child_index_class.oid = child_index.indexrelid
      WHERE inheritance.inhparent = to_regclass('public.' || :'parent_index')
        AND child_index.indrelid = to_regclass('public.' || :'leaf')
-);
-`) === "t";
+     ORDER BY child_index_class.relname
+     LIMIT 1;
+`);
+  return name || undefined;
 }
 
-function ensureLeafIndex(environment: NodeJS.ProcessEnv, parentTable: TableName, parentIndex: string, kind: string, definition: string): void {
-  const leaves = captured(environment, { parent_table: parentTable }, `SELECT child.relname
+function readIndexMetadata(environment: NodeJS.ProcessEnv, index: string): IndexMetadata | undefined {
+  const raw = captured(environment, { index }, `SELECT target.relname,
+       pg_index.indisvalid::int,
+       pg_index.indisready::int,
+       pg_index.indisunique::int,
+       pg_index.indisexclusion::int,
+       access_method.amname,
+       (pg_index.indpred IS NOT NULL)::int,
+       (pg_index.indexprs IS NOT NULL)::int,
+       pg_index.indnkeyatts,
+       pg_index.indnatts,
+       index_class.relkind,
+       array_to_string(ARRAY(
+         SELECT pg_get_indexdef(pg_index.indexrelid, key_number, true)
+             || CASE WHEN (pg_index.indoption[key_number - 1] & 1) = 1 THEN ' DESC' ELSE '' END
+             || CASE
+                  WHEN (pg_index.indoption[key_number - 1] & 1) = 1
+                    AND (pg_index.indoption[key_number - 1] & 2) = 0 THEN ' NULLS LAST'
+                  WHEN (pg_index.indoption[key_number - 1] & 1) = 0
+                    AND (pg_index.indoption[key_number - 1] & 2) = 2 THEN ' NULLS FIRST'
+                  ELSE ''
+                END
+           FROM generate_series(1, pg_index.indnkeyatts) key_number
+          ORDER BY key_number
+       ), E'\\t')
+  FROM pg_index
+  JOIN pg_class index_class ON index_class.oid = pg_index.indexrelid
+  JOIN pg_class target ON target.oid = pg_index.indrelid
+  JOIN pg_namespace index_namespace ON index_namespace.oid = index_class.relnamespace
+  JOIN pg_am access_method ON access_method.oid = index_class.relam
+ WHERE index_namespace.nspname = 'public'
+   AND index_class.oid = to_regclass('public.' || :'index');
+`);
+  if (!raw) return undefined;
+  const fields = raw.split("|");
+  if (fields.length !== 12) throw new CliFailure(`unable to parse index metadata for public.${index}`, 1);
+  const [relation, valid, ready, unique, exclusion, accessMethod, hasPredicate, hasExpressions, keyColumns, totalColumns, relationKind, columns] = fields as [string, string, string, string, string, string, string, string, string, string, string, string];
+  return {
+    relation,
+    valid: valid === "1",
+    ready: ready === "1",
+    unique: unique === "1",
+    exclusion: exclusion === "1",
+    accessMethod,
+    hasPredicate: hasPredicate === "1",
+    hasExpressions: hasExpressions === "1",
+    keyColumns: Number(keyColumns),
+    totalColumns: Number(totalColumns),
+    relationKind,
+    columns: columns ? columns.split("\t") : [],
+  };
+}
+
+function publicRelationKind(environment: NodeJS.ProcessEnv, relation: string): string | undefined {
+  const kind = captured(environment, { relation }, `SELECT pg_class.relkind
+  FROM pg_class
+  JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+ WHERE pg_namespace.nspname = 'public'
+   AND pg_class.relname = :'relation';
+`);
+  return kind || undefined;
+}
+
+function validateIndexDefinition(spec: IndexSpec, metadata: IndexMetadata): void {
+  const expectedKind = spec.partitioned ? "I" : "i";
+  const definitionMatches = metadata.relation === spec.table
+    && metadata.accessMethod === "btree"
+    && !metadata.unique
+    && !metadata.exclusion
+    && !metadata.hasPredicate
+    && !metadata.hasExpressions
+    && metadata.keyColumns === spec.columns.length
+    && metadata.totalColumns === spec.columns.length
+    && metadata.relationKind === expectedKind
+    && metadata.columns.length === spec.columns.length
+    && metadata.columns.every((column, index) => column === spec.columns[index]);
+  if (!definitionMatches) {
+    throw new CliFailure(`public.${spec.index} exists with the wrong table, access method, columns, ordering, predicate, or index kind; refusing to alter it`, 1);
+  }
+}
+
+function validateReadyIndex(environment: NodeJS.ProcessEnv, spec: IndexSpec): void {
+  const metadata = readIndexMetadata(environment, spec.index);
+  if (metadata === undefined) throw new CliFailure(`required index public.${spec.index} is missing`, 1);
+  validateIndexDefinition(spec, metadata);
+  if (!metadata.valid || !metadata.ready) throw new CliFailure(`required index public.${spec.index} is not valid and ready`, 1);
+}
+
+function ensureLeafIndex(environment: NodeJS.ProcessEnv, spec: IndexSpec): void {
+  const parentMetadata = readIndexMetadata(environment, spec.index);
+  if (parentMetadata === undefined) throw new CliFailure(`required partitioned-index metadata public.${spec.index} is missing`, 1);
+  validateIndexDefinition(spec, parentMetadata);
+
+  const leaves = captured(environment, { parent_table: spec.table }, `SELECT child.relname
   FROM pg_inherits inheritance
   JOIN pg_class parent ON parent.oid = inheritance.inhparent
   JOIN pg_namespace parent_namespace ON parent_namespace.oid = parent.relnamespace
@@ -297,50 +467,86 @@ function ensureLeafIndex(environment: NodeJS.ProcessEnv, parentTable: TableName,
 `).split(/\r?\n/u).filter(Boolean);
 
   for (const leaf of leaves) {
-    if (indexIsAttached(environment, parentIndex, leaf)) continue;
-    const leafIndex = indexLeafName(environment, leaf, kind);
-    let indexStatus = captured(environment, { leaf_index: leafIndex }, `SELECT CASE
-         WHEN candidate.indexrelid IS NULL THEN 'missing'
-         WHEN indisvalid AND indisready THEN 'valid'
-         ELSE 'invalid'
-       END
-  FROM (SELECT to_regclass('public.' || :'leaf_index') AS indexrelid) candidate
-  LEFT JOIN pg_index ON pg_index.indexrelid = candidate.indexrelid;
-`);
-    if (indexStatus === "invalid") {
+    const attachedIndex = attachedLeafIndex(environment, spec.index, leaf);
+    if (attachedIndex !== undefined) {
+      validateReadyIndex(environment, { ...spec, table: leaf, index: attachedIndex, partitioned: false });
+      continue;
+    }
+    const leafIndex = indexLeafName(environment, leaf, spec.kind);
+    const leafSpec = { ...spec, table: leaf, index: leafIndex, partitioned: false };
+    const existing = readIndexMetadata(environment, leafIndex);
+    if (existing !== undefined) {
+      validateIndexDefinition(leafSpec, existing);
+    }
+    if (existing !== undefined && (!existing.valid || !existing.ready)) {
       console.log(`Dropping invalid interrupted index public.${leafIndex}`);
       psql(environment, { args: variables({ leaf_index: leafIndex }), input: 'DROP INDEX CONCURRENTLY IF EXISTS public.:"leaf_index";\n' });
-      indexStatus = "missing";
     }
-    if (indexStatus === "missing") {
+    if (existing === undefined || !existing.valid || !existing.ready) {
       console.log(`Building public.${leafIndex} concurrently on public.${leaf}`);
       psql(environment, {
         args: variables({ leaf: leaf, leaf_index: leafIndex }),
-        input: `CREATE INDEX CONCURRENTLY :"leaf_index" ON public.:"leaf" (${definition});\n`,
+        input: `CREATE INDEX CONCURRENTLY :"leaf_index" ON public.:"leaf" (${spec.definition});\n`,
       });
     }
-    console.log(`Attaching public.${leafIndex} to public.${parentIndex}`);
+    validateReadyIndex(environment, leafSpec);
+    console.log(`Attaching public.${leafIndex} to public.${spec.index}`);
     psql(environment, {
-      args: variables({ parent_index: parentIndex, leaf_index: leafIndex }),
+      args: variables({ parent_index: spec.index, leaf_index: leafIndex }),
       input: 'ALTER INDEX public.:"parent_index" ATTACH PARTITION public.:"leaf_index";\n',
     });
   }
 
-  const valid = captured(environment, { parent_index: parentIndex }, `SELECT indisvalid AND indisready
-  FROM pg_index
- WHERE indexrelid = to_regclass('public.' || :'parent_index');
-`);
-  if (valid !== "t") throw new CliFailure(`partitioned index public.${parentIndex} remains invalid; a partition may have appeared concurrently, rerun --apply --indexes-only`, 1);
+  const parentAfterAttach = readIndexMetadata(environment, spec.index);
+  if (parentAfterAttach === undefined || !parentAfterAttach.valid || !parentAfterAttach.ready) {
+    throw new CliFailure(`partitioned index public.${spec.index} remains invalid; a partition may have appeared concurrently, rerun --apply --indexes-only`, 1);
+  }
+  validateIndexDefinition(spec, parentAfterAttach);
+  for (const leaf of leaves) {
+    const attachedIndex = attachedLeafIndex(environment, spec.index, leaf);
+    if (attachedIndex === undefined) throw new CliFailure(`public.${leaf} is not attached to public.${spec.index}`, 1);
+    validateReadyIndex(environment, { ...spec, table: leaf, index: attachedIndex, partitioned: false });
+  }
+}
+
+function ensureStandaloneConcurrentIndex(environment: NodeJS.ProcessEnv, spec: IndexSpec): void {
+  const existing = readIndexMetadata(environment, spec.index);
+  if (existing !== undefined) validateIndexDefinition(spec, existing);
+  if (existing !== undefined && (!existing.valid || !existing.ready)) {
+    console.log(`Dropping invalid interrupted index public.${spec.index}`);
+    psql(environment, { args: variables({ index: spec.index }), input: 'DROP INDEX CONCURRENTLY IF EXISTS public.:"index";\n' });
+  }
+  if (existing === undefined || !existing.valid || !existing.ready) {
+    console.log(`Building public.${spec.index} concurrently on public.${spec.table}`);
+    psql(environment, {
+      args: variables({ table: spec.table, index: spec.index }),
+      input: `CREATE INDEX CONCURRENTLY :"index" ON public.:"table" (${spec.definition});\n`,
+    });
+  }
+  validateReadyIndex(environment, spec);
+}
+
+function preflightIndexes(environment: NodeJS.ProcessEnv): void {
+  for (const spec of [...PARTITIONED_INDEXES, GENERATION_MODEL_INDEX]) {
+    const existing = readIndexMetadata(environment, spec.index);
+    if (existing !== undefined) {
+      validateIndexDefinition(spec, existing);
+    } else if (publicRelationKind(environment, spec.index) !== undefined) {
+      throw new CliFailure(`public.${spec.index} is occupied by a non-index relation; refusing to alter it`, 1);
+    }
+  }
 }
 
 function installIndexes(environment: NodeJS.ProcessEnv, postgresDirectory: string): void {
-  console.log("Installing partitioned-index metadata. Leaf builds use CREATE INDEX CONCURRENTLY.");
+  preflightIndexes(environment);
+  console.log("Installing partitioned-index metadata. Leaf and generation builds use CREATE INDEX CONCURRENTLY.");
   psql(environment, { args: ["-f", resolve(postgresDirectory, "history-partition-indexes.sql")] });
-  ensureLeafIndex(environment, "request_records", "request_records_recent_idx", "recent", "created_at DESC, id DESC");
-  ensureLeafIndex(environment, "request_records", "request_records_tenant_time_idx", "tenant_time", "tenant_id, created_at DESC, id DESC");
-  ensureLeafIndex(environment, "request_records", "request_records_key_time_idx", "key_time", "key_id, created_at DESC, id DESC");
-  ensureLeafIndex(environment, "request_events", "request_events_global_cursor_idx", "global_cursor", "event_at ASC, event_id ASC");
-  ensureLeafIndex(environment, "request_events", "request_events_tenant_cursor_idx", "tenant_cursor", "tenant_id, event_at ASC, event_id ASC");
+  for (const spec of PARTITIONED_INDEXES) ensureLeafIndex(environment, spec);
+  ensureStandaloneConcurrentIndex(environment, GENERATION_MODEL_INDEX);
+  psql(environment, { input: `COMMENT ON INDEX public.generation_jobs_global_model_time_idx IS
+    'Global public-model-filtered newest-generation access path; installed concurrently by the history backfill operator.';\n` });
+  console.log("All required parent, leaf, and standalone indexes are valid and ready. Future request/event partitions inherit the attached parent definitions.");
+  console.log("schema_migrations was not changed; start the application normally so schema v59 is recorded only by the application migration runner.");
 }
 
 function selectedDays(environment: NodeJS.ProcessEnv, table: TableName, options: Options): string[] {
@@ -404,12 +610,12 @@ export function main(argv = process.argv.slice(2)): number {
       return 0;
     }
     console.log("APPLY mode selected. Each daily cutover is atomic and independently restartable.");
-    psql(environment, { args: ["-f", resolve(postgresDirectory, "history-partition-backfill.sql")] });
     installIndexes(environment, postgresDirectory);
     if (options.indexesOnly) {
       console.log("Index installation and verification complete; no rows were moved.");
       return 0;
     }
+    psql(environment, { args: ["-f", resolve(postgresDirectory, "history-partition-backfill.sql")] });
     for (const table of tableNames(options.tableSelection)) {
       const days = selectedDays(environment, table, options);
       if (days.length === 0) {

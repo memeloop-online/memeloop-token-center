@@ -52,7 +52,9 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const migrationVersions = (directory: string): number[] => readdirSync(join(repository, 'migrations', directory)).flatMap((name) => /^([0-9]{4})_.*\.sql$/.exec(name)?.[1] ?? []).map(Number);
     const sqlite = Math.max(...migrationVersions('common'), ...migrationVersions('sqlite'));
     const postgres = Math.max(...migrationVersions('common'), ...migrationVersions('postgres'));
-    assert.equal(sqlite, postgres); assert.equal(Number(/^  schemaVersion: ([0-9]+)$/m.exec(read('charts/memeloop-token-center/values.yaml'))?.[1]), sqlite);
+    assert.equal(sqlite, postgres);
+    assert.equal(sqlite, 59, 'release chart must require schema v59');
+    assert.equal(Number(/^  schemaVersion: ([0-9]+)$/m.exec(read('charts/memeloop-token-center/values.yaml'))?.[1]), sqlite);
     has('default', `memeloop.io/schema-generation: "v${sqlite}"`);
     count('default', 'image: "ghcr.io/memeloop-online/memeloop-token-center:0.1.0"', 4);
     count('digest', `image: "ghcr.io/memeloop-online/memeloop-token-center@${reviewed}"`, 4); lacks('digest', 'must-not-render');
@@ -89,6 +91,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       const result = spawnSync(helm, args, { cwd: repository, encoding: 'utf8', shell: false });
       assert.notEqual(result.status, 0, `values schema accepted invalid case ${values!.join(',')}`);
     }
+    const oldSchema = spawnSync(helm, ['template', 'invalid-old-schema', chart, '--set', 'migration.schemaVersion=58'], { cwd: repository, encoding: 'utf8', shell: false });
+    assert.notEqual(oldSchema.status, 0, 'release values schema accepted migration.schemaVersion=58');
 
     if (process.env.KUBECONFORM_BIN) {
       const result = spawnSync(process.env.KUBECONFORM_BIN, ['-strict', '-summary', '-ignore-missing-schemas'], { cwd: repository, input: Object.values(output).join('\n---\n'), encoding: 'utf8', shell: false });

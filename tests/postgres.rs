@@ -394,15 +394,72 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
 
     let index_pool = sqlx::PgPool::connect(&database_url).await.unwrap();
     let default_history_indexes_ready: bool = sqlx::query_scalar(
-        "SELECT to_regclass(current_schema() || '.request_records_recent_idx') IS NOT NULL AND to_regclass(current_schema() || '.request_events_global_cursor_idx') IS NOT NULL",
+        "SELECT to_regclass(current_schema() || '.request_records_recent_idx') IS NOT NULL AND to_regclass(current_schema() || '.request_events_global_cursor_idx') IS NOT NULL AND to_regclass(current_schema() || '.request_records_global_model_time_idx') IS NOT NULL AND to_regclass(current_schema() || '.generation_jobs_global_model_time_idx') IS NOT NULL",
     )
     .fetch_one(&index_pool)
     .await
     .unwrap();
     assert!(
         default_history_indexes_ready,
-        "fresh PostgreSQL migrations must install global request and SSE cursor indexes"
+        "fresh PostgreSQL migrations must install global request, model-filtered and SSE cursor indexes"
     );
+    let unattached_model_index_leaves: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_inherits table_inheritance WHERE table_inheritance.inhparent = to_regclass(current_schema() || '.request_records') AND NOT EXISTS (SELECT 1 FROM pg_inherits index_inheritance JOIN pg_index child_index ON child_index.indexrelid = index_inheritance.inhrelid WHERE index_inheritance.inhparent = to_regclass(current_schema() || '.request_records_global_model_time_idx') AND child_index.indrelid = table_inheritance.inhrelid AND child_index.indisvalid AND child_index.indisready)",
+    )
+    .fetch_one(&index_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unattached_model_index_leaves, 0,
+        "the v59 parent model index must cover every request partition"
+    );
+    let model_index_definitions: Vec<String> = sqlx::query_scalar(
+        "SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indexrelid IN (to_regclass(current_schema() || '.request_records_global_model_time_idx'), to_regclass(current_schema() || '.generation_jobs_global_model_time_idx')) ORDER BY indexrelid::regclass::TEXT",
+    )
+    .fetch_all(&index_pool)
+    .await
+    .unwrap();
+    assert_eq!(model_index_definitions.len(), 2);
+    assert!(model_index_definitions.iter().any(|definition| {
+        definition.contains("request_records")
+            && definition.contains("(model, created_at DESC, id DESC)")
+    }));
+    assert!(model_index_definitions.iter().any(|definition| {
+        definition.contains("generation_jobs")
+            && definition.contains("(public_model, created_at DESC, id DESC)")
+    }));
+    let mut explain = index_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL enable_seqscan = off")
+        .execute(&mut *explain)
+        .await
+        .unwrap();
+    let request_model_plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (FORMAT TEXT, COSTS OFF) SELECT id, created_at FROM request_records WHERE created_at >= 0 AND created_at <= 9223372036854775807 AND model = 'needle' ORDER BY created_at DESC, id DESC LIMIT 5",
+    )
+    .fetch_all(&mut *explain)
+    .await
+    .unwrap();
+    let generation_model_plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN (FORMAT TEXT, COSTS OFF) SELECT id, created_at FROM generation_jobs WHERE created_at >= 0 AND created_at <= 9223372036854775807 AND public_model = 'needle' ORDER BY created_at DESC, id DESC LIMIT 5",
+    )
+    .fetch_all(&mut *explain)
+    .await
+    .unwrap();
+    explain.rollback().await.unwrap();
+    for (source, plan, model_column) in [
+        ("request_records", request_model_plan, "model"),
+        ("generation_jobs", generation_model_plan, "public_model"),
+    ] {
+        let rendered = plan.join("\n");
+        assert!(
+            !rendered.contains("Seq Scan"),
+            "global {source} model Top-N must not fall back to a sequential scan: {rendered}"
+        );
+        assert!(
+            rendered.contains("Index") && rendered.contains(model_column),
+            "global {source} model Top-N must expose an ordered model-index plan: {rendered}"
+        );
+    }
     index_pool.close().await;
 
     let unique = Uuid::now_v7();

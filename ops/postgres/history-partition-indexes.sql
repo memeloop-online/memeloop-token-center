@@ -12,6 +12,8 @@ CREATE INDEX IF NOT EXISTS request_records_tenant_time_idx
     ON ONLY public.request_records (tenant_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS request_records_key_time_idx
     ON ONLY public.request_records (key_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS request_records_global_model_time_idx
+    ON ONLY public.request_records (model, created_at DESC, id DESC);
 
 CREATE INDEX IF NOT EXISTS request_events_global_cursor_idx
     ON ONLY public.request_events (event_at ASC, event_id ASC);
@@ -20,5 +22,7 @@ CREATE INDEX IF NOT EXISTS request_events_tenant_cursor_idx
 
 COMMENT ON INDEX public.request_records_recent_idx IS
     'Global newest-request access path; leaf indexes are installed concurrently by the history backfill operator.';
+COMMENT ON INDEX public.request_records_global_model_time_idx IS
+    'Global model-filtered newest-request access path; leaf indexes are installed concurrently by the history backfill operator.';
 COMMENT ON INDEX public.request_events_global_cursor_idx IS
     'Global request-event cursor access path; leaf indexes are installed concurrently by the history backfill operator.';

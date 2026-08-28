@@ -120,6 +120,7 @@ export function main(argv = process.argv.slice(2)): number {
     const count = (sql: string): number => Number.parseInt(scalar(databaseUrl, sql, timeout), 10);
     const requestRows = count("SELECT count(*) FROM request_records;");
     const eventRows = count("SELECT count(*) FROM request_events;");
+    const generationRows = count("SELECT count(*) FROM generation_jobs;");
     const factRows = count("SELECT count(*) FROM request_stats_facts;");
     const generationFactRows = count("SELECT count(*) FROM generation_stats_facts;");
     const terminalRequestRows = count("SELECT count(*) FROM request_records WHERE completed_at IS NOT NULL AND status_code IS NOT NULL;");
@@ -127,6 +128,8 @@ export function main(argv = process.argv.slice(2)): number {
     const blankCurrencyRows = count("SELECT SUM(rows) FROM (SELECT count(*) AS rows FROM request_records WHERE currency = '' UNION ALL SELECT count(*) FROM request_stats_facts WHERE currency = '' UNION ALL SELECT count(*) FROM request_daily_aggregates WHERE currency = '' UNION ALL SELECT count(*) FROM generation_stats_facts WHERE currency = '' UNION ALL SELECT count(*) FROM generation_daily_aggregates WHERE currency = '' UNION ALL SELECT count(*) FROM usage_analysis_hourly WHERE currency = '' UNION ALL SELECT count(*) FROM usage_analysis_daily WHERE currency = '') currency_gaps;");
     const validRequiredCursorIndexes = count("SELECT count(*) FROM pg_index WHERE indexrelid IN (to_regclass('public.request_records_recent_idx'), to_regclass('public.request_events_global_cursor_idx')) AND indisvalid AND indisready;");
     const unattachedRequiredCursorLeaves = count("WITH required(parent_table, parent_index) AS (VALUES ('request_records', 'request_records_recent_idx'), ('request_events', 'request_events_global_cursor_idx')) SELECT count(*) FROM required r JOIN pg_inherits table_inheritance ON table_inheritance.inhparent = to_regclass('public.' || r.parent_table) WHERE NOT EXISTS (SELECT 1 FROM pg_inherits index_inheritance JOIN pg_index child_index ON child_index.indexrelid = index_inheritance.inhrelid WHERE index_inheritance.inhparent = to_regclass('public.' || r.parent_index) AND child_index.indrelid = table_inheritance.inhrelid AND child_index.indisvalid AND child_index.indisready);");
+    const validRequiredGlobalModelIndexes = count("SELECT count(*) FROM pg_index WHERE indexrelid IN (to_regclass('public.request_records_global_model_time_idx'), to_regclass('public.generation_jobs_global_model_time_idx')) AND indisvalid AND indisready;");
+    const unattachedRequiredGlobalModelLeaves = count("SELECT count(*) FROM pg_inherits table_inheritance WHERE table_inheritance.inhparent = to_regclass('public.request_records') AND NOT EXISTS (SELECT 1 FROM pg_inherits index_inheritance JOIN pg_index child_index ON child_index.indexrelid = index_inheritance.inhrelid WHERE index_inheritance.inhparent = to_regclass('public.request_records_global_model_time_idx') AND child_index.indrelid = table_inheritance.inhrelid AND child_index.indisvalid AND child_index.indisready);");
     const validRequiredObservabilityIndexes = count("SELECT count(*) FROM pg_index WHERE indexrelid IN (to_regclass('public.request_stats_facts_tenant_created_idx'), to_regclass('public.generation_stats_facts_tenant_created_idx'), to_regclass('public.request_daily_aggregates_tenant_day_idx'), to_regclass('public.generation_daily_aggregates_tenant_day_idx'), to_regclass('public.usage_analysis_hourly_tenant_time_idx'), to_regclass('public.usage_analysis_daily_tenant_time_idx'), to_regclass('public.usage_analysis_daily_tenant_model_time_idx'), to_regclass('public.usage_analysis_daily_tenant_error_time_idx'), to_regclass('public.usage_analysis_daily_tenant_route_time_idx')) AND indisvalid AND indisready;");
     const keyId = scalar(databaseUrl, "SELECT key_id FROM request_records GROUP BY key_id ORDER BY count(*) DESC LIMIT 1;", timeout);
     const tenantId = scalar(databaseUrl, "SELECT tenant_id FROM request_records GROUP BY tenant_id ORDER BY count(*) DESC LIMIT 1;", timeout);
@@ -134,6 +137,9 @@ export function main(argv = process.argv.slice(2)): number {
     for (const [name, value] of [["key_id", keyId], ["tenant_id", tenantId]] as const) if (!SAFE_ID.test(value)) throw new PrerequisiteFailure(`sample ${name} is absent or malformed`);
     if (eventTenantId && !SAFE_ID.test(eventTenantId)) throw new PrerequisiteFailure("sample event tenant id is malformed");
     const errorCode = literal(databaseUrl, "SELECT error_code FROM request_records WHERE error_code IS NOT NULL GROUP BY error_code ORDER BY count(*) DESC LIMIT 1", timeout);
+    const globalRequestModel = literal(databaseUrl, "SELECT model FROM request_records GROUP BY model ORDER BY count(*) DESC, model ASC LIMIT 1", timeout);
+    if (globalRequestModel === undefined) throw new PrerequisiteFailure("sample global request model is absent");
+    const globalGenerationModel = literal(databaseUrl, "SELECT public_model FROM generation_jobs GROUP BY public_model ORDER BY count(*) DESC, public_model ASC LIMIT 1", timeout) ?? globalRequestModel;
     const analysisModel = literal(databaseUrl, `SELECT model FROM usage_analysis_daily WHERE tenant_id = '${tenantId}' GROUP BY model ORDER BY count(*) DESC LIMIT 1`, timeout);
     const analysisError = literal(databaseUrl, `SELECT error_code FROM usage_analysis_daily WHERE tenant_id = '${tenantId}' AND error_code <> '' GROUP BY error_code ORDER BY count(*) DESC LIMIT 1`, timeout);
     const analysisRoute = literal(databaseUrl, `SELECT model_route_id FROM usage_analysis_daily WHERE tenant_id = '${tenantId}' AND model_route_id <> '' GROUP BY model_route_id ORDER BY count(*) DESC LIMIT 1`, timeout);
@@ -151,6 +157,8 @@ export function main(argv = process.argv.slice(2)): number {
     const usageHourlyQuery = `SELECT hour_bucket, currency, protocol, SUM(requests), SUM(input_tokens), SUM(cached_input_tokens), SUM(cache_write_tokens), SUM(cost_micros) FROM usage_analysis_hourly WHERE tenant_id = '${tenantId}' AND hour_bucket >= ${usageFromHour} AND hour_bucket <= ${usageMaxHour} GROUP BY hour_bucket, currency, protocol ORDER BY hour_bucket, currency, protocol`;
     const queries: Array<[string, string]> = [
       ["global_newest_cursor", "SELECT id, created_at, model, status_code FROM request_records ORDER BY created_at DESC, id DESC LIMIT 100"],
+      ["global_model_request_top_n", `SELECT id, created_at, model, status_code FROM request_records WHERE model = ${globalRequestModel} ORDER BY created_at DESC, id DESC LIMIT 100`],
+      ["global_model_generation_top_n", `SELECT id, created_at, public_model, status FROM generation_jobs WHERE public_model = ${globalGenerationModel} ORDER BY created_at DESC, id DESC LIMIT 100`],
       ["tenant_newest_cursor", `SELECT id, created_at, model, status_code FROM request_records WHERE tenant_id = '${tenantId}' ORDER BY created_at DESC, id DESC LIMIT 100`],
       ["key_newest_cursor", `SELECT id, created_at, model, status_code FROM request_records WHERE key_id = '${keyId}' ORDER BY created_at DESC, id DESC LIMIT 100`],
       ["key_daily_aggregate", `SELECT day_bucket, SUM(requests), SUM(input_tokens), SUM(output_tokens), SUM(cost_micros) FROM usage_daily_aggregates WHERE key_id = '${keyId}' GROUP BY day_bucket ORDER BY day_bucket`],
@@ -160,6 +168,8 @@ export function main(argv = process.argv.slice(2)): number {
     for (const [name, column, value] of [["tenant_usage_model_drilldown", "model", analysisModel], ["tenant_usage_error_drilldown", "error_code", analysisError], ["tenant_usage_route_drilldown", "model_route_id", analysisRoute]] as const) if (value !== undefined) queries.push([name, `SELECT currency, SUM(requests), SUM(cost_micros) FROM usage_analysis_daily WHERE tenant_id = '${tenantId}' AND ${column} = ${value} AND day_bucket >= ${usageFromDay} AND day_bucket <= ${usageMaxDay} GROUP BY currency`]);
     if (eventTenantId) queries.push(["tenant_event_cursor", `SELECT event_id, event_at, request_id, event_kind FROM request_events WHERE tenant_id = '${eventTenantId}' ORDER BY event_at ASC, event_id ASC LIMIT 500`]);
     const results = queries.map(([name, query]) => explain(databaseUrl, name, query, timeout, args.maxSequentialScanRows));
+    const globalRequestModelPlan = results.find((result) => result.name === "global_model_request_top_n")!;
+    const globalGenerationModelPlan = results.find((result) => result.name === "global_model_generation_top_n")!;
     const checks: JsonObject[] = [
       { name: "large-volume request row precondition", actual: requestRows, operator: ">=", expected: args.minRequestRows, passed: requestRows >= args.minRequestRows },
       { name: "terminal request fact coverage", actual: factRows, operator: "==", expected: terminalRequestRows, passed: factRows === terminalRequestRows },
@@ -167,6 +177,10 @@ export function main(argv = process.argv.slice(2)): number {
       { name: "historical billing currency is complete", actual: blankCurrencyRows, operator: "==", expected: 0, passed: blankCurrencyRows === 0 },
       { name: "required global cursor parent indexes are ready", actual: validRequiredCursorIndexes, operator: "==", expected: 2, passed: validRequiredCursorIndexes === 2 },
       { name: "required global cursor indexes cover every partition", actual: unattachedRequiredCursorLeaves, operator: "==", expected: 0, passed: unattachedRequiredCursorLeaves === 0 },
+      { name: "required global model Top-N indexes are ready", actual: validRequiredGlobalModelIndexes, operator: "==", expected: 2, passed: validRequiredGlobalModelIndexes === 2 },
+      { name: "required global model request index covers every partition", actual: unattachedRequiredGlobalModelLeaves, operator: "==", expected: 0, passed: unattachedRequiredGlobalModelLeaves === 0 },
+      { name: "large-volume global model request branch uses an index plan", actual: globalRequestModelPlan.indexes, operator: "!=", expected: "[] when request_rows reaches min_request_rows", passed: requestRows < args.minRequestRows || globalRequestModelPlan.indexes.length > 0 },
+      { name: "large-volume global model generation branch uses its index", actual: globalGenerationModelPlan.indexes, operator: "contains", expected: "generation_jobs_global_model_time_idx when generation_rows reaches min_request_rows", passed: generationRows < args.minRequestRows || globalGenerationModelPlan.indexes.includes("generation_jobs_global_model_time_idx") },
       { name: "required observability indexes are ready", actual: validRequiredObservabilityIndexes, operator: "==", expected: 9, passed: validRequiredObservabilityIndexes === 9 },
     ];
     for (const result of results) {
@@ -178,7 +192,7 @@ export function main(argv = process.argv.slice(2)): number {
       }
     }
     const passed = checks.every((item) => item.passed);
-    const report = { schema_version: 3, benchmark: "memeloop-token-center-postgres-explain", generated_at: new Date().toISOString(), postgres_version: scalar(databaseUrl, "SHOW server_version;", timeout), dataset: { request_rows: requestRows, terminal_request_rows: terminalRequestRows, request_fact_rows: factRows, terminal_generation_rows: terminalGenerationRows, generation_fact_rows: generationFactRows, blank_currency_rows: blankCurrencyRows, event_rows: eventRows }, thresholds: { max_execution_ms: args.maxExecutionMs, min_request_rows: args.minRequestRows, max_sequential_scan_rows: args.maxSequentialScanRows, allow_sequential_scan: args.allowSequentialScan }, results, checks, passed, exit_code: passed ? 0 : 2 };
+    const report = { schema_version: 4, benchmark: "memeloop-token-center-postgres-explain", generated_at: new Date().toISOString(), postgres_version: scalar(databaseUrl, "SHOW server_version;", timeout), dataset: { request_rows: requestRows, terminal_request_rows: terminalRequestRows, request_fact_rows: factRows, generation_rows: generationRows, terminal_generation_rows: terminalGenerationRows, generation_fact_rows: generationFactRows, blank_currency_rows: blankCurrencyRows, event_rows: eventRows }, thresholds: { max_execution_ms: args.maxExecutionMs, min_request_rows: args.minRequestRows, max_sequential_scan_rows: args.maxSequentialScanRows, allow_sequential_scan: args.allowSequentialScan }, results, checks, passed, exit_code: passed ? 0 : 2 };
     writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`);
     console.log(JSON.stringify({ passed, checks }, null, 2));
     return report.exit_code;

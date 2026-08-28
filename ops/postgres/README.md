@@ -21,12 +21,21 @@ The command is deliberately safe by default:
   readers see either the old default rows or the attached partition, never a
   partial state.
 
-Before moving data, apply mode installs global/tenant/key newest-request and
-global/tenant event-cursor indexes. New leaf indexes are built with
-`CREATE INDEX CONCURRENTLY`; the short parent operation only attaches them to
-partitioned-index metadata. These are operational indexes, not a new app schema
-version, so application migration numbers remain available to application
-features.
+Before moving data, apply mode installs global/tenant/key newest-request,
+global model-filtered request Top-N, and global/tenant event-cursor indexes.
+New leaf indexes are built with `CREATE INDEX CONCURRENTLY`; the short parent
+operation only attaches them to partitioned-index metadata. The non-partitioned
+`generation_jobs (public_model, created_at DESC, id DESC)` Top-N index is also
+built concurrently. The operator verifies the exact table, access method,
+columns/order, absence of predicates/expressions, `indisvalid`, `indisready`,
+and every current leaf attachment. A future request partition inherits the
+validated parent definition through PostgreSQL partitioned-index metadata.
+
+This operational path never inserts schema migration rows. For a
+latency-sensitive database that has not applied schema v59, run the indexes-only
+command first, then start the application normally. Its real v59 migration sees
+the exact indexes through `IF NOT EXISTS` and records v59 itself. Never insert a
+v59 row manually.
 
 ## Runbook
 

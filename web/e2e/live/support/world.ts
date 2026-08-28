@@ -2,6 +2,13 @@ import assert from 'node:assert/strict';
 import { World, setWorldConstructor, type IWorldOptions } from '@cucumber/cucumber';
 import type { BrowserContext, Page, Response, Route } from 'playwright';
 import {
+  captureConsoleFailure,
+  capturePageFailure,
+  captureRequestFailure,
+  ExpectedClientErrorNavigationLedger,
+  type BrowserFailure,
+} from '../expected-navigation-errors.js';
+import {
   credentialsAreBoundToDestination, isAllowedLiveDestination, isReadOnlyMethod,
   urlContainsCredential,
 } from '../security.js';
@@ -11,8 +18,8 @@ export class LiveWorld extends World {
   context?: BrowserContext;
   page?: Page;
   private activeOrigin?: string;
-  private browserErrorCount = 0;
-  private failedRequestCount = 0;
+  private readonly browserFailures: BrowserFailure[] = [];
+  private readonly expectedClientErrorNavigations = new ExpectedClientErrorNavigationLedger();
   private readonly rejectedMethods: string[] = [];
   private readonly rejectedDestinations: string[] = [];
   private readonly rejectedCredentialURLs: string[] = [];
@@ -27,15 +34,35 @@ export class LiveWorld extends World {
   }
 
   async createBrowserContext(): Promise<void> {
+    const configuration = liveRuntime.requireConfiguration();
+    const reportableOrigins = new Set([
+      configuration.controlURL.origin,
+      configuration.gatewayURL.origin,
+    ]);
     this.context = await liveRuntime.requireBrowser().newContext({ viewport: { width: 1280, height: 900 } });
     await this.context.route('**/*', (route) => this.guardRoute(route));
     this.page = await this.context.newPage();
-    this.page.on('console', (message) => { if (message.type() === 'error') this.browserErrorCount += 1; });
-    this.page.on('pageerror', () => { this.browserErrorCount += 1; });
+    this.page.on('console', (message) => {
+      if (message.type() !== 'error') return;
+      this.browserFailures.push(captureConsoleFailure(
+        message.text(),
+        message.location().url,
+        this.page?.url() ?? '',
+        reportableOrigins,
+      ));
+    });
+    this.page.on('pageerror', (error) => {
+      this.browserFailures.push(capturePageFailure(error.name));
+    });
     this.page.on('requestfailed', (request) => {
       if (request.url().includes('/internal/v1/request-events')) return;
       if (this.rejectedMethods.includes(request.method().toUpperCase())) return;
-      this.failedRequestCount += 1;
+      this.browserFailures.push(captureRequestFailure(
+        request.method(),
+        request.url(),
+        request.failure()?.errorText,
+        reportableOrigins,
+      ));
     });
     this.page.on('response', (response) => {
       const audit = this.auditResponse(response);
@@ -65,6 +92,19 @@ export class LiveWorld extends World {
     return this.requirePage().goto(new URL(path, base).toString(), { waitUntil: 'domcontentloaded' });
   }
 
+  async navigateExpectingClientError(base: URL, path: string, expectedStatus: number): Promise<Response> {
+    const requestedURL = new URL(path, base).href;
+    const response = await this.navigate(base, path);
+    assert.ok(response, 'expected client-error navigation returned no HTTP response');
+    this.expectedClientErrorNavigations.verify(
+      requestedURL,
+      expectedStatus,
+      response.url(),
+      response.status(),
+    );
+    return response;
+  }
+
   async assertProviderSecretAbsent(expectedAPIPaths: readonly string[] = []): Promise<void> {
     await this.awaitResponseAudits();
     const content = await this.requirePage().content();
@@ -82,8 +122,11 @@ export class LiveWorld extends World {
     assert.deepEqual(this.rejectedCredentialURLs, [], 'the live application placed a credential in a URL');
     assert.deepEqual(this.rejectedCredentialHeaders, [], 'the live application sent a credential header to the wrong origin');
     assert.deepEqual(this.responseAuditFailures, [], 'the live response canary audit could not inspect an eligible response');
-    assert.equal(this.browserErrorCount, 0, 'the live browser emitted console or page errors');
-    assert.equal(this.failedRequestCount, 0, 'the live browser observed failed requests');
+    assert.deepEqual(
+      this.expectedClientErrorNavigations.unexpectedFailures(this.browserFailures),
+      [],
+      'the live browser emitted unexpected console, page, or request failures',
+    );
   }
 
   private async guardRoute(route: Route): Promise<void> {

@@ -552,6 +552,10 @@ Then('普通凭据在英文暗色主题下仍无法访问管理端', async funct
   this.page = operatorPage;
   await assertAttribute(operatorPage.locator('html'), 'lang', 'en');
   await assertAttribute(operatorPage.locator('html'), 'data-theme', 'dark');
+  const clearRememberedOperatorCredential = operatorPage.getByRole('button', { name: 'Clear credential', exact: true });
+  await assertVisible(clearRememberedOperatorCredential);
+  await clearRememberedOperatorCredential.click();
+  await assertNoCount(operatorPage.locator('.tenant-picker'));
   await operatorPage.locator('input[type="password"]').fill(observation.clientCredential);
   await operatorPage.getByRole('button', { name: 'Connect', exact: true }).click();
   await eventually(async () => {
