@@ -6,6 +6,52 @@ This is the resume point for the next Token Center development agent. Read
 scope and rejected designs; this document preserves the implementation state and
 remaining acceptance gates, updated on 2026-08-28.
 
+## Current 2026-08-28 live API2 acceptance
+
+This section supersedes every older API2 and release-status section below.
+API3 is still outside the production window and has not been changed.
+
+- Clean master `fb29097c396da74082c19299266e833d9618d813` passed GitHub
+  Actions run
+  [`33141979411`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33141979411),
+  including all functional, migration, browser, security, packaging and 35/35
+  memory checks. The complete immutable release is service
+  `sha256:48e6353fe01072e15c931c101b87c271151763eb2fc0c1d58b76b394b1dba50a`,
+  importer
+  `sha256:8e25527753759577e22328cde61e2ab101a48cf99150e261388c0457866cc9c9`
+  and plugin-installer
+  `sha256:80684fd2748ea9be5b90605f3c9b88f5b8ad4f1cf9d2f976dcfbdd3f6d4e9028`.
+- The reversible API2 trial is migrated to schema v58 and runs the exact service
+  digest in gateway, control and worker with one ready replica and zero restarts
+  each. A pre-v58 PostgreSQL backup remains on the dedicated
+  `mtc-api2-pre-v58-backup-fb29097` PVC; its dump is 107,885,667 bytes with
+  SHA-256
+  `ce51853143fcd653d7f79a5cf98dd177b48cde7b095d3757cbd5643a7289536b`.
+- Real Chromium acceptance selected the imported tenant and opened all nine
+  operator resource tabs without panel or console errors. Price synchronization
+  was enabled for the explicit tenant, credential creation was collapsed by
+  default, client versus bootstrap service credentials were distinguished,
+  credential reload/manual-clear semantics passed, and a 375-pixel viewport had
+  no horizontal overflow.
+- Codex CLI 0.150.0 used the API2 Responses endpoint through a custom provider
+  and returned the exact text marker `MTC-CODEX-TEXT-OK`. The separately exposed
+  `qwen3-coder` route correctly failed closed because it has no price in the key
+  currency; the priced `Qwen` route is usable. Do not invent a price for the
+  unmatched route.
+- A real `qwen-image` request returned HTTP 200, settled exactly 10,000 USD
+  micros, archived a 637,059-byte PNG and returned only an internal Token Center
+  asset URL. Exact idempotent replay preserved the request ID, response length
+  and response bytes without a second charge. The archived bytes have SHA-256
+  `1446587d688d95a9565c2e2277d917ee843cf022b1af8ce2b6822a6fc56540df`.
+- Live dogfood exposed one final metadata defect: the signed SiliconFlow object
+  sends `application/octet-stream`, so the valid PNG was stored as `.bin`.
+  The current local continuation performs a bounded, single-pass 16-byte magic
+  check only when the provider MIME is generic and maps known image/video
+  signatures to the existing safe allowlist. It does not buffer an asset or
+  weaken origin/size controls. A replacement exact-SHA CI, immutable digest
+  rollout to API2 and one real recheck of `image/png`/`.png` are required before
+  calling this the final launch candidate.
+
 ## Current 2026-08-28 local convergence evidence
 
 This section supersedes older local-development status below. It does not yet

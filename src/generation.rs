@@ -1241,13 +1241,12 @@ async fn archive_asset_to_staging(
             response.status().as_u16()
         )));
     }
-    let mime_type = safe_asset_mime(
+    let declared_mime_type = safe_asset_mime(
         response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
     );
-    let filename = safe_asset_filename(filename, index, &mime_type);
     if response
         .content_length()
         .is_some_and(|size| !archive_budget.can_fit_declared(size))
@@ -1257,6 +1256,7 @@ async fn archive_asset_to_staging(
     let staging = format!("{}/asset-{index}", staging_lease.key.canonical_prefix());
     let mut writer = state.archive.start_writer(&staging).await?;
     let mut total = 0_usize;
+    let mut signature_prefix = Vec::with_capacity(16);
     let mut stream = response.bytes_stream();
     while let Some(chunk) =
         await_with_staging_heartbeat(state, staging_lease, stream.next()).await?
@@ -1269,6 +1269,10 @@ async fn archive_asset_to_staging(
                 return Err(error);
             }
         };
+        if signature_prefix.len() < 16 {
+            let remaining = 16 - signature_prefix.len();
+            signature_prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
         total = total.saturating_add(chunk.len());
         if total > MAX_ASSET_BODY || !archive_budget.try_consume(chunk.len()) {
             writer.abort().await?;
@@ -1294,6 +1298,8 @@ async fn archive_asset_to_staging(
             "generation staged asset size mismatch".into(),
         ));
     }
+    let mime_type = resolve_asset_mime(declared_mime_type, &signature_prefix);
+    let filename = safe_asset_filename(filename, index, &mime_type);
     let object_locator = staged.object_locator;
     Ok(ArchivedGenerationAsset {
         asset_id: uuid::Uuid::now_v7(),
@@ -1524,6 +1530,28 @@ fn safe_asset_mime(value: Option<&str>) -> String {
     } else {
         "application/octet-stream".to_owned()
     }
+}
+
+fn resolve_asset_mime(declared: String, prefix: &[u8]) -> String {
+    if declared != "application/octet-stream" {
+        return declared;
+    }
+    let detected = if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if prefix.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if prefix.starts_with(b"GIF87a") || prefix.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if prefix.len() >= 12 && prefix.starts_with(b"RIFF") && &prefix[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if prefix.starts_with(b"\x1a\x45\xdf\xa3") {
+        Some("video/webm")
+    } else if prefix.len() >= 12 && &prefix[4..8] == b"ftyp" {
+        Some("video/mp4")
+    } else {
+        None
+    };
+    detected.map(str::to_owned).unwrap_or(declared)
 }
 
 fn safe_asset_filename(value: Option<&str>, index: usize, mime_type: &str) -> String {
@@ -1785,6 +1813,21 @@ mod tests {
         );
         assert_eq!(safe_asset_filename(None, 0, "image/png"), "asset-0.png");
         assert!(!safe_asset_filename(None, 0, "image/png").contains("SECRET_TOKEN"));
+        assert_eq!(
+            resolve_asset_mime(
+                "application/octet-stream".to_owned(),
+                b"\x89PNG\r\n\x1a\nrest"
+            ),
+            "image/png"
+        );
+        assert_eq!(
+            resolve_asset_mime("application/octet-stream".to_owned(), b"unknown"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            resolve_asset_mime("image/png".to_owned(), b"not-a-png"),
+            "image/png"
+        );
     }
 
     #[test]
