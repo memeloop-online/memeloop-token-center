@@ -6,6 +6,58 @@ This is the resume point for the next Token Center development agent. Read
 scope and rejected designs; this document preserves the implementation state and
 remaining acceptance gates, updated on 2026-08-28.
 
+## Current 2026-08-28 final-candidate convergence
+
+This section supersedes the local-source and release-next-step claims below.
+The API2 deployment still runs the previously released `a381be0` service image;
+API3 remains unchanged and prohibited until the user explicitly opens the
+production window.
+
+- Local master contains two not-yet-pushed commits on top of `origin/master`:
+  `62f15fc` keeps remembered operator/self-service credentials usable after
+  reload without ever repopulating either password input, removes the
+  misleading bootstrap/candidate copy, and preserves explicit manual clearing;
+  `51d96bb` adds the TypeScript-only `api2-target-rollback` operator and its
+  importer-image entry point.
+- Web typecheck and production build pass. Localization contracts pass 29/29;
+  real Chromium passes all 19 scenarios and 140 steps, including credential
+  non-reflection, reload, isolation, manual clear and responsive views. This is
+  local final-source evidence, not deployed API2 evidence.
+- The rollback operator uses `pg_dump`/`pg_restore`/`psql`/`mc` with
+  `shell:false`, PGPASSFILE and `MC_HOST_<alias>` Secrets only. It pins the exact
+  API2 PostgreSQL/MinIO source, rejects in-place restore, requires a separately
+  administered external HTTPS failure domain and disjoint
+  `<window>/postgres`/`<window>/minio` prefixes, validates custom dump format,
+  hashes actual remote object bytes, checks complete logical inventories, and
+  seals PostgreSQL plus MinIO receipts into one no-overwrite paired evidence
+  manifest. Root ops tests pass 30 with three explicit Docker/PostgreSQL
+  environment skips; typecheck, importer bundle syntax, release contracts 7/7,
+  repository TypeScript-only scan and `git diff --check` pass.
+- GitOps `master@63df7cb` contains the reversible API2 runtime states
+  `1/1/1 -> 0/0/1 -> 0/0/0` and reverse resume, a twice-observed read-only
+  Kubernetes/PostgreSQL quiesce receipt, default-suspended PostgreSQL/MinIO
+  backup/pair/new-endpoint restore Jobs, exact `/32:443` backup egress, explicit
+  receipt schemas and archive-apply binding to the exact paired-receipt SHA.
+  Its 23 maintenance tests, 16-YAML/9-suspended-Job archive contract and
+  repository Python prohibition pass. Nothing in this tranche was synced or
+  applied to the cluster; API2/API3 were not mutated.
+- No approved private, versioned external backup target or credentials are
+  recorded yet. Longhorn, another API2 PVC and API2 MinIO are the same failure
+  domain; public GHCR is for public program images and must not hold private
+  database/archive bytes. A maintenance window cannot proceed beyond dry-run
+  until operations supplies that external target and completes the paired
+  restore drill against brand-new PostgreSQL and MinIO endpoints.
+- The last complete 15-minute local memory run was on `62f15fc`: 35/35 checks,
+  0.05 MiB/min soak slope, +8.875 MiB retained RSS and 126.48 MiB peak gateway
+  RSS under the unchanged 224 MiB deployment budget. Because `51d96bb` adds the
+  importer bundle and this handoff changes the final Git revision, rebuild the
+  release binary and rerun the unchanged 15-minute gate on the final commit
+  before the single planned push/CI. Do not raise any threshold.
+- The Codex remote-browser limitation is tracked at
+  <https://github.com/openai/codex/issues/22844#issuecomment-5447860264>:
+  remote CLI tasks receive Desktop Tab URL/title context but no browser-control
+  tool, so user-visible Tab operations cannot be claimed from that environment.
+
 ## Current 2026-08-28 live API2 acceptance
 
 This section supersedes every older API2 and release-status section below.
