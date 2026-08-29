@@ -6,11 +6,68 @@ This is the resume point for the next Token Center development agent. Read
 scope and rejected designs; this document preserves the implementation state and
 remaining acceptance gates, updated on 2026-08-29.
 
-## Current 2026-08-29 release and working-tree status
+## Current 2026-08-29 exact release status
 
-This section supersedes the older statements below that call `0cf5fdc`, schema
-v58, or an uncommitted v59 tree current. Retained rehearsal and migration
-history remains valid.
+- The immutable deployed release source is
+  `8d3348e79921efd9e9e54a124cca40efbf000f9d`. The documentation-only
+  `[skip ci]` convergence containing this receipt follows that SHA on `master`
+  and is not represented as another image release. GitHub Actions run
+  [`33233291973`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33233291973)
+  passed repository/dependency security, Web Chromium, Rust format/Clippy/all
+  tests, migration and API contracts, packaging, the unchanged 15-minute
+  memory/stream/500 MiB asset gate, all three image publications and complete
+  immutable release verification. The verified service, importer and
+  plugin-installer digests are respectively
+  `sha256:24e46602754d80dc885959ce83f4d08040081ce93db6c4331c9c24ae93ae7e39`,
+  `sha256:66487e14184c72f8692e3a7e6628c7ba57dbd938bb1c1bc70b61b76d5a0d3fa4`
+  and
+  `sha256:fb7f462962903ed7a6ca1cb0517985c3dcbf11f212d3cacbdd78e30d51451784`.
+- API2 trial runs that exact service digest at schema 59. Gateway, control and
+  worker are 1/1 Ready with zero restarts. Argo is Synced/Healthy and manual
+  after GitOps revisions `7a0b083` (candidate), `eda14e5` (one-shot sync) and
+  `1207253` (automation removed). The prior service digest
+  `sha256:f059036b27f2543972e2b5edcd273aea4ff56e46c094e7b330c9dde0d0de369c`
+  remains the immediate schema-compatible rollback point. API3 and old CPA
+  were not changed.
+- Exact-release Chromium acceptance passed singleton tenant selection, all
+  seven usage views, usable price synchronization, collapsed credential
+  creation, the custom-model confirmation regression, stable dogfood key and
+  44 historical rows, credential reload/manual-clear, Chinese/English,
+  light/dark, 390-pixel responsiveness and gateway isolation with zero browser
+  failures. The remote workspace remains outside the reviewed operator ingress
+  source allowlist, so its public operator request returns the expected
+  ingress-layer 403 and the same live control Service was tested through a
+  temporary port-forward. The port-forward was stopped. See
+  [exact API2 acceptance](operations/2026-08-29-api2-8d3348e-live-acceptance.md).
+- Codex CLI `0.150.0-alpha.8` returned exact text marker
+  `MTC_API2_8D3348E_TEXT_OK` through API2 Responses and persisted the declared
+  session name, task kind, agent ID, trace, explicit structure session and
+  Codex CLI client identity. The same CLI invoked a TypeScript Images driver:
+  real `qwen-image` request `01a04bf6-02b5-7552-99e6-820ca022022b` returned
+  HTTP 200, settled 0.01 USD, archived a 591,547-byte PNG and replayed twice
+  with the same request ID and byte-identical 288-byte response without another
+  provider generation or image charge.
+- The strict TypeScript-only legacy key-policy and provider-exact route
+  importers are released but have not been applied. Owner-private review
+  resolves 21/23 source mappings to one account and 18/23 source coordinates;
+  two account choices, five source coordinates, eight live-route relation
+  reviews, two managed Codex mappings, Copilot/Cursor reauthorization and one
+  malformed anomaly remain fail-closed. Do not create a strict manifest or run
+  live apply until those owner decisions exist.
+- Production remains blocked by that route/policy convergence, the approved
+  collector-only v0.8.1 maintenance and complete session archive
+  baseline/delta/apply/replay, final CPAMP fence, any separately authoritative
+  subscription inventory, paired PostgreSQL/MinIO backup and external restore,
+  OAuth continuity, formal route rollback and the dedicated disabled-provider
+  canary. API3 remains prohibited until the user explicitly opens the
+  production window.
+
+## Pre-release 2026-08-29 convergence history
+
+This retained section describes the immediately preceding `413f151` baseline
+and the then-uncommitted convergence tree. It no longer describes the current
+release; the exact status above supersedes it. Its rehearsal and migration
+evidence remains valid.
 
 - Clean `master` and `origin/master` released baseline is
   `413f15161397f3ac640b4921c8e7becdfc8aa3b9`. GitHub Actions run
