@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "kind": "api2-exact-release-stability-sample",
+  "observed_at": "2026-08-29T06:10:00Z",
+  "source_revision": "8d3348e79921efd9e9e54a124cca40efbf000f9d",
+  "service_digest": "sha256:24e46602754d80dc885959ce83f4d08040081ce93db6c4331c9c24ae93ae7e39",
+  "namespace": "memeloop-token-center-api2-trial",
+  "public_health_url": "https://token-center-api2-trial-portal.k3s.onetwo.website/healthz",
+  "sample_count": 30,
+  "sample_interval_seconds": 10,
+  "observed_duration_seconds": 290,
+  "health_failures": 0,
+  "readiness_failures": 0,
+  "restart_increases": 0,
+  "digest_mismatches": 0,
+  "max_service_pod_memory_mib": 9,
+  "public_health_latency_ms": {
+    "p95": 1273.91,
+    "max": 5489.086
+  },
+  "scope": "Reversible API2 trial only; API3 and old CPA were not changed. Public latency includes the remote workspace-to-ingress network path.",
+  "credentials_or_secrets_recorded": false
+}

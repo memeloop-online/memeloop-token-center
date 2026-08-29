@@ -60,6 +60,27 @@ const COLLECTOR_PATHS = {
   stats: "/v1/stats",
 } as const;
 
+/**
+ * One canonical payload copy is sufficient for de-duplication, per-session
+ * digest verification, and both output orders. `emit` retains the legacy
+ * overlap filter without staging selected records in a second table.
+ */
+export const ARCHIVE_SPOOL_SCHEMA = `
+  PRAGMA journal_mode=DELETE;
+  PRAGMA synchronous=FULL;
+  CREATE TABLE records(
+    request_id TEXT PRIMARY KEY COLLATE BINARY,
+    session_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    canonical BLOB NOT NULL,
+    emit INTEGER NOT NULL CHECK(emit IN (0, 1))
+  ) WITHOUT ROWID;
+  CREATE INDEX records_by_session ON records(session_id COLLATE BINARY, request_id COLLATE BINARY);
+  CREATE INDEX records_by_output ON records(started_at, request_id COLLATE BINARY) WHERE emit = 1;
+`;
+
 type JsonObject = Record<string, unknown>;
 type SourcePaths = typeof CPA_PATHS | typeof COLLECTOR_PATHS;
 type Time = { nanos: bigint };
@@ -728,9 +749,9 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
   const spoolPath = join(dirname(args.output), `.mtc-archive-delta-spool.${process.pid}.${Date.now()}.sqlite`); let database: DatabaseSync | undefined; let outputTemporary: string | undefined;
   let maximumCompleted = prior; let maximumStarted: Time | undefined;
   try {
-    database = new DatabaseSync(spoolPath); database.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE records(request_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT NOT NULL, digest TEXT NOT NULL, canonical BLOB NOT NULL); CREATE TABLE seen_records(request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, digest TEXT NOT NULL, canonical BLOB NOT NULL)");
-    const seen = database.prepare("SELECT session_id, digest FROM seen_records WHERE request_id=?");
-    const addSeen = database.prepare("INSERT INTO seen_records VALUES(?,?,?,?)"); const addRecord = database.prepare("INSERT INTO records VALUES(?,?,?,?,?)");
+    database = new DatabaseSync(spoolPath); database.exec(ARCHIVE_SPOOL_SCHEMA);
+    const seen = database.prepare("SELECT session_id, digest FROM records WHERE request_id=?");
+    const addRecord = database.prepare("INSERT INTO records VALUES(?,?,?,?,?,?,?)");
     let selectedBytes = 0;
     for (const session of [...first.sessions].sort((left, right) => compareUtf8Bytewise(left.session_id, right.session_id))) {
       if (session.deleted === true) {
@@ -756,17 +777,20 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
         const encoded = Buffer.concat([canonicalBytes(record), Buffer.from("\n")]); const digest = sha256Bytes(encoded);
         const existing = seen.get(requestId) as { session_id: string; digest: string } | undefined;
         if (existing !== undefined) { if (existing.session_id !== session.session_id || existing.digest !== digest) throw new DeltaError("one source request id has conflicting archive records"); continue; }
-        addSeen.run(requestId, session.session_id, digest, encoded); exported += 1;
-        if (first.protocol === LEGACY_PROJECTION_PROTOCOL && compareTime(started, lower) < 0 && compareTime(completed, lower) < 0) continue;
-        selectedBytes += encoded.length; if (selectedBytes > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
-        addRecord.run(requestId, formatTime(started), formatTime(completed), digest, encoded);
+        const emit = first.protocol !== LEGACY_PROJECTION_PROTOCOL || compareTime(started, lower) >= 0 || compareTime(completed, lower) >= 0;
+        if (emit) {
+          selectedBytes += encoded.length;
+          if (selectedBytes > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
+        }
+        addRecord.run(requestId, session.session_id, formatTime(started), formatTime(completed), digest, encoded, emit ? 1 : 0); exported += 1;
+        if (!emit) continue;
         if (compareTime(completed, maximumCompleted) > 0) maximumCompleted = completed;
         if (maximumStarted === undefined || compareTime(started, maximumStarted) > 0) maximumStarted = started;
       }
       if (exported !== session.requests) throw new DeltaError("source session export count disagrees with its session summary");
       if (first.protocol === STABLE_CURSOR_PROTOCOL) {
         const digest = createHash("sha256");
-        for (const row of database.prepare("SELECT canonical FROM seen_records WHERE session_id=? ORDER BY request_id").iterate(session.session_id) as Iterable<{ canonical: Uint8Array }>) digest.update(row.canonical);
+        for (const row of database.prepare("SELECT canonical FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY").iterate(session.session_id) as Iterable<{ canonical: Uint8Array }>) digest.update(row.canonical);
         if (digest.digest("hex") !== session.records_sha256) throw new DeltaError("source session export digest disagrees with its stable summary");
       }
     }
@@ -786,7 +810,7 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
           if (outputSize + summaryBytes.length > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
           writeFileSync(descriptor, summaryBytes); outputDigest.update(summaryBytes); outputSize += summaryBytes.length;
           if (session.deleted !== true) {
-            for (const row of database.prepare("SELECT canonical FROM seen_records WHERE session_id=? ORDER BY request_id COLLATE BINARY").iterate(session.session_id) as Iterable<{ canonical: Uint8Array }>) {
+            for (const row of database.prepare("SELECT canonical FROM records WHERE session_id=? ORDER BY request_id COLLATE BINARY").iterate(session.session_id) as Iterable<{ canonical: Uint8Array }>) {
               const bytes = Buffer.from(row.canonical);
               if (outputSize + bytes.length > args.maxOutputBytes) throw new DeltaError("delta output exceeds the configured size limit");
               writeFileSync(descriptor, bytes); outputDigest.update(bytes); outputSize += bytes.length; recordCount += 1;
@@ -794,7 +818,7 @@ async function exportDelta(args: Arguments): Promise<JsonObject> {
           }
         }
       } else {
-        for (const row of database.prepare("SELECT canonical FROM records ORDER BY started_at, request_id COLLATE BINARY").iterate() as Iterable<{ canonical: Uint8Array }>) { const bytes = Buffer.from(row.canonical); writeFileSync(descriptor, bytes); outputDigest.update(bytes); outputSize += bytes.length; recordCount += 1; }
+        for (const row of database.prepare("SELECT canonical FROM records WHERE emit=1 ORDER BY started_at, request_id COLLATE BINARY").iterate() as Iterable<{ canonical: Uint8Array }>) { const bytes = Buffer.from(row.canonical); writeFileSync(descriptor, bytes); outputDigest.update(bytes); outputSize += bytes.length; recordCount += 1; }
       }
       fsyncSync(descriptor);
     } finally { closeSync(descriptor); }

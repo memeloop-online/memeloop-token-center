@@ -8,8 +8,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import test, { after, before, beforeEach } from "node:test";
 import {
+  ARCHIVE_SPOOL_SCHEMA,
   canonicalBytes,
   compareUtf8Bytewise,
   formatTime,
@@ -174,6 +176,21 @@ test("canonical helpers preserve six-digit UTC timestamps and deterministic keys
   assert.equal(canonicalBytes({ z: 1, a: { y: 2, x: 3 } }).toString(), '{"a":{"x":3,"y":2},"z":1}');
 });
 
+test("archive spool stores each canonical payload in one indexed table", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    database.exec(ARCHIVE_SPOOL_SCHEMA);
+    const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all() as Array<{ name: string }>;
+    assert.deepEqual(tables.map((table) => table.name), ["records"]);
+    const columns = database.prepare("PRAGMA table_info(records)").all() as Array<{ name: string }>;
+    assert.equal(columns.filter((column) => column.name === "canonical").length, 1);
+    assert.equal(columns.some((column) => column.name === "emit"), true);
+    const indexes = database.prepare("SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name='records' ORDER BY name").all() as Array<{ name: string }>;
+    assert.deepEqual(indexes.map((index) => index.name), ["records_by_output", "records_by_session"]);
+    assert.doesNotMatch(ARCHIVE_SPOOL_SCHEMA, /seen_records/);
+  } finally { database.close(); }
+});
+
 test("schema-v2 set digest matches the fixed Go field order and bytewise session order", () => {
   const projection: Session[] = [
     { session_id: "a", requests: 0, last_at: "2026-01-03T03:04:05.000000Z", deleted: true, deleted_at: "2026-01-03T03:04:05.000000Z" },
@@ -311,6 +328,35 @@ test("stable snapshot schema v2 exports tombstones without requesting archive ti
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 
+test("stable snapshot schema v2 output remains byte-identical while the spool keeps one payload copy", async () => {
+  const paths = fixture();
+  try {
+    state.stable = true;
+    state.snapshotSchemaVersion = 2;
+    state.tombstoneFence = "5";
+    const laterRequest = record("request-z", "session-present", "2025-01-02T01:00:02.000000Z", "2025-01-02T01:00:03.000000Z");
+    const earlierRequest = record("request-a", "session-present", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z");
+    state.records.set("session-present", [laterRequest, earlierRequest]);
+    const result = await run(baseArguments(paths));
+    assert.equal(result.code, 0, result.stderr);
+    const summary = {
+      _mtc_delta_type: "session_summary",
+      schema_version: 2,
+      session_id: "session-present",
+      requests: 2,
+      first_at: earlierRequest.started_at,
+      last_at: laterRequest.completed_at,
+      records_sha256: digestRecords([laterRequest, earlierRequest]),
+    };
+    const expected = Buffer.concat([canonicalLine(summary), canonicalLine(earlierRequest), canonicalLine(laterRequest)]);
+    assert.deepEqual(readFileSync(paths.output), expected);
+    const manifest = JSON.parse(readFileSync(`${paths.output}.manifest.json`, "utf8")) as Record<string, unknown>;
+    assert.equal(manifest.output_size_bytes, expected.length);
+    assert.equal(manifest.output_sha256, createHash("sha256").update(expected).digest("hex"));
+    assert.equal(manifest.record_count, 2);
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
 test("stable snapshot schema and tombstone metadata fail closed", async () => {
   state.stable = true;
   state.snapshotSchemaVersion = 2;
@@ -360,6 +406,23 @@ test("redirects are refused and management credentials never cross the boundary"
     state.redirects = true;
     const result = await run(baseArguments(paths));
     assert.equal(result.code, 2); assert.match(result.stderr, /source request returned HTTP 302/); assert.equal(state.leakCalls, 0); assert(!result.stderr.includes(TOKEN));
+  } finally { rmSync(paths.directory, { recursive: true, force: true }); }
+});
+
+test("single-table de-duplication fails closed on a conflicting request identity", async () => {
+  const paths = fixture();
+  try {
+    state.stable = true;
+    state.snapshotSchemaVersion = 2;
+    state.tombstoneFence = "5";
+    state.records.set("session-a", [record("request-shared", "session-a", "2025-01-02T01:00:00.000000Z", "2025-01-02T01:00:01.000000Z")]);
+    state.records.set("session-b", [record("request-shared", "session-b", "2025-01-03T01:00:00.000000Z", "2025-01-03T01:00:01.000000Z")]);
+    const result = await run(baseArguments(paths));
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /conflicting archive records/);
+    assert.equal(existsSync(paths.output), false);
+    assert.equal(existsSync(`${paths.output}.manifest.json`), false);
+    assert.equal(existsSync(paths.checkpoint), false);
   } finally { rmSync(paths.directory, { recursive: true, force: true }); }
 });
 

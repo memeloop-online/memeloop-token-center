@@ -1,0 +1,55 @@
+{
+  "evidence_version": 1,
+  "result": "passed",
+  "release": {
+    "source_sha": "8d3348e79921efd9e9e54a124cca40efbf000f9d",
+    "service_image_digest": "sha256:24e46602754d80dc885959ce83f4d08040081ce93db6c4331c9c24ae93ae7e39"
+  },
+  "trial_provider": {
+    "canary_sha256": "84ff20d28eb09e469884dab491ac41e43d7e0ee95aab2ac4bdde709cb2683942",
+    "provider_id_sha256": "e4d5fe72cb6bd81b9b9f5accc04df451483e920a1aafa86898e2fe615c763a26",
+    "create_http_status": 201,
+    "immediate_status": "disabled",
+    "route_count": 0,
+    "history_count": 0
+  },
+  "live_control_audit": {
+    "upstream_list_rows": 10,
+    "request_list_rows": 100,
+    "request_detail_rows": 1,
+    "response_canary_match_count": 0,
+    "ordinary_client_control_http_status": 401
+  },
+  "chromium_read_only_audit": {
+    "profile_exit_code": 0,
+    "profile_output_sha256": "d740000f44afc8b01ad2fd5a5fb41f0ed59f0a7d58fa8e178dc0320eec37ec62",
+    "non_read_only_request_count": 0,
+    "cross_origin_request_count": 0,
+    "credential_url_match_count": 0,
+    "wrong_origin_credential_header_count": 0,
+    "response_canary_match_count": 0,
+    "dom_canary_match_count": 0,
+    "unexpected_browser_failure_count": 0
+  },
+  "cleanup": {
+    "delete_http_status": 204,
+    "provider_rows_after_delete": 0,
+    "port_forward_status": "stopped",
+    "temporary_pod_count": 0,
+    "temporary_job_count": 0,
+    "temporary_pvc_count": 0,
+    "temporary_secret_count": 0,
+    "cluster_object_count_before": 64,
+    "cluster_object_count_after": 64,
+    "cluster_inventory_sha256_before": "aa6777d6d62e59bccc906c1df68c46d25ae794c7055de4cc75861560f5d3396f",
+    "cluster_inventory_sha256_after": "aa6777d6d62e59bccc906c1df68c46d25ae794c7055de4cc75861560f5d3396f"
+  },
+  "boundaries": {
+    "api3_change_count": 0,
+    "old_cpa_change_count": 0,
+    "ingress_change_count": 0,
+    "route_change_count": 0,
+    "credential_grant_change_count": 0,
+    "ci_run_count": 0
+  }
+}

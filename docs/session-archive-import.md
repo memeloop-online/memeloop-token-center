@@ -99,13 +99,37 @@ without another source request by repeating the same command with `--resume`.
 Do not delete or edit an output, manifest, pending file or checkpoint to force a
 transition; retain it for investigation and retry from the last verified pair.
 
-The host needs private scratch space for the selected whole-session downloads,
-the bounded SQLite de-duplication spool and the final JSONL. The default download
-and output caps are 64 GiB each and can be adjusted explicitly up to 1 TiB. A
-session may contain records older than the overlap because the source ticket is
-whole-session. Legacy mode validates but does not emit them; stable mode emits
-them because the session may have been selected by ingest fence rather than
-provider time.
+The host needs private scratch space for the bounded SQLite de-duplication spool
+and the final JSONL. Downloads are streamed into that spool; there is no separate
+download file. The spool has one `records` table and stores each canonical record
+body exactly once. Its indexes carry request identity, session order and legacy
+output selection without a second payload-bearing `seen_records` table.
+
+Use this peak-space equation for the filesystem that contains `--output`:
+
+```text
+peak = D + K + O + J + E
+stable-schema-v2: O = D + H, therefore peak = 2D + H + K + J + E
+```
+
+`D` is the canonical record-line bytes in the single SQLite spool, `K` is its
+scalar columns and B-tree indexes, `O` is the pending/final JSONL (rename does not
+duplicate it), `J` is the transient SQLite DELETE-mode rollback journal, `H` is
+schema-v2 session-summary bytes, and `E` is the small manifest/checkpoint
+allowance. The previous two-table spool stored the same canonical bytes twice,
+making schema-v2 peak approximately `3D + H + K + J + E`; that estimate is no
+longer valid.
+
+`K` and `J` depend on record count, identifier lengths, page fill and filesystem,
+so do not replace them with a universal percentage. Run the exact exporter
+against the isolated clone, record the filesystem high-water mark, and require
+at least that measured peak plus 20% free space before the retained baseline.
+The default download and output caps are 64 GiB safety ceilings, not a statement
+that a 64 GiB or 100 GiB evidence volume is sufficient. Adjust them explicitly
+up to 1 TiB only after the capacity rehearsal. A session may contain records
+older than the overlap because the source ticket is whole-session. Legacy mode
+validates but does not emit them; stable mode emits them because the session may
+have been selected by ingest fence rather than provider time.
 
 The export host and CPA nodes must be time-synchronized. By default, a source
 session or record more than one hour ahead of the export host is rejected so one

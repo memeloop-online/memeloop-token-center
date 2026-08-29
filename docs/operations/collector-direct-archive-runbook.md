@@ -73,6 +73,16 @@ bounded backoff until `--max-elapsed-seconds` during the offline baseline. HTTP
 never advances the atomic checkpoint until every page, record count and digest
 has been verified.
 
+Before retaining this baseline, rehearse the same command on the isolated clone
+and measure the evidence filesystem high-water mark. The exporter streams source
+bytes and keeps one canonical payload copy in its SQLite spool. With `D` record
+bytes, `H` summary bytes, `K` SQLite scalar/index bytes, `J` the transient
+rollback journal and `E` manifest/checkpoint allowance, stable-schema-v2 peak is
+`2D + H + K + J + E`: one spool payload plus the JSONL, not two spool payloads
+plus the JSONL. `K` and `J` must be measured for the real record-count and
+identifier distribution. Require the measured peak plus 20% free space; the
+64 GiB CLI defaults are rejection ceilings rather than PVC sizing guidance.
+
 ## Online deltas
 
 After the baseline is sealed, point the same migration-only Service at the live

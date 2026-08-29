@@ -78,10 +78,44 @@ settled exactly 0.01 USD and archived one PNG:
 The temporary browser port-forward was stopped. No temporary Pod, Job, PVC or
 cluster configuration remained. API3 and old CPA were untouched.
 
+## Stability sample
+
+A 30-sample observation at ten-second intervals covered the public portal
+health endpoint plus the gateway, control and worker Pod status, restart count,
+exact image ID and memory use. All 30 health requests returned HTTP 200; every
+service Pod remained Ready on the exact digest with zero restarts or digest
+mismatches. Maximum service-Pod memory was 9 MiB. Public-path health latency was
+1,273.910 ms at p95 and 5,489.086 ms maximum; this includes the remote
+workspace-to-ingress network path and did not coincide with a readiness failure.
+The machine-readable receipt is
+`docs/evidence/api2-8d3348e-stability-summary.json`.
+
+## Disabled-provider secret canary
+
+A dedicated trial-only provider was created with a fresh high-entropy sentinel
+credential and immediately disabled before browser inspection. The provider had
+no routes or request history. The existing guarded Chromium profile audited the
+provider list, 100 request summaries, one request detail and the rendered DOM;
+the sentinel appeared zero times. Chromium issued no non-read-only or
+cross-origin request. The ordinary dogfood client credential received HTTP 401
+from the control upstream-list endpoint.
+
+The disabled provider was deleted with its latest `expected_updated_at`. A
+post-delete list returned zero matching rows. The port-forward was stopped, no
+Kubernetes object was created, and the Pod/Job/PVC name-plus-UID inventory had
+the same 64-object SHA-256 before and after. The secret-safe machine receipt is
+[`../evidence/api2-8d3348e-disabled-provider-canary.json`](../evidence/api2-8d3348e-disabled-provider-canary.json).
+
+One preliminary preflight failed closed on an HTTP 400 before the successful
+recorded run. Its cleanup handler completed and created no retained evidence or
+cluster object. Because that diagnostic did not yet retain the failing path,
+the response cannot be attributed more precisely and is not counted as a
+passed canary; the complete rerun above is the recorded gate.
+
 ## Remaining boundary
 
 This closes exact-release API2 browser and Codex CLI text/image acceptance. It
 does not close owner-reviewed legacy route/policy apply, Copilot/Cursor OAuth,
 complete session-archive migration, final CPAMP delta, subscription authority,
-paired PostgreSQL/MinIO recovery, disabled-provider canary or production route
-rollback. API3 still requires the user's explicit production-window approval.
+paired PostgreSQL/MinIO recovery or production route rollback. API3 still
+requires the user's explicit production-window approval.
