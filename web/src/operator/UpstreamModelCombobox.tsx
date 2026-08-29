@@ -64,6 +64,12 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   useEffect(() => {
     setCustomConfirmed(customModelConfirmed);
     setPartialConfirmed(false);
+    // A catalog is scoped to the exact candidate set, protocol and query.
+    // Keeping the previous result visible during the debounce can make a model
+    // look selected for the newly chosen upstream and suppress the explicit
+    // custom-model confirmation until the next request settles. Clear it
+    // synchronously so neither validity nor UI can borrow stale coverage.
+    setCatalog(undefined);
     if (!token || !tenant || !hasCandidates) { setCatalog(undefined); setError(''); setLoading(false); return; }
     const controller = new AbortController();
     const timeout = window.setTimeout(async () => {
