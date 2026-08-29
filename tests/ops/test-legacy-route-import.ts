@@ -9,15 +9,21 @@ import { RouteImportFailure, completeSinglePage, createPlan, execute, parseLiveR
 const account = "018f1111-1111-7111-8111-111111111111";
 const routeId = "018f2222-2222-7222-8222-222222222222";
 const stable = "a".repeat(64);
+const poolAccounts = [account, "018f1111-1111-7111-8111-111111111112", "018f1111-1111-7111-8111-111111111113", "018f1111-1111-7111-8111-111111111114"];
+const poolStables = [stable, "b".repeat(64), "c".repeat(64), "d".repeat(64)];
 const source = { provider: "codex-csil", model: "gpt-5.6-sol", group: null, upstream_prefix: "codex-csil", protocol: "openai" };
 const json = (value: unknown): Buffer => Buffer.from(JSON.stringify(value));
 const sourceDocument = (mappings: unknown[] = [source], reauthorization_required: unknown[] = [], anomalies: unknown[] = []): Buffer => json({ version: 1, mappings, reauthorization_required, anomalies });
 const upstreamDocument = (): Buffer => json({ version: 1, tenant_external_id: "legacy", upstreams: [{ upstream_account_id: account, source_stable_id: stable, driver: "codex", status: "active", updated_at: 11 }] });
+const poolBindings = (): Record<string, unknown>[] => poolAccounts.map((upstream_account_id, index) => ({ upstream_account_id, source_stable_id: poolStables[index] }));
+const upstreamV2Document = (overrides: Record<string, unknown> = {}): Buffer => json({ version: 2, tenant_external_id: "legacy", upstreams: poolAccounts.map((upstream_account_id, index) => ({ upstream_account_id, source_stable_id: poolStables[index], source_provider: source.provider, driver: "http-json", status: "active", updated_at: 11 + index })), provider_candidate_sets: [{ source, upstream_model: source.model, protocol: source.protocol, selection: "equal_round_robin", candidates: poolBindings() }], ...overrides });
 const manifestDocument = (sourceRaw: Buffer, upstreamRaw: Buffer, routes: unknown[]): Buffer => {
   const sha = (value: Buffer): string => createHash("sha256").update(value).digest("hex");
   return json({ version: 1, tenant_external_id: "legacy", target_api_base_url: "https://control.invalid/", source_inventory_sha256: sha(sourceRaw), upstream_inventory_sha256: sha(upstreamRaw), routes });
 };
+const manifestV2Document = (sourceRaw: Buffer, upstreamRaw: Buffer, routes: unknown[], anomaly_quarantine: unknown = null): Buffer => json({ version: 2, tenant_external_id: "legacy", target_api_base_url: "https://control.invalid/", source_inventory_sha256: hash(sourceRaw), upstream_inventory_sha256: hash(upstreamRaw), anomaly_quarantine, routes });
 const routeSpec = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({ source, target: { upstream_account_id: account, source_stable_id: stable, public_model: "gpt-5.6-sol-csil", upstream_model: "gpt-5.6-sol", protocol: "openai", priority: 10 }, expected_existing: { action: "create", route_id: null, updated_at: null, grant_revision: null, history_and_references_reviewed: false, history_and_references_evidence_sha256: null }, ...overrides });
+const poolRouteSpec = (candidates: unknown[] = poolBindings(), overrides: Record<string, unknown> = {}): Record<string, unknown> => ({ source, target: { upstream_candidates: candidates, public_model: "gpt-5.6-sol-csil", upstream_model: "gpt-5.6-sol", protocol: "openai", priority: 10 }, expected_existing: { action: "create", route_id: null, updated_at: null, grant_revision: null, history_and_references_reviewed: false, history_and_references_evidence_sha256: null }, ...overrides });
 const live = (overrides: Partial<LiveRoute> = {}): LiveRoute => ({ id: routeId, publicModel: "gpt-5.6-sol-csil", upstreamModel: "gpt-5.6-sol", protocol: "openai", priority: 10, enabled: true, accountIds: [account], candidateAccountIds: [account], includedProviderGroupIds: [], excludedProviderGroupIds: [], routeGroupIds: [], grantedCredentialIds: [], customModelConfirmed: true, updatedAt: 22, grantRevision: 0, ...overrides });
 const accountInventory = [{ id: account, driver: "codex", status: "active", updatedAt: 11 }];
 
@@ -27,8 +33,8 @@ class MemoryTarget implements RouteTarget {
   constructor(routes: LiveRoute[] = []) { this.routes = routes; }
   async listRoutes(): Promise<LiveRoute[]> { return this.routes; }
   async listAccounts(): Promise<typeof accountInventory> { return accountInventory; }
-  async create(_tenant: string, spec: RouteSpec): Promise<LiveRoute> { this.writes.push("create"); const result = live({ id: "018f3333-3333-7333-8333-333333333333", publicModel: spec.publicModel, upstreamModel: spec.upstreamModel, protocol: spec.protocol, priority: spec.priority, accountIds: [spec.accountId], candidateAccountIds: [spec.accountId] }); this.routes.push(result); return result; }
-  async update(_tenant: string, spec: RouteSpec): Promise<LiveRoute> { this.writes.push("update"); return live({ publicModel: spec.publicModel, upstreamModel: spec.upstreamModel, protocol: spec.protocol, priority: spec.priority, accountIds: [spec.accountId], candidateAccountIds: [spec.accountId] }); }
+  async create(_tenant: string, spec: RouteSpec): Promise<LiveRoute> { this.writes.push("create"); const accountIds = spec.candidates.map((item) => item.accountId); const result = live({ id: "018f3333-3333-7333-8333-333333333333", publicModel: spec.publicModel, upstreamModel: spec.upstreamModel, protocol: spec.protocol, priority: spec.priority, accountIds, candidateAccountIds: accountIds }); this.routes.push(result); return result; }
+  async update(_tenant: string, spec: RouteSpec): Promise<LiveRoute> { this.writes.push("update"); const accountIds = spec.candidates.map((item) => item.accountId); return live({ publicModel: spec.publicModel, upstreamModel: spec.upstreamModel, protocol: spec.protocol, priority: spec.priority, accountIds, candidateAccountIds: accountIds }); }
 }
 
 function plan(routes: LiveRoute[], sourceRaw = sourceDocument(), manifestRoutes: unknown[] = [routeSpec()]) {
@@ -83,6 +89,48 @@ test("provider expansion, route-group grants, and stale upstream inventory fail 
   assert.equal(plan([live({ routeGroupIds: ["018f5555-5555-7555-8555-555555555555"] })]).counts.conflict_count, 1);
   const sourceRaw = sourceDocument(), upstreamRaw = upstreamDocument(), manifestRaw = manifestDocument(sourceRaw, upstreamRaw, [routeSpec()]);
   assert.throws(() => createPlan(sourceRaw, upstreamRaw, manifestRaw, [], [{ ...accountInventory[0]!, updatedAt: 12 }]), /stale or conflicting/u);
+});
+
+test("v2 provider pool creates and replays the complete native equal-weight four-account set", async () => {
+  const sourceRaw = sourceDocument(), upstreamRaw = upstreamV2Document(), manifestRaw = manifestV2Document(sourceRaw, upstreamRaw, [poolRouteSpec()]);
+  const liveAccounts = poolAccounts.map((id, index) => ({ id, driver: "http-json", status: "active", updatedAt: 11 + index }));
+  const selected = createPlan(sourceRaw, upstreamRaw, manifestRaw, [], liveAccounts);
+  assert.equal(selected.counts.create_count, 1); assert.equal(selected.items[0]!.spec.candidates.length, 4);
+  const reorderedManifest = manifestV2Document(sourceRaw, upstreamRaw, [poolRouteSpec([...poolBindings()].reverse())]);
+  const reordered = createPlan(sourceRaw, upstreamRaw, reorderedManifest, [], liveAccounts); assert.notEqual(reordered.manifestDigest, selected.manifestDigest); assert.equal(reordered.planDigest, selected.planDigest); assert.deepEqual(reordered.items[0]!.spec.candidates, selected.items[0]!.spec.candidates);
+  const target = new MemoryTarget(), checkpoint = join(mkdtempSync(join(tmpdir(), "mtc-route-pool-")), "checkpoint.json");
+  const applied = await execute(selected, "legacy", target, true, checkpoint); assert.equal(applied.written_count, 1); assert.deepEqual(target.routes[0]!.accountIds, [...poolAccounts].sort());
+  const replay = createPlan(sourceRaw, upstreamRaw, manifestRaw, target.routes, liveAccounts); assert.equal(replay.counts.replay_count, 1); assert.equal((await execute(replay, "legacy", target, true, checkpoint)).written_count, 0);
+});
+
+test("v2 provider pool rejects subsets, supersets, duplicates, cross-provider bindings, and target drift", () => {
+  const sourceRaw = sourceDocument(), upstreamRaw = upstreamV2Document(), liveAccounts = poolAccounts.map((id, index) => ({ id, driver: "http-json", status: "active", updatedAt: 11 + index }));
+  const create = (routes: unknown[], upstream = upstreamRaw, accounts = liveAccounts) => createPlan(sourceRaw, upstream, manifestV2Document(sourceRaw, upstream, routes), [], accounts);
+  assert.throws(() => create([poolRouteSpec(poolBindings().slice(0, 3))]), /complete provider pool/u);
+  const extra = { upstream_account_id: "018f1111-1111-7111-8111-111111111115", source_stable_id: "e".repeat(64) };
+  assert.throws(() => create([poolRouteSpec([...poolBindings(), extra])]), /complete provider pool/u);
+  assert.throws(() => create([poolRouteSpec([poolBindings()[0]!, poolBindings()[0]!])]), /duplicate bindings/u);
+  const cross = JSON.parse(upstreamV2Document().toString()); cross.upstreams[3].source_provider = "other-provider";
+  assert.throws(() => parseUpstreamInventory(json(cross)), /crosses or lacks/u);
+  const mixedDriver = JSON.parse(upstreamV2Document().toString()); mixedDriver.upstreams[3].driver = "other-driver";
+  assert.throws(() => parseUpstreamInventory(json(mixedDriver)), /crosses provider drivers/u);
+  assert.throws(() => create([poolRouteSpec(undefined, { target: { upstream_candidates: poolBindings(), public_model: "gpt-5.6-sol-csil", upstream_model: "different-model", protocol: "openai", priority: 10 } })]), /complete provider pool/u);
+  assert.throws(() => create([poolRouteSpec()], upstreamRaw, liveAccounts.map((item, index) => index === 3 ? { ...item, status: "disabled" } : item)), /stale or conflicting/u);
+});
+
+test("v2 anomaly quarantine is exact, digest-bound, count-visible, and does not remove the anomaly", async () => {
+  const anomalies = [{ provider: "codex", model: "classify:csil", reason: "legacy field-shape anomaly; do not infer group/model" }];
+  const sourceRaw = sourceDocument([source], [], anomalies), parsed = parseSourceInventory(sourceRaw), upstreamRaw = upstreamV2Document();
+  const quarantine = { source_anomalies_sha256: parsed.anomalyDigest, anomaly_count: 1, disposition: "quarantine_unmapped", owner_review_evidence_sha256: "f".repeat(64) };
+  const manifest = manifestV2Document(sourceRaw, upstreamRaw, [poolRouteSpec()], quarantine), liveAccounts = poolAccounts.map((id, index) => ({ id, driver: "http-json", status: "active", updatedAt: 11 + index }));
+  const selected = createPlan(sourceRaw, upstreamRaw, manifest, [], liveAccounts); assert.equal(selected.counts.anomaly_count, 1); assert.equal(selected.counts.quarantined_anomaly_count, 1);
+  const dry = await execute(selected, "legacy", new MemoryTarget(), false); assert.equal(dry.anomaly_count, 1); assert.equal(dry.quarantined_anomaly_count, 1);
+  const target = new MemoryTarget(), checkpoint = join(mkdtempSync(join(tmpdir(), "mtc-route-quarantine-")), "checkpoint.json");
+  assert.equal((await execute(selected, "legacy", target, true, checkpoint)).written_count, 1);
+  const replay = createPlan(sourceRaw, upstreamRaw, manifest, target.routes, liveAccounts); assert.equal(replay.counts.quarantined_anomaly_count, 1); assert.equal((await execute(replay, "legacy", target, true, checkpoint)).written_count, 0);
+  for (const bad of [{ ...quarantine, source_anomalies_sha256: "0".repeat(64) }, { ...quarantine, anomaly_count: 2 }, { ...quarantine, disposition: "ignore" }]) assert.throws(() => createPlan(sourceRaw, upstreamRaw, manifestV2Document(sourceRaw, upstreamRaw, [poolRouteSpec()], bad), [], liveAccounts), /quarantine/u);
+  const changedSource = sourceDocument([source], [], [...anomalies, { provider: "new", model: "new", reason: "new anomaly" }]);
+  assert.throws(() => createPlan(changedSource, upstreamRaw, manifestV2Document(changedSource, upstreamRaw, [poolRouteSpec()], quarantine), [], liveAccounts), /quarantine/u);
 });
 
 test("update never clears existing grants or provider groups", () => {

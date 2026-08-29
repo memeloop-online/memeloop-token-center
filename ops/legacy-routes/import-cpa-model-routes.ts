@@ -11,10 +11,14 @@ type Obj = Record<string, unknown>;
 type Protocol = "openai" | "anthropic";
 type LiveProtocol = Protocol | "generation";
 type SourcePattern = Readonly<{ provider: string; model: string; group: string | null; upstreamPrefix: string | null; protocol: Protocol }>;
-type SourceInventory = Readonly<{ mappings: readonly SourcePattern[]; reauthorizationRequired: number; anomalies: number }>;
-type Upstream = Readonly<{ accountId: string; sourceStableId: string; driver: string; status: "active"; updatedAt: number }>;
+type SourceAnomaly = Readonly<{ provider: string; model: string; reason: string }>;
+type SourceInventory = Readonly<{ mappings: readonly SourcePattern[]; reauthorizationRequired: number; anomalies: readonly SourceAnomaly[]; anomalyDigest: string }>;
+type Upstream = Readonly<{ accountId: string; sourceStableId: string; sourceProvider: string | null; driver: string; status: "active"; updatedAt: number }>;
+type CandidateBinding = Readonly<{ accountId: string; sourceStableId: string }>;
+type ProviderCandidateSet = Readonly<{ source: SourcePattern; upstreamModel: string; protocol: Protocol; selection: "equal_round_robin"; candidates: readonly CandidateBinding[] }>;
+type UpstreamInventory = Readonly<{ version: 1 | 2; tenant: string; upstreams: readonly Upstream[]; candidateSets: readonly ProviderCandidateSet[] }>;
 type ExistingExpectation = Readonly<{ action: "create" | "update"; routeId: string | null; updatedAt: number | null; grantRevision: number | null; historyAndReferencesReviewed: boolean; historyAndReferencesEvidenceDigest: string | null }>;
-export type RouteSpec = Readonly<{ source: SourcePattern; accountId: string; sourceStableId: string; publicModel: string; upstreamModel: string; protocol: Protocol; priority: number; existing: ExistingExpectation }>;
+export type RouteSpec = Readonly<{ source: SourcePattern; accountId: string; sourceStableId: string; candidates: readonly CandidateBinding[]; publicModel: string; upstreamModel: string; protocol: Protocol; priority: number; existing: ExistingExpectation }>;
 export type LiveRoute = Readonly<{ id: string; publicModel: string; upstreamModel: string; protocol: LiveProtocol; priority: number; enabled: boolean; accountIds: readonly string[]; candidateAccountIds: readonly string[]; includedProviderGroupIds: readonly string[]; excludedProviderGroupIds: readonly string[]; routeGroupIds: readonly string[]; grantedCredentialIds: readonly string[]; customModelConfirmed: boolean; updatedAt: number; grantRevision: number }>;
 type PlanItem = Readonly<{ spec: RouteSpec; outcome: "create" | "replay" | "update" | "conflict"; live?: LiveRoute }>;
 export type RoutePlan = Readonly<{ items: readonly PlanItem[]; sourceDigest: string; upstreamDigest: string; manifestDigest: string; planDigest: string; targetBaseUrl: string; counts: Readonly<Record<string, number>> }>;
@@ -30,6 +34,7 @@ export class RouteImportFailure extends Error {
 }
 const digest = (value: Uint8Array | string): string => createHash("sha256").update(value).digest("hex");
 const encode = (value: unknown): string => JSON.stringify(value);
+const asciiCompare = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 function record(value: unknown, keys: readonly string[], label: string): Obj {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new RouteImportFailure(`${label} has an invalid schema`);
   const actual = Object.keys(value as Obj).sort(), expected = [...keys].sort();
@@ -50,6 +55,12 @@ function stringArray(value: unknown, label: string): string[] {
   const output = value.map((item) => text(item, label, UUID)).sort();
   if (new Set(output).size !== output.length) throw new RouteImportFailure(`${label} contains duplicates`);
   return output;
+}
+function candidateBindings(value: unknown, label: string): CandidateBinding[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 100) throw new RouteImportFailure(`${label} has an invalid schema`);
+  const candidates = value.map((entry) => { const item = record(entry, ["upstream_account_id", "source_stable_id"], label); return { accountId: text(item.upstream_account_id, label, UUID), sourceStableId: text(item.source_stable_id, label, SHA) }; }).sort((left, right) => asciiCompare(left.accountId, right.accountId));
+  if (new Set(candidates.map((item) => item.accountId)).size !== candidates.length || new Set(candidates.map((item) => item.sourceStableId)).size !== candidates.length) throw new RouteImportFailure(`${label} contains duplicate bindings`);
+  return candidates;
 }
 function same(left: readonly unknown[], right: readonly unknown[]): boolean { return left.length === right.length && left.every((item, index) => item === right[index]); }
 function sourcePattern(value: unknown, label: string): SourcePattern {
@@ -76,32 +87,63 @@ export function parseSourceInventory(raw: Buffer): SourceInventory {
   if (root.version !== 1 || !Array.isArray(root.mappings) || !Array.isArray(root.reauthorization_required) || !Array.isArray(root.anomalies) || root.mappings.length > 1000) throw new RouteImportFailure("source inventory has an invalid schema");
   const mappings = root.mappings.map((item) => sourcePattern(item, "source mapping"));
   if (new Set(mappings.map(sourceKey)).size !== mappings.length) throw new RouteImportFailure("source inventory contains duplicate mappings");
+  const anomalies: SourceAnomaly[] = [];
   for (const [field, values] of [["reauthorization", root.reauthorization_required], ["anomaly", root.anomalies]] as const) {
     for (const value of values) {
       const item = record(value, ["provider", "model", "reason"], `source ${field}`);
-      text(item.provider, `source ${field}`); text(item.model, `source ${field}`); text(item.reason, `source ${field}`);
+      const normalized = { provider: text(item.provider, `source ${field}`), model: text(item.model, `source ${field}`), reason: text(item.reason, `source ${field}`) };
+      if (field === "anomaly") anomalies.push(normalized);
     }
   }
-  return { mappings, reauthorizationRequired: root.reauthorization_required.length, anomalies: root.anomalies.length };
+  if (new Set(anomalies.map((item) => encode([item.provider, item.model, item.reason]))).size !== anomalies.length) throw new RouteImportFailure("source inventory contains duplicate anomalies");
+  return { mappings, reauthorizationRequired: root.reauthorization_required.length, anomalies, anomalyDigest: digest(encode(anomalies.map((item) => [item.provider, item.model, item.reason]))) };
 }
 
-export function parseUpstreamInventory(raw: Buffer): { tenant: string; upstreams: Upstream[] } {
-  const root = record(strictJson(raw, "upstream inventory"), ["version", "tenant_external_id", "upstreams"], "upstream inventory");
-  if (root.version !== 1 || !Array.isArray(root.upstreams) || root.upstreams.length > 1000) throw new RouteImportFailure("upstream inventory has an invalid schema");
+export function parseUpstreamInventory(raw: Buffer): UpstreamInventory {
+  const parsed = strictJson(raw, "upstream inventory");
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new RouteImportFailure("upstream inventory has an invalid schema");
+  const version = (parsed as Obj).version;
+  const root = record(parsed, version === 1 ? ["version", "tenant_external_id", "upstreams"] : ["version", "tenant_external_id", "upstreams", "provider_candidate_sets"], "upstream inventory");
+  if ((version !== 1 && version !== 2) || !Array.isArray(root.upstreams) || root.upstreams.length > 1000 || (version === 2 && (!Array.isArray(root.provider_candidate_sets) || root.provider_candidate_sets.length > 1000))) throw new RouteImportFailure("upstream inventory has an invalid schema");
   const tenant = text(root.tenant_external_id, "upstream inventory tenant");
-  const upstreams = root.upstreams.map((value) => { const item = record(value, ["upstream_account_id", "source_stable_id", "driver", "status", "updated_at"], "upstream inventory item"); if (item.status !== "active") throw new RouteImportFailure("upstream inventory selects an inactive account"); return { accountId: text(item.upstream_account_id, "upstream inventory item", UUID), sourceStableId: text(item.source_stable_id, "upstream inventory item", SHA), driver: text(item.driver, "upstream inventory item"), status: "active" as const, updatedAt: integer(item.updated_at, "upstream inventory item") }; });
+  const upstreams = root.upstreams.map((value) => { const item = record(value, version === 1 ? ["upstream_account_id", "source_stable_id", "driver", "status", "updated_at"] : ["upstream_account_id", "source_stable_id", "source_provider", "driver", "status", "updated_at"], "upstream inventory item"); if (item.status !== "active") throw new RouteImportFailure("upstream inventory selects an inactive account"); return { accountId: text(item.upstream_account_id, "upstream inventory item", UUID), sourceStableId: text(item.source_stable_id, "upstream inventory item", SHA), sourceProvider: version === 1 ? null : text(item.source_provider, "upstream inventory item"), driver: text(item.driver, "upstream inventory item"), status: "active" as const, updatedAt: integer(item.updated_at, "upstream inventory item") }; });
   if (new Set(upstreams.map((item) => item.accountId)).size !== upstreams.length || new Set(upstreams.map((item) => item.sourceStableId)).size !== upstreams.length) throw new RouteImportFailure("upstream inventory contains duplicate source bindings");
-  return { tenant, upstreams };
+  const candidateSets = version === 1 ? [] : (root.provider_candidate_sets as unknown[]).map((value) => {
+    const item = record(value, ["source", "upstream_model", "protocol", "selection", "candidates"], "provider candidate set");
+    const source = sourcePattern(item.source, "provider candidate set source"), targetProtocol = protocol(item.protocol, "provider candidate set");
+    if (targetProtocol !== source.protocol || item.selection !== "equal_round_robin") throw new RouteImportFailure("provider candidate set has an invalid protocol or selection");
+    return { source, upstreamModel: text(item.upstream_model, "provider candidate set"), protocol: targetProtocol, selection: "equal_round_robin" as const, candidates: candidateBindings(item.candidates, "provider candidate set candidates") };
+  });
+  if (new Set(candidateSets.map((item) => sourceKey(item.source))).size !== candidateSets.length) throw new RouteImportFailure("upstream inventory contains duplicate provider candidate sets");
+  const indexed = new Map(upstreams.map((item) => [item.accountId, item]));
+  for (const pool of candidateSets) {
+    const drivers = new Set<string>();
+    for (const candidate of pool.candidates) { const upstream = indexed.get(candidate.accountId); if (!upstream || upstream.sourceStableId !== candidate.sourceStableId || upstream.sourceProvider !== pool.source.provider) throw new RouteImportFailure("provider candidate set crosses or lacks an exact provider binding"); drivers.add(upstream.driver); }
+    if (drivers.size !== 1) throw new RouteImportFailure("provider candidate set crosses provider drivers");
+  }
+  return { version, tenant, upstreams, candidateSets };
 }
 
-export function parseManifest(raw: Buffer, sourceDigest: string, upstreamDigest: string): { tenant: string; targetBaseUrl: string; specs: RouteSpec[] } {
-  const root = record(strictJson(raw, "reviewed manifest"), ["version", "tenant_external_id", "target_api_base_url", "source_inventory_sha256", "upstream_inventory_sha256", "routes"], "reviewed manifest");
-  if (root.version !== 1 || text(root.source_inventory_sha256, "reviewed manifest", SHA) !== sourceDigest || text(root.upstream_inventory_sha256, "reviewed manifest", SHA) !== upstreamDigest || !Array.isArray(root.routes) || root.routes.length > 1000) throw new RouteImportFailure("reviewed manifest does not match the selected inventories");
+export function parseManifest(raw: Buffer, sourceDigest: string, upstreamDigest: string, sourceInventory?: SourceInventory): { tenant: string; targetBaseUrl: string; specs: RouteSpec[]; quarantinedAnomalies: number } {
+  const parsed = strictJson(raw, "reviewed manifest"); if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new RouteImportFailure("reviewed manifest has an invalid schema");
+  const version = (parsed as Obj).version;
+  const root = record(parsed, version === 1 ? ["version", "tenant_external_id", "target_api_base_url", "source_inventory_sha256", "upstream_inventory_sha256", "routes"] : ["version", "tenant_external_id", "target_api_base_url", "source_inventory_sha256", "upstream_inventory_sha256", "anomaly_quarantine", "routes"], "reviewed manifest");
+  if ((version !== 1 && version !== 2) || text(root.source_inventory_sha256, "reviewed manifest", SHA) !== sourceDigest || text(root.upstream_inventory_sha256, "reviewed manifest", SHA) !== upstreamDigest || !Array.isArray(root.routes) || root.routes.length > 1000) throw new RouteImportFailure("reviewed manifest does not match the selected inventories");
   const tenant = text(root.tenant_external_id, "reviewed manifest tenant");
   const targetBaseUrl = text(root.target_api_base_url, "reviewed target API base URL");
+  let quarantinedAnomalies = 0;
+  if (version === 2) {
+    if (!sourceInventory) throw new RouteImportFailure("reviewed manifest anomaly binding cannot be verified");
+    if (sourceInventory.anomalies.length === 0) { if (root.anomaly_quarantine !== null) throw new RouteImportFailure("reviewed manifest anomaly quarantine is unexpected"); }
+    else {
+      const quarantine = record(root.anomaly_quarantine, ["source_anomalies_sha256", "anomaly_count", "disposition", "owner_review_evidence_sha256"], "reviewed anomaly quarantine");
+      if (text(quarantine.source_anomalies_sha256, "reviewed anomaly quarantine", SHA) !== sourceInventory.anomalyDigest || integer(quarantine.anomaly_count, "reviewed anomaly quarantine", 1, 1000) !== sourceInventory.anomalies.length || quarantine.disposition !== "quarantine_unmapped") throw new RouteImportFailure("reviewed anomaly quarantine does not exactly match the source anomalies");
+      text(quarantine.owner_review_evidence_sha256, "reviewed anomaly quarantine", SHA); quarantinedAnomalies = sourceInventory.anomalies.length;
+    }
+  }
   const specs = root.routes.map((value) => {
     const item = record(value, ["source", "target", "expected_existing"], "reviewed route");
-    const target = record(item.target, ["upstream_account_id", "source_stable_id", "public_model", "upstream_model", "protocol", "priority"], "reviewed target");
+    const target = record(item.target, version === 1 ? ["upstream_account_id", "source_stable_id", "public_model", "upstream_model", "protocol", "priority"] : ["upstream_candidates", "public_model", "upstream_model", "protocol", "priority"], "reviewed target");
     const expected = record(item.expected_existing, ["action", "route_id", "updated_at", "grant_revision", "history_and_references_reviewed", "history_and_references_evidence_sha256"], "reviewed existing route");
     if (expected.action !== "create" && expected.action !== "update") throw new RouteImportFailure("reviewed existing route has an invalid schema");
     if (typeof expected.history_and_references_reviewed !== "boolean") throw new RouteImportFailure("reviewed existing route has an invalid schema");
@@ -111,28 +153,39 @@ export function parseManifest(raw: Buffer, sourceDigest: string, upstreamDigest:
     const evidenceDigest = expected.history_and_references_evidence_sha256 === null ? null : text(expected.history_and_references_evidence_sha256, "reviewed existing route", SHA);
     if (expected.action === "create" ? routeId !== null || updatedAt !== null || grantRevision !== null || expected.history_and_references_reviewed || evidenceDigest !== null : routeId === null || updatedAt === null || grantRevision === null || !expected.history_and_references_reviewed || evidenceDigest === null) throw new RouteImportFailure("reviewed existing route action is incomplete");
     const action: "create" | "update" = expected.action;
-    const targetProtocol = protocol(target.protocol, "reviewed target"); if (targetProtocol !== sourcePattern(item.source, "reviewed source").protocol) throw new RouteImportFailure("reviewed target protocol differs from its exact source mapping");
-    return { source: sourcePattern(item.source, "reviewed source"), accountId: text(target.upstream_account_id, "reviewed target", UUID), sourceStableId: text(target.source_stable_id, "reviewed target", SHA), publicModel: text(target.public_model, "reviewed target"), upstreamModel: text(target.upstream_model, "reviewed target"), protocol: targetProtocol, priority: integer(target.priority, "reviewed target", -1_000_000, 1_000_000), existing: { action, routeId, updatedAt, grantRevision, historyAndReferencesReviewed: expected.history_and_references_reviewed, historyAndReferencesEvidenceDigest: evidenceDigest } };
+    const reviewedSource = sourcePattern(item.source, "reviewed source"), targetProtocol = protocol(target.protocol, "reviewed target"); if (targetProtocol !== reviewedSource.protocol) throw new RouteImportFailure("reviewed target protocol differs from its exact source mapping");
+    const candidates = version === 1 ? [{ accountId: text(target.upstream_account_id, "reviewed target", UUID), sourceStableId: text(target.source_stable_id, "reviewed target", SHA) }] : candidateBindings(target.upstream_candidates, "reviewed target candidates");
+    return { source: reviewedSource, accountId: candidates[0]!.accountId, sourceStableId: candidates[0]!.sourceStableId, candidates, publicModel: text(target.public_model, "reviewed target"), upstreamModel: text(target.upstream_model, "reviewed target"), protocol: targetProtocol, priority: integer(target.priority, "reviewed target", -1_000_000, 1_000_000), existing: { action, routeId, updatedAt, grantRevision, historyAndReferencesReviewed: expected.history_and_references_reviewed, historyAndReferencesEvidenceDigest: evidenceDigest } };
   });
   if (new Set(specs.map((item) => sourceKey(item.source))).size !== specs.length) throw new RouteImportFailure("reviewed manifest maps a source more than once");
   if (new Set(specs.map((item) => encode([item.publicModel, item.protocol, item.priority]))).size !== specs.length) throw new RouteImportFailure("reviewed manifest merges provider-specific routes");
-  return { tenant, targetBaseUrl, specs };
+  return { tenant, targetBaseUrl, specs, quarantinedAnomalies };
 }
 
 function routeMatches(route: LiveRoute, spec: RouteSpec): boolean {
-  return route.enabled && route.publicModel === spec.publicModel && route.upstreamModel === spec.upstreamModel && route.protocol === spec.protocol && route.priority === spec.priority && same(route.accountIds, [spec.accountId]) && same(route.candidateAccountIds, [spec.accountId]) && route.includedProviderGroupIds.length === 0 && route.excludedProviderGroupIds.length === 0 && route.routeGroupIds.length === 0 && route.grantedCredentialIds.length === 0 && route.customModelConfirmed;
+  const accountIds = spec.candidates.map((item) => item.accountId);
+  return route.enabled && route.publicModel === spec.publicModel && route.upstreamModel === spec.upstreamModel && route.protocol === spec.protocol && route.priority === spec.priority && same(route.accountIds, accountIds) && same(route.candidateAccountIds, accountIds) && route.includedProviderGroupIds.length === 0 && route.excludedProviderGroupIds.length === 0 && route.routeGroupIds.length === 0 && route.grantedCredentialIds.length === 0 && route.customModelConfirmed;
 }
-function summary(source: SourceInventory, items: readonly PlanItem[]): Record<string, number> {
-  return { source_mapping_count: source.mappings.length, matched_mapping_count: items.length, unmatched_mapping_count: source.mappings.length - items.length, create_count: items.filter((item) => item.outcome === "create").length, replay_count: items.filter((item) => item.outcome === "replay").length, update_count: items.filter((item) => item.outcome === "update").length, conflict_count: items.filter((item) => item.outcome === "conflict").length, reauthorization_required_count: source.reauthorizationRequired, anomaly_count: source.anomalies };
+function summary(source: SourceInventory, items: readonly PlanItem[], quarantinedAnomalies: number): Record<string, number> {
+  return { source_mapping_count: source.mappings.length, matched_mapping_count: items.length, unmatched_mapping_count: source.mappings.length - items.length, create_count: items.filter((item) => item.outcome === "create").length, replay_count: items.filter((item) => item.outcome === "replay").length, update_count: items.filter((item) => item.outcome === "update").length, conflict_count: items.filter((item) => item.outcome === "conflict").length, reauthorization_required_count: source.reauthorizationRequired, anomaly_count: source.anomalies.length, quarantined_anomaly_count: quarantinedAnomalies };
 }
 
 export function createPlan(sourceRaw: Buffer, upstreamRaw: Buffer, manifestRaw: Buffer, liveRoutes: readonly LiveRoute[], liveAccounts: readonly { id: string; driver: string; status: string; updatedAt: number }[]): RoutePlan {
   const sourceDigest = digest(sourceRaw), upstreamDigest = digest(upstreamRaw), manifestDigest = digest(manifestRaw);
-  const source = parseSourceInventory(sourceRaw), inventory = parseUpstreamInventory(upstreamRaw), manifest = parseManifest(manifestRaw, sourceDigest, upstreamDigest);
+  const source = parseSourceInventory(sourceRaw), inventory = parseUpstreamInventory(upstreamRaw), manifest = parseManifest(manifestRaw, sourceDigest, upstreamDigest, source);
   if (inventory.tenant !== manifest.tenant) throw new RouteImportFailure("inventory tenant and reviewed tenant differ");
   const upstreams = new Map(inventory.upstreams.map((item) => [item.accountId, item]));
   const accounts = new Map(liveAccounts.map((item) => [item.id, item]));
-  for (const spec of manifest.specs) { const upstream = upstreams.get(spec.accountId), account = accounts.get(spec.accountId); if (!upstream || upstream.sourceStableId !== spec.sourceStableId || !account || account.driver !== upstream.driver || account.status !== upstream.status || account.updatedAt !== upstream.updatedAt) throw new RouteImportFailure("reviewed target upstream binding is stale or conflicting"); }
+  if (accounts.size !== liveAccounts.length) throw new RouteImportFailure("target upstream inventory contains duplicate accounts");
+  if (inventory.version === 2) {
+    const sourceKeys = source.mappings.map(sourceKey).sort(), poolKeys = inventory.candidateSets.map((item) => sourceKey(item.source)).sort();
+    if (!same(sourceKeys, poolKeys)) throw new RouteImportFailure("provider candidate sets are not complete for the source mappings");
+  }
+  const candidateSets = new Map(inventory.candidateSets.map((item) => [sourceKey(item.source), item]));
+  for (const spec of manifest.specs) {
+    if (inventory.version === 2) { const pool = candidateSets.get(sourceKey(spec.source)); if (!pool || pool.protocol !== spec.protocol || pool.upstreamModel !== spec.upstreamModel || !same(pool.candidates.map((item) => encode(item)), spec.candidates.map((item) => encode(item)))) throw new RouteImportFailure("reviewed target candidate set is not the complete provider pool"); }
+    for (const candidate of spec.candidates) { const upstream = upstreams.get(candidate.accountId), account = accounts.get(candidate.accountId); if (!upstream || upstream.sourceStableId !== candidate.sourceStableId || !account || account.driver !== upstream.driver || account.status !== upstream.status || account.updatedAt !== upstream.updatedAt) throw new RouteImportFailure("reviewed target upstream binding is stale or conflicting"); }
+  }
   const sourceSet = new Set(source.mappings.map(sourceKey)), manifestSet = new Set(manifest.specs.map((item) => sourceKey(item.source)));
   if ([...manifestSet].some((key) => !sourceSet.has(key))) throw new RouteImportFailure("reviewed manifest contains a source absent from inventory");
   const items: PlanItem[] = [];
@@ -148,11 +201,11 @@ export function createPlan(sourceRaw: Buffer, upstreamRaw: Buffer, manifestRaw: 
     else if (collisions.length === 0) items.push({ spec, outcome: "create" });
     else items.push({ spec, outcome: "conflict", live: collisions[0] });
   }
-  const counts = summary(source, items);
+  const counts = summary(source, items, manifest.quarantinedAnomalies);
   // The intent digest deliberately excludes live outcomes. After an acknowledged
   // create whose response was lost, the same reviewed intent changes from
   // `create` to `replay` without invalidating the resume checkpoint.
-  const planDigest = digest(encode({ sourceDigest, upstreamDigest, manifestDigest, itemCount: items.length }));
+  const planDigest = digest(encode({ sourceDigest, upstreamDigest, targetBaseUrl: manifest.targetBaseUrl, specs: manifest.specs }));
   return { items, sourceDigest, upstreamDigest, manifestDigest, planDigest, targetBaseUrl: manifest.targetBaseUrl, counts };
 }
 
@@ -171,7 +224,7 @@ function resumeState(path: string, plan: RoutePlan): { completed: number; mode: 
 }
 export async function execute(plan: RoutePlan, tenant: string, target: RouteTarget, apply: boolean, checkpointPath?: string): Promise<Record<string, number>> {
   const counts: Record<string, number> = { ...plan.counts, written_count: 0, verified_count: 0, failed_count: 0 };
-  if (counts.unmatched_mapping_count || counts.conflict_count || counts.anomaly_count) throw new RouteImportFailure("route convergence is blocked by unmatched or conflicting source mappings", counts);
+  if (counts.unmatched_mapping_count || counts.conflict_count || counts.anomaly_count !== counts.quarantined_anomaly_count) throw new RouteImportFailure("route convergence is blocked by unmatched, conflicting, or unquarantined source mappings", counts);
   if (!apply) { if (checkpointPath) { const previous = resumeState(checkpointPath, plan); if (previous.mode === "apply") throw new RouteImportFailure("dry-run cannot overwrite an apply checkpoint"); checkpoint(checkpointPath, plan, "dry-run", 0, 0); } return counts; }
   if (!checkpointPath) throw new RouteImportFailure("apply requires an owner-only checkpoint file", counts);
   let completed = resumeState(checkpointPath, plan).completed;
@@ -207,7 +260,7 @@ class HttpTarget implements RouteTarget {
   }
   async listRoutes(tenant: string): Promise<LiveRoute[]> { const result = completeSinglePage(await this.request("GET", `/internal/v1/model-routes?tenant_external_id=${encodeURIComponent(tenant)}&limit=100`), "target route"); return result.map(parseLiveRoute); }
   async listAccounts(tenant: string): Promise<{ id: string; driver: string; status: string; updatedAt: number }[]> { const result = completeSinglePage(await this.request("GET", `/internal/v1/upstreams?tenant_external_id=${encodeURIComponent(tenant)}&limit=100`), "target upstream"); return result.map((value) => { if (!value || typeof value !== "object" || Array.isArray(value)) throw new RouteImportFailure("target upstream response is invalid"); const item = value as Obj; return { id: text(item.id, "target upstream", UUID), driver: text(item.driver, "target upstream"), status: text(item.status, "target upstream"), updatedAt: integer(item.updated_at, "target upstream") }; }); }
-  private payload(tenant: string, spec: RouteSpec): Obj { return { tenant_external_id: tenant, public_model: spec.publicModel, upstream_account_ids: [spec.accountId], upstream_model: spec.upstreamModel, protocol: spec.protocol, priority: spec.priority, included_provider_group_ids: [], excluded_provider_group_ids: [], route_group_ids: [], route_group_names: [], granted_credential_ids: [], custom_model_confirmed: true }; }
+  private payload(tenant: string, spec: RouteSpec): Obj { return { tenant_external_id: tenant, public_model: spec.publicModel, upstream_account_ids: spec.candidates.map((item) => item.accountId), upstream_model: spec.upstreamModel, protocol: spec.protocol, priority: spec.priority, included_provider_group_ids: [], excluded_provider_group_ids: [], route_group_ids: [], route_group_names: [], granted_credential_ids: [], custom_model_confirmed: true }; }
   async create(tenant: string, spec: RouteSpec): Promise<LiveRoute> { return parseLiveRoute(await this.request("POST", "/internal/v1/model-routes", this.payload(tenant, spec))); }
   async update(tenant: string, spec: RouteSpec): Promise<LiveRoute> { return parseLiveRoute(await this.request("PUT", `/internal/v1/model-routes/${spec.existing.routeId}`, { ...this.payload(tenant, spec), expected_updated_at: spec.existing.updatedAt, expected_grant_revision: spec.existing.grantRevision })); }
 }
@@ -229,7 +282,7 @@ function safeBase(raw: string, reviewed: string, allowHttp: boolean): URL { if (
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   let token: Buffer | undefined;
-  try { const selected = options(argv); const source = readProtected(selected.source!, "source inventory"), upstream = readProtected(selected.upstream!, "upstream inventory"), manifest = readProtected(selected.manifest!, "reviewed manifest"); token = readProtected(selected.token!, "service token"); const tokenText = token.toString("utf8").trim(); if (!TOKEN.test(tokenText)) throw new RouteImportFailure("service token file is invalid"); token.fill(0); token = Buffer.from(tokenText); const reviewed = parseManifest(manifest, digest(source), digest(upstream)); const target = new HttpTarget(safeBase(selected.target!, reviewed.targetBaseUrl, selected.allowHttpTarget), token); const parsed = parseUpstreamInventory(upstream); const plan = createPlan(source, upstream, manifest, await target.listRoutes(parsed.tenant), await target.listAccounts(parsed.tenant)); const counts = await execute(plan, parsed.tenant, target, selected.apply, selected.checkpoint); process.stdout.write(`${encode({ mode: selected.apply ? "apply" : "dry-run", source_inventory_sha256: plan.sourceDigest, upstream_inventory_sha256: plan.upstreamDigest, reviewed_manifest_sha256: plan.manifestDigest, plan_sha256: plan.planDigest, ...counts })}\n`); return 0; }
+  try { const selected = options(argv); const source = readProtected(selected.source!, "source inventory"), upstream = readProtected(selected.upstream!, "upstream inventory"), manifest = readProtected(selected.manifest!, "reviewed manifest"); token = readProtected(selected.token!, "service token"); const tokenText = token.toString("utf8").trim(); if (!TOKEN.test(tokenText)) throw new RouteImportFailure("service token file is invalid"); token.fill(0); token = Buffer.from(tokenText); const reviewed = parseManifest(manifest, digest(source), digest(upstream), parseSourceInventory(source)); const target = new HttpTarget(safeBase(selected.target!, reviewed.targetBaseUrl, selected.allowHttpTarget), token); const parsed = parseUpstreamInventory(upstream); const plan = createPlan(source, upstream, manifest, await target.listRoutes(parsed.tenant), await target.listAccounts(parsed.tenant)); const counts = await execute(plan, parsed.tenant, target, selected.apply, selected.checkpoint); process.stdout.write(`${encode({ mode: selected.apply ? "apply" : "dry-run", source_inventory_sha256: plan.sourceDigest, upstream_inventory_sha256: plan.upstreamDigest, reviewed_manifest_sha256: plan.manifestDigest, plan_sha256: plan.planDigest, ...counts })}\n`); return 0; }
   catch (error) { const failure = error instanceof RouteImportFailure ? error : new RouteImportFailure("route importer failed"); process.stderr.write(`${encode({ error: failure.message, ...(failure.counts ?? {}) })}\n`); return 1; }
   finally { token?.fill(0); }
 }

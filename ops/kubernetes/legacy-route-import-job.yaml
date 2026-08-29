@@ -1,7 +1,9 @@
 # Owner must replace every placeholder and review all three pinned digests.
 # This checked-in Job is a live dry-run. Never add --apply until its count-only
 # output, rollback point, provider-specific priorities, and reauthorization
-# worklist are approved.
+# worklist are approved. For multi-account source pools, use the v2 inventory
+# and manifest contracts: the complete provider-exact equal_round_robin set and
+# any digest-bound quarantine_unmapped anomaly acknowledgement must be reviewed.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -15,6 +17,8 @@ metadata:
     memeloop-token-center/source-inventory-sha256: REPLACE_SOURCE_INVENTORY_SHA256
     memeloop-token-center/upstream-inventory-sha256: REPLACE_UPSTREAM_INVENTORY_SHA256
     memeloop-token-center/reviewed-manifest-sha256: REPLACE_REVIEWED_MANIFEST_SHA256
+    memeloop-token-center/provider-candidate-contract: REPLACE_V1_SINGLE_OR_V2_EXACT_SET
+    memeloop-token-center/anomaly-quarantine-evidence-sha256: REPLACE_OR_NONE
     memeloop-token-center/approval-reference: REPLACE_APPROVAL_REFERENCE
 spec:
   backoffLimit: 0

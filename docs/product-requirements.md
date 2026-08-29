@@ -294,9 +294,14 @@ URLs or stable identifiers.
 
 Missing legacy model routes are converged by a separate owner-reviewed,
 provider-exact operation before any credential grant is applied. Its manifest
-pins the immutable source/upstream inventories, exact target account and stable
-source binding, protocol, upstream model, public model and owner-selected
-priority. The operation must never merge providers merely because they expose
+pins the immutable source/upstream inventories, exact target candidate set and
+stable source bindings, protocol, upstream model, public model and
+owner-selected priority. A source pool that immutable evidence shows to be
+equal round-robin must retain its complete deduplicated account set; subsets,
+supersets, cross-provider candidates and guessed weights fail closed. Known
+malformed source entries remain present and unmapped, and may proceed only with
+an exact digest/count-bound owner quarantine acknowledgement that never grants
+access. The operation must never merge providers merely because they expose
 the same model name, infer a model family, reuse an image/video route for a text
 mapping, introduce a provider/route group, or attach a credential. It defaults
 to live dry-run, rejects truncated target inventories, revalidates completed

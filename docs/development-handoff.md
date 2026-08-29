@@ -10,8 +10,13 @@ remaining acceptance gates, updated on 2026-08-29.
 
 - The immutable deployed release source is
   `8d3348e79921efd9e9e54a124cca40efbf000f9d`. The documentation-only
-  `[skip ci]` convergence containing this receipt follows that SHA on `master`
-  and is not represented as another image release. GitHub Actions run
+  `[skip ci]` convergence containing this receipt and the later archive-spool
+  capacity change `c2966903ac5efe0d73aee1c6717309e5feaae7b5` follow that SHA
+  on `master`; neither is represented as another accepted image release. CI
+  run `33238047455` for `c296690` was deliberately cancelled before the
+  expensive memory/publication tail after route forensics proved that the
+  legacy importer still needed exact multi-account candidate-pool support.
+  GitHub Actions run
   [`33233291973`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33233291973)
   passed repository/dependency security, Web Chromium, Rust format/Clippy/all
   tests, migration and API contracts, packaging, the unchanged 15-minute
@@ -58,9 +63,11 @@ remaining acceptance gates, updated on 2026-08-29.
   collector-only v0.8.1 maintenance and complete session archive
   baseline/delta/apply/replay, final CPAMP fence, any separately authoritative
   subscription inventory, paired PostgreSQL/MinIO backup and external restore,
-  OAuth continuity, formal route rollback and the dedicated disabled-provider
-  canary. API3 remains prohibited until the user explicitly opens the
-  production window.
+  OAuth continuity and formal route rollback. The dedicated disabled-provider
+  canary is complete: its sentinel appeared zero times in live control data and
+  Chromium, the ordinary client was denied, and cleanup returned the cluster
+  object inventory to the exact prior digest. API3 remains prohibited until
+  the user explicitly opens the production window.
 
 ## Pre-release 2026-08-29 convergence history
 
@@ -162,8 +169,10 @@ evidence remains valid.
   delta and source fence, a separately authoritative subscription
   inventory/reconciliation if one exists, a paired
   PostgreSQL/MinIO backup plus external restore drill, formal route rollback,
-  and the dedicated live disabled-provider secret canary. API3 is unchanged
-  and prohibited until the user explicitly opens the production window.
+  and the exact multi-account route/policy convergence. The dedicated live
+  disabled-provider secret canary was subsequently completed and cleaned up;
+  see the exact-release acceptance receipt. API3 is unchanged and prohibited
+  until the user explicitly opens the production window.
 
 ## Current schema-v59 release contract
 
