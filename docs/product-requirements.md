@@ -279,6 +279,40 @@ credential, stable identity, policy, balances and history. CPAMP usage, aliases
 and prices are reconciled separately from session-archive bodies; a nonzero usage
 checkpoint never proves body migration.
 
+Legacy access policy must be migrated independently from credential attachment.
+Each active source credential's exact provider, model, group and upstream-prefix
+grant shape is mapped through its stable source-hash identity to reviewed Token
+Center routes. The mapping is an owner-only, versioned manifest that pins the
+target route inventory and exact upstream candidate set. It must fail closed on
+unknown source fields, unmapped or ambiguous grants, missing identities, or a
+target route whose candidate set is broader than the source grant. It may not
+guess provider aliases, create routes implicitly, or grant a common route group
+to every credential. Dry-run is the default; apply uses grant-revision CAS,
+checkpoint/source-digest conflict detection and an exact replay that writes
+nothing. Reports are count-only and never expose credentials, source hashes,
+URLs or stable identifiers.
+
+Missing legacy model routes are converged by a separate owner-reviewed,
+provider-exact operation before any credential grant is applied. Its manifest
+pins the immutable source/upstream inventories, exact target account and stable
+source binding, protocol, upstream model, public model and owner-selected
+priority. The operation must never merge providers merely because they expose
+the same model name, infer a model family, reuse an image/video route for a text
+mapping, introduce a provider/route group, or attach a credential. It defaults
+to live dry-run, rejects truncated target inventories, revalidates completed
+checkpoint entries after interruption, and treats an identical route after a
+lost create response as a zero-write replay. Existing routes may be changed
+only with exact CAS state and a separately reviewed history/reference evidence
+digest, and never while they have any credential, route-group or provider-group
+relation.
+
+A subscription entitlement is migrated only from an authoritative customer
+ledger. Usage identities, aliases and upstream OAuth accounts are not customers
+or paid subscriptions and must never be converted into credit. If CPAMP has no
+such ledger, reconciliation explicitly records zero rather than inventing data;
+MemeLoop Web must provide a separate signed, versioned source snapshot when
+customer subscriptions exist.
+
 The CPAMP failure flag is authoritative during normalization. Failed rows with
 a real 4xx/5xx code preserve it; failed rows carrying zero, missing, 1xx, 2xx,
 3xx or invalid codes become sanitized `502`/`upstream_error` failures. Such

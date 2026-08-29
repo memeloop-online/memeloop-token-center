@@ -80,18 +80,44 @@ function nodes(plan: JsonObject): JsonObject[] {
   return [plan, ...(Array.isArray(plan.Plans) ? plan.Plans.flatMap((child: JsonObject) => nodes(child)) : [])];
 }
 
+export interface SequentialScanEvidence {
+  relation: string;
+  scanned_rows: number;
+  shared_blocks: number;
+}
+
+export function sequentialScanEvidence(plan: JsonObject): { bounded: SequentialScanEvidence[]; forbidden: SequentialScanEvidence[] } {
+  const relations = ["request_records", "conversation_key_clusters", "conversation_observations", "conversation_edges"];
+  const scans = nodes(plan)
+    .filter((node) => node["Node Type"] === "Seq Scan" && relations.some((relation) => String(node["Relation Name"] ?? "").startsWith(relation)))
+    .map((node) => ({
+      relation: String(node["Relation Name"]),
+      scanned_rows: Number(node["Actual Rows"] ?? 0) + Number(node["Rows Removed by Filter"] ?? 0),
+      shared_blocks: Number(node["Shared Hit Blocks"] ?? 0) + Number(node["Shared Read Blocks"] ?? 0),
+    }));
+  // PostgreSQL deliberately chooses a sequential scan for an empty or tiny
+  // partition even when the correct ready index exists. Reject actual bulk
+  // work here; the independent leaf-index inventory below proves the shape
+  // remains indexed as those partitions grow.
+  return {
+    bounded: scans.filter((scan) => scan.scanned_rows <= 256 && scan.shared_blocks <= 64),
+    forbidden: scans.filter((scan) => scan.scanned_rows > 256 || scan.shared_blocks > 64),
+  };
+}
+
 function explain(databaseUrl: string, name: string, query: string, timeoutMs: number): JsonObject {
   const parsed = JSON.parse(psql(databaseUrl, `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, TIMING OFF) ${query};`, timeoutMs)) as JsonObject[];
   const document = parsed[0]!;
   const plan = document.Plan as JsonObject;
   const planNodes = nodes(plan);
-  const relations = ["request_records", "conversation_key_clusters", "conversation_observations", "conversation_edges"];
+  const sequentialScans = sequentialScanEvidence(plan);
   return {
     name,
     execution_time_ms: document["Execution Time"] ?? 0,
     returned_rows: plan["Actual Rows"] ?? 0,
     indexes: [...new Set(planNodes.map((node) => node["Index Name"]).filter((value): value is string => value !== undefined))].sort(),
-    forbidden_sequential_scans: [...new Set(planNodes.filter((node) => node["Node Type"] === "Seq Scan" && relations.some((relation) => String(node["Relation Name"] ?? "").startsWith(relation))).map((node) => String(node["Relation Name"])))].sort(),
+    bounded_sequential_scans: sequentialScans.bounded,
+    forbidden_sequential_scans: sequentialScans.forbidden,
     plan,
   };
 }
@@ -113,6 +139,7 @@ export function main(argv = process.argv.slice(2)): number {
     if (!databaseUrl) throw new GateFailure("MTC_BENCH_DATABASE_URL or --database-url-file is required");
     const requestRows = Number.parseInt(scalar(databaseUrl, "SELECT COUNT(*) FROM request_records;", args.statementTimeoutMs), 10);
     const projectionRows = Number.parseInt(scalar(databaseUrl, "SELECT COUNT(*) FROM conversation_key_clusters;", args.statementTimeoutMs), 10);
+    const missingConversationLeafIndexes = Number.parseInt(scalar(databaseUrl, "SELECT COUNT(*) FROM pg_inherits partitions WHERE partitions.inhparent='request_records'::regclass AND NOT EXISTS (SELECT 1 FROM pg_index candidate WHERE candidate.indrelid=partitions.inhrelid AND candidate.indisvalid AND candidate.indisready AND pg_get_indexdef(candidate.indexrelid) LIKE '%(key_id, conversation_cluster_id, created_at, id)%' AND pg_get_expr(candidate.indpred,candidate.indrelid)='(conversation_cluster_id IS NOT NULL)');", args.statementTimeoutMs), 10);
     const sample = scalar(databaseUrl, "SELECT key_id || '|' || cluster_id FROM conversation_key_clusters ORDER BY request_count DESC, updated_at DESC LIMIT 1;", args.statementTimeoutMs).split("|");
     if (sample.length !== 2 || !sample.every((value) => SAFE_UUID.test(value))) throw new GateFailure("no valid conversation projection is available");
     const [keyId, clusterId] = sample as [string, string];
@@ -129,12 +156,13 @@ export function main(argv = process.argv.slice(2)): number {
     const checks: JsonObject[] = [
       { name: "imported request scale", actual: requestRows, expected_minimum: args.minRequestRows, passed: requestRows >= args.minRequestRows },
       { name: "conversation projections populated", actual: projectionRows, expected_minimum: 1, passed: projectionRows > 0 },
+      { name: "conversation leaf indexes valid and ready", actual: missingConversationLeafIndexes, expected: 0, passed: missingConversationLeafIndexes === 0 },
     ];
     for (const result of results) checks.push(
       { name: `${result.name} latency`, actual: result.execution_time_ms, expected_maximum: args.maxExecutionMs, passed: result.execution_time_ms <= args.maxExecutionMs },
-      { name: `${result.name} indexed`, actual: result.forbidden_sequential_scans, expected: [], passed: result.forbidden_sequential_scans.length === 0 },
+      { name: `${result.name} has no bulk sequential scan`, actual: result.forbidden_sequential_scans, expected: [], passed: result.forbidden_sequential_scans.length === 0 },
     );
-    const report = { schema_version: 1, dataset: { request_rows: requestRows, projection_rows: projectionRows }, sample: { key_id: keyId, cluster_id: clusterId }, thresholds: { min_request_rows: args.minRequestRows, max_execution_ms: args.maxExecutionMs }, results, checks, passed: checks.every((check) => check.passed) };
+    const report = { schema_version: 2, dataset: { request_rows: requestRows, projection_rows: projectionRows, missing_conversation_leaf_indexes: missingConversationLeafIndexes }, sample: { key_id: keyId, cluster_id: clusterId }, thresholds: { min_request_rows: args.minRequestRows, max_execution_ms: args.maxExecutionMs, max_bounded_sequential_scan_rows: 256, max_bounded_sequential_scan_shared_blocks: 64 }, results, checks, passed: checks.every((check) => check.passed) };
     if (args.output) { mkdirSync(dirname(args.output), { recursive: true }); writeFileSync(args.output, `${JSON.stringify(report, null, 2)}\n`); }
     console.log(JSON.stringify({ passed: report.passed, checks }, null, 2));
     return report.passed ? 0 : 2;

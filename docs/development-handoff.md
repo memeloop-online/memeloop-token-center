@@ -4,7 +4,109 @@ This is the resume point for the next Token Center development agent. Read
 [Product requirements](product-requirements.md) first, then
 [Architecture](architecture.md). Those documents preserve the agreed product
 scope and rejected designs; this document preserves the implementation state and
-remaining acceptance gates, updated on 2026-08-28.
+remaining acceptance gates, updated on 2026-08-29.
+
+## Current 2026-08-29 release and working-tree status
+
+This section supersedes the older statements below that call `0cf5fdc`, schema
+v58, or an uncommitted v59 tree current. Retained rehearsal and migration
+history remains valid.
+
+- Clean `master` and `origin/master` released baseline is
+  `413f15161397f3ac640b4921c8e7becdfc8aa3b9`. GitHub Actions run
+  [`33216849486`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33216849486)
+  passed the complete exact-SHA release, including 35/35 memory checks. The
+  immutable service, importer, and plugin-installer digests are respectively
+  `sha256:f059036b27f2543972e2b5edcd273aea4ff56e46c094e7b330c9dde0d0de369c`,
+  `sha256:cdfd7a8a14be6b1402cd126542a5166ae1843d982e1d98730c4352ccb0c6cd90`,
+  and
+  `sha256:9bdded96e1bc8a9492239d87f0fce1d8ffd73f3f7bd5ff4c7188fc2bb99cc625`.
+- API2 gateway, control, and worker run the exact service digest above at
+  schema 59 and are each 1/1 Ready. The low-lock live index inventory has 14/14
+  attached request leaves, the generation index is valid/ready, and no rows
+  moved. The pre-v59 PostgreSQL dump is retained on the dedicated trial PVC,
+  but it is still a same-cluster PostgreSQL-only rollback point rather than a
+  paired external PostgreSQL/MinIO recovery proof.
+- Playwright Chromium 151 re-accepted the deployed API2 portal and control
+  Service on 2026-08-29. It proved the stable client key, 44 visible historical
+  rows, remember/manual-clear semantics, seven usage views, Chinese/English,
+  light/dark, zero 390-pixel horizontal overflow, and gateway 200/404 routing
+  isolation. The exact read-only receipt is
+  [API2 v59 live browser acceptance](operations/2026-08-29-api2-v59-live-browser.md).
+- Current uncommitted source changes on top of `413f151` fix operator stale
+  scope restoration after explicit credential clear while preserving a valid
+  session after a failed direct replacement, preserve generation drafts across
+  background refresh, remove two browser scheduling races, and make the
+  imported-scale conversation EXPLAIN gate distinguish bounded empty/tiny
+  partition scans from real bulk scans while independently requiring every
+  conversation leaf index valid/ready. They also add the TypeScript-only
+  legacy policy importer, provider-exact route convergence importer,
+  importer-image integration and two hardened default dry-run Jobs. The policy
+  importer pins exact source-pattern to route/account/source
+  pairs, live route topology and grant CAS; unknown, unmapped, anomalous or
+  broader grants fail closed, partial progress is checkpointed, and exact
+  replay writes nothing. The route importer separately requires all source
+  mappings, one exact upstream candidate per route, owner-selected priorities,
+  checkpoint-prefix live revalidation and zero-write lost-response replay; it
+  rejects generation expansion, relations on an update, or a target inventory
+  at the 100-row single-page boundary.
+- After rebuilding `web/dist`, Web build/typecheck and real Chromium passed
+  20/20 scenarios and 145/145 steps. Root TypeScript typecheck and the combined
+  operations suite passed 59 runnable tests with three explicit environment
+  skips. The
+  conversation live snapshot gate passed on 309,893 requests and 17
+  projections with zero missing indexes; list, membership, first-page, and
+  older-page execution times were 0.239, 0.112, 0.378, and 0.402 ms, with no
+  bulk sequential scan. The sanitized report is retained at
+  [`docs/evidence/api2-v59-conversation-explain-summary.json`](evidence/api2-v59-conversation-explain-summary.json).
+  These changes have not triggered another CI run or produced replacement
+  images yet.
+- A secret-safe live continuity probe exercised all 10 active legacy CPA
+  credentials through the public API2 gateway. All 10 authenticated, all 10
+  resolved to distinct stable key identities, all 10 could read their own
+  history (309,849 imported requests in total), and all 10 were denied by the
+  control plane. However, all 10 returned an empty `/v1/models` list. The
+  authoritative old policy has 10 enabled, non-uniform entries with 2–36
+  grants per credential, while API2 currently has only 10 reviewed routes and
+  lacks several old source families. This is a P0 routing-continuity failure,
+  not a credential-attachment failure. The count-only receipt is
+  [`docs/evidence/api2-v59-legacy-credential-continuity-summary.json`](evidence/api2-v59-legacy-credential-continuity-summary.json).
+- A second read-only audit corrected the earlier ambiguous “27 upstreams”
+  wording: the old source has four provider blocks and 23 nested model
+  mappings, but seven API-key connections plus two managed Codex OAuth
+  connections. Those nine connections match the nine current API2 upstreams.
+  Routing still does not: both managed Codex accounts have zero route
+  candidates, Copilot and Cursor each need native reauthorization, Claude is
+  absent, and DeepSeek/GLM/Qwen mappings are compressed across provider
+  boundaries. The exact count-only matrix is
+  [`docs/evidence/api2-v59-upstream-continuity-summary.json`](evidence/api2-v59-upstream-continuity-summary.json).
+- The sealed CPAMP inventory has 37 tables and no durable user, paid
+  subscription, entitlement, tenant, principal, billing or plan table. Two
+  subscription-labelled Copilot/Cursor entries are upstream OAuth connection
+  state that requires reauthorization, not customer credit. Do not infer paid
+  entitlements from aliases, usage identities or upstream accounts; use a
+  separately authoritative MemeLoop Web source if one exists.
+- A 2026-08-29 read-only session-archive preflight fenced the still-Ready
+  v0.7.21 source at 3,826 sessions, 329,961 records, 1,098,909 blobs and
+  17,697,944,272 compressed bytes. Although the immutable importer contains
+  the compatible exporter, the legacy source returned only 100 sessions
+  (37,928 projected requests) even when asked for 10,000 and advertises neither
+  a stable cursor nor an offline-full snapshot. The exporter must therefore
+  fail closed rather than omit data. API2 archive tables remain empty; the
+  check wrote neither PostgreSQL nor MinIO and removed all four temporary
+  inspection Pods. The sanitized receipt is
+  [`docs/evidence/api2-v59-session-archive-preflight-summary.json`](evidence/api2-v59-session-archive-preflight-summary.json).
+- Remaining production blockers are creation of provider-exact missing routes,
+  Copilot/Cursor reauthorization, an owner-reviewed old-policy to exact-route
+  mapping plus live dry-run/apply/replay, the complete
+  approved collector-only v0.8.1 maintenance, fresh isolated 100 GiB source
+  clone and separate 100 GiB evidence volume, measured archive capacity and
+  baseline/deltas/apply/replay/reconciliation, final CPAMP
+  delta and source fence, a separately authoritative subscription
+  inventory/reconciliation if one exists, a paired
+  PostgreSQL/MinIO backup plus external restore drill, formal route rollback,
+  and the dedicated live disabled-provider secret canary. API3 is unchanged
+  and prohibited until the user explicitly opens the production window.
 
 ## Current schema-v59 release contract
 

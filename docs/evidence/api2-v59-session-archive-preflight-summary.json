@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-08-29T03:46:04.662Z",
+  "scope": "read-only session archive migration preflight",
+  "result": {
+    "ready_for_api2_apply": false,
+    "decision": "fail_closed",
+    "api3_touched": false,
+    "api2_business_database_written": false,
+    "api2_minio_written": false,
+    "old_cpa_route_changed": false,
+    "ci_runs_started": 0
+  },
+  "immutable_importer": {
+    "image_digest": "sha256:cdfd7a8a14be6b1402cd126542a5166ae1843d982e1d98730c4352ccb0c6cd90",
+    "exporter_present_and_executable": true,
+    "import_wrapper_present_and_executable": true,
+    "exporter_bundle_sha256": "9f0664ca75c15d2d4a05d5a683340e20d2f57f44cad0e892476afa93551e6010",
+    "legacy_offset_timestamp_normalization_present": true,
+    "stable_cursor_timestamp_strictness_present": true,
+    "incomplete_projection_count_guard_present": true
+  },
+  "source_count_fence": {
+    "observed_before_utc": "2026-08-29T03:46:04.112Z",
+    "observed_after_utc": "2026-08-29T03:46:04.662Z",
+    "collector_ready_replicas": 1,
+    "collector_restart_count": 0,
+    "collector_image_digest": "sha256:8da7d432410eb952de364abdd88bae330750e48ac40f348a2660a44a08ecf104",
+    "collector_release": "v0.7.21",
+    "sessions": 3826,
+    "records": 329961,
+    "blobs": 1098909,
+    "compressed_bytes": 17697944272
+  },
+  "source_schema_sample": {
+    "requested_limit": 10000,
+    "returned_rows": 100,
+    "projected_requests": 37928,
+    "declared_total_records_at_later_count_fence": 329961,
+    "stable_cursor_advertised": false,
+    "offline_full_snapshot_advertised": false,
+    "timestamp_sample": {
+      "rows_with_numeric_offset_and_nine_fractional_digits": 93,
+      "rows_with_numeric_offset_and_eight_fractional_digits": 7,
+      "rows_missing_last_at": 0,
+      "rows_with_invalid_rfc3339_shape": 0
+    },
+    "sensitive_values_retained": false,
+    "conclusion": "The immutable exporter can normalize the observed legacy offset timestamps, but the v0.7.21 source cannot expose a complete session projection. A baseline export must refuse this source rather than omit records."
+  },
+  "capacity": {
+    "source_archive_pvc": {
+      "capacity_bytes": 107307073536,
+      "filesystem_used_bytes": 19783307264,
+      "data_directory_bytes": 17694720800,
+      "available_bytes": 87523766272,
+      "archive_sqlite_bytes": 17312743424
+    },
+    "api2_minio_pvc": {
+      "capacity_bytes": 32145145856,
+      "filesystem_used_bytes": 656130048,
+      "data_directory_bytes": 5660750,
+      "available_bytes": 31489015808
+    },
+    "api2_postgresql": {
+      "pvc_capacity_bytes": 10737418240,
+      "database_bytes": 1323043987
+    },
+    "required_isolated_source_clone_bytes": 107374182400,
+    "required_isolated_evidence_pvc_bytes": 107374182400,
+    "fresh_evidence_pvc_present": false,
+    "target_capacity_proven": false,
+    "capacity_conclusion": "The source clone and evidence artifacts require distinct fresh 100 GiB volumes. The 30 GiB target MinIO has only 31,489,015,808 bytes free, while normalized JSONL and rehydrated CAS size have not been measured; 17,697,944,272 compressed source bytes are not a safe upper bound."
+  },
+  "target_read_only_baseline": {
+    "session_archive_import_checkpoints": 0,
+    "session_archive_snapshot_checkpoints": 0,
+    "session_archive_import_records": 0,
+    "session_archive_unlinked_requests": 0,
+    "session_archive_quarantine_batches": 0,
+    "archive_staging_attempts": 92,
+    "nonterminal_archive_staging_attempts": 0
+  },
+  "window_time_assessment": {
+    "full_export_throughput_measured": false,
+    "full_dry_run_throughput_measured": false,
+    "full_apply_throughput_measured": false,
+    "full_replay_throughput_measured": false,
+    "template_export_deadline_seconds": 21600,
+    "template_import_deadline_seconds": 86400,
+    "fits_api2_trial_window": false,
+    "conclusion": "No full-size throughput evidence exists for backup, offline export, dry-run, apply, and exact replay over 329,961 records and 1,098,909 blobs. The current source protocol blocks the sequence before timing can be qualified."
+  },
+  "rollback": {
+    "existing_postgresql_dump": {
+      "bytes": 107927886,
+      "sha256": "fdddc5fa748ae67d8975dab55c0ba62df818213229ebbf3ed32b524b6d44e706",
+      "captured_schema_version": 58,
+      "sufficient_for_archive_apply_rollback": false
+    },
+    "paired_minio_backup_present": false,
+    "paired_receipt_present": false,
+    "apply_prerequisite": "After API2 is quiesced and dry-run results are approved, capture and independently verify a fresh PostgreSQL dump and a fresh MinIO backup at one write barrier, bind both immutable references and hashes into one owner-private receipt, and test both restore procedures before apply."
+  },
+  "required_next_sequence": [
+    "During an approved maintenance window, roll only the internal collector to the reviewed v0.8.1 immutable digest and verify schema 2, stable cursor, offline full snapshot, and tombstone-safe ingest fence; restore the recorded v0.7.21 digest on readiness failure.",
+    "Create a fresh 100 GiB read-only-source online backup clone and a distinct fresh 100 GiB evidence PVC; do not reuse an old forensic clone.",
+    "Export and seal the offline full baseline from the disposable clone, then switch the private migration Service to the live v0.8.1 collector and export ordered deltas.",
+    "Measure normalized artifact size, CAS expansion, object count, and end-to-end backup/export/dry-run throughput before declaring that the 30 GiB MinIO or the trial window is sufficient.",
+    "Complete the matching final CPAMP identity/history delta before archive admission.",
+    "Quiesce API2, run dry-run, capture and verify paired PostgreSQL and MinIO rollback points, then apply artifacts in manifest order and require exact replay with zero new imports."
+  ],
+  "cleanup": {
+    "temporary_inspection_pods_created": 4,
+    "temporary_inspection_pods_deleted": 4,
+    "temporary_inspection_pods_remaining": 0,
+    "temporary_jobs_created": 0,
+    "port_forward_stopped": true,
+    "temporary_pvcs_created": 0,
+    "cluster_business_objects_changed": 0
+  }
+}

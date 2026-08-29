@@ -1,0 +1,75 @@
+{
+  "schema_version": 2,
+  "captured_at": "2026-08-29T01:10:00Z",
+  "release_source": "413f15161397f3ac640b4921c8e7becdfc8aa3b9",
+  "release_service_digest": "sha256:f059036b27f2543972e2b5edcd273aea4ff56e46c094e7b330c9dde0d0de369c",
+  "dataset": {
+    "request_rows": 309893,
+    "projection_rows": 17,
+    "missing_conversation_leaf_indexes": 0
+  },
+  "thresholds": {
+    "min_request_rows": 300000,
+    "max_execution_ms": 250,
+    "max_bounded_sequential_scan_rows": 256,
+    "max_bounded_sequential_scan_shared_blocks": 64
+  },
+  "results": [
+    {
+      "name": "conversation_list_first_page",
+      "execution_time_ms": 0.239,
+      "returned_rows": 17,
+      "indexes": ["conversation_key_clusters_page_idx"],
+      "bounded_sequential_scans": [],
+      "forbidden_sequential_scans": []
+    },
+    {
+      "name": "conversation_detail_membership",
+      "execution_time_ms": 0.112,
+      "returned_rows": 1,
+      "indexes": ["conversation_key_clusters_pkey"],
+      "bounded_sequential_scans": [],
+      "forbidden_sequential_scans": []
+    },
+    {
+      "name": "conversation_detail_first_page",
+      "execution_time_ms": 0.378,
+      "returned_rows": 6,
+      "bounded_sequential_scans": [
+        { "relation": "request_records_20260826", "scanned_rows": 0, "shared_blocks": 0 },
+        { "relation": "request_records_20260827", "scanned_rows": 26, "shared_blocks": 3 },
+        { "relation": "request_records_20260828", "scanned_rows": 14, "shared_blocks": 2 },
+        { "relation": "request_records_20260829", "scanned_rows": 4, "shared_blocks": 1 },
+        { "relation": "request_records_20260830", "scanned_rows": 0, "shared_blocks": 0 },
+        { "relation": "request_records_20260831", "scanned_rows": 0, "shared_blocks": 0 },
+        { "relation": "request_records_20260901", "scanned_rows": 0, "shared_blocks": 0 },
+        { "relation": "request_records_20260902", "scanned_rows": 0, "shared_blocks": 0 }
+      ],
+      "forbidden_sequential_scans": []
+    },
+    {
+      "name": "conversation_detail_older_page",
+      "execution_time_ms": 0.402,
+      "returned_rows": 6,
+      "bounded_sequential_scans": [
+        { "relation": "request_records_20260826", "scanned_rows": 0, "shared_blocks": 0 },
+        { "relation": "request_records_20260827", "scanned_rows": 26, "shared_blocks": 3 },
+        { "relation": "request_records_20260828", "scanned_rows": 14, "shared_blocks": 2 },
+        { "relation": "request_records_20260829", "scanned_rows": 4, "shared_blocks": 1 },
+        { "relation": "request_records_20260830", "scanned_rows": 0, "shared_blocks": 0 },
+        { "relation": "request_records_20260831", "scanned_rows": 0, "shared_blocks": 0 },
+        { "relation": "request_records_20260901", "scanned_rows": 0, "shared_blocks": 0 },
+        { "relation": "request_records_20260902", "scanned_rows": 0, "shared_blocks": 0 }
+      ],
+      "forbidden_sequential_scans": []
+    }
+  ],
+  "checks": {
+    "imported_request_scale": true,
+    "conversation_projections_populated": true,
+    "conversation_leaf_indexes_valid_and_ready": true,
+    "all_latencies_within_threshold": true,
+    "no_bulk_sequential_scan": true
+  },
+  "passed": true
+}

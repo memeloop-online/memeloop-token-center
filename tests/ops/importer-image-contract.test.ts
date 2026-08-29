@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { occurrences, read, repository, run } from './contract-helpers.ts';
+import './test-legacy-policy-import.ts';
+import './test-legacy-route-import.ts';
 
 test('importer bundles execute as native ESM without dynamic CommonJS bridges', () => {
   run(process.execPath, ['ops/ci/build-importer-scripts.ts']);
@@ -13,12 +15,28 @@ test('importer bundles execute as native ESM without dynamic CommonJS bridges', 
   const localUpstreamHelp = run(process.execPath, [upstreamBundle, '--help']);
   assert.match(localUpstreamHelp, /dry-run by default/);
   assert.match(localUpstreamHelp, /--transport-policy-file/);
+  const policyBundle = join(repository, 'dist/operator-scripts/legacy-policy/import-cpa-key-policy.mjs');
+  assert.doesNotMatch(readFileSync(policyBundle, 'utf8'), /Dynamic require of/);
+  const localPolicyHelp = run(process.execPath, [policyBundle, '--help']);
+  assert.match(localPolicyHelp, /dry-run by default/); assert.match(localPolicyHelp, /route-inventory-file FILE --target-api-base-url URL --service-token-file FILE \[--checkpoint-file FILE\]/);
+  const routeBundle = join(repository, 'dist/operator-scripts/legacy-routes/import-cpa-model-routes.mjs');
+  assert.doesNotMatch(readFileSync(routeBundle, 'utf8'), /Dynamic require of/);
+  const localRouteHelp = run(process.execPath, [routeBundle, '--help']);
+  assert.match(localRouteHelp, /live dry-run by default/); assert.match(localRouteHelp, /--source-inventory-file FILE --upstream-inventory-file FILE --reviewed-manifest-file FILE/);
   const rollbackBundle = join(repository, 'dist/operator-scripts/api2-target-rollback.mjs');
   assert.doesNotMatch(readFileSync(rollbackBundle, 'utf8'), /Dynamic require of/);
   assert.match(run(process.execPath, [rollbackBundle, '--help']), /Outputs and receipts are never overwritten/);
   const dockerfile = read('Dockerfile.importer');
   assert.match(dockerfile, /apk add --no-cache[^\n]*minio-client/);
   assert.match(dockerfile, /ln -s \/usr\/bin\/mcli \/usr\/local\/bin\/mc/);
+  assert.match(dockerfile, /import-cpa-key-policy/);
+  assert.match(dockerfile, /import-cpa-model-routes/);
+  const policyJob = read('ops/kubernetes/legacy-key-policy-import-job.yaml');
+  for (const needle of ['import-mode: dry-run','memeloop-token-center-importer@sha256:REPLACE_DIGEST','automountServiceAccountToken: false','readOnlyRootFilesystem: true','runAsUser: 10001','chmod 0600 /runtime/policy.json','REPLACE_SOURCE_POLICY_SHA256','REPLACE_MAPPING_SHA256','REPLACE_ROUTE_INVENTORY_SHA256','REPLACE_POLICY_IMPORT_CHECKPOINT_PVC']) assert.ok(policyJob.includes(needle));
+  assert.doesNotMatch(policyJob, /^\s*-\s*--apply\s*$/m);
+  const routeJob = read('ops/kubernetes/legacy-route-import-job.yaml');
+  for (const needle of ['import-mode: dry-run','memeloop-token-center-importer@sha256:REPLACE_DIGEST','automountServiceAccountToken: false','readOnlyRootFilesystem: true','runAsUser: 10001','chmod 0600 /runtime/source-inventory.json','REPLACE_SOURCE_INVENTORY_SHA256','REPLACE_UPSTREAM_INVENTORY_SHA256','REPLACE_REVIEWED_MANIFEST_SHA256','REPLACE_ROUTE_IMPORT_CHECKPOINT_PVC']) assert.ok(routeJob.includes(needle));
+  assert.doesNotMatch(routeJob, /^\s*-\s*--apply\s*$/m);
 });
 
 test('importer image and migration Jobs are hardened and contain only production assets', (context) => {
@@ -49,6 +67,10 @@ test('importer image and migration Jobs are hardened and contain only production
     assert.match(exporterHelp, /--output/); assert.match(exporterHelp, /--checkpoint/); assert.doesNotMatch(exporterHelp, /(token|credential|ticket).*(argument|value)/i);
     const legacyHelp = help('/usr/local/bin/attach-legacy-cpa-credentials');
     assert.match(legacyHelp, /dry-run by default/); assert.doesNotMatch(legacyHelp, /--credential(?:[ =]|$)/);
+    const policyHelp = help('/usr/local/bin/import-cpa-key-policy');
+    assert.match(policyHelp, /dry-run by default/); assert.match(policyHelp, /checkpoint/); assert.doesNotMatch(policyHelp, /--(?:key-hash|route-id|service-token)(?:[ =]|$)/);
+    const routeHelp = help('/usr/local/bin/import-cpa-model-routes');
+    assert.match(routeHelp, /live dry-run by default/); assert.match(routeHelp, /reauthorization is report-only/); assert.doesNotMatch(routeHelp, /--(?:account-id|source-stable-id|service-token)(?:[ =]|$)/);
     const upstreamHelp = help('/usr/local/bin/import-cpa-upstreams');
     assert.match(upstreamHelp, /dry-run by default/); assert.match(upstreamHelp, /--transport-policy-file/); assert.doesNotMatch(upstreamHelp, /--(?:credential|api-key|service-token)(?:[ =]|$)/); assert.doesNotMatch(upstreamHelp, /bridge|subscription-accounts/i);
     const rollbackHelp = help('/usr/local/bin/api2-target-rollback');
@@ -66,7 +88,7 @@ test('importer image and migration Jobs are hardened and contain only production
     assert.doesNotMatch(dryRun, /fixture-only-|Fixture(?:Copilot|Cursor)Handle|example\.test|fixture-proxy\.internal/);
 
     container = run('docker', ['create','--entrypoint','/bin/true',image]).trim();
-    const binaries = ['migrate-cpamp','audit-cpa-migration','import-cpa-session-archive-wrapper','attach-legacy-cpa-credentials','import-cpa-upstreams','generate-source-identity-key','export-cpa-session-archive-delta','api2-target-rollback'];
+    const binaries = ['migrate-cpamp','audit-cpa-migration','import-cpa-session-archive-wrapper','attach-legacy-cpa-credentials','import-cpa-key-policy','import-cpa-model-routes','import-cpa-upstreams','generate-source-identity-key','export-cpa-session-archive-delta','api2-target-rollback'];
     for (const binary of binaries) {
       const destination = join(workspace, binary);
       run('docker', ['cp',`${container}:/usr/local/bin/${binary}`,destination]);

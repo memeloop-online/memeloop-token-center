@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-29T03:15:00Z",
+  "scope": "api2-trial-read-only",
+  "release_source": "413f15161397f3ac640b4921c8e7becdfc8aa3b9",
+  "source": {
+    "structural_record_count": 27,
+    "provider_blocks": 4,
+    "nested_model_mappings": 23,
+    "api_key_connections": 7,
+    "managed_codex_oauth_connections": 2,
+    "native_reauthorization_worklist": {
+      "copilot": 1,
+      "cursor": 1
+    },
+    "proxied_api_key_connections": 1,
+    "disabled_connections": 0,
+    "connection_families": {
+      "deepseek_compatible": { "endpoints": 2, "api_keys": 5, "proxied": 0 },
+      "siliconflow_compatible": { "endpoints": 1, "api_keys": 1, "proxied": 0 },
+      "other_private_compatible": { "endpoints": 1, "api_keys": 1, "proxied": 1 }
+    },
+    "model_family_mappings": {
+      "deepseek": 8,
+      "glm": 6,
+      "qwen": 5,
+      "claude": 2,
+      "other": 2
+    }
+  },
+  "target": {
+    "upstreams": 9,
+    "active_api_key_upstreams": 7,
+    "active_managed_codex_oauth_upstreams": 2,
+    "managed_import_rows": 2,
+    "upstream_scopes": {
+      "deepseek_compatible_public": 5,
+      "siliconflow_public": 1,
+      "other_private": 1,
+      "codex_managed_public": 2
+    },
+    "enabled_routes": 10,
+    "single_direct_routes": 9,
+    "multi_direct_routes": 1,
+    "direct_candidate_associations": 12,
+    "provider_group_candidate_associations": 0,
+    "route_families": {
+      "deepseek_openai": 4,
+      "glm_openai": 1,
+      "qwen_openai": 2,
+      "qwen_generation": 2,
+      "other_generation": 1
+    },
+    "codex_route_candidates": 0
+  },
+  "gaps": {
+    "missing_claude_route_mappings": 2,
+    "compressed_source_families": ["deepseek", "glm", "qwen"],
+    "native_oauth_reauthorizations": 2,
+    "managed_codex_accounts_without_routes": 2,
+    "potential_provider_scope_expansions": [
+      "qwen-image-to-siliconflow",
+      "other-generation-to-siliconflow"
+    ]
+  },
+  "checks": {
+    "direct_and_managed_connection_count_parity": true,
+    "native_oauth_continuity_complete": false,
+    "codex_route_continuity_complete": false,
+    "source_model_mapping_continuity_complete": false,
+    "safe_for_wholesale_route_grant": false,
+    "production_cutover_ready": false
+  },
+  "passed": false
+}

@@ -193,8 +193,13 @@ export function SelfPortal() {
       setSessionNextCursor(sessionResponse?.next_cursor ?? null);
       setSessionsGeneratedAt(sessionResponse?.generated_at ?? 0);
       setAvailableModels(nextModels.status === 'fulfilled' ? nextModels.value.data : []);
-      setGenerationModel('');
-      setGenerationParameters({});
+      // Background generation polling refreshes the surrounding portal once a
+      // job settles. Preserve the next draft across that refresh; only a
+      // deliberate credential replacement may reset credential-scoped input.
+      if (replaceCredential) {
+        setGenerationModel('');
+        setGenerationParameters({});
+      }
       setHasOlderSessions(sessionResponse?.next_cursor !== null && sessionResponse?.next_cursor !== undefined);
       if (failures.length) setError(t('self.partialLoad', { count: formatNumber(failures.length, locale) }));
     } catch (reason) {

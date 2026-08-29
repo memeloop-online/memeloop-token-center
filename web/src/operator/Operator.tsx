@@ -213,6 +213,7 @@ export function Operator() {
   const sessionEventKeyIds = useRef(new Set<string>());
   const refreshSequence = useRef(0);
   const loadedScope = useRef<{ credential: string; tenant: string } | undefined>(undefined);
+  const activeCredential = useRef(token);
   const [scopeReady, setScopeReady] = useState(false);
   const [refreshingScope, setRefreshingScope] = useState(Boolean(token));
 
@@ -232,6 +233,9 @@ export function Operator() {
     const credential = refreshCredential;
     if (!credential) return;
     const currentScope = loadedScope.current;
+    const existingCredential = activeCredential.current;
+    const preserveExistingScope = Boolean(replaceCredential && existingCredential
+      && currentScope?.credential === existingCredential);
     const resolvingScope = replaceCredential
       || currentScope?.credential !== credential
       || currentScope.tenant !== requestedTenant;
@@ -240,6 +244,15 @@ export function Operator() {
       setScopeReady(false);
       setRequestsLoading(false);
       setDetail(undefined);
+      if (replaceCredential && !preserveExistingScope) {
+        // Never leave resources from the previous operator credential visible
+        // while a replacement credential is being authenticated. Besides
+        // avoiding misleading mixed-scope UI, this closes the window where a
+        // late failed replacement could reveal the previous tenant list.
+        loadedScope.current = undefined;
+        setTenant(''); setTenants([]); setProviders([]); setPlugins([]); setUpstreams([]); setRequests([]); setSchemas(undefined);
+        setHasOlderRequests(false);
+      }
     }
     setError('');
     try {
@@ -276,6 +289,7 @@ export function Operator() {
       setSchemas(nextSchemas.status === 'fulfilled' ? nextSchemas.value : undefined);
       rememberCredential('operator', credential);
       if (replaceCredential) {
+        activeCredential.current = credential;
         setToken(credential);
         setCredentialInput((current) => current.trim() === credential ? '' : current);
       }
@@ -284,12 +298,19 @@ export function Operator() {
       if (failures.length) setError(t('common.scopeWarning', { count: formatNumber(failures.length, locale) }));
     } catch (reason) {
       if (sequence !== refreshSequence.current) return;
-      if (resolvingScope && !replaceCredential) {
-        loadedScope.current = { credential, tenant: requestedTenant };
+      if (resolvingScope && !preserveExistingScope) {
+        loadedScope.current = undefined;
         setTenants([]); setProviders([]); setPlugins([]); setUpstreams([]); setRequests([]);
         setSchemas(undefined); setHasOlderRequests(false);
+        setTenant('');
+        if (replaceCredential) {
+          clearRememberedCredential('operator');
+          activeCredential.current = '';
+          setToken('');
+        }
       }
-      setScopeReady(!resolvingScope || (replaceCredential && Boolean(token)));
+      if (preserveExistingScope && currentScope) setTenant(currentScope.tenant);
+      setScopeReady(!resolvingScope || preserveExistingScope);
       setRefreshingScope(false);
       setError(messageOf(reason, t('common.connectionFailed')));
     }
@@ -450,6 +471,7 @@ export function Operator() {
     loadedScope.current = undefined;
     requestEventScope.current = { credential: '', tenant: '', filters: requestFilters };
     clearRememberedCredential('operator');
+    activeCredential.current = '';
     setToken(''); setCredentialInput(''); setTenant(''); setTenants([]); setProviders([]); setPlugins([]); setUpstreams([]); setRequests([]); setSchemas(undefined);
     setScopeReady(false);
     setRefreshingScope(false);

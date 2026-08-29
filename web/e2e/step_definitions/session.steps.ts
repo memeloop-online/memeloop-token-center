@@ -209,7 +209,7 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
   await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
   const observation = observations.get(this)!;
   observation.baselineSessionListRequests = observation.sessionListRequests.length;
-  const calls = Array.from({ length: 4 }, (_, index) => fetch(new URL('/v1/chat/completions', page.url()), {
+  const sendCall = (index: number) => fetch(new URL('/v1/chat/completions', page.url()), {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${seed.clientCredential}`,
@@ -218,8 +218,8 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
       'X-MTC-Turn-Id': `browser-turn-${index}`,
       ...(index > 0 ? { 'X-MTC-Parent-Turn-Id': `browser-turn-${index - 1}` } : {}),
       'X-MTC-Session-Name': 'Codex release dogfood',
-      'X-MTC-Agent-Id': index === 3 ? 'codex-worker' : 'codex-root',
-      ...(index === 3 ? { 'X-MTC-Parent-Agent-Id': 'codex-root' } : {}),
+      'X-MTC-Agent-Id': index === 1 ? 'codex-worker' : 'codex-root',
+      ...(index === 1 ? { 'X-MTC-Parent-Agent-Id': 'codex-root' } : {}),
       'X-MTC-Task-Kind': index % 2 ? 'background' : 'interactive',
       'X-MTC-Session-Labels': JSON.stringify({ workflow: 'release', environment: 'browser-e2e' }),
       traceparent: `00-4bf92f3577b34da6a3ce929d0e0e4736-${String(index + 1).padStart(16, '0')}-01`,
@@ -229,7 +229,15 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
       messages: [{ role: 'user', content: `force session active ${index % 2 ? 'error' : 'success'} ${index}` }],
       max_tokens: 32,
     }),
-  }));
+  });
+  // Make the root/worker semantic pair own the two available concurrency
+  // slots before the two rate-limit probes arrive. Starting all four in one
+  // tick made the only worker request nondeterministically become a 429,
+  // turning the semantic hierarchy assertion into a scheduler lottery.
+  const calls = [sendCall(0), sendCall(1), ...[2, 3].map(async (index) => {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return sendCall(index);
+  })];
   observation.liveRequests = calls;
   await eventually(async () => {
     await visible(page.locator('.session-card').first());

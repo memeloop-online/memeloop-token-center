@@ -1,0 +1,354 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-29T02:58:00Z",
+  "release_source": "413f15161397f3ac640b4921c8e7becdfc8aa3b9",
+  "policy_count": 10,
+  "unique_grant_count": 61,
+  "grant_inventory_sha256": "3cb8a1cb1150808e76189b2ef12cf9eaf0255583a244d51258ac04216f4beb15",
+  "grants": [
+    {
+      "provider": "codex",
+      "model": "classify:csil",
+      "group": "gpt-5.6-sol",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.3-codex-spark",
+      "group": "classify:csil",
+      "upstream_prefix": "codex-csil",
+      "policy_occurrences": 6
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.3-codex-spark",
+      "group": "classify:csil",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.3-codex-spark",
+      "group": "classify:dongwu",
+      "upstream_prefix": "codex-dongwu",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.3-codex-spark",
+      "group": "classify:dongwu",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.3-codex-spark",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "group": "classify:csil",
+      "upstream_prefix": "codex-csil",
+      "policy_occurrences": 6
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "group": "classify:csil",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "group": "classify:dongwu",
+      "upstream_prefix": "codex-dongwu",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "group": "classify:dongwu",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "group": "classify:csil",
+      "upstream_prefix": "codex-csil",
+      "policy_occurrences": 6
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "group": "classify:csil",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "group": "classify:dongwu",
+      "upstream_prefix": "codex-dongwu",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "group": "classify:dongwu",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "group": "classify:csil",
+      "upstream_prefix": "codex-csil",
+      "policy_occurrences": 6
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "group": "classify:csil",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "group": "classify:dongwu",
+      "upstream_prefix": "codex-dongwu",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "group": "classify:dongwu",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "copilot",
+      "model": "gpt-5-mini",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "cursor",
+      "model": "kimi-k2.7-code",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "deepseek-羊毛",
+      "model": "deepseek-v4-flash",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "deepseek-羊毛",
+      "model": "deepseek-v4-pro",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "deepseek-自己",
+      "model": "deepseek-v4-flash",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "deepseek-自己",
+      "model": "deepseek-v4-pro",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2-thinking",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2.5",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2.6",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2.7-code-highspeed",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2.7-code",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k2",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k3-256k",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k3",
+      "policy_occurrences": 3
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "deepseek_pro",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "deepseek_pro",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "deepseek-v3",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "deepseek-v3",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "deepseek",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "deepseek",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "gemma_claude",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "gemma_claude",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "gemma",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "gemma",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "glm_claude",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "glm_claude",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "glm-4.7_claude",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "glm-4.7_claude",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "glm-4.7",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "glm-4.7",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "glm-5.2",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "glm-5.2",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "glm",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "glm",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "minimax_claude",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "minimax_claude",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "minimax",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "minimax",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "Qwen_claude",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "Qwen_claude",
+      "policy_occurrences": 2
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "Qwen",
+      "upstream_prefix": "westlake",
+      "policy_occurrences": 1
+    },
+    {
+      "provider": "westlake-hpc",
+      "model": "Qwen",
+      "policy_occurrences": 2
+    }
+  ]
+}

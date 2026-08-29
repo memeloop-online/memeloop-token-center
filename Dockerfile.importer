@@ -11,6 +11,8 @@ COPY tsconfig.scripts.json ./
 COPY ops/ci/build-importer-scripts.ts ./ops/ci/build-importer-scripts.ts
 COPY ops/cpa-upstreams ./ops/cpa-upstreams
 COPY ops/legacy-credentials ./ops/legacy-credentials
+COPY ops/legacy-policy ./ops/legacy-policy
+COPY ops/legacy-routes ./ops/legacy-routes
 COPY ops/lib ./ops/lib
 COPY ops/sql ./ops/sql
 COPY ops/migrate-cpamp.ts ops/audit-cpa-migration.ts ops/import-cpa-session-archive.ts ./ops/
@@ -28,6 +30,8 @@ COPY --from=scripts /source/dist/operator-scripts/migrate-cpamp.mjs /usr/local/b
 COPY --from=scripts /source/dist/operator-scripts/audit-cpa-migration.mjs /usr/local/bin/audit-cpa-migration
 COPY --from=scripts /source/dist/operator-scripts/import-cpa-session-archive.mjs /usr/local/bin/import-cpa-session-archive-wrapper
 COPY --from=scripts /source/dist/operator-scripts/legacy-credentials/attach-legacy-cpa-credentials.mjs /usr/local/bin/attach-legacy-cpa-credentials
+COPY --from=scripts /source/dist/operator-scripts/legacy-policy/import-cpa-key-policy.mjs /usr/local/bin/import-cpa-key-policy
+COPY --from=scripts /source/dist/operator-scripts/legacy-routes/import-cpa-model-routes.mjs /usr/local/bin/import-cpa-model-routes
 COPY --from=scripts /source/dist/operator-scripts/cpa-upstreams/import-cpa-upstreams.mjs /usr/local/bin/import-cpa-upstreams
 COPY --from=scripts /source/dist/operator-scripts/cpa-upstreams/generate-source-identity-key.mjs /usr/local/bin/generate-source-identity-key
 COPY --from=scripts /source/dist/operator-scripts/export-cpa-session-archive-delta.mjs /usr/local/bin/export-cpa-session-archive-delta
@@ -36,6 +40,8 @@ COPY --from=scripts /source/dist/operator-scripts/sql /usr/local/bin/sql
 RUN chmod 0555 /usr/local/bin/migrate-cpamp /usr/local/bin/audit-cpa-migration \
     /usr/local/bin/import-cpa-session-archive-wrapper \
     /usr/local/bin/attach-legacy-cpa-credentials \
+    /usr/local/bin/import-cpa-key-policy \
+    /usr/local/bin/import-cpa-model-routes \
     /usr/local/bin/import-cpa-upstreams \
     /usr/local/bin/generate-source-identity-key \
     /usr/local/bin/export-cpa-session-archive-delta \

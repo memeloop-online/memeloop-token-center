@@ -1,0 +1,190 @@
+# Review every REPLACE_* value and the three pinned input digests before create.
+# Checked in as a live-target dry-run. Add only `--apply` after the count-only
+# dry-run and rollback snapshot are approved; never grant a route group here.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: memeloop-token-center-legacy-key-policy-import
+  namespace: memeloop-token-center
+  labels:
+    app.kubernetes.io/name: memeloop-token-center-legacy-key-policy-import
+    app.kubernetes.io/component: migration
+  annotations:
+    memeloop-token-center/import-mode: dry-run
+    memeloop-token-center/source-policy-sha256: REPLACE_SOURCE_POLICY_SHA256
+    memeloop-token-center/reviewed-mapping-sha256: REPLACE_MAPPING_SHA256
+    memeloop-token-center/route-inventory-sha256: REPLACE_ROUTE_INVENTORY_SHA256
+    memeloop-token-center/approval-reference: REPLACE_APPROVAL_REFERENCE
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: memeloop-token-center-legacy-key-policy-import
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      imagePullSecrets:
+        - name: REPLACE_IMAGE_PULL_SECRET
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: stage-protected-inputs
+          image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center-importer@sha256:REPLACE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              umask 077
+              cp -- /source-policy/policy.json /runtime/policy.json
+              cp -- /source-mapping/mapping.json /runtime/mapping.json
+              cp -- /source-inventory/inventory.json /runtime/inventory.json
+              cp -- /source-token/service-token /runtime/service-token
+              cp -- /source-database/pgpass /runtime/pgpass
+              chmod 0600 /runtime/policy.json /runtime/mapping.json /runtime/inventory.json /runtime/service-token /runtime/pgpass
+              chown 10001:10001 /runtime/policy.json /runtime/mapping.json /runtime/inventory.json /runtime/service-token /runtime/pgpass
+              test "$(stat -c '%u:%g:%a:%h' /runtime/policy.json)" = "10001:10001:600:1"
+              test "$(stat -c '%u:%g:%a:%h' /runtime/mapping.json)" = "10001:10001:600:1"
+              test "$(stat -c '%u:%g:%a:%h' /runtime/inventory.json)" = "10001:10001:600:1"
+              test "$(stat -c '%u:%g:%a:%h' /runtime/service-token)" = "10001:10001:600:1"
+              test "$(stat -c '%u:%g:%a:%h' /runtime/pgpass)" = "10001:10001:600:1"
+              if test -e /checkpoint/checkpoint.json; then
+                test -f /checkpoint/checkpoint.json
+                test ! -L /checkpoint/checkpoint.json
+                test "$(stat -c '%h' /checkpoint/checkpoint.json)" = "1"
+                chmod 0600 /checkpoint/checkpoint.json
+                chown 10001:10001 /checkpoint/checkpoint.json
+                test "$(stat -c '%u:%g:%a:%h' /checkpoint/checkpoint.json)" = "10001:10001:600:1"
+              fi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: source-policy
+              mountPath: /source-policy
+              readOnly: true
+            - name: reviewed-mapping
+              mountPath: /source-mapping
+              readOnly: true
+            - name: route-inventory
+              mountPath: /source-inventory
+              readOnly: true
+            - name: target-service-token
+              mountPath: /source-token
+              readOnly: true
+            - name: database-secret
+              mountPath: /source-database
+              readOnly: true
+            - name: protected-runtime
+              mountPath: /runtime
+            - name: checkpoint
+              mountPath: /checkpoint
+      containers:
+        - name: importer
+          image: REPLACE_PRIVATE_REGISTRY/memeloop-token-center-importer@sha256:REPLACE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/import-cpa-key-policy"]
+          args:
+            - --tenant-external-id
+            - REPLACE_TENANT_EXTERNAL_ID
+            - --policy-file
+            - /runtime/policy.json
+            - --mapping-file
+            - /runtime/mapping.json
+            - --route-inventory-file
+            - /runtime/inventory.json
+            - --target-api-base-url
+            - REPLACE_TOKEN_CENTER_PRIVATE_CONTROL_URL
+            - --service-token-file
+            - /runtime/service-token
+            - --checkpoint-file
+            - /checkpoint/checkpoint.json
+            # Add exactly this one argument only after dry-run approval:
+            # - --apply
+            # Add --allow-http-target only for an explicitly reviewed
+            # cluster-internal plaintext hop.
+          env:
+            - name: PGHOST
+              value: REPLACE_TARGET_POSTGRES_HOST
+            - name: PGPORT
+              value: "5432"
+            - name: PGUSER
+              value: token_center
+            - name: PGDATABASE
+              value: REPLACE_TARGET_DATABASE
+            - name: PGPASSFILE
+              value: /runtime/pgpass
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 96Mi
+          volumeMounts:
+            - name: protected-runtime
+              mountPath: /runtime
+              readOnly: true
+            - name: checkpoint
+              mountPath: /checkpoint
+      volumes:
+        - name: source-policy
+          secret:
+            secretName: REPLACE_NATIVE_POLICY_SECRET
+            defaultMode: 0400
+            items: [{ key: policy.json, path: policy.json }]
+        - name: reviewed-mapping
+          secret:
+            secretName: REPLACE_REVIEWED_MAPPING_SECRET
+            defaultMode: 0400
+            items: [{ key: mapping.json, path: mapping.json }]
+        - name: route-inventory
+          secret:
+            secretName: REPLACE_ROUTE_INVENTORY_SECRET
+            defaultMode: 0400
+            items: [{ key: inventory.json, path: inventory.json }]
+        - name: target-service-token
+          secret:
+            secretName: REPLACE_TARGET_SERVICE_TOKEN_SECRET
+            defaultMode: 0400
+            items: [{ key: service-token, path: service-token }]
+        - name: database-secret
+          secret:
+            secretName: REPLACE_DATABASE_PGPASS_SECRET
+            defaultMode: 0400
+            items: [{ key: pgpass, path: pgpass }]
+        - name: protected-runtime
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Mi
+        - name: checkpoint
+          persistentVolumeClaim:
+            claimName: REPLACE_POLICY_IMPORT_CHECKPOINT_PVC

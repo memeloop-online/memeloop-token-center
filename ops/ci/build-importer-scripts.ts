@@ -13,6 +13,8 @@ await build({
     'ops/audit-cpa-migration.ts',
     'ops/import-cpa-session-archive.ts',
     'ops/legacy-credentials/attach-legacy-cpa-credentials.ts',
+    'ops/legacy-policy/import-cpa-key-policy.ts',
+    'ops/legacy-routes/import-cpa-model-routes.ts',
     'ops/cpa-upstreams/import-cpa-upstreams.ts',
     'ops/cpa-upstreams/generate-source-identity-key.ts',
     'ops/export-cpa-session-archive-delta.ts',

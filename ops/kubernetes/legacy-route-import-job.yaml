@@ -1,0 +1,142 @@
+# Owner must replace every placeholder and review all three pinned digests.
+# This checked-in Job is a live dry-run. Never add --apply until its count-only
+# output, rollback point, provider-specific priorities, and reauthorization
+# worklist are approved.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: memeloop-token-center-legacy-route-import
+  namespace: memeloop-token-center
+  labels:
+    app.kubernetes.io/name: memeloop-token-center-legacy-route-import
+    app.kubernetes.io/component: migration
+  annotations:
+    memeloop-token-center/import-mode: dry-run
+    memeloop-token-center/source-inventory-sha256: REPLACE_SOURCE_INVENTORY_SHA256
+    memeloop-token-center/upstream-inventory-sha256: REPLACE_UPSTREAM_INVENTORY_SHA256
+    memeloop-token-center/reviewed-manifest-sha256: REPLACE_REVIEWED_MANIFEST_SHA256
+    memeloop-token-center/approval-reference: REPLACE_APPROVAL_REFERENCE
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: memeloop-token-center-legacy-route-import
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      imagePullSecrets:
+        - name: REPLACE_IMAGE_PULL_SECRET
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: stage-owner-only-inputs
+          image: ghcr.io/memeloop-online/memeloop-token-center-importer@sha256:REPLACE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              umask 077
+              cp -- /source/source-inventory.json /runtime/source-inventory.json
+              cp -- /upstream/upstream-inventory.json /runtime/upstream-inventory.json
+              cp -- /manifest/reviewed-manifest.json /runtime/reviewed-manifest.json
+              cp -- /token/service-token /runtime/service-token
+              chmod 0600 /runtime/source-inventory.json /runtime/upstream-inventory.json /runtime/reviewed-manifest.json /runtime/service-token
+              chown 10001:10001 /runtime/source-inventory.json /runtime/upstream-inventory.json /runtime/reviewed-manifest.json /runtime/service-token
+              for file in /runtime/source-inventory.json /runtime/upstream-inventory.json /runtime/reviewed-manifest.json /runtime/service-token; do
+                test "$(stat -c '%u:%g:%a:%h' "$file")" = "10001:10001:600:1"
+              done
+              if test -e /checkpoint/checkpoint.json; then
+                test -f /checkpoint/checkpoint.json
+                test ! -L /checkpoint/checkpoint.json
+                test "$(stat -c '%h' /checkpoint/checkpoint.json)" = "1"
+                chmod 0600 /checkpoint/checkpoint.json
+                chown 10001:10001 /checkpoint/checkpoint.json
+                test "$(stat -c '%u:%g:%a:%h' /checkpoint/checkpoint.json)" = "10001:10001:600:1"
+              fi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+          volumeMounts:
+            - { name: source-inventory, mountPath: /source, readOnly: true }
+            - { name: upstream-inventory, mountPath: /upstream, readOnly: true }
+            - { name: reviewed-manifest, mountPath: /manifest, readOnly: true }
+            - { name: target-service-token, mountPath: /token, readOnly: true }
+            - { name: protected-runtime, mountPath: /runtime }
+            - { name: checkpoint, mountPath: /checkpoint }
+      containers:
+        - name: importer
+          image: ghcr.io/memeloop-online/memeloop-token-center-importer@sha256:REPLACE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/import-cpa-model-routes"]
+          args:
+            - --source-inventory-file
+            - /runtime/source-inventory.json
+            - --upstream-inventory-file
+            - /runtime/upstream-inventory.json
+            - --reviewed-manifest-file
+            - /runtime/reviewed-manifest.json
+            - --target-api-base-url
+            - REPLACE_EXACT_REVIEWED_PRIVATE_CONTROL_URL
+            - --service-token-file
+            - /runtime/service-token
+            - --checkpoint-file
+            - /checkpoint/checkpoint.json
+            # Cluster-local HTTP also requires this exact reviewed argument:
+            # - --allow-http-target
+            # Add only after approval; apply refuses to run without checkpoint:
+            # - --apply
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { cpu: 250m, memory: 96Mi }
+          volumeMounts:
+            - { name: protected-runtime, mountPath: /runtime, readOnly: true }
+            - { name: checkpoint, mountPath: /checkpoint }
+      volumes:
+        - name: source-inventory
+          secret:
+            secretName: REPLACE_SOURCE_INVENTORY_SECRET
+            defaultMode: 0400
+            items: [{ key: source-inventory.json, path: source-inventory.json }]
+        - name: upstream-inventory
+          secret:
+            secretName: REPLACE_UPSTREAM_INVENTORY_SECRET
+            defaultMode: 0400
+            items: [{ key: upstream-inventory.json, path: upstream-inventory.json }]
+        - name: reviewed-manifest
+          secret:
+            secretName: REPLACE_REVIEWED_MANIFEST_SECRET
+            defaultMode: 0400
+            items: [{ key: reviewed-manifest.json, path: reviewed-manifest.json }]
+        - name: target-service-token
+          secret:
+            secretName: REPLACE_TARGET_SERVICE_TOKEN_SECRET
+            defaultMode: 0400
+            items: [{ key: service-token, path: service-token }]
+        - name: protected-runtime
+          emptyDir: { medium: Memory, sizeLimit: 4Mi }
+        - name: checkpoint
+          persistentVolumeClaim:
+            claimName: REPLACE_ROUTE_IMPORT_CHECKPOINT_PVC

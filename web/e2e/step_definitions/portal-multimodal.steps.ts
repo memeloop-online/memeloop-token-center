@@ -313,7 +313,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await routeForm.getByLabel('公开模型').fill(imageModel);
   const imageUpstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
   await imageUpstreamPicker.fill('Browser UI ComfyUI');
-  await imageUpstreamPicker.press('Enter');
+  await routeForm.getByRole('option', { name: /Browser UI ComfyUI/ }).click();
+  await assertContains(imageUpstreamPicker.locator('..'), 'Browser UI ComfyUI');
   await routeForm.getByLabel('协议').selectOption('generation');
   await routeForm.getByLabel('上游模型').fill('browser-workflow-v1');
   await routeForm.getByLabel(/未验证的自定义模型/).check();
@@ -328,13 +329,21 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await routeForm.getByLabel('公开模型').fill(videoModel);
   const upstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
   await upstreamPicker.fill('Browser UI Seedance');
-  await upstreamPicker.press('Enter');
+  await routeForm.getByRole('option', { name: /Browser UI Seedance/ }).click();
+  await assertContains(upstreamPicker.locator('..'), 'Browser UI Seedance');
   await routeForm.getByLabel('协议').selectOption('generation');
   await routeForm.getByLabel('上游模型').fill('seedance-browser-v1');
-  await assertContains(routeForm.locator('.custom-model-confirm'), '未验证的自定义模型');
-  await routeForm.getByLabel(/未验证的自定义模型/).check();
+  const customModelConfirmation = routeForm.getByLabel(/未验证的自定义模型/);
+  const createVideoRouteButton = routeForm.getByRole('button', { name: '创建路由', exact: true });
+  await eventually(async () => {
+    assert.ok(await customModelConfirmation.isVisible() || await createVideoRouteButton.isEnabled(),
+      'the video model must be catalogued or offer explicit custom-model confirmation');
+  }, 10_000);
+  if (await customModelConfirmation.isVisible()) await customModelConfirmation.check();
+  await eventually(async () => assert.equal(await createVideoRouteButton.isEnabled(), true), 10_000,
+    'the video route did not become valid after selecting its upstream model');
   const routeResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
-  await routeForm.getByRole('button', { name: '创建路由', exact: true }).click();
+  await createVideoRouteButton.click();
   const routeResponse = await routeResponsePromise;
   assert.equal(routeResponse.status(), 201);
   const videoRoute = await routeResponse.json() as { id: string };
