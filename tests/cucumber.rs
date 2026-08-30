@@ -6632,32 +6632,16 @@ async fn assert_cpamp_import_state(
             .get::<String, _>("policy_json")
             .contains("allowed_models")
     );
-    let price = sqlx::query(
-        "SELECT input_micros_per_million, output_micros_per_million, source FROM model_prices WHERE model = 'fixture-model' AND currency = 'USD'",
+    let global_price_rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM model_prices WHERE model = 'fixture-model') + (SELECT COUNT(*) FROM model_price_tiers WHERE model = 'fixture-model')",
     )
     .fetch_one(&pool)
     .await
-    .expect("imported fixture price");
-    assert_eq!(price.get::<i64, _>("input_micros_per_million"), 2_000_000);
-    assert_eq!(price.get::<i64, _>("output_micros_per_million"), 4_000_000);
-    assert_eq!(price.get::<String, _>("source"), "cpamp:fixture");
-    let tier = sqlx::query(
-        "SELECT input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million, source FROM model_price_tiers WHERE model = 'fixture-model' AND currency = 'USD' AND service_tier = 'default'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("imported fixture default price tier");
-    assert_eq!(tier.get::<i64, _>("input_micros_per_million"), 2_000_000);
+    .expect("CPAMP source prices remain provenance-only");
     assert_eq!(
-        tier.get::<i64, _>("cached_input_micros_per_million"),
-        2_000_000
+        global_price_rows, 0,
+        "an import must not overwrite the operator-managed global price catalog"
     );
-    assert_eq!(
-        tier.get::<i64, _>("cache_write_micros_per_million"),
-        2_000_000
-    );
-    assert_eq!(tier.get::<i64, _>("output_micros_per_million"), 4_000_000);
-    assert_eq!(tier.get::<String, _>("source"), "cpamp:fixture");
     pool.close().await;
 }
 

@@ -139,6 +139,8 @@ test("CPAMP import is transactional, replay-safe, bounded by watermarks, and ten
   for (const migration of [
     "0001_initial.sql", "0002_query_indexes.sql", "0004_request_events.sql",
     "0005_generation_jobs.sql", "0018_model_price_tiers.sql", "0019_session_archive_import.sql",
+    "0021_request_locators.sql", "0022_budget_rollups.sql", "0023_generation_daily_aggregates.sql",
+    "0024_request_stats_rollups.sql", "0027_cpamp_source_digests.sql",
   ]) {
     requireSuccess(run("psql", ["-X", "-v", "ON_ERROR_STOP=1", "--no-psqlrc", "-f", join(workRoot, migration)], undefined, environment), migration);
   }

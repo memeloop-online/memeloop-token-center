@@ -291,7 +291,7 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
   await assertContains(routeEditor.locator(`#${routeGroupListId}`).getByRole('option'), '创建路由组“默认路由”');
   await routeGroupInput.press('Enter');
   const exactCredentials = routeEditor.getByRole('combobox', { name: '授权给具体凭据', exact: true });
-  await exactCredentials.fill('Browser E2E credential');
+  await exactCredentials.fill(seed.clientKeyId);
   await exactCredentials.press('Enter');
   await exactCredentials.press('Escape');
   const createdRoute = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
