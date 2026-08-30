@@ -29,6 +29,8 @@ test('overview and generation creation remain separate page boundaries', async (
   assert.match(portal, /route\?: SelfPortalRoute/);
   assert.match(portal, /embedded\?: boolean/);
   assert.match(portal, /showNavigation\?: boolean/);
+  assert.match(portal, /type=\{credentialVisible \? 'text' : 'password'\}/);
+  assert.match(portal, /aria-pressed=\{credentialVisible\}/);
 });
 
 test('credential-bound portal work is abortable and remounts on identity generation', async () => {

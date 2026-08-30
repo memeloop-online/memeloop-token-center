@@ -91,6 +91,50 @@ test('shell and route content share the exact 899/900/901 responsive boundary wi
   } finally { await browser.close(); }
 });
 
+test('portal and operator primitives remain readable from 320px mobile to 2560px widescreen', { timeout: 30_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) return test.skip('a local Chromium runtime is required for the responsive matrix');
+  const operatorStylesPath = fileURLToPath(new URL('../src/operator/operator.css', import.meta.url));
+  const usageStylesPath = fileURLToPath(new URL('../src/operator/usage.css', import.meta.url));
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`<div class="product-app"><aside class="app-sidebar"></aside><div class="app-stage"><header class="app-context-bar"><button class="app-mobile-menu">☰</button><div class="app-breadcrumb"><small>Identity and access</small><strong>Service credentials with a deliberately long route title</strong></div><div class="app-mobile-preferences"><button>EN</button><button>☀</button></div></header><main class="app-main-content"><header class="hero"><div><h1>Traffic monitoring</h1><p>Recent activity and current health</p></div><form class="credential"><input aria-label="Credential"><button>Connect</button></form></header><section class="metrics usage-metrics"><article class="metric"><span class="metric-label">Total requests</span><strong class="metric-value">123,456</strong></article><article class="metric"><span class="metric-label">Success rate</span><strong class="metric-value">99.95%</strong></article></section><article class="panel"><div class="panel-title traffic-heading"><div><h2>Recent requests</h2><span>Live updates</span></div><div class="traffic-heading-actions"><div class="session-live-state live">Live</div><div class="segmented"><button>Requests</button><button>Sessions</button></div></div></div><div class="table-scroll"><table><tbody><tr><td>2026-08-30 10:02:15</td><td>gpt-5.6-luna-with-a-long-model-name</td><td>successful</td><td>128,000</td><td>US$123.45</td></tr></tbody></table></div></article><section class="session-list"><article class="session-card"><div class="session-card-heading"><b>A deliberately long session title that must wrap safely</b><span><i class="status ok">active</i><i class="pill">foreground</i></span></div></article><article class="session-card"><div class="session-card-heading"><b>Second independent session</b><span><i class="status ok">active</i></span></div></article></section></main></div></div>`);
+    await page.addStyleTag({ path: sharedStylesPath });
+    await page.addStyleTag({ path: appShellStylesPath });
+    await page.addStyleTag({ path: operatorStylesPath });
+    await page.addStyleTag({ path: usageStylesPath });
+    await page.addStyleTag({ content: 'html, body { overflow-x: visible !important; }' });
+    for (const width of [320, 390, 768, 900, 1024, 1440, 1920, 2560]) {
+      await page.setViewportSize({ width, height: 900 });
+      const layout = await page.evaluate(() => {
+        const root = document.documentElement;
+        const main = document.querySelector<HTMLElement>('.app-main-content')!;
+        const context = document.querySelector<HTMLElement>('.app-context-bar')!;
+        const table = document.querySelector<HTMLElement>('.table-scroll')!;
+        const sessionHeading = document.querySelector<HTMLElement>('.session-card-heading')!;
+        return {
+          root: [root.clientWidth, root.scrollWidth],
+          main: [main.clientWidth, main.scrollWidth],
+          context: [context.clientWidth, context.scrollWidth],
+          table: [table.clientWidth, table.scrollWidth],
+          sessionColumns: getComputedStyle(sessionHeading).gridTemplateColumns,
+          sessionListColumns: getComputedStyle(document.querySelector<HTMLElement>('.session-list')!).gridTemplateColumns.split(' ').length,
+          metricColumns: getComputedStyle(document.querySelector<HTMLElement>('.usage-metrics')!).gridTemplateColumns.split(' ').length,
+        };
+      });
+      assert.ok(layout.root[1] <= layout.root[0], `${width}px document must not overflow`);
+      assert.ok(layout.main[1] <= layout.main[0], `${width}px main content must not overflow`);
+      assert.ok(layout.context[1] <= layout.context[0], `${width}px context bar must not overflow`);
+      assert.ok(layout.table[1] >= layout.table[0], `${width}px wide tables must remain inside their scroll container`);
+      if (width <= 480) assert.equal(layout.sessionColumns.split(' ').length, 1, `${width}px session heading must stack`);
+      if (width <= 350) assert.equal(layout.metricColumns, 1, `${width}px usage metrics must use a readable single column`);
+      if (width <= 1100) assert.equal(layout.sessionListColumns, 1, `${width}px session summaries must retain a readable single column`);
+      if (width >= 1440) assert.ok(layout.sessionListColumns >= 2, `${width}px session summaries must use available widescreen space`);
+    }
+  } finally { await browser.close(); }
+});
+
 test('a rejected lazy route reloads its module graph and recovers instead of staying blank', { timeout: 30_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) return test.skip('a local Chromium runtime is required for lazy rejection assertions');

@@ -1,0 +1,25 @@
+.credential-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.credential-input .credential-visibility {
+  min-width: 72px;
+  margin: 0;
+  white-space: nowrap;
+}
+
+@media (width <= 480px) {
+  .credential-input .credential-visibility {
+    width: auto;
+  }
+}
+
+@media (width <= 360px) {
+  .credential-input .credential-visibility {
+    min-width: 58px;
+    padding-inline: 8px;
+  }
+}

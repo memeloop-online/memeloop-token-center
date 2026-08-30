@@ -31,3 +31,4 @@
 :root[data-theme='light'] .usage-heatmap-selection { background: #e8f5f1; color: #285f57; }
 @media (width <= 1080px) { .usage-chart-grid { grid-template-columns: minmax(0, 1fr); } .usage-chart-grid .usage-chart-card:last-child { grid-column: auto; } }
 @media (width <= 620px) { .usage-echart { height: 290px; } .usage-echart-heatmap { height: 360px; } .usage-chart-card { padding-inline: 10px; } .usage-dimension-picker { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 5px; } .usage-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (width <= 350px) { .usage-metrics { grid-template-columns: minmax(0, 1fr); } .usage-echart { height: 260px; } .usage-echart-heatmap { height: 320px; } }

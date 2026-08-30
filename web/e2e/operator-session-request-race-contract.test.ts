@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { LatestRequestGate } from '../src/operator/SessionMonitor.js';
+
+const monitorSource = await readFile(new URL('../src/operator/SessionMonitor.tsx', import.meta.url), 'utf8');
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -38,4 +41,12 @@ test('scope invalidation aborts and rejects a deferred response', async () => {
   response.resolve('old-scope');
   await consume;
   assert.equal(accepted, undefined);
+});
+
+test('scope-stamped projections hide A immediately while B loads', () => {
+  assert.match(monitorSource, /const scopeKey = `\$\{tenant\}\\0\$\{token\}`/);
+  assert.match(monitorSource, /const visibleSessions = listScope === scopeKey \? sessions : \[\]/);
+  assert.match(monitorSource, /const visibleDetail = detailScope === scopeKey \? detail : undefined/);
+  assert.match(monitorSource, /const visibleError = errorScope === scopeKey \? error : ''/);
+  assert.match(monitorSource, /if \(!latest\) return page/);
 });

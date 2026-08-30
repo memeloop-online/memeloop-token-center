@@ -24,23 +24,23 @@ When('管理员和下游用户验证凭据记忆与手动清空', async function
   await assertContains(page.locator('.tenant-picker'), tenant);
 
   await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 375, height: 812 } });
-  await page.getByLabel('客户端凭据', { exact: true }).fill(seed.clientCredential);
+  await page.getByPlaceholder('输入客户端凭据').fill(seed.clientCredential);
   await page.getByRole('button', { name: '进入', exact: true }).click();
-  await assertNoCount(page.getByLabel('客户端凭据', { exact: true }));
+  await assertNoCount(page.getByPlaceholder('输入客户端凭据'));
   await assertContains(page.locator('.console-context'), 'Browser E2E credential');
   await assertContains(page.locator('.console-context'), '已连接');
   await page.reload();
-  await assertNoCount(page.getByLabel('客户端凭据', { exact: true }));
+  await assertNoCount(page.getByPlaceholder('输入客户端凭据'));
   await assertContains(page.locator('.console-context'), 'Browser E2E credential');
   await page.getByRole('button', { name: '清空凭据', exact: true }).click();
-  await assertValue(page.getByLabel('客户端凭据', { exact: true }), '');
+  await assertValue(page.getByPlaceholder('输入客户端凭据'), '');
   await assertNoCount(page.locator('.console-context'));
   assert.deepEqual(await page.evaluate(() => ({
     operator: localStorage.getItem('mtc.operator.service-credential.v1'),
     self: localStorage.getItem('mtc.self.client-credential.v1'),
   })), { operator: seed.serviceCredential, self: null });
   await page.reload();
-  await assertValue(page.getByLabel('客户端凭据', { exact: true }), '');
+  await assertValue(page.getByPlaceholder('输入客户端凭据'), '');
   await assertNoCount(page.locator('.console-context'));
 
   await this.open('/operator', { theme: 'dark', locale: 'zh-CN' });
@@ -217,7 +217,7 @@ Then('模型、客户端凭据、上游和状态过滤都作用于真实统计 A
 
   await applyUsageFilter(page, async () => controls.getByLabel('模型').fill(model), 'model', model, 51);
   await clearUsageFilters(page);
-  await applyUsageFilter(page, async () => controls.getByLabel('凭据主键').fill(seed.clientKeyId), 'key_id', seed.clientKeyId, 51);
+  await applyUsageFilter(page, async () => controls.getByLabel('凭据 ID').fill(seed.clientKeyId), 'key_id', seed.clientKeyId, 51);
   await clearUsageFilters(page);
   await applyUsageFilter(page, async () => { await controls.getByLabel('上游提供商').selectOption(seed.upstreamId); }, 'upstream_account_id', seed.upstreamId, 51);
   await clearUsageFilters(page);
@@ -322,7 +322,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
   assert.equal(requestUrl.searchParams.get('key_id'), seed.clientKeyId);
   assert.match(requestUrl.searchParams.get('key_id') ?? '', uuidPattern);
-  await assertValue(controls.getByLabel('凭据主键'), seed.clientKeyId);
+  await assertValue(controls.getByLabel('凭据 ID'), seed.clientKeyId);
 
   await clearStrictUsageFilters(this, 17);
   await openUsageDimension(page, '协议');

@@ -88,13 +88,17 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   onSelectRequest: (request: RequestView) => Promise<void>;
 }) {
   const { locale, t } = useI18n();
+  const scopeKey = `${tenant}\0${token}`;
   const [sessions, setSessions] = useState<LogicalSessionSummary[]>([]);
+  const [listScope, setListScope] = useState('');
   const [detail, setDetail] = useState<LogicalSessionDetail>();
+  const [detailScope, setDetailScope] = useState('');
   const [selected, setSelected] = useState<LogicalSessionSummary>();
   const [loading, setLoading] = useState(false);
   const [nextCursor, setNextCursor] = useState<LogicalSessionCursor | null>(null);
   const [generatedAt, setGeneratedAt] = useState(0);
   const [error, setError] = useState('');
+  const [errorScope, setErrorScope] = useState('');
   const [draft, setDraft] = useState<SessionFilters>(emptySessionFilters);
   const [filters, setFilters] = useState<SessionFilters>(emptySessionFilters);
   const [refreshing, setRefreshing] = useState(false);
@@ -116,6 +120,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
 
   async function loadSessions(older = false, selectedFilters = filters, background = false) {
     const sequence = ++listSequence.current;
+    const requestScope = scopeKey;
     const credential = token.trim();
     if (!credential || !tenant) {
       setSessions([]); setNextCursor(null); setGeneratedAt(0);
@@ -146,6 +151,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         loadedOlderList.current = merged.loadedOlder;
         return merged.sessions;
       });
+      setListScope(requestScope);
       if (!background || !loadedOlderList.current || resetActiveTail) setNextCursor(response.next_cursor);
       setGeneratedAt(response.generated_at);
       if (!older && focus && handledFocus.current !== focus.revision) {
@@ -158,6 +164,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     } catch (reason) {
       if (sequence !== listSequence.current) return;
       setError(messageOf(reason, t('sessions.loadFailed')));
+      setErrorScope(requestScope);
       if (!older) setSessions([]);
     } finally {
       if (sequence === listSequence.current) {
@@ -169,13 +176,20 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
 
   async function selectSession(session: LogicalSessionSummary) {
     const request = detailRequests.current.begin();
+    const requestScope = scopeKey;
     loadedOlderDetail.current = false;
-    setSelected(session); setLoading(true); setError('');
+    setSelected(session); setDetail(undefined); setDetailScope(''); setLoading(true); setError(''); setErrorScope('');
     try {
       const next = await api<LogicalSessionDetail>(detailPath(tenant, session), token.trim(), { signal: request.signal });
-      if (request.isCurrent()) setDetail(next);
+      if (request.isCurrent()) {
+        setDetail(next);
+        setDetailScope(requestScope);
+      }
     } catch (reason) {
-      if (request.isCurrent()) setError(messageOf(reason, t('sessions.detailFailed')));
+      if (request.isCurrent()) {
+        setError(messageOf(reason, t('sessions.detailFailed')));
+        setErrorScope(requestScope);
+      }
     } finally {
       if (request.isCurrent()) setLoading(false);
     }
@@ -184,11 +198,13 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   async function refreshSelected(session = selectedRef.current) {
     if (!session) return;
     const request = detailRequests.current.begin();
+    const requestScope = scopeKey;
     try {
       const page = await api<LogicalSessionDetail>(detailPath(tenant, session), token.trim(), { signal: request.signal });
       if (!request.isCurrent()) return;
       setDetail((latest) => {
-        if (!latest || latest.session_id !== page.session_id) return latest;
+        if (!latest) return page;
+        if (latest.session_id !== page.session_id) return latest;
         if (!loadedOlderDetail.current) return page;
         const requests = new Map(latest.requests.map((request) => [request.request_id, request]));
         for (const request of page.requests) requests.set(request.request_id, request);
@@ -203,8 +219,12 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
           edges_truncated: page.edges_truncated || latest.edges_truncated,
         };
       });
+      setDetailScope(requestScope);
     } catch (reason) {
-      if (request.isCurrent()) setError(messageOf(reason, t('sessions.detailFailed')));
+      if (request.isCurrent()) {
+        setError(messageOf(reason, t('sessions.detailFailed')));
+        setErrorScope(requestScope);
+      }
     } finally {
       if (request.isCurrent()) setLoading(false);
     }
@@ -215,6 +235,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     const session = selected;
     if (!current?.next_cursor || !session) return;
     const request = detailRequests.current.begin();
+    const requestScope = scopeKey;
     setLoading(true); setError('');
     try {
       const page = await api<LogicalSessionDetail>(detailPath(tenant, session, current.next_cursor), token.trim(), { signal: request.signal });
@@ -231,8 +252,12 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
           edges_truncated: page.edges_truncated || latest.edges_truncated,
         };
       });
+      setDetailScope(requestScope);
     } catch (reason) {
-      if (request.isCurrent()) setError(messageOf(reason, t('sessions.detailFailed')));
+      if (request.isCurrent()) {
+        setError(messageOf(reason, t('sessions.detailFailed')));
+        setErrorScope(requestScope);
+      }
     } finally {
       if (request.isCurrent()) setLoading(false);
     }
@@ -281,8 +306,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     firstPageSize.current = 0;
     loadedOlderList.current = false;
     loadedOlderDetail.current = false;
-    setSessions([]); setDetail(undefined); setSelected(undefined); setNextCursor(null); setGeneratedAt(0);
-    setLoading(false); setRefreshing(false); setError('');
+    handledFocus.current = 0;
+    setSessions([]); setListScope(''); setDetail(undefined); setDetailScope(''); setSelected(undefined); setNextCursor(null); setGeneratedAt(0);
+    setLoading(false); setRefreshing(false); setError(''); setErrorScope('');
     if (!token.trim() || !tenant) {
       setDraft(emptySessionFilters);
       setFilters(emptySessionFilters);
@@ -293,6 +319,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       if (refreshTimer.current !== undefined) window.clearTimeout(refreshTimer.current);
       refreshTimer.current = undefined;
       refreshDirty.current = false;
+      refreshInFlight.current = false;
       dirtyKeyIds.current.clear();
       listSequence.current += 1;
       detailRequests.current.invalidate();
@@ -308,9 +335,12 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
 
   const hasScope = Boolean(token.trim() && tenant);
   const status = !hasScope ? 'idle' : refreshing ? 'refreshing' : streamState;
+  const visibleSessions = listScope === scopeKey ? sessions : [];
+  const visibleDetail = detailScope === scopeKey ? detail : undefined;
+  const visibleError = errorScope === scopeKey ? error : '';
   return <>
     {!tenant && <div className="notice warning" role="status">{t('sessions.selectTenant')}</div>}
-    {error && <div className="notice error" role="alert">{error}</div>}
+    {visibleError && <div className="notice error" role="alert">{visibleError}</div>}
     <div className={`session-live-state ${status}`} role="status">{t(`sessions.live.${status}`)}</div>
     <form className="session-controls" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }); }}>
       <label>{t('sessions.search')}<input value={draft.q} onChange={(event) => setDraft({ ...draft, q: event.target.value })} placeholder={t('sessions.searchPlaceholder')} /></label>
@@ -319,9 +349,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       <label>{t('sessions.state')}<select value={draft.state} onChange={(event) => setDraft({ ...draft, state: event.target.value as SessionFilters['state'] })}><option value="">{t('common.all')}</option><option value="active">{t('sessions.filter.active')}</option><option value="has_errors">{t('sessions.filter.hasErrors')}</option></select></label>
       <div className="filter-actions"><button type="submit" disabled={loading || !tenant}>{t('traffic.applyFilters')}</button><button type="button" className="secondary" disabled={loading || !Object.values(filters).some(Boolean)} onClick={() => { setDraft(emptySessionFilters); setFilters(emptySessionFilters); }}>{t('traffic.clearFilters')}</button></div>
     </form>
-    <p className="muted session-result-count">{t('sessions.serverFiltered', { count: sessions.length })}{generatedAt > 0 && <> · {t('sessions.generatedAt', { time: new Date(generatedAt).toLocaleString(locale) })}</>}</p>
-    <SessionList values={sessions} loading={loading} showCredential onSelect={(session) => void selectSession(session)} />
-    {nextCursor && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(true, filters)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
-    {detail && <SessionDrawer detail={detail} summary={selected} showDiagnosticIds loading={loading} onLoadOlder={() => void loadEarlier()} onSelect={(request) => { setDetail(undefined); setSelected(undefined); void onSelectRequest(request); }} onClose={() => { setDetail(undefined); setSelected(undefined); }} />}
+    <p className="muted session-result-count">{t('sessions.serverFiltered', { count: visibleSessions.length })}{listScope === scopeKey && generatedAt > 0 && <> · {t('sessions.generatedAt', { time: new Date(generatedAt).toLocaleString(locale) })}</>}</p>
+    <SessionList values={visibleSessions} loading={loading} showCredential onSelect={(session) => void selectSession(session)} />
+    {listScope === scopeKey && nextCursor && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(true, filters)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
+    {visibleDetail && <SessionDrawer detail={visibleDetail} summary={selected} showDiagnosticIds loading={loading} onLoadOlder={() => void loadEarlier()} onSelect={(request) => { setDetail(undefined); setDetailScope(''); setSelected(undefined); void onSelectRequest(request); }} onClose={() => { setDetail(undefined); setDetailScope(''); setSelected(undefined); }} />}
   </>;
 }

@@ -79,9 +79,9 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   const protocolValues = await filters.getByLabel('协议').locator('option').evaluateAll((options) =>
     options.map((option) => (option as HTMLOptionElement).value));
   assert.deepEqual(protocolValues, ['', 'openai', 'anthropic', 'openai-image', 'generation']);
-  await filters.getByLabel('凭据别名前缀').fill('Browser');
-  await filters.getByLabel('用户主体前缀').fill('browser-e2e');
-  await filters.getByLabel('路由主键').fill(seed.routeId);
+  await filters.getByLabel('凭据别名').fill('Browser');
+  await filters.getByLabel('用户').fill('browser-e2e');
+  await filters.getByLabel('路由 ID').fill(seed.routeId);
   await filters.getByLabel('上游提供商').selectOption(seed.upstreamId);
   await filters.getByLabel('最低费用').fill('0');
   await filters.getByLabel('最高费用').fill('1000');

@@ -56,8 +56,8 @@ When('下游用户筛选失败请求并打开详情', async function (this: Dogf
   const seed = runtime.requireSeed();
   await openAppRoute(page, 'portal', 'requests');
   const filters = page.locator('.self-request-filters');
-  await filters.getByLabel('上游主键').fill(seed.upstreamId);
-  await filters.getByLabel('路由主键').fill(seed.routeId);
+  await filters.getByLabel('上游 ID').fill(seed.upstreamId);
+  await filters.getByLabel('路由 ID').fill(seed.routeId);
   await filters.getByLabel('最低费用').fill('0');
   await filters.getByLabel('最高费用').fill('1000');
   await filters.getByRole('button', { name: '应用筛选' }).click();
@@ -713,7 +713,7 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   const filters = page.locator('.traffic-filters');
   await filters.getByLabel('模型').fill(model);
   await filters.getByRole('button', { name: '应用筛选', exact: true }).click();
-  await assertVisible(page.getByRole('heading', { name: '筛选请求', exact: true }));
+  await assertVisible(page.getByRole('heading', { name: '筛选结果', exact: true }));
   const connectionsBeforeFilterReset = observation.connectionUrls.length;
   await filters.getByRole('button', { name: '清除筛选', exact: true }).click();
   await eventually(

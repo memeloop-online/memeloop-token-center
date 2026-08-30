@@ -5,8 +5,11 @@
 }
 
 .table-scroll {
+  width: 100%;
   max-width: 100%;
   min-width: 0;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
 }
 
 .bucket-heading {
@@ -204,6 +207,21 @@ button.bucket-heading:hover b {
   }
 }
 
+@media (width > 900px) and (width <= 1100px) {
+  .hero {
+    flex-wrap: wrap;
+  }
+
+  .hero > .credential {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+  }
+
+  .hero > .credential input {
+    width: min(100%, 420px);
+  }
+}
+
 .generation-parameters {
   border-top: 1px solid #293c42;
   margin-top: 18px;
@@ -228,7 +246,7 @@ button.bucket-heading:hover b {
 
 @media (width <= 480px) {
   .table-scroll {
-    max-width: calc(100vw - 48px);
+    max-width: 100%;
     width: 100%;
   }
 
@@ -247,6 +265,14 @@ button.bucket-heading:hover b {
   display: grid;
   gap: 12px;
   margin-top: 14px;
+}
+
+/* Session cards are independent summaries. Let widescreen workspaces scan them
+   side by side while retaining a single, readable column around tablet width. */
+@media (width > 1100px) {
+  .session-list {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 30rem), 1fr));
+  }
 }
 
 .session-card {
@@ -437,6 +463,8 @@ button.bucket-heading:hover b {
 
 @media (width <= 480px) {
   .session-card { padding: 12px; }
+  .session-card-heading { align-items: start; grid-template-columns: minmax(0, 1fr); }
+  .session-card-heading > span { justify-content: flex-start; }
   .session-card-metrics,
   .session-controls { grid-template-columns: minmax(0, 1fr); }
   .session-card-actions { align-items: stretch; flex-direction: column; }

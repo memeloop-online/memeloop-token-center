@@ -77,7 +77,7 @@ When('只读验收使用旧客户端凭据打开自助门户', async function (t
   const page = this.requirePage();
   const configuration = liveRuntime.requireConfiguration();
   await this.open(configuration.gatewayURL, '/portal', 'zh-CN', 'light');
-  await page.getByLabel('客户端凭据', { exact: true }).fill(configuration.clientCredential);
+  await page.getByPlaceholder('输入客户端凭据').fill(configuration.clientCredential);
   await page.getByRole('button', { name: '进入', exact: true }).click();
   await page.locator('.key-summary').waitFor({ state: 'visible' });
 });

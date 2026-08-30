@@ -615,6 +615,10 @@
   flex-wrap: wrap;
 }
 
+.traffic-heading-actions .session-live-state {
+  margin-top: 0;
+}
+
 .segmented button {
   background: transparent;
   border-color: transparent;
@@ -1141,6 +1145,15 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .traffic-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .traffic-heading-actions {
+    justify-content: space-between;
+  }
+
 
   .usage-overview-tables {
     grid-template-columns: minmax(0, 1fr);
@@ -1200,6 +1213,15 @@
 
   .row-actions,
   .row-actions button {
+    width: 100%;
+  }
+
+  .traffic-heading-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .traffic-heading-actions .segmented {
     width: 100%;
   }
 }

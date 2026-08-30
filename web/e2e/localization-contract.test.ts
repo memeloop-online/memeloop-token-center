@@ -41,8 +41,8 @@ test('application rail uses localized product labels instead of OP or SELF abbre
 test('usage copy names stable upstream accounts without exposing analytics implementation notes', () => {
   assert.equal(translationCatalogs['zh-CN']['usage.tab.upstreams'], '上游账户分析');
   assert.equal(translationCatalogs.en['usage.tab.upstreams'], 'Upstream account analysis');
-  assert.match(translationCatalogs['zh-CN']['usage.sessionScope'], /100 个会话.*未归入会话.*单独列出/);
-  assert.match(translationCatalogs.en['usage.sessionScope'], /top 100 sessions.*ungrouped requests.*separately/i);
+  assert.match(translationCatalogs['zh-CN']['usage.sessionScope'], /100 个会话.*未关联会话.*单独列出/);
+  assert.match(translationCatalogs.en['usage.sessionScope'], /100 busiest sessions.*without a session.*separately/i);
   for (const [locale, catalog] of Object.entries(translationCatalogs)) {
     const exposed = Object.values(catalog).filter((value) => /\bSSE\b|\bepoch\b|stable cursor|indexed fields|JSON Schema|Wasmtime|稳定游标|索引字段|毫秒 epoch/i.test(value));
     assert.deepEqual(exposed, [], `${locale} must not expose transport, storage, or runtime implementation notes`);

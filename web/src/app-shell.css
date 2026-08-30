@@ -111,9 +111,10 @@
   border-bottom: 1px solid #213137;
   backdrop-filter: blur(18px);
 }
+.app-breadcrumb { min-width: 0; }
 .app-breadcrumb small, .app-breadcrumb strong { display: block; }
 .app-breadcrumb small { color: #71858d; font-size: 10px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
-.app-breadcrumb strong { margin-top: 2px; color: #dce8ec; font-size: 15px; }
+.app-breadcrumb strong { margin-top: 2px; overflow: hidden; color: #dce8ec; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
 .app-mobile-menu, .app-mobile-preferences { display: none; }
 .app-route-announcement {
   position: fixed;
@@ -206,6 +207,9 @@
 
 @media (width < 480px) {
   .app-context-bar { min-height: 58px; }
+  .app-mobile-menu { width: 40px; height: 40px; margin-right: 7px; }
+  .app-mobile-preferences { flex: 0 0 auto; }
+  .app-mobile-preferences button { width: 40px; height: 40px; }
   .app-breadcrumb small { display: none; }
   .app-breadcrumb strong { font-size: 14px; }
   .app-main-content { padding-inline: 10px; }

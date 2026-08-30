@@ -198,7 +198,7 @@ Then('六类可靠关系、候选关系、未关联请求和语义执行图被�
   await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
   const unlinked = page.locator('.session-card').filter({ hasText: '未关联请求' }).first();
   await visible(unlinked);
-  assert.match(await unlinked.textContent() ?? '', /尚未归入会话/);
+  assert.match(await unlinked.textContent() ?? '', /未关联会话/);
 });
 
 When('连续新请求进入活跃状态并分别完成为成功和错误', async function (this: DogfoodWorld) {

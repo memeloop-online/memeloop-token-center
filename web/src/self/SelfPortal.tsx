@@ -8,6 +8,7 @@ import { selfErrorMessage } from './errors';
 import { type SelfPortalRoute } from './routes';
 import { SelfPortalNavigation } from './SelfPortalNavigation';
 import { RequestDetailDrawer } from './SelfDrawers';
+import './SelfPortal.css';
 
 const GeneratePage = lazy(() => import('./GeneratePage').then((module) => ({ default: module.GeneratePage })));
 const GenerationsPage = lazy(() => import('./GenerationsPage').then((module) => ({ default: module.GenerationsPage })));
@@ -36,6 +37,7 @@ export function SelfPortal({ route, onRouteChange, showNavigation = true, embedd
   const activeRoute = route ?? internalRoute;
   const [credential, setCredential] = useState(() => readRememberedCredential('self'));
   const [credentialInput, setCredentialInput] = useState('');
+  const [credentialVisible, setCredentialVisible] = useState(false);
   const [credentialView, setCredentialView] = useState<KeyView>();
   const [requestDetail, setRequestDetail] = useState<RequestDetail>();
   const [sessionFocus, setSessionFocus] = useState<string>();
@@ -75,7 +77,10 @@ export function SelfPortal({ route, onRouteChange, showNavigation = true, embedd
       setCredentialView(view);
       credentialScopeRef.current += 1;
       setCredentialScopeGeneration((current) => current + 1);
-      if (replaceCredential) setCredentialInput('');
+      if (replaceCredential) {
+        setCredentialInput('');
+        setCredentialVisible(false);
+      }
     } catch (reason) {
       if (sequence !== authSequence.current || controller.signal.aborted) return;
       setCredentialView(undefined);
@@ -98,6 +103,7 @@ export function SelfPortal({ route, onRouteChange, showNavigation = true, embedd
     clearRememberedCredential('self');
     setCredential('');
     setCredentialInput('');
+    setCredentialVisible(false);
     setCredentialView(undefined);
     setRequestDetail(undefined);
     setSessionFocus(undefined);
@@ -168,7 +174,7 @@ export function SelfPortal({ route, onRouteChange, showNavigation = true, embedd
     : `signed-out:${credentialScopeGeneration}`;
 
   const content = <div className="self-portal" data-self-route={activeRoute}>
-    {!credentialView ? <header className="hero self-sign-in"><div><h1>{t('self.title')}</h1></div><form className="credential" onSubmit={submitCredential}><label><span>{t('self.credential')}</span><input autoComplete="off" type="password" value={credentialInput} onChange={(event) => setCredentialInput(event.target.value)} placeholder={t('self.placeholder')} /></label><button type="submit" disabled={authenticating || !credentialInput.trim()}>{authenticating ? t('common.loading') : t('common.load')}</button>{credential && <button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button>}</form></header> : <>
+    {!credentialView ? <header className="hero self-sign-in"><div><h1>{t('self.title')}</h1></div><form className="credential" onSubmit={submitCredential}><label><span>{t('self.credential')}</span><span className="credential-input"><input autoComplete="off" type={credentialVisible ? 'text' : 'password'} value={credentialInput} onChange={(event) => setCredentialInput(event.target.value)} placeholder={t('self.placeholder')} /><button type="button" className="secondary credential-visibility" aria-pressed={credentialVisible} onClick={() => setCredentialVisible((visible) => !visible)}>{t(credentialVisible ? 'common.hide' : 'common.show')}</button></span></label><button type="submit" disabled={authenticating || !credentialInput.trim()}>{authenticating ? t('common.loading') : t('common.load')}</button>{credential && <button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button>}</form></header> : <>
       <div className="console-context self-account-status"><div><b>{credentialView.alias}</b><span>{t('common.savedCredentialInUse')}</span></div><button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button></div>
       {showNavigation && <SelfPortalNavigation activeRoute={activeRoute} onNavigate={navigate} />}
     </>}

@@ -133,7 +133,12 @@ export async function assertGenerationDownload(page: Page, generationModel: stri
   await row.getByRole('button', { name: `查看 ${generationModel} 生成任务`, exact: true }).click();
   const drawer = page.getByRole('dialog');
   const downloadPromise = page.waitForEvent('download');
-  await drawer.getByRole('button', { name: '下载资产', exact: true }).click();
+  const assetRequestPromise = page.waitForRequest((request) => new URL(request.url()).pathname.includes('/self/v1/generations/') && new URL(request.url()).pathname.includes('/assets/'));
+  await drawer.getByRole('button', { name: '下载文件', exact: true }).click();
+  const assetRequest = await assetRequestPromise;
+  const assetResponse = await assetRequest.response();
+  assert.ok(assetResponse, `generation asset request did not receive a response: ${assetRequest.failure()?.errorText ?? 'unknown failure'}`);
+  assert.equal(assetResponse.status(), 200, `generation asset request failed: ${await assetResponse.text()}`);
   const download = await downloadPromise;
   assert.equal(download.suggestedFilename(), filename);
   const path = await download.path();
