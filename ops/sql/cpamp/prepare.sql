@@ -24,7 +24,14 @@ ALTER TABLE cpamp_import_checkpoints
   DROP CONSTRAINT IF EXISTS cpamp_import_checkpoints_pkey;
 ALTER TABLE cpamp_import_checkpoints
   ADD CONSTRAINT cpamp_import_checkpoints_pkey PRIMARY KEY (tenant_external_id, source);
-CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_usage (
+-- These tables are disposable, process-global staging protected by the importer's
+-- advisory lock. Recreate them so installations left with an older staging shape
+-- are upgraded without altering durable checkpoints, provenance, audit, or user data.
+DROP TABLE IF EXISTS cpamp_import_usage, cpamp_import_aliases,
+  cpamp_import_prices, cpamp_import_context_prices,
+  cpamp_import_service_prices, cpamp_import_identities,
+  cpamp_import_new_requests, cpamp_import_evaluated;
+CREATE UNLOGGED TABLE cpamp_import_usage (
   event_hash text, request_id text, timestamp_ms bigint, provider text,
   model text, endpoint text, api_key_hash text, requested_model text,
   resolved_model text, reasoning_effort text, service_tier text,
@@ -37,10 +44,10 @@ CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_usage (
   latency_ms bigint, ttft_ms bigint, failed bigint,
   fail_status_code bigint, fail_summary text
 );
-CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_aliases (
+CREATE UNLOGGED TABLE cpamp_import_aliases (
   api_key_hash text, alias text, updated_at_ms bigint
 );
-CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_prices (
+CREATE UNLOGGED TABLE cpamp_import_prices (
   model text, prompt_per_1m numeric, completion_per_1m numeric,
   cache_per_1m numeric, cache_read_per_1m numeric,
   cache_creation_per_1m numeric, prompt_configured bigint,
@@ -48,27 +55,27 @@ CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_prices (
   cache_creation_configured bigint, source text, source_model_id text,
   updated_at_ms bigint
 );
-CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_context_prices (
+CREATE UNLOGGED TABLE cpamp_import_context_prices (
   model text, threshold_tokens bigint, prompt_per_1m numeric,
   completion_per_1m numeric, cache_per_1m numeric, cache_read_per_1m numeric,
   cache_creation_per_1m numeric, prompt_configured bigint,
   completion_configured bigint, cache_configured bigint,
   cache_read_configured bigint, cache_creation_configured bigint
 );
-CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_service_prices (
+CREATE UNLOGGED TABLE cpamp_import_service_prices (
   model text, mode text, service_tier text, prompt_per_1m numeric,
   completion_per_1m numeric, cache_per_1m numeric, cache_read_per_1m numeric,
   cache_creation_per_1m numeric, prompt_configured bigint,
   completion_configured bigint, cache_configured bigint,
   cache_read_configured bigint, cache_creation_configured bigint
 );
-CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_identities (
+CREATE UNLOGGED TABLE cpamp_import_identities (
   api_key_hash text PRIMARY KEY, key_id text NOT NULL, account_id text NOT NULL,
   alias text NOT NULL
 );
-CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_new_requests
+CREATE UNLOGGED TABLE cpamp_import_new_requests
   (LIKE request_records INCLUDING DEFAULTS);
-CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_evaluated (
+CREATE UNLOGGED TABLE cpamp_import_evaluated (
   event_hash text, request_id text, timestamp_ms bigint, provider text,
   model text, endpoint text, api_key_hash text, requested_model text,
   resolved_model text, reasoning_effort text, source_service_tier text,
@@ -88,9 +95,6 @@ CREATE UNLOGGED TABLE IF NOT EXISTS cpamp_import_evaluated (
   cost_micros bigint, pricing_digest text, pricing_config_json text,
   validation_error text
 );
-ALTER TABLE cpamp_import_evaluated
-  ADD COLUMN IF NOT EXISTS pricing_config_json text;
-
 CREATE TABLE IF NOT EXISTS cpamp_import_event_provenance (
   tenant_id text NOT NULL, source text NOT NULL, external_event_hash text NOT NULL,
   target_request_id text NOT NULL, source_digest text NOT NULL,

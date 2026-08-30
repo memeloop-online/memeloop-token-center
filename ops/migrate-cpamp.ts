@@ -97,12 +97,21 @@ function requireSqliteColumns(sqlitePath: string, table: string, requiredColumns
   }
 }
 
-async function pipeSqliteCsvToPostgres(sqlitePath: string, query: string, table: string): Promise<void> {
+async function pipeSqliteCsvToPostgres(
+  sqlitePath: string,
+  query: string,
+  table: string,
+  columns: readonly string[],
+): Promise<void> {
+  if (!/^[a-z0-9_]+$/.test(table) || columns.length === 0 || columns.some((column) => !/^[a-z0-9_]+$/.test(column))) {
+    fail("invalid PostgreSQL staging copy contract");
+  }
+  const target = `${table} (${columns.join(", ")})`;
   const sqlite = spawn("sqlite3", ["-header", "-csv", sqlitePath, query], {
     shell: false,
     stdio: ["ignore", "pipe", "inherit"],
   });
-  const postgres = spawn("psql", psqlArgs(["-c", `\\copy ${table} FROM STDIN WITH (FORMAT csv, HEADER true)`]), {
+  const postgres = spawn("psql", psqlArgs(["-c", `\\copy ${target} FROM STDIN WITH (FORMAT csv, HEADER true)`]), {
     env: process.env,
     shell: false,
     stdio: ["pipe", "inherit", "inherit"],
@@ -284,11 +293,20 @@ async function main(): Promise<void> {
       sqlitePath,
       `SELECT event_hash, request_id, timestamp_ms, provider, model, endpoint, lower(api_key_hash), requested_model, resolved_model, reasoning_effort, service_tier, request_service_tier, response_service_tier, cache_input_mode, input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_tokens, cache_read_tokens, cache_creation_tokens, normalized_uncached_input_tokens, normalized_total_input_tokens, normalized_cache_read_tokens, normalized_cache_creation_tokens, total_tokens, latency_ms, ttft_ms, CASE WHEN failed THEN 1 ELSE 0 END, COALESCE(fail_status_code, 0), COALESCE(fail_summary, '') FROM usage_events WHERE event_hash <> '' AND timestamp_ms >= ${lowerBound};`,
       "cpamp_import_usage",
+      [
+        "event_hash", "request_id", "timestamp_ms", "provider", "model", "endpoint",
+        "api_key_hash", "requested_model", "resolved_model", "reasoning_effort", "service_tier",
+        "request_service_tier", "response_service_tier", "cache_input_mode", "input_tokens",
+        "output_tokens", "reasoning_tokens", "cached_tokens", "cache_tokens", "cache_read_tokens",
+        "cache_creation_tokens", "normalized_uncached_input_tokens", "normalized_total_input_tokens",
+        "normalized_cache_read_tokens", "normalized_cache_creation_tokens", "total_tokens", "latency_ms",
+        "ttft_ms", "failed", "fail_status_code", "fail_summary",
+      ],
     );
-    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT lower(api_key_hash), alias, updated_at_ms FROM api_key_aliases;", "cpamp_import_aliases");
-    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT model, prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m, prompt_configured, completion_configured, cache_read_configured, cache_creation_configured, COALESCE(source, ''), COALESCE(source_model_id, ''), updated_at_ms FROM model_prices;", "cpamp_import_prices");
-    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT model, threshold_tokens, prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m, prompt_configured, completion_configured, cache_configured, cache_read_configured, cache_creation_configured FROM model_price_context_tiers;", "cpamp_import_context_prices");
-    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT model, lower(trim(mode)), lower(trim(service_tier)), prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m, prompt_configured, completion_configured, cache_configured, cache_read_configured, cache_creation_configured FROM model_price_service_tiers;", "cpamp_import_service_prices");
+    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT lower(api_key_hash), alias, updated_at_ms FROM api_key_aliases;", "cpamp_import_aliases", ["api_key_hash", "alias", "updated_at_ms"]);
+    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT model, prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m, prompt_configured, completion_configured, cache_read_configured, cache_creation_configured, COALESCE(source, ''), COALESCE(source_model_id, ''), updated_at_ms FROM model_prices;", "cpamp_import_prices", ["model", "prompt_per_1m", "completion_per_1m", "cache_per_1m", "cache_read_per_1m", "cache_creation_per_1m", "prompt_configured", "completion_configured", "cache_read_configured", "cache_creation_configured", "source", "source_model_id", "updated_at_ms"]);
+    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT model, threshold_tokens, prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m, prompt_configured, completion_configured, cache_configured, cache_read_configured, cache_creation_configured FROM model_price_context_tiers;", "cpamp_import_context_prices", ["model", "threshold_tokens", "prompt_per_1m", "completion_per_1m", "cache_per_1m", "cache_read_per_1m", "cache_creation_per_1m", "prompt_configured", "completion_configured", "cache_configured", "cache_read_configured", "cache_creation_configured"]);
+    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT model, lower(trim(mode)), lower(trim(service_tier)), prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m, prompt_configured, completion_configured, cache_configured, cache_read_configured, cache_creation_configured FROM model_price_service_tiers;", "cpamp_import_service_prices", ["model", "mode", "service_tier", "prompt_per_1m", "completion_per_1m", "cache_per_1m", "cache_read_per_1m", "cache_creation_per_1m", "prompt_configured", "completion_configured", "cache_configured", "cache_read_configured", "cache_creation_configured"]);
 
     runPsql([], readSql("evaluate.sql"));
 

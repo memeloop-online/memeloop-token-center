@@ -174,12 +174,31 @@ CREATE TABLE session_usage_daily (
   PRIMARY KEY(tenant_id,key_id,session_id,day_bucket,model,protocol,status_class,error_code,upstream_account_id,model_route_id,currency));`);
   psql("CREATE TABLE IF NOT EXISTS request_records_default PARTITION OF request_records DEFAULT;");
 
+  // A previous importer release left process-global UNLOGGED staging tables in
+  // place. The current importer must replace only that disposable schema while
+  // preserving durable checkpoint rows.
+  psql(`CREATE TABLE cpamp_import_checkpoints (
+    tenant_external_id TEXT NOT NULL, source TEXT NOT NULL,
+    watermark_ms BIGINT NOT NULL, watermark_hash TEXT NOT NULL,
+    imported_events BIGINT NOT NULL, updated_at BIGINT NOT NULL,
+    PRIMARY KEY (tenant_external_id, source));
+  INSERT INTO cpamp_import_checkpoints
+    (tenant_external_id,source,watermark_ms,watermark_hash,imported_events,updated_at)
+    VALUES ('legacy-staging-sentinel','legacy-source',17,'legacy-hash',3,19);
+  CREATE UNLOGGED TABLE cpamp_import_usage (
+    event_hash TEXT, request_id TEXT, timestamp_ms BIGINT,
+    provider TEXT, model TEXT, endpoint TEXT, api_key_hash TEXT);
+  INSERT INTO cpamp_import_usage VALUES
+    ('stale-event','stale-request',1,'legacy','legacy','/v1/responses','stale-key');`);
+
   initializeSqlite(databases.same);
   sqlite(databases.same, `DELETE FROM usage_events;
 ${basicEvent('fixture-event-same-duplicate','legacy-request-same-duplicate',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',5,2,40,0)}
 ${basicEvent('fixture-event-same-duplicate','legacy-request-same-duplicate',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',5,2,40,0)}`);
   const sameTenant = `cpamp-${runId}-same-duplicate`;
   importOk(sameTenant, duplicateSource, databases.same);
+  assert.equal(psql("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='cpamp_import_usage';"), "31", "legacy staging table is rebuilt to the current shape");
+  assert.equal(psql("SELECT watermark_ms || '|' || watermark_hash || '|' || imported_events || '|' || updated_at FROM cpamp_import_checkpoints WHERE tenant_external_id='legacy-staging-sentinel' AND source='legacy-source';"), "17|legacy-hash|3|19", "durable checkpoint survives staging rebuild");
   importOk(sameTenant, duplicateSource, databases.same);
   assert.equal(sqlite(databases.same, "SELECT count(*) || '|' || count(DISTINCT event_hash) FROM usage_events;"), "2|1");
   assert.equal(psql(`SELECT
