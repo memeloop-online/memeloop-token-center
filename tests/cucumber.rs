@@ -6744,91 +6744,17 @@ async fn late_cpamp_import_is_exact(world: &mut TokenCenterWorld) {
 
     let pool = PgPool::connect(&world.import_database_url)
         .await
-        .expect("connect for CPAMP price settlement");
-    let key_row = sqlx::query(
-        "SELECT k.id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.credential_generation, k.policy_json FROM key_records k JOIN tenants t ON t.id = k.tenant_id WHERE t.external_id = $1",
-    )
-    .bind(&world.import_tenant)
-    .fetch_one(&pool)
-    .await
-    .expect("imported CPAMP key");
-    let key = memeloop_token_center::model::AuthenticatedKey {
-        key_id: Uuid::parse_str(key_row.get("id")).expect("key UUID"),
-        tenant_id: Uuid::parse_str(key_row.get("tenant_id")).expect("tenant UUID"),
-        principal_id: Uuid::parse_str(key_row.get("principal_id")).expect("principal UUID"),
-        account_id: Uuid::parse_str(key_row.get("account_id")).expect("account UUID"),
-        alias: key_row.get("alias"),
-        currency: key_row.get("currency"),
-        credential_generation: key_row.get("credential_generation"),
-        policy: serde_json::from_str(&key_row.get::<String, _>("policy_json")).expect("key policy"),
-    };
-    sqlx::query("UPDATE credit_accounts SET available_micros = 1000000000 WHERE id = $1")
-        .bind(key.account_id.to_string())
-        .execute(&pool)
-        .await
-        .expect("fund CPAMP acceptance account");
-    let tier = sqlx::query(
-        "SELECT input_micros_per_million, output_micros_per_million, source FROM model_price_tiers WHERE model = 'fixture-model' AND currency = 'USD' AND service_tier = 'default'",
+        .expect("verify source price isolation");
+    let global_price_rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM model_prices WHERE model = 'fixture-model') + (SELECT COUNT(*) FROM model_price_tiers WHERE model = 'fixture-model')",
     )
     .fetch_one(&pool)
     .await
-    .expect("updated CPAMP tier");
-    assert_eq!(tier.get::<i64, _>("input_micros_per_million"), 3_000_000);
-    assert_eq!(tier.get::<i64, _>("output_micros_per_million"), 5_000_000);
-    assert_eq!(tier.get::<String, _>("source"), "cpamp:fixture");
-    pool.close().await;
-    let database = memeloop_token_center::db::Database::connect(&world.import_database_url)
-        .await
-        .expect("connect settlement database");
-    let price = database
-        .model_price("fixture-model", "USD")
-        .await
-        .expect("updated CPAMP model price");
-    let reservation = database
-        .reserve_usage(&key, &price, 10, 10)
-        .await
-        .expect("reserve with updated CPAMP tier");
-    let charged = database
-        .settle_usage(&reservation, 1, 1)
-        .await
-        .expect("settle with updated CPAMP tier");
-    assert_eq!(charged, 8);
-    assert_eq!(database.settle_usage(&reservation, 1, 1).await.unwrap(), 8);
-
-    let pool = PgPool::connect(&world.import_database_url)
-        .await
-        .expect("connect for manual price precedence");
-    sqlx::query("UPDATE model_prices SET input_micros_per_million = 9000000, output_micros_per_million = 11000000, source = 'manual' WHERE model = 'fixture-model' AND currency = 'USD'")
-        .execute(&pool)
-        .await
-        .expect("install manual base price override");
-    sqlx::query("UPDATE model_price_tiers SET input_micros_per_million = 9000000, cached_input_micros_per_million = 9000000, cache_write_micros_per_million = 9000000, output_micros_per_million = 11000000, source = 'manual' WHERE model = 'fixture-model' AND currency = 'USD' AND service_tier = 'default'")
-        .execute(&pool)
-        .await
-        .expect("install manual tier price override");
-    pool.close().await;
-    let status = Command::new("sqlite3")
-        .arg(sqlite_path)
-        .arg("UPDATE model_prices SET prompt_per_1m = 4.0, completion_per_1m = 6.0, updated_at_ms = 600000000 WHERE model = 'fixture-model';")
-        .status()
-        .expect("update CPAMP source beneath manual override");
-    assert!(status.success());
-    run_cpamp_importer(world);
-    let pool = PgPool::connect(&world.import_database_url)
-        .await
-        .expect("verify manual price precedence");
-    let preserved = sqlx::query(
-        "SELECT b.input_micros_per_million AS base_input, b.output_micros_per_million AS base_output, b.source AS base_source, t.input_micros_per_million AS tier_input, t.output_micros_per_million AS tier_output, t.source AS tier_source FROM model_prices b JOIN model_price_tiers t ON t.model = b.model AND t.currency = b.currency AND t.service_tier = 'default' WHERE b.model = 'fixture-model' AND b.currency = 'USD'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("preserved manual prices");
-    assert_eq!(preserved.get::<i64, _>("base_input"), 9_000_000);
-    assert_eq!(preserved.get::<i64, _>("base_output"), 11_000_000);
-    assert_eq!(preserved.get::<String, _>("base_source"), "manual");
-    assert_eq!(preserved.get::<i64, _>("tier_input"), 9_000_000);
-    assert_eq!(preserved.get::<i64, _>("tier_output"), 11_000_000);
-    assert_eq!(preserved.get::<String, _>("tier_source"), "manual");
+    .expect("updated CPAMP source prices remain provenance-only");
+    assert_eq!(
+        global_price_rows, 0,
+        "source price updates must not create operator-managed catalog rows"
+    );
     pool.close().await;
 
     let status = Command::new("sqlite3")

@@ -173,12 +173,6 @@ CREATE TABLE session_usage_daily (
   duration_sum_ms BIGINT NOT NULL,cost_micros BIGINT NOT NULL,
   PRIMARY KEY(tenant_id,key_id,session_id,day_bucket,model,protocol,status_class,error_code,upstream_account_id,model_route_id,currency));`);
   psql("CREATE TABLE IF NOT EXISTS request_records_default PARTITION OF request_records DEFAULT;");
-  for (const migration of [
-    "0021_request_locators.sql", "0022_budget_rollups.sql", "0023_generation_daily_aggregates.sql",
-    "0024_request_stats_rollups.sql", "0027_cpamp_source_digests.sql",
-  ]) {
-    requireSuccess(run("psql", ["-X", "-v", "ON_ERROR_STOP=1", "--no-psqlrc", "-f", join(workRoot, migration)], undefined, environment), migration);
-  }
 
   initializeSqlite(databases.same);
   sqlite(databases.same, `DELETE FROM usage_events;
