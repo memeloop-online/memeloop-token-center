@@ -326,9 +326,15 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await assertVisible(routeForm.locator('.selection-chip').filter({ hasText: 'Browser UI ComfyUI' }));
   await routeForm.getByLabel('协议').selectOption('generation');
   await routeForm.getByLabel('上游模型').fill('browser-workflow-v1');
-  await routeForm.getByLabel(/未验证的自定义模型/).check();
+  const imageCustomModelConfirmation = routeForm.getByLabel(/未验证的自定义模型/);
+  const createImageRouteButton = routeForm.getByRole('button', { name: '创建路由', exact: true });
+  await eventually(async () => {
+    assert.ok(await imageCustomModelConfirmation.isVisible() || await createImageRouteButton.isEnabled(),
+      'image route must either require custom-model confirmation or be catalog-verified');
+  });
+  if (await imageCustomModelConfirmation.isVisible()) await imageCustomModelConfirmation.check();
   const imageRouteResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
-  await routeForm.getByRole('button', { name: '创建路由', exact: true }).click();
+  await createImageRouteButton.click();
   const imageRouteResponse = await imageRouteResponsePromise;
   assert.equal(imageRouteResponse.status(), 201, await imageRouteResponse.text());
   const imageRoute = await imageRouteResponse.json() as { id: string };
