@@ -4,8 +4,9 @@ import { Given, Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
 import { baseURL, eventually, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
+import { appPreferenceControls, openAppRoute } from './app-route.support.js';
 
-import { assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertValue, assertVisible, applyUsageFilter, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
+import { assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertValue, assertVisible, applyUsageFilter, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, operatorTrafficPanel, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
 When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且仅显示产品接入方式', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.route('**/internal/v1/provider-types', async (route) => {
@@ -67,13 +68,13 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   const page = this.requirePage();
   const seed = runtime.requireSeed();
 
-  await page.getByRole('tab', { name: '请求统计', exact: true }).click();
+  await openAppRoute(page, 'operator', 'usage');
   await assertExactText(metric(page, '请求数'), '51');
   await assertNoCount(page.locator('.notice.error'));
 
-  await page.getByRole('tab', { name: '实时请求', exact: true }).click();
-  await assertVisible(page.getByRole('heading', { name: '实时请求尾流', exact: true }));
-  await assertNoCount(page.locator('#operator-panel-traffic .metric'));
+  await openAppRoute(page, 'operator', 'requests');
+  await assertVisible(page.getByRole('heading', { name: '实时请求', exact: true }));
+  await assertNoCount(operatorTrafficPanel(page).locator('.metric'));
   const filters = page.locator('.traffic-filters');
   const protocolValues = await filters.getByLabel('协议').locator('option').evaluateAll((options) =>
     options.map((option) => (option as HTMLOptionElement).value));
@@ -85,18 +86,18 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   await filters.getByLabel('最低费用').fill('0');
   await filters.getByLabel('最高费用').fill('1000');
   await filters.getByRole('button', { name: '应用筛选' }).click();
-  await assertCount(page.locator('#operator-panel-traffic tbody tr'), 51);
+  await assertCount(operatorTrafficPanel(page).locator('tbody tr'), 51);
 
   await filters.getByLabel('状态').selectOption('error');
   await filters.getByLabel('错误码').fill('http_429');
   await filters.getByRole('button', { name: '应用筛选' }).click();
   await assertValue(filters.getByLabel('状态'), 'error');
   await assertValue(filters.getByLabel('错误码'), 'http_429');
-  await assertCount(page.locator('#operator-panel-traffic tbody tr'), 1);
-  await assertContains(page.locator('#operator-panel-traffic tbody'), 'http_429');
+  await assertCount(operatorTrafficPanel(page).locator('tbody tr'), 1);
+  await assertContains(operatorTrafficPanel(page).locator('tbody'), 'http_429');
 
   await filters.getByRole('button', { name: '清除筛选' }).click();
-  await assertCount(page.locator('#operator-panel-traffic tbody tr'), 51);
+  await assertCount(operatorTrafficPanel(page).locator('tbody tr'), 51);
 });
 
 Then('租户边界和未认证请求在解析正文前生效', async function () {
@@ -118,7 +119,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   const page = this.requirePage();
   const seed = runtime.requireSeed();
 
-  await page.getByRole('tab', { name: '上游提供商', exact: true }).click();
+  await openAppRoute(page, 'operator', 'providers');
   const onboarding = page.locator('.provider-onboarding');
   await onboarding.locator('summary').click();
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
@@ -138,12 +139,13 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   seed.upstreamName = 'Browser mock upstream edited';
   await providerAccount.getByRole('button', { name: '停用', exact: true }).click();
   await assertContains(providerAccount, '已停用');
+  await assertNotContains(providerAccount, '连接正常');
   await providerAccount.getByRole('button', { name: '启用', exact: true }).click();
   await assertContains(providerAccount, '正常');
   await onboarding.getByRole('button', { name: '账户授权', exact: true }).click();
   await assertContains(onboarding.getByLabel('服务提供商'), 'OpenAI Codex');
 
-  await page.getByRole('tab', { name: '模型路由', exact: true }).click();
+  await openAppRoute(page, 'operator', 'routes');
   const routeRow = page.locator('tbody tr').filter({ hasText: model });
   await assertContains(routeRow, 'Browser mock upstream');
   await routeRow.getByRole('button', { name: '编辑', exact: true }).click();
@@ -177,7 +179,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
 
 Then('中英文新增上游使用面向操作的产品文案', async function (this: DogfoodWorld) {
   const page = this.requirePage();
-  await page.getByRole('tab', { name: '上游提供商', exact: true }).click();
+  await openAppRoute(page, 'operator', 'providers');
   const onboarding = page.locator('.provider-onboarding');
   await onboarding.locator('summary').click();
   await assertVisible(page.getByRole('heading', { name: '上游服务', exact: true }));
@@ -206,7 +208,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await assertNotContains(page.locator('body'), '订阅桥接');
   await assertNotContains(page.locator('body'), '插件 OAuth Adapter');
 
-  await page.locator('.rail .language-toggle').click();
+  await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
   await assertAttribute(page.locator('html'), 'lang', 'en');
   await assertVisible(page.getByRole('heading', { name: 'Upstream services', exact: true }));
   await assertContains(page.locator('.provider-list'), 'Connect and manage model services.');
@@ -227,7 +229,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
 When('管理员用键盘创建提供商组和路由组', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
-  await page.getByRole('tab', { name: '模型路由', exact: true }).click();
+  await openAppRoute(page, 'operator', 'routes');
   await assertVisible(page.locator('.group-manager[data-group-kind="provider"]'));
   await assertVisible(page.locator('.group-manager[data-group-kind="route"]'));
   const providerGroups = page.locator('.group-manager[data-group-kind="provider"]');
@@ -257,7 +259,7 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
   assert.deepEqual(providerMembersPayload.member_ids, [seed.upstreamId]);
 
   await connectOperator(this, 'dark');
-  await page.getByRole('tab', { name: '模型路由', exact: true }).click();
+  await openAppRoute(page, 'operator', 'routes');
   const reloadedProviderGroups = page.locator('.group-manager[data-group-kind="provider"]');
   await assertContains(reloadedProviderGroups, '主力提供商');
   await assertContains(reloadedProviderGroups.locator('.selection-chip'), 'Browser mock upstream');
@@ -307,7 +309,7 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
   await assertVisible(routeRow);
 
   await connectOperator(this, 'dark');
-  await page.getByRole('tab', { name: '模型路由', exact: true }).click();
+  await openAppRoute(page, 'operator', 'routes');
   const reloadedRouteGroups = page.locator('.group-manager[data-group-kind="route"]');
   await assertContains(reloadedRouteGroups, '默认路由');
   await assertContains(reloadedRouteGroups.locator('.selection-chip'), groupedModel);
@@ -316,7 +318,7 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
 Then('提供商组参与路由候选而路由组参与凭据授权', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
-  await page.getByRole('tab', { name: '凭据管理', exact: true }).click();
+  await openAppRoute(page, 'operator', 'credentials');
   const credential = page.locator('.managed-resource').filter({ hasText: seed.clientKeyId });
   const openedRouting = page.waitForResponse((response) => response.url().includes(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'GET');
   await credential.getByRole('button', { name: '路由权限', exact: true }).click();
@@ -383,7 +385,7 @@ When('管理员创建凭据组并按组筛选凭据', async function (this: Dogf
   assert.deepEqual(Object.keys(credentialMembersPayload).sort(), ['expected_updated_at', 'member_ids', 'tenant_external_id']);
   assert.deepEqual(credentialMembersPayload.member_ids, [seed.clientKeyId]);
   await connectOperator(this, 'dark');
-  await page.getByRole('tab', { name: '凭据管理', exact: true }).click();
+  await openAppRoute(page, 'operator', 'credentials');
   await page.getByLabel('按凭据组筛选').selectOption({ label: '测试凭据' });
   await assertCount(page.locator('.managed-resource').filter({ hasText: seed.clientKeyId }), 1);
   await assertNoCount(page.locator('.managed-resource').filter({ hasText: seed.otherClientKeyId }));
@@ -412,7 +414,7 @@ Then('凭据组只用于分类且不改变凭据授权或可用模型', async fu
   await routeGroupInput.fill('不存在的权限组');
   await assertNotContains(routing.locator('.combobox-popover'), '创建');
   await routeGroupInput.press('Escape');
-  await page.getByRole('tab', { name: '模型路由', exact: true }).click();
+  await openAppRoute(page, 'operator', 'routes');
   const routeRow = page.locator('tbody tr').filter({ hasText: model });
   await routeRow.getByRole('button', { name: '编辑', exact: true }).click();
   const routeEditor = page.locator('.inline-editor.form-panel');

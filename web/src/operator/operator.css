@@ -607,6 +607,14 @@
   padding: 3px;
 }
 
+.traffic-heading-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .segmented button {
   background: transparent;
   border-color: transparent;

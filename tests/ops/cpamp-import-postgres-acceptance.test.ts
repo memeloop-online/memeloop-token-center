@@ -43,6 +43,9 @@ test("CPAMP import is transactional, replay-safe, bounded by watermarks, and ten
     same: join(workDirectory, "same-duplicate.sqlite"),
     conflicting: join(workDirectory, "conflicting-duplicate.sqlite"),
     failed200: join(workDirectory, "failed-success-code.sqlite"),
+    pricing: join(workDirectory, "pricing.sqlite"),
+    oldSchema: join(workDirectory, "old-schema.sqlite"),
+    missingPrice: join(workDirectory, "missing-price.sqlite"),
   };
   const tenant = `cpamp-${runId}-main`;
   const otherTenant = `cpamp-${runId}-tenant`;
@@ -56,6 +59,63 @@ test("CPAMP import is transactional, replay-safe, bounded by watermarks, and ten
   };
   const sqlite = (database: string, sql: string): string => requireSuccess(run("sqlite3", [database], sql, environment), "sqlite3");
   const initializeSqlite = (database: string): void => { sqlite(database, readFileSync(join(workRoot, "initial.sql"), "utf8")); };
+  const basicEvent = (
+    hash: string,
+    request: string,
+    timestamp: number,
+    provider: string,
+    model: string,
+    endpoint: string,
+    keyHash: string,
+    input: number,
+    output: number,
+    latency: number,
+    failed: number,
+    status: number | null = null,
+    summary = "",
+  ): string => {
+    const quote = (value: string): string => `'${value.replaceAll("'", "''")}'`;
+    return `INSERT INTO usage_events (
+      event_hash,request_id,timestamp_ms,provider,model,endpoint,api_key_hash,
+      input_tokens,output_tokens,latency_ms,failed,fail_status_code,fail_summary,
+      requested_model,resolved_model,reasoning_effort,service_tier,
+      request_service_tier,response_service_tier,cache_input_mode,
+      reasoning_tokens,cached_tokens,cache_tokens,cache_read_tokens,
+      cache_creation_tokens,normalized_uncached_input_tokens,
+      normalized_total_input_tokens,normalized_cache_read_tokens,
+      normalized_cache_creation_tokens,total_tokens,ttft_ms
+    ) VALUES (${quote(hash)},${quote(request)},${timestamp},${quote(provider)},${quote(model)},${quote(endpoint)},${quote(keyHash)},${input},${output},${latency},${failed},${status ?? "NULL"},${quote(summary)},${quote(model)},${quote(model)},'medium','default','default','default','included_in_input',0,0,0,0,0,${input},${input},0,0,${input + output},10);`;
+  };
+  const pricedEvent = (event: {
+    hash: string;
+    request: string;
+    timestamp: number;
+    provider: string;
+    serviceTier: string;
+    cacheInputMode: string;
+    rawInput: number;
+    output: number;
+    reasoning: number;
+    cached: number;
+    cacheRead: number;
+    cacheCreation: number;
+    uncached: number;
+    totalInput: number;
+    normalizedCacheRead: number;
+    normalizedCacheCreation: number;
+  }): string => {
+    const quote = (value: string): string => `'${value.replaceAll("'", "''")}'`;
+    return `INSERT INTO usage_events (
+      event_hash,request_id,timestamp_ms,provider,model,endpoint,api_key_hash,
+      input_tokens,output_tokens,latency_ms,failed,fail_status_code,fail_summary,
+      requested_model,resolved_model,reasoning_effort,service_tier,
+      request_service_tier,response_service_tier,cache_input_mode,
+      reasoning_tokens,cached_tokens,cache_tokens,cache_read_tokens,
+      cache_creation_tokens,normalized_uncached_input_tokens,
+      normalized_total_input_tokens,normalized_cache_read_tokens,
+      normalized_cache_creation_tokens,total_tokens,ttft_ms
+    ) VALUES (${quote(event.hash)},${quote(event.request)},${event.timestamp},${quote(event.provider)},'display-alias','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',${event.rawInput},${event.output},125,0,NULL,'','display-alias','exact-model','high',${quote(event.serviceTier)},${quote(event.serviceTier)},${quote(event.serviceTier)},${quote(event.cacheInputMode)},${event.reasoning},${event.cached},0,${event.cacheRead},${event.cacheCreation},${event.uncached},${event.totalInput},${event.normalizedCacheRead},${event.normalizedCacheCreation},${event.totalInput + event.output},15);`;
+  };
   const runImport = (importTenant: string, importSource: string, database: string, extra: NodeJS.ProcessEnv = {}): SpawnSyncReturns<string> => run(
     process.execPath,
     [importer],
@@ -82,6 +142,34 @@ test("CPAMP import is transactional, replay-safe, bounded by watermarks, and ten
   ]) {
     requireSuccess(run("psql", ["-X", "-v", "ON_ERROR_STOP=1", "--no-psqlrc", "-f", join(workRoot, migration)], undefined, environment), migration);
   }
+  psql(`ALTER TABLE request_stats_facts ADD COLUMN session_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE generation_stats_facts ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD';
+ALTER TABLE generation_stats_facts ADD COLUMN model_route_id TEXT NOT NULL DEFAULT '';
+CREATE TABLE session_usage_totals (
+  tenant_id TEXT NOT NULL,key_id TEXT NOT NULL,session_id TEXT NOT NULL,currency TEXT NOT NULL,
+  last_activity_at BIGINT NOT NULL,requests BIGINT NOT NULL,errors BIGINT NOT NULL,
+  input_tokens BIGINT NOT NULL,output_tokens BIGINT NOT NULL,cached_input_tokens BIGINT NOT NULL DEFAULT 0,
+  cache_write_tokens BIGINT NOT NULL DEFAULT 0,generation_units BIGINT NOT NULL DEFAULT 0,
+  duration_count BIGINT NOT NULL,duration_sum_ms BIGINT NOT NULL,cost_micros BIGINT NOT NULL,
+  PRIMARY KEY(tenant_id,key_id,session_id,currency));
+CREATE TABLE session_usage_hourly (
+  tenant_id TEXT NOT NULL,key_id TEXT NOT NULL,session_id TEXT NOT NULL,hour_bucket BIGINT NOT NULL,
+  model TEXT NOT NULL,protocol TEXT NOT NULL,status_class TEXT NOT NULL,error_code TEXT NOT NULL,
+  upstream_account_id TEXT NOT NULL,model_route_id TEXT NOT NULL,currency TEXT NOT NULL,
+  requests BIGINT NOT NULL,input_tokens BIGINT NOT NULL,output_tokens BIGINT NOT NULL,
+  cached_input_tokens BIGINT NOT NULL DEFAULT 0,cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+  generation_units BIGINT NOT NULL DEFAULT 0,duration_count BIGINT NOT NULL,
+  duration_sum_ms BIGINT NOT NULL,cost_micros BIGINT NOT NULL,
+  PRIMARY KEY(tenant_id,key_id,session_id,hour_bucket,model,protocol,status_class,error_code,upstream_account_id,model_route_id,currency));
+CREATE TABLE session_usage_daily (
+  tenant_id TEXT NOT NULL,key_id TEXT NOT NULL,session_id TEXT NOT NULL,day_bucket BIGINT NOT NULL,
+  model TEXT NOT NULL,protocol TEXT NOT NULL,status_class TEXT NOT NULL,error_code TEXT NOT NULL,
+  upstream_account_id TEXT NOT NULL,model_route_id TEXT NOT NULL,currency TEXT NOT NULL,
+  requests BIGINT NOT NULL,input_tokens BIGINT NOT NULL,output_tokens BIGINT NOT NULL,
+  cached_input_tokens BIGINT NOT NULL DEFAULT 0,cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+  generation_units BIGINT NOT NULL DEFAULT 0,duration_count BIGINT NOT NULL,
+  duration_sum_ms BIGINT NOT NULL,cost_micros BIGINT NOT NULL,
+  PRIMARY KEY(tenant_id,key_id,session_id,day_bucket,model,protocol,status_class,error_code,upstream_account_id,model_route_id,currency));`);
   psql("CREATE TABLE IF NOT EXISTS request_records_default PARTITION OF request_records DEFAULT;");
   for (const migration of [
     "0021_request_locators.sql", "0022_budget_rollups.sql", "0023_generation_daily_aggregates.sql",
@@ -92,9 +180,8 @@ test("CPAMP import is transactional, replay-safe, bounded by watermarks, and ten
 
   initializeSqlite(databases.same);
   sqlite(databases.same, `DELETE FROM usage_events;
-INSERT INTO usage_events VALUES
-('fixture-event-same-duplicate','legacy-request-same-duplicate',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',5,2,40,0,NULL,NULL),
-('fixture-event-same-duplicate','legacy-request-same-duplicate',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',5,2,40,0,NULL,NULL);`);
+${basicEvent('fixture-event-same-duplicate','legacy-request-same-duplicate',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',5,2,40,0)}
+${basicEvent('fixture-event-same-duplicate','legacy-request-same-duplicate',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',5,2,40,0)}`);
   const sameTenant = `cpamp-${runId}-same-duplicate`;
   importOk(sameTenant, duplicateSource, databases.same);
   importOk(sameTenant, duplicateSource, databases.same);
@@ -107,9 +194,8 @@ INSERT INTO usage_events VALUES
 
   initializeSqlite(databases.conflicting);
   sqlite(databases.conflicting, `DELETE FROM usage_events;
-INSERT INTO usage_events VALUES
-('fixture-event-conflicting-duplicate','legacy-request-conflicting-duplicate',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',5,2,40,0,NULL,NULL),
-('fixture-event-conflicting-duplicate','legacy-request-conflicting-duplicate',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',6,2,40,0,NULL,NULL);`);
+${basicEvent('fixture-event-conflicting-duplicate','legacy-request-conflicting-duplicate',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',5,2,40,0)}
+${basicEvent('fixture-event-conflicting-duplicate','legacy-request-conflicting-duplicate',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',6,2,40,0)}`);
   const conflictingTenant = `cpamp-${runId}-conflicting-duplicate`;
   const conflicting = runImport(conflictingTenant, duplicateSource, databases.conflicting);
   assert.notEqual(conflicting.status, 0, "conflicting duplicate import unexpectedly succeeded");
@@ -117,8 +203,7 @@ INSERT INTO usage_events VALUES
   assert.equal(psql("SELECT (SELECT count(*) FROM tenants WHERE external_id=:'tenant') || '|' || (SELECT count(*) FROM cpamp_import_checkpoints WHERE tenant_external_id=:'tenant' AND source=:'source');", { tenant: conflictingTenant, source: duplicateSource }), "0|0");
 
   initializeSqlite(databases.failed200);
-  sqlite(databases.failed200, `DELETE FROM usage_events;
-INSERT INTO usage_events VALUES ('fixture-event-failed-http-200','legacy-request-failed-http-200',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',5,2,40,1,200,'provider returned an unusable success envelope');`);
+  sqlite(databases.failed200, `DELETE FROM usage_events;${basicEvent('fixture-event-failed-http-200','legacy-request-failed-http-200',100000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',5,2,40,1,200,'provider returned an unusable success envelope')}`);
   const failedTenant = `cpamp-${runId}-failed-success-code`;
   importOk(failedTenant, duplicateSource, databases.failed200);
   importOk(failedTenant, duplicateSource, databases.failed200);
@@ -139,13 +224,13 @@ INSERT INTO usage_events VALUES ('fixture-event-failed-http-200','legacy-request
   assert.equal(psql("SELECT watermark_ms || '|' || watermark_hash || '|' || imported_events FROM cpamp_import_checkpoints WHERE tenant_external_id=:'tenant' AND source=:'source';", { tenant, source }), "300000000|fixture-event-initial-b|2");
   assert.equal(psql("SELECT count(*) FILTER (WHERE request_object LIKE 'gap://cpamp/fixture-event-initial-b/request' AND response_object='gap://cpamp/fixture-event-initial-b/response') || '|' || count(*) FILTER (WHERE request_object LIKE 'gap://cpamp/fixture-event-initial-a/request' AND response_object='gap://cpamp/fixture-event-initial-a/response') FROM request_records WHERE tenant_id=:'tenant_id';", { tenant_id: tenantId }), "1|1");
 
-  sqlite(databases.source, "INSERT INTO usage_events VALUES ('fixture-event-late-overlap','legacy-request-late',299000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',19,7,90,0,NULL,NULL);");
+  sqlite(databases.source, basicEvent('fixture-event-late-overlap','legacy-request-late',299000000,'openai','fixture-model','/v1/responses','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',19,7,90,0));
   importOk(tenant, source, databases.source);
   importOk(tenant, source, databases.source);
   assert.equal(psql("SELECT count(*) || '|' || count(DISTINCT id) || '|' || sum(input_tokens) || '|' || sum(output_tokens) || '|' || sum(cost_micros) FROM request_records WHERE tenant_id=:'tenant_id';", { tenant_id: tenantId }), "3|3|47|15|154");
   assert.equal(psql("SELECT watermark_ms || '|' || watermark_hash || '|' || imported_events FROM cpamp_import_checkpoints WHERE tenant_external_id=:'tenant' AND source=:'source';", { tenant, source }), "300000000|fixture-event-initial-b|3");
 
-  sqlite(databases.source, "INSERT INTO usage_events VALUES ('fixture-event-new-watermark','legacy-request-new',400000000,'anthropic','fixture-model','/v1/messages','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',23,11,210,0,NULL,NULL);");
+  sqlite(databases.source, basicEvent('fixture-event-new-watermark','legacy-request-new',400000000,'anthropic','fixture-model','/v1/messages','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',23,11,210,0));
   importOk(tenant, source, databases.source);
   const identityQuery = "SELECT string_agg(id, ',' ORDER BY id) FROM request_records WHERE tenant_id=:'tenant_id';";
   const finalIds = psql(identityQuery, { tenant_id: tenantId });
@@ -175,12 +260,143 @@ INSERT INTO usage_events VALUES ('fixture-event-failed-http-200','legacy-request
   assert.equal(psql("SELECT count(*) || '|' || count(DISTINCT r.id) || '|' || (SELECT count(*) FROM request_stats_facts f WHERE f.tenant_id IN (SELECT id FROM tenants WHERE external_id IN (:'tenant',:'other_tenant'))) || '|' || (SELECT sum(requests) FROM usage_analysis_hourly h WHERE h.tenant_id IN (SELECT id FROM tenants WHERE external_id IN (:'tenant',:'other_tenant'))) || '|' || (SELECT sum(requests) FROM usage_analysis_daily d WHERE d.tenant_id IN (SELECT id FROM tenants WHERE external_id IN (:'tenant',:'other_tenant'))) FROM request_records r JOIN tenants t ON t.id=r.tenant_id WHERE t.external_id IN (:'tenant',:'other_tenant');", { tenant, other_tenant: otherTenant }), "12|12|12|12|12");
 
   initializeSqlite(databases.unmapped);
-  sqlite(databases.unmapped, "DELETE FROM usage_events; INSERT INTO usage_events VALUES ('fixture-event-unmapped','legacy-unmapped',500000000,'openai','fixture-model','/v1/responses','invalid-hash',1,1,10,0,NULL,NULL); DELETE FROM api_key_aliases;");
+  sqlite(databases.unmapped, `DELETE FROM usage_events;${basicEvent('fixture-event-unmapped','legacy-unmapped',500000000,'openai','fixture-model','/v1/responses','invalid-hash',1,1,10,0)}DELETE FROM api_key_aliases;`);
   const unmappedTenant = `cpamp-${runId}-unmapped`;
   const unmapped = runImport(unmappedTenant, source, databases.unmapped);
   assert.notEqual(unmapped.status, 0, "unmapped import unexpectedly succeeded");
   assert.match(unmapped.stderr, /staged events have no supported key identity/);
   assert.equal(psql("SELECT (SELECT count(*) FROM tenants WHERE external_id=:'tenant') || '|' || (SELECT count(*) FROM cpamp_import_checkpoints WHERE tenant_external_id=:'tenant');", { tenant: unmappedTenant }), "0|0");
+
+  initializeSqlite(databases.pricing);
+  sqlite(databases.pricing, `DELETE FROM usage_events;
+DELETE FROM model_prices;
+INSERT INTO model_prices VALUES ('exact-model',2.0,4.0,0.5,0.25,3.0,1,1,1,1,'fixture-exact','exact-model',600000000);
+INSERT INTO model_price_context_tiers VALUES ('exact-model',100,10.0,20.0,1.0,2.0,12.0,1,1,1,1,1);
+INSERT INTO model_price_service_tiers VALUES ('exact-model','priority','priority',3.0,5.0,0.6,0.2,4.0,1,1,1,1,1);
+${pricedEvent({hash:'pricing-codex-inclusive',request:'pricing-request-codex',timestamp:500000000,provider:'openai',serviceTier:'priority',cacheInputMode:'included_in_input',rawInput:100,output:10,reasoning:3,cached:40,cacheRead:0,cacheCreation:0,uncached:60,totalInput:100,normalizedCacheRead:40,normalizedCacheCreation:0})}
+${pricedEvent({hash:'pricing-claude-separate',request:'pricing-request-claude',timestamp:600001000,provider:'anthropic',serviceTier:'default',cacheInputMode:'separate',rawInput:80,output:5,reasoning:2,cached:30,cacheRead:20,cacheCreation:10,uncached:80,totalInput:110,normalizedCacheRead:20,normalizedCacheCreation:10})}
+${pricedEvent({hash:'pricing-auto-base',request:'pricing-request-auto',timestamp:600002000,provider:'openai',serviceTier:'auto',cacheInputMode:'included_in_input',rawInput:10,output:1,reasoning:0,cached:0,cacheRead:0,cacheCreation:0,uncached:10,totalInput:10,normalizedCacheRead:0,normalizedCacheCreation:0})}`);
+  const pricingTenant = `cpamp-${runId}-pricing`;
+  const pricingSource = `cpamp-acceptance:${runId}:pricing`;
+  importOk(pricingTenant, pricingSource, databases.pricing);
+  const pricingTenantId = psql("SELECT id FROM tenants WHERE external_id=:'tenant';", { tenant: pricingTenant });
+  assert.equal(psql(`SELECT count(*) || '|' || sum(input_tokens) || '|' || sum(output_tokens) || '|' ||
+    sum(cached_input_tokens) || '|' || sum(cache_write_tokens) || '|' || sum(cost_micros) || '|' ||
+    count(*) FILTER (WHERE service_tier='priority') || '|' || count(*) FILTER (WHERE service_tier='auto')
+    FROM request_records WHERE tenant_id=:'tenant_id';`, { tenant_id: pricingTenantId }), "3|220|16|60|10|1338|1|1");
+  assert.equal(psql(`SELECT count(*) || '|' || count(*) FILTER (WHERE pricing_model='exact-model') || '|' ||
+    count(*) FILTER (WHERE pricing_rule='service') || '|' || count(*) FILTER (WHERE pricing_rule='context') || '|' ||
+    count(*) FILTER (WHERE pricing_rule='base') || '|' || sum(reasoning_tokens) || '|' || sum(ttft_ms) || '|' ||
+    sum(normalized_total_input_tokens) || '|' || sum(normalized_cache_read_tokens) || '|' ||
+    sum(normalized_cache_creation_tokens) || '|' || sum(cost_micros) || '|' ||
+    count(*) FILTER (WHERE pricing_config_json::jsonb->>'schema'='cpamp-v1.11.12-price-v1') || '|' ||
+    count(*) FILTER (WHERE cache_input_mode='separate' AND raw_cached_tokens=30
+      AND raw_cache_read_tokens=20 AND raw_cache_creation_tokens=10 AND residual_cached_tokens=0)
+    FROM cpamp_import_event_provenance WHERE tenant_id=:'tenant_id' AND source=:'source';`,
+    { tenant_id: pricingTenantId, source: pricingSource }), "3|3|1|1|1|5|45|220|60|10|1338|3|1");
+  assert.equal(psql("SELECT count(*) FROM model_prices WHERE model='exact-model';"), "0", "CPAMP source pricing must not mutate global MTC prices");
+  assert.equal(psql(`SELECT sum(requests) || '|' || sum(input_tokens) || '|' || sum(output_tokens) || '|' ||
+    sum(cached_input_tokens) || '|' || sum(cache_write_tokens) || '|' || sum(cost_micros)
+    FROM usage_analysis_daily WHERE tenant_id=:'tenant_id' AND source_kind='request';`, { tenant_id: pricingTenantId }), "3|150|16|60|10|1338");
+  assert.equal(psql(`SELECT sum(requests) || '|' || sum(input_tokens) || '|' || sum(output_tokens) || '|' ||
+    sum(cached_input_tokens) || '|' || sum(cache_write_tokens) || '|' || sum(cost_micros)
+    FROM session_usage_totals WHERE tenant_id=:'tenant_id';`, { tenant_id: pricingTenantId }), "3|150|16|60|10|1338");
+
+  psql(`UPDATE import_request_links l SET source_digest=p.legacy_source_digest
+    FROM cpamp_import_event_provenance p
+   WHERE p.tenant_id=:'tenant_id' AND p.source=:'source'
+     AND l.tenant_id=p.tenant_id AND l.source=p.source AND l.external_event_hash=p.external_event_hash;
+UPDATE request_records r SET input_tokens=p.raw_input_tokens,cached_input_tokens=0,
+       cache_write_tokens=0,service_tier='default',cost_micros=0
+  FROM cpamp_import_event_provenance p
+ WHERE p.tenant_id=:'tenant_id' AND p.source=:'source'
+   AND r.tenant_id=p.tenant_id AND r.id=p.target_request_id;
+UPDATE request_stats_facts f SET input_tokens=p.raw_input_tokens,cached_input_tokens=0,
+       cache_write_tokens=0,service_tier='default',cost_micros=0
+  FROM cpamp_import_event_provenance p
+ WHERE p.tenant_id=:'tenant_id' AND p.source=:'source'
+   AND f.tenant_id=p.tenant_id AND f.request_id=p.target_request_id;
+DELETE FROM cpamp_import_event_provenance WHERE tenant_id=:'tenant_id' AND source=:'source';
+UPDATE usage_daily_aggregates SET requests=999 WHERE key_id IN (SELECT id FROM key_records WHERE tenant_id=:'tenant_id');
+UPDATE request_daily_aggregates SET requests=999 WHERE tenant_id=:'tenant_id';
+UPDATE usage_analysis_hourly SET requests=999 WHERE tenant_id=:'tenant_id' AND source_kind='request';
+UPDATE usage_analysis_daily SET requests=999 WHERE tenant_id=:'tenant_id' AND source_kind='request';
+UPDATE session_usage_totals SET requests=999 WHERE tenant_id=:'tenant_id';
+UPDATE session_usage_hourly SET requests=999 WHERE tenant_id=:'tenant_id';
+UPDATE session_usage_daily SET requests=999 WHERE tenant_id=:'tenant_id';`,
+    { tenant_id: pricingTenantId, source: pricingSource });
+
+  const ordinaryBeforeCorrection = runImport(pricingTenant, pricingSource, databases.pricing);
+  assert.notEqual(ordinaryBeforeCorrection.status, 0, "ordinary replay corrected a legacy digest");
+  assert.match(ordinaryBeforeCorrection.stderr, /require the explicit cache\/pricing correction mode/);
+  const plan = runImport(pricingTenant, pricingSource, databases.pricing, { CPAMP_CORRECTION_MODE: "plan" });
+  assert.equal(plan.status, 0, `correction plan failed: ${plan.stderr}`);
+  assert.match(plan.stdout, /candidate_events=3 non_usd_candidates=0 live_candidates=0/);
+  assert.match(plan.stdout, /display-alias/);
+  assert.equal(psql("SELECT sum(requests) FROM usage_analysis_daily WHERE tenant_id=:'tenant_id' AND source_kind='request';", { tenant_id: pricingTenantId }), "999", "dry-run changed projections");
+
+  const correction = runImport(pricingTenant, pricingSource, databases.pricing, {
+    CPAMP_CORRECTION_MODE: "apply",
+    CPAMP_CORRECTION_CONFIRM: "CORRECT_CPAMP_IMPORTED_USAGE",
+  });
+  assert.equal(correction.status, 0, `correction apply failed: ${correction.stderr}`);
+  assert.match(correction.stdout, /corrected_events/);
+  assert.equal(psql(`SELECT count(*) || '|' || sum(input_tokens) || '|' || sum(output_tokens) || '|' ||
+    sum(cached_input_tokens) || '|' || sum(cache_write_tokens) || '|' || sum(cost_micros)
+    FROM request_records WHERE tenant_id=:'tenant_id';`, { tenant_id: pricingTenantId }), "3|220|16|60|10|1338");
+  assert.equal(psql(`SELECT count(*) || '|' || count(*) FILTER (WHERE source_digest<>legacy_source_digest) || '|' ||
+    count(*) FILTER (WHERE correction_revision='cpamp-cache-pricing-v2') || '|' || sum(cost_micros)
+    FROM cpamp_import_event_provenance WHERE tenant_id=:'tenant_id' AND source=:'source';`,
+    { tenant_id: pricingTenantId, source: pricingSource }), "3|3|3|1338");
+  assert.equal(psql(`SELECT
+    (SELECT count(*) FROM cpamp_import_correction_audit WHERE tenant_id=:'tenant_id' AND source=:'source') || '|' ||
+    (SELECT count(*) FROM import_request_links WHERE tenant_id=:'tenant_id' AND source=:'source' AND source_digest<>'') || '|' ||
+    (SELECT correction_revision FROM cpamp_import_checkpoints WHERE tenant_external_id=:'tenant' AND source=:'source') || '|' ||
+    (SELECT corrected_events FROM cpamp_import_checkpoints WHERE tenant_external_id=:'tenant' AND source=:'source');`,
+    { tenant_id: pricingTenantId, tenant: pricingTenant, source: pricingSource }), "3|3|cpamp-cache-pricing-v2|3");
+  const correctedProjection = psql(`SELECT
+    (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cost_micros) FROM usage_daily_aggregates WHERE key_id IN (SELECT id FROM key_records WHERE tenant_id=:'tenant_id')) || '|' ||
+    (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cached_input_tokens)||':'||sum(cache_write_tokens)||':'||sum(cost_micros) FROM request_daily_aggregates WHERE tenant_id=:'tenant_id') || '|' ||
+    (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cached_input_tokens)||':'||sum(cache_write_tokens)||':'||sum(cost_micros) FROM usage_analysis_hourly WHERE tenant_id=:'tenant_id' AND source_kind='request') || '|' ||
+    (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cached_input_tokens)||':'||sum(cache_write_tokens)||':'||sum(cost_micros) FROM usage_analysis_daily WHERE tenant_id=:'tenant_id' AND source_kind='request') || '|' ||
+    (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cached_input_tokens)||':'||sum(cache_write_tokens)||':'||sum(cost_micros) FROM session_usage_totals WHERE tenant_id=:'tenant_id') || '|' ||
+    (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cached_input_tokens)||':'||sum(cache_write_tokens)||':'||sum(cost_micros) FROM session_usage_hourly WHERE tenant_id=:'tenant_id') || '|' ||
+    (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cached_input_tokens)||':'||sum(cache_write_tokens)||':'||sum(cost_micros) FROM session_usage_daily WHERE tenant_id=:'tenant_id');`,
+    { tenant_id: pricingTenantId });
+  assert.equal(correctedProjection, "3:220:1338|3:220:60:10:1338|3:150:60:10:1338|3:150:60:10:1338|3:150:60:10:1338|3:150:60:10:1338|3:150:60:10:1338");
+
+  const secondCorrection = runImport(pricingTenant, pricingSource, databases.pricing, {
+    CPAMP_CORRECTION_MODE: "apply",
+    CPAMP_CORRECTION_CONFIRM: "CORRECT_CPAMP_IMPORTED_USAGE",
+  });
+  assert.equal(secondCorrection.status, 0, `second correction failed: ${secondCorrection.stderr}`);
+  assert.match(secondCorrection.stdout, /\b0\b/);
+  assert.equal(psql("SELECT count(*) FROM cpamp_import_correction_audit WHERE tenant_id=:'tenant_id' AND source=:'source';", { tenant_id: pricingTenantId, source: pricingSource }), "3");
+  assert.equal(psql(`SELECT
+    (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cost_micros) FROM usage_daily_aggregates WHERE key_id IN (SELECT id FROM key_records WHERE tenant_id=:'tenant_id')) || '|' ||
+    (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cached_input_tokens)||':'||sum(cache_write_tokens)||':'||sum(cost_micros) FROM request_daily_aggregates WHERE tenant_id=:'tenant_id') || '|' ||
+    (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cached_input_tokens)||':'||sum(cache_write_tokens)||':'||sum(cost_micros) FROM usage_analysis_daily WHERE tenant_id=:'tenant_id' AND source_kind='request') || '|' ||
+    (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cached_input_tokens)||':'||sum(cache_write_tokens)||':'||sum(cost_micros) FROM session_usage_totals WHERE tenant_id=:'tenant_id');`, { tenant_id: pricingTenantId }),
+    "3:220:1338|3:220:60:10:1338|3:150:60:10:1338|3:150:60:10:1338");
+  importOk(pricingTenant, pricingSource, databases.pricing);
+  assert.equal(psql("SELECT count(*) || '|' || sum(cost_micros) FROM request_records WHERE tenant_id=:'tenant_id';", { tenant_id: pricingTenantId }), "3|1338");
+
+  sqlite(databases.oldSchema, `CREATE TABLE usage_events (event_hash TEXT,request_id TEXT,timestamp_ms INTEGER,provider TEXT,model TEXT,endpoint TEXT,api_key_hash TEXT,input_tokens INTEGER,output_tokens INTEGER,latency_ms INTEGER,failed INTEGER,fail_status_code INTEGER,fail_summary TEXT);
+CREATE TABLE api_key_aliases (api_key_hash TEXT,alias TEXT,updated_at_ms INTEGER);
+CREATE TABLE model_prices (model TEXT,prompt_per_1m REAL,completion_per_1m REAL);`);
+  const oldSchemaTenant = `cpamp-${runId}-old-schema`;
+  const oldSchema = runImport(oldSchemaTenant, `${pricingSource}:old`, databases.oldSchema);
+  assert.notEqual(oldSchema.status, 0, "old source schema unexpectedly imported");
+  assert.match(oldSchema.stderr, /source schema is too old for exact billing/);
+  assert.equal(psql("SELECT count(*) FROM tenants WHERE external_id=:'tenant';", { tenant: oldSchemaTenant }), "0");
+
+  initializeSqlite(databases.missingPrice);
+  sqlite(databases.missingPrice, "DELETE FROM model_prices;");
+  const missingPriceTenant = `cpamp-${runId}-missing-price`;
+  const missingPrice = runImport(missingPriceTenant, `${pricingSource}:missing`, databases.missingPrice);
+  assert.notEqual(missingPrice.status, 0, "missing source price unexpectedly imported");
+  assert.match(missingPrice.stderr, /lack exact token\/pricing provenance/);
+  assert.equal(psql("SELECT count(*) FROM tenants WHERE external_id=:'tenant';", { tenant: missingPriceTenant }), "0");
 
   const resetTenant = "cpa-dogfood-import";
   const resetSource = `cpamp-reset-guard:${runId}`;

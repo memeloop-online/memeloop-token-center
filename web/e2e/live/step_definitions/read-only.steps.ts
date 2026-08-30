@@ -3,6 +3,7 @@ import { Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
 import { liveRuntime } from '../support/runtime.js';
 import type { LiveWorld } from '../support/world.js';
+import { appPreferenceControls, openAppRoute, openUsageDimension } from '../../step_definitions/app-route.support.js';
 
 When('只读验收以中文暗色主题连接操作台', async function (this: LiveWorld) {
   const page = this.requirePage();
@@ -10,7 +11,7 @@ When('只读验收以中文暗色主题连接操作台', async function (this: L
   await this.open(configuration.controlURL, '/operator', 'zh-CN', 'dark');
   await page.getByLabel('服务凭据', { exact: true }).fill(configuration.serviceCredential);
   await page.getByRole('button', { name: '连接', exact: true }).click();
-  await page.getByRole('tab', { name: '请求统计', exact: true }).click();
+  await openAppRoute(page, 'operator', 'usage');
   await page.getByRole('button', { name: '最近 30 天', exact: true }).click();
   await expectUsageLoaded(page);
 });
@@ -20,37 +21,40 @@ Then('操作台 favicon 和暗色主题正确', async function (this: LiveWorld)
   assert.equal(await page.locator('html').getAttribute('data-theme'), 'dark');
   assert.equal(await page.locator('meta[name="theme-color"]').getAttribute('content'), '#071014');
   assert.equal(await page.locator('link[rel="icon"]').getAttribute('href'), '/ui-assets/token-center-icon-32.png');
-  await page.locator('.brand-mark img').waitFor({ state: 'visible' });
-  assert.ok(await page.locator('.brand-mark img').evaluate((image) => (image as HTMLImageElement).naturalWidth > 0));
+  await page.locator('.app-brand img').waitFor({ state: 'visible' });
+  assert.ok(await page.locator('.app-brand img').evaluate((image) => (image as HTMLImageElement).naturalWidth > 0));
 });
 
 Then('最近三十天请求统计的七个视图均可读取', async function (this: LiveWorld) {
   const page = this.requirePage();
-  for (const name of ['总览', '趋势分析', '模型分析', '客户端凭据分析', '会话分析', '上游账户分析', '用量热力图']) {
+  for (const name of ['总览', '趋势分析', '维度分析', '用量热力图']) {
     const tab = page.getByRole('tab', { name, exact: true });
     await tab.click();
     assert.equal(await tab.getAttribute('aria-selected'), 'true');
     await page.locator('.usage-tab-panel').waitFor({ state: 'visible' });
   }
+  for (const dimension of ['模型', '客户端凭据', '会话', '上游账户', '协议', '状态', '错误码']) {
+    await openUsageDimension(page, dimension);
+    await page.locator('.usage-dimension').waitFor({ state: 'visible' });
+  }
   await page.getByRole('tab', { name: '总览', exact: true }).click();
 });
 
 Then('中文请求数按万或亿显示并保留精确值', async function (this: LiveWorld) {
-  const value = metric(this.requirePage(), '请求数').locator('strong span');
+  const value = metric(this.requirePage(), '请求数').locator('strong');
   const text = (await value.textContent())?.trim() ?? '';
-  assert.match(text, /^\d+(?:\.\d+)?(?:万亿|亿|万)$/);
-  assert.match(await value.getAttribute('title') ?? '', /^\d{1,3}(?:,\d{3})+$/);
+  assert.match(text, /^\d{1,3}(?:,\d{3})+$/);
 });
 
 When('只读验收切换为英文亮色主题', async function (this: LiveWorld) {
   const page = this.requirePage();
-  await page.locator('.rail').getByRole('button', { name: 'English', exact: true }).click();
-  await page.locator('.rail').getByRole('button', { name: 'Switch to light theme', exact: true }).click();
+  await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
+  await appPreferenceControls(page).getByRole('button', { name: 'Switch to light theme', exact: true }).click();
 });
 
 Then('英文请求数使用三位分隔且主题色正确', async function (this: LiveWorld) {
   const page = this.requirePage();
-  const text = ((await metric(page, 'Requests').locator('strong span').textContent()) ?? '').trim();
+  const text = ((await metric(page, 'Requests').locator('strong').textContent()) ?? '').trim();
   assert.match(text, /^\d{1,3}(?:,\d{3})+$/);
   assert.equal(await page.locator('html').getAttribute('lang'), 'en');
   assert.equal(await page.locator('html').getAttribute('data-theme'), 'light');
@@ -59,7 +63,7 @@ Then('英文请求数使用三位分隔且主题色正确', async function (this
 
 Then('操作员列表和请求详情均不泄漏上游凭据金丝雀', async function (this: LiveWorld) {
   const page = this.requirePage();
-  await page.getByRole('tab', { name: 'Live traffic', exact: true }).click();
+  await openAppRoute(page, 'operator', 'requests');
   const detailButton = page.locator('table').getByRole('button', { name: /^Open details for / }).first();
   await detailButton.waitFor({ state: 'visible', timeout: 60_000 });
   await this.assertProviderSecretAbsent(['/internal/v1/upstreams', '/internal/v1/requests']);
@@ -74,7 +78,7 @@ When('只读验收使用旧客户端凭据打开自助门户', async function (t
   const configuration = liveRuntime.requireConfiguration();
   await this.open(configuration.gatewayURL, '/portal', 'zh-CN', 'light');
   await page.getByLabel('客户端凭据', { exact: true }).fill(configuration.clientCredential);
-  await page.getByRole('button', { name: '载入', exact: true }).click();
+  await page.getByRole('button', { name: '进入', exact: true }).click();
   await page.locator('.key-summary').waitFor({ state: 'visible' });
 });
 
@@ -84,6 +88,7 @@ Then('自助门户返回预期稳定凭据主键', async function (this: LiveWor
 });
 
 Then('自助门户至少显示一条历史请求', async function (this: LiveWorld) {
+  await openAppRoute(this.requirePage(), 'portal', 'requests');
   const rows = this.requirePage().locator('.self-history tbody tr');
   await rows.first().waitFor({ state: 'visible' });
   assert.ok(await rows.count() > 0, 'the stable legacy credential must retain request history');

@@ -15,10 +15,10 @@ use super::{
     unix_millis,
 };
 use crate::model::{
-    UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisGenerationUnitsByBillingUnit,
-    UsageAnalysisGenerationUnitsByModality, UsageAnalysisHeatmapBucket, UsageAnalysisMetrics,
-    UsageAnalysisResponse, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket,
-    micros_to_decimal_string,
+    SelfUsageAnalysisResponse, UsageAnalysisBucket, UsageAnalysisCost,
+    UsageAnalysisGenerationUnitsByBillingUnit, UsageAnalysisGenerationUnitsByModality,
+    UsageAnalysisHeatmapBucket, UsageAnalysisMetrics, UsageAnalysisResponse,
+    UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, micros_to_decimal_string,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -80,26 +80,59 @@ impl Database {
         self.aggregate_usage_analysis(None, &filter).await
     }
 
+    pub async fn self_usage_analysis(
+        &self,
+        tenant_id: Uuid,
+        key_id: Uuid,
+        mut filter: UsageAnalysisFilter,
+    ) -> Result<SelfUsageAnalysisResponse, AppError> {
+        // Authentication is the only source of the stable key scope.  The
+        // self-service query surface has no selector that can override it.
+        filter.key_id = Some(key_id);
+        self.aggregate_usage_analysis_for_tenant_id(Some(tenant_id), &filter)
+            .await
+            .map(SelfUsageAnalysisResponse::from)
+    }
+
     async fn aggregate_usage_analysis(
         &self,
         tenant_external_id: Option<&str>,
         filter: &UsageAnalysisFilter,
     ) -> Result<UsageAnalysisResponse, AppError> {
-        let range = validate_usage_analysis_filter(filter)?;
-        let tenant_scoped = tenant_external_id.is_some();
         let tenant_id = if let Some(external_id) = tenant_external_id {
-            sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
+            let stored_id = sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
                 .bind(external_id)
                 .fetch_optional(&self.pool)
                 .await?
                 .map(|row| row.try_get::<String, _>("id"))
-                .transpose()?
-                // Preserve the historical empty-result contract for an unknown
-                // tenant without falling back to a global scan.
-                .unwrap_or_else(|| Uuid::nil().to_string())
+                .transpose()?;
+            // Preserve the historical empty-result contract for an unknown
+            // tenant without falling back to a global scan.
+            Some(match stored_id {
+                Some(id) => parse_uuid(id)?,
+                None => Uuid::nil(),
+            })
         } else {
-            String::new()
+            None
         };
+        self.aggregate_usage_analysis_for_tenant_id(tenant_id, filter)
+            .await
+    }
+
+    async fn aggregate_usage_analysis_for_tenant_id(
+        &self,
+        tenant_id: Option<Uuid>,
+        filter: &UsageAnalysisFilter,
+    ) -> Result<UsageAnalysisResponse, AppError> {
+        let range = validate_usage_analysis_filter(filter)?;
+        let tenant_scoped = tenant_id.is_some();
+        let tenant_id = tenant_id.map(|id| id.to_string()).unwrap_or_default();
+        let mut snapshot = self.pool.begin().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .execute(&mut *snapshot)
+                .await?;
+        }
         let key_id = filter.key_id.map(|id| id.to_string()).unwrap_or_default();
         let upstream_account_id = filter
             .upstream_account_id
@@ -142,7 +175,7 @@ impl Database {
         // SQL safety boundary: the generator accepts only backend/granularity enums and a scope
         // boolean. User filters are always bound below and are never interpolated into SQL.
         let rows = bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(main_sql)), main_plan)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *snapshot)
             .await?;
         let mut projections: BTreeMap<(String, String), UsageMetricsAccumulator> = BTreeMap::new();
         for row in rows {
@@ -155,7 +188,7 @@ impl Database {
         // Same closed generator boundary as the main analysis statement above.
         let heatmap_rows =
             bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(heatmap_sql)), heatmap_plan)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *snapshot)
                 .await?;
         let mut heatmap_projection: BTreeMap<(String, String), UsageMetricsAccumulator> =
             BTreeMap::new();
@@ -169,7 +202,7 @@ impl Database {
             sqlx::query(sqlx::AssertSqlSafe(generation_dimension_sql)),
             main_plan
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *snapshot)
         .await?;
         let mut generation_units_by_modality = Vec::new();
         let mut generation_units_by_billing_unit = Vec::new();
@@ -210,7 +243,7 @@ impl Database {
         let session_sql = session_usage_dimension_sql(range.granularity, tenant_scoped);
         let session_rows =
             bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(session_sql)), main_plan)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *snapshot)
                 .await?;
         let mut session_projection: BTreeMap<(String, String), SessionUsageAccumulator> =
             BTreeMap::new();
@@ -303,7 +336,7 @@ impl Database {
             .collect::<Result<Vec<_>, AppError>>()?;
         heatmap.sort_by_key(|bucket| bucket.hour_of_week);
 
-        Ok(UsageAnalysisResponse {
+        let response = UsageAnalysisResponse {
             from_created_at: range.from_created_at,
             to_created_at: range.to_created_at,
             granularity: range.granularity.as_str().to_owned(),
@@ -323,7 +356,9 @@ impl Database {
             by_status,
             errors,
             heatmap,
-        })
+        };
+        snapshot.commit().await?;
+        Ok(response)
     }
 }
 

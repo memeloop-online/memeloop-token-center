@@ -47,6 +47,14 @@ function unsignedSetting(name: string, fallback: string): bigint {
   return BigInt(raw);
 }
 
+function correctionModeSetting(): "off" | "plan" | "apply" {
+  const raw = process.env.CPAMP_CORRECTION_MODE ?? "off";
+  if (raw !== "off" && raw !== "plan" && raw !== "apply") {
+    fail("CPAMP_CORRECTION_MODE must be off, plan, or apply");
+  }
+  return raw;
+}
+
 function psqlArgs(extra: readonly string[] = []): string[] {
   return ["-X", "-v", "ON_ERROR_STOP=1", "--no-psqlrc", ...extra];
 }
@@ -66,6 +74,27 @@ function runPsql(
   if (result.error) fail(`psql is unavailable: ${result.error.message}`);
   if (result.status !== 0) fail("PostgreSQL command failed");
   return output === "capture" ? String(result.stdout).trim() : "";
+}
+
+function sqliteColumns(sqlitePath: string, table: string): Set<string> {
+  if (!/^[a-z0-9_]+$/.test(table)) fail("invalid SQLite table name");
+  const result = spawnSync(
+    "sqlite3",
+    ["-readonly", "-batch", "-bail", "-noheader", sqlitePath, `SELECT name FROM pragma_table_info('${table}') ORDER BY cid;`],
+    { encoding: "utf8", shell: false, stdio: ["ignore", "pipe", "inherit"] },
+  );
+  if (result.error) fail(`sqlite3 is unavailable: ${result.error.message}`);
+  if (result.status !== 0) fail(`unable to inspect CPAMP SQLite table ${table}`);
+  return new Set(String(result.stdout).trim().split(/\s+/).filter(Boolean));
+}
+
+function requireSqliteColumns(sqlitePath: string, table: string, requiredColumns: readonly string[]): void {
+  const present = sqliteColumns(sqlitePath, table);
+  if (present.size === 0) fail(`CPAMP source table ${table} is missing`);
+  const missing = requiredColumns.filter((column) => !present.has(column));
+  if (missing.length > 0) {
+    fail(`CPAMP source schema is too old for exact billing (${table} missing: ${missing.join(", ")}); upgrade and finish the CPAMP cache-accounting migration before importing`);
+  }
 }
 
 async function pipeSqliteCsvToPostgres(sqlitePath: string, query: string, table: string): Promise<void> {
@@ -115,6 +144,7 @@ async function main(): Promise<void> {
   const overlapMs = unsignedSetting("CPAMP_OVERLAP_MS", "86400000");
   const reset = booleanSetting("CPAMP_RESET_IMPORT", false);
   const allowUnmapped = booleanSetting("CPAMP_ALLOW_UNMAPPED", false);
+  const correctionMode = correctionModeSetting();
 
   if (reset && tenant !== "cpa-dogfood-import") fail("reset is only allowed for the cpa-dogfood-import tenant");
   if (reset && process.env.CPAMP_RESET_CONFIRM !== "DELETE_CPA_DOGFOOD_IMPORT") {
@@ -126,6 +156,39 @@ async function main(): Promise<void> {
     fail("CPAMP SQLite database is not readable");
   }
   if (!/^[A-Za-z0-9._:-]+$/.test(source)) fail("CPAMP_IMPORT_SOURCE contains unsupported characters");
+  if (correctionMode === "apply" && process.env.CPAMP_CORRECTION_CONFIRM !== "CORRECT_CPAMP_IMPORTED_USAGE") {
+    fail("CPAMP_CORRECTION_CONFIRM=CORRECT_CPAMP_IMPORTED_USAGE is required for a correction");
+  }
+
+  requireSqliteColumns(sqlitePath, "usage_events", [
+    "event_hash", "request_id", "timestamp_ms", "provider", "model", "endpoint",
+    "api_key_hash", "requested_model", "resolved_model", "reasoning_effort",
+    "service_tier", "request_service_tier", "response_service_tier", "cache_input_mode",
+    "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens", "cache_tokens",
+    "cache_read_tokens", "cache_creation_tokens", "normalized_uncached_input_tokens",
+    "normalized_total_input_tokens", "normalized_cache_read_tokens",
+    "normalized_cache_creation_tokens", "total_tokens", "latency_ms", "ttft_ms", "failed",
+    "fail_status_code", "fail_summary",
+  ]);
+  requireSqliteColumns(sqlitePath, "api_key_aliases", ["api_key_hash", "alias", "updated_at_ms"]);
+  requireSqliteColumns(sqlitePath, "model_prices", [
+    "model", "prompt_per_1m", "completion_per_1m", "cache_per_1m",
+    "cache_read_per_1m", "cache_creation_per_1m", "prompt_configured",
+    "completion_configured", "cache_read_configured", "cache_creation_configured",
+    "source", "source_model_id", "updated_at_ms",
+  ]);
+  requireSqliteColumns(sqlitePath, "model_price_context_tiers", [
+    "model", "threshold_tokens", "prompt_per_1m", "completion_per_1m", "cache_per_1m",
+    "cache_read_per_1m", "cache_creation_per_1m", "prompt_configured",
+    "completion_configured", "cache_configured", "cache_read_configured",
+    "cache_creation_configured",
+  ]);
+  requireSqliteColumns(sqlitePath, "model_price_service_tiers", [
+    "model", "mode", "service_tier", "prompt_per_1m", "completion_per_1m",
+    "cache_per_1m", "cache_read_per_1m", "cache_creation_per_1m",
+    "prompt_configured", "completion_configured", "cache_configured",
+    "cache_read_configured", "cache_creation_configured",
+  ]);
 
   const pgPassFile = process.env.PGPASSFILE;
   const pgPassword = process.env.PGPASSWORD;
@@ -210,27 +273,117 @@ async function main(): Promise<void> {
     );
     if (!/^\d+$/.test(watermarkText)) fail("invalid PostgreSQL import watermark");
     const watermark = BigInt(watermarkText);
-    const lowerBound = watermark > overlapMs ? watermark - overlapMs : 0n;
+    // A correction must evaluate every legacy receipt against the same sealed
+    // source, not only the ordinary late-write overlap window. Otherwise an
+    // apparently clean plan could silently omit older v1 digests.
+    const lowerBound = correctionMode === "off"
+      ? (watermark > overlapMs ? watermark - overlapMs : 0n)
+      : 0n;
 
     await pipeSqliteCsvToPostgres(
       sqlitePath,
-      `SELECT event_hash, request_id, timestamp_ms, provider, model, endpoint, lower(api_key_hash), input_tokens, output_tokens, latency_ms, CASE WHEN failed THEN 1 ELSE 0 END, COALESCE(fail_status_code, 0), COALESCE(fail_summary, '') FROM usage_events WHERE event_hash <> '' AND timestamp_ms >= ${lowerBound};`,
+      `SELECT event_hash, request_id, timestamp_ms, provider, model, endpoint, lower(api_key_hash), requested_model, resolved_model, reasoning_effort, service_tier, request_service_tier, response_service_tier, cache_input_mode, input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_tokens, cache_read_tokens, cache_creation_tokens, normalized_uncached_input_tokens, normalized_total_input_tokens, normalized_cache_read_tokens, normalized_cache_creation_tokens, total_tokens, latency_ms, ttft_ms, CASE WHEN failed THEN 1 ELSE 0 END, COALESCE(fail_status_code, 0), COALESCE(fail_summary, '') FROM usage_events WHERE event_hash <> '' AND timestamp_ms >= ${lowerBound};`,
       "cpamp_import_usage",
     );
     await pipeSqliteCsvToPostgres(sqlitePath, "SELECT lower(api_key_hash), alias, updated_at_ms FROM api_key_aliases;", "cpamp_import_aliases");
-    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT model, prompt_per_1m, completion_per_1m, source, updated_at_ms FROM model_prices;", "cpamp_import_prices");
+    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT model, prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m, prompt_configured, completion_configured, cache_read_configured, cache_creation_configured, COALESCE(source, ''), COALESCE(source_model_id, ''), updated_at_ms FROM model_prices;", "cpamp_import_prices");
+    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT model, threshold_tokens, prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m, prompt_configured, completion_configured, cache_configured, cache_read_configured, cache_creation_configured FROM model_price_context_tiers;", "cpamp_import_context_prices");
+    await pipeSqliteCsvToPostgres(sqlitePath, "SELECT model, lower(trim(mode)), lower(trim(service_tier)), prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m, prompt_configured, completion_configured, cache_configured, cache_read_configured, cache_creation_configured FROM model_price_service_tiers;", "cpamp_import_service_prices");
 
-    const validationSql = `SELECT count(*) FROM cpamp_import_usage;\nSELECT count(*) FROM cpamp_import_usage WHERE COALESCE(api_key_hash, '') !~ '^[0-9a-f]{64}$';\nSELECT count(*) FROM cpamp_import_aliases WHERE COALESCE(api_key_hash, '') !~ '^[0-9a-f]{64}$';\nSELECT COALESCE(sum(events - 1), 0) FROM (SELECT count(*) AS events FROM cpamp_import_usage GROUP BY event_hash HAVING count(*) > 1) duplicates;\nWITH duplicate_event_hashes AS MATERIALIZED (SELECT event_hash FROM cpamp_import_usage GROUP BY event_hash HAVING count(*) > 1), digested_duplicates AS MATERIALIZED (SELECT u.event_hash, encode(sha256(convert_to(jsonb_build_array(u.request_id, u.timestamp_ms, u.provider, u.model, u.endpoint, u.api_key_hash, u.input_tokens, u.output_tokens, u.latency_ms, u.failed, u.fail_status_code, u.fail_summary)::text, 'UTF8')), 'hex') AS source_digest FROM cpamp_import_usage u JOIN duplicate_event_hashes d ON d.event_hash = u.event_hash) SELECT count(*) FROM (SELECT event_hash FROM digested_duplicates GROUP BY event_hash HAVING count(DISTINCT source_digest) > 1) conflicts;\n`;
+    runPsql([], readSql("evaluate.sql"));
+
+    const validationSql = `SELECT count(*) FROM cpamp_import_usage;
+SELECT count(*) FROM cpamp_import_usage WHERE COALESCE(api_key_hash, '') !~ '^[0-9a-f]{64}$';
+SELECT count(*) FROM cpamp_import_aliases WHERE COALESCE(api_key_hash, '') !~ '^[0-9a-f]{64}$';
+SELECT COALESCE(sum(events - 1), 0) FROM (SELECT count(*) AS events FROM cpamp_import_evaluated GROUP BY event_hash HAVING count(*) > 1) duplicates;
+SELECT count(*) FROM (SELECT event_hash FROM cpamp_import_evaluated GROUP BY event_hash HAVING count(DISTINCT source_digest) > 1) conflicts;
+SELECT count(*) FROM cpamp_import_evaluated WHERE validation_error <> '';
+SELECT count(*) FROM (
+  SELECT model FROM cpamp_import_prices
+   GROUP BY model HAVING count(*) <> 1
+  UNION ALL
+  SELECT model || ':' || threshold_tokens FROM cpamp_import_context_prices
+   GROUP BY model, threshold_tokens HAVING count(*) <> 1
+  UNION ALL
+  SELECT p.model FROM cpamp_import_prices p
+   WHERE COALESCE(p.model, '') = ''
+      OR NOT (p.prompt_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (p.completion_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (p.cache_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (p.cache_read_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (p.cache_creation_per_1m BETWEEN 0 AND 1000000000)
+      OR p.prompt_configured NOT IN (0,1) OR p.completion_configured NOT IN (0,1)
+      OR p.cache_read_configured NOT IN (0,1) OR p.cache_creation_configured NOT IN (0,1)
+  UNION ALL
+  SELECT c.model FROM cpamp_import_context_prices c
+   WHERE COALESCE(c.model, '') = '' OR c.threshold_tokens < 0
+      OR NOT (c.prompt_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (c.completion_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (c.cache_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (c.cache_read_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (c.cache_creation_per_1m BETWEEN 0 AND 1000000000)
+      OR c.prompt_configured NOT IN (0,1) OR c.completion_configured NOT IN (0,1)
+      OR c.cache_configured NOT IN (0,1) OR c.cache_read_configured NOT IN (0,1)
+      OR c.cache_creation_configured NOT IN (0,1)
+  UNION ALL
+  SELECT s.model FROM cpamp_import_service_prices s
+   WHERE COALESCE(s.model, '') = '' OR COALESCE(s.mode, '') = ''
+      OR COALESCE(s.service_tier, '') = ''
+      OR NOT (s.prompt_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (s.completion_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (s.cache_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (s.cache_read_per_1m BETWEEN 0 AND 1000000000)
+      OR NOT (s.cache_creation_per_1m BETWEEN 0 AND 1000000000)
+      OR s.prompt_configured NOT IN (0,1) OR s.completion_configured NOT IN (0,1)
+      OR s.cache_configured NOT IN (0,1) OR s.cache_read_configured NOT IN (0,1)
+      OR s.cache_creation_configured NOT IN (0,1)
+  UNION ALL
+  SELECT left_rule.model FROM cpamp_import_service_prices left_rule
+  JOIN cpamp_import_service_prices right_rule
+    ON left_rule.model = right_rule.model AND left_rule.ctid < right_rule.ctid
+   AND (left_rule.mode IN (right_rule.mode, right_rule.service_tier)
+     OR left_rule.service_tier IN (right_rule.mode, right_rule.service_tier))
+) invalid_price_configuration;
+`;
     const values = runPsql(["-At"], validationSql, "capture").split(/\s+/);
-    if (values.length !== 5 || values.some((value) => !/^\d+$/.test(value ?? ""))) fail("invalid CPAMP staging validation result");
-    const [stagedText, unmappedText, invalidAliasText, duplicateText, conflictsText] = values as [string, string, string, string, string];
+    if (values.length !== 7 || values.some((value) => !/^\d+$/.test(value ?? ""))) fail("invalid CPAMP staging validation result");
+    const [stagedText, unmappedText, invalidAliasText, duplicateText, conflictsText, invalidBillingText, invalidPricesText] = values as [string, string, string, string, string, string, string];
     const unmapped = BigInt(unmappedText);
     const invalidAliases = BigInt(invalidAliasText);
     const conflicts = BigInt(conflictsText);
     if (unmapped > 0n && !allowUnmapped) fail(`CPAMP import stopped: ${unmappedText} staged events have no supported key identity; set CPAMP_ALLOW_UNMAPPED=true only after accepting that data loss`);
     if (invalidAliases > 0n) fail(`CPAMP import stopped: ${invalidAliasText} staged aliases have a non-hex key identity`);
     if (conflicts > 0n) fail(`CPAMP import stopped: ${conflictsText} event hashes map to conflicting source rows`);
+    if (BigInt(invalidPricesText) > 0n) fail(`CPAMP import stopped: ${invalidPricesText} source price rows are ambiguous or invalid`);
+    if (BigInt(invalidBillingText) > 0n) {
+      const reasons = runPsql(
+        ["-At", "-F", " | "],
+        "SELECT validation_error, count(*) FROM cpamp_import_evaluated WHERE validation_error <> '' GROUP BY validation_error ORDER BY count(*) DESC, validation_error LIMIT 5;",
+        "capture",
+      );
+      fail(`CPAMP import stopped: ${invalidBillingText} staged events lack exact token/pricing provenance${reasons ? ` (${reasons})` : ""}`);
+    }
     process.stderr.write(`CPAMP staged=${stagedText} unmapped=${unmappedText} duplicate_rows_deduplicated=${duplicateText} conflicting_event_hashes=0\n`);
+
+    const legacyCorrectionText = runPsql(
+      ["-v", `tenant_external_id=${tenant}`, "-v", `import_source=${source}`, "-At"],
+      `SELECT count(*) FROM cpamp_import_evaluated e JOIN tenants t ON t.external_id = :'tenant_external_id' JOIN import_request_links l ON l.tenant_id=t.id AND l.source=:'import_source' AND l.external_event_hash=e.event_hash WHERE l.source_digest=e.legacy_source_digest AND l.source_digest<>e.source_digest;\n`,
+      "capture",
+    );
+    if (!/^\d+$/.test(legacyCorrectionText)) fail("invalid CPAMP correction preflight result");
+    if (BigInt(legacyCorrectionText) > 0n && correctionMode === "off") {
+      fail(`CPAMP import stopped: ${legacyCorrectionText} previously imported events require the explicit cache/pricing correction mode`);
+    }
+    if (correctionMode === "plan") {
+      runPsql(["-v", `tenant_external_id=${tenant}`, "-v", `import_source=${source}`], readSql("correct-plan.sql"));
+      return;
+    }
+    if (correctionMode === "apply") {
+      runPsql(
+        ["-v", `tenant_external_id=${tenant}`, "-v", `import_source=${source}`],
+        `${readSql("correct.sql")}\n${readSql("correct-rebuild.sql")}`,
+      );
+    }
 
     runPsql(["-v", `tenant_external_id=${tenant}`, "-v", `import_source=${source}`], readSql("apply.sql"));
   } finally {

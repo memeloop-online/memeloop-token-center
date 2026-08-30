@@ -265,6 +265,33 @@ async fn declared_execution_metadata_is_bounded_persisted_and_projected() {
     assert_eq!(structure.client_name.as_deref(), Some("Codex"));
     assert_eq!(structure.source, "client_protocol");
     assert!(!structure.compaction);
+
+    let recent = fixture
+        .state
+        .db
+        .list_requests(fixture.key.key_id, 10)
+        .await
+        .expect("load recent request session context");
+    let context = recent
+        .iter()
+        .find(|request| request.request_id == request_id)
+        .and_then(|request| request.session_context.as_ref())
+        .expect("confirmed request session context");
+    assert_eq!(
+        context.session_id.as_deref(),
+        Some(cluster_id.to_string().as_str())
+    );
+    assert_eq!(
+        context.association,
+        memeloop_token_center::model::RequestSessionAssociation::Confirmed
+    );
+    assert_eq!(
+        context.session_name.as_deref(),
+        Some("API2 release dogfood")
+    );
+    assert_eq!(context.task_kind.as_deref(), Some("interactive"));
+    assert_eq!(context.agent_id.as_deref(), Some("codex-root"));
+    assert_eq!(context.semantics_source.as_deref(), Some("declared"));
 }
 
 #[tokio::test]
@@ -949,6 +976,43 @@ async fn candidates_are_visible_but_do_not_merge_and_empty_context_never_links()
     assert_ne!(empty_one_cluster, empty_two_cluster);
     assert_ne!(empty_one_cluster, second_cluster);
     assert_ne!(empty_two_cluster, second_cluster);
+
+    let unlinked_request = fixture.start_request("memory://unlinked").await;
+    let recent = fixture
+        .state
+        .db
+        .list_requests(fixture.key.key_id, 20)
+        .await
+        .expect("load recent session projections");
+    let projected = |request_id: Uuid| {
+        recent
+            .iter()
+            .find(|request| request.request_id == request_id)
+            .and_then(|request| request.session_context.as_ref())
+            .expect("request session context")
+    };
+    let first_context = projected(first_request);
+    let candidate_target_context = projected(second_request);
+    let unlinked_context = projected(unlinked_request);
+    assert_eq!(
+        first_context.session_id.as_deref(),
+        Some(first_cluster.to_string().as_str())
+    );
+    assert_eq!(
+        candidate_target_context.session_id.as_deref(),
+        Some(second_cluster.to_string().as_str())
+    );
+    assert_ne!(
+        candidate_target_context.session_id, first_context.session_id,
+        "a candidate edge must not masquerade as a confirmed association"
+    );
+    assert_eq!(
+        unlinked_context.association,
+        memeloop_token_center::model::RequestSessionAssociation::Unlinked
+    );
+    assert!(unlinked_context.session_id.is_none());
+    assert!(unlinked_context.session_name.is_none());
+    assert!(unlinked_context.semantics_source.is_none());
 
     let (status, clusters) = fixture.get("/self/v1/conversations?limit=50").await;
     assert_eq!(status, StatusCode::OK);

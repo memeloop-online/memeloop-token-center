@@ -30,7 +30,10 @@ copyRegular(join(repository, 'ops/migrate-cpamp.ts'), 'migrate-cpamp.ts', 0o444)
 copyRegular(join(repository, 'tests/fixtures/cpamp/initial.sql'), 'initial.sql', 0o444);
 mkdirSync(join(target, 'sql'), { mode: 0o700 });
 mkdirSync(join(target, 'sql/cpamp'), { mode: 0o700 });
-for (const sql of ['prepare.sql', 'reset.sql', 'apply.sql']) {
+for (const sql of [
+  'prepare.sql', 'evaluate.sql', 'apply.sql', 'correct-plan.sql',
+  'correct.sql', 'correct-rebuild.sql', 'reset.sql',
+]) {
   copyRegular(join(repository, 'ops/sql/cpamp', sql), join('sql/cpamp', sql), 0o444);
 }
 chmodSync(join(target, 'sql/cpamp'), 0o555);

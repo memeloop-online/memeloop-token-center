@@ -214,11 +214,37 @@ the existing buffered-only ABI.
 
 - Operator and self-service interfaces support Chinese and English, light and
   dark themes, keyboard use and mobile widths.
-- Chinese large numbers use `万`, `亿` and `万亿` conventions; English uses full
-  three-digit grouping rather than `K`/`M` abbreviations. Exact values remain
-  available to the user.
+- Primary balances, request counts, Token counts, rates, durations and costs
+  always show locale-grouped exact values in every locale. Chinese `万`/`亿` and
+  English compact notation may appear only as secondary context; hover-only
+  text is not an acceptable way to expose precision. Dynamic numeric data uses
+  lining, tabular figures and a stable baseline.
+- Operator and self-service are route-addressable applications with shared
+  visual foundations, a real desktop side navigation, discoverable mobile
+  navigation, browser back/forward and reload-safe deep links. Monitoring and
+  analytics use available wide-screen space; configuration forms retain a
+  bounded reading width. Acceptance covers at least 320, 390, 768, 1024, 1440,
+  1920 and 2560 pixel viewports without page-level horizontal overflow.
+- Self-service separates overview, requests, sessions, usage, generation jobs
+  and generation creation. Creation forms never appear on the monitoring
+  overview. Operator separates overview, requests, sessions, usage,
+  generations, providers, routes, pricing, client credentials, service
+  credentials and plugins.
+- Both applications provide accessible historical visualizations for request
+  success/failure, latency, Token structure, cost, models, credentials,
+  upstream accounts and time-of-week patterns. Charts use bounded, lazy-loaded
+  ECharts modules, resize and dispose correctly, and have a text/table
+  alternative. Approximate metrics such as histogram P95 are labelled as such;
+  costs are never summed across currencies.
+- Recent requests expose confirmed session/conversation context, including a
+  reported session name, task kind and agent relationship when present. Missing
+  semantics are labelled unlinked and never guessed from prompt content or
+  model names. Users can drill from a request into its session evidence.
 - Product copy is mature user-facing language, not implementation notes or task
-  reports. Terms such as “create key” are presented as “create credential”.
+  reports. Transport, storage and runtime terms such as SSE, epoch, indexed
+  fields, stable cursors, JSON Schema and Wasmtime do not appear as primary
+  product copy. Terms such as “create key” are presented as “create
+  credential”.
 - Operator and self-service credentials are remembered separately by the
   browser across reloads and restarts, and are removed only through the user's
   explicit clear action. The raw remembered value is never rendered back.
@@ -327,6 +353,20 @@ Each import records source identity, digest and checkpoint, replays without
 duplicate facts or aggregates, and uses a reviewed overlap window for late
 writes. Session archives are dry-run, apply and exact-replay checked. Exact and
 unlinked counts, object digests, source totals and target totals must reconcile.
+
+Historical CPAMP billing import preserves the source's normalized total input,
+cache-read, cache-creation, resolved pricing model, effective service tier,
+context tier and price provenance. It must respect the source's inclusive versus
+separate cache-accounting mode and must not double-count mirrored Claude cache
+fields. Missing pricing evidence fails closed rather than treating cached input
+as ordinary prompt input or presenting an estimate as an exact charge. A
+versioned correction of already imported history uses compare-and-swap against
+the original receipt, updates request facts and tenant-scoped aggregates in one
+transaction, and never changes balances, grants, reservations or ledger
+entries. Correction replay and the ordinary importer replay must both write
+nothing. Acceptance reconciles event, day, model and credential dimensions
+against the sealed CPAMP snapshot, including Codex/OpenAI inclusive cache,
+Claude separate cache, service/context tiers and live rows outside the import.
 
 Legacy CPA upstream migration must preserve its private SOCKS5 account proxy
 rather than silently bypassing it. Proxy credentials/topology are encrypted

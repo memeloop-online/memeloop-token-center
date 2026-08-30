@@ -45,7 +45,7 @@ class LiveRuntime {
       expectedKeyId,
       providerSecretCanary,
     };
-    this.browser = await chromium.launch({ headless: true });
+    this.browser = await chromium.launch({ headless: true, executablePath: chromium.executablePath() });
   }
 
   async stop(): Promise<void> {

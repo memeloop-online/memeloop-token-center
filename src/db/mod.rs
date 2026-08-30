@@ -24,9 +24,9 @@ use crate::{
         KeyConcurrencySnapshot, KeyLimitSnapshot, KeyPolicy, KeyRateLimitSnapshot, KeyView,
         LedgerEntryView, LegacyCredentialView, ManagedKeyView, ModelPrice, ModelPriceTier,
         ModelPriceTierView, ModelPriceView, OperatorGenerationJobView, OperatorStats,
-        RequestArchiveRefs, RequestEventView, RequestProvenanceView, RequestView, SelfStats,
-        ServiceTokenView, StatsBucket, StatsSummary, TenantView, TokenUsage, UsageReservation,
-        micros_to_decimal_string, priced_tokens,
+        RequestArchiveRefs, RequestEventView, RequestProvenanceView, RequestSessionAssociation,
+        RequestSessionContext, RequestView, SelfStats, ServiceTokenView, StatsBucket, StatsSummary,
+        TenantView, TokenUsage, UsageReservation, micros_to_decimal_string, priced_tokens,
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,

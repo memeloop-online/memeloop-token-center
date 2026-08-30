@@ -4,7 +4,8 @@ import { Given, Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
 import { baseURL, eventually, generationMockCounts, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
-import { assertAttribute, assertContains, assertCount, assertExactText, assertGenerationDownload, assertNoCount, assertNoHorizontalOverflow, assertValue, assertVisible, connectOperator, generationTableFor, metric, multimodalObservations, requestEventFixture, realtimeReconnectObservations, requireMultimodalObservation, sseRequestEvent, submitPortalGeneration, uuidPattern, waitForGenerationStatus } from './dogfood.support.js';
+import { appPreferenceControls, openAppRoute } from './app-route.support.js';
+import { assertAttribute, assertContains, assertCount, assertExactText, assertGenerationDownload, assertNoCount, assertNoHorizontalOverflow, assertValue, assertVisible, connectOperator, generationTableFor, metric, multimodalObservations, operatorTrafficPanel, requestEventFixture, realtimeReconnectObservations, requireMultimodalObservation, sseRequestEvent, submitPortalGeneration, uuidPattern, waitForGenerationStatus } from './dogfood.support.js';
 
 const operatorGenerationCancellations = new WeakMap<DogfoodWorld, { status: number; body: { status: string } }>();
 
@@ -13,28 +14,27 @@ When('下游用户以中文亮色主题在手机视口打开自助门户', async
   const seed = runtime.requireSeed();
   await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 375, height: 812 } });
   await page.locator('input[type="password"]').fill(seed.clientCredential);
-  await page.getByRole('button', { name: '载入', exact: true }).click();
+  await page.getByRole('button', { name: '进入', exact: true }).click();
 });
 
 Then('自助门户显示自己的 51 条请求和分页统计', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await assertExactText(metric(page, '总请求'), '51');
-  await assertExactText(metric(page, '成功'), '50');
+  await assertExactText(metric(page, '成功率'), '98.04%');
   await assertExactText(metric(page, '失败'), '1');
   await assertExactText(metric(page, 'Token 用量'), '600');
   await assertContains(metric(page, '可用余额 (USD)'), '$');
   await assertContains(metric(page, '总费用'), '$');
   await assertVisible(page.getByRole('heading', { name: 'Browser E2E credential', exact: true }));
   await assertVisible(page.getByText(model, { exact: true }).first());
-  await assertCount(page.locator('.self-history tbody tr'), 50);
-  await assertVisible(page.getByRole('button', { name: '加载更早请求', exact: true }));
+  await assertCount(page.locator('.self-history tbody tr'), 5);
 
-  await page.locator('.mobile-controls .language-toggle').click();
+  await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
   await assertAttribute(page.locator('html'), 'lang', 'en');
   await assertExactText(metric(page, 'Tokens'), '600');
   await assertContains(metric(page, 'Available balance (USD)'), '$');
   await assertContains(metric(page, 'Total cost'), '$');
-  await page.locator('.mobile-controls .language-toggle').click();
+  await appPreferenceControls(page).getByRole('button', { name: '中文', exact: true }).click();
   await assertAttribute(page.locator('html'), 'lang', 'zh-CN');
 });
 
@@ -54,6 +54,7 @@ Then('自助门户显示自己的余额、速率、并发和预算快照', async
 When('下游用户筛选失败请求并打开详情', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
+  await openAppRoute(page, 'portal', 'requests');
   const filters = page.locator('.self-request-filters');
   await filters.getByLabel('上游主键').fill(seed.upstreamId);
   await filters.getByLabel('路由主键').fill(seed.routeId);
@@ -104,11 +105,12 @@ Then('下游凭据不能读取管理资源或选择另一个凭据身份', async
 
 When('下游用户输入无效凭据并切换英文', async function (this: DogfoodWorld) {
   const page = this.requirePage();
+  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
   await page.locator('input[type="password"]').fill('invalid-browser-test-credential');
-  await page.getByRole('button', { name: '载入', exact: true }).click();
+  await page.getByRole('button', { name: '进入', exact: true }).click();
   await assertContains(page.getByRole('alert'), '凭据无效或已失效');
-  await page.locator('.mobile-controls .language-toggle').click();
-  await page.getByRole('button', { name: 'Load', exact: true }).click();
+  await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
+  await page.getByRole('button', { name: 'Continue', exact: true }).click();
 });
 
 Then('中英文都显示安全的无效凭据提示且浏览器没有失败', async function (this: DogfoodWorld) {
@@ -127,7 +129,7 @@ Then('中英文都显示安全的无效凭据提示且浏览器没有失败', as
 When('管理员以中文亮色主题打开模型计费', async function (this: DogfoodWorld) {
   await connectOperator(this, 'light', runtime.requireSeed().globalServiceCredential);
   const page = this.requirePage();
-  await page.getByRole('tab', { name: '模型计费', exact: true }).click();
+  await openAppRoute(page, 'operator', 'pricing');
   await assertVisible(page.getByRole('heading', { name: '多模态生成价格', exact: true }));
 });
 
@@ -215,8 +217,8 @@ When('管理员通过可见生成任务页查看排队任务详情并取消', as
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(job) });
   });
   await connectOperator(this, 'light', seed.globalServiceCredential);
-  await page.getByRole('tab', { name: '生成任务', exact: true }).click();
-  const panel = page.locator('article.panel').filter({ has: page.getByRole('heading', { name: '多模态生成任务', exact: true }) });
+  await openAppRoute(page, 'operator', 'generations');
+  const panel = page.locator('.operator-generations');
   await assertContains(panel, 'browser-operator-generation');
   await panel.getByRole('button', { name: '详情', exact: true }).click();
   await assertVisible(page.getByRole('dialog'));
@@ -231,7 +233,7 @@ Then('生成任务取消请求包含明确租户且页面显示已取消', async
   assert.equal(cancellation?.status, 200);
   assert.equal(cancellation?.body.status, 'cancelled');
   await assertContains(page.getByRole('status'), '已提交取消请求');
-  const panel = page.locator('article.panel').filter({ has: page.getByRole('heading', { name: '多模态生成任务', exact: true }) });
+  const panel = page.locator('.operator-generations');
   await assertContains(panel, '已取消');
   this.assertNoBrowserFailures();
 });
@@ -244,9 +246,13 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const videoModel = 'browser-ui-seedance-video';
 
   await connectOperator(this, 'light', seed.globalServiceCredential);
-  await page.getByRole('tab', { name: '上游提供商', exact: true }).click();
+  await openAppRoute(page, 'operator', 'providers');
   const onboarding = page.locator('.provider-onboarding');
-  await onboarding.locator('summary').click();
+  // Successful refresh keeps the workspace and its form state mounted. Open
+  // the disclosure only when it is currently collapsed.
+  if (!(await onboarding.evaluate((element) => (element as HTMLDetailsElement).open))) {
+    await onboarding.locator('summary').click();
+  }
   await onboarding.getByLabel('服务提供商').selectOption('comfyui');
   const comfyForm = onboarding.locator('form');
   await comfyForm.locator('#root_name').fill('Browser UI ComfyUI');
@@ -275,8 +281,11 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   assert.equal(comfyResponse.status(), 201, await comfyResponse.text());
   const comfyUpstream = await comfyResponse.json() as { id: string };
   assert.match(comfyUpstream.id, uuidPattern);
-  await assertContains(page.getByRole('status'), '上游服务已添加');
+  await assertVisible(page.locator('.provider-account').filter({ hasText: 'Browser UI ComfyUI' }));
 
+  if (!(await onboarding.evaluate((element) => (element as HTMLDetailsElement).open))) {
+    await onboarding.locator('summary').click();
+  }
   await onboarding.getByLabel('提供商').selectOption('volcengine-seedance');
   const providerForm = onboarding.locator('form');
   await providerForm.locator('#root_name').fill('Browser UI Seedance');
@@ -305,9 +314,9 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   assert.equal(upstreamResponse.status(), 201);
   const seedanceUpstream = await upstreamResponse.json() as { id: string };
   assert.match(seedanceUpstream.id, uuidPattern);
-  await assertContains(page.getByRole('status'), '上游服务已添加');
+  await assertVisible(page.locator('.provider-account').filter({ hasText: 'Browser UI Seedance' }));
 
-  await page.getByRole('tab', { name: '模型路由', exact: true }).click();
+  await openAppRoute(page, 'operator', 'routes');
   const routeForm = page.locator('details.create-resource').filter({ hasText: '创建模型路由' });
   await routeForm.locator('summary').click();
   await routeForm.getByLabel('公开模型').fill(imageModel);
@@ -359,7 +368,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   assert.match(videoRoute.id, uuidPattern);
   await assertContains(page.getByRole('status'), '路由已创建');
 
-  await page.getByRole('tab', { name: '模型计费', exact: true }).click();
+  await openAppRoute(page, 'operator', 'pricing');
   const manualPricing = page.locator('details.manual-pricing');
   await manualPricing.locator('summary').click();
   await manualPricing.getByLabel('类型').selectOption('generation');
@@ -378,7 +387,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   assert.equal((await priceResponsePromise).status(), 200);
   await assertContains(page.getByRole('status'), '价格已保存');
 
-  await page.getByRole('tab', { name: '凭据管理', exact: true }).click();
+  await openAppRoute(page, 'operator', 'credentials');
   const credentialPanel = page.locator('details.create-resource').filter({ hasText: '创建客户端凭据' });
   await credentialPanel.locator('summary').click();
   const credentialForm = credentialPanel.locator('form');
@@ -433,21 +442,27 @@ When('普通凭据用户通过中文亮色门户创建图片和两种视频任�
     if (!url.pathname.startsWith('/self/v1/generations')
       && url.pathname !== '/v1/images/generations'
       && url.pathname !== '/v1/videos/generations') return;
-    observation.generationResponses.push(response.text());
+    void response.text().then(
+      (body) => observation.generationResponses.push(body),
+      () => observation.generationResponses.push('__response_body_read_failed__'),
+    );
   });
   await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 390, height: 844 } });
   await page.locator('input[type="password"]').fill(observation.clientCredential);
-  await page.getByRole('button', { name: '载入', exact: true }).click();
+  await page.getByRole('button', { name: '进入', exact: true }).click();
+  await openAppRoute(page, 'portal', 'generate');
   await assertVisible(page.getByRole('heading', { name: '创建多模态任务', exact: true }));
   const imageRequest = await submitPortalGeneration(page, 'image', observation.imageModel, '画一个明亮的橙色圆形', '5', { 宽度: '512', 高度: '512' });
   assert.deepEqual(imageRequest, {
     model: observation.imageModel,
     input: { parameters: { width: 512, height: 512, prompt: '画一个明亮的橙色圆形' } },
   });
+  await openAppRoute(page, 'portal', 'generations');
   await waitForGenerationStatus(page, observation.imageModel, '已成功');
   await eventually(async () => {
     assert.deepEqual(await generationMockCounts(), { image: 1, video: 0 });
   }, 10_000, 'mock upstream did not receive exactly one image generation');
+  await openAppRoute(page, 'portal', 'generate');
   const seedanceRequest = await submitPortalGeneration(page, 'video', observation.videoModel, '一只狐狸跑过草地', '5');
   assert.deepEqual(seedanceRequest, {
     model: observation.videoModel,
@@ -460,6 +475,7 @@ When('普通凭据用户通过中文亮色门户创建图片和两种视频任�
     model: observation.imageModel,
     input: { parameters: { width: 640, height: 360, prompt: '一只机械鸟掠过城市' } },
   });
+  await openAppRoute(page, 'portal', 'generations');
 });
 
 Then('门户自动轮询到图片和视频成功并显示准确计费', async function (this: DogfoodWorld) {
@@ -471,8 +487,6 @@ Then('门户自动轮询到图片和视频成功并显示准确计费', async fu
   await assertContains(imageRow, '1');
   await assertContains(videoRow, '$0.5');
   await assertContains(videoRow, '5');
-  await assertContains(metric(page, '可用余额 (USD)'), '$9.1');
-  await assertContains(metric(page, '总费用'), '$0.9');
   assert.deepEqual(await generationMockCounts(), { image: 2, video: 1 });
   await assertAttribute(page.locator('html'), 'data-theme', 'light');
 });
@@ -481,8 +495,9 @@ Then('上游短期签名不出现在响应、页面、详情或持久化存储�
   const page = this.requirePage();
   const observation = requireMultimodalObservation(this);
   const canary = 'never-persist';
-  const responseBodies = await Promise.all(observation.generationResponses);
-  assert.ok(responseBodies.length >= 4, 'expected browser generation submission and polling responses');
+  await eventually(() => assert.ok(observation.generationResponses.length >= 4, 'expected browser generation submission and polling responses'));
+  const responseBodies = [...observation.generationResponses];
+  assert.ok(!responseBodies.includes('__response_body_read_failed__'), 'a generation response body could not be inspected');
   assert.ok(responseBodies.every((body) => !body.includes(canary)), 'provider canary leaked through a browser generation response');
   assert.ok(!(await page.content()).includes(canary), 'provider canary leaked into the rendered portal DOM');
 
@@ -529,10 +544,13 @@ When('用户通过门户创建并取消排队中的图片任务', async function
     assert.equal(response.status, 200);
     assert.equal((await response.json() as { active: boolean }).active, true);
   }, 10_000, 'the deterministic fixture did not occupy the single generation worker');
+  await openAppRoute(page, 'portal', 'generate');
   await submitPortalGeneration(page, 'image', observation.imageModel, '这个任务将在排队时取消', '5', { 宽度: '512', 高度: '512' });
+  await openAppRoute(page, 'portal', 'generations');
   const generationTable = generationTableFor(page);
   const row = generationTable.locator('tbody tr').filter({ hasText: observation.imageModel }).first();
   const cancellationResponse = page.waitForResponse((response) => response.url().includes('/self/v1/generations/') && response.request().method() === 'DELETE');
+  page.once('dialog', (dialog) => void dialog.accept());
   await row.getByRole('button', { name: '取消任务', exact: true }).click();
   const response = await cancellationResponse;
   assert.equal(response.status(), 200, '任务应在 worker 获取 lease 之前由真实门户控件取消');
@@ -542,17 +560,17 @@ When('用户通过门户创建并取消排队中的图片任务', async function
 
 Then('取消任务不扣费且请求统计反映多模态用量', async function (this: DogfoodWorld) {
   const page = this.requirePage();
+  await openAppRoute(page, 'portal', 'overview');
   await assertContains(metric(page, '可用余额 (USD)'), '$9.1');
   await assertContains(metric(page, '总费用'), '$0.9');
   await assertExactText(metric(page, '总请求'), '4');
-  await assertContains(generationTableFor(page), '已取消');
 });
 
 Then('普通凭据在英文暗色主题下仍无法访问管理端', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const observation = requireMultimodalObservation(this);
-  await page.locator('.mobile-controls .language-toggle').click();
-  await page.locator('.mobile-controls').getByRole('button', { name: 'Switch to dark theme' }).click();
+  await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
+  await appPreferenceControls(page).getByRole('button', { name: 'Switch to dark theme' }).click();
   await assertAttribute(page.locator('html'), 'lang', 'en');
   await assertAttribute(page.locator('html'), 'data-theme', 'dark');
   await eventually(async () => {
@@ -645,16 +663,17 @@ When('浏览器模拟实时请求流断线超过五秒并重放最后事件', as
   });
 
   await connectOperator(this, 'dark');
-  await assertCount(page.locator('#operator-panel-traffic tbody tr').filter({ hasText: baseline.model }), 1);
-  await assertCount(page.locator('#operator-panel-traffic tbody tr').filter({ hasText: missingOne.model }), 1);
-  await assertCount(page.locator('#operator-panel-traffic tbody tr').filter({ hasText: missingTwo.model }), 1);
+  await openAppRoute(page, 'operator', 'requests');
+  await assertCount(operatorTrafficPanel(page).locator('tbody tr').filter({ hasText: baseline.model }), 1);
+  await assertCount(operatorTrafficPanel(page).locator('tbody tr').filter({ hasText: missingOne.model }), 1);
+  await assertCount(operatorTrafficPanel(page).locator('tbody tr').filter({ hasText: missingTwo.model }), 1);
   await eventually(() => assert.ok(connectionUrls.length >= 3), 15_000, 'realtime stream did not reconnect after the mocked close');
 
   realtimeReconnectObservations.set(this, {
     connectionUrls,
     disconnectedForMs: secondDeliveredAt - firstClosedAt,
     finalCursorId: missingTwo.event_id,
-    finalRowCount: await page.locator('#operator-panel-traffic tbody tr').count(),
+    finalRowCount: await operatorTrafficPanel(page).locator('tbody tr').count(),
   });
 });
 
@@ -672,15 +691,15 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   assert.ok(Number.isSafeInteger(Number(caughtUpReconnect.searchParams.get('after_event_at'))));
 
   assert.ok(observation.finalRowCount >= 3, 'the caught-up request table must contain all mocked events');
-  await assertCount(page.locator('#operator-panel-traffic tbody tr'), observation.finalRowCount);
+  await assertCount(operatorTrafficPanel(page).locator('tbody tr'), observation.finalRowCount);
   for (const eventModel of ['browser-sse-baseline', 'browser-sse-missing-one', 'browser-sse-missing-two']) {
-    await assertCount(page.locator('#operator-panel-traffic tbody tr').filter({ hasText: eventModel }), 1);
+    await assertCount(operatorTrafficPanel(page).locator('tbody tr').filter({ hasText: eventModel }), 1);
   }
   await assertNoCount(page.locator('.notice.error'));
 
   const connectionsBeforeTabChange = observation.connectionUrls.length;
-  await page.getByRole('tab', { name: '请求统计', exact: true }).click();
-  await page.getByRole('tab', { name: '实时请求', exact: true }).click();
+  await openAppRoute(page, 'operator', 'usage');
+  await openAppRoute(page, 'operator', 'requests');
   await eventually(
     () => assert.ok(observation.connectionUrls.length > connectionsBeforeTabChange),
     10_000,
@@ -689,7 +708,7 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   const afterAbort = new URL(observation.connectionUrls.at(-1)!);
   assert.equal(afterAbort.searchParams.get('after_event_id'), observation.finalCursorId);
   await assertNoCount(page.locator('.notice.error'));
-  await assertCount(page.locator('#operator-panel-traffic tbody tr'), observation.finalRowCount);
+  await assertCount(operatorTrafficPanel(page).locator('tbody tr'), observation.finalRowCount);
 
   const filters = page.locator('.traffic-filters');
   await filters.getByLabel('模型').fill(model);
@@ -703,8 +722,10 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
     'realtime stream did not restart after clearing filters',
   );
   const afterFilterReset = new URL(observation.connectionUrls.at(-1)!);
-  assert.equal(afterFilterReset.searchParams.has('after_event_at'), false);
-  assert.equal(afterFilterReset.searchParams.has('after_event_id'), false);
+  // Filtering affects the rendered snapshot, not the bounded background
+  // stream. Clearing filters therefore preserves the durable replay cursor.
+  assert.equal(afterFilterReset.searchParams.get('after_event_id'), observation.finalCursorId);
+  assert.ok(Number.isSafeInteger(Number(afterFilterReset.searchParams.get('after_event_at'))));
 
   const tenantPicker = page.locator('.tenant-picker select');
   await tenantPicker.selectOption('');

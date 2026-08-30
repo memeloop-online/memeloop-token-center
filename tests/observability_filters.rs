@@ -5,6 +5,7 @@ use axum::{
 use memeloop_token_center::{
     AppState, api,
     config::Config,
+    conversation::ConversationHints,
     db::{CreateKeyInput, CreateServiceTokenInput, FinishRequest, NewRequest},
     model::KeyPolicy,
 };
@@ -72,7 +73,7 @@ async fn postgres_observability_queries_use_the_same_bound_contract() {
         .unwrap();
     let route_id = Uuid::now_v7();
     let upstream_id = Uuid::now_v7();
-    record(
+    let confirmed_request = record(
         &state,
         &key,
         RecordedRequest {
@@ -86,6 +87,69 @@ async fn postgres_observability_queries_use_the_same_bound_contract() {
         },
     )
     .await;
+    let confirmed_cluster = state
+        .db
+        .record_conversation_observation(
+            &key,
+            confirmed_request,
+            &serde_json::json!({"input": "persisted PostgreSQL session"}),
+            &ConversationHints {
+                session_name: Some("PostgreSQL session".into()),
+                agent_id: Some("postgres-contract-agent".into()),
+                task_kind: Some("contract-test".into()),
+                ..Default::default()
+            },
+            Some("contract-test"),
+        )
+        .await
+        .unwrap();
+    let unlinked_request = record(
+        &state,
+        &key,
+        RecordedRequest {
+            model: "postgres-unlinked-model",
+            route_id: Uuid::now_v7(),
+            upstream_id: Uuid::now_v7(),
+            duration_ms: 10,
+            cost_micros: 1,
+            status_code: 200,
+            error_code: None,
+        },
+    )
+    .await;
+    let projected = state.db.list_requests(key.key_id, 10).await.unwrap();
+    let confirmed = projected
+        .iter()
+        .find(|request| request.request_id == confirmed_request)
+        .unwrap()
+        .session_context
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        confirmed.session_id.as_deref(),
+        Some(confirmed_cluster.to_string().as_str())
+    );
+    assert_eq!(
+        confirmed.association,
+        memeloop_token_center::model::RequestSessionAssociation::Confirmed
+    );
+    assert_eq!(
+        confirmed.session_name.as_deref(),
+        Some("PostgreSQL session")
+    );
+    assert_eq!(confirmed.semantics_source.as_deref(), Some("declared"));
+    let unlinked = projected
+        .iter()
+        .find(|request| request.request_id == unlinked_request)
+        .unwrap()
+        .session_context
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        unlinked.association,
+        memeloop_token_center::model::RequestSessionAssociation::Unlinked
+    );
+    assert!(unlinked.session_id.is_none());
     let filter = memeloop_token_center::db::RequestListFilter {
         limit: 10,
         route_id: Some(route_id),
@@ -255,6 +319,20 @@ async fn operator_and_self_observability_filters_are_bounded_scoped_and_keyset_p
         },
     )
     .await;
+    let alpha_cluster = state
+        .db
+        .record_conversation_observation(
+            &alpha,
+            alpha_request,
+            &serde_json::json!({"input": "operator-visible confirmed session"}),
+            &ConversationHints {
+                session_name: Some("Operator-visible session".into()),
+                ..Default::default()
+            },
+            Some("contract-test"),
+        )
+        .await
+        .unwrap();
     let _alpha_older = record(
         &state,
         &alpha,
@@ -340,6 +418,22 @@ async fn operator_and_self_observability_filters_are_bounded_scoped_and_keyset_p
     assert_eq!(status, StatusCode::OK);
     assert_eq!(older.as_array().unwrap().len(), 1);
     assert_ne!(older[0]["request_id"], first["request_id"]);
+    let projected_request = [first, &older[0]]
+        .into_iter()
+        .find(|request| request["request_id"] == alpha_request.to_string())
+        .expect("operator-scoped confirmed request");
+    assert_eq!(
+        projected_request["session_context"]["association"],
+        "confirmed"
+    );
+    assert_eq!(
+        projected_request["session_context"]["session_id"],
+        alpha_cluster.to_string()
+    );
+    assert_eq!(
+        projected_request["session_context"]["session_name"],
+        "Operator-visible session"
+    );
 
     let (status, stats) = get_json(
         &state,

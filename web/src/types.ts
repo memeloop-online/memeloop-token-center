@@ -10,6 +10,16 @@ export interface RequestView {
   cost: string;
   currency?: string | null;
   error_code: string | null;
+  session_context?: RequestSessionContext | null;
+}
+
+export interface RequestSessionContext {
+  session_id: string | null;
+  association: 'confirmed' | 'unlinked';
+  session_name: string | null;
+  task_kind: string | null;
+  agent_id: string | null;
+  semantics_source: 'declared' | string | null;
 }
 
 export interface RequestDetail extends RequestView {
@@ -139,6 +149,24 @@ export interface OperatorUsageAnalysis {
   by_key: UsageAnalysisBucket[];
   by_session: UsageAnalysisSessionBucket[];
   by_upstream: UsageAnalysisBucket[];
+  by_protocol: UsageAnalysisBucket[];
+  by_status: UsageAnalysisBucket[];
+  errors: UsageAnalysisBucket[];
+  heatmap: UsageAnalysisHeatmapBucket[];
+}
+
+export interface SelfUsageAnalysis {
+  from_created_at: number;
+  to_created_at: number;
+  granularity: 'hour' | 'day';
+  time_zone: 'UTC';
+  p95_is_approximate: true;
+  p95_method: string;
+  summary: UsageAnalysisMetrics;
+  generation_units_by_modality: UsageAnalysisGenerationUnitByModality[];
+  generation_units_by_billing_unit: UsageAnalysisGenerationUnitByBillingUnit[];
+  time_series: UsageAnalysisTimeBucket[];
+  by_model: UsageAnalysisBucket[];
   by_protocol: UsageAnalysisBucket[];
   by_status: UsageAnalysisBucket[];
   errors: UsageAnalysisBucket[];

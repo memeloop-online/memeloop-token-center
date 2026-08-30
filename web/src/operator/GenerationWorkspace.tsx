@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../api';
 import { DrawerFrame } from '../components';
 import { formatCurrency, formatNumber } from '../format';
@@ -23,58 +23,78 @@ export function GenerationWorkspace({ token, tenant }: { token: string; tenant: 
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const loadSequence = useRef(0);
+  const detailSequence = useRef(0);
+  const scope = useRef({ token, tenant });
+  scope.current = { token, tenant };
 
   const load = async () => {
-    if (!token.trim()) { setJobs([]); setDetail(undefined); return; }
+    const sequence = ++loadSequence.current;
+    const loadToken = token.trim(); const loadTenant = tenant;
+    if (!loadToken) { setJobs([]); setDetail(undefined); return; }
     setLoading(true); setError('');
     try {
-      setJobs(await api<OperatorGenerationJob[]>('/internal/v1/generations' + tenantQuery(tenant), token.trim()));
+      const next = await api<OperatorGenerationJob[]>('/internal/v1/generations' + tenantQuery(loadTenant), loadToken);
+      if (sequence !== loadSequence.current || scope.current.token.trim() !== loadToken || scope.current.tenant !== loadTenant) return;
+      setJobs(next);
     } catch (reason) {
+      if (sequence !== loadSequence.current || scope.current.token.trim() !== loadToken || scope.current.tenant !== loadTenant) return;
       setJobs([]);
       setError(reason instanceof Error ? reason.message : t('generations.loadFailed'));
     } finally {
-      setLoading(false);
+      if (sequence === loadSequence.current && scope.current.token.trim() === loadToken && scope.current.tenant === loadTenant) setLoading(false);
     }
   };
 
-  useEffect(() => { setDetail(undefined); setMessage(''); void load(); }, [token, tenant]);
+  useEffect(() => {
+    loadSequence.current += 1; detailSequence.current += 1;
+    setJobs([]); setDetail(undefined); setBusy(''); setLoading(false); setMessage(''); setError('');
+    void load();
+  }, [token, tenant]);
 
   const select = async (job: OperatorGenerationJob) => {
+    const sequence = ++detailSequence.current;
+    const selectToken = token.trim(); const selectTenant = tenant;
     setError('');
     try {
-      setDetail(await api<OperatorGenerationJob>('/internal/v1/generations/' + job.job_id + tenantQuery(job.tenant_external_id), token.trim()));
+      const next = await api<OperatorGenerationJob>('/internal/v1/generations/' + job.job_id + tenantQuery(job.tenant_external_id), selectToken);
+      if (sequence === detailSequence.current && scope.current.token.trim() === selectToken && scope.current.tenant === selectTenant) setDetail(next);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : t('generations.detailFailed'));
+      if (sequence === detailSequence.current && scope.current.token.trim() === selectToken && scope.current.tenant === selectTenant) setError(reason instanceof Error ? reason.message : t('generations.detailFailed'));
     }
   };
 
   const cancel = async (job: OperatorGenerationJob) => {
     if (!tenant || !canCancel(job) || !window.confirm(t('generations.confirmCancel', { model: job.model }))) return;
+    const cancelToken = token.trim(); const cancelTenant = tenant;
     setBusy(job.job_id); setError(''); setMessage('');
     try {
-      const cancelled = await api<OperatorGenerationJob>('/internal/v1/generations/' + job.job_id + tenantQuery(tenant), token.trim(), { method: 'DELETE' });
+      const cancelled = await api<OperatorGenerationJob>('/internal/v1/generations/' + job.job_id + tenantQuery(cancelTenant), cancelToken, { method: 'DELETE' });
+      if (scope.current.token.trim() !== cancelToken || scope.current.tenant !== cancelTenant) return;
       setJobs((current) => current.map((value) => value.job_id === cancelled.job_id ? cancelled : value));
       setDetail((current) => current?.job_id === cancelled.job_id ? cancelled : current);
       setMessage(t('generations.cancelRequested'));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : t('generations.cancelFailed'));
+      if (scope.current.token.trim() === cancelToken && scope.current.tenant === cancelTenant) setError(reason instanceof Error ? reason.message : t('generations.cancelFailed'));
     } finally {
-      setBusy('');
+      if (scope.current.token.trim() === cancelToken && scope.current.tenant === cancelTenant) setBusy('');
     }
   };
 
   const download = async (job: OperatorGenerationJob, asset: GenerationAsset) => {
+    const downloadToken = token.trim(); const downloadTenant = tenant;
     try {
       const response = await fetch('/internal/v1/generations/' + job.job_id + '/assets/' + asset.asset_id + tenantQuery(job.tenant_external_id), {
-        headers: { Authorization: 'Bearer ' + token.trim() },
+        headers: { Authorization: 'Bearer ' + downloadToken },
       });
+      if (scope.current.token.trim() !== downloadToken || scope.current.tenant !== downloadTenant) return;
       if (!response.ok) throw new ApiError('HTTP ' + response.status, response.status);
       const objectUrl = URL.createObjectURL(await response.blob());
       const link = document.createElement('a');
       link.href = objectUrl; link.download = asset.filename; link.click();
       URL.revokeObjectURL(objectUrl);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : t('generations.assetFailed'));
+      if (scope.current.token.trim() === downloadToken && scope.current.tenant === downloadTenant) setError(reason instanceof Error ? reason.message : t('generations.assetFailed'));
     }
   };
 
@@ -82,7 +102,7 @@ export function GenerationWorkspace({ token, tenant }: { token: string; tenant: 
     {!tenant && <div className="notice warning" role="status">{t('generations.allTenantsReadOnly')}</div>}
     {error && <div className="notice error" role="alert">{error}</div>}
     {message && <div className="notice success" role="status">{message}</div>}
-    <article className="panel">
+    <article className="panel operator-generations">
       <div className="panel-title"><div><h2>{t('generations.title')}</h2><p className="muted">{t('generations.description')}</p></div><div className="row-actions"><span>{formatNumber(jobs.length, locale)}</span><button type="button" className="secondary" disabled={loading || !token.trim()} onClick={() => void load()}>{loading ? t('common.loading') : t('usage.refresh')}</button></div></div>
       {jobs.length === 0 ? <div className="empty">{loading ? t('common.loading') : t('generations.empty')}</div> : <div className="table-scroll"><table>
         <thead><tr><th>{t('request.time')}</th><th>{t('operator.tenant')}</th><th>{t('generations.credential')}</th><th>{t('request.model')}</th><th>{t('generations.driver')}</th><th>{t('request.status')}</th><th>{t('generations.units')}</th><th>{t('request.cost')}</th><th>{t('request.actions')}</th></tr></thead>

@@ -2995,6 +2995,52 @@ paths:
                       key_id: { type: string, format: uuid }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  /self/v1/usage-analysis:
+    get:
+      tags: [Self service]
+      operationId: getOwnUsageAnalysis
+      summary: Analyze bounded usage for the current stable credential
+      description: |
+        Always binds the stable tenant and `key_id` established by the supplied
+        client credential. No tenant, key, principal, route, session, or upstream
+        selector is accepted or returned. `auto` selects hourly rollups through
+        31 days and daily rollups for longer ranges; the maximum inclusive range
+        is 93 days. Costs remain separated by currency. Average duration is exact
+        for the selected rollups; P95 is a fixed-histogram approximation capped at
+        60000 ms. The response is assembled from one consistent read-only database
+        snapshot.
+      security: [{ clientBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/FromCreatedAt'
+        - $ref: '#/components/parameters/ToCreatedAt'
+        - name: granularity
+          in: query
+          required: false
+          schema: { type: string, enum: [auto, hour, day], default: auto }
+        - $ref: '#/components/parameters/ModelFilter'
+        - name: protocol
+          in: query
+          required: false
+          description: Exact canonical protocol family.
+          schema: { type: string, enum: [openai, anthropic, openai-image, generation] }
+        - name: status
+          in: query
+          required: false
+          description: Terminal logical status; pending traffic is absent from usage rollups.
+          schema: { type: string, enum: [success, error] }
+        - $ref: '#/components/parameters/ErrorCodeFilter'
+      responses:
+        '200':
+          description: Currency-safe analytics belonging only to the authenticated stable credential.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'private, no-store' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SelfUsageAnalysis' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   /self/v1/generations:
     get:
       tags: [Self service]
@@ -5463,7 +5509,7 @@ components:
           items: { $ref: '#/components/schemas/MemeLoopCloudSubscriptionEvent' }
     RequestSummary:
       type: object
-      required: [request_id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost, error_code]
+      required: [request_id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost, error_code, session_context]
       properties:
         request_id: { type: string, format: uuid }
         created_at: { type: integer, format: int64 }
@@ -5475,6 +5521,32 @@ components:
         output_tokens: { type: integer, format: int64 }
         cost: { $ref: '#/components/schemas/Money' }
         error_code: { type: [string, 'null'] }
+        session_context:
+          description: |
+            Persisted logical-session projection for request records. `confirmed`
+            identifies the internal session accepted by durable relationship evidence;
+            `unlinked` explicitly records the absence of such an association. Candidate
+            edges never appear as confirmed, and generation jobs return null.
+          oneOf:
+            - $ref: '#/components/schemas/RequestSessionContext'
+            - type: 'null'
+    RequestSessionContext:
+      type: object
+      additionalProperties: false
+      required: [session_id, association, session_name, task_kind, agent_id, semantics_source]
+      properties:
+        session_id:
+          type: [string, 'null']
+          format: uuid
+          description: Internal logical-session identifier; null for unlinked records.
+        association: { type: string, enum: [confirmed, unlinked] }
+        session_name: { type: [string, 'null'], maxLength: 256 }
+        task_kind: { type: [string, 'null'], maxLength: 256 }
+        agent_id: { type: [string, 'null'], maxLength: 256 }
+        semantics_source:
+          type: [string, 'null']
+          enum: [declared, null]
+          description: Source of the optional human/execution semantics; never model- or prompt-guessed.
     RequestDetail:
       allOf:
         - $ref: '#/components/schemas/RequestSummary'
@@ -5740,6 +5812,50 @@ components:
             `hour_of_week` is a UTC display coordinate, not a query-filter
             sentinel. Missing coordinates mean zero activity and are filled by
             the client.
+          items: { $ref: '#/components/schemas/UsageAnalysisHeatmapBucket' }
+    SelfUsageAnalysis:
+      type: object
+      additionalProperties: false
+      required: [from_created_at, to_created_at, granularity, time_zone, p95_is_approximate, p95_method, summary, generation_units_by_modality, generation_units_by_billing_unit, time_series, by_model, by_protocol, by_status, errors, heatmap]
+      properties:
+        from_created_at: { type: integer, format: int64, minimum: 0 }
+        to_created_at: { type: integer, format: int64, minimum: 0 }
+        granularity: { type: string, enum: [hour, day] }
+        time_zone: { type: string, const: UTC }
+        p95_is_approximate: { type: boolean, const: true }
+        p95_method: { type: string, const: fixed_histogram_upper_bound_capped_60000ms }
+        summary: { $ref: '#/components/schemas/UsageAnalysisMetrics' }
+        generation_units_by_modality:
+          type: array
+          description: Units remain separated by currency and are never added across currencies.
+          items: { $ref: '#/components/schemas/UsageAnalysisGenerationUnitsByModality' }
+        generation_units_by_billing_unit:
+          type: array
+          description: Units remain separated by currency and are never added across currencies.
+          items: { $ref: '#/components/schemas/UsageAnalysisGenerationUnitsByBillingUnit' }
+        time_series:
+          type: array
+          items: { $ref: '#/components/schemas/UsageAnalysisTimeBucket' }
+        by_model:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
+        by_protocol:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
+        by_status:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
+        errors:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/UsageAnalysisDimensionBucket' }
+        heatmap:
+          type: array
+          maxItems: 168
+          description: Missing UTC hour-of-week coordinates mean zero activity.
           items: { $ref: '#/components/schemas/UsageAnalysisHeatmapBucket' }
     GenerationJob:
       type: object

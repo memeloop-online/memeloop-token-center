@@ -14,6 +14,7 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
             output_tokens: 1,
             cost: "0".to_owned(),
             error_code: None,
+            session_context: None,
         },
         request_object: "inline-json:{\"prompt\":\"detail body\"}".to_owned(),
         response_object: None,

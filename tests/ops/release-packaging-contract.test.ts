@@ -59,7 +59,9 @@ test('release workflow and Docker packaging remain immutable and attested', () =
     assert.equal(lstatSync(bundle).mode & 0o777, 0o555);
     for (const name of readdirSync(bundle).filter((name) => name.endsWith('.sql'))) assert.equal(lstatSync(join(bundle, name)).mode & 0o777, 0o444);
     assert.deepEqual(readFileSync(join(bundle, 'migrate-cpamp.ts')), readFileSync(join(repository, 'ops/migrate-cpamp.ts')));
-    for (const name of ['prepare.sql','reset.sql','apply.sql']) assert.deepEqual(readFileSync(join(bundle, 'sql/cpamp', name)), readFileSync(join(repository, 'ops/sql/cpamp', name)));
+    for (const name of ['prepare.sql','evaluate.sql','apply.sql','correct-plan.sql','correct.sql','correct-rebuild.sql','reset.sql']) {
+      assert.deepEqual(readFileSync(join(bundle, 'sql/cpamp', name)), readFileSync(join(repository, 'ops/sql/cpamp', name)));
+    }
   } finally {
     run('chmod', ['-R', 'u+w', temporary]);
     rmSync(temporary, { recursive: true, force: true });

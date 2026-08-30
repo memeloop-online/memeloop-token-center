@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState, type RefObject } from 'react';
-import { api } from '../api';
-import { useI18n } from '../i18n';
-import { SessionDrawer, SessionList } from '../SessionViews';
-import { drainSessionEventKeys, mergeSessionPage } from './sessionRefresh';
+import { api } from '../api.js';
+import { useI18n } from '../i18n.js';
+import { SessionDrawer, SessionList } from '../SessionViews.js';
+import { drainSessionEventKeys, mergeSessionPage } from './sessionRefresh.js';
 import type {
   LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, RequestView,
-} from '../types';
+} from '../types.js';
 
 interface SessionFilters {
   q: string;
@@ -16,11 +16,39 @@ interface SessionFilters {
 
 export interface SessionFocus {
   sessionId: string;
-  keyId: string;
+  keyId?: string;
   revision: number;
 }
 
 export type SessionStreamState = 'idle' | 'connecting' | 'live' | 'reconnecting';
+
+export interface LatestRequest {
+  signal: AbortSignal;
+  isCurrent: () => boolean;
+}
+
+/** Owns one request lane: starting B aborts A, and invalidating a scope rejects both. */
+export class LatestRequestGate {
+  private sequence = 0;
+  private controller?: AbortController;
+
+  begin(): LatestRequest {
+    this.controller?.abort();
+    const controller = new AbortController();
+    const sequence = ++this.sequence;
+    this.controller = controller;
+    return {
+      signal: controller.signal,
+      isCurrent: () => sequence === this.sequence && !controller.signal.aborted,
+    };
+  }
+
+  invalidate() {
+    this.sequence += 1;
+    this.controller?.abort();
+    this.controller = undefined;
+  }
+}
 
 const emptySessionFilters: SessionFilters = { q: '', keyId: '', model: '', state: '' };
 
@@ -71,7 +99,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const [filters, setFilters] = useState<SessionFilters>(emptySessionFilters);
   const [refreshing, setRefreshing] = useState(false);
   const listSequence = useRef(0);
-  const detailSequence = useRef(0);
+  const detailRequests = useRef(new LatestRequestGate());
   const handledFocus = useRef(0);
   const firstPageSize = useRef(0);
   const loadedOlderList = useRef(false);
@@ -121,7 +149,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       if (!background || !loadedOlderList.current || resetActiveTail) setNextCursor(response.next_cursor);
       setGeneratedAt(response.generated_at);
       if (!older && focus && handledFocus.current !== focus.revision) {
-        const focused = page.find((session) => session.session_id === focus.sessionId && session.key_id === focus.keyId);
+        const focused = page.find((session) => session.session_id === focus.sessionId && (!focus.keyId || session.key_id === focus.keyId));
         if (focused) {
           handledFocus.current = focus.revision;
           void selectSession(focused);
@@ -140,25 +168,25 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   }
 
   async function selectSession(session: LogicalSessionSummary) {
-    const sequence = ++detailSequence.current;
+    const request = detailRequests.current.begin();
     loadedOlderDetail.current = false;
     setSelected(session); setLoading(true); setError('');
     try {
-      const next = await api<LogicalSessionDetail>(detailPath(tenant, session), token.trim());
-      if (sequence === detailSequence.current) setDetail(next);
+      const next = await api<LogicalSessionDetail>(detailPath(tenant, session), token.trim(), { signal: request.signal });
+      if (request.isCurrent()) setDetail(next);
     } catch (reason) {
-      if (sequence === detailSequence.current) setError(messageOf(reason, t('sessions.detailFailed')));
+      if (request.isCurrent()) setError(messageOf(reason, t('sessions.detailFailed')));
     } finally {
-      if (sequence === detailSequence.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
   }
 
   async function refreshSelected(session = selectedRef.current) {
     if (!session) return;
-    const sequence = ++detailSequence.current;
+    const request = detailRequests.current.begin();
     try {
-      const page = await api<LogicalSessionDetail>(detailPath(tenant, session), token.trim());
-      if (sequence !== detailSequence.current) return;
+      const page = await api<LogicalSessionDetail>(detailPath(tenant, session), token.trim(), { signal: request.signal });
+      if (!request.isCurrent()) return;
       setDetail((latest) => {
         if (!latest || latest.session_id !== page.session_id) return latest;
         if (!loadedOlderDetail.current) return page;
@@ -176,7 +204,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         };
       });
     } catch (reason) {
-      if (sequence === detailSequence.current) setError(messageOf(reason, t('sessions.detailFailed')));
+      if (request.isCurrent()) setError(messageOf(reason, t('sessions.detailFailed')));
+    } finally {
+      if (request.isCurrent()) setLoading(false);
     }
   }
 
@@ -184,11 +214,11 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     const current = detail;
     const session = selected;
     if (!current?.next_cursor || !session) return;
-    const sequence = ++detailSequence.current;
+    const request = detailRequests.current.begin();
     setLoading(true); setError('');
     try {
-      const page = await api<LogicalSessionDetail>(detailPath(tenant, session, current.next_cursor), token.trim());
-      if (sequence !== detailSequence.current) return;
+      const page = await api<LogicalSessionDetail>(detailPath(tenant, session, current.next_cursor), token.trim(), { signal: request.signal });
+      if (!request.isCurrent()) return;
       loadedOlderDetail.current = true;
       setDetail((latest) => {
         if (!latest || latest.session_id !== page.session_id) return latest;
@@ -202,9 +232,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         };
       });
     } catch (reason) {
-      if (sequence === detailSequence.current) setError(messageOf(reason, t('sessions.detailFailed')));
+      if (request.isCurrent()) setError(messageOf(reason, t('sessions.detailFailed')));
     } finally {
-      if (sequence === detailSequence.current) setLoading(false);
+      if (request.isCurrent()) setLoading(false);
     }
   }
 
@@ -234,7 +264,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
 
   useEffect(() => {
     if (!focus) return;
-    const focusedFilters: SessionFilters = { q: focus.sessionId, keyId: focus.keyId, model: '', state: '' };
+    const focusedFilters: SessionFilters = { q: focus.sessionId, keyId: focus.keyId ?? '', model: '', state: '' };
     setDraft(focusedFilters);
     setFilters(focusedFilters);
   }, [focus?.revision]);
@@ -247,11 +277,16 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     refreshInFlight.current = false;
     dirtyKeyIds.current.clear();
     listSequence.current += 1;
-    detailSequence.current += 1;
+    detailRequests.current.invalidate();
     firstPageSize.current = 0;
     loadedOlderList.current = false;
     loadedOlderDetail.current = false;
     setSessions([]); setDetail(undefined); setSelected(undefined); setNextCursor(null); setGeneratedAt(0);
+    setLoading(false); setRefreshing(false); setError('');
+    if (!token.trim() || !tenant) {
+      setDraft(emptySessionFilters);
+      setFilters(emptySessionFilters);
+    }
     void loadSessions(false, filters);
     return () => {
       scopeGeneration.current += 1;
@@ -260,7 +295,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       refreshDirty.current = false;
       dirtyKeyIds.current.clear();
       listSequence.current += 1;
-      detailSequence.current += 1;
+      detailRequests.current.invalidate();
     };
   }, [token, tenant, filters]);
 
@@ -271,7 +306,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     scheduleRefresh();
   }, [revision, eventKeyIds]);
 
-  const status = refreshing ? 'refreshing' : streamState === 'idle' ? 'connecting' : streamState;
+  const hasScope = Boolean(token.trim() && tenant);
+  const status = !hasScope ? 'idle' : refreshing ? 'refreshing' : streamState;
   return <>
     {!tenant && <div className="notice warning" role="status">{t('sessions.selectTenant')}</div>}
     {error && <div className="notice error" role="alert">{error}</div>}

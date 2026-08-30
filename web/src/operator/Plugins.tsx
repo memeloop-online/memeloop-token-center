@@ -1,6 +1,6 @@
 import RjsfForm from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { formatNumber } from '../format';
 import { localizeSchema, useI18n } from '../i18n';
@@ -21,23 +21,35 @@ export function Plugins({ token, tenant, values }: { token: string; tenant: stri
   const [saving, setSaving] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const loadSequence = useRef(0);
+  const scope = useRef({ token, tenant });
+  scope.current = { token, tenant };
 
   const load = async () => {
+    const sequence = ++loadSequence.current;
+    const loadToken = token;
+    const loadTenant = tenant;
     const configurable = values.filter((plugin) => plugin.contributions.configuration);
-    if (!token || configurable.length === 0) { setConfigurations({}); return; }
+    if (!loadToken || configurable.length === 0) { setConfigurations({}); return; }
     try {
       const loaded = await Promise.all(configurable.map(async (plugin) => [
         plugin.id,
-        await api<PluginConfiguration>(`/internal/v1/plugins/${plugin.id}/configuration${queryForTenant(tenant)}`, token),
+        await api<PluginConfiguration>(`/internal/v1/plugins/${plugin.id}/configuration${queryForTenant(loadTenant)}`, loadToken),
       ] as const));
+      if (sequence !== loadSequence.current || scope.current.token !== loadToken || scope.current.tenant !== loadTenant) return;
       setConfigurations(Object.fromEntries(loaded));
       setError('');
     } catch (reason) {
+      if (sequence !== loadSequence.current || scope.current.token !== loadToken || scope.current.tenant !== loadTenant) return;
       setError(reason instanceof Error ? reason.message : t('common.requestFailed'));
     }
   };
 
-  useEffect(() => { void load(); }, [token, tenant, values]);
+  useEffect(() => {
+    loadSequence.current += 1;
+    setConfigurations({}); setSaving(''); setMessage(''); setError('');
+    void load();
+  }, [token, tenant, values]);
 
   return <article className="panel">
     <div className="panel-title"><div><h2>{t('plugins.title')}</h2><p className="muted">{t('plugins.configurationDescription')}</p></div><span>{t('plugins.runtime')}</span></div>
@@ -61,20 +73,24 @@ export function Plugins({ token, tenant, values }: { token: string; tenant: stri
               noHtml5Validate
               onError={() => { /* RJSF renders bounded validation errors inline. */ }}
               onSubmit={async ({ formData }) => {
+                if (!tenant) return;
+                const saveToken = token; const saveTenant = tenant;
                 setSaving(plugin.id); setMessage(''); setError('');
                 try {
-                  await api<PluginConfiguration>(`/internal/v1/plugins/${plugin.id}/configuration`, token, {
+                  await api<PluginConfiguration>(`/internal/v1/plugins/${plugin.id}/configuration`, saveToken, {
                     method: 'PUT',
                     headers: { 'Idempotency-Key': crypto.randomUUID() },
-                    body: JSON.stringify({ tenant_external_id: tenant || null, expected_version: configuration.scope_version, value: formData }),
+                    body: JSON.stringify({ tenant_external_id: saveTenant || null, expected_version: configuration.scope_version, value: formData }),
                   });
+                  if (scope.current.token !== saveToken || scope.current.tenant !== saveTenant) return;
                   setMessage(t('plugins.configurationSaved', { plugin: plugin.id }));
                   await load();
                 } catch (reason) {
+                  if (scope.current.token !== saveToken || scope.current.tenant !== saveTenant) return;
                   setError(reason instanceof Error ? reason.message : t('common.requestFailed'));
-                } finally { setSaving(''); }
+                } finally { if (scope.current.token === saveToken && scope.current.tenant === saveTenant) setSaving(''); }
               }}
-            ><button type="submit" disabled={saving === plugin.id}>{saving === plugin.id ? t('common.loading') : t('common.save')}</button></RjsfForm>
+            ><button type="submit" disabled={!tenant || saving === plugin.id}>{saving === plugin.id ? t('common.loading') : t('common.save')}</button></RjsfForm>
           </div>}
         </div>;
       })}

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
@@ -19,13 +19,25 @@ export function useGroups(kind: GroupKind, token: string, tenant: string) {
   const { t } = useI18n();
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [error, setError] = useState('');
+  const loadSequence = useRef(0);
+  const scope = useRef({ kind, token, tenant });
+  scope.current = { kind, token, tenant };
   const load = async () => {
-    if (!token || !tenant) { setGroups([]); return; }
-    const query = new URLSearchParams({ tenant_external_id: tenant });
-    try { setGroups(await api<GroupView[]>(`/internal/v1/${paths[kind]}?${query}`, token)); setError(''); }
-    catch (reason) { setGroups([]); setError(messageOf(reason, t('groups.loadFailed'))); }
+    const sequence = ++loadSequence.current;
+    const loadScope = { kind, token, tenant };
+    if (!loadScope.token || !loadScope.tenant) { setGroups([]); return; }
+    const query = new URLSearchParams({ tenant_external_id: loadScope.tenant });
+    try {
+      const next = await api<GroupView[]>(`/internal/v1/${paths[loadScope.kind]}?${query}`, loadScope.token);
+      if (sequence !== loadSequence.current || scope.current.kind !== loadScope.kind || scope.current.token !== loadScope.token || scope.current.tenant !== loadScope.tenant) return;
+      setGroups(next); setError('');
+    }
+    catch (reason) {
+      if (sequence !== loadSequence.current || scope.current.kind !== loadScope.kind || scope.current.token !== loadScope.token || scope.current.tenant !== loadScope.tenant) return;
+      setGroups([]); setError(messageOf(reason, t('groups.loadFailed')));
+    }
   };
-  useEffect(() => { void load(); }, [kind, token, tenant]);
+  useEffect(() => { loadSequence.current += 1; setGroups([]); setError(''); void load(); }, [kind, token, tenant]);
   return { groups, error, load };
 }
 
@@ -47,6 +59,9 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const operationSequence = useRef(0);
+  const scope = useRef({ kind, token, tenant });
+  scope.current = { kind, token, tenant };
   const selected = groups.find((group) => group.id === selectedId);
   const selectGroup = (id: string) => {
     const group = groups.find((value) => value.id === id);
@@ -70,11 +85,27 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
       ?? { value: memberId, label: memberId }));
   }, [groupVersion, resourceVersion, selectedId]);
 
+  useEffect(() => {
+    operationSequence.current += 1;
+    setSelectedId(''); setMemberDraft([]); setNewName(''); setRenameDraft('');
+    setBusy(false); setMessage(''); setError('');
+  }, [kind, token, tenant]);
+
   const perform = async (action: () => Promise<void>, success: string) => {
+    const sequence = ++operationSequence.current;
+    const operationScope = { kind, token, tenant };
     setBusy(true); setMessage(''); setError('');
-    try { await action(); setMessage(success); await onChanged(); }
-    catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
-    finally { setBusy(false); }
+    try {
+      await action();
+      if (sequence !== operationSequence.current || scope.current.kind !== operationScope.kind || scope.current.token !== operationScope.token || scope.current.tenant !== operationScope.tenant) return;
+      setMessage(success); await onChanged();
+    }
+    catch (reason) {
+      if (sequence === operationSequence.current && scope.current.kind === operationScope.kind && scope.current.token === operationScope.token && scope.current.tenant === operationScope.tenant) setError(messageOf(reason, t('common.requestFailed')));
+    }
+    finally {
+      if (sequence === operationSequence.current && scope.current.kind === operationScope.kind && scope.current.token === operationScope.token && scope.current.tenant === operationScope.tenant) setBusy(false);
+    }
   };
 
   return <article className="panel group-manager" data-group-kind={kind}>

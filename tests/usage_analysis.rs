@@ -38,7 +38,8 @@ async fn get_json(state: &AppState, path: &str, token: &str) -> (StatusCode, Val
     let value = if body.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&body).unwrap()
+        serde_json::from_slice(&body)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()))
     };
     (status, value)
 }
@@ -74,6 +75,40 @@ async fn issue(
         .authenticate_key(&issued.key, PEPPER)
         .await
         .unwrap()
+}
+
+async fn issue_with_credential(
+    state: &AppState,
+    tenant: &str,
+    principal: &str,
+    alias: &str,
+    currency: &str,
+) -> (AuthenticatedKey, String) {
+    let issued = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: tenant.to_owned(),
+                principal_external_id: principal.to_owned(),
+                alias: alias.to_owned(),
+                currency: currency.to_owned(),
+                policy: KeyPolicy {
+                    allowed_models: vec!["*".to_owned()],
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            PEPPER,
+        )
+        .await
+        .unwrap();
+    let authenticated = state
+        .db
+        .authenticate_key(&issued.key, PEPPER)
+        .await
+        .unwrap();
+    (authenticated, issued.key)
 }
 
 struct UsageSample<'a> {
@@ -787,6 +822,236 @@ async fn assert_multibucket_usage_analysis(database_url: String, tenant: String)
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+async fn assert_self_usage_analysis_is_stable_key_scoped(
+    database_url: String,
+    tenant_prefix: &str,
+) {
+    let mut config = Config::for_test(database_url.clone());
+    config.key_pepper = String::from_utf8(PEPPER.to_vec()).unwrap();
+    let state = AppState::initialize(config).await.unwrap();
+    let unique = Uuid::now_v7();
+    let tenant = format!("{tenant_prefix}-{unique}");
+    let foreign_tenant = format!("{tenant_prefix}-foreign-{unique}");
+    let (viewer, viewer_credential) =
+        issue_with_credential(&state, &tenant, "Self Viewer", "Self Viewer", "USD").await;
+    let (same_tenant_foreign, foreign_credential) =
+        issue_with_credential(&state, &tenant, "Foreign Key", "Foreign Key", "CNY").await;
+    let other_tenant = issue(
+        &state,
+        &foreign_tenant,
+        "Other Tenant",
+        "Other Tenant",
+        "USD",
+    )
+    .await;
+
+    finish(
+        &state,
+        &viewer,
+        UsageSample {
+            model: "self-text-model",
+            status_code: 200,
+            duration_ms: 20,
+            input_tokens: 100,
+            cached_input_tokens: 30,
+            cache_write_tokens: 20,
+            output_tokens: 7,
+            cost_micros: 1_000_000,
+            error_code: None,
+        },
+    )
+    .await;
+    finish(
+        &state,
+        &same_tenant_foreign,
+        UsageSample {
+            model: "foreign-key-model",
+            status_code: 503,
+            duration_ms: 1_200,
+            input_tokens: 900,
+            cached_input_tokens: 100,
+            cache_write_tokens: 50,
+            output_tokens: 90,
+            cost_micros: 9_000_000,
+            error_code: Some("foreign_key_error"),
+        },
+    )
+    .await;
+    finish(
+        &state,
+        &other_tenant,
+        UsageSample {
+            model: "foreign-tenant-model",
+            status_code: 500,
+            duration_ms: 3_000,
+            input_tokens: 800,
+            cached_input_tokens: 80,
+            cache_write_tokens: 40,
+            output_tokens: 80,
+            cost_micros: 8_000_000,
+            error_code: Some("foreign_tenant_error"),
+        },
+    )
+    .await;
+
+    let now = memeloop_token_center::db::unix_millis();
+    let pool = AnyPool::connect(&database_url).await.unwrap();
+    seed_usage_activity(
+        &pool,
+        SeedUsageActivity {
+            key: &viewer,
+            currency: "USD",
+            model: "self-image-model",
+            created_at: now,
+            status_class: "success",
+            error_code: "",
+            upstream_account_id: None,
+            cost_micros: 3_000_000,
+            kind: SeedUsageKind::Generation {
+                units: 4,
+                modality: "image",
+                billing_unit: "job",
+            },
+        },
+    )
+    .await;
+    pool.close().await;
+
+    let from = now.saturating_sub(86_400_000);
+    let to = memeloop_token_center::db::unix_millis().saturating_add(1_000);
+    let path = format!(
+        "/self/v1/usage-analysis?from_created_at={from}&to_created_at={to}&granularity=hour"
+    );
+    let (status, body) = get_json(&state, &path, &viewer_credential).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["summary"]["requests"], 2, "{body}");
+    assert_eq!(body["summary"]["success"], 2, "{body}");
+    assert_eq!(body["summary"]["failed"], 0, "{body}");
+    assert_eq!(body["summary"]["input_tokens"], 50, "{body}");
+    assert_eq!(body["summary"]["cached_input_tokens"], 30, "{body}");
+    assert_eq!(body["summary"]["cache_write_tokens"], 20, "{body}");
+    assert_eq!(body["summary"]["output_tokens"], 7, "{body}");
+    assert_eq!(body["summary"]["generation_units"], 4, "{body}");
+    assert_eq!(body["summary"]["avg_duration_ms"], 20.0, "{body}");
+    assert_eq!(body["summary"]["p95_duration_ms"], 50, "{body}");
+    assert_eq!(body["p95_is_approximate"], true, "{body}");
+    assert_eq!(body["summary"]["costs"].as_array().unwrap().len(), 1);
+    assert_eq!(body["summary"]["costs"][0]["currency"], "USD");
+    assert_eq!(body["summary"]["costs"][0]["cost"], "4");
+    assert_eq!(body["generation_units_by_modality"][0]["modality"], "image");
+    assert_eq!(body["generation_units_by_modality"][0]["units"], 4);
+    assert_eq!(
+        body["generation_units_by_billing_unit"][0]["billing_unit"],
+        "job"
+    );
+    assert_eq!(body["generation_units_by_billing_unit"][0]["units"], 4);
+    assert!(
+        body["by_model"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|bucket| bucket["id"] == "self-text-model")
+    );
+    assert!(
+        body["by_protocol"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|bucket| bucket["id"] == "generation")
+    );
+    assert!(
+        body["heatmap"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    );
+
+    for forbidden in [
+        "tenant_external_id",
+        "key_id",
+        "by_key",
+        "key_alias",
+        "principal",
+        "route_id",
+        "by_session",
+        "upstream_account_id",
+        "by_upstream",
+        "upstream_grouping",
+        "session_id",
+    ] {
+        assert!(body.get(forbidden).is_none(), "{forbidden} leaked: {body}");
+    }
+    for forbidden_value in [
+        same_tenant_foreign.key_id.to_string(),
+        same_tenant_foreign.tenant_id.to_string(),
+        other_tenant.key_id.to_string(),
+        "Foreign Key".to_owned(),
+        "foreign-key-model".to_owned(),
+        "foreign_key_error".to_owned(),
+        "foreign-tenant-model".to_owned(),
+        "foreign_tenant_error".to_owned(),
+    ] {
+        assert!(
+            !body.to_string().contains(&forbidden_value),
+            "foreign identity or usage leaked: {forbidden_value}: {body}"
+        );
+    }
+
+    let (status, filtered) = get_json(
+        &state,
+        &format!("{path}&model=self-image-model&protocol=generation&status=success"),
+        &viewer_credential,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{filtered}");
+    assert_eq!(filtered["summary"]["requests"], 1, "{filtered}");
+    assert_eq!(filtered["summary"]["generation_units"], 4, "{filtered}");
+
+    for selector in [
+        format!("key_id={}", same_tenant_foreign.key_id),
+        format!("tenant_external_id={tenant}"),
+        "key_alias=Foreign%20Key".to_owned(),
+        "principal=Foreign%20Key".to_owned(),
+        format!("route_id={}", Uuid::now_v7()),
+        "upstream_account_id=unassigned".to_owned(),
+        format!("session_id={}", Uuid::now_v7()),
+    ] {
+        let (status, rejected) = get_json(
+            &state,
+            &format!("/self/v1/usage-analysis?{selector}"),
+            &viewer_credential,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{selector}: {rejected}");
+    }
+
+    let (status, foreign_body) = get_json(&state, &path, &foreign_credential).await;
+    assert_eq!(status, StatusCode::OK, "{foreign_body}");
+    assert_eq!(foreign_body["summary"]["requests"], 1, "{foreign_body}");
+    assert_eq!(foreign_body["summary"]["costs"][0]["currency"], "CNY");
+    assert!(!foreign_body.to_string().contains("self-text-model"));
+
+    let (status, _) = get_json(&state, &path, "not-a-client-credential").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn sqlite_self_usage_analysis_is_stable_key_scoped_and_identity_safe() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("self-usage-analysis.db").display()
+    );
+    assert_self_usage_analysis_is_stable_key_scoped(database_url, "self-usage-sqlite").await;
+}
+
+#[tokio::test]
+async fn postgres_self_usage_analysis_is_stable_key_scoped_and_identity_safe() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    assert_self_usage_analysis_is_stable_key_scoped(database_url, "self-usage-postgres").await;
 }
 
 #[tokio::test]

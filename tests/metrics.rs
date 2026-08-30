@@ -228,6 +228,7 @@ async fn gateway_and_control_roles_return_404_for_every_opposite_operation_famil
         (Method::GET, "/self/v1/key/limits"),
         (Method::GET, "/self/v1/requests"),
         (Method::GET, "/self/v1/stats"),
+        (Method::GET, "/self/v1/usage-analysis"),
         (Method::GET, "/self/v1/generations"),
         (Method::GET, "/self/v1/conversations"),
         (Method::GET, "/v1/models"),

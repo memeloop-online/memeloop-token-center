@@ -1,13 +1,8 @@
 BEGIN;
 
 CREATE TEMP TABLE cpamp_import_canonical ON COMMIT DROP AS
-SELECT DISTINCT ON (event_hash) u.*,
-       encode(sha256(convert_to(jsonb_build_array(
-         request_id, timestamp_ms, provider, model, endpoint, api_key_hash,
-         input_tokens, output_tokens, latency_ms, failed,
-         fail_status_code, fail_summary
-       )::text, 'UTF8')), 'hex') AS source_digest
-  FROM cpamp_import_usage u
+SELECT DISTINCT ON (event_hash) u.*
+  FROM cpamp_import_evaluated u
  ORDER BY event_hash, timestamp_ms DESC, request_id DESC;
 
 -- Once an event hash has durable provenance, the source payload is immutable. Abort the
@@ -90,47 +85,8 @@ SELECT i.key_id, t.id, p.id, i.account_id, i.alias, 'USD',
   FROM cpamp_import_identities i
   JOIN tenants t ON t.external_id = :'tenant_external_id'
   JOIN principals p ON p.tenant_id = t.id AND p.external_id = 'cpamp-import'
-ON CONFLICT (id) DO UPDATE SET alias = excluded.alias, updated_at = excluded.updated_at;
-
-INSERT INTO model_prices
-  (id, model, currency, input_micros_per_million, output_micros_per_million, source, updated_at)
-SELECT substr(d.value,1,8)||'-'||substr(d.value,9,4)||'-5'||substr(d.value,14,3)||'-a'||substr(d.value,18,3)||'-'||substr(d.value,21,12),
-       p.model, 'USD', round(COALESCE(p.prompt_per_1m, 0) * 1000000)::bigint,
-       round(COALESCE(p.completion_per_1m, 0) * 1000000)::bigint,
-       'cpamp:' || COALESCE(NULLIF(p.source, ''), 'import'), p.updated_at_ms
-  FROM cpamp_import_prices p
-  CROSS JOIN LATERAL (SELECT md5('price:USD:' || p.model) AS value) d
- WHERE p.model <> ''
-ON CONFLICT (model, currency) DO UPDATE SET
-  input_micros_per_million = excluded.input_micros_per_million,
-  output_micros_per_million = excluded.output_micros_per_million,
-  source = excluded.source, updated_at = excluded.updated_at
-WHERE model_prices.source LIKE 'cpamp:%';
-
--- Since schema v18 settlement snapshots prefer model_price_tiers. Keep the CPAMP-owned
--- default tier in lockstep with its compatibility row, but never overwrite a manual or
--- catalog-owned base/tier. Missing cache dimensions conservatively reuse input pricing.
-INSERT INTO model_price_tiers
-  (id, model, currency, service_tier, input_micros_per_million,
-   cached_input_micros_per_million, cache_write_micros_per_million,
-   output_micros_per_million, cache_price_estimated, source, updated_at)
-SELECT substr(d.value,1,8)||'-'||substr(d.value,9,4)||'-5'||substr(d.value,14,3)||'-a'||substr(d.value,18,3)||'-'||substr(d.value,21,12),
-       b.model, b.currency, 'default', b.input_micros_per_million,
-       b.input_micros_per_million, b.input_micros_per_million,
-       b.output_micros_per_million, 1, b.source, b.updated_at
-  FROM model_prices b
-  JOIN cpamp_import_prices p ON p.model = b.model
-  CROSS JOIN LATERAL (SELECT md5('price-tier:USD:default:' || b.model) AS value) d
- WHERE b.currency = 'USD' AND b.source LIKE 'cpamp:%'
-ON CONFLICT (model, currency, service_tier) DO UPDATE SET
-  input_micros_per_million = excluded.input_micros_per_million,
-  cached_input_micros_per_million = excluded.cached_input_micros_per_million,
-  cache_write_micros_per_million = excluded.cache_write_micros_per_million,
-  output_micros_per_million = excluded.output_micros_per_million,
-  cache_price_estimated = excluded.cache_price_estimated,
-  source = excluded.source,
-  updated_at = excluded.updated_at
-WHERE model_price_tiers.source LIKE 'cpamp:%';
+ON CONFLICT (id) DO UPDATE SET alias = excluded.alias, updated_at = excluded.updated_at
+  WHERE key_records.alias IS DISTINCT FROM excluded.alias;
 
 INSERT INTO cpamp_import_new_requests
   (id, tenant_id, key_id, created_at, completed_at, protocol, model,
@@ -144,10 +100,9 @@ SELECT substr(r.value,1,8)||'-'||substr(r.value,9,4)||'-5'||substr(r.value,14,3)
        CASE WHEN u.failed = 0 THEN 200
             WHEN u.fail_status_code BETWEEN 400 AND 599 THEN u.fail_status_code
             ELSE 502 END,
-       GREATEST(COALESCE(u.latency_ms, 0), 0), GREATEST(COALESCE(u.input_tokens, 0), 0),
+       GREATEST(COALESCE(u.latency_ms, 0), 0), u.normalized_total_input_tokens,
        GREATEST(COALESCE(u.output_tokens, 0), 0),
-       round((GREATEST(COALESCE(u.input_tokens, 0), 0) * COALESCE(p.input_micros_per_million, 0)
-            + GREATEST(COALESCE(u.output_tokens, 0), 0) * COALESCE(p.output_micros_per_million, 0)) / 1000000.0)::bigint,
+       u.cost_micros,
        CASE WHEN u.failed <> 0 THEN
             CASE WHEN u.fail_status_code BETWEEN 400 AND 599
                  THEN 'http_' || u.fail_status_code::text
@@ -155,11 +110,11 @@ SELECT substr(r.value,1,8)||'-'||substr(r.value,9,4)||'-5'||substr(r.value,14,3)
        'gap://cpamp/' || u.event_hash || '/request',
        'gap://cpamp/' || u.event_hash || '/response',
        'cpamp-import:' || u.event_hash,
-       0, 0, 'default', 'USD'
+       u.normalized_cache_read_tokens, u.normalized_cache_creation_tokens,
+       u.applied_service_tier, 'USD'
   FROM cpamp_import_canonical u
   JOIN cpamp_import_identities i USING (api_key_hash)
   JOIN tenants t ON t.external_id = :'tenant_external_id'
-  LEFT JOIN model_prices p ON p.model = u.model AND p.currency = 'USD'
   CROSS JOIN LATERAL (SELECT md5('request:cpamp:' ||
     CASE WHEN :'tenant_external_id' = 'cpa-dogfood-import' AND :'import_source' = 'cpamp-usage-events-v1'
          THEN '' ELSE :'tenant_external_id' || ':' || :'import_source' || ':' END || u.event_hash) AS value) r
@@ -212,13 +167,13 @@ INSERT INTO request_stats_facts
   (request_id, tenant_id, key_id, created_at, model, protocol, status_class,
    error_code, upstream_account_id, model_route_id, duration_ms,
    input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
-   service_tier, currency, cost_micros)
+   service_tier, currency, cost_micros, session_id)
 SELECT id, tenant_id, key_id, created_at, model, protocol,
        CASE WHEN status_code BETWEEN 200 AND 399 THEN 'success' ELSE 'failure' END,
        COALESCE(error_code, ''), COALESCE(upstream_account_id, ''),
        COALESCE(model_route_id, ''), COALESCE(duration_ms, 0),
        input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
-       service_tier, currency, cost_micros
+       service_tier, currency, cost_micros, 'unlinked:' || key_id
   FROM cpamp_import_new_requests
  WHERE completed_at IS NOT NULL AND status_code IS NOT NULL
 ON CONFLICT (request_id) DO NOTHING;
@@ -389,6 +344,137 @@ ON CONFLICT (tenant_id, key_id, day_bucket, source_kind, model, protocol,
   duration_bucket_11 = usage_analysis_daily.duration_bucket_11 + excluded.duration_bucket_11,
   cost_micros = usage_analysis_daily.cost_micros + excluded.cost_micros;
 
+INSERT INTO session_usage_totals
+  (tenant_id, key_id, session_id, currency, last_activity_at, requests,
+   errors, input_tokens, output_tokens, cached_input_tokens,
+   cache_write_tokens, generation_units, duration_count, duration_sum_ms,
+   cost_micros)
+SELECT tenant_id, key_id, session_id, currency, MAX(created_at), COUNT(*),
+       COALESCE(SUM(CASE WHEN status_class = 'failure' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
+                         THEN input_tokens - cached_input_tokens - cache_write_tokens
+                         ELSE 0 END), 0),
+       COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
+       COALESCE(SUM(cache_write_tokens), 0), 0, COUNT(*),
+       COALESCE(SUM(duration_ms), 0), COALESCE(SUM(cost_micros), 0)
+  FROM cpamp_import_new_request_facts
+ GROUP BY tenant_id, key_id, session_id, currency
+ON CONFLICT (tenant_id, key_id, session_id, currency) DO UPDATE SET
+  last_activity_at = GREATEST(session_usage_totals.last_activity_at, excluded.last_activity_at),
+  requests = session_usage_totals.requests + excluded.requests,
+  errors = session_usage_totals.errors + excluded.errors,
+  input_tokens = session_usage_totals.input_tokens + excluded.input_tokens,
+  output_tokens = session_usage_totals.output_tokens + excluded.output_tokens,
+  cached_input_tokens = session_usage_totals.cached_input_tokens + excluded.cached_input_tokens,
+  cache_write_tokens = session_usage_totals.cache_write_tokens + excluded.cache_write_tokens,
+  duration_count = session_usage_totals.duration_count + excluded.duration_count,
+  duration_sum_ms = session_usage_totals.duration_sum_ms + excluded.duration_sum_ms,
+  cost_micros = session_usage_totals.cost_micros + excluded.cost_micros;
+
+INSERT INTO session_usage_hourly
+  (tenant_id, key_id, session_id, hour_bucket, model, protocol, status_class,
+   error_code, upstream_account_id, model_route_id, currency, requests,
+   input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+   generation_units, duration_count, duration_sum_ms, cost_micros)
+SELECT tenant_id, key_id, session_id, created_at / 3600000, model,
+       CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%' THEN 'anthropic'
+            WHEN protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END,
+       status_class, error_code, upstream_account_id, model_route_id, currency,
+       COUNT(*),
+       COALESCE(SUM(CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
+                         THEN input_tokens - cached_input_tokens - cache_write_tokens
+                         ELSE 0 END), 0),
+       COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
+       COALESCE(SUM(cache_write_tokens), 0), 0, COUNT(*),
+       COALESCE(SUM(duration_ms), 0), COALESCE(SUM(cost_micros), 0)
+  FROM cpamp_import_new_request_facts
+ GROUP BY tenant_id, key_id, session_id, created_at / 3600000, model,
+          CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%' THEN 'anthropic'
+               WHEN protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END,
+          status_class, error_code, upstream_account_id, model_route_id, currency
+ON CONFLICT (tenant_id, key_id, session_id, hour_bucket, model, protocol,
+             status_class, error_code, upstream_account_id, model_route_id, currency)
+DO UPDATE SET
+  requests = session_usage_hourly.requests + excluded.requests,
+  input_tokens = session_usage_hourly.input_tokens + excluded.input_tokens,
+  output_tokens = session_usage_hourly.output_tokens + excluded.output_tokens,
+  cached_input_tokens = session_usage_hourly.cached_input_tokens + excluded.cached_input_tokens,
+  cache_write_tokens = session_usage_hourly.cache_write_tokens + excluded.cache_write_tokens,
+  duration_count = session_usage_hourly.duration_count + excluded.duration_count,
+  duration_sum_ms = session_usage_hourly.duration_sum_ms + excluded.duration_sum_ms,
+  cost_micros = session_usage_hourly.cost_micros + excluded.cost_micros;
+
+INSERT INTO session_usage_daily
+  (tenant_id, key_id, session_id, day_bucket, model, protocol, status_class,
+   error_code, upstream_account_id, model_route_id, currency, requests,
+   input_tokens, output_tokens, cached_input_tokens, cache_write_tokens,
+   generation_units, duration_count, duration_sum_ms, cost_micros)
+SELECT tenant_id, key_id, session_id, created_at / 86400000, model,
+       CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%' THEN 'anthropic'
+            WHEN protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END,
+       status_class, error_code, upstream_account_id, model_route_id, currency,
+       COUNT(*),
+       COALESCE(SUM(CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
+                         THEN input_tokens - cached_input_tokens - cache_write_tokens
+                         ELSE 0 END), 0),
+       COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_input_tokens), 0),
+       COALESCE(SUM(cache_write_tokens), 0), 0, COUNT(*),
+       COALESCE(SUM(duration_ms), 0), COALESCE(SUM(cost_micros), 0)
+  FROM cpamp_import_new_request_facts
+ GROUP BY tenant_id, key_id, session_id, created_at / 86400000, model,
+          CASE WHEN protocol = 'anthropic' OR protocol LIKE 'anthropic-%' THEN 'anthropic'
+               WHEN protocol = 'openai-image' THEN 'openai-image' ELSE 'openai' END,
+          status_class, error_code, upstream_account_id, model_route_id, currency
+ON CONFLICT (tenant_id, key_id, session_id, day_bucket, model, protocol,
+             status_class, error_code, upstream_account_id, model_route_id, currency)
+DO UPDATE SET
+  requests = session_usage_daily.requests + excluded.requests,
+  input_tokens = session_usage_daily.input_tokens + excluded.input_tokens,
+  output_tokens = session_usage_daily.output_tokens + excluded.output_tokens,
+  cached_input_tokens = session_usage_daily.cached_input_tokens + excluded.cached_input_tokens,
+  cache_write_tokens = session_usage_daily.cache_write_tokens + excluded.cache_write_tokens,
+  duration_count = session_usage_daily.duration_count + excluded.duration_count,
+  duration_sum_ms = session_usage_daily.duration_sum_ms + excluded.duration_sum_ms,
+  cost_micros = session_usage_daily.cost_micros + excluded.cost_micros;
+
+INSERT INTO cpamp_import_event_provenance (
+  tenant_id, source, external_event_hash, target_request_id, source_digest,
+  legacy_source_digest, billing_model, requested_model, resolved_model,
+  pricing_model, source_service_tier, request_service_tier,
+  response_service_tier, cache_input_mode, applied_service_tier,
+  context_threshold_tokens,
+  pricing_rule, pricing_source, pricing_digest, pricing_config_json,
+  raw_input_tokens, raw_cached_tokens, raw_cache_tokens,
+  raw_cache_read_tokens, raw_cache_creation_tokens, residual_cached_tokens,
+  normalized_uncached_input_tokens, normalized_total_input_tokens,
+  normalized_cache_read_tokens, normalized_cache_creation_tokens,
+  reasoning_tokens, total_tokens, ttft_ms, prompt_micros_per_million,
+  legacy_cache_micros_per_million, cache_read_micros_per_million,
+  cache_creation_micros_per_million, output_micros_per_million, cost_micros,
+  correction_revision, created_at, updated_at)
+SELECT t.id, :'import_source', u.event_hash, n.id, u.source_digest,
+       u.legacy_source_digest, u.billing_model, u.requested_model,
+       u.resolved_model, u.pricing_model, u.source_service_tier,
+       u.request_service_tier, u.response_service_tier,
+       u.cache_input_mode, u.applied_service_tier, u.context_threshold_tokens, u.pricing_rule,
+       u.pricing_source, u.pricing_digest, u.pricing_config_json,
+       u.raw_input_tokens, u.raw_cached_tokens, u.raw_cache_tokens,
+       u.raw_cache_read_tokens, u.raw_cache_creation_tokens,
+       u.residual_cached_tokens,
+       u.normalized_uncached_input_tokens, u.normalized_total_input_tokens,
+       u.normalized_cache_read_tokens, u.normalized_cache_creation_tokens,
+       u.reasoning_tokens, u.total_tokens, u.ttft_ms,
+       u.prompt_micros_per_million, u.legacy_cache_micros_per_million,
+       u.cache_read_micros_per_million, u.cache_creation_micros_per_million,
+       u.output_micros_per_million, u.cost_micros, 'cpamp-cache-pricing-v2',
+       (extract(epoch from clock_timestamp()) * 1000)::bigint,
+       (extract(epoch from clock_timestamp()) * 1000)::bigint
+  FROM cpamp_import_canonical u
+  JOIN tenants t ON t.external_id = :'tenant_external_id'
+  JOIN cpamp_import_new_requests n
+    ON n.reservation_id = 'cpamp-import:' || u.event_hash
+ON CONFLICT (tenant_id, source, external_event_hash) DO NOTHING;
+
 -- Preserve the source request identity independently from the deterministic target UUID.
 -- cpa-session-archive uses the same CPA request id; keeping the CPAMP event hash, timestamp,
 -- model and key hash here lets its body importer fail closed instead of guessing by time.
@@ -412,7 +498,13 @@ ON CONFLICT (tenant_id, source, external_event_hash) DO UPDATE SET
   source_created_at = excluded.source_created_at,
   source_model = excluded.source_model,
   source_digest = CASE WHEN import_request_links.source_digest = ''
-                       THEN excluded.source_digest ELSE import_request_links.source_digest END;
+                       THEN excluded.source_digest ELSE import_request_links.source_digest END
+ WHERE import_request_links.external_request_id IS DISTINCT FROM excluded.external_request_id
+    OR import_request_links.source_key_hash IS DISTINCT FROM excluded.source_key_hash
+    OR import_request_links.target_request_id IS DISTINCT FROM excluded.target_request_id
+    OR import_request_links.source_created_at IS DISTINCT FROM excluded.source_created_at
+    OR import_request_links.source_model IS DISTINCT FROM excluded.source_model
+    OR import_request_links.source_digest = '';
 
 -- Earlier CPAMP imports stored tiny synthetic inline-json markers instead of bodies. Normalize
 -- only an exact marker reconstructed from the currently staged source row and its durable link.
@@ -476,7 +568,9 @@ ON CONFLICT (tenant_external_id, source) DO UPDATE SET
   watermark_hash = CASE WHEN excluded.watermark_ms >= cpamp_import_checkpoints.watermark_ms
                         THEN excluded.watermark_hash ELSE cpamp_import_checkpoints.watermark_hash END,
   imported_events = cpamp_import_checkpoints.imported_events + excluded.imported_events,
-  updated_at = excluded.updated_at;
+  updated_at = excluded.updated_at
+ WHERE excluded.imported_events > 0
+    OR excluded.watermark_ms > cpamp_import_checkpoints.watermark_ms;
 
 COMMIT;
 ANALYZE request_records;

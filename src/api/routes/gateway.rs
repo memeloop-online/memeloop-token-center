@@ -15,6 +15,7 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
             get(self_request_asset),
         )
         .route("/self/v1/stats", get(self_stats))
+        .route("/self/v1/usage-analysis", get(self_usage_analysis))
         .route("/self/v1/generations", get(self_generations))
         .route(
             "/self/v1/generations/{job_id}",

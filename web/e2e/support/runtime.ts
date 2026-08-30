@@ -68,7 +68,7 @@ class E2ERuntime {
     await this.waitUntilMockOwned();
     await this.waitUntilReady();
     this.seed = await seedThroughHttp();
-    this.browser = await chromium.launch({ headless: true });
+    this.browser = await chromium.launch({ headless: true, executablePath: chromium.executablePath() });
   }
 
   async stop(): Promise<void> {

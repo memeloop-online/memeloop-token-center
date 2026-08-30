@@ -1,0 +1,73 @@
+.metrics {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+}
+
+.metric {
+  container-type: inline-size;
+  padding: clamp(1rem, 0.875rem + 0.45vw, 1.375rem);
+}
+
+.metric > .metric-label {
+  display: block;
+  color: #70858d;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 0.75rem;
+  font-weight: 650;
+  font-variant-numeric: lining-nums tabular-nums;
+  letter-spacing: 0.075em;
+  line-height: 1.35;
+  text-transform: uppercase;
+}
+
+.metric > .metric-value,
+.usage-metrics .metric > .metric-value {
+  display: block;
+  min-width: 0;
+  margin-top: 0.55rem;
+  overflow-wrap: anywhere;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: clamp(1.5rem, 1.28rem + 0.7vw, 2rem);
+  font-style: normal;
+  font-variant-numeric: lining-nums tabular-nums;
+  font-weight: 650;
+  letter-spacing: -0.025em;
+  line-height: 1.12;
+}
+
+.metric-number {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.55rem;
+}
+
+.metric-exact {
+  min-width: 0;
+  font: inherit;
+  font-variant-numeric: inherit;
+  line-height: inherit;
+}
+
+.metric-compact {
+  color: #70858d;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 0.75rem;
+  font-variant-numeric: lining-nums tabular-nums;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+:root[data-theme='light'] .metric > .metric-label,
+:root[data-theme='light'] .metric-compact {
+  color: #566d73;
+}
+
+@media (width <= 390px) {
+  .metric > .metric-value,
+  .usage-metrics .metric > .metric-value {
+    font-size: 1.5rem;
+  }
+}

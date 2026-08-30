@@ -1,8 +1,9 @@
-import { DrawerFrame, RequestTable } from './components';
+import { DrawerFrame, RequestTable } from './components.js';
 import type { CSSProperties } from 'react';
-import { formatCurrency, formatMetricNumber, formatMilliseconds, formatPercent } from './format';
-import { useI18n } from './i18n';
-import type { LogicalSessionDetail, LogicalSessionSummary, RequestView, UsageAnalysisCost } from './types';
+import { formatCurrency, formatMetricNumber, formatMilliseconds, formatPercent } from './format.js';
+import { useI18n } from './i18n.js';
+import { deriveSemanticExecution } from './sessionSemantics.js';
+import type { LogicalSessionDetail, LogicalSessionSummary, RequestView, UsageAnalysisCost } from './types.js';
 
 const semanticPalette = ['#6859d9', '#18a999', '#e68a2e', '#d74f70', '#4078c0', '#8a63b8'];
 
@@ -43,44 +44,18 @@ function SemanticExecutionPanel({ detail }: { detail: LogicalSessionDetail }) {
   const timelineStart = Math.min(...observations.map((request) => request.created_at));
   const timelineEnd = Math.max(...observations.map((request) => request.created_at + Math.max(0, request.duration_ms ?? 0)));
   const timelineDuration = Math.max(1, timelineEnd - timelineStart);
-  const agentParents = new Map(declared.flatMap((request) => {
-    const execution = request.execution;
-    return execution?.agent_id && execution.parent_agent_id ? [[execution.agent_id, execution.parent_agent_id] as const] : [];
-  }));
-  const edgeParents = new Map(confirmedEdges.flatMap((edge) => edge.from_request_id ? [[edge.to_request_id, edge.from_request_id] as const] : []));
-  const agentDepth = (agent?: string | null) => {
-    let depth = 0;
-    let current = agent;
-    const visited = new Set<string>();
-    while (current && agentParents.has(current) && depth < 8 && !visited.has(current)) {
-      visited.add(current); current = agentParents.get(current); depth += 1;
-    }
-    return depth;
-  };
-  const requestDepth = (requestId: string) => {
-    let depth = 0;
-    let current: string | undefined = requestId;
-    const visited = new Set<string>();
-    while (current && edgeParents.has(current) && depth < 12 && !visited.has(current)) {
-      visited.add(current); current = edgeParents.get(current); depth += 1;
-    }
-    return depth;
-  };
-  const depthOf = (request: LogicalSessionDetail['requests'][number]) => request.execution?.agent_id
-    ? agentDepth(request.execution.agent_id)
-    : requestDepth(request.request_id);
+  const semantics = deriveSemanticExecution(detail);
+  const semanticNodes = new Map(semantics.nodes.map((node) => [node.requestId, node]));
+  const depthOf = (request: LogicalSessionDetail['requests'][number]) => semanticNodes.get(request.request_id)?.depth ?? 0;
   const latestName = [...declared].reverse().find((request) => request.execution?.session_name)?.execution?.session_name;
   const latestTrace = [...declared].reverse().find((request) => request.execution?.trace_id)?.execution?.trace_id;
   const structures = [...observations].reverse().flatMap((request) => request.structure ? [request.structure] : []);
-  const reportedSession = structures.find((structure) => structure.session_id)?.session_id;
   const clientName = structures.find((structure) => structure.client_name)?.client_name;
   const turnId = structures.find((structure) => structure.turn_id)?.turn_id;
   const parentTurnId = structures.find((structure) => structure.parent_turn_id)?.parent_turn_id;
   const responseId = structures.find((structure) => structure.response_id)?.response_id;
   const branchId = structures.find((structure) => structure.branch_id)?.branch_id;
   const compacted = structures.some((structure) => structure.compaction);
-  const labels = new Map<string, string>();
-  for (const request of declared) Object.entries(request.execution?.labels ?? {}).forEach(([key, value]) => labels.set(key, value));
   const agentCosts = new Map<string, bigint>();
   const taskCosts = new Map<string, bigint>();
   for (const request of observations) {
@@ -98,19 +73,23 @@ function SemanticExecutionPanel({ detail }: { detail: LogicalSessionDetail }) {
     || request.structure?.turn_id
     || request.structure?.client_name
     || t('sessions.executionNode', { index: index + 1 });
+  const observationPositions = new Map(observations.map((request, index) => [request.request_id, { request, index }]));
+  const parentLabel = (requestId: string) => {
+    const parent = observationPositions.get(requestId);
+    return parent ? nodeLabel(parent.request, parent.index) : t('sessions.timelineRequest');
+  };
 
   return <section className="semantic-execution" aria-label={t('sessions.semantic')}>
     <div className="semantic-heading"><div><span className="eyebrow">{t('sessions.semantic')}</span><h3>{latestName || t('sessions.semanticEvidence')}</h3></div><div className="semantic-provenance">{declared.length > 0 && <span className="status ok">{t('sessions.declaredMetadata')}</span>}{(hasStructure || confirmedEdges.length > 0) && <span className="status pending">{t('sessions.structuralEvidence')}</span>}</div></div>
-    {(latestTrace || structures.length > 0 || labels.size > 0) && <div className="semantic-chips">
+    {(latestTrace || structures.length > 0 || semantics.labels.length > 0) && <div className="semantic-chips">
       {latestTrace && <span><small>{t('sessions.trace')}</small><code>{latestTrace}</code></span>}
-      {reportedSession && <span><small>{t('sessions.reportedSession')}</small><code>{reportedSession}</code></span>}
       {clientName && <span><small>{t('sessions.client')}</small><b>{clientName}</b></span>}
       {turnId && <span><small>{t('sessions.turn')}</small><code>{turnId}</code></span>}
       {parentTurnId && <span><small>{t('sessions.parentTurn')}</small><code>{parentTurnId}</code></span>}
       {responseId && <span><small>{t('sessions.response')}</small><code>{responseId}</code></span>}
       {branchId && <span><small>{t('sessions.branch')}</small><code>{branchId}</code></span>}
       {compacted && <span><small>{t('sessions.compaction')}</small><b>{t('sessions.compacted')}</b></span>}
-      {[...labels].map(([key, value]) => <span key={key}><small>{key}</small><b>{value}</b></span>)}
+      {semantics.labels.map(({ key, values, conflict }) => <span key={key} className={conflict ? 'status pending' : undefined}><small>{key}</small><b>{values.join(conflict ? ' ≠ ' : '')}</b></span>)}
     </div>}
     <div className="semantic-grid">
       <div className="execution-lanes"><div className="execution-title"><h4>{t('sessions.executionTimeline')}</h4><small>{t('sessions.timelineRange', { duration: formatMilliseconds(timelineDuration, locale) })}</small></div>{observations.map((request, index) => {
@@ -119,15 +98,17 @@ function SemanticExecutionPanel({ detail }: { detail: LogicalSessionDetail }) {
         const rawWidth = (Math.max(0, request.duration_ms ?? 0) / timelineDuration) * 100;
         const width = Math.max(0.5, Math.min(100 - left, Math.max(2, rawWidth)));
         const depth = depthOf(request);
-        const parent = execution?.parent_agent_id || request.structure?.parent_turn_id;
+        const semanticNode = semanticNodes.get(request.request_id);
+        const parent = semanticNode?.parentRequestId;
+        const degraded = semanticNode?.parentSource === 'conflict' || semanticNode?.parentSource === 'cycle';
         return <div className={`execution-lane${execution ? '' : ' inferred'}`} key={request.request_id} style={{ '--agent-depth': depth } as CSSProperties}>
-          <span className="execution-agent"><b>{nodeLabel(request, index)}</b>{parent && <small>← {parent}</small>}</span>
+          <span className="execution-agent"><b>{nodeLabel(request, index)}</b>{parent && <small>← {parentLabel(parent)}</small>}{degraded && <small title={t('sessions.parentEvidenceDegraded')}>⚠</small>}</span>
           <span className="execution-track"><span className="execution-span" style={{ left: `${left}%`, width: `${width}%` }} title={`${new Date(request.created_at).toLocaleString(locale)} · ${request.duration_ms ?? 0} ms`}><span>{execution?.task_kind || t('sessions.taskUnclassified')}</span><small>{index + 1} · {request.duration_ms ?? 0} ms</small></span></span>
         </div>;
       })}<div className="execution-axis" aria-hidden="true"><span>0</span><span>{formatMilliseconds(timelineDuration, locale)}</span></div></div>
       <div className="task-breakdown"><h4>{t('sessions.taskBreakdown')}</h4><div className="task-pie" style={{ background: `conic-gradient(${stops})` }} role="img" aria-label={t('sessions.taskBreakdown')} /><ul>{taskEntries.map(([kind, count], index) => <li key={kind}><i style={{ background: semanticPalette[index % semanticPalette.length] }} /><span>{kind}</span><b>{count}</b></li>)}</ul><small>{t('sessions.taskBreakdownBasis')}</small></div>
     </div>
-    <div className="semantic-flame"><div className="execution-title"><h4>{t('sessions.flame')}</h4><small>{t('sessions.flameBasis')}</small></div><div className="flame-scroll">{observations.map((request, index) => {
+    <div className="semantic-flame"><div className="execution-title"><h4>{t('sessions.durationBars')}</h4><small>{t('sessions.flameBasis')}</small></div><div className="flame-scroll">{observations.map((request, index) => {
       const depth = depthOf(request);
       const duration = Math.max(0, request.duration_ms ?? 0);
       return <div className={`flame-row${request.execution ? '' : ' inferred'}`} key={`flame-${request.request_id}`} style={{ '--agent-depth': depth } as CSSProperties}><span style={{ width: `${Math.max(8, duration / maxDuration * 100)}%` }} title={`${nodeLabel(request, index)} · ${duration} ms`}><b>{nodeLabel(request, index)}</b><small>{formatMilliseconds(duration, locale)}</small></span></div>;
@@ -175,7 +156,7 @@ export function SessionList({ values, loading, showCredential, onSelect }: {
   return <div className="session-list">{values.map((session) => {
     const title = session.unlinked
       ? t('sessions.unlinkedRequests')
-      : session.session_name || t('sessions.sessionTitle', { model: session.model || t('common.none') });
+      : session.session_name || t('sessions.reportedNameMissing');
     return <article className="session-card" key={`${session.key_id}:${session.session_id}`}>
       <div className="session-card-heading"><b>{title}</b><span>{session.task_kind && <span className="pill">{session.task_kind}</span>}<span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span></div>
       {session.unlinked && <span className="session-unlinked-label">{t('sessions.unlinkedReason')}</span>}
@@ -211,7 +192,10 @@ export function SessionDrawer({ detail, summary, currency, showDiagnosticIds = f
 }) {
   const { locale, t } = useI18n();
   const declaredSessionName = [...detail.requests].reverse().find((request) => request.execution?.session_name)?.execution?.session_name;
-  const title = detail.unlinked ? t('sessions.unlinkedRequests') : declaredSessionName || summary?.model || t('sessions.logicalSession');
+  const reportedSessionId = [...detail.requests].reverse().find((request) => request.structure?.session_id)?.structure?.session_id;
+  const title = detail.unlinked
+    ? t('sessions.unlinkedRequests')
+    : declaredSessionName || summary?.session_name || t('sessions.reportedNameMissing');
   const summaryCurrency = summary?.costs.length === 1 ? summary.costs[0].currency : undefined;
   const requestPositions = new Map(detail.requests.map((request, index) => [request.request_id, { index: index + 1, createdAt: request.created_at }]));
   const confirmedEdges = detail.edges.filter((edge) => edge.relation !== 'candidate');
@@ -222,7 +206,7 @@ export function SessionDrawer({ detail, summary, currency, showDiagnosticIds = f
     return request ? t('sessions.timelinePoint', { index: request.index, time: new Date(request.createdAt).toLocaleString(locale) }) : t('sessions.timelineRequest');
   };
   return <DrawerFrame title={title} eyebrow={t('sessions.logicalSession')} onClose={onClose}>
-    {showDiagnosticIds && <details className="session-diagnostics"><summary>{t('sessions.diagnostics')}</summary><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" /></details>}
+    {showDiagnosticIds && <details className="session-diagnostics"><summary>{t('sessions.diagnostics')}</summary><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /></>}</details>}
     {detail.unlinked && <div className="notice warning" role="status"><b>{t('sessions.unlinkedRequests')}</b><br />{t('sessions.unlinkedDetail')}</div>}
     {!detail.unlinked && <SemanticExecutionPanel detail={detail} />}
     <h3>{t('sessions.timeline')}</h3>

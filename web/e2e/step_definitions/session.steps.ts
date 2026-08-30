@@ -3,6 +3,7 @@ import { Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
 import { eventually, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
+import { appPreferenceControls, openAppRoute } from './app-route.support.js';
 
 interface SessionObservation {
   liveRequests: Promise<Response>[];
@@ -107,8 +108,7 @@ When('管理员打开实时会话聚合', async function (this: DogfoodWorld) {
     if (url.pathname === '/internal/v1/sessions') observation.sessionListRequests.push(url.toString());
     else if (url.pathname.startsWith('/internal/v1/sessions/')) observation.detailRequests.push(url.toString());
   });
-  await page.getByRole('tab', { name: '实时请求', exact: true }).click();
-  await page.getByRole('button', { name: '会话', exact: true }).click();
+  await openAppRoute(page, 'operator', 'sessions');
   await visible(page.getByRole('heading', { name: '最近会话与未关联请求', exact: true }));
   await visible(page.locator('.session-live-state'));
 });
@@ -147,9 +147,9 @@ Then('六类可靠关系、候选关系、未关联请求和语义执行图被�
   assert.match(text, /语义执行图.*发布试用/s);
   assert.match(text, /codex-root.*research-worker/s);
   assert.match(text, /interactive.*background/s);
-  assert.match(text, /协议\/前缀树结构证据/);
+  assert.match(text, /结构关联/);
   assert.match(text, /codex-session-browser/);
-  assert.match(text, /执行耗时火焰视图/);
+  assert.match(text, /耗时条形图/);
   assert.match(text, /任务类型费用/);
   assert.ok(await drawer.locator('.execution-lane.inferred').count() > 0, 'protocol-only Codex request must remain visible as inferred structure');
   assert.match(text, /代理费用/);
@@ -161,9 +161,9 @@ Then('六类可靠关系、候选关系、未关联请求和语义执行图被�
   }
   const candidate = drawer.locator('.candidate-edges');
   await candidate.locator('summary').click();
-  assert.match(await candidate.textContent() ?? '', /候选仅供排查|未用于归类/);
+  assert.match(await candidate.textContent() ?? '', /不计入会话统计/);
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
-  await page.locator('.rail .language-toggle').click();
+  await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
   await page.locator('.session-card').first().getByRole('button', { name: /^Open / }).click();
   const englishDrawer = page.getByRole('dialog');
   await visible(englishDrawer);
@@ -172,7 +172,7 @@ Then('六类可靠关系、候选关系、未关联请求和语义执行图被�
     assert.match(englishText, new RegExp(sentence), `missing English natural-language relationship: ${sentence}`);
   }
   await englishDrawer.getByRole('button', { name: 'Close', exact: true }).click();
-  await page.locator('.rail .language-toggle').click();
+  await appPreferenceControls(page).getByRole('button', { name: '中文', exact: true }).click();
   const seed = runtime.requireSeed();
   await page.route('**/internal/v1/sessions?**', async (route) => {
     await route.fulfill({
@@ -198,7 +198,7 @@ Then('六类可靠关系、候选关系、未关联请求和语义执行图被�
   await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
   const unlinked = page.locator('.session-card').filter({ hasText: '未关联请求' }).first();
   await visible(unlinked);
-  assert.match(await unlinked.textContent() ?? '', /不一定属于同一次对话/);
+  assert.match(await unlinked.textContent() ?? '', /尚未归入会话/);
 });
 
 When('连续新请求进入活跃状态并分别完成为成功和错误', async function (this: DogfoodWorld) {
@@ -264,7 +264,7 @@ Then('Codex 上报的会话名称、代理层级和任务分类进入真实语�
   assert.match(text, /4bf92f3577b34da6a3ce929d0e0e4736/);
   assert.match(text, /browser-e2e/);
   assert.match(text, /browser-codex-semantic-session/);
-  assert.match(text, /执行耗时火焰视图/);
+  assert.match(text, /耗时条形图/);
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
 });
 
@@ -315,12 +315,12 @@ Then('其他凭据事件和无事件重连不会污染已打开的会话', async
   assert.equal(observation.detailRequests.length, detailCount, 'another credential event refreshed the selected detail');
 
   await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
-  await page.getByRole('tab', { name: '请求统计', exact: true }).click();
+  await openAppRoute(page, 'operator', 'usage');
   await page.route('**/internal/v1/request-events**', async (route) => {
     await route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': keepalive\n\n' });
   });
-  await page.getByRole('tab', { name: '实时请求', exact: true }).click();
-  await eventually(async () => assert.match(await page.locator('.session-live-state').textContent() ?? '', /正在重连/), 4_000);
+  await openAppRoute(page, 'operator', 'requests');
+  await eventually(async () => assert.match(await page.locator('.session-live-state').textContent() ?? '', /正在重新连接/), 4_000);
 });
 
 Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身份被拒', async function (this: DogfoodWorld) {
@@ -357,11 +357,12 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
   assert.equal(forbiddenDetail.status, 404);
 
   seed.clientCredential = rotated.key;
+  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
   await page.locator('input[type="password"]').fill(rotated.key);
-  await page.getByRole('button', { name: '载入', exact: true }).click();
+  await page.getByRole('button', { name: '进入', exact: true }).click();
+  await openAppRoute(page, 'portal', 'sessions');
   await visible(page.locator('.self-sessions .session-card').first());
   assert.equal((await page.locator('.self-sessions').textContent() ?? '').includes(seed.clientKeyId), false);
-  assert.match(await page.locator('.self-sessions').textContent() ?? '', /轮换凭据字符串不会中断这里的历史/);
 });
 
 Then('会话界面支持中英文亮暗主题、键盘和 320 与 375 像素视口', async function (this: DogfoodWorld) {
@@ -373,9 +374,9 @@ Then('会话界面支持中英文亮暗主题、键盘和 320 与 375 像素视�
   await page.keyboard.press('Enter');
   await visible(page.getByRole('dialog'));
   await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
-  await page.locator('.mobile-controls .language-toggle').click();
-  await visible(page.getByText('Rotating the credential string does not split this history.', { exact: true }));
-  await page.locator('.mobile-controls .theme-toggle').click();
+  await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
+  await visible(page.getByRole('heading', { name: 'My sessions and requests', exact: true }));
+  await appPreferenceControls(page).getByRole('button', { name: 'Switch to dark theme' }).click();
   assert.equal(await page.locator('html').getAttribute('data-theme'), 'dark');
   await page.setViewportSize({ width: 375, height: 812 });
   await noHorizontalOverflow(page);

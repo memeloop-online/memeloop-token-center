@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 use super::*;
 use crate::model::{
-    ConversationRequestView, LogicalSessionDetail, LogicalSessionSummary, RequestView,
-    UsageAnalysisCost,
+    ConversationRequestView, LogicalSessionDetail, LogicalSessionSummary, RequestSessionContext,
+    RequestView, UsageAnalysisCost,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -513,6 +513,7 @@ impl Database {
                         output_tokens: row.try_get("output_tokens")?,
                         cost: micros_to_decimal_string(row.try_get("cost_micros")?),
                         error_code: row.try_get("error_code")?,
+                        session_context: Some(RequestSessionContext::unlinked(None)),
                     },
                     source: row.try_get("source_kind")?,
                     provenance: row.try_get("provenance_kind")?,

@@ -6,6 +6,43 @@ This is the resume point for the next Token Center development agent. Read
 scope and rejected designs; this document preserves the implementation state and
 remaining acceptance gates, updated on 2026-08-29.
 
+## Active 2026-08-29 billing-correction and Web redesign gate
+
+- The sealed online CPAMP snapshot contains 350,631 events, has SHA-256
+  `63c5f78bc96f5db7d3e02683dba2c0e66b63a2d2d420b5905dfbda2013be7898`,
+  and passed SQLite `quick_check`. Job
+  `mtc-cpamp-import-e339de8-r2-20260829` committed 40,782 new rows and advanced
+  the checkpoint to exactly 350,631 events. Job
+  `mtc-cpamp-replay-e339de8-r2-20260829` remains deliberately suspended. Do
+  not resume it yet.
+- Read-only reconciliation proved that the released importer treated all
+  imported cache usage as ordinary prompt input: historical rows have zero
+  cache-write and effectively zero cache-read Token, while 71,456 cached Token
+  belong to later live trial requests. This is caused by missing normalized
+  cache, resolved-model, service-tier and tiered-price fields in the CPAMP
+  staging/apply contract. The resulting historical cost is not trusted for
+  acceptance or production promotion.
+- Ordinary importer replay cannot repair these rows because the v1 locator and
+  source digest intentionally claim each event once. The required fix is a
+  TypeScript-only, versioned billing correction with a dry-run, immutable
+  provenance, compare-and-swap updates, tenant-scoped fact/aggregate rebuild,
+  exact rollback evidence and zero-write correction/importer replays. It must
+  not change balances, grants, reservations, ledger entries, non-imported live
+  rows or global real-time prices. Missing price evidence fails closed.
+- The source worktree is intentionally under active local development on top of
+  `f2a1ad5`; no new release SHA or image digest exists yet. In parallel, the Web
+  application is being split into URL-addressable Portal and Operator pages,
+  with true side/mobile navigation, exact locale-grouped numbers, accessible
+  ECharts analytics, session context on recent requests, and a credential-scoped
+  self-service usage endpoint. Implementation-detail copy is being removed.
+- Before any new CI run, complete local TypeScript/Rust/API/operations gates and
+  sanitized Chromium acceptance at 320, 390, 768, 1024, 1440, 1920 and 2560
+  pixels in Chinese/English and light/dark. Use one final exact-SHA GitHub
+  Actions run only after the local tree is complete. Redeploy only the reversible
+  API2 trial with the resulting immutable digests, re-run browser and Codex CLI
+  text/image dogfood, and retain the old digest rollback. API3 remains forbidden
+  until the user explicitly opens the production window.
+
 ## Current 2026-08-29 exact release status
 
 - The immutable deployed release source is

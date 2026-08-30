@@ -82,6 +82,12 @@ DELETE FROM usage_daily_aggregates
  ) OR key_id LIKE 'cpamp-key-%';
 DELETE FROM request_record_locators
  WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
+DELETE FROM cpamp_import_correction_audit
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id')
+   AND source = :'import_source';
+DELETE FROM cpamp_import_event_provenance
+ WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id')
+   AND source = :'import_source';
 DELETE FROM request_records
  WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
 DELETE FROM legacy_key_credentials

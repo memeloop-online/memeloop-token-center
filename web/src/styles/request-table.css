@@ -1,0 +1,32 @@
+.request-session-cell {
+  min-width: 10rem;
+  max-width: 20rem;
+}
+
+.request-session-cell > :is(span, button) {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.request-session-cell small {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--muted, #82979e);
+  font-size: 0.75rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.request-session-unlinked {
+  color: var(--muted, #82979e);
+}
+
+@media (max-width: 599px) {
+  .request-session-cell {
+    min-width: 8.5rem;
+    max-width: 12rem;
+  }
+}

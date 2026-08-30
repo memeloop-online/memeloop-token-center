@@ -370,6 +370,45 @@ pub struct RequestView {
     pub output_tokens: i64,
     pub cost: String,
     pub error_code: Option<String>,
+    /// Bounded, persisted conversation semantics for this request. A missing
+    /// value means this request kind has no request/session projection (for
+    /// example a generation job); it is never synthesized from model or prompt
+    /// text while serving history.
+    pub session_context: Option<RequestSessionContext>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestSessionAssociation {
+    Confirmed,
+    Unlinked,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RequestSessionContext {
+    /// Internal logical-session identifier used by the session detail API.
+    /// Unlinked request records deliberately keep this null.
+    pub session_id: Option<String>,
+    pub association: RequestSessionAssociation,
+    pub session_name: Option<String>,
+    pub task_kind: Option<String>,
+    pub agent_id: Option<String>,
+    /// Provenance of the optional human/execution semantics, currently
+    /// `declared` when a compatible downstream client supplied them.
+    pub semantics_source: Option<String>,
+}
+
+impl RequestSessionContext {
+    pub fn unlinked(session_id: Option<String>) -> Self {
+        Self {
+            session_id,
+            association: RequestSessionAssociation::Unlinked,
+            session_name: None,
+            task_kind: None,
+            agent_id: None,
+            semantics_source: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -657,6 +696,53 @@ pub struct UsageAnalysisResponse {
     pub by_status: Vec<UsageAnalysisBucket>,
     pub errors: Vec<UsageAnalysisBucket>,
     pub heatmap: Vec<UsageAnalysisHeatmapBucket>,
+}
+
+/// Usage analytics safe to expose to one authenticated client credential.
+///
+/// The database layer always scopes this projection to the stable `key_id`
+/// established by authentication.  Deliberately omit tenant, key, session,
+/// route, and upstream dimensions so this type cannot accidentally serialize
+/// operator-only identities into the public self-service API.
+#[derive(Clone, Debug, Serialize)]
+pub struct SelfUsageAnalysisResponse {
+    pub from_created_at: i64,
+    pub to_created_at: i64,
+    pub granularity: String,
+    pub time_zone: String,
+    pub p95_is_approximate: bool,
+    pub p95_method: String,
+    pub summary: UsageAnalysisMetrics,
+    pub generation_units_by_modality: Vec<UsageAnalysisGenerationUnitsByModality>,
+    pub generation_units_by_billing_unit: Vec<UsageAnalysisGenerationUnitsByBillingUnit>,
+    pub time_series: Vec<UsageAnalysisTimeBucket>,
+    pub by_model: Vec<UsageAnalysisBucket>,
+    pub by_protocol: Vec<UsageAnalysisBucket>,
+    pub by_status: Vec<UsageAnalysisBucket>,
+    pub errors: Vec<UsageAnalysisBucket>,
+    pub heatmap: Vec<UsageAnalysisHeatmapBucket>,
+}
+
+impl From<UsageAnalysisResponse> for SelfUsageAnalysisResponse {
+    fn from(value: UsageAnalysisResponse) -> Self {
+        Self {
+            from_created_at: value.from_created_at,
+            to_created_at: value.to_created_at,
+            granularity: value.granularity,
+            time_zone: value.time_zone,
+            p95_is_approximate: value.p95_is_approximate,
+            p95_method: value.p95_method,
+            summary: value.summary,
+            generation_units_by_modality: value.generation_units_by_modality,
+            generation_units_by_billing_unit: value.generation_units_by_billing_unit,
+            time_series: value.time_series,
+            by_model: value.by_model,
+            by_protocol: value.by_protocol,
+            by_status: value.by_status,
+            errors: value.errors,
+            heatmap: value.heatmap,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

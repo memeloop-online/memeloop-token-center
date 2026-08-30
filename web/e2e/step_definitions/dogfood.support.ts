@@ -19,7 +19,7 @@ export interface MultimodalObservation {
   clientKeyId: string;
   imageModel: string;
   videoModel: string;
-  generationResponses: Promise<string>[];
+  generationResponses: string[];
 }
 export interface CredentialGroupObservation {
   routing: unknown;
@@ -62,7 +62,11 @@ export function requireMultimodalObservation(world: DogfoodWorld): MultimodalObs
 }
 
 export function generationTableFor(page: Page): Locator {
-  return page.locator('article.panel').filter({ has: page.getByRole('heading', { name: '多模态生成任务', exact: true }) });
+  return page.locator('.self-generations');
+}
+
+export function operatorTrafficPanel(page: Page): Locator {
+  return page.locator('article.panel').filter({ has: page.locator('.traffic-filters') });
 }
 
 export async function submitPortalGeneration(
@@ -80,7 +84,7 @@ export async function submitPortalGeneration(
   await assertValue(kindSelect, kind);
   const modelInput = panel.getByLabel('模型');
   const promptInput = panel.getByLabel('提示词');
-  await modelInput.fill(generationModel);
+  await modelInput.selectOption(generationModel);
   await assertValue(modelInput, generationModel);
   await promptInput.fill(prompt);
   await assertValue(promptInput, prompt);
@@ -92,7 +96,7 @@ export async function submitPortalGeneration(
   } else {
     await assertNoCount(durationInput);
   }
-  if (Object.keys(parameters).length) await assertVisible(panel.getByRole('heading', { name: '工作流参数', exact: true }));
+  if (Object.keys(parameters).length) await assertVisible(panel.getByRole('heading', { name: '任务参数', exact: true }));
   for (const [label, value] of Object.entries(parameters)) {
     const schemaProperty = label === '宽度' ? 'width' : label === '高度' ? 'height' : '';
     const field = schemaProperty ? panel.locator('#root_' + schemaProperty) : panel.getByLabel(label, { exact: true });
@@ -113,7 +117,7 @@ export async function submitPortalGeneration(
   assert.equal(new URL(request.url()).pathname, endpoint);
   const response = await responsePromise;
   assert.equal(response.status(), 202);
-  await assertContains(panel.getByRole('status'), '任务已提交');
+  await assertContains(panel.getByRole('status'), '任务已创建');
   return request.postDataJSON();
 }
 
@@ -214,6 +218,7 @@ export async function applyUsageFilter(
   expectedValue: string,
   expectedRequests: number,
 ): Promise<void> {
+  await openUsageFilters(page);
   await change();
   const responsePromise = page.waitForResponse((response) => {
     if (!response.url().includes('/internal/v1/usage-analysis?')) return false;
@@ -227,6 +232,7 @@ export async function applyUsageFilter(
 }
 
 export async function clearUsageFilters(page: Page, expectedRequests = 51): Promise<void> {
+  await openUsageFilters(page);
   const responsePromise = page.waitForResponse((response) => {
     if (!response.url().includes('/internal/v1/usage-analysis?')) return false;
     const query = new URL(response.url()).searchParams;
@@ -259,6 +265,7 @@ export async function nextStrictUsageUrl(observation: StrictUsageObservation, pr
 
 export async function clearStrictUsageFilters(world: DogfoodWorld, expectedRequests: number) {
   const page = world.requirePage();
+  await openUsageFilters(page);
   const observation = requireStrictUsageObservation(world);
   const previousCount = observation.requestUrls.length;
   await page.locator('.usage-controls').getByRole('button', { name: '清除筛选', exact: true }).click();
@@ -269,16 +276,14 @@ export async function clearStrictUsageFilters(world: DogfoodWorld, expectedReque
   assert.equal(requestUrl.searchParams.has('key_id'), false);
   assert.equal(requestUrl.searchParams.has('protocol'), false);
   assert.equal(requestUrl.searchParams.has('error_code'), false);
-  const summaryMetric = metric(page, '请求数');
-  if (await summaryMetric.count()) {
-    await assertExactText(summaryMetric, String(expectedRequests));
-  } else {
-    await eventually(async () => {
-      const requestCounts = await page.locator('.usage-tab-panel .usage-dimension tbody tr td:nth-child(2)')
-        .evaluateAll((cells) => cells.map((cell) => Number(cell.getAttribute('title'))));
-      assert.equal(requestCounts.reduce((sum, count) => sum + count, 0), expectedRequests);
-    });
-  }
+  await page.getByRole('tab', { name: /^(总览|Overview)$/ }).click();
+  await assertExactText(metric(page, '请求数'), String(expectedRequests));
+}
+
+export async function openUsageFilters(page: Page): Promise<void> {
+  const disclosure = page.locator('details.usage-filter-disclosure');
+  if (await disclosure.getAttribute('open') === null) await disclosure.locator('summary').click();
+  await eventually(async () => assert.notEqual(await disclosure.getAttribute('open'), null));
 }
 
 export function usageMetrics(overrides: Record<string, unknown> = {}) {

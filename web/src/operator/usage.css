@@ -1,0 +1,33 @@
+.usage-page { max-width: none; width: 100%; }
+.usage-filter-disclosure { background: #081216; border: 1px solid #22363c; margin-bottom: 18px; }
+.usage-filter-disclosure > summary { align-items: center; color: #a6bac0; cursor: pointer; display: flex; font-size: 12px; font-weight: 650; gap: 10px; list-style-position: inside; padding: 12px 14px; }
+.usage-filter-count { background: #17312f; border-radius: 999px; color: #78dfce; font-size: 10px; font-weight: 600; padding: 3px 8px; }
+.usage-time-zone { color: #728a91; display: inline-block; font-family: ui-monospace, monospace; font-size: 10px; letter-spacing: .04em; margin-top: 5px; }
+.usage-filter-disclosure .usage-controls { border: 0; border-top: 1px solid #22363c; margin: 0; }
+.usage-chart-grid { display: grid; gap: 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.usage-chart-grid .usage-chart-card:last-child { grid-column: 1 / -1; }
+.usage-generation-table { margin-bottom: 16px; }
+.usage-chart-card { min-width: 0; overflow: hidden; }
+.usage-echart { height: 330px; min-width: 0; width: 100%; }
+.usage-echart-heatmap { height: 430px; min-width: 0; width: 100%; }
+.usage-chart-table { border-top: 1px solid #20343a; color: #82979e; font-size: 11px; margin-top: 6px; padding-top: 10px; }
+.usage-chart-table summary { cursor: pointer; width: max-content; }
+.usage-chart-table[open] summary { margin-bottom: 10px; }
+.usage-chart-table td, .usage-chart-table th { font-variant-numeric: tabular-nums; }
+.usage-dimension-picker { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.usage-dimension-picker button { font-size: 11px; padding: 7px 11px; }
+.usage-dimension-picker button.active { background: #173b37; border-color: #397f74; color: #8ce8d9; }
+.usage-heatmap-panel { min-width: 0; overflow: hidden; }
+.usage-heatmap-title { align-items: flex-end; gap: 16px; }
+.usage-heatmap-title > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.usage-heatmap-title label { color: #82979e; font-size: 10px; min-width: 140px; }
+.usage-heatmap-title select { margin-top: 4px; }
+.usage-heatmap-selection { background: #102521; border-left: 3px solid #64d8c4; color: #a9d8cf; font-size: 12px; margin-top: 8px; padding: 9px 11px; }
+.usage-heatmap-table { margin-top: 12px; }
+.usage-heatmap-table th[scope='row'] { font-weight: 500; white-space: nowrap; }
+.usage-metrics .metric strong { font-family: Inter, ui-sans-serif, system-ui, sans-serif; font-size: clamp(27px, 2.1vw, 36px); font-variant-numeric: tabular-nums lining-nums; letter-spacing: -.035em; line-height: 1.08; }
+:root[data-theme='light'] .usage-filter-disclosure { background: #f3f8f6; border-color: #c5d6d2; }
+:root[data-theme='light'] .usage-filter-disclosure .usage-controls { border-color: #c5d6d2; }
+:root[data-theme='light'] .usage-heatmap-selection { background: #e8f5f1; color: #285f57; }
+@media (width <= 1080px) { .usage-chart-grid { grid-template-columns: minmax(0, 1fr); } .usage-chart-grid .usage-chart-card:last-child { grid-column: auto; } }
+@media (width <= 620px) { .usage-echart { height: 290px; } .usage-echart-heatmap { height: 360px; } .usage-chart-card { padding-inline: 10px; } .usage-dimension-picker { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 5px; } .usage-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
