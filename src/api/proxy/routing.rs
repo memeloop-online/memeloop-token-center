@@ -136,7 +136,7 @@ pub(super) async fn send_proxy_route(
     protocol: Protocol,
     request_id: Uuid,
     route: &PreparedProxyRoute,
-) -> Result<reqwest::Response, ProxySendError> {
+) -> Result<(reqwest::Response, crate::metrics::ActivityGuard), ProxySendError> {
     let is_codex = route.is_codex();
     let request_path = if is_codex {
         codex_transport::RESPONSES_PATH
@@ -199,6 +199,7 @@ pub(super) async fn send_proxy_route(
             request = request.header("anthropic-beta", beta);
         }
     }
+    let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
     let upstream_result = request.send().await;
     state.metrics.observe_upstream(
@@ -208,7 +209,7 @@ pub(super) async fn send_proxy_route(
         upstream_started.elapsed(),
     );
     match upstream_result {
-        Ok(response) => Ok(response),
+        Ok(response) => Ok((response, upstream_activity)),
         Err(error) if error.is_connect() => Err(ProxySendError::RetryableConnection),
         // A timeout or body/write error can happen after the upstream accepted
         // the POST. Replaying it could duplicate non-idempotent model work.

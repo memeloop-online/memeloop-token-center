@@ -84,6 +84,18 @@ pub(super) async fn prometheus_metrics(
             None
         }
     };
+    let plugin = state.plugins.runtime_metrics().await;
+    let runtime = crate::metrics::RuntimeMetrics {
+        database: runtime,
+        request_event_streams: state.request_event_streams.active_count(),
+        proxy_lifecycles: crate::PROXY_LIFECYCLE_CONCURRENCY
+            .saturating_sub(state.proxy_lifecycle_permits.available_permits()),
+        proxy_archive_streams: crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+            .saturating_sub(state.proxy_archive_stream_permits.available_permits()),
+        plugin_cache_entries: plugin.cache_entries,
+        plugin_cache_bytes: plugin.cache_bytes,
+        loaded_plugins: plugin.loaded_plugins,
+    };
     Ok((
         [
             (
@@ -92,7 +104,7 @@ pub(super) async fn prometheus_metrics(
             ),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        state.metrics.render(runtime.as_ref()),
+        state.metrics.render(&runtime),
     )
         .into_response())
 }
@@ -129,6 +141,7 @@ pub(super) async fn observe_http(
     request: Request,
     next: Next,
 ) -> Response {
+    let _active_request = state.metrics.active_http_request();
     let method = request.method().clone();
     // `MatchedPath` is a route template, never a concrete URI containing a key,
     // tenant, request id or other user-controlled high-cardinality value.

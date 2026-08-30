@@ -31,7 +31,7 @@ union JemallocConfigPointer {
 #[unsafe(export_name = "_rjem_malloc_conf")]
 static JEMALLOC_CONFIG: Option<&'static std::ffi::c_char> = Some(unsafe {
     JemallocConfigPointer {
-        byte: &b"abort_conf:true,background_thread:true,narenas:2,tcache:false,dirty_decay_ms:1000,muzzy_decay_ms:0\0"[0],
+        byte: &b"abort_conf:true,background_thread:true,narenas:2,tcache:false,dirty_decay_ms:1000,muzzy_decay_ms:0,prof:true,prof_active:false,lg_prof_sample:19\0"[0],
     }
     .character
 });

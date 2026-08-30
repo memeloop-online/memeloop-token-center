@@ -28,7 +28,7 @@ harness = false
 
 [features]
 default = []
-plugin-distribution = ["dep:oci-client", "dep:rustix", "dep:tempfile"]
+plugin-distribution = ["dep:oci-client", "dep:tempfile"]
 
 [dependencies]
 async-trait = "0.1"
@@ -54,7 +54,7 @@ oci-client = { version = "0.17", optional = true, default-features = false, feat
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "socks", "stream"] }
 regex = "1"
 rust_decimal = { version = "=1.42.1", default-features = false, features = ["serde-with-str", "std"] }
-rustix = { version = "1", optional = true, features = ["fs"] }
+rustix = { version = "1", features = ["fs", "time"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -74,7 +74,11 @@ uuid = { version = "1", features = ["serde", "v7"] }
 wasmtime = { version = "47.0.3", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.7.0"
+tikv-jemalloc-ctl = { version = "0.7.0", features = ["profiling", "stats", "use_std"] }
+tikv-jemallocator = { version = "0.7.0", features = ["profiling", "stats"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pprof = { version = "0.15.0", default-features = false, features = ["flamegraph"] }
 
 [dev-dependencies]
 cucumber = { version = "0.23.0", features = ["macros"] }
@@ -90,7 +94,9 @@ wit-parser = "0.252"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+# Runtime CPU profiles need the native symbol table. Debug sections remain
+# stripped so production images do not carry full source-level debug data.
+strip = "debuginfo"
 
 [patch.crates-io]
 # Upstream 1.42.1 declares an optional, unused rkyv dependency that is still

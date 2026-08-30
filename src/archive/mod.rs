@@ -28,6 +28,7 @@ mod staging;
 pub use download::ArchiveDownload;
 #[cfg(test)]
 use download::{validate_download_range, verified_download_stream};
+pub(crate) use multipart::ARCHIVE_MULTIPART_PART_BYTES;
 pub use multipart::{ArchiveWriter, StagedArchiveObject};
 #[cfg(test)]
 use path::content_location;

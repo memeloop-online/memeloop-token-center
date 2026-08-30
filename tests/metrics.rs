@@ -52,12 +52,22 @@ async fn request(application: &Router, method: Method, path: &str) -> axum::resp
 }
 
 async fn get_authorized(application: &Router, path: &str) -> axum::response::Response {
+    request_with_token(application, Method::GET, path, "test-service-token").await
+}
+
+async fn request_with_token(
+    application: &Router,
+    method: Method,
+    path: &str,
+    token: &str,
+) -> axum::response::Response {
     application
         .clone()
         .oneshot(
             Request::builder()
+                .method(method)
                 .uri(path)
-                .header(header::AUTHORIZATION, "Bearer test-service-token")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -135,6 +145,15 @@ async fn health_version_and_metrics_contract_is_operational() {
     assert!(metrics.contains("memeloop_token_center_dependency_ready{dependency=\"database\"} 1"));
     assert!(metrics.contains("memeloop_token_center_db_pool_connections{state=\"idle\"}"));
     assert!(metrics.contains("memeloop_token_center_generation_jobs{status=\"queued\"} 0"));
+    assert!(metrics.contains("memeloop_token_center_http_active_requests"));
+    assert!(metrics.contains("memeloop_token_center_active_streams{kind=\"proxy_response\"}"));
+    assert!(metrics.contains("memeloop_token_center_upstream_active_requests"));
+    assert!(metrics.contains("memeloop_token_center_component_memory_bytes"));
+    assert!(metrics.contains("memeloop_token_center_background_work_items"));
+    assert!(metrics.contains("memeloop_token_center_plugin_cache_bytes"));
+    assert!(metrics.contains("process_resident_memory_bytes"));
+    assert!(metrics.contains("process_cpu_seconds_total"));
+    assert!(metrics.contains("memeloop_token_center_allocator_bytes{state=\"allocated\"}"));
     assert!(!metrics.contains("private-user-value"));
     assert!(!metrics.contains("credential-123"));
     assert!(!metrics.contains("test-service-token"));
@@ -160,6 +179,91 @@ async fn public_gateway_role_does_not_register_operational_metadata_routes() {
     assert_eq!(
         get(&application, "/version").await.status(),
         StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(&application, "/internal/v1/diagnostics/runtime")
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn diagnostics_are_explicit_control_only_and_scope_protected() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("diagnostics.db").display()
+    );
+    let mut config = Config::for_test(database_url);
+    config.runtime_profiling_enabled = true;
+    let state = AppState::initialize(config)
+        .await
+        .expect("application state");
+    let issued = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "request-reader".to_owned(),
+                scopes: vec!["requests:read".to_owned()],
+                tenant_external_id: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .expect("scoped service credential");
+    let gateway = api::router_for_role(state.clone(), RuntimeRole::Gateway);
+    let control = api::router_for_role(state, RuntimeRole::Control);
+
+    let mut operations = vec![(Method::GET, "/internal/v1/diagnostics/runtime")];
+    #[cfg(target_os = "linux")]
+    operations.push((Method::POST, "/internal/v1/diagnostics/cpu-profile"));
+    #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+    operations.push((Method::POST, "/internal/v1/diagnostics/heap-profile"));
+
+    for (method, path) in operations {
+        assert_eq!(
+            request(&gateway, method.clone(), path).await.status(),
+            StatusCode::NOT_FOUND,
+            "gateway registered {path}"
+        );
+        assert_eq!(
+            request(&control, method.clone(), path).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated {path}"
+        );
+        assert_eq!(
+            request_with_token(&control, method, path, &issued.token)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN,
+            "wrong scope reached {path}"
+        );
+    }
+
+    let runtime = get_authorized(&control, "/internal/v1/diagnostics/runtime").await;
+    assert_eq!(runtime.status(), StatusCode::OK);
+    assert_eq!(
+        runtime.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let runtime: Value =
+        serde_json::from_str(&body_text(runtime).await).expect("runtime diagnostics JSON");
+    assert!(runtime["process"]["uptime_seconds"].is_number());
+    assert!(runtime["allocator"]["allocated_bytes"].is_number());
+    assert_eq!(runtime["profiling"]["cpu_max_seconds"], 30);
+
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        request_with_token(
+            &control,
+            Method::POST,
+            "/internal/v1/diagnostics/cpu-profile?seconds=0",
+            "test-service-token",
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
     );
 }
 

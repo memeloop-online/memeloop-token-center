@@ -419,6 +419,13 @@ are in [CPA to Token Center cutover](operations/cutover-runbook.md).
   rollout is authorized only with a recorded old-CPA rollback point; API3 must
   remain unchanged until the release agent records complete browser and Codex
   CLI evidence and explicitly releases the same digests.
+- Every release exposes anonymous process-only `/livez` and bounded dependency
+  `/readyz` probes. The internal control role exposes authenticated,
+  low-cardinality Prometheus metrics for request/upstream traffic, active
+  work, queues, process CPU/RSS, allocator totals and bounded component memory.
+  Release builds provide explicitly enabled, `metrics:read`-protected CPU and
+  heap diagnostics on the control route family only. These endpoints must not
+  create a NodePort, hostPort, alternate public listener or gateway route.
 
 ## Explicitly rejected or removed designs
 

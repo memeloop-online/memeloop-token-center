@@ -58,6 +58,10 @@ impl RequestEventStreamLimiter {
     pub(crate) fn global_available_permits(&self) -> usize {
         self.global.available_permits()
     }
+
+    pub(crate) fn active_count(&self) -> usize {
+        GLOBAL_REQUEST_EVENT_STREAMS.saturating_sub(self.global.available_permits())
+    }
 }
 
 #[cfg(test)]

@@ -59,6 +59,9 @@ pub struct Config {
     pub pricing_openrouter_url: String,
     pub plugin_dir: Option<String>,
     pub allow_oauth_loopback: bool,
+    /// Registers authenticated control-plane diagnostics when explicitly set.
+    /// The routes remain absent (404) by default and on gateway/worker roles.
+    pub runtime_profiling_enabled: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -116,6 +119,7 @@ impl std::fmt::Debug for Config {
             .field("pricing_openrouter_url", &"[configured public HTTPS URL]")
             .field("plugin_dir", &self.plugin_dir)
             .field("allow_oauth_loopback", &self.allow_oauth_loopback)
+            .field("runtime_profiling_enabled", &self.runtime_profiling_enabled)
             .finish()
     }
 }
@@ -188,6 +192,7 @@ impl Config {
             pricing_openrouter_url,
             plugin_dir: env::var("MTC_PLUGIN_DIR").ok(),
             allow_oauth_loopback,
+            runtime_profiling_enabled: env_bool("MTC_RUNTIME_PROFILING_ENABLED", false),
         })
     }
 
@@ -223,6 +228,7 @@ impl Config {
             pricing_openrouter_url: DEFAULT_PRICING_OPENROUTER_URL.to_owned(),
             plugin_dir: None,
             allow_oauth_loopback: false,
+            runtime_profiling_enabled: false,
         })
     }
 
@@ -254,6 +260,7 @@ impl Config {
             pricing_openrouter_url: DEFAULT_PRICING_OPENROUTER_URL.to_owned(),
             plugin_dir: None,
             allow_oauth_loopback: true,
+            runtime_profiling_enabled: false,
         }
     }
 }

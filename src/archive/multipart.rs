@@ -11,7 +11,7 @@ use crate::error::AppError;
 // parts multiply directly by request concurrency. Keep one part in flight per
 // object; request-level concurrency still supplies aggregate S3 parallelism
 // while each individual writer applies bounded backpressure.
-const ARCHIVE_MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const ARCHIVE_MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
 const ARCHIVE_MULTIPART_MAX_IN_FLIGHT_PARTS: usize = 1;
 
 #[must_use = "an archive writer must be finished or explicitly aborted"]

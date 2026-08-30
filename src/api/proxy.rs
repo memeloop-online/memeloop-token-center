@@ -27,6 +27,9 @@ pub(super) async fn proxy(
     body: Bytes,
     protocol: Protocol,
 ) -> Result<Response, AppError> {
+    let _request_buffer = state
+        .metrics
+        .memory_usage(crate::metrics::MemoryComponent::RequestBuffer, body.len());
     let key = authenticate_downstream(&headers, &state).await?;
     let proxy_lifecycle_permit = state
         .proxy_lifecycle_permits
@@ -267,15 +270,15 @@ pub(super) async fn proxy(
         )
         .await;
     }
-    let upstream = loop {
+    let (upstream, upstream_activity) = loop {
         let result = send_proxy_route(&state, &headers, protocol, request_id, &active_route).await;
         let retry = match &result {
-            Ok(response) => retryable_upstream_status(response.status()),
+            Ok((response, _)) => retryable_upstream_status(response.status()),
             Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => true,
             Err(ProxySendError::NonRetryableTransport | ProxySendError::Credential) => false,
         };
         if retry && let Some(next_route) = route_attempts.next() {
-            if let Ok(response) = result {
+            if let Ok((response, _activity)) = result {
                 drop(response);
             }
             if state
@@ -425,6 +428,7 @@ pub(super) async fn proxy(
         capture_json_usage,
         protocol,
         is_codex_route,
+        upstream_activity,
         request_id,
         buffered_request,
         proxy_lifecycle_permit,
@@ -561,6 +565,10 @@ async fn execute_component_provider(
             return finish_component_provider_failure(&request, "provider_credential").await;
         }
     };
+    let _upstream_activity = request
+        .state
+        .metrics
+        .active_upstream(driver, "component_provider");
     let upstream_started = Instant::now();
     let upstream_result = upstream_request.send().await;
     request.state.metrics.observe_upstream(
@@ -755,6 +763,10 @@ async fn finish_buffered_request(
         }
         Err(error) => return Err(error),
     };
+    let _response_buffer = request
+        .state
+        .metrics
+        .memory_usage(crate::metrics::MemoryComponent::ResponseBuffer, body.len());
     let response_id = (status.is_success()
         && error_code.is_none()
         && matches!(request.protocol, Protocol::OpenAiResponses))

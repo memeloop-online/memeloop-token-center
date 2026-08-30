@@ -9,6 +9,7 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) capture_json_usage: bool,
     pub(super) protocol: Protocol,
     pub(super) is_codex_route: bool,
+    pub(super) upstream_activity: crate::metrics::ActivityGuard,
     pub(super) request_id: Uuid,
     pub(super) buffered_request: BufferedRequest<'a>,
     pub(super) proxy_lifecycle_permit: tokio::sync::OwnedSemaphorePermit,
@@ -24,12 +25,22 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         capture_json_usage,
         protocol,
         is_codex_route,
+        upstream_activity,
         request_id,
         buffered_request,
         proxy_lifecycle_permit,
     } = input;
     let (archive_stream_permit, response_archive_attempt, archive_writer) =
         begin_streaming_response_archive(state, request_id).await;
+    let stream_activity = state
+        .metrics
+        .active_stream(crate::metrics::ActiveStreamKind::ProxyResponse);
+    let archive_memory = archive_stream_permit.as_ref().map(|_| {
+        state.metrics.memory_usage(
+            crate::metrics::MemoryComponent::ArchiveMultipart,
+            crate::archive::ARCHIVE_MULTIPART_PART_BYTES,
+        )
+    });
     let (body_sender, body_receiver) = tokio::sync::mpsc::channel(PROXY_BODY_CHANNEL_CAPACITY);
     let background_state = state.clone();
     let status_code = i64::from(status.as_u16());
@@ -48,6 +59,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         // permit inside this task until archive and billing finalization end.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
         let _archive_stream_permit = archive_stream_permit;
+        let _archive_memory = archive_memory;
+        let _stream_activity = stream_activity;
+        let _upstream_activity = upstream_activity;
         let lifecycle_started = tokio::time::Instant::now();
         let stream_deadline = lifecycle_started + MAX_PROXY_STREAM_LIFETIME;
         let lifecycle_deadline = lifecycle_started + MAX_PROXY_LIFETIME;
@@ -56,6 +70,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut archive_writer = archive_writer;
             let mut response_archive_attempt = response_archive_attempt;
             let mut usage_capture = Vec::new();
+            let mut capture_memory = background_state
+                .metrics
+                .memory_usage(crate::metrics::MemoryComponent::StreamCapture, 0);
             let mut sse_capture = is_sse.then(|| {
                 if matches!(protocol, Protocol::OpenAiResponses) {
                     ResponsesSseCapture::for_responses()
@@ -135,6 +152,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 };
                 match next {
                     Ok(raw_chunk) => {
+                        let _response_buffer = background_state.metrics.memory_usage(
+                            crate::metrics::MemoryComponent::ResponseBuffer,
+                            raw_chunk.len(),
+                        );
                         response_bytes = response_bytes.saturating_add(raw_chunk.len());
                         if response_bytes > MAX_PROXY_RESPONSE_BODY {
                             transport_error = Some("upstream_response_too_large");
@@ -187,6 +208,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             };
                         if capture_json_usage {
                             append_bounded(&mut usage_capture, &chunk, 2 * 1024 * 1024);
+                            capture_memory.set_bytes(usage_capture.capacity());
                         }
                         if let Some(capture) = sse_capture.as_mut() {
                             capture.push(&chunk);

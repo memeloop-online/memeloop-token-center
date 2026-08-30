@@ -14,6 +14,20 @@ pub fn router_for_role(state: AppState, role: RuntimeRole) -> Router {
         application = application
             .route("/metrics", get(prometheus_metrics))
             .route("/version", get(version));
+        if state.config.runtime_profiling_enabled {
+            application =
+                application.route("/internal/v1/diagnostics/runtime", get(runtime_diagnostics));
+            #[cfg(target_os = "linux")]
+            {
+                application =
+                    application.route("/internal/v1/diagnostics/cpu-profile", post(cpu_profile));
+            }
+            #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+            {
+                application =
+                    application.route("/internal/v1/diagnostics/heap-profile", post(heap_profile));
+            }
+        }
     }
     application = application.route("/ui-assets/{*path}", get(web_asset));
     if role.serves_control() {

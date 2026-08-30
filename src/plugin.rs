@@ -383,6 +383,19 @@ impl PluginRuntime {
             .collect()
     }
 
+    /// A bounded, aggregate-only snapshot for operational metrics. Tenant and
+    /// plugin identifiers never leave the cache through this interface.
+    pub async fn runtime_metrics(&self) -> PluginRuntimeMetrics {
+        let cache = self.configuration_cache.read().await;
+        PluginRuntimeMetrics {
+            loaded_plugins: self.plugins.len(),
+            cache_entries: cache.len(),
+            cache_bytes: cache.values().fold(0usize, |total, entry| {
+                total.saturating_add(entry.estimated_bytes)
+            }),
+        }
+    }
+
     pub fn configuration_contribution(
         &self,
         plugin_id: &str,
@@ -1024,6 +1037,13 @@ impl PluginRuntime {
         self.execution_timeout = timeout;
         self.fuel = fuel;
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PluginRuntimeMetrics {
+    pub loaded_plugins: usize,
+    pub cache_entries: usize,
+    pub cache_bytes: usize,
 }
 
 fn encoded_body_limit(body_limit: usize) -> usize {

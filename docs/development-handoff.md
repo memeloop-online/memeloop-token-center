@@ -997,3 +997,25 @@ treat it as a defect or explicitly revise the requirement through review. Do not
 silently resurrect rejected features such as model-prefix routing, a CPA bridge,
 credential-to-provider coupling, application download throttling or a Forgejo/
 Harbor release path.
+
+## 2026-08-30 observability continuation
+
+The current working tree extends the existing `/livez`, dependency-aware
+`/readyz` and control-only `metrics:read` `/metrics` contract. It adds fixed
+label active request/stream/upstream gauges, process CPU/RSS, jemalloc
+allocated/active/resident/mapped/retained totals, bounded component memory,
+generation/background capacity and aggregate plugin-cache state. Optional
+runtime, CPU flamegraph and jemalloc heap diagnostics are registered only on a
+control/all role when `MTC_RUNTIME_PROFILING_ENABLED=true`; the gateway and
+worker do not register them. Captures are authenticated, process-wide
+singleflight, duration/output bounded, `no-store`, shell-free and disabled by
+default. No deployment port or ingress is added.
+
+Local evidence includes rustfmt, `cargo check --tests`, the five-test metrics
+integration binary, five metrics unit tests, `git diff --check` and an optimized
+release build. An explicitly enabled local release process produced a nonempty
+23,937-byte CPU flamegraph under real HTTP load and an 8,380-byte jemalloc heap
+profile; the temporary artifacts and SQLite state were removed afterward. An
+enabled in-Pod capture remains deployment evidence. Do not trigger a separate
+CI solely for this work: combine it with the next necessary exact-SHA release
+run after the API2 data-correction and replay evidence has closed.

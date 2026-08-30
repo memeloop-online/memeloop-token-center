@@ -454,6 +454,9 @@ async fn cancel_upstream_generation(
         }
         _ => return Err(AppError::Upstream("unsupported generation driver".into())),
     };
+    let _upstream_activity = state
+        .metrics
+        .active_upstream(&route.driver, "generation_cancel");
     let upstream_started = std::time::Instant::now();
     let response_result = route.credential.apply(request, unix_millis())?.send().await;
     state.metrics.observe_upstream(
@@ -607,6 +610,9 @@ async fn submit(
         .post(format!("{}{}", route.base_url, path))
         .header("idempotency-key", job.job_id.to_string())
         .json(&input);
+    let _upstream_activity = state
+        .metrics
+        .active_upstream(&route.driver, "generation_submit");
     let upstream_started = std::time::Instant::now();
     let response_result = route.credential.apply(request, unix_millis())?.send().await;
     state.metrics.observe_upstream(
@@ -717,6 +723,9 @@ async fn poll_siliconflow_video(
     let request = outbound_http
         .post(poll_url)
         .json(&serde_json::json!({"requestId": upstream_job_id}));
+    let _upstream_activity = state
+        .metrics
+        .active_upstream(&route.driver, "generation_poll");
     let upstream_started = std::time::Instant::now();
     let response_result = route.credential.apply(request, unix_millis())?.send().await;
     state.metrics.observe_upstream(
@@ -864,6 +873,9 @@ async fn poll_seedance(
     )?;
     let outbound_http = route_http(state, route, &poll_url).await?;
     let request = outbound_http.get(poll_url);
+    let _upstream_activity = state
+        .metrics
+        .active_upstream(&route.driver, "generation_poll");
     let upstream_started = std::time::Instant::now();
     let response_result = route.credential.apply(request, unix_millis())?.send().await;
     state.metrics.observe_upstream(
@@ -1129,6 +1141,9 @@ async fn authenticated_json(
     let request = route
         .credential
         .apply(outbound_http.get(url), unix_millis())?;
+    let _upstream_activity = state
+        .metrics
+        .active_upstream(&route.driver, "generation_poll");
     let upstream_started = std::time::Instant::now();
     let response_result = request.send().await;
     state.metrics.observe_upstream(
@@ -1224,6 +1239,9 @@ async fn archive_asset_to_staging(
     } else {
         request
     };
+    let _upstream_activity = state
+        .metrics
+        .active_upstream(&route.driver, "generation_asset");
     let upstream_started = std::time::Instant::now();
     let response_result =
         await_with_staging_heartbeat(state, staging_lease, request.send()).await?;

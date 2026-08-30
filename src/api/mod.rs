@@ -36,6 +36,7 @@ mod billing;
 mod cloud_entitlements;
 mod control_requests;
 mod credentials;
+mod diagnostics;
 mod generation;
 mod groups;
 mod health;
@@ -74,6 +75,11 @@ use control_requests::{
     list_tenants, plugin_manifests, provider_types,
 };
 use credentials::*;
+#[cfg(target_os = "linux")]
+use diagnostics::cpu_profile;
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+use diagnostics::heap_profile;
+use diagnostics::runtime_diagnostics;
 use generation::*;
 use groups::*;
 use health::{

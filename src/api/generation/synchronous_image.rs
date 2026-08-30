@@ -160,6 +160,7 @@ pub(super) async fn execute_synchronous_image_request(
     if !renew_image_request_claim(context).await? {
         return Ok(replayed_image_failure(request_id, "idempotency_claim_lost"));
     }
+    let _upstream_activity = state.metrics.active_upstream(&route.driver, "image");
     let upstream_result = request.send().await;
     state.metrics.observe_upstream(
         &route.driver,

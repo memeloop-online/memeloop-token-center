@@ -1,0 +1,271 @@
+use std::{
+    io::{self, Write},
+    time::Duration,
+};
+
+use super::*;
+use crate::metrics::{ProfileKind, allocator_runtime_metrics};
+
+const DEFAULT_PROFILE_SECONDS: u8 = 10;
+const MAX_PROFILE_SECONDS: u8 = 30;
+const MAX_CPU_PROFILE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HEAP_PROFILE_BYTES: usize = 64 * 1024 * 1024;
+const PROFILE_FINISH_GRACE: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ProfileQuery {
+    seconds: Option<u8>,
+}
+
+impl ProfileQuery {
+    fn duration(&self) -> Result<Duration, AppError> {
+        let seconds = self.seconds.unwrap_or(DEFAULT_PROFILE_SECONDS);
+        if !(1..=MAX_PROFILE_SECONDS).contains(&seconds) {
+            return Err(AppError::BadRequest(format!(
+                "seconds must be between 1 and {MAX_PROFILE_SECONDS}"
+            )));
+        }
+        Ok(Duration::from_secs(u64::from(seconds)))
+    }
+}
+
+pub(super) async fn runtime_diagnostics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    require_service(&headers, &state, "metrics:read").await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "process": state.metrics.process_runtime_metrics(),
+            "allocator": allocator_runtime_metrics(),
+            "profiling": {
+                "enabled": true,
+                "cpu_max_seconds": MAX_PROFILE_SECONDS,
+                "heap_max_seconds": MAX_PROFILE_SECONDS,
+            }
+        })),
+    )
+        .into_response())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) async fn cpu_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ProfileQuery>,
+) -> Result<Response, AppError> {
+    require_service(&headers, &state, "metrics:read").await?;
+    let duration = query.duration()?;
+    let profile_guard = state
+        .metrics
+        .try_begin_profile(ProfileKind::Cpu)
+        .ok_or_else(|| AppError::Conflict("a CPU profile is already running".to_owned()))?;
+    let task = tokio::task::spawn_blocking(move || {
+        // The singleflight guard stays in the blocking task even if the HTTP
+        // request is cancelled or the outer timeout expires.
+        let _profile_guard = profile_guard;
+        capture_cpu_profile(duration)
+    });
+    let bytes = tokio::time::timeout(duration + PROFILE_FINISH_GRACE, task)
+        .await
+        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::Internal)??;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=memeloop-token-center-cpu-profile.svg",
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+#[cfg(target_os = "linux")]
+fn capture_cpu_profile(duration: Duration) -> Result<Vec<u8>, AppError> {
+    let profiler = pprof::ProfilerGuardBuilder::default()
+        .frequency(99)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+        .map_err(|_| AppError::Internal)?;
+    std::thread::sleep(duration);
+    let report = profiler.report().build().map_err(|_| AppError::Internal)?;
+    let mut output = BoundedWriter::new(MAX_CPU_PROFILE_BYTES);
+    report
+        .flamegraph(&mut output)
+        .map_err(|_| AppError::Internal)?;
+    let output = output.finish();
+    if output.is_empty() {
+        return Err(AppError::Internal);
+    }
+    Ok(output)
+}
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+pub(super) async fn heap_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ProfileQuery>,
+) -> Result<Response, AppError> {
+    require_service(&headers, &state, "metrics:read").await?;
+    let duration = query.duration()?;
+    let profile_guard = state
+        .metrics
+        .try_begin_profile(ProfileKind::Heap)
+        .ok_or_else(|| AppError::Conflict("a heap profile is already running".to_owned()))?;
+    let task = tokio::task::spawn_blocking(move || {
+        let _profile_guard = profile_guard;
+        capture_heap_profile(duration)
+    });
+    let bytes = tokio::time::timeout(duration + PROFILE_FINISH_GRACE, task)
+        .await
+        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::Internal)??;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=memeloop-token-center.heap",
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+fn capture_heap_profile(duration: Duration) -> Result<Vec<u8>, AppError> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, path::PathBuf};
+    use tikv_jemalloc_ctl::{profiling, raw};
+
+    if profiling::prof::read() != Ok(true) {
+        return Err(AppError::Internal);
+    }
+    let active = JemallocProfileActivation::begin()?;
+    std::thread::sleep(duration);
+    let path = PathBuf::from("/tmp").join(format!("memeloop-token-center-{}.heap", Uuid::now_v7()));
+    let temporary = TemporaryProfile(path);
+    let path = CString::new(temporary.0.as_os_str().as_bytes()).map_err(|_| AppError::Internal)?;
+    // SAFETY: `prof.dump` expects a pointer to a NUL-terminated path and
+    // jemalloc consumes it synchronously before CString is dropped.
+    unsafe {
+        raw::write::<*const std::ffi::c_char>(b"prof.dump\0", path.as_ptr())
+            .map_err(|_| AppError::Internal)?;
+    }
+    drop(active);
+    let metadata = std::fs::metadata(&temporary.0).map_err(|_| AppError::Internal)?;
+    if metadata.len() > MAX_HEAP_PROFILE_BYTES as u64 {
+        return Err(AppError::Internal);
+    }
+    std::fs::read(&temporary.0).map_err(|_| AppError::Internal)
+}
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+struct JemallocProfileActivation {
+    previous: bool,
+}
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+impl JemallocProfileActivation {
+    fn begin() -> Result<Self, AppError> {
+        // SAFETY: `prof.active` has the documented jemalloc `bool` type.
+        let previous = unsafe {
+            tikv_jemalloc_ctl::raw::update::<bool>(b"prof.active\0", true)
+                .map_err(|_| AppError::Internal)?
+        };
+        Ok(Self { previous })
+    }
+}
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+impl Drop for JemallocProfileActivation {
+    fn drop(&mut self) {
+        // SAFETY: `prof.active` has the documented jemalloc `bool` type.
+        let result =
+            unsafe { tikv_jemalloc_ctl::raw::write::<bool>(b"prof.active\0", self.previous) };
+        if result.is_err() {
+            tracing::error!("failed to restore jemalloc profiling state");
+        }
+    }
+}
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+struct TemporaryProfile(std::path::PathBuf);
+
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+impl Drop for TemporaryProfile {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => tracing::warn!("failed to remove a temporary heap profile"),
+        }
+    }
+}
+
+struct BoundedWriter {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
+
+impl BoundedWriter {
+    fn new(maximum: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum,
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(buffer.len()) > self.maximum {
+            return Err(io::Error::other("profile output exceeds its fixed limit"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duration_is_strictly_bounded() {
+        assert_eq!(
+            ProfileQuery { seconds: None }.duration().unwrap(),
+            Duration::from_secs(10)
+        );
+        assert!(ProfileQuery { seconds: Some(0) }.duration().is_err());
+        assert!(
+            ProfileQuery {
+                seconds: Some(MAX_PROFILE_SECONDS + 1)
+            }
+            .duration()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn output_writer_fails_before_exceeding_the_limit() {
+        let mut writer = BoundedWriter::new(4);
+        assert_eq!(writer.write(b"1234").unwrap(), 4);
+        assert!(writer.write(b"5").is_err());
+        assert_eq!(writer.finish(), b"1234");
+    }
+}
