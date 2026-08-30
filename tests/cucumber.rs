@@ -6784,7 +6784,7 @@ async fn late_cpamp_import_is_exact(world: &mut TokenCenterWorld) {
     assert!(status.success());
     let status = Command::new("sqlite3")
         .arg(sqlite_path)
-        .arg("INSERT INTO usage_events VALUES ('fixture-invalid-hash', 'invalid-hash-request', 450000000, 'openai', 'fixture-model', '/v1/responses', 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz', 1, 1, 1, 0, NULL, NULL);")
+        .arg("INSERT INTO usage_events (event_hash, request_id, timestamp_ms, provider, model, endpoint, api_key_hash, input_tokens, output_tokens, latency_ms, failed, fail_status_code, fail_summary) VALUES ('fixture-invalid-hash', 'invalid-hash-request', 450000000, 'openai', 'fixture-model', '/v1/responses', 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz', 1, 1, 1, 0, NULL, NULL);")
         .status()
         .expect("append invalid CPAMP key hash");
     assert!(status.success());
