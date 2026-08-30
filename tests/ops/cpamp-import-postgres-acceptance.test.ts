@@ -322,14 +322,26 @@ UPDATE session_usage_hourly SET requests=999 WHERE tenant_id=:'tenant_id';
 UPDATE session_usage_daily SET requests=999 WHERE tenant_id=:'tenant_id';`,
     { tenant_id: pricingTenantId, source: pricingSource });
 
+  const projectionSnapshot = (): string => psql(`SELECT
+    (SELECT COALESCE(sum(requests),0) FROM usage_daily_aggregates WHERE key_id IN (SELECT id FROM key_records WHERE tenant_id=:'tenant_id')) || '|' ||
+    (SELECT COALESCE(sum(requests),0) FROM request_daily_aggregates WHERE tenant_id=:'tenant_id') || '|' ||
+    (SELECT COALESCE(sum(requests),0) FROM usage_analysis_hourly WHERE tenant_id=:'tenant_id' AND source_kind='request') || '|' ||
+    (SELECT COALESCE(sum(requests),0) FROM usage_analysis_daily WHERE tenant_id=:'tenant_id' AND source_kind='request') || '|' ||
+    (SELECT COALESCE(sum(requests),0) FROM session_usage_totals WHERE tenant_id=:'tenant_id') || '|' ||
+    (SELECT COALESCE(sum(requests),0) FROM session_usage_hourly WHERE tenant_id=:'tenant_id') || '|' ||
+    (SELECT COALESCE(sum(requests),0) FROM session_usage_daily WHERE tenant_id=:'tenant_id');`,
+    { tenant_id: pricingTenantId });
+  const projectionsBeforeCorrection = projectionSnapshot();
+
   const ordinaryBeforeCorrection = runImport(pricingTenant, pricingSource, databases.pricing);
   assert.notEqual(ordinaryBeforeCorrection.status, 0, "ordinary replay corrected a legacy digest");
   assert.match(ordinaryBeforeCorrection.stderr, /require the explicit cache\/pricing correction mode/);
+  assert.equal(projectionSnapshot(), projectionsBeforeCorrection, "rejected replay changed projections");
   const plan = runImport(pricingTenant, pricingSource, databases.pricing, { CPAMP_CORRECTION_MODE: "plan" });
   assert.equal(plan.status, 0, `correction plan failed: ${plan.stderr}`);
   assert.match(plan.stdout, /candidate_events=3 non_usd_candidates=0 live_candidates=0/);
   assert.match(plan.stdout, /display-alias/);
-  assert.equal(psql("SELECT sum(requests) FROM usage_analysis_daily WHERE tenant_id=:'tenant_id' AND source_kind='request';", { tenant_id: pricingTenantId }), "999", "dry-run changed projections");
+  assert.equal(projectionSnapshot(), projectionsBeforeCorrection, "dry-run changed projections");
 
   const correction = runImport(pricingTenant, pricingSource, databases.pricing, {
     CPAMP_CORRECTION_MODE: "apply",

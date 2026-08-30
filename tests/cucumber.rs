@@ -6766,7 +6766,7 @@ async fn late_cpamp_import_is_exact(world: &mut TokenCenterWorld) {
     run_cpamp_importer(world);
     let status = Command::new("sqlite3")
         .arg(sqlite_path)
-        .arg("INSERT INTO usage_events SELECT event_hash, request_id, timestamp_ms, provider, model, endpoint, api_key_hash, 999, output_tokens, latency_ms, failed, fail_status_code, fail_summary FROM usage_events WHERE event_hash = 'fixture-event-new-watermark' LIMIT 1;")
+        .arg("INSERT INTO usage_events (event_hash, request_id, timestamp_ms, provider, model, endpoint, api_key_hash, input_tokens, output_tokens, latency_ms, failed, fail_status_code, fail_summary) SELECT event_hash, request_id, timestamp_ms, provider, model, endpoint, api_key_hash, 999, output_tokens, latency_ms, failed, fail_status_code, fail_summary FROM usage_events WHERE event_hash = 'fixture-event-new-watermark' LIMIT 1;")
         .status()
         .expect("append conflicting duplicate CPAMP event");
     assert!(status.success());
