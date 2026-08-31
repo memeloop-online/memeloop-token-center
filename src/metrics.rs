@@ -779,17 +779,15 @@ pub struct AllocatorRuntimeMetrics {
 
 #[cfg(not(target_env = "msvc"))]
 pub fn allocator_runtime_metrics() -> AllocatorRuntimeMetrics {
-    use tikv_jemalloc_ctl::{epoch, stats};
-
-    if epoch::advance().is_err() {
+    if crate::jemalloc_control::advance_epoch().is_err() {
         return AllocatorRuntimeMetrics::default();
     }
     AllocatorRuntimeMetrics {
-        allocated_bytes: stats::allocated::read().ok(),
-        active_bytes: stats::active::read().ok(),
-        resident_bytes: stats::resident::read().ok(),
-        mapped_bytes: stats::mapped::read().ok(),
-        retained_bytes: stats::retained::read().ok(),
+        allocated_bytes: crate::jemalloc_control::read_usize(b"stats.allocated\0"),
+        active_bytes: crate::jemalloc_control::read_usize(b"stats.active\0"),
+        resident_bytes: crate::jemalloc_control::read_usize(b"stats.resident\0"),
+        mapped_bytes: crate::jemalloc_control::read_usize(b"stats.mapped\0"),
+        retained_bytes: crate::jemalloc_control::read_usize(b"stats.retained\0"),
     }
 }
 

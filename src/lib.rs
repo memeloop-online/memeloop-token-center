@@ -9,6 +9,8 @@ pub mod db;
 pub mod error;
 mod gateway_body;
 pub mod generation;
+#[cfg(not(target_env = "msvc"))]
+mod jemalloc_control;
 pub mod metrics;
 pub mod model;
 pub mod network;

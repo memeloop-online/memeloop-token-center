@@ -141,9 +141,7 @@ pub(super) async fn heap_profile(
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 fn capture_heap_profile(duration: Duration) -> Result<Vec<u8>, AppError> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt, path::PathBuf};
-    use tikv_jemalloc_ctl::{profiling, raw};
-
-    if profiling::prof::read() != Ok(true) {
+    if crate::jemalloc_control::read_bool(b"opt.prof\0") != Some(true) {
         return Err(AppError::Internal);
     }
     let active = JemallocProfileActivation::begin()?;
@@ -153,10 +151,8 @@ fn capture_heap_profile(duration: Duration) -> Result<Vec<u8>, AppError> {
     let path = CString::new(temporary.0.as_os_str().as_bytes()).map_err(|_| AppError::Internal)?;
     // SAFETY: `prof.dump` expects a pointer to a NUL-terminated path and
     // jemalloc consumes it synchronously before CString is dropped.
-    unsafe {
-        raw::write::<*const std::ffi::c_char>(b"prof.dump\0", path.as_ptr())
-            .map_err(|_| AppError::Internal)?;
-    }
+    crate::jemalloc_control::write_pointer(b"prof.dump\0", path.as_ptr())
+        .map_err(|_| AppError::Internal)?;
     drop(active);
     let metadata = std::fs::metadata(&temporary.0).map_err(|_| AppError::Internal)?;
     if metadata.len() > MAX_HEAP_PROFILE_BYTES as u64 {
@@ -174,10 +170,8 @@ struct JemallocProfileActivation {
 impl JemallocProfileActivation {
     fn begin() -> Result<Self, AppError> {
         // SAFETY: `prof.active` has the documented jemalloc `bool` type.
-        let previous = unsafe {
-            tikv_jemalloc_ctl::raw::update::<bool>(b"prof.active\0", true)
-                .map_err(|_| AppError::Internal)?
-        };
+        let previous = crate::jemalloc_control::update_bool(b"prof.active\0", true)
+            .map_err(|_| AppError::Internal)?;
         Ok(Self { previous })
     }
 }
@@ -186,8 +180,7 @@ impl JemallocProfileActivation {
 impl Drop for JemallocProfileActivation {
     fn drop(&mut self) {
         // SAFETY: `prof.active` has the documented jemalloc `bool` type.
-        let result =
-            unsafe { tikv_jemalloc_ctl::raw::write::<bool>(b"prof.active\0", self.previous) };
+        let result = crate::jemalloc_control::update_bool(b"prof.active\0", self.previous);
         if result.is_err() {
             tracing::error!("failed to restore jemalloc profiling state");
         }

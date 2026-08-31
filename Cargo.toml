@@ -74,7 +74,7 @@ uuid = { version = "1", features = ["serde", "v7"] }
 wasmtime = { version = "47.0.3", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemalloc-ctl = { version = "0.7.0", features = ["profiling", "stats", "use_std"] }
+tikv-jemalloc-sys = { version = "0.7.1", features = ["profiling", "stats"] }
 tikv-jemallocator = { version = "0.7.0", features = ["profiling", "stats"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
