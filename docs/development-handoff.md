@@ -4,7 +4,63 @@ This is the resume point for the next Token Center development agent. Read
 [Product requirements](product-requirements.md) first, then
 [Architecture](architecture.md). Those documents preserve the agreed product
 scope and rejected designs; this document preserves the implementation state and
-remaining acceptance gates, updated on 2026-08-29.
+remaining acceptance gates, updated on 2026-08-31.
+
+## Active 2026-08-31 release-window continuation
+
+- Clean source `4e8d2468b61c6505c8efc3b745acf632e4d7f2d0` passed the complete
+  GitHub Actions release in run
+  [`33360162697`](https://github.com/memeloop-online/memeloop-token-center/actions/runs/33360162697).
+  Its verified service, importer and plugin-installer digests are respectively
+  `sha256:291a788e0404d99d329826c0c059cffdfb3d172cedcc824937e1461d5fa9f810`,
+  `sha256:2616b2adc5b944c3fc857de9178b061aa7b6ad7c11ca5674c6fbd8c8b5a9542b`
+  and
+  `sha256:5d63a4b5b15b7ace3ceeb13a7267e4d299d8d5c52af382635f20a58d1ef23298`.
+  API2 trial currently runs that exact service digest with gateway, control and
+  worker Ready and at zero restarts. API3 and the old CPA route remain
+  unchanged.
+- All 10 active legacy credentials retain their stable key identities and
+  history. Their balances were raised through the ordinary idempotent grant API
+  to the ledger maximum of `9223372036854775807` micros, with zero reservations,
+  no account budgets and an exact zero-write replay. This intentionally removes
+  balance admission as a cutover restriction; it does not broaden route,
+  rate-limit or concurrency policy. The owner may lower balances later.
+- Live source model discovery found 13 distinct currently visible models. The
+  three models whose current target prices were missing were synchronized and
+  persisted, and all 13 now have durable price records. Missing future model
+  prices remain fail-closed; a model is not free merely because a legacy account
+  carries the maximum balance.
+- A strictly API2-trial-only compatibility diagnostic attached each of the 10
+  credentials to one exact old-CPA-backed account and its own model inventory.
+  Exact replay created no additional resources; 10 non-streamed Responses and
+  one Chat Completions request passed. Review then proved that bridge traffic
+  would be represented once as a native MTC request and again by the later
+  CPAMP delta, because the old source does not retain an exact MTC request ID.
+  The diagnostic was stopped before any hostname cutover: all 64 routes and all
+  10 accounts are disabled by CAS, active requests/reservations are zero, old
+  credentials expose zero bridge models, and the exact egress removal is
+  committed through GitOps. The retained 20 requests (11 success, nine failure)
+  and disabled resources remain audit evidence; they must be explicitly
+  reconciled rather than imported as duplicate facts. The temporary bridge tool
+  is not part of the release tree. Direct provider-exact route/policy convergence
+  remains the production gate.
+- A real Codex CLI Responses stream then exposed a release blocker in the
+  current image. The old CPA emits a valid terminal `response.completed` event
+  followed by one harmless extra blank line. The streaming sanitizer forwarded
+  the complete response but retained that final newline and recorded
+  `upstream_incomplete_response`/HTTP 502. The local continuation accepts only a
+  CR/LF-only suffix after a fully framed event; the independent terminal-event
+  capture still rejects missing completion and arbitrary partial fields. The
+  complete 380-test Rust library, strict library Clippy, root TypeScript
+  typecheck, all runnable operations tests, all release contracts, the
+  TypeScript-only repository contract and `git diff --check` pass locally.
+- Do not promote the current service digest. Publish one replacement exact-SHA
+  release from this locally accepted tree, deploy only that immutable
+  service digest to the reversible API2 trial, and require a real Codex CLI
+  request plus an exact old-CPA terminal-stream fixture to persist HTTP 200 with
+  validated total/cache usage without re-enabling the bridge. Complete direct
+  route, final CPAMP delta, session archive and browser reconciliation before any
+  API3 change.
 
 ## Active 2026-08-29 billing-correction and Web redesign gate
 

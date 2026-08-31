@@ -355,7 +355,15 @@ impl ResponsesStreamingSanitizer {
     }
 
     pub(super) fn is_complete(&self) -> bool {
-        self.pending.is_empty()
+        // Some compatible Responses servers terminate the final event with an
+        // extra blank line. The first two newlines already framed and
+        // validated the event; a remaining CR/LF-only suffix is not a partial
+        // SSE field. Terminal success is still required independently by
+        // ResponsesSseCapture, so this does not accept a missing completed
+        // event or an arbitrary truncated line.
+        self.pending
+            .iter()
+            .all(|byte| matches!(byte, b'\r' | b'\n'))
     }
 
     pub(super) fn last_push_billable(&self) -> bool {
@@ -1031,6 +1039,36 @@ mod tests {
         let second = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES / 2 + 1];
         assert!(oversized.push(&first).is_ok());
         assert!(oversized.push(&second).is_err());
+    }
+
+    #[test]
+    fn streaming_sanitizer_accepts_only_blank_lines_after_a_framed_terminal_event() {
+        for stream in [
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n\n".as_slice(),
+            b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{}}\r\n\r\n\r\n".as_slice(),
+        ] {
+            for split in 0..=stream.len() {
+                let mut sanitizer = ResponsesStreamingSanitizer::default();
+                let mut output = sanitizer.push(&stream[..split]).unwrap().to_vec();
+                output.extend_from_slice(&sanitizer.push(&stream[split..]).unwrap());
+                assert!(String::from_utf8(output).unwrap().contains("response.completed"));
+                assert!(sanitizer.is_complete(), "split at byte {split}");
+            }
+        }
+
+        let mut partial = ResponsesStreamingSanitizer::default();
+        partial
+            .push(b"data: {\"type\":\"response.created\"}")
+            .unwrap();
+        assert!(!partial.is_complete());
+
+        let mut trailing_partial = ResponsesStreamingSanitizer::default();
+        trailing_partial
+            .push(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n\ndata:",
+            )
+            .unwrap();
+        assert!(!trailing_partial.is_complete());
     }
 
     #[test]

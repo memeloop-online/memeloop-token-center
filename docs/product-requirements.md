@@ -344,6 +344,17 @@ such ledger, reconciliation explicitly records zero rather than inventing data;
 MemeLoop Web must provide a separate signed, versioned source snapshot when
 customer subscriptions exist.
 
+During the approved legacy cutover, every currently active legacy client
+credential is attached to its existing stable account with no newly invented
+budget. Its available balance is raised once to the maximum value supported by
+the monetary ledger so balance admission does not restrict that credential;
+the owner may reduce individual balances later. The grant is idempotent,
+tenant-scoped and independently reconciled, and it must not change route,
+rate-limit, concurrency, history or subscription records. Prices are durable
+database state rather than Pod-local state. A newly exposed model without a
+resolved price must fail admission before contacting the upstream; it must
+never become a zero-price path merely because an account has a large balance.
+
 The CPAMP failure flag is authoritative during normalization. Failed rows with
 a real 4xx/5xx code preserve it; failed rows carrying zero, missing, 1xx, 2xx,
 3xx or invalid codes become sanitized `502`/`upstream_error` failures. Such
