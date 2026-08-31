@@ -1019,3 +1019,13 @@ profile; the temporary artifacts and SQLite state were removed afterward. An
 enabled in-Pod capture remains deployment evidence. Do not trigger a separate
 CI solely for this work: combine it with the next necessary exact-SHA release
 run after the API2 data-correction and replay evidence has closed.
+
+The first live correction committed all 350,631 reviewed events and rebuilt
+the derived aggregates, then exposed an importer orchestration defect: apply
+mode continued directly into an all-history ordinary import whose wide
+canonical sort exhausted the 10 GiB PostgreSQL PVC's temporary space. That
+later replay transaction rolled back and PostgreSQL removed its temporary
+files; the committed correction checkpoint, audit and provenance remain
+intact. `migrate-cpamp.ts` now returns immediately after a successful
+correction. A fresh importer digest must prove a zero-change second correction;
+only then should a separate ordinary-overlap replay prove zero imported events.

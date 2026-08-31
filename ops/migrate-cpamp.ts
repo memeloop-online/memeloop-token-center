@@ -401,6 +401,13 @@ SELECT count(*) FROM (
         ["-v", `tenant_external_id=${tenant}`, "-v", `import_source=${source}`],
         `${readSql("correct.sql")}\n${readSql("correct-rebuild.sql")}`,
       );
+      // Correction is a separately fenced, all-history operation. Do not
+      // immediately feed the same wide all-history staging set into the
+      // ordinary importer: that duplicates work, can require multi-gigabyte
+      // temporary sorts, and obscures whether correction replay or ordinary
+      // overlap replay changed state. Operations run the ordinary importer as
+      // a distinct job after a zero-change second correction.
+      return;
     }
 
     runPsql(["-v", `tenant_external_id=${tenant}`, "-v", `import_source=${source}`], readSql("apply.sql"));

@@ -368,6 +368,7 @@ UPDATE session_usage_daily SET requests=999 WHERE tenant_id=:'tenant_id';`,
   });
   assert.equal(correction.status, 0, `correction apply failed: ${correction.stderr}`);
   assert.match(correction.stdout, /corrected_events/);
+  assert.doesNotMatch(correction.stdout, /total_imported_events/, "correction unexpectedly ran ordinary replay");
   assert.equal(psql(`SELECT count(*) || '|' || sum(input_tokens) || '|' || sum(output_tokens) || '|' ||
     sum(cached_input_tokens) || '|' || sum(cache_write_tokens) || '|' || sum(cost_micros)
     FROM request_records WHERE tenant_id=:'tenant_id';`, { tenant_id: pricingTenantId }), "3|220|16|60|10|1338");
@@ -398,6 +399,7 @@ UPDATE session_usage_daily SET requests=999 WHERE tenant_id=:'tenant_id';`,
   });
   assert.equal(secondCorrection.status, 0, `second correction failed: ${secondCorrection.stderr}`);
   assert.match(secondCorrection.stdout, /\b0\b/);
+  assert.doesNotMatch(secondCorrection.stdout, /total_imported_events/, "second correction unexpectedly ran ordinary replay");
   assert.equal(psql("SELECT count(*) FROM cpamp_import_correction_audit WHERE tenant_id=:'tenant_id' AND source=:'source';", { tenant_id: pricingTenantId, source: pricingSource }), "3");
   assert.equal(psql(`SELECT
     (SELECT sum(requests)||':'||sum(input_tokens)||':'||sum(cost_micros) FROM usage_daily_aggregates WHERE key_id IN (SELECT id FROM key_records WHERE tenant_id=:'tenant_id')) || '|' ||
