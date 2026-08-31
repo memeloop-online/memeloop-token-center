@@ -71,7 +71,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
-wasmtime = { version = "47.0.3", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime = { version = "47.0.4", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemalloc-sys = { version = "0.7.1", features = ["profiling", "stats"] }

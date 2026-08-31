@@ -61,6 +61,13 @@ remaining acceptance gates, updated on 2026-08-31.
   validated total/cache usage without re-enabling the bridge. Complete direct
   route, final CPAMP delta, session archive and browser reconciliation before any
   API3 change.
+- The first push of this continuation, `7a64eac4d878e64dcd10fdb5ececd3a041849fb1`,
+  was stopped after dependency security discovered newly published
+  `RUSTSEC-2026-0268` and `RUSTSEC-2026-0269` against Wasmtime `47.0.3`.
+  It produced no images. The continuation raises the direct Wasmtime minimum and
+  the complete locked runtime family to fixed `47.0.4` without an advisory
+  waiver. The updated lockfile again passes all 380 library tests, strict library
+  Clippy and rustfmt locally; one replacement exact-SHA run is required.
 
 ## Active 2026-08-29 billing-correction and Web redesign gate
 
