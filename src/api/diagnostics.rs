@@ -1,10 +1,9 @@
-use std::{
-    io::{self, Write},
-    time::Duration,
-};
+use std::{io, time::Duration};
 
 use super::*;
 use crate::metrics::{ProfileKind, allocator_runtime_metrics};
+#[cfg(target_os = "linux")]
+use pprof::protos::Message;
 
 const DEFAULT_PROFILE_SECONDS: u8 = 10;
 const MAX_PROFILE_SECONDS: u8 = 30;
@@ -73,11 +72,11 @@ pub(super) async fn cpu_profile(
         .map_err(|_| AppError::Internal)??;
     Ok((
         [
-            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (header::CONTENT_TYPE, "application/vnd.google.protobuf"),
             (header::CACHE_CONTROL, "no-store"),
             (
                 header::CONTENT_DISPOSITION,
-                "attachment; filename=memeloop-token-center-cpu-profile.svg",
+                "attachment; filename=memeloop-token-center-cpu-profile.pb",
             ),
         ],
         bytes,
@@ -94,12 +93,12 @@ fn capture_cpu_profile(duration: Duration) -> Result<Vec<u8>, AppError> {
         .map_err(|_| AppError::Internal)?;
     std::thread::sleep(duration);
     let report = profiler.report().build().map_err(|_| AppError::Internal)?;
-    let mut output = BoundedWriter::new(MAX_CPU_PROFILE_BYTES);
-    report
-        .flamegraph(&mut output)
+    let profile = report.pprof().map_err(|_| AppError::Internal)?;
+    let mut output = Vec::with_capacity(profile.encoded_len().min(MAX_CPU_PROFILE_BYTES));
+    profile
+        .encode(&mut output)
         .map_err(|_| AppError::Internal)?;
-    let output = output.finish();
-    if output.is_empty() {
+    if output.is_empty() || output.len() > MAX_CPU_PROFILE_BYTES {
         return Err(AppError::Internal);
     }
     Ok(output)
@@ -209,38 +208,6 @@ impl Drop for TemporaryProfile {
     }
 }
 
-struct BoundedWriter {
-    bytes: Vec<u8>,
-    maximum: usize,
-}
-
-impl BoundedWriter {
-    fn new(maximum: usize) -> Self {
-        Self {
-            bytes: Vec::new(),
-            maximum,
-        }
-    }
-
-    fn finish(self) -> Vec<u8> {
-        self.bytes
-    }
-}
-
-impl Write for BoundedWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if self.bytes.len().saturating_add(buffer.len()) > self.maximum {
-            return Err(io::Error::other("profile output exceeds its fixed limit"));
-        }
-        self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,13 +226,5 @@ mod tests {
             .duration()
             .is_err()
         );
-    }
-
-    #[test]
-    fn output_writer_fails_before_exceeding_the_limit() {
-        let mut writer = BoundedWriter::new(4);
-        assert_eq!(writer.write(b"1234").unwrap(), 4);
-        assert!(writer.write(b"5").is_err());
-        assert_eq!(writer.finish(), b"1234");
     }
 }

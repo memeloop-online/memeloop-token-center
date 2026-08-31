@@ -78,7 +78,7 @@ tikv-jemalloc-ctl = { version = "0.7.0", features = ["profiling", "stats", "use_
 tikv-jemallocator = { version = "0.7.0", features = ["profiling", "stats"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-pprof = { version = "0.15.0", default-features = false, features = ["flamegraph"] }
+pprof = { version = "0.15.0", default-features = false, features = ["prost-codec"] }
 
 [dev-dependencies]
 cucumber = { version = "0.23.0", features = ["macros"] }

@@ -601,6 +601,79 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/diagnostics/runtime:
+    get:
+      tags: [System]
+      operationId: getRuntimeDiagnostics
+      summary: Read bounded process, allocator, and profiling status
+      security: [{ serviceBearer: [] }]
+      x-required-scope: metrics:read
+      responses:
+        '200':
+          description: A no-store snapshot of low-cardinality runtime diagnostics.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/diagnostics/cpu-profile:
+    post:
+      tags: [System]
+      operationId: captureCpuProfile
+      summary: Capture a bounded Google pprof CPU profile when runtime profiling is enabled
+      security: [{ serviceBearer: [] }]
+      x-required-scope: metrics:read
+      parameters:
+        - name: seconds
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 30, default: 10 }
+      responses:
+        '200':
+          description: Google pprof protobuf suitable for pprof-compatible analysis tools.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/vnd.google.protobuf:
+              schema: { type: string, format: binary, maxLength: 33554432 }
+        '400': { description: Profiling duration is outside the configured bound. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /internal/v1/diagnostics/heap-profile:
+    post:
+      tags: [System]
+      operationId: captureHeapProfile
+      summary: Capture a bounded jemalloc heap profile when runtime profiling is enabled
+      security: [{ serviceBearer: [] }]
+      x-required-scope: metrics:read
+      parameters:
+        - name: seconds
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 30, default: 10 }
+      responses:
+        '200':
+          description: A jemalloc heap profile for offline analysis.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary, maxLength: 67108864 }
+        '400': { description: Profiling duration is outside the configured bound. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /internal/v1/plugins:
     get:
       tags: [System]

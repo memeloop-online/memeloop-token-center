@@ -1005,7 +1005,7 @@ The current working tree extends the existing `/livez`, dependency-aware
 label active request/stream/upstream gauges, process CPU/RSS, jemalloc
 allocated/active/resident/mapped/retained totals, bounded component memory,
 generation/background capacity and aggregate plugin-cache state. Optional
-runtime, CPU flamegraph and jemalloc heap diagnostics are registered only on a
+runtime, Google pprof CPU and jemalloc heap diagnostics are registered only on a
 control/all role when `MTC_RUNTIME_PROFILING_ENABLED=true`; the gateway and
 worker do not register them. Captures are authenticated, process-wide
 singleflight, duration/output bounded, `no-store`, shell-free and disabled by
@@ -1014,7 +1014,7 @@ default. No deployment port or ingress is added.
 Local evidence includes rustfmt, `cargo check --tests`, the five-test metrics
 integration binary, five metrics unit tests, `git diff --check` and an optimized
 release build. An explicitly enabled local release process produced a nonempty
-23,937-byte CPU flamegraph under real HTTP load and an 8,380-byte jemalloc heap
+non-empty CPU profile under real HTTP load and an 8,380-byte jemalloc heap
 profile; the temporary artifacts and SQLite state were removed afterward. An
 enabled in-Pod capture remains deployment evidence. Do not trigger a separate
 CI solely for this work: combine it with the next necessary exact-SHA release

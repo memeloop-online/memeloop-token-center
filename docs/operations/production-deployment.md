@@ -178,7 +178,7 @@ is required or supported.
 | Route | Output and bounds |
 | --- | --- |
 | `GET /internal/v1/diagnostics/runtime` | `no-store` JSON snapshot of process CPU/RSS/uptime, jemalloc totals and active diagnostic limits. |
-| `POST /internal/v1/diagnostics/cpu-profile?seconds=10` | Linux pprof sampling at 99 Hz, returned as `image/svg+xml` attachment. Duration defaults to 10 seconds and is restricted to 1–30 seconds; report generation has 15 seconds of grace and output is capped at 32 MiB. |
+| `POST /internal/v1/diagnostics/cpu-profile?seconds=10` | Linux pprof sampling at 99 Hz, returned as a Google pprof protobuf (`application/vnd.google.protobuf`) attachment for offline analysis. Duration defaults to 10 seconds and is restricted to 1–30 seconds; report generation has 15 seconds of grace and output is capped at 32 MiB. |
 | `POST /internal/v1/diagnostics/heap-profile?seconds=10` | glibc jemalloc sampled heap dump returned as an `application/octet-stream` attachment compatible with `jeprof`. Duration is restricted to 1–30 seconds and output to 64 MiB. The temporary `/tmp` dump uses a random name and is removed after bounded reading. |
 
 CPU and heap collection share one process-wide singleflight. A concurrent
@@ -189,7 +189,7 @@ Heap profiling support is compiled into glibc releases with sampling every
 approximately 512 KiB, but `prof_active` is false until an authenticated
 capture starts and its previous state is restored by an RAII guard. Release
 builds strip debug sections while retaining the native symbol table required
-for useful CPU flamegraphs. Profiling deliberately adds CPU/allocation
+for useful CPU profiles and derived flamegraphs. Profiling deliberately adds CPU/allocation
 sampling overhead during a capture, so use the shortest interval that answers
 the incident question and do not leave the route switch enabled routinely.
 
