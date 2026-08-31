@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
+const correctionRevision = "cpamp-cache-pricing-v2";
 
 class CliError extends Error {
   readonly exitCode: number;
@@ -273,6 +274,24 @@ async function main(): Promise<void> {
     runPsql(["-v", `tenant_external_id=${tenant}`], readSql("prepare.sql"));
     if (reset) {
       runPsql(["-v", `tenant_external_id=${tenant}`, "-v", `import_source=${source}`], readSql("reset.sql"));
+    }
+
+    // The checkpoint revision is committed in the same serializable
+    // transaction as the correction and all rebuilt projections. Once it is
+    // present, an apply replay has nothing to recover or compare. Return
+    // before copying and evaluating the all-history SQLite source: doing that
+    // work again can consume gigabytes of PostgreSQL temporary space even
+    // though the eventual candidate set is empty.
+    if (correctionMode === "apply" && !reset) {
+      const appliedRevision = runPsql(
+        ["-v", `tenant_external_id=${tenant}`, "-v", `import_source=${source}`, "-At"],
+        "SELECT COALESCE((SELECT correction_revision FROM cpamp_import_checkpoints WHERE tenant_external_id = :'tenant_external_id' AND source = :'import_source'), '');\n",
+        "capture",
+      );
+      if (appliedRevision === correctionRevision) {
+        process.stdout.write(`correction_revision=${correctionRevision} corrected_events=0 replay=unchanged\n`);
+        return;
+      }
     }
 
     const watermarkText = runPsql(

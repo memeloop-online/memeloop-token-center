@@ -398,7 +398,8 @@ UPDATE session_usage_daily SET requests=999 WHERE tenant_id=:'tenant_id';`,
     CPAMP_CORRECTION_CONFIRM: "CORRECT_CPAMP_IMPORTED_USAGE",
   });
   assert.equal(secondCorrection.status, 0, `second correction failed: ${secondCorrection.stderr}`);
-  assert.match(secondCorrection.stdout, /\b0\b/);
+  assert.match(secondCorrection.stdout, /correction_revision=cpamp-cache-pricing-v2 corrected_events=0 replay=unchanged/);
+  assert.doesNotMatch(secondCorrection.stderr, /CPAMP staged=/, "second correction restaged the all-history source");
   assert.doesNotMatch(secondCorrection.stdout, /total_imported_events/, "second correction unexpectedly ran ordinary replay");
   assert.equal(psql("SELECT count(*) FROM cpamp_import_correction_audit WHERE tenant_id=:'tenant_id' AND source=:'source';", { tenant_id: pricingTenantId, source: pricingSource }), "3");
   assert.equal(psql(`SELECT
