@@ -32,10 +32,10 @@ test('importer bundles execute as native ESM without dynamic CommonJS bridges', 
   assert.match(dockerfile, /import-cpa-key-policy/);
   assert.match(dockerfile, /import-cpa-model-routes/);
   const policyJob = read('ops/kubernetes/legacy-key-policy-import-job.yaml');
-  for (const needle of ['import-mode: dry-run','memeloop-token-center-importer@sha256:REPLACE_DIGEST','automountServiceAccountToken: false','readOnlyRootFilesystem: true','runAsUser: 10001','chmod 0600 /runtime/policy.json','REPLACE_SOURCE_POLICY_SHA256','REPLACE_MAPPING_SHA256','REPLACE_ROUTE_INVENTORY_SHA256','REPLACE_POLICY_IMPORT_CHECKPOINT_PVC']) assert.ok(policyJob.includes(needle));
+  for (const needle of ['import-mode: dry-run','namespace: REPLACE_TARGET_NAMESPACE','memeloop-token-center-importer@sha256:REPLACE_DIGEST','automountServiceAccountToken: false','readOnlyRootFilesystem: true','runAsUser: 10001','chmod 0600 /runtime/policy.json','REPLACE_SOURCE_POLICY_SHA256','REPLACE_MAPPING_SHA256','REPLACE_ROUTE_INVENTORY_SHA256','REPLACE_POLICY_IMPORT_CHECKPOINT_PVC']) assert.ok(policyJob.includes(needle));
   assert.doesNotMatch(policyJob, /^\s*-\s*--apply\s*$/m);
   const routeJob = read('ops/kubernetes/legacy-route-import-job.yaml');
-  for (const needle of ['import-mode: dry-run','memeloop-token-center-importer@sha256:REPLACE_DIGEST','automountServiceAccountToken: false','readOnlyRootFilesystem: true','runAsUser: 10001','chmod 0600 /runtime/source-inventory.json','REPLACE_SOURCE_INVENTORY_SHA256','REPLACE_UPSTREAM_INVENTORY_SHA256','REPLACE_REVIEWED_MANIFEST_SHA256','REPLACE_ROUTE_IMPORT_CHECKPOINT_PVC']) assert.ok(routeJob.includes(needle));
+  for (const needle of ['import-mode: dry-run','namespace: REPLACE_TARGET_NAMESPACE','memeloop-token-center-importer@sha256:REPLACE_DIGEST','automountServiceAccountToken: false','readOnlyRootFilesystem: true','runAsUser: 10001','chmod 0600 /runtime/source-inventory.json','REPLACE_SOURCE_INVENTORY_SHA256','REPLACE_UPSTREAM_INVENTORY_SHA256','REPLACE_REVIEWED_MANIFEST_SHA256','REPLACE_ROUTE_IMPORT_CHECKPOINT_PVC']) assert.ok(routeJob.includes(needle));
   assert.doesNotMatch(routeJob, /^\s*-\s*--apply\s*$/m);
 });
 
@@ -109,7 +109,7 @@ test('importer image and migration Jobs are hardened and contain only production
     const jobs = ['ops/kubernetes/legacy-credential-import-job.yaml','ops/kubernetes/cpamp-import-job.yaml'];
     for (const path of jobs) {
       const job = read(path);
-      for (const needle of ['memeloop-token-center-importer@sha256:REPLACE_DIGEST','automountServiceAccountToken: false','name: REPLACE_IMAGE_PULL_SECRET','readOnlyRootFilesystem: true','allowPrivilegeEscalation: false','runAsUser: 10001','fsGroup: 10001','name: PGPASSFILE','initContainers:','name: prepare-database-credentials','chmod 0600 /credentials/pgpass','"10001:10001:600"','medium: Memory']) assert.ok(job.includes(needle), `${path} lacks ${needle}`);
+      for (const needle of ['REPLACE_TENANT_EXTERNAL_ID','memeloop-token-center-importer@sha256:REPLACE_DIGEST','automountServiceAccountToken: false','name: REPLACE_IMAGE_PULL_SECRET','readOnlyRootFilesystem: true','allowPrivilegeEscalation: false','runAsUser: 10001','fsGroup: 10001','name: PGPASSFILE','initContainers:','name: prepare-database-credentials','chmod 0600 /credentials/pgpass','"10001:10001:600"','medium: Memory']) assert.ok(job.includes(needle), `${path} lacks ${needle}`);
       assert.doesNotMatch(job, /^\s*-\s*name:\s*PGPASSWORD\s*$/m); assert.doesNotMatch(job, /memeloop_token_center_dogfood/);
     }
     assert.doesNotMatch(read(jobs[1]!), /image:\s+\S+@sha256:[0-9a-f]{64}/);

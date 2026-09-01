@@ -23,6 +23,13 @@ All four input files, including the service token, must be regular files with on
 
 Every manifest item repeats the complete source pattern (`provider`, `model`, nullable `group`, nullable `upstream_prefix`, `protocol`) and the exact target candidate bindings, public model, upstream model, protocol, priority, and expected existing state. Target protocol must equal source protocol. For v2, the manifest candidate set must equal the corresponding upstream-inventory set in full; order does not affect the normalized intent digest. Unknown fields, duplicate mappings/candidates, duplicate route choices, stale or disabled upstream bindings, incomplete provider pools, model/protocol mismatch, priority outside `[-1000000,1000000]`, missing source mappings, and provider expansion all fail closed.
 
+The Job template also requires an explicit `REPLACE_TARGET_NAMESPACE`. It must
+be the namespace that owns the same database, key pepper and control Service
+named by the reviewed manifest. Never infer it from a historical production or
+trial name: during the current migration the accepted target is
+`memeloop-token-center-api2-trial`, not the older
+`memeloop-token-center`/`memeloop-token-center-dev` data planes.
+
 The known malformed legacy shape `{provider: codex, model: classify:csil, group: gpt-5.6-sol}` must remain in `anomalies`; it is never converted into a route. A v2 manifest may proceed only with an explicit `quarantine_unmapped` acknowledgement that pins the normalized anomaly-list SHA-256, exact count, and a separate owner-review evidence SHA-256. An absent acknowledgement, changed reason, new/unknown anomaly, count/digest drift, or any other disposition blocks dry-run and apply. Reports retain both `anomaly_count` and `quarantined_anomaly_count`; quarantine is auditable non-mutation, not silent ignore or permission expansion. Version 1 deliberately has no acknowledgement mechanism and remains blocked by any anomaly.
 
 Copilot and Cursor belong in `reauthorization_required`. That worklist is report-only and does not start OAuth. It does not block creation of otherwise fully reviewed routes, but any nonzero count means end-user continuity is still incomplete and production replacement remains blocked.

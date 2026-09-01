@@ -5,7 +5,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: memeloop-token-center-session-archive-import
-  namespace: memeloop-token-center-dev
+  namespace: REPLACE_TARGET_NAMESPACE
   labels:
     app.kubernetes.io/name: memeloop-token-center-session-archive-import
     app.kubernetes.io/component: migration
@@ -45,7 +45,7 @@ spec:
             - --max-plan-bytes
             - "1073741824"
             - --tenant-external-id
-            - cpa-dogfood-import
+            - REPLACE_TENANT_EXTERNAL_ID
             - --cpamp-source
             - REPLACE_CPAMP_IMPORT_SOURCE
             - --archive-source
@@ -65,7 +65,7 @@ spec:
             - name: MTC_S3_REGION
               value: us-east-1
             - name: MTC_S3_ENDPOINT
-              value: http://minio.memeloop-token-center-dev.svc.cluster.local:9000
+              value: REPLACE_TARGET_S3_ENDPOINT
             - name: MTC_S3_ALLOW_HTTP
               value: "true"
             - name: MTC_S3_ACCESS_KEY
@@ -122,7 +122,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: memeloop-token-center-session-archive-import-default-deny
-  namespace: memeloop-token-center-dev
+  namespace: REPLACE_TARGET_NAMESPACE
 spec:
   podSelector:
     matchLabels:
@@ -138,7 +138,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: memeloop-token-center-session-archive-import-egress
-  namespace: memeloop-token-center-dev
+  namespace: REPLACE_TARGET_NAMESPACE
 spec:
   podSelector:
     matchLabels:
@@ -162,17 +162,17 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: memeloop-token-center-dev
+              kubernetes.io/metadata.name: REPLACE_TARGET_NAMESPACE
           podSelector:
             matchLabels:
-              cnpg.io/cluster: memeloop-token-center-pg
+              cnpg.io/cluster: REPLACE_TARGET_CNPG_CLUSTER
       ports:
         - protocol: TCP
           port: 5432
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: memeloop-token-center-dev
+              kubernetes.io/metadata.name: REPLACE_TARGET_NAMESPACE
           podSelector:
             matchLabels:
               app.kubernetes.io/name: minio

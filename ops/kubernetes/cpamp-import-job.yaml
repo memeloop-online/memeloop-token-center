@@ -76,7 +76,7 @@ spec:
             - name: CPAMP_SQLITE_PATH
               value: /source/usage.sqlite
             - name: IMPORT_TENANT_EXTERNAL_ID
-              value: cpa-dogfood-import
+              value: REPLACE_TENANT_EXTERNAL_ID
             - name: CPAMP_OVERLAP_MS
               value: "86400000"
             - name: CPAMP_IMPORT_SOURCE

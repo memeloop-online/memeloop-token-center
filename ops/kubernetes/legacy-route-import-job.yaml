@@ -8,7 +8,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: memeloop-token-center-legacy-route-import
-  namespace: memeloop-token-center
+  namespace: REPLACE_TARGET_NAMESPACE
   labels:
     app.kubernetes.io/name: memeloop-token-center-legacy-route-import
     app.kubernetes.io/component: migration
