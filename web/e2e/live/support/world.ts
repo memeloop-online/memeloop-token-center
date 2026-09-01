@@ -92,17 +92,17 @@ export class LiveWorld extends World {
     return this.requirePage().goto(new URL(path, base).toString(), { waitUntil: 'domcontentloaded' });
   }
 
-  async navigateExpectingClientError(base: URL, path: string, expectedStatus: number): Promise<Response> {
+  async navigateExpectingClientError(base: URL, path: string, expectedStatus: number): Promise<void> {
     const requestedURL = new URL(path, base).href;
-    const response = await this.navigate(base, path);
-    assert.ok(response, 'expected client-error navigation returned no HTTP response');
+    this.activeOrigin = base.origin;
+    const value = await fetch(requestedURL, { method: 'GET', redirect: 'manual' });
+    const response = { url: value.url, status: value.status };
     this.expectedClientErrorNavigations.verify(
       requestedURL,
       expectedStatus,
-      response.url(),
-      response.status(),
+      response.url,
+      response.status,
     );
-    return response;
   }
 
   async assertProviderSecretAbsent(expectedAPIPaths: readonly string[] = []): Promise<void> {

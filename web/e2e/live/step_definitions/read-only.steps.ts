@@ -9,9 +9,10 @@ When('只读验收以中文暗色主题连接操作台', async function (this: L
   const page = this.requirePage();
   const configuration = liveRuntime.requireConfiguration();
   await this.open(configuration.controlURL, '/operator', 'zh-CN', 'dark');
-  await page.getByLabel('服务凭据', { exact: true }).fill(configuration.serviceCredential);
+  await page.getByPlaceholder('mts_… 服务凭据', { exact: true }).fill(configuration.serviceCredential);
   await page.getByRole('button', { name: '连接', exact: true }).click();
   await openAppRoute(page, 'operator', 'usage');
+  await page.locator('.usage-filter-disclosure > summary').click();
   await page.getByRole('button', { name: '最近 30 天', exact: true }).click();
   await expectUsageLoaded(page);
 });

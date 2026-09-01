@@ -39,6 +39,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
   const [health, setHealth] = useState<Record<string, UpstreamHealth>>({});
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [showDisabled, setShowDisabled] = useState(false);
   const providerGroups = useGroups('provider', token, tenant);
   const directProviders = providers.filter(supportsDirectConnection);
   const provider = directProviders.find((value) => value.id === driver) ?? directProviders[0];
@@ -90,8 +91,12 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
   };
   useEffect(() => {
     setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined);
-    setBusy(''); setHealth({}); setMessage(''); setError('');
+    setBusy(''); setHealth({}); setMessage(''); setError(''); setShowDisabled(false);
   }, [token, tenant]);
+
+  const activeValues = values.filter((value) => value.status === 'active');
+  const disabledValues = values.filter((value) => value.status !== 'active');
+  const visibleValues = showDisabled ? [...activeValues, ...disabledValues] : activeValues;
 
   const canManage = (value: UpstreamAccount) => Boolean(tenant) && (!value.tenant_external_id || value.tenant_external_id === tenant);
 
@@ -127,6 +132,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
     setBusy(`status-${value.id}`); setError(''); setMessage('');
     try {
       await api(`/internal/v1/upstreams/${value.id}`, token, { method: 'PATCH', body: JSON.stringify({ tenant_external_id: tenant, status, expected_updated_at: value.updated_at }) });
+      if (status === 'disabled') setShowDisabled(true);
       setHealth((current) => { const next = { ...current }; delete next[value.id]; return next; });
       setMessage(t(status === 'active' ? 'providers.enabled' : 'providers.disabled', { name: value.name }));
       await onChanged();
@@ -158,9 +164,9 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
   }
 
   return <><WriteScopeNotice tenant={tenant} /><section className="provider-layout">
-    <article className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><span>{formatNumber(values.length, locale)}</span></div>
+    <article className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><div className="provider-list-actions"><span>{t('providers.activeCount', { active: formatNumber(activeValues.length, locale), total: formatNumber(values.length, locale) })}</span>{disabledValues.length > 0 && <button type="button" className="secondary" aria-expanded={showDisabled} onClick={() => setShowDisabled((current) => !current)}>{showDisabled ? t('providers.hideDisabled') : t('providers.showDisabled', { count: formatNumber(disabledValues.length, locale) })}</button>}</div></div>
       {error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}
-      <div className="account-list">{values.length === 0 && <div className="empty">{t('providers.empty')}</div>}{values.map((value) => {
+      <div className="account-list">{visibleValues.length === 0 && <div className="empty">{values.length === 0 ? t('providers.empty') : t('providers.noActive')}</div>}{visibleValues.map((value) => {
         const currentHealth = value.status === 'active' ? health[value.id] : undefined;
         const manageable = canManage(value);
         const memberships = providerGroups.groups.filter((group) => group.member_ids.includes(value.id));

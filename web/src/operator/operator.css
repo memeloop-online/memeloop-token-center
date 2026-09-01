@@ -62,7 +62,23 @@
   align-items: start;
   display: grid;
   gap: 18px;
-  grid-template-columns: minmax(360px, .95fr) minmax(420px, 1.05fr);
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.provider-list-actions {
+  align-items: flex-end;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.provider-list-actions button {
+  font-size: 11px;
+  padding: 7px 10px;
+}
+
+@media (width >= 1400px) {
+  .provider-list .account-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 .provider-list .panel-title,
