@@ -35,7 +35,7 @@ test('plugin installer image is patched, pinned, and non-root', (context) => {
     assert.equal(run('docker', ['image', 'inspect', '--format', '{{.Config.User}}', image]).trim(), '10001:10001');
     assert.equal(run('docker', ['image', 'inspect', '--format', '{{json .Config.Entrypoint}}', image]).trim(), '["/usr/local/bin/install-plugin-oci"]');
     const version = JSON.parse(run('docker', ['run', '--rm', '--entrypoint', '/usr/local/bin/cosign', image, 'version', '--json'])) as { gitVersion?: string; goVersion?: string };
-    assert.equal(version.gitVersion, 'v3.1.3-mtc.1');
+    assert.equal(version.gitVersion, 'v3.1.3-mtc.2');
     assert.equal(version.goVersion, 'go1.26.7');
     run('docker', ['run', '--rm', image, '--help']);
   } finally {

@@ -64,7 +64,9 @@ Cosign had no release newer than 3.1.3 when checked on 2026-08-24. Its annotated
 source archive SHA-256
 `3a718446bac51466efff6853639e1ca108b456ecbf07cd92938f548715d22d6b`, applies
 the checked-in `packaging/cosign/v3.1.3-security.patch`, verifies `go.sum`, and
-builds `v3.1.3-mtc.1` with fixed Go 1.26.7. The locally used official Go archive
+builds `v3.1.3-mtc.2` with fixed Go 1.26.7. The backport now includes
+`google.golang.org/grpc` 1.83.1, which fixes CVE-2026-84304 detected by the
+exact-digest release scan on 2026-09-02. The locally used official Go archive
 matched SHA-256
 `ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca`.
 The patch moves only the related Go dependency family and gRPC to versions
