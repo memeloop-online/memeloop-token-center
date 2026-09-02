@@ -36,6 +36,10 @@ pub struct Config {
     pub listen: String,
     pub database_url: String,
     pub database_max_connections: u32,
+    /// Maximum complete proxy lifecycles retained by one gateway process.
+    /// Service saturation is distinct from a credential policy limit and is
+    /// reported as HTTP 503, never as a per-key 429.
+    pub proxy_lifecycle_concurrency: u32,
     pub run_migrations_on_start: bool,
     pub key_pepper: String,
     pub service_token: String,
@@ -71,6 +75,10 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("database_url", &"[redacted]")
             .field("database_max_connections", &self.database_max_connections)
+            .field(
+                "proxy_lifecycle_concurrency",
+                &self.proxy_lifecycle_concurrency,
+            )
             .field("run_migrations_on_start", &self.run_migrations_on_start)
             .field("key_pepper", &"[redacted]")
             .field("service_token", &"[redacted]")
@@ -171,6 +179,8 @@ impl Config {
                 "postgres://postgres:postgres@127.0.0.1:5432/memeloop_token_center",
             ),
             database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
+            proxy_lifecycle_concurrency: env_u32("MTC_PROXY_LIFECYCLE_CONCURRENCY", 64)?
+                .clamp(1, 4_096),
             run_migrations_on_start: env_bool("MTC_RUN_MIGRATIONS_ON_START", true),
             key_pepper,
             service_token,
@@ -207,6 +217,7 @@ impl Config {
             listen: "127.0.0.1:0".to_owned(),
             database_url: required("MTC_DATABASE_URL")?,
             database_max_connections: 2,
+            proxy_lifecycle_concurrency: 1,
             run_migrations_on_start: false,
             key_pepper: "unused-by-session-archive-importer".to_owned(),
             service_token: "unused-by-session-archive-importer".to_owned(),
@@ -237,6 +248,7 @@ impl Config {
             listen: "127.0.0.1:0".to_owned(),
             database_url,
             database_max_connections: 8,
+            proxy_lifecycle_concurrency: 64,
             run_migrations_on_start: true,
             key_pepper: "test-pepper-must-have-at-least-32-bytes".to_owned(),
             service_token: "test-service-token".to_owned(),

@@ -263,28 +263,18 @@ pub(crate) async fn lock_key_budget_state(
     now: i64,
 ) -> Result<(i64, i64), AppError> {
     let key_id = key_id.to_string();
-    sqlx::query(
-        "INSERT INTO key_budget_state (key_id, settled_lifetime_micros, reserved_micros, updated_at) SELECT $1, 0, 0, $2 WHERE EXISTS (SELECT 1 FROM key_records WHERE id = $3) ON CONFLICT(key_id) DO NOTHING",
+    let row = sqlx::query(
+        "UPDATE key_budget_state SET updated_at = $1 WHERE key_id = $2 RETURNING settled_lifetime_micros, reserved_micros",
     )
-    .bind(&key_id)
-    .bind(now)
-    .bind(&key_id)
-    .execute(&mut **tx)
-    .await?;
-    let locked = sqlx::query("UPDATE key_budget_state SET updated_at = $1 WHERE key_id = $2")
         .bind(now)
         .bind(&key_id)
-        .execute(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await?;
-    if locked.rows_affected() != 1 {
-        return Err(AppError::NotFound);
-    }
-    let row = sqlx::query(
-        "SELECT settled_lifetime_micros, reserved_micros FROM key_budget_state WHERE key_id = $1",
-    )
-    .bind(key_id)
-    .fetch_one(&mut **tx)
-    .await?;
+    // Key creation and the budget-rollup migration establish this row as one
+    // invariant. Fail closed if it is absent. A speculative INSERT on every
+    // request makes PostgreSQL wait on a concurrent updater merely to prove
+    // the existing unique-index entry conflicts.
+    let row = row.ok_or(AppError::NotFound)?;
     Ok((
         row.try_get("settled_lifetime_micros")?,
         row.try_get("reserved_micros")?,

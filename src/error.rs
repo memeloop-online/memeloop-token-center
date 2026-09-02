@@ -69,6 +69,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("configured upstream is unavailable: {0}")]
     Upstream(String),
+    #[error("service is temporarily overloaded")]
+    Overloaded,
     #[error("storage error: {0}")]
     Storage(String),
     #[error("internal error")]
@@ -112,6 +114,11 @@ impl IntoResponse for AppError {
                 "upstream_error",
                 "configured upstream is unavailable".to_owned(),
             ),
+            Self::Overloaded => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_overloaded",
+                self.to_string(),
+            ),
             Self::Storage(_) | Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -138,10 +145,15 @@ impl IntoResponse for AppError {
         if let Self::LimitExceeded {
             retry_after_seconds: Some(seconds),
             ..
-        } = self
-            && let Ok(value) = HeaderValue::from_str(&seconds.max(1).to_string())
+        } = &self
+            && let Ok(value) = HeaderValue::from_str(&(*seconds).max(1).to_string())
         {
             response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        if matches!(&self, Self::Overloaded) {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
         response
     }
@@ -256,6 +268,19 @@ mod tests {
         assert_eq!(body["error"]["code"], "insufficient_quota");
         assert_eq!(body["error"]["reason"], "lifetime_budget_exhausted");
         assert_eq!(body["error"]["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn service_capacity_is_not_reported_as_a_key_rate_limit() {
+        let response = AppError::Overloaded.into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "service_overloaded");
+        assert!(body["error"].get("reason").is_none());
     }
 
     #[test]

@@ -4,11 +4,12 @@ use memeloop_token_center::{
         ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingState, BeginArchiveStagingInput,
         BeginArchiveStagingResult,
     },
+    conversation::{ConversationHints, extract_atoms},
     db::{
         CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput, Database,
         FinishProxyRequest, FinishProxyRequestResult, FinishSynchronousImageRequest,
-        FinishSynchronousImageResult, StartProxyRequest, StartSynchronousImageRequest,
-        StartSynchronousImageResult, StatsFilter, unix_millis,
+        FinishSynchronousImageResult, ProxyConversationInput, StartProxyRequest,
+        StartSynchronousImageRequest, StartSynchronousImageResult, StatsFilter, unix_millis,
     },
     model::{ArchivedGenerationAsset, KeyPolicy, TokenUsage},
     provider::UpstreamCredential,
@@ -136,6 +137,304 @@ async fn postgres_pending_proxy_failover_assignment_is_tenant_scoped_and_idempot
     .await
     .unwrap();
     assert_eq!(row, (accounts[1].to_string(), routes[1].to_string()));
+}
+
+#[tokio::test]
+async fn postgres_proxy_conversation_finish_lock_does_not_block_same_key_admission() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
+    let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+    database.migrate().await.unwrap();
+    let inspection = PgPool::connect(&database_url).await.unwrap();
+    let unique = Uuid::now_v7();
+    let model = format!("proxy-admission-lock-{unique}");
+    let pepper = b"postgres proxy admission lock pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("proxy-admission-lock-{unique}"),
+                principal_external_id: "member".to_owned(),
+                alias: "proxy-admission-lock".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    requests_per_minute: 100_000,
+                    tokens_per_minute: 100_000,
+                    max_concurrency: 8,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+
+    let request_a = Uuid::now_v7();
+    let reservation_a = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: request_a,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 100,
+            output_token_ceiling: 100,
+            protocol: "openai",
+            model: &model,
+            request_object: "objects/blake3/postgres-admission-lock-request-a",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    // Cross both PostgreSQL/SQLite-safe insert batch boundaries while keeping
+    // every semantic atom unique to this test tenant.
+    let messages = (0..151)
+        .map(|index| {
+            serde_json::json!({
+                "role": "user",
+                "content": format!("admission-lock-{unique}-{index}"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let request_json = serde_json::json!({"model": model, "messages": messages});
+    let target_atom = extract_atoms(&request_json)
+        .into_iter()
+        .next()
+        .expect("the request must materialize one semantic atom");
+    sqlx::query(
+        "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(&target_atom.content_hash)
+    .bind(&target_atom.instance_hash)
+    .bind(&target_atom.role)
+    .bind(&target_atom.kind)
+    .bind(serde_json::to_string(&target_atom.content).unwrap())
+    .bind(unix_millis())
+    .execute(&inspection)
+    .await
+    .unwrap();
+
+    // Deleting the conflicting unique-key row without committing makes PostgreSQL's
+    // `INSERT .. ON CONFLICT DO NOTHING` wait for this transaction's outcome.
+    let mut blocker = inspection.begin().await.unwrap();
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let deleted =
+        sqlx::query("DELETE FROM semantic_atoms WHERE tenant_id = $1 AND content_hash = $2")
+            .bind(key.tenant_id.to_string())
+            .bind(&target_atom.content_hash)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+    assert_eq!(deleted.rows_affected(), 1);
+
+    let finish_a_database = database.clone();
+    let finish_a_key = key.clone();
+    let finish_a_reservation = reservation_a.clone();
+    let finish_a_request_json = request_json.clone();
+    let mut finish_a = tokio::spawn(async move {
+        let hints = ConversationHints {
+            session_id: Some(format!("admission-lock-{unique}")),
+            ..ConversationHints::default()
+        };
+        finish_a_database
+            .finish_proxy_request(FinishProxyRequest {
+                request_id: request_a,
+                tenant_id: finish_a_key.tenant_id,
+                reservation: &finish_a_reservation,
+                input_token_ceiling: 100,
+                output_token_ceiling: 100,
+                requested_service_tier: None,
+                status_code: 200,
+                duration_ms: 1,
+                usage: TokenUsage {
+                    input_tokens: 11,
+                    output_tokens: 7,
+                    ..TokenUsage::default()
+                },
+                charge_contract_ceiling: false,
+                error_code: None,
+                response_object: "objects/blake3/postgres-admission-lock-response-a",
+                conversation: Some(ProxyConversationInput {
+                    key: &finish_a_key,
+                    request_json: &finish_a_request_json,
+                    hints: &hints,
+                    client_name: Some("codex"),
+                    upstream_response_id: Some("resp-postgres-admission-lock-a"),
+                }),
+            })
+            .await
+    });
+
+    let blocked_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(pid) = sqlx::query_scalar::<_, i32>(
+                "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND backend_type = 'client backend' AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO semantic_atoms%' AND $1 = ANY(pg_blocking_pids(pid)) ORDER BY query_start DESC LIMIT 1",
+            )
+            .bind(blocker_pid)
+            .fetch_optional(&inspection)
+            .await
+            .unwrap()
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let blocked_pid = match blocked_pid {
+        Ok(pid) => pid,
+        Err(_) => {
+            blocker.rollback().await.unwrap();
+            let finish_result =
+                tokio::time::timeout(std::time::Duration::from_secs(30), &mut finish_a).await;
+            if finish_result.is_err() {
+                finish_a.abort();
+                let _ = finish_a.await;
+            }
+            panic!("finish A never reached the semantic INSERT lock wait: {finish_result:?}");
+        }
+    };
+    assert!(blocked_pid > 0);
+
+    let request_b = Uuid::now_v7();
+    // Keep the semantic-row blocker open for this entire admission gate. The two-second
+    // wait-detection budget plus this five-second admission gate remains below the
+    // production 10-second PostgreSQL lock_timeout: the old lock order cannot pass by
+    // merely timing out its lock.
+    let started_b = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        database.start_proxy_request(StartProxyRequest {
+            request_id: request_b,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 100,
+            output_token_ceiling: 100,
+            protocol: "openai",
+            model: &model,
+            request_object: "objects/blake3/postgres-admission-lock-request-b",
+            upstream_account_id: None,
+            model_route_id: None,
+        }),
+    )
+    .await;
+
+    // Always release the blocker before interpreting B's result so a regression fails
+    // promptly instead of leaving the spawned finish waiting on test teardown.
+    blocker.rollback().await.unwrap();
+    let finish_a_result =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), &mut finish_a).await {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => {
+                finish_a.abort();
+                let _ = finish_a.await;
+                panic!("finish A must resume after the semantic row blocker is released");
+            }
+        };
+    assert_eq!(
+        finish_a_result,
+        FinishProxyRequestResult::Finished {
+            cost_micros: 18,
+            usage_invalid: false,
+        }
+    );
+    let materialized: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id = $1), (SELECT COUNT(*) FROM context_nodes WHERE tenant_id = $2)",
+    )
+    .bind(key.tenant_id.to_string())
+    .bind(key.tenant_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(materialized, (151, 151));
+    let reservation_b = started_b
+        .expect("same-key request B admission must complete within five seconds")
+        .unwrap();
+
+    let finish_b_result = database
+        .finish_proxy_request(FinishProxyRequest {
+            request_id: request_b,
+            tenant_id: key.tenant_id,
+            reservation: &reservation_b,
+            input_token_ceiling: 100,
+            output_token_ceiling: 100,
+            requested_service_tier: None,
+            status_code: 200,
+            duration_ms: 1,
+            usage: TokenUsage {
+                input_tokens: 5,
+                output_tokens: 3,
+                ..TokenUsage::default()
+            },
+            charge_contract_ceiling: false,
+            error_code: None,
+            response_object: "objects/blake3/postgres-admission-lock-response-b",
+            conversation: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        finish_b_result,
+        FinishProxyRequestResult::Finished {
+            cost_micros: 8,
+            usage_invalid: false,
+        }
+    );
+
+    for (reservation_id, expected_cost) in [(reservation_a.id, 18_i64), (reservation_b.id, 8)] {
+        let reservation_row: (String, Option<i64>) =
+            sqlx::query_as("SELECT status, actual_micros FROM usage_reservations WHERE id = $1")
+                .bind(reservation_id.to_string())
+                .fetch_one(&inspection)
+                .await
+                .unwrap();
+        assert_eq!(reservation_row, ("settled".to_owned(), Some(expected_cost)));
+        let ledger: (i64, Option<i64>) = sqlx::query_as(
+            "SELECT COUNT(*), SUM(amount_micros)::BIGINT FROM ledger_entries WHERE source = $1",
+        )
+        .bind(reservation_id.to_string())
+        .fetch_one(&inspection)
+        .await
+        .unwrap();
+        assert_eq!(ledger, (1, Some(-expected_cost)));
+    }
+    let account: (i64, i64) = sqlx::query_as(
+        "SELECT available_micros, reserved_micros FROM credit_accounts WHERE id = $1",
+    )
+    .bind(issued.account_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(account, (10_000_000 - 26, 0));
+    let budget: (i64, i64) = sqlx::query_as(
+        "SELECT settled_lifetime_micros, reserved_micros FROM key_budget_state WHERE key_id = $1",
+    )
+    .bind(key.key_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(budget, (26, 0));
+    let active_reservations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1 AND status = 'reserved'",
+    )
+    .bind(key.key_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(active_reservations, 0);
 }
 
 #[tokio::test]

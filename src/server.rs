@@ -19,11 +19,14 @@ use tokio::{
     task::JoinSet,
 };
 
-const MAX_CONNECTIONS: usize = 256;
-const MAX_CONNECTIONS_PER_IP: usize = 32;
+const MAX_CONNECTIONS: usize = 2_048;
+// Behind the cluster ingress, many independent clients share one socket peer.
+// Credential policy and ingress protections remain authoritative; this limit
+// is only a final per-process connection safety bound.
+const MAX_CONNECTIONS_PER_IP: usize = 512;
 const MAX_HTTP1_HEADERS: usize = 64;
 const MAX_HTTP1_BUFFER_BYTES: usize = 64 * 1024;
-const MAX_HTTP2_CONCURRENT_STREAMS: u32 = 32;
+const MAX_HTTP2_CONCURRENT_STREAMS: u32 = 256;
 const MAX_HTTP2_HEADER_LIST_BYTES: u32 = 64 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 

@@ -837,7 +837,7 @@ async fn successful_stream_is_never_replayed_after_downstream_delivery_can_start
 }
 
 #[tokio::test]
-async fn exhausted_proxy_lifecycle_budget_rejects_before_upstream_or_reservation() {
+async fn exhausted_proxy_lifecycle_capacity_reports_overload_before_side_effects() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -860,7 +860,8 @@ async fn exhausted_proxy_lifecycle_budget_rejects_before_upstream_or_reservation
         &json!({"model": fixture.model.clone(), "input": "probe", "stream": true}),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
     assert!(
         fixture
             .state

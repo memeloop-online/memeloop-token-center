@@ -196,7 +196,7 @@ function check(name: string, actual: unknown, operator: string, expected: unknow
 function writeReport(output: string, report: Obj): void { mkdirSync(dirname(output), { recursive: true }); writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`); }
 
 function validateArguments(args: Arguments, values: Obj): number {
-  if (values.concurrency < 1 || values.concurrency > 16) throw new PrerequisiteFailure("concurrency must be between 1 and the gateway cap of 16");
+  if (values.concurrency < 1 || values.concurrency > 64) throw new PrerequisiteFailure("concurrency must be between 1 and the default per-gateway lifecycle capacity of 64");
   if (values.asset_mib < 100 || values.asset_mib > 500) throw new PrerequisiteFailure("asset-mib must be in the MM-05 acceptance range 100..500");
   if (values.soak_seconds < 1) throw new PrerequisiteFailure("soak-seconds must be positive"); if (values.stream_mib < 1) throw new PrerequisiteFailure("stream-mib must be positive");
   if (args.profile === "acceptance" && (values.asset_mib !== 500 || values.soak_seconds < 900 || values.concurrency < 12 || values.stream_mib < 16)) throw new PrerequisiteFailure("acceptance profile requires a 500 MiB asset, at least a 900 second soak, at least 12 concurrent streams, and at least 16 MiB per stream");

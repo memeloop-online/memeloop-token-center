@@ -41,6 +41,8 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
       key: {{ .Values.config.databaseUrlSecret.key }}
 - name: MTC_DATABASE_MAX_CONNECTIONS
   value: {{ .Values.config.databaseMaxConnections | quote }}
+- name: MTC_PROXY_LIFECYCLE_CONCURRENCY
+  value: {{ .Values.config.proxyLifecycleConcurrency | quote }}
 - name: MTC_KEY_PEPPER
   valueFrom:
     secretKeyRef:

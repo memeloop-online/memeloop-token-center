@@ -114,6 +114,9 @@ roles:
 config:
   # Keep the sum across replicas below the PostgreSQL/PgBouncer connection budget.
   databaseMaxConnections: 4
+  # Per-gateway active proxy lifecycles. Capacity exhaustion is a service 503;
+  # credential RPM/TPM/concurrency policies remain the only sources of 429.
+  proxyLifecycleConcurrency: 64
   databaseUrlSecret:
     name: memeloop-token-center-secrets
     key: database-url

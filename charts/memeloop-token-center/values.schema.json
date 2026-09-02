@@ -124,6 +124,7 @@
       "additionalProperties": false,
       "required": [
         "databaseMaxConnections",
+        "proxyLifecycleConcurrency",
         "databaseUrlSecret",
         "keyPepperSecret",
         "serviceTokenSecret",
@@ -135,6 +136,7 @@
       ],
       "properties": {
         "databaseMaxConnections": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "proxyLifecycleConcurrency": { "type": "integer", "minimum": 1, "maximum": 4096 },
         "databaseUrlSecret": { "$ref": "#/definitions/secretKeyRef" },
         "keyPepperSecret": { "$ref": "#/definitions/secretKeyRef" },
         "serviceTokenSecret": { "$ref": "#/definitions/secretKeyRef" },

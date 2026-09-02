@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use super::super::*;
 
@@ -9,6 +10,11 @@ use super::super::*;
 // not lose precision when the diagnostic fingerprint is capped.
 const MAX_CONVERSATION_FINGERPRINT_ATOMS: usize = 1_024;
 const MAX_CONVERSATION_FINGERPRINT_JSON_BYTES: usize = 70_000;
+// Stay below SQLite's historical default of 999 bind variables as well as
+// PostgreSQL's much larger protocol limit.
+const CONVERSATION_INSERT_BATCH_BIND_LIMIT: usize = 900;
+const SEMANTIC_ATOM_INSERT_BIND_COUNT: usize = 7;
+const CONTEXT_NODE_INSERT_BIND_COUNT: usize = 6;
 
 #[derive(Clone, Debug)]
 pub struct ConversationListFilter {
@@ -117,35 +123,51 @@ impl Database {
             None
         };
 
-        for atom in &atoms {
-            sqlx::query(
-                "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(tenant_id, content_hash) DO NOTHING",
-            )
-            .bind(key.tenant_id.to_string())
-            .bind(&atom.content_hash)
-            .bind(&atom.instance_hash)
-            .bind(&atom.role)
-            .bind(&atom.kind)
-            .bind(serde_json::to_string(&atom.content).map_err(|_| AppError::Internal)?)
-            .bind(now)
-            .execute(&mut **transaction)
-            .await?;
+        let tenant_id = key.tenant_id.to_string();
+        for atom_batch in
+            atoms.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT)
+        {
+            let statement = conversation_batch_insert_statement(
+                "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ",
+                atom_batch.len(),
+                SEMANTIC_ATOM_INSERT_BIND_COUNT,
+                " ON CONFLICT(tenant_id, content_hash) DO NOTHING",
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
+            for atom in atom_batch {
+                query = query
+                    .bind(&tenant_id)
+                    .bind(&atom.content_hash)
+                    .bind(&atom.instance_hash)
+                    .bind(&atom.role)
+                    .bind(&atom.kind)
+                    .bind(serde_json::to_string(&atom.content).map_err(|_| AppError::Internal)?)
+                    .bind(now);
+            }
+            query.execute(&mut **transaction).await?;
         }
-        for node in &nodes {
-            sqlx::query(
-                "INSERT INTO context_nodes (tenant_id, node_hash, parent_hash, atom_hash, depth, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT(tenant_id, node_hash) DO NOTHING",
-            )
-            .bind(key.tenant_id.to_string())
-            .bind(&node.node_hash)
-            .bind(&node.parent_hash)
-            .bind(&node.atom_hash)
-            .bind(node.depth as i64)
-            .bind(now)
-            .execute(&mut **transaction)
-            .await?;
+        for node_batch in
+            nodes.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / CONTEXT_NODE_INSERT_BIND_COUNT)
+        {
+            let statement = conversation_batch_insert_statement(
+                "INSERT INTO context_nodes (tenant_id, node_hash, parent_hash, atom_hash, depth, created_at) VALUES ",
+                node_batch.len(),
+                CONTEXT_NODE_INSERT_BIND_COUNT,
+                " ON CONFLICT(tenant_id, node_hash) DO NOTHING",
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
+            for node in node_batch {
+                query = query
+                    .bind(&tenant_id)
+                    .bind(&node.node_hash)
+                    .bind(&node.parent_hash)
+                    .bind(&node.atom_hash)
+                    .bind(node.depth as i64)
+                    .bind(now);
+            }
+            query.execute(&mut **transaction).await?;
         }
 
-        let tenant_id = key.tenant_id.to_string();
         let principal_id = key.principal_id.to_string();
         let mut candidates = if hints.parent_turn_id.is_some()
             || hints.turn_id.is_some()
@@ -762,6 +784,40 @@ fn meaningful_atom_overlap(previous: &[String], current: &[String]) -> bool {
     })
 }
 
+fn conversation_batch_insert_statement(
+    prefix: &'static str,
+    row_count: usize,
+    bind_count_per_row: usize,
+    suffix: &'static str,
+) -> String {
+    debug_assert!(row_count > 0);
+    debug_assert!(bind_count_per_row > 0);
+    debug_assert!(row_count * bind_count_per_row <= CONVERSATION_INSERT_BATCH_BIND_LIMIT);
+
+    let mut statement =
+        String::with_capacity(prefix.len() + suffix.len() + row_count * bind_count_per_row * 6);
+    statement.push_str(prefix);
+    let mut bind_index = 1;
+    for row_index in 0..row_count {
+        if row_index > 0 {
+            statement.push(',');
+        }
+        statement.push('(');
+        for column_index in 0..bind_count_per_row {
+            if column_index > 0 {
+                statement.push(',');
+            }
+            // Only monotonically generated placeholders enter the statement;
+            // every persisted value is supplied separately through bind().
+            write!(statement, "${bind_index}").expect("writing to String cannot fail");
+            bind_index += 1;
+        }
+        statement.push(')');
+    }
+    statement.push_str(suffix);
+    statement
+}
+
 fn bounded_atom_hashes(atoms: &[crate::conversation::SemanticAtom]) -> Vec<String> {
     atoms
         .iter()
@@ -824,5 +880,26 @@ mod tests {
             ),
             (RelationKind::Candidate, 350)
         );
+    }
+
+    #[test]
+    fn conversation_batch_insert_uses_ordered_bound_placeholders() {
+        assert_eq!(
+            conversation_batch_insert_statement("VALUES ", 2, 3, " ON CONFLICT DO NOTHING"),
+            "VALUES ($1,$2,$3),($4,$5,$6) ON CONFLICT DO NOTHING"
+        );
+    }
+
+    #[test]
+    fn conversation_insert_batches_stay_below_sqlite_bind_limit() {
+        for bind_count_per_row in [
+            SEMANTIC_ATOM_INSERT_BIND_COUNT,
+            CONTEXT_NODE_INSERT_BIND_COUNT,
+        ] {
+            let rows = CONVERSATION_INSERT_BATCH_BIND_LIMIT / bind_count_per_row;
+            assert!(rows * bind_count_per_row <= CONVERSATION_INSERT_BATCH_BIND_LIMIT);
+            assert!((rows + 1) * bind_count_per_row > CONVERSATION_INSERT_BATCH_BIND_LIMIT);
+            assert!(CONVERSATION_INSERT_BATCH_BIND_LIMIT < 999);
+        }
     }
 }

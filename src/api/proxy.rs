@@ -35,10 +35,7 @@ pub(super) async fn proxy(
         .proxy_lifecycle_permits
         .clone()
         .try_acquire_owned()
-        .map_err(|_| AppError::LimitExceeded {
-            reason: crate::error::LimitReason::ConcurrencyExhausted,
-            retry_after_seconds: Some(1),
-        })?;
+        .map_err(|_| AppError::Overloaded)?;
     let request_id = Uuid::now_v7();
     let original_request_json: Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;

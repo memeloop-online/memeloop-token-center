@@ -41,10 +41,9 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // matching the read timeout to the overall deadline does not make it unbounded.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(21 * 60);
-const PROXY_LIFECYCLE_CONCURRENCY: usize = 16;
 // Each streaming response archive owns a 5 MiB multipart buffer. Keep the
 // upstream/request concurrency independent, but bound simultaneous archive
-// writers so one gateway cannot multiply that buffer by all 16 lifecycles.
+// writers so one gateway cannot multiply that buffer by all active lifecycles.
 const PROXY_ARCHIVE_STREAM_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
@@ -75,6 +74,7 @@ pub enum InitializationError {
 
 impl AppState {
     pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
+        let proxy_lifecycle_concurrency = config.proxy_lifecycle_concurrency as usize;
         if config.run_migrations_on_start {
             let migration_db = Database::connect_for_migration(
                 &config.database_url,
@@ -114,7 +114,7 @@ impl AppState {
             metrics: metrics::Metrics::default(),
             request_event_streams: request_event_stream::RequestEventStreamLimiter::default(),
             proxy_lifecycle_permits: Arc::new(tokio::sync::Semaphore::new(
-                PROXY_LIFECYCLE_CONCURRENCY,
+                proxy_lifecycle_concurrency,
             )),
             proxy_archive_stream_permits: Arc::new(tokio::sync::Semaphore::new(
                 PROXY_ARCHIVE_STREAM_CONCURRENCY,
