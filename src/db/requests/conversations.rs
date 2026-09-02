@@ -892,6 +892,7 @@ mod tests {
 
     #[test]
     fn conversation_insert_batches_stay_below_sqlite_bind_limit() {
+        const { assert!(CONVERSATION_INSERT_BATCH_BIND_LIMIT < 999) };
         for bind_count_per_row in [
             SEMANTIC_ATOM_INSERT_BIND_COUNT,
             CONTEXT_NODE_INSERT_BIND_COUNT,
@@ -899,7 +900,6 @@ mod tests {
             let rows = CONVERSATION_INSERT_BATCH_BIND_LIMIT / bind_count_per_row;
             assert!(rows * bind_count_per_row <= CONVERSATION_INSERT_BATCH_BIND_LIMIT);
             assert!((rows + 1) * bind_count_per_row > CONVERSATION_INSERT_BATCH_BIND_LIMIT);
-            assert!(CONVERSATION_INSERT_BATCH_BIND_LIMIT < 999);
         }
     }
 }
