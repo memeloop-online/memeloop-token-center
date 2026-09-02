@@ -202,10 +202,12 @@ Then('总览、趋势、模型、客户端凭据、会话、上游账户和热�
   const heatmap = page.locator('.usage-echart-heatmap');
   await assertVisible(heatmap);
   await assertAttribute(heatmap, 'aria-label', '按星期和 UTC 小时显示的请求量热力图');
-  assert.ok(await heatmap.locator('canvas').evaluate((element) => {
+  const heatmapCanvases = heatmap.locator('canvas');
+  assert.ok(await heatmapCanvases.count() > 0, 'heatmap must create at least one canvas layer');
+  assert.ok(await heatmapCanvases.evaluateAll((elements) => elements.every((element) => {
     const canvas = element as HTMLCanvasElement;
     return canvas.width > 0 && canvas.height > 0;
-  }), 'heatmap canvas must be rendered');
+  })), 'every heatmap canvas layer must be rendered');
 
   await page.getByRole('tab', { name: '总览', exact: true }).click();
 });
@@ -394,26 +396,28 @@ Then('趋势下钻使用 UTC 毫秒完整闭区间', async function (this: Dogfo
   const chart = page.locator('.usage-chart-card').first().locator('.usage-echart');
   const bounds = await chart.boundingBox();
   assert.ok(bounds, 'throughput chart must have measurable pointer bounds');
-  const dataPixel = await chart.locator('canvas').evaluate((element) => {
-    const canvas = element as HTMLCanvasElement;
-    const context = canvas.getContext('2d');
-    if (!context) return undefined;
-    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+  const dataPixel = await chart.locator('canvas').evaluateAll((elements) => {
     const colors = [[104, 222, 201], [255, 156, 114]];
-    for (let y = Math.floor(canvas.height * 0.2); y < canvas.height * 0.9; y += 2) {
-      for (let x = 0; x < canvas.width; x += 2) {
-        const index = (y * canvas.width + x) * 4;
-        if (pixels[index + 3] < 180) continue;
-        if (colors.some(([red, green, blue]) => Math.abs(pixels[index] - red) < 18
-          && Math.abs(pixels[index + 1] - green) < 18 && Math.abs(pixels[index + 2] - blue) < 18)) {
-          return { x: x * canvas.clientWidth / canvas.width, y: y * canvas.clientHeight / canvas.height };
+    for (let canvasIndex = 0; canvasIndex < elements.length; canvasIndex += 1) {
+      const canvas = elements[canvasIndex] as HTMLCanvasElement;
+      const context = canvas.getContext('2d');
+      if (!context) continue;
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      for (let y = Math.floor(canvas.height * 0.2); y < canvas.height * 0.9; y += 2) {
+        for (let x = 0; x < canvas.width; x += 2) {
+          const index = (y * canvas.width + x) * 4;
+          if (pixels[index + 3] < 180) continue;
+          if (colors.some(([red, green, blue]) => Math.abs(pixels[index] - red) < 18
+            && Math.abs(pixels[index + 1] - green) < 18 && Math.abs(pixels[index + 2] - blue) < 18)) {
+            return { canvasIndex, x: x * canvas.clientWidth / canvas.width, y: y * canvas.clientHeight / canvas.height };
+          }
         }
       }
     }
     return undefined;
   });
   assert.ok(dataPixel, 'throughput chart must paint at least one data bar');
-  await chart.locator('canvas').click({ position: dataPixel });
+  await chart.locator('canvas').nth(dataPixel.canvasIndex).click({ position: dataPixel });
   const response = await responsePromise;
   assert.equal(response.status(), 200);
   const requestURL = new URL(response.url());
