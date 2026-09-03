@@ -111,7 +111,8 @@ pub use providers::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, CreateModelRouteInput,
     CreateUpstreamAccountInput, DiscoveredUpstreamModel, ImportManagedOAuthAccountInput,
     ManagedOAuthImportResult, ManagedOAuthImportStatus, ReauthorizeUpstreamAccountInput,
-    ReplaceModelCatalogResult, UpdateModelRouteInput, UpdateUpstreamAccountInput,
+    NativeCodexUpgradeReport, NativeCodexUpgradeTarget, ReplaceModelCatalogResult,
+    UpdateModelRouteInput, UpdateUpstreamAccountInput,
     UpstreamModelCatalogView, UpstreamModelView,
 };
 #[cfg(test)]

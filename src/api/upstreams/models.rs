@@ -252,7 +252,7 @@ async fn discover_models(
     if let Some(value) = plugin_result {
         return parse_model_array(&value).map(|models| ("component", models));
     }
-    if matches!(account.driver.as_str(), "openai-codex" | "cpa-codex-oauth") {
+    if account.driver == "openai-codex" {
         return discover_codex_models(state, account, credential).await;
     }
     if account.driver != "http-json" {
@@ -408,7 +408,7 @@ fn codex_account_header(credential: &UpstreamCredential) -> Result<String, &'sta
     if state.len() != 2
         || !matches!(
             state.get("schema").and_then(Value::as_str),
-            Some("openai-codex-oauth-v1" | "cpa-codex-oauth-v1")
+            Some("openai-codex-oauth-v1")
         )
     {
         return Err("credential_invalid");

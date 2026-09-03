@@ -349,8 +349,7 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
         .collect::<Vec<_>>();
     assert!(public_ids.contains(&"openai-codex"));
     assert!(!public_ids.iter().any(|driver| driver.starts_with("cpa-")));
-    assert!(catalog.get("cpa-codex-oauth").is_some());
-    assert!(!catalog.is_public("cpa-codex-oauth"));
+    assert!(catalog.get("cpa-codex-oauth").is_none());
     assert!(catalog.get("cpa-subscription-bridge").is_none());
     assert!(!catalog.supports_direct_credential("openai-codex", "oauth"));
     // The schema remains authoritative and rejects unsupported API-key shapes
@@ -359,7 +358,7 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
 
     assert!(
         catalog
-            .managed_oauth_adapter_for_driver("cpa-codex-oauth")
+            .managed_oauth_adapter_for_driver("openai-codex")
             .unwrap()
             .can_refresh()
     );

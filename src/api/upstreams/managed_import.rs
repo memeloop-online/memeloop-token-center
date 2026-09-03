@@ -144,6 +144,8 @@ pub(in crate::api) async fn import_cpa_managed_oauth(
         .await?;
     let (status, disposition) = if imported.replayed {
         (StatusCode::OK, "replayed")
+    } else if imported.updated {
+        (StatusCode::OK, "updated")
     } else {
         (StatusCode::CREATED, "created")
     };

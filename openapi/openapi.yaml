@@ -1370,8 +1370,11 @@ paths:
         Global-only import with a 1 MiB canonical-document limit and a bounded
         64 KiB JSON envelope allowance. The source path is used only in a keyed
         provenance identity and is never stored, logged, or returned.
-        Exact immutable replays return the current account without resolving or
-        calling an adapter; changed material under the same source returns 409.
+        Exact replays return the current account without resolving or calling
+        an adapter. A changed Codex document may atomically install a new
+        credential generation only when its encrypted external account
+        identity matches the existing source-bound account; other changes fail
+        closed and require explicit reauthorization.
         Driver, account configuration, credentials, and adapter destinations are
         derived by the current server catalog and cannot be supplied by the caller.
       security: [{ serviceBearer: [] }]
@@ -1384,7 +1387,7 @@ paths:
             schema: { $ref: '#/components/schemas/CpaManagedOAuthImportRequest' }
       responses:
         '200':
-          description: Exact or concurrently won replay of the existing account.
+          description: Exact replay or identity-preserving credential-generation update.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CpaManagedOAuthImportResult' }
@@ -1398,6 +1401,68 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
         '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/migrations/openai-codex/prepare:
+    post:
+      tags: [Upstream providers]
+      operationId: prepareNativeOpenAICodexUpgrade
+      summary: Prepare an exact native OpenAI Codex account migration
+      description: |
+        Global operator-only review stage for a finite explicit account-id
+        allowlist. It returns only ids, compare-and-swap versions, and proxy
+        attestations; OAuth tokens, account configuration, and proxy URLs are
+        never returned. Every selected account must already carry a private
+        SOCKS transport, otherwise preparation fails closed.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      x-global-service-only: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NativeCodexUpgradePrepareRequest' }
+      responses:
+        '200':
+          description: Immutable CAS plan for the explicitly selected account ids.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NativeCodexUpgradePlan' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/migrations/openai-codex/apply:
+    post:
+      tags: [Upstream providers]
+      operationId: applyNativeOpenAICodexUpgrade
+      summary: Apply a reviewed native OpenAI Codex account migration
+      description: |
+        Transactional native-only upgrade for the exact targets returned by
+        prepare. It preserves each stable account id, encrypted refresh state,
+        and approved private proxy, while atomically changing the provider
+        driver and adapter-state ABI. Repeating a completed request returns
+        ids as already native; an unreviewed or changed legacy row fails with
+        409 rather than being silently rewritten.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      x-global-service-only: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NativeCodexUpgradeApplyRequest' }
+      responses:
+        '200':
+          description: Upgrade outcome containing only stable account ids and counts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NativeCodexUpgradeResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /internal/v1/imports/session-archive/quarantine:
     get:
@@ -4661,8 +4726,65 @@ components:
       additionalProperties: false
       required: [disposition, account]
       properties:
-        disposition: { type: string, enum: [created, replayed] }
+        disposition: { type: string, enum: [created, replayed, updated] }
         account: { $ref: '#/components/schemas/UpstreamProvider' }
+    NativeCodexUpgradeTarget:
+      type: object
+      additionalProperties: false
+      required: [account_id, expected_updated_at, expected_credential_generation, has_proxy, proxy_network_scope]
+      properties:
+        account_id: { type: string, format: uuid }
+        expected_updated_at: { type: integer, format: int64 }
+        expected_credential_generation: { type: integer, format: int64, minimum: 1 }
+        has_proxy: { const: true, description: The encrypted credential has an operator-approved proxy; no URL is returned. }
+        proxy_network_scope: { const: private }
+    NativeCodexUpgradePrepareRequest:
+      type: object
+      additionalProperties: false
+      required: [account_ids]
+      properties:
+        account_ids:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: { type: string, format: uuid }
+    NativeCodexUpgradePlan:
+      type: object
+      additionalProperties: false
+      required: [target_count, targets]
+      properties:
+        target_count: { type: integer, minimum: 1, maximum: 64 }
+        targets:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items: { $ref: '#/components/schemas/NativeCodexUpgradeTarget' }
+    NativeCodexUpgradeApplyRequest:
+      type: object
+      additionalProperties: false
+      required: [targets]
+      properties:
+        targets:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items: { $ref: '#/components/schemas/NativeCodexUpgradeTarget' }
+    NativeCodexUpgradeResult:
+      type: object
+      additionalProperties: false
+      required: [upgraded_count, upgraded_account_ids, already_native_count, already_native_account_ids]
+      properties:
+        upgraded_count: { type: integer, minimum: 0, maximum: 64 }
+        upgraded_account_ids:
+          type: array
+          maxItems: 64
+          items: { type: string, format: uuid }
+        already_native_count: { type: integer, minimum: 0, maximum: 64 }
+        already_native_account_ids:
+          type: array
+          maxItems: 64
+          items: { type: string, format: uuid }
     SessionArchiveQuarantineRecord:
       type: object
       additionalProperties: false

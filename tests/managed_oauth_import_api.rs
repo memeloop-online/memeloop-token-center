@@ -978,6 +978,86 @@ async fn concurrent_same_and_mixed_payloads_have_one_atomic_winner() {
 }
 
 #[tokio::test]
+async fn native_codex_upgrade_api_is_global_allowlisted_and_never_returns_proxy_material() {
+    let (_directory, state, _adapter) = test_state().await;
+    let account = state
+        .db
+        .import_cpa_managed_oauth_account(
+            ImportManagedOAuthAccountInput {
+                tenant_external_id: "native-upgrade".into(),
+                source_key: "a".repeat(64),
+                payload_digest: "b".repeat(64),
+                contract_version: 1,
+                account_name: "Native account".into(),
+                config: json!({
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {"gpt-5.6-sol": 128000}
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "native-upgrade-access-secret".into(),
+                    refresh_token: Some("native-upgrade-refresh-secret".into()),
+                    expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: Some(json!({
+                        "schema": "openai-codex-oauth-v1",
+                        "account_id": "native-account-123"
+                    })),
+                    proxy_url: Some("socks5://operator:proxy-secret@100.64.0.16:1080".into()),
+                    proxy_network_scope: Some(memeloop_token_center::network::OutboundScope::Private),
+                },
+                status: ManagedOAuthImportStatus::Active,
+                adapter: state
+                    .providers
+                    .managed_oauth_adapter_for_source("codex")
+                    .unwrap(),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap()
+        .account;
+    let token = service_token(&state, &["providers:write"], None).await;
+    let (status, plan_body) = call(
+        &state,
+        "POST",
+        "/internal/v1/migrations/openai-codex/prepare",
+        Some(&token),
+        serde_json::to_vec(&json!({"account_ids": [account.id]})).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let plan: Value = serde_json::from_slice(&plan_body).unwrap();
+    assert_eq!(plan["target_count"], 1);
+    assert_eq!(plan["targets"][0]["account_id"], account.id.to_string());
+    assert_eq!(plan["targets"][0]["has_proxy"], true);
+    assert_eq!(plan["targets"][0]["proxy_network_scope"], "private");
+    let plan_text = String::from_utf8(plan_body).unwrap();
+    for secret in [
+        "native-upgrade-access-secret",
+        "native-upgrade-refresh-secret",
+        "operator:proxy-secret",
+        "100.64.0.16",
+    ] {
+        assert!(!plan_text.contains(secret));
+    }
+    let (status, result_body) = call(
+        &state,
+        "POST",
+        "/internal/v1/migrations/openai-codex/apply",
+        Some(&token),
+        serde_json::to_vec(&json!({"targets": plan["targets"]})).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result: Value = serde_json::from_slice(&result_body).unwrap();
+    assert_eq!(result["upgraded_count"], 0);
+    assert_eq!(result["already_native_count"], 1);
+    assert_eq!(result["already_native_account_ids"][0], account.id.to_string());
+}
+
+#[tokio::test]
 async fn exact_one_mib_document_and_tenant_provenance_are_replayable() {
     let (_directory, state, adapter) = test_state().await;
     Mock::given(method("POST"))

@@ -244,7 +244,7 @@ impl Database {
                 .await?;
         }
 
-        if matches!(driver.as_str(), "openai-codex" | "cpa-codex-oauth") {
+        if driver == "openai-codex" {
             let mut config: Value =
                 serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
             let object = config.as_object_mut().ok_or(AppError::Internal)?;
@@ -576,7 +576,7 @@ impl Database {
             .ok_or(AppError::NotFound)?;
             let driver: String = row.try_get("driver")?;
             let catalogued: bool = row.try_get("catalogued")?;
-            if matches!(driver.as_str(), "openai-codex" | "cpa-codex-oauth") && !catalogued {
+            if driver == "openai-codex" && !catalogued {
                 return Err(AppError::BadRequest(
                     "managed Codex routes require a synchronized model catalog entry".into(),
                 ));

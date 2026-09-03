@@ -20,7 +20,9 @@ use crate::{
 use super::OAuthReauthorizationTarget;
 
 pub const PROVIDER_DRIVER: &str = "openai-codex";
-pub const LEGACY_PROVIDER_DRIVER: &str = "cpa-codex-oauth";
+/// Historical persisted driver identifier accepted only by the one-shot
+/// native-account converter. It is not a routable provider driver.
+pub const IMPORTED_PROVIDER_DRIVER: &str = "cpa-codex-oauth";
 pub const OAUTH_DRIVER: &str = "openai_codex_device";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";

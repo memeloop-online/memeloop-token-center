@@ -17,7 +17,6 @@ use crate::{
 };
 
 pub(super) const DRIVER: &str = "openai-codex";
-pub(super) const LEGACY_DRIVER: &str = "cpa-codex-oauth";
 pub(super) const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub(super) const RESPONSES_PATH: &str = "/responses";
 // Keep a fixed, audited Codex-compatible identity. It must not be supplied by
@@ -28,7 +27,7 @@ const MAX_OUTPUT_ITEMS: usize = 16_384;
 const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
 
 pub(super) fn is_driver(driver: &str) -> bool {
-    matches!(driver, DRIVER | LEGACY_DRIVER)
+    driver == DRIVER
 }
 
 #[cfg(test)]
@@ -922,7 +921,7 @@ mod tests {
             header: "authorization".to_owned(),
             prefix: "Bearer ".to_owned(),
             adapter_state: Some(json!({
-                "schema": "cpa-codex-oauth-v1",
+                "schema": "openai-codex-oauth-v1",
                 "account_id": "account-123"
             })),
             proxy_url: None,
@@ -964,7 +963,7 @@ mod tests {
                 header: header.to_owned(),
                 prefix: prefix.to_owned(),
                 adapter_state: Some(json!({
-                    "schema": "cpa-codex-oauth-v1",
+                    "schema": "openai-codex-oauth-v1",
                     "account_id": "account-123"
                 })),
                 proxy_url: None,

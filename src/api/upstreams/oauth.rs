@@ -653,6 +653,14 @@ pub(crate) async fn refresh_managed_upstream_oauth(
                 )
                 .await?
             }
+            crate::oauth::codex_device::OAUTH_DRIVER => {
+                crate::oauth::managed::codex::refresh(
+                    &state.http,
+                    &credential,
+                    state.config.allow_oauth_loopback,
+                )
+                .await?
+            }
             "cursor" | "provider_adapter" => {
                 let refresh_scope = if driver == "provider_adapter" {
                     crate::oauth::oauth_adapter_endpoint_scope(
@@ -727,7 +735,6 @@ pub(crate) async fn refresh_managed_upstream_oauth(
 
 fn supports_oauth_refresh_proxy(driver: &str) -> bool {
     driver == crate::oauth::codex_device::OAUTH_DRIVER
-        || driver == crate::oauth::codex_device::LEGACY_PROVIDER_DRIVER
 }
 
 #[cfg(test)]
@@ -738,9 +745,6 @@ mod oauth_proxy_tests {
     fn only_codex_refresh_lifecycles_accept_private_proxy_credentials() {
         assert!(supports_oauth_refresh_proxy(
             crate::oauth::codex_device::OAUTH_DRIVER
-        ));
-        assert!(supports_oauth_refresh_proxy(
-            crate::oauth::codex_device::LEGACY_PROVIDER_DRIVER
         ));
         for driver in [
             crate::oauth::claude::OAUTH_DRIVER,

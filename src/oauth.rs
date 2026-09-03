@@ -602,11 +602,11 @@ mod tests {
         let catalog = ProviderCatalog::builtins();
         let adapter = resolve_managed_oauth_refresh_adapter(
             &catalog,
-            "cpa-codex-oauth",
+            "openai-codex",
             managed::codex::TOKEN_ENDPOINT,
         )
         .unwrap();
-        assert_eq!(adapter.provider_driver(), "cpa-codex-oauth");
+        assert_eq!(adapter.provider_driver(), "openai-codex");
         assert_eq!(adapter.backend(), &ManagedOAuthAdapterBackend::BuiltinCodex);
         assert!(adapter.can_refresh());
 
@@ -623,7 +623,7 @@ mod tests {
 
         let stored_secret_url = "https://stored-lifecycle-secret.invalid/token";
         let error =
-            resolve_managed_oauth_refresh_adapter(&catalog, "cpa-codex-oauth", stored_secret_url)
+            resolve_managed_oauth_refresh_adapter(&catalog, "openai-codex", stored_secret_url)
                 .unwrap_err();
         assert_eq!(
             error.to_string(),

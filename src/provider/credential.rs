@@ -543,7 +543,7 @@ mod proxy_tests {
             header: "authorization".into(),
             prefix: "Bearer ".into(),
             adapter_state: Some(serde_json::json!({
-                "schema": "cpa-codex-oauth-v1",
+                "schema": "openai-codex-oauth-v1",
                 "account_id": "account-123"
             })),
             proxy_url: Some("socks5://proxy-user:proxy-secret@100.64.0.16:1080".into()),

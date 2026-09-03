@@ -449,26 +449,21 @@ impl ProviderCatalog {
                 refresh_url: crate::oauth::DEFAULT_CURSOR_REFRESH_URL,
             },
         ));
-        let legacy_types = vec![
-            builtin_managed_oauth_provider(
-                "cpa-codex-oauth",
-                "Legacy Codex OAuth import",
-                "https://chatgpt.com/backend-api/codex",
-                true,
-            ),
-            builtin_managed_oauth_provider(
+        let legacy_types = vec![builtin_managed_oauth_provider(
                 "cpa-gemini-oauth-legacy",
                 "Legacy Gemini OAuth import",
                 "https://cloudcode-pa.googleapis.com",
                 false,
-            ),
-        ];
+            )];
         Self {
             types: Arc::new(types),
             legacy_types: Arc::new(legacy_types),
             builtin_managed_oauth: Arc::new(vec![
                 BuiltinManagedOAuthRegistration {
-                    provider_driver: "cpa-codex-oauth",
+                    // Imports normalize directly to the native driver. The
+                    // controlled database upgrade handles the small number
+                    // of older rows before this catalog is used at runtime.
+                    provider_driver: "openai-codex",
                     source_type: "codex",
                     backend: ManagedOAuthAdapterBackend::BuiltinCodex,
                 },

@@ -2,6 +2,7 @@ mod accounts;
 mod health;
 mod managed_import;
 mod models;
+mod native_codex_upgrade;
 mod oauth;
 mod oauth_claude;
 mod oauth_copilot;
@@ -17,6 +18,9 @@ pub(in crate::api) use managed_import::{
 pub(crate) use models::trigger_upstream_model_sync;
 pub(in crate::api) use models::{
     aggregate_upstream_models, list_upstream_models, sync_upstream_models,
+};
+pub(in crate::api) use native_codex_upgrade::{
+    apply_native_codex_upgrade, prepare_native_codex_upgrade,
 };
 
 pub(crate) use oauth::refresh_managed_upstream_oauth;

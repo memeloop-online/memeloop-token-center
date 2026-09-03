@@ -157,7 +157,7 @@ async fn codex_route_fixture(label: &str) -> CodexRouteFixture {
                     header: "authorization".to_owned(),
                     prefix: "Bearer ".to_owned(),
                     adapter_state: Some(json!({
-                        "schema": "cpa-codex-oauth-v1",
+                        "schema": "openai-codex-oauth-v1",
                         "account_id": "account-123"
                     })),
                     proxy_url: None,
@@ -1107,7 +1107,7 @@ async fn malformed_codex_credential_and_config_fail_before_side_effects() {
                 header: "x-api-key".to_owned(),
                 prefix: "Bearer ".to_owned(),
                 adapter_state: Some(json!({
-                    "schema": "cpa-codex-oauth-v1",
+                    "schema": "openai-codex-oauth-v1",
                     "account_id": "account-123"
                 })),
                 proxy_url: None,

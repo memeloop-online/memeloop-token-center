@@ -68,6 +68,14 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(MAX_MANAGED_OAUTH_IMPORT_REQUEST)),
         )
         .route(
+            "/internal/v1/migrations/openai-codex/prepare",
+            post(prepare_native_codex_upgrade),
+        )
+        .route(
+            "/internal/v1/migrations/openai-codex/apply",
+            post(apply_native_codex_upgrade),
+        )
+        .route(
             "/internal/v1/imports/session-archive/quarantine",
             get(list_archive_quarantine),
         )
