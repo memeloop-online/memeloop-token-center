@@ -374,7 +374,7 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
 
 #[tokio::test]
 async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_requests_off_cluster_hotspots()
-{
+ {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
