@@ -53,7 +53,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const sqlite = Math.max(...migrationVersions('common'), ...migrationVersions('sqlite'));
     const postgres = Math.max(...migrationVersions('common'), ...migrationVersions('postgres'));
     assert.equal(sqlite, postgres);
-    assert.equal(sqlite, 61, 'release chart must require schema v61');
+    assert.equal(sqlite, 63, 'release chart must require schema v63');
     assert.equal(Number(/^  schemaVersion: ([0-9]+)$/m.exec(read('charts/memeloop-token-center/values.yaml'))?.[1]), sqlite);
     has('default', `memeloop.io/schema-generation: "v${sqlite}"`);
     count('default', 'image: "ghcr.io/memeloop-online/memeloop-token-center:0.1.0"', 4);

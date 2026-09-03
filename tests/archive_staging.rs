@@ -66,7 +66,7 @@ async fn fresh_sqlite_migrates_latest_schema_and_rejects_untyped_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(latest, 61);
+    assert_eq!(latest, 63);
     database.readiness_check().await.unwrap();
     sqlx::query(
         "SELECT r.enforcement_mode, o.projected_at FROM usage_reservations r CROSS JOIN metered_usage_projection_outbox o WHERE 1 = 0",
