@@ -54,7 +54,192 @@ pub(crate) struct ConversationObservationInput<'a> {
     pub(crate) attach_request_record: bool,
 }
 
+/// A lease-owned terminal observation awaiting semantic materialization.
+///
+/// The payload intentionally remains private to the database layer: workers
+/// only need the stable request identity to project it, which prevents an
+/// untrusted caller from altering a persisted observation between claim and
+/// projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationProjectionTask {
+    pub request_id: Uuid,
+    pub observed_at: i64,
+}
+
+const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
+const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
+
+pub(crate) async fn enqueue_conversation_projection_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: Uuid,
+    key: &AuthenticatedKey,
+    request_json: &serde_json::Value,
+    hints: &ConversationHints,
+    client_name: Option<&str>,
+    upstream_response_id: Option<&str>,
+    observed_at: i64,
+) -> Result<(), AppError> {
+    let request_json = serde_json::to_string(request_json).map_err(|_| AppError::Internal)?;
+    let hints_json = serde_json::to_string(hints).map_err(|_| AppError::Internal)?;
+    sqlx::query(
+        "INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT(request_id) DO NOTHING",
+    )
+    .bind(request_id.to_string())
+    .bind(key.tenant_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.principal_id.to_string())
+    .bind(request_json)
+    .bind(hints_json)
+    .bind(client_name)
+    .bind(upstream_response_id)
+    .bind(observed_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 impl Database {
+    /// Claims a bounded batch of terminal conversation observations for one
+    /// projector. A crashed worker's lease expires and another worker can
+    /// safely retry the same durable payload.
+    pub async fn claim_conversation_projection_tasks(
+        &self,
+        lease_owner: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ConversationProjectionTask>, AppError> {
+        let now = unix_millis();
+        let expires_at = now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS);
+        let limit = limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT);
+        let mut transaction = self.begin_write_transaction().await?;
+        let claimable = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at <= $3) ORDER BY observed_at ASC, request_id ASC LIMIT $4 FOR UPDATE SKIP LOCKED"
+            }
+            // SQLite's BEGIN IMMEDIATE writer transaction serializes claimers,
+            // so the same bounded selector is race-free without row locks.
+            DatabaseBackend::Sqlite => {
+                "SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at <= $3) ORDER BY observed_at ASC, request_id ASC LIMIT $4"
+            }
+        };
+        let statement = format!(
+            "UPDATE conversation_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN ({claimable}) RETURNING request_id, observed_at"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind(lease_owner.to_string())
+            .bind(expires_at)
+            .bind(now)
+            .bind(limit)
+            .fetch_all(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ConversationProjectionTask {
+                    request_id: parse_uuid(row.try_get("request_id")?)?,
+                    observed_at: row.try_get("observed_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Materializes one task claimed by `lease_owner`. The observation writes,
+    /// request membership update, usage reclassification, and `projected_at`
+    /// acknowledgement commit atomically, making a retry exactly-once.
+    pub async fn project_claimed_conversation_projection_task(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+    ) -> Result<bool, AppError> {
+        let now = unix_millis();
+        let mut transaction = self.begin_write_transaction().await?;
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3 FOR UPDATE"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = $2 AND lease_expires_at >= $3"
+            }
+        };
+        let task = sqlx::query(select)
+            .bind(request_id.to_string())
+            .bind(lease_owner.to_string())
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(task) = task else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+
+        let tenant_id = parse_uuid(task.try_get("tenant_id")?)?;
+        let key_id = parse_uuid(task.try_get("key_id")?)?;
+        let principal_id = parse_uuid(task.try_get("principal_id")?)?;
+        let key_row = sqlx::query(
+            "SELECT id, tenant_id, principal_id, account_id, alias, currency, credential_generation, policy_json FROM key_records WHERE id = $1 AND tenant_id = $2 AND principal_id = $3",
+        )
+        .bind(key_id.to_string())
+        .bind(tenant_id.to_string())
+        .bind(principal_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        let projection_key = AuthenticatedKey {
+            key_id: parse_uuid(key_row.try_get("id")?)?,
+            tenant_id: parse_uuid(key_row.try_get("tenant_id")?)?,
+            principal_id: parse_uuid(key_row.try_get("principal_id")?)?,
+            account_id: parse_uuid(key_row.try_get("account_id")?)?,
+            alias: key_row.try_get("alias")?,
+            currency: key_row.try_get("currency")?,
+            credential_generation: key_row.try_get("credential_generation")?,
+            policy: serde_json::from_str(&key_row.try_get::<String, _>("policy_json")?)
+                .map_err(|_| AppError::Internal)?,
+        };
+        let request_json = serde_json::from_str(&task.try_get::<String, _>("request_json")?)
+            .map_err(|_| AppError::Internal)?;
+        let hints = serde_json::from_str(&task.try_get::<String, _>("hints_json")?)
+            .map_err(|_| AppError::Internal)?;
+        let client_name: Option<String> = task.try_get("client_name")?;
+        let upstream_response_id: Option<String> = task.try_get("upstream_response_id")?;
+        let observed_at: i64 = task.try_get("observed_at")?;
+
+        self.record_conversation_observation_in_transaction(
+            &mut transaction,
+            ConversationObservationInput {
+                key: &projection_key,
+                request_id,
+                request_json: &request_json,
+                hints: &hints,
+                client_name: client_name.as_deref(),
+                observed_at,
+                attach_request_record: true,
+            },
+        )
+        .await?;
+        if let Some(upstream_response_id) = upstream_response_id.as_deref() {
+            attach_conversation_upstream_response_in_transaction(
+                &mut transaction,
+                request_id,
+                upstream_response_id,
+            )
+            .await?;
+        }
+        let acknowledged = sqlx::query(
+            "UPDATE conversation_projection_outbox SET projected_at = $1, lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND lease_owner = $3",
+        )
+        .bind(now)
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        if acknowledged.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "conversation projection lease ownership changed".into(),
+            ));
+        }
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     pub async fn record_conversation_observation(
         &self,
         key: &AuthenticatedKey,

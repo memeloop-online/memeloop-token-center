@@ -6,10 +6,11 @@ use memeloop_token_center::{
     },
     conversation::{ConversationHints, extract_atoms},
     db::{
-        CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput, Database,
-        FinishProxyRequest, FinishProxyRequestResult, FinishSynchronousImageRequest,
-        FinishSynchronousImageResult, ProxyConversationInput, StartProxyRequest,
-        StartSynchronousImageRequest, StartSynchronousImageResult, StatsFilter, unix_millis,
+        ConversationDetailFilter, ConversationListFilter, CreateKeyInput, CreateModelRouteInput,
+        CreateUpstreamAccountInput, Database, FinishProxyRequest, FinishProxyRequestResult,
+        FinishSynchronousImageRequest, FinishSynchronousImageResult, ProxyConversationInput,
+        StartProxyRequest, StartSynchronousImageRequest, StartSynchronousImageResult,
+        StatsFilter, unix_millis,
     },
     error::{AppError, LimitReason},
     model::{ArchivedGenerationAsset, EnforcementMode, KeyPolicy, TokenUsage},
@@ -314,6 +315,296 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
             0,
             0,
         )
+    );
+}
+
+#[tokio::test]
+async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_requests_off_cluster_hotspots(
+) {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
+    let database = Database::connect_with_max(&database_url, 96).await.unwrap();
+    database.migrate().await.unwrap();
+    let unique = Uuid::now_v7();
+    let tenant = format!("metered-conversation-1024-{unique}");
+    let model = format!("metered-conversation-1024-{unique}");
+    let pepper = b"postgres metered conversation projection pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: tenant,
+                principal_external_id: "member".to_owned(),
+                alias: "metered-conversation-1024".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    enforcement_mode: EnforcementMode::MeteredUnlimited,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::ZERO,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let session_id = format!("metered-terminal-session-{unique}");
+
+    // First project one root turn. Every concurrent child below names it as
+    // its parent, so the final query verifies both session membership and the
+    // durable parent-child semantics rather than merely a shared label.
+    let root_request_id = Uuid::now_v7();
+    let root_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: root_request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 1,
+            output_token_ceiling: 1,
+            protocol: "openai",
+            model: &model,
+            request_object: "objects/blake3/metered-conversation-root-request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let root_request_json = serde_json::json!({"input": [{"role": "user", "content": "root"}]});
+    let root_hints = ConversationHints {
+        session_id: Some(session_id.clone()),
+        turn_id: Some("root-turn".to_owned()),
+        ..ConversationHints::default()
+    };
+    database
+        .finish_proxy_request(FinishProxyRequest {
+            request_id: root_request_id,
+            tenant_id: key.tenant_id,
+            reservation: &root_reservation,
+            input_token_ceiling: 1,
+            output_token_ceiling: 1,
+            requested_service_tier: None,
+            status_code: 200,
+            duration_ms: 1,
+            usage: TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..TokenUsage::default()
+            },
+            charge_contract_ceiling: false,
+            error_code: None,
+            response_object: "objects/blake3/metered-conversation-root-response",
+            conversation: Some(ProxyConversationInput {
+                key: &key,
+                request_json: &root_request_json,
+                hints: &root_hints,
+                client_name: Some("codex"),
+                upstream_response_id: Some("root-response"),
+            }),
+        })
+        .await
+        .unwrap();
+    let projector = Uuid::now_v7();
+    let root_tasks = database
+        .claim_conversation_projection_tasks(projector, 1)
+        .await
+        .unwrap();
+    assert_eq!(root_tasks.len(), 1);
+    assert_eq!(root_tasks[0].request_id, root_request_id);
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(projector, root_request_id)
+            .await
+            .unwrap()
+    );
+
+    const REQUESTS: usize = 1024;
+    let admission_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUESTS));
+    let mut admissions = Vec::with_capacity(REQUESTS);
+    for index in 0..REQUESTS {
+        let database = database.clone();
+        let key = key.clone();
+        let price = price.clone();
+        let model = model.clone();
+        let admission_barrier = admission_barrier.clone();
+        admissions.push(tokio::spawn(async move {
+            let request_id = Uuid::now_v7();
+            let request_object = format!("objects/blake3/metered-conversation-child-request-{index}");
+            admission_barrier.wait().await;
+            let reservation = database
+                .start_proxy_request(StartProxyRequest {
+                    request_id,
+                    key: &key,
+                    price: &price,
+                    input_token_ceiling: 1,
+                    output_token_ceiling: 1,
+                    protocol: "openai",
+                    model: &model,
+                    request_object: &request_object,
+                    upstream_account_id: None,
+                    model_route_id: None,
+                })
+                .await
+                .unwrap();
+            (index, request_id, reservation)
+        }));
+    }
+    let mut admitted = Vec::with_capacity(REQUESTS);
+    for admission in admissions {
+        admitted.push(admission.await.unwrap());
+    }
+
+    let finish_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUESTS));
+    let mut finishes = Vec::with_capacity(REQUESTS);
+    for (index, request_id, reservation) in admitted {
+        let database = database.clone();
+        let key = key.clone();
+        let finish_barrier = finish_barrier.clone();
+        let session_id = session_id.clone();
+        finishes.push(tokio::spawn(async move {
+            let request_json = serde_json::json!({
+                "input": [{"role": "user", "content": format!("child-{index}")}]
+            });
+            let hints = ConversationHints {
+                session_id: Some(session_id),
+                turn_id: Some(format!("child-turn-{index}")),
+                parent_turn_id: Some("root-turn".to_owned()),
+                ..ConversationHints::default()
+            };
+            finish_barrier.wait().await;
+            database
+                .finish_proxy_request(FinishProxyRequest {
+                    request_id,
+                    tenant_id: key.tenant_id,
+                    reservation: &reservation,
+                    input_token_ceiling: 1,
+                    output_token_ceiling: 1,
+                    requested_service_tier: None,
+                    status_code: 200,
+                    duration_ms: 1,
+                    usage: TokenUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        ..TokenUsage::default()
+                    },
+                    charge_contract_ceiling: false,
+                    error_code: None,
+                    response_object: "objects/blake3/metered-conversation-child-response",
+                    conversation: Some(ProxyConversationInput {
+                        key: &key,
+                        request_json: &request_json,
+                        hints: &hints,
+                        client_name: Some("codex"),
+                        upstream_response_id: None,
+                    }),
+                })
+                .await
+                .unwrap()
+        }));
+    }
+    for finish in finishes {
+        assert!(matches!(
+            finish.await.unwrap(),
+            FinishProxyRequestResult::Finished {
+                cost_micros: 2,
+                usage_invalid: false,
+            }
+        ));
+    }
+
+    let inspection = PgPool::connect(&database_url).await.unwrap();
+    let terminal_only: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM conversation_projection_outbox WHERE key_id = $1 AND projected_at IS NULL),
+            (SELECT COUNT(*) FROM conversation_observations WHERE key_id = $2),
+            (SELECT COALESCE(SUM(request_count), 0) FROM conversation_key_clusters WHERE key_id = $3)",
+    )
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(terminal_only, (REQUESTS as i64, 1, 1));
+
+    let mut projected = 0_usize;
+    loop {
+        let tasks = database
+            .claim_conversation_projection_tasks(projector, 32)
+            .await
+            .unwrap();
+        if tasks.is_empty() {
+            break;
+        }
+        for task in tasks {
+            assert!(
+                database
+                    .project_claimed_conversation_projection_task(projector, task.request_id)
+                    .await
+                    .unwrap()
+            );
+            projected += 1;
+        }
+    }
+    assert_eq!(projected, REQUESTS);
+
+    let clusters = database
+        .conversation_clusters(
+            key.key_id,
+            ConversationListFilter {
+                limit: 10,
+                before_updated_at: None,
+                before_cluster_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(clusters.len(), 1);
+    assert_eq!(clusters[0].explicit_session_id.as_deref(), Some(session_id.as_str()));
+    assert_eq!(clusters[0].request_count, REQUESTS as i64 + 1);
+    let detail = database
+        .conversation_cluster_detail(
+            key.key_id,
+            clusters[0].cluster_id,
+            ConversationDetailFilter {
+                limit: 200,
+                before_created_at: None,
+                before_request_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.cluster.request_count, REQUESTS as i64 + 1);
+    assert_eq!(detail.requests.len(), 200);
+    assert!(detail.has_more);
+
+    let materialized: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM conversation_observations WHERE key_id = $1 AND cluster_id = $2),
+            (SELECT COUNT(*) FROM conversation_edges WHERE cluster_id = $3 AND relation_kind = 'continues'),
+            (SELECT COUNT(*) FROM request_records WHERE key_id = $4 AND conversation_cluster_id = $5),
+            (SELECT COUNT(*) FROM conversation_projection_outbox WHERE key_id = $6 AND projected_at IS NULL)",
+    )
+    .bind(key.key_id.to_string())
+    .bind(clusters[0].cluster_id.to_string())
+    .bind(clusters[0].cluster_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(clusters[0].cluster_id.to_string())
+    .bind(key.key_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(
+        materialized,
+        (REQUESTS as i64 + 1, REQUESTS as i64, REQUESTS as i64 + 1, 0)
     );
 }
 

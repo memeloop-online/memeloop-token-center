@@ -603,38 +603,53 @@ impl Database {
                 Err(error) => return Err(error),
             };
 
-        // Attach the proven logical conversation before materializing session rollups.
-        // This keeps the request in its inferred cluster instead of first accounting it
-        // under the explicit `unlinked:<stable-key-id>` sentinel. Do this before
-        // taking the shared key/account budget locks: semantic materialization can
-        // issue many bounded inserts for a large Codex context, and must not block a
-        // concurrent request admission for the same credential while it runs.
+        // Metered-unlimited terminal traffic can complete in large bursts for
+        // one session. Its terminal transaction must remain insert-only with
+        // respect to conversation state: updating the shared cluster and
+        // key-cluster rows here would turn that session into a write hotspot.
+        // Persist the complete observation in the durable outbox instead; a
+        // bounded projector transaction later performs the semantic writes and
+        // reclassifies the initially-unlinked request fact atomically.
         if let Some(conversation) = input.conversation {
             if conversation.key.tenant_id != input.tenant_id
                 || conversation.key.key_id != input.reservation.key_id
             {
                 return Err(AppError::NotFound);
             }
-            self.record_conversation_observation_in_transaction(
-                &mut transaction,
-                ConversationObservationInput {
-                    key: conversation.key,
-                    request_id: input.request_id,
-                    request_json: conversation.request_json,
-                    hints: conversation.hints,
-                    client_name: conversation.client_name,
-                    observed_at: now,
-                    attach_request_record: true,
-                },
-            )
-            .await?;
-            if let Some(response_id) = conversation.upstream_response_id {
-                attach_conversation_upstream_response_in_transaction(
+            if trusted_reservation.enforcement_mode == EnforcementMode::MeteredUnlimited {
+                enqueue_conversation_projection_in_transaction(
                     &mut transaction,
                     input.request_id,
-                    response_id,
+                    conversation.key,
+                    conversation.request_json,
+                    conversation.hints,
+                    conversation.client_name,
+                    conversation.upstream_response_id,
+                    now,
                 )
                 .await?;
+            } else {
+                self.record_conversation_observation_in_transaction(
+                    &mut transaction,
+                    ConversationObservationInput {
+                        key: conversation.key,
+                        request_id: input.request_id,
+                        request_json: conversation.request_json,
+                        hints: conversation.hints,
+                        client_name: conversation.client_name,
+                        observed_at: now,
+                        attach_request_record: true,
+                    },
+                )
+                .await?;
+                if let Some(response_id) = conversation.upstream_response_id {
+                    attach_conversation_upstream_response_in_transaction(
+                        &mut transaction,
+                        input.request_id,
+                        response_id,
+                    )
+                    .await?;
+                }
             }
         }
         let reservation_status: String = reservation_row.try_get("status")?;

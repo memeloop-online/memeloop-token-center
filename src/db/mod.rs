@@ -119,6 +119,7 @@ pub(crate) use requests::claim_request_record_locator;
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter, FinishProxyRequest,
     FinishProxyRequestResult, FinishRequest, NewRequest, ProxyConversationInput, RequestListFilter,
+    ConversationProjectionTask,
     SessionArchiveCommitInput, SessionArchiveCorrelation, SessionArchiveImportLock,
     SessionArchiveImportMatch, SessionArchiveImportMatchInput, SessionArchiveLegacyCheckpointInput,
     SessionArchiveMatchInput, SessionArchivePresentSummaryInput,

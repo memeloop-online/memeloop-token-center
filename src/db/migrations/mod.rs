@@ -330,6 +330,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "metered unlimited usage projection outbox",
         sql: include_str!("../../../migrations/common/0061_metered_unlimited_usage.sql"),
     },
+    Migration {
+        version: 62,
+        name: "durable conversation projection outbox",
+        sql: include_str!("../../../migrations/common/0062_conversation_projection_outbox.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -645,6 +650,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 61,
         name: "metered unlimited usage projection outbox",
         sql: include_str!("../../../migrations/common/0061_metered_unlimited_usage.sql"),
+    },
+    Migration {
+        version: 62,
+        name: "durable conversation projection outbox",
+        sql: include_str!("../../../migrations/common/0062_conversation_projection_outbox.sql"),
     },
 ];
 
