@@ -1,5 +1,6 @@
 use super::super::archive_staging::bind_archive_staging_attempt_in_transaction;
 use super::super::*;
+use super::conversations::enqueue_conversation_projection_in_transaction;
 use crate::archive_staging::{
     ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease,
 };

@@ -11,7 +11,6 @@ mod stats;
 pub use conversations::{ConversationDetailFilter, ConversationListFilter};
 pub(crate) use conversations::{
     ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
-    enqueue_conversation_projection_in_transaction,
 };
 #[cfg(test)]
 pub(crate) use lifecycle::claim_request_record_locator;
