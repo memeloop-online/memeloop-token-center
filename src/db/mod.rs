@@ -136,9 +136,8 @@ pub(crate) use requests::{
     attach_conversation_upstream_response_in_transaction, claim_request_event_locator,
     price_token_usage, proxy_contract_ceiling_micros, record_request_finished_in_transaction,
     record_request_started_in_transaction, reserve_usage_in_transaction, search_prefix,
-    settle_token_usage_in_transaction,
-    settle_token_usage_in_transaction_with_charge, valid_archive_identifier,
-    validate_numeric_range,
+    settle_token_usage_in_transaction, settle_token_usage_in_transaction_with_charge,
+    valid_archive_identifier, validate_numeric_range,
 };
 #[cfg(test)]
 pub(crate) use requests::{
