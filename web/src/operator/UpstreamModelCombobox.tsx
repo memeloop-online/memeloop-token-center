@@ -91,8 +91,13 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   const selected = catalog?.data.find((model) => model.id === value && (model.protocol === protocol || model.protocol === 'any'));
   const catalogFresh = Boolean(catalog && catalog.unknown_account_count === 0 && catalog.stale_account_count === 0);
   const selectedValid = Boolean(selected && catalogFresh && (selected.complete_coverage || partialConfirmed));
-  const valid = Boolean(selectedValid || (value.trim() && customAllowed && customConfirmed));
-  const allowCustom = Boolean(!selected && customAllowed && customConfirmed);
+  // A model returned by a stale or incomplete catalog is not verified. For
+  // an exact account selection, keep the explicit custom-model escape hatch
+  // available instead of leaving the form in a state with neither a usable
+  // confirmation nor a valid submit button while synchronization settles.
+  const needsCustomConfirmation = Boolean(value.trim() && (!selected || !catalogFresh));
+  const allowCustom = Boolean(needsCustomConfirmation && customAllowed && customConfirmed);
+  const valid = Boolean(selectedValid || allowCustom);
   useEffect(() => validityCallback.current(valid, allowCustom), [valid, allowCustom]);
 
   const choose = (model: CatalogModel) => {
@@ -132,7 +137,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     {open && options.length > 0 && <div className="combobox-popover model-options" id={`${id}-list`} role="listbox">{options.map((model, index) => <button type="button" role="option" aria-selected={index === active} className={index === active ? 'active' : ''} id={`${id}-option-${index}`} key={`${model.protocol}:${model.id}`} onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setActive(index)} onClick={() => choose(model)}><span><b>{model.id}</b><small>{model.complete_coverage ? t('routes.fullCoverage') : t('routes.partialCoverage', { supported: formatNumber(model.supported_account_count, locale), eligible: formatNumber(model.eligible_account_count, locale) })}</small></span><span className="model-limits">{model.context_window ? t('routes.contextWindow', { count: formatNumber(model.context_window, locale) }) : ''}{model.reservation_token_bound ? t('routes.reservationBound', { count: formatNumber(model.reservation_token_bound, locale) }) : ''}</span></button>)}</div>}
     {selected && !selected.complete_coverage && <div className="custom-model-confirm"><label><input type="checkbox" checked={partialConfirmed} onChange={(event) => setPartialConfirmed(event.target.checked)} />{t('routes.confirmPartialCoverage', { supported: formatNumber(selected.supported_account_count, locale), eligible: formatNumber(selected.eligible_account_count, locale) })}</label></div>}
     {selected && catalog && (catalog.unknown_account_count > 0 || catalog.stale_account_count > 0) && <div className="notice warning compact">{t('routes.catalogNotReady')}</div>}
-    {value.trim() && !selected && <div className={`custom-model-confirm${customAllowed ? '' : ' disabled'}`}>
+    {needsCustomConfirmation && <div className={`custom-model-confirm${customAllowed ? '' : ' disabled'}`}>
       {customAllowed ? <label><input type="checkbox" checked={customConfirmed} onChange={(event) => setCustomConfirmed(event.target.checked)} />{t('routes.confirmCustomModel', { model: value.trim() })}</label> : <span>{t('routes.customUnavailableForGroups')}</span>}
     </div>}
   </div>;
