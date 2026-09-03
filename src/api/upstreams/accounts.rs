@@ -434,11 +434,7 @@ pub(in crate::api) async fn rotate_upstream_credential(
         .db
         .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
-    if current_credential.proxy().is_some() && credential.auth_kind() != "api_key" {
-        return Err(AppError::BadRequest(
-            "a proxied upstream must retain an API-key credential".into(),
-        ));
-    }
+    require_proxied_rotation_kind(&current_credential, &credential)?;
     let credential = credential.preserve_proxy_from(&current_credential);
     credential.validate(unix_millis())?;
     validate_upstream_proxy(
@@ -464,9 +460,62 @@ pub(in crate::api) async fn rotate_upstream_credential(
     Ok(Json(account))
 }
 
+fn require_proxied_rotation_kind(
+    current: &UpstreamCredential,
+    replacement: &UpstreamCredential,
+) -> Result<(), AppError> {
+    if current.proxy().is_some() && current.auth_kind() != replacement.auth_kind() {
+        return Err(AppError::BadRequest(
+            "a proxied upstream must retain its credential kind".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxied_rotation_retains_api_key_or_oauth_kind() {
+        let api_key = UpstreamCredential::ProxiedApiKey {
+            value: "api-secret".into(),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            proxy_url: "socks5://100.64.0.16:1080".into(),
+            proxy_network_scope: crate::network::OutboundScope::Private,
+        };
+        let oauth = UpstreamCredential::OAuth {
+            access_token: "oauth-secret".into(),
+            refresh_token: Some("refresh-secret".into()),
+            expires_at: None,
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: Some("socks5://100.64.0.16:1080".into()),
+            proxy_network_scope: Some(crate::network::OutboundScope::Private),
+        };
+        let plain_api_key = UpstreamCredential::ApiKey {
+            value: "replacement".into(),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+        };
+        let plain_oauth = UpstreamCredential::OAuth {
+            access_token: "replacement".into(),
+            refresh_token: Some("replacement-refresh".into()),
+            expires_at: None,
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: None,
+            proxy_network_scope: None,
+        };
+
+        assert!(require_proxied_rotation_kind(&api_key, &plain_api_key).is_ok());
+        assert!(require_proxied_rotation_kind(&oauth, &plain_oauth).is_ok());
+        assert!(require_proxied_rotation_kind(&api_key, &plain_oauth).is_err());
+        assert!(require_proxied_rotation_kind(&oauth, &plain_api_key).is_err());
+    }
 
     #[test]
     fn siliconflow_video_profile_requires_fixed_base_path_and_result_allowlist() {

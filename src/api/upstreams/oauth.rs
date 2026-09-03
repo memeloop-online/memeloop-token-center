@@ -629,7 +629,12 @@ pub(crate) async fn refresh_managed_upstream_oauth(
             .db
             .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
             .await?;
-        Ok(match driver.as_str() {
+        if credential.proxy().is_some() && !supports_oauth_refresh_proxy(&driver) {
+            return Err(AppError::BadRequest(
+                "this OAuth lifecycle does not support a private proxy".into(),
+            ));
+        }
+        let refreshed = match driver.as_str() {
             crate::oauth::claude::OAUTH_DRIVER => {
                 crate::oauth::claude::refresh_claude_credential(
                     &state.http,
@@ -687,7 +692,8 @@ pub(crate) async fn refresh_managed_upstream_oauth(
                 )
                 .await?
             }
-        })
+        };
+        Ok(refreshed.preserve_proxy_from(&credential))
     }
     .await;
     let refreshed = match refreshed {
@@ -717,4 +723,32 @@ pub(crate) async fn refresh_managed_upstream_oauth(
         .await?;
     super::trigger_upstream_model_sync(state.clone(), account.id);
     Ok(account)
+}
+
+fn supports_oauth_refresh_proxy(driver: &str) -> bool {
+    driver == crate::oauth::codex_device::OAUTH_DRIVER
+        || driver == crate::oauth::codex_device::LEGACY_PROVIDER_DRIVER
+}
+
+#[cfg(test)]
+mod oauth_proxy_tests {
+    use super::supports_oauth_refresh_proxy;
+
+    #[test]
+    fn only_codex_refresh_lifecycles_accept_private_proxy_credentials() {
+        assert!(supports_oauth_refresh_proxy(
+            crate::oauth::codex_device::OAUTH_DRIVER
+        ));
+        assert!(supports_oauth_refresh_proxy(
+            crate::oauth::codex_device::LEGACY_PROVIDER_DRIVER
+        ));
+        for driver in [
+            crate::oauth::claude::OAUTH_DRIVER,
+            crate::oauth::copilot::OAUTH_DRIVER,
+            "cursor",
+            "provider_adapter",
+        ] {
+            assert!(!supports_oauth_refresh_proxy(driver), "{driver}");
+        }
+    }
 }

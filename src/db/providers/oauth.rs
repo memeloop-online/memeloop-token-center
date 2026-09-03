@@ -185,8 +185,13 @@ impl Database {
                 "reload the upstream provider before authorizing it again".into(),
             ));
         }
-        input.credential.validate(now)?;
-        let ciphertext = seal_credential(&input.credential, key_material)?;
+        let current_credential = open_credential(
+            &row.try_get::<String, _>("credential_ciphertext")?,
+            key_material,
+        )?;
+        let credential = input.credential.preserve_proxy_from(&current_credential);
+        credential.validate(now)?;
+        let ciphertext = seal_credential(&credential, key_material)?;
         let current_generation: i64 = row.try_get("credential_generation")?;
         let generation = current_generation
             .checked_add(1)
@@ -206,7 +211,7 @@ impl Database {
         .bind(account_id.to_string())
         .bind(generation)
         .bind(ciphertext)
-        .bind(input.credential.expires_at())
+        .bind(credential.expires_at())
         .bind(now)
         .execute(&mut *tx)
         .await?;

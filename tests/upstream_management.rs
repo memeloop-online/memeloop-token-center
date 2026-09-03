@@ -109,8 +109,12 @@ async fn interactive_reauthorization_preserves_stable_identity_routes_and_replay
                     header: "authorization".into(),
                     prefix: "Bearer ".into(),
                     adapter_state: None,
-                    proxy_url: None,
-                    proxy_network_scope: None,
+                    proxy_url: Some(
+                        "socks5://proxy-user:proxy-secret@100.64.0.16:1080".into(),
+                    ),
+                    proxy_network_scope: Some(
+                        memeloop_token_center::network::OutboundScope::Private,
+                    ),
                 },
                 oauth_session_id: Some(original_session),
                 oauth_driver: Some("cursor".into()),
@@ -168,6 +172,18 @@ async fn interactive_reauthorization_preserves_stable_identity_routes_and_replay
     assert_eq!(reauthorized.route_count, 1);
     assert!(reauthorized.can_refresh);
     assert!(reauthorized.can_reauthorize);
+    let (_, installed) = state
+        .db
+        .upstream_account_with_credential(original.id, pepper)
+        .await
+        .unwrap();
+    assert_eq!(
+        installed.proxy(),
+        Some((
+            "socks5://proxy-user:proxy-secret@100.64.0.16:1080",
+            memeloop_token_center::network::OutboundScope::Private,
+        ))
+    );
 
     let replay = state
         .db
@@ -209,6 +225,8 @@ async fn interactive_reauthorization_preserves_stable_identity_routes_and_replay
     .unwrap();
     assert!(!ciphertext.contains("new-access-secret"));
     assert!(!ciphertext.contains("new-refresh-secret"));
+    assert!(!ciphertext.contains("proxy-secret"));
+    assert!(!ciphertext.contains("100.64.0.16"));
 
     let stale = state
         .db
