@@ -46,6 +46,20 @@ HTTP 429. The permit ends as soon as the bounded body read completes, times
 out or fails, rather than spanning proxy execution. Synchronous image requests
 retain their separate two-request lifecycle limit.
 
+`/v1/responses` has a separately configurable body ceiling:
+`MTC_RESPONSES_BODY_MAX_BYTES` (Helm `config.responsesBodyMaxBytes`) defaults
+to 16 MiB and is clamped to 4–64 MiB. The route has a 64 MiB ingress ceiling,
+but admission always applies the configured lower value before JSON parsing.
+It also needs one of the independent
+`MTC_RESPONSES_BODY_READ_CONCURRENCY` permits (Helm
+`config.responsesBodyReadConcurrency`), which defaults to four and is capped
+at eight. Thus the default large-body buffer budget is at most 64 MiB per
+gateway process, rather than 1024 × 16 MiB. Capacity exhaustion remains a
+503; a body above its configured size is a 413. A 413 writes only the
+request-id middleware UUID, a fixed route class/reason, declared content
+length and configured limit to structured logs—never credentials, request
+content, model names or raw paths.
+
 Before enabling an HPA, keep the maximum application connection demand,
 including rollout surge, migration connections and an operational reserve,
 within the PostgreSQL or PgBouncer connection budget. Alert on database pool
@@ -151,6 +165,8 @@ The fixed-label runtime series are:
 - `memeloop_token_center_background_work_items{queue,state="active"}` for
   request-event streams, gateway body reads, proxy lifecycle capacity and
   response-archive stream capacity;
+- `memeloop_token_center_gateway_body_rejections_total{route_class,reason}`
+  for 413 body-size rejections, with both labels drawn from fixed enums;
 - `memeloop_token_center_generation_jobs{status}` and
   `memeloop_token_center_db_pool_connections{state}` for durable queue and pool
   state;

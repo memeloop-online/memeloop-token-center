@@ -5,6 +5,10 @@ pub(super) const MAX_IMAGE_RESPONSE: usize = 16 * 1024 * 1024;
 pub(super) const MAX_ARCHIVE_DETAIL_RESPONSE: usize = 4 * 1024 * 1024;
 pub(super) const MAX_PROXY_RESPONSE_BODY: usize = 64 * 1024 * 1024;
 pub(super) const MAX_DEFAULT_REQUEST_BODY: usize = 4 * 1024 * 1024;
+/// A route-level ingress ceiling. The per-process configured responses limit
+/// is applied by gateway body admission before the JSON extractor runs.
+pub(super) const MAX_RESPONSES_REQUEST_BODY: usize =
+    crate::config::MAX_RESPONSES_BODY_MAX_BYTES as usize;
 pub(super) const MAX_IMAGE_REQUEST_BODY: usize = 16 * 1024 * 1024;
 pub(super) const MAX_RESPONSES_SSE_EVENT_BYTES: usize = 256 * 1024;
 pub(super) const SYNCHRONOUS_IMAGE_DEADLINE: Duration = Duration::from_secs(12 * 60);

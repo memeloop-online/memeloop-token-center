@@ -8,6 +8,11 @@ pub const DEFAULT_PRICING_LITELLM_URL: &str =
 pub const DEFAULT_PRICING_OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
 pub const DEFAULT_GATEWAY_BODY_READ_CONCURRENCY: u32 = 1_024;
 pub const MAX_GATEWAY_BODY_READ_CONCURRENCY: u32 = 8_192;
+pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 16 * 1024 * 1024;
+pub const MIN_RESPONSES_BODY_MAX_BYTES: u32 = 4 * 1024 * 1024;
+pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
+pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = 4;
+pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +50,11 @@ pub struct Config {
     /// Maximum gateway request bodies buffered concurrently. The permit covers
     /// only the bounded body read, not the complete proxy lifecycle.
     pub gateway_body_read_concurrency: u32,
+    /// Maximum `/v1/responses` request body size. It is separately admitted so
+    /// its 16 MiB default cannot consume all general body-read capacity.
+    pub responses_body_max_bytes: u32,
+    /// Maximum concurrent `/v1/responses` body reads per gateway process.
+    pub responses_body_read_concurrency: u32,
     pub run_migrations_on_start: bool,
     pub key_pepper: String,
     pub service_token: String,
@@ -87,6 +97,11 @@ impl std::fmt::Debug for Config {
             .field(
                 "gateway_body_read_concurrency",
                 &self.gateway_body_read_concurrency,
+            )
+            .field("responses_body_max_bytes", &self.responses_body_max_bytes)
+            .field(
+                "responses_body_read_concurrency",
+                &self.responses_body_read_concurrency,
             )
             .field("run_migrations_on_start", &self.run_migrations_on_start)
             .field("key_pepper", &"[redacted]")
@@ -194,6 +209,14 @@ impl Config {
                 "MTC_GATEWAY_BODY_READ_CONCURRENCY",
                 DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
             )?),
+            responses_body_max_bytes: responses_body_max_bytes(env_u32(
+                "MTC_RESPONSES_BODY_MAX_BYTES",
+                DEFAULT_RESPONSES_BODY_MAX_BYTES,
+            )?),
+            responses_body_read_concurrency: responses_body_read_concurrency(env_u32(
+                "MTC_RESPONSES_BODY_READ_CONCURRENCY",
+                DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
+            )?),
             run_migrations_on_start: env_bool("MTC_RUN_MIGRATIONS_ON_START", true),
             key_pepper,
             service_token,
@@ -232,6 +255,8 @@ impl Config {
             database_max_connections: 2,
             proxy_lifecycle_concurrency: 1,
             gateway_body_read_concurrency: 1,
+            responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
+            responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
             run_migrations_on_start: false,
             key_pepper: "unused-by-session-archive-importer".to_owned(),
             service_token: "unused-by-session-archive-importer".to_owned(),
@@ -264,6 +289,8 @@ impl Config {
             database_max_connections: 8,
             proxy_lifecycle_concurrency: 64,
             gateway_body_read_concurrency: DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
+            responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
+            responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
             run_migrations_on_start: true,
             key_pepper: "test-pepper-must-have-at-least-32-bytes".to_owned(),
             service_token: "test-service-token".to_owned(),
@@ -387,6 +414,14 @@ fn env_u32(name: &'static str, default: u32) -> Result<u32, ConfigError> {
 
 fn gateway_body_read_concurrency(value: u32) -> u32 {
     value.clamp(1, MAX_GATEWAY_BODY_READ_CONCURRENCY)
+}
+
+fn responses_body_max_bytes(value: u32) -> u32 {
+    value.clamp(MIN_RESPONSES_BODY_MAX_BYTES, MAX_RESPONSES_BODY_MAX_BYTES)
+}
+
+fn responses_body_read_concurrency(value: u32) -> u32 {
+    value.clamp(1, MAX_RESPONSES_BODY_READ_CONCURRENCY)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -545,6 +580,29 @@ mod tests {
         assert_eq!(
             Config::for_test("sqlite::memory:".to_owned()).gateway_body_read_concurrency,
             DEFAULT_GATEWAY_BODY_READ_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn responses_body_configuration_keeps_large_reads_bounded() {
+        assert_eq!(DEFAULT_RESPONSES_BODY_MAX_BYTES, 16 * 1024 * 1024);
+        assert_eq!(
+            responses_body_max_bytes(MIN_RESPONSES_BODY_MAX_BYTES - 1),
+            MIN_RESPONSES_BODY_MAX_BYTES
+        );
+        assert_eq!(
+            responses_body_max_bytes(MAX_RESPONSES_BODY_MAX_BYTES + 1),
+            MAX_RESPONSES_BODY_MAX_BYTES
+        );
+        assert_eq!(
+            responses_body_read_concurrency(MAX_RESPONSES_BODY_READ_CONCURRENCY + 1),
+            MAX_RESPONSES_BODY_READ_CONCURRENCY
+        );
+        let config = Config::for_test("sqlite::memory:".to_owned());
+        assert_eq!(config.responses_body_max_bytes, DEFAULT_RESPONSES_BODY_MAX_BYTES);
+        assert_eq!(
+            config.responses_body_read_concurrency,
+            DEFAULT_RESPONSES_BODY_READ_CONCURRENCY
         );
     }
 }

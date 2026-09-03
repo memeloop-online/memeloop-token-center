@@ -492,6 +492,7 @@ pub struct DatabaseRuntimeMetrics {
 pub struct RuntimeMetrics {
     pub database: Option<DatabaseRuntimeMetrics>,
     pub request_event_streams: usize,
+    pub gateway_body_rejections: [[u64; 2]; 4],
     pub gateway_body_reads: usize,
     pub proxy_lifecycles: usize,
     pub proxy_archive_streams: usize,
@@ -732,6 +733,21 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
             output,
             "memeloop_token_center_background_work_items{{queue=\"{queue}\",state=\"active\"}} {value}"
         );
+    }
+    output.push_str(
+        "# HELP memeloop_token_center_gateway_body_rejections_total Rejected gateway request bodies by fixed route class and reason.\n",
+    );
+    output.push_str("# TYPE memeloop_token_center_gateway_body_rejections_total counter\n");
+    for route_class in crate::gateway_body::GatewayBodyRouteClass::ALL {
+        for reason in crate::gateway_body::GatewayBodyRejectionReason::ALL {
+            let value = runtime.gateway_body_rejections[route_class.index()][reason.index()];
+            let _ = writeln!(
+                output,
+                "memeloop_token_center_gateway_body_rejections_total{{route_class=\"{}\",reason=\"{}\"}} {value}",
+                route_class.label(),
+                reason.label(),
+            );
+        }
     }
     output.push_str(
         "# HELP memeloop_token_center_plugin_cache_entries Resolved plugin configuration cache entries.\n",

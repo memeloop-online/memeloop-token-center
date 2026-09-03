@@ -57,6 +57,8 @@ pub struct AppState {
     pub metrics: metrics::Metrics,
     pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
     pub(crate) gateway_body_read_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) gateway_body_rejections: Arc<gateway_body::GatewayBodyRejectionMetrics>,
     pub(crate) proxy_lifecycle_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) proxy_archive_stream_permits: Arc<tokio::sync::Semaphore>,
 }
@@ -77,6 +79,7 @@ impl AppState {
     pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
         let proxy_lifecycle_concurrency = config.proxy_lifecycle_concurrency as usize;
         let gateway_body_read_concurrency = config.gateway_body_read_concurrency as usize;
+        let responses_body_read_concurrency = config.responses_body_read_concurrency as usize;
         if config.run_migrations_on_start {
             let migration_db = Database::connect_for_migration(
                 &config.database_url,
@@ -118,6 +121,10 @@ impl AppState {
             gateway_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 gateway_body_read_concurrency,
             )),
+            responses_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
+                responses_body_read_concurrency,
+            )),
+            gateway_body_rejections: Arc::new(gateway_body::GatewayBodyRejectionMetrics::default()),
             proxy_lifecycle_permits: Arc::new(tokio::sync::Semaphore::new(
                 proxy_lifecycle_concurrency,
             )),

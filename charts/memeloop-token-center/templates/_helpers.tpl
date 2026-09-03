@@ -45,6 +45,10 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ .Values.config.proxyLifecycleConcurrency | quote }}
 - name: MTC_GATEWAY_BODY_READ_CONCURRENCY
   value: {{ .Values.config.gatewayBodyReadConcurrency | quote }}
+- name: MTC_RESPONSES_BODY_MAX_BYTES
+  value: {{ .Values.config.responsesBodyMaxBytes | quote }}
+- name: MTC_RESPONSES_BODY_READ_CONCURRENCY
+  value: {{ .Values.config.responsesBodyReadConcurrency | quote }}
 - name: MTC_KEY_PEPPER
   valueFrom:
     secretKeyRef:

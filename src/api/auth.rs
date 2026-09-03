@@ -18,7 +18,7 @@ use crate::{
 
 use super::limits::{
     CLOUD_WEBHOOK_BODY_PERMITS, CLOUD_WEBHOOK_BODY_READ_DEADLINE, IMAGE_RESPONSE_PERMITS,
-    MAX_CLOUD_WEBHOOK_BODY,
+    MAX_CLOUD_WEBHOOK_BODY, REQUEST_ID_HEADER,
 };
 
 const CONTROL_BODY_READ_DEADLINE: Duration = Duration::from_secs(60);
@@ -77,7 +77,7 @@ pub(super) async fn authenticate_control_before_body(
                     "request body was not received before the deadline",
                 ));
             }
-            Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected) => {
+            Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(_)) => {
                 return Ok(control_body_rejection(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request_body_too_large",
@@ -146,15 +146,18 @@ pub(super) async fn authenticate_gateway_before_body(
         None
     };
     if request.method() == axum::http::Method::POST {
+        let request_id = safe_gateway_request_id(request.headers());
         request = match crate::gateway_body::admit_gateway_request_body(
             request,
             crate::gateway_body::GATEWAY_BODY_READ_DEADLINE,
             state.gateway_body_read_permits.clone(),
+            state.responses_body_read_permits.clone(),
+            state.config.responses_body_max_bytes as usize,
         )
         .await
         {
             Ok(request) => request,
-            Err(error) => return Ok(gateway_body_admission_rejection(error)),
+            Err(error) => return Ok(gateway_body_admission_rejection(&state, &request_id, error)),
         };
     }
     let response = next.run(request).await;
@@ -165,11 +168,13 @@ pub(super) async fn authenticate_gateway_before_body(
 }
 
 fn gateway_body_admission_rejection(
+    state: &AppState,
+    request_id: &str,
     error: crate::gateway_body::GatewayBodyAdmissionError,
 ) -> Response {
     match error {
         crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted => {
-            AppError::Overloaded.into_response()
+            gateway_body_capacity_rejection()
         }
         crate::gateway_body::GatewayBodyAdmissionError::Timeout => (
             StatusCode::REQUEST_TIMEOUT,
@@ -179,15 +184,42 @@ fn gateway_body_admission_rejection(
             }})),
         )
             .into_response(),
-        crate::gateway_body::GatewayBodyAdmissionError::Rejected => (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({"error": {
-                "code": "request_body_too_large",
-                "message": "request body exceeds the supported limit"
-            }})),
-        )
-            .into_response(),
+        crate::gateway_body::GatewayBodyAdmissionError::Rejected(rejection) => {
+            state.gateway_body_rejections.observe(rejection);
+            // All fields are server-derived numbers or fixed enums. In
+            // particular, never log credentials, model names, raw paths or
+            // any part of the rejected request body.
+            tracing::warn!(
+                request_id = %request_id,
+                route_class = rejection.route_class.label(),
+                declared_content_length = ?rejection.declared_content_length,
+                limit_bytes = rejection.limit_bytes,
+                reason = rejection.reason.label(),
+                "gateway request body rejected"
+            );
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"error": {
+                    "code": "request_body_too_large",
+                    "message": "request body exceeds the supported limit"
+                }})),
+            )
+                .into_response()
+        }
     }
+}
+
+fn gateway_body_capacity_rejection() -> Response {
+    AppError::Overloaded.into_response()
+}
+
+fn safe_gateway_request_id(headers: &HeaderMap) -> String {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unavailable".to_owned())
 }
 
 /// Keeps a lifecycle guard alive until the response body reaches EOF, errors,
@@ -235,7 +267,7 @@ pub(super) async fn admit_cloud_webhook_before_body(
                 "request body was not received before the deadline",
             ));
         }
-        Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected) => {
+        Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected(_)) => {
             return Ok(control_body_rejection(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request_body_too_large",
@@ -302,9 +334,7 @@ mod response_body_guard_tests {
 
     #[tokio::test]
     async fn gateway_body_capacity_exhaustion_is_a_service_overload_not_a_rate_limit() {
-        let response = gateway_body_admission_rejection(
-            crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted,
-        );
+        let response = gateway_body_capacity_rejection();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
@@ -312,6 +342,22 @@ mod response_body_guard_tests {
         assert!(std::str::from_utf8(&body)
             .expect("UTF-8 error")
             .contains("service_overloaded"));
+    }
+
+    #[test]
+    fn gateway_body_rejection_logs_only_a_uuid_request_id() {
+        let request_id = uuid::Uuid::now_v7();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REQUEST_ID_HEADER,
+            request_id.to_string().parse().expect("request ID header"),
+        );
+        assert_eq!(safe_gateway_request_id(&headers), request_id.to_string());
+        headers.insert(
+            REQUEST_ID_HEADER,
+            "user-controlled-value".parse().expect("valid non-UUID header"),
+        );
+        assert_eq!(safe_gateway_request_id(&headers), "unavailable");
     }
 }
 

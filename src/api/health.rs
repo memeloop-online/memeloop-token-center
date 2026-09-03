@@ -88,6 +88,7 @@ pub(super) async fn prometheus_metrics(
     let runtime = crate::metrics::RuntimeMetrics {
         database: runtime,
         request_event_streams: state.request_event_streams.active_count(),
+        gateway_body_rejections: state.gateway_body_rejections.snapshot(),
         gateway_body_reads: (state.config.gateway_body_read_concurrency as usize)
             .saturating_sub(state.gateway_body_read_permits.available_permits()),
         proxy_lifecycles: (state.config.proxy_lifecycle_concurrency as usize)
