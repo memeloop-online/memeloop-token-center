@@ -5359,6 +5359,7 @@ async fn create_and_use_policy_credential(world: &mut TokenCenterWorld) {
         "requests_per_minute": 7,
         "tokens_per_minute": 7000,
         "max_concurrency": 2,
+        "enforcement_mode": "prepaid",
         "daily_budget": "5",
         "weekly_budget": "20",
         "lifetime_budget": "50"
