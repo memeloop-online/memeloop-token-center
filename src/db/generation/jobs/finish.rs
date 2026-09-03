@@ -63,10 +63,10 @@ impl Database {
         let mut transaction = self.pool.begin().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT j.status, j.lease_owner, j.tenant_id, j.key_id, j.driver, j.created_at, j.estimated_units, j.billed_units, j.cost_micros, j.result_json, j.error_code, j.staged_assets_json, j.reservation_id, j.billing_unit_snapshot, j.micros_per_unit_snapshot, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 FOR UPDATE"
+                "SELECT j.status, j.lease_owner, j.tenant_id, j.key_id, j.driver, j.created_at, j.estimated_units, j.billed_units, j.cost_micros, j.result_json, j.error_code, j.staged_assets_json, j.reservation_id, j.billing_unit_snapshot, j.micros_per_unit_snapshot, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 FOR UPDATE"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT j.status, j.lease_owner, j.tenant_id, j.key_id, j.driver, j.created_at, j.estimated_units, j.billed_units, j.cost_micros, j.result_json, j.error_code, j.staged_assets_json, j.reservation_id, j.billing_unit_snapshot, j.micros_per_unit_snapshot, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1"
+                "SELECT j.status, j.lease_owner, j.tenant_id, j.key_id, j.driver, j.created_at, j.estimated_units, j.billed_units, j.cost_micros, j.result_json, j.error_code, j.staged_assets_json, j.reservation_id, j.billing_unit_snapshot, j.micros_per_unit_snapshot, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1"
             }
         };
         let job = sqlx::query(select)
@@ -111,6 +111,10 @@ impl Database {
             id: parse_uuid(job.try_get("reservation_id")?)?,
             account_id: parse_uuid(job.try_get("account_id")?)?,
             key_id,
+            enforcement_mode: EnforcementMode::from_storage(
+                job.try_get::<String, _>("enforcement_mode")?.as_str(),
+            )
+            .ok_or(AppError::Internal)?,
             reserved_micros: job.try_get("reserved_micros")?,
             input_micros_per_million: 0,
             output_micros_per_million: if billing_unit == "megapixel" {

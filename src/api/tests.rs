@@ -908,7 +908,8 @@ async fn synchronous_image_budget_is_acquired_before_reading_the_request_body() 
     .await
     .expect("an exhausted image budget must reject without reading the body")
     .unwrap();
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
 
     drop(both);
     let _released =
@@ -1196,6 +1197,86 @@ async fn gateway_and_control_have_disjoint_route_surfaces() {
         .await
         .unwrap();
     assert_eq!(gateway_model.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn gateway_router_has_no_blanket_in_flight_limit_ahead_of_lifecycle_capacity() {
+    let gateway_routes = include_str!("routes/gateway.rs");
+    assert!(!gateway_routes.contains("ConcurrencyLimitLayer"));
+    assert!(!gateway_routes.contains("GATEWAY_IN_FLIGHT_REQUESTS"));
+}
+
+#[tokio::test]
+async fn operator_can_explicitly_set_and_read_metered_unlimited_enforcement() {
+    let (state, _directory) = test_state().await;
+    let service_token = state.config.service_token.clone();
+    let control = router_for_role(state, RuntimeRole::Control);
+    let created = control
+        .clone()
+        .oneshot(
+            Request::post("/internal/v1/keys")
+                .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant_external_id": "metered-policy-api",
+                        "principal_external_id": "member",
+                        "alias": "metered-policy-api"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: Value = serde_json::from_slice(
+        &axum::body::to_bytes(created.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let key_id = created["key_id"].as_str().unwrap();
+
+    let updated = control
+        .clone()
+        .oneshot(
+            Request::put(format!("/internal/v1/keys/{key_id}/policy"))
+                .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"enforcement_mode": "metered_unlimited"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated: Value = serde_json::from_slice(
+        &axum::body::to_bytes(updated.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(updated["enforcement_mode"], "metered_unlimited");
+
+    let listed = control
+        .oneshot(
+            Request::get("/internal/v1/keys?tenant_external_id=metered-policy-api")
+                .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: Value = serde_json::from_slice(
+        &axum::body::to_bytes(listed.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(listed[0]["policy"]["enforcement_mode"], "metered_unlimited");
 }
 
 #[tokio::test]

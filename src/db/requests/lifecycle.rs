@@ -519,7 +519,7 @@ impl Database {
         }
 
         let reservation_row = sqlx::query(
-            "SELECT account_id, key_id, reserved_micros, reserved_tokens, rate_window_start, status, actual_micros, price_snapshot_json FROM usage_reservations WHERE id = $1",
+            "SELECT account_id, key_id, enforcement_mode, reserved_micros, reserved_tokens, rate_window_start, status, actual_micros, price_snapshot_json FROM usage_reservations WHERE id = $1",
         )
         .bind(&reservation_id)
         .fetch_optional(&mut *transaction)
@@ -565,6 +565,12 @@ impl Database {
             id: input.reservation.id,
             account_id: trusted_account_id,
             key_id: trusted_key_id,
+            enforcement_mode: EnforcementMode::from_storage(
+                reservation_row
+                    .try_get::<String, _>("enforcement_mode")?
+                    .as_str(),
+            )
+            .ok_or(AppError::Internal)?,
             reserved_micros: reservation_row.try_get("reserved_micros")?,
             input_micros_per_million,
             output_micros_per_million,
@@ -680,6 +686,9 @@ impl Database {
                 response_object,
             },
             now,
+            trusted_reservation
+                .enforcement_mode
+                .enforces_prepaid_limits(),
         )
         .await?;
         if !finished {
@@ -782,7 +791,7 @@ impl Database {
     pub async fn record_request_finished(&self, request: FinishRequest) -> Result<(), AppError> {
         let mut tx = self.begin_write_transaction().await?;
         let completed_at = unix_millis();
-        record_request_finished_in_transaction(&mut tx, &request, completed_at).await?;
+        record_request_finished_in_transaction(&mut tx, &request, completed_at, true).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -929,6 +938,7 @@ pub(crate) async fn record_request_finished_in_transaction(
     tx: &mut Transaction<'_, Any>,
     request: &FinishRequest,
     completed_at: i64,
+    project_aggregates: bool,
 ) -> Result<bool, AppError> {
     let request_id = request.request_id.to_string();
     let locator = sqlx::query(
@@ -964,13 +974,15 @@ pub(crate) async fn record_request_finished_in_transaction(
     if updated.rows_affected() == 0 {
         return Ok(false);
     }
-    sqlx::query(
-        "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, CASE WHEN status_code >= 200 AND status_code < 400 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), 1, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1 AND created_at = $2 ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + 1, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",
-    )
-    .bind(&request_id)
-    .bind(created_at)
-    .execute(&mut **tx)
-    .await?;
+    if project_aggregates {
+        sqlx::query(
+            "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, CASE WHEN status_code >= 200 AND status_code < 400 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), 1, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1 AND created_at = $2 ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + 1, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",
+        )
+        .bind(&request_id)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await?;
+    }
     let fact_inserted = sqlx::query(
         "INSERT INTO request_stats_facts (request_id, tenant_id, key_id, created_at, model, protocol, status_class, error_code, upstream_account_id, model_route_id, duration_ms, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, service_tier, currency, cost_micros, session_id) SELECT id, tenant_id, key_id, created_at, model, protocol, CASE WHEN status_code BETWEEN 200 AND 399 THEN 'success' ELSE 'failure' END, COALESCE(error_code, ''), COALESCE(upstream_account_id, ''), COALESCE(model_route_id, ''), COALESCE(duration_ms, 0), input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, service_tier, currency, cost_micros, COALESCE(conversation_cluster_id, 'unlinked:' || key_id) FROM request_records WHERE id = $1 AND created_at = $2 AND completed_at IS NOT NULL AND status_code IS NOT NULL ON CONFLICT(request_id) DO NOTHING",
     )
@@ -980,7 +992,7 @@ pub(crate) async fn record_request_finished_in_transaction(
     .await?
     .rows_affected()
         == 1;
-    if fact_inserted {
+    if fact_inserted && project_aggregates {
         sqlx::query(
             "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, duration_count, duration_sum_ms, cost_micros) SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, 1, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, 1, duration_ms, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency) DO UPDATE SET requests = request_daily_aggregates.requests + 1, input_tokens = request_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = request_daily_aggregates.output_tokens + excluded.output_tokens, cached_input_tokens = request_daily_aggregates.cached_input_tokens + excluded.cached_input_tokens, cache_write_tokens = request_daily_aggregates.cache_write_tokens + excluded.cache_write_tokens, duration_count = request_daily_aggregates.duration_count + excluded.duration_count, duration_sum_ms = request_daily_aggregates.duration_sum_ms + excluded.duration_sum_ms, cost_micros = request_daily_aggregates.cost_micros + excluded.cost_micros",
         )

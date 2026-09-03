@@ -695,6 +695,7 @@ impl Database {
                 response_object: input.response_object.to_owned(),
             },
             now,
+            input.reservation.enforcement_mode.enforces_prepaid_limits(),
         )
         .await?;
         if !finished {
@@ -997,7 +998,7 @@ async fn recover_expired_synchronous_image_owner(
     now: i64,
 ) -> Result<Option<SynchronousImageIdempotencyClaim>, AppError> {
     let row = sqlx::query(
-        "SELECT q.created_at, q.completed_at, q.status_code, q.cost_micros, q.error_code, q.response_object, q.reservation_id, r.account_id, r.key_id AS reservation_key_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1 AND q.key_id = $2",
+        "SELECT q.created_at, q.completed_at, q.status_code, q.cost_micros, q.error_code, q.response_object, q.reservation_id, r.account_id, r.key_id AS reservation_key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1 AND q.key_id = $2",
     )
     .bind(request_id.to_string())
     .bind(key_id.to_string())
@@ -1016,6 +1017,10 @@ async fn recover_expired_synchronous_image_owner(
         id: parse_uuid(row.try_get("reservation_id")?)?,
         account_id: parse_uuid(row.try_get("account_id")?)?,
         key_id: parse_uuid(row.try_get("reservation_key_id")?)?,
+        enforcement_mode: EnforcementMode::from_storage(
+            row.try_get::<String, _>("enforcement_mode")?.as_str(),
+        )
+        .ok_or(AppError::Internal)?,
         reserved_micros: row.try_get("reserved_micros")?,
         input_micros_per_million: 0,
         output_micros_per_million: 0,
@@ -1110,6 +1115,7 @@ async fn recover_expired_synchronous_image_owner(
                 response_object: format!("gap://{request_id}/response"),
             },
             now,
+            reservation.enforcement_mode.enforces_prepaid_limits(),
         )
         .await?;
         let updated = sqlx::query(
@@ -1152,6 +1158,7 @@ async fn recover_expired_synchronous_image_owner(
             response_object: format!("gap://{request_id}/response"),
         },
         now,
+        reservation.enforcement_mode.enforces_prepaid_limits(),
     )
     .await?;
     Ok(None)

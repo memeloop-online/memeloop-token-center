@@ -135,7 +135,7 @@ pub(super) async fn authenticate_gateway_before_body(
         Some(
             IMAGE_RESPONSE_PERMITS
                 .try_acquire()
-                .map_err(|_| AppError::RateLimited)?,
+                .map_err(|_| AppError::Overloaded)?,
         )
     } else {
         None

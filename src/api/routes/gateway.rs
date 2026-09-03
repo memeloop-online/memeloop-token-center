@@ -50,8 +50,7 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
         .route_layer(middleware::from_fn_with_state(
             state,
             authenticate_gateway_before_body,
-        ))
-        .layer(ConcurrencyLimitLayer::new(GATEWAY_IN_FLIGHT_REQUESTS));
+        ));
     Router::new()
         .route("/portal", get(portal_index))
         .merge(authenticated)

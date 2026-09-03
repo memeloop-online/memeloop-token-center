@@ -4,6 +4,39 @@ use uuid::Uuid;
 pub const MONEY_SCALE: i64 = 1_000_000;
 pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementMode {
+    #[default]
+    Prepaid,
+    /// Records exact priced usage without synchronously reserving a shared
+    /// balance, budget, rate-window, or per-key concurrency counter. This is
+    /// the postpaid path for credentials whose spend is intentionally
+    /// unlimited while their usage remains fully auditable.
+    MeteredUnlimited,
+}
+
+impl EnforcementMode {
+    pub const fn enforces_prepaid_limits(self) -> bool {
+        matches!(self, Self::Prepaid)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepaid => "prepaid",
+            Self::MeteredUnlimited => "metered_unlimited",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "prepaid" => Some(Self::Prepaid),
+            "metered_unlimited" => Some(Self::MeteredUnlimited),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyPolicy {
@@ -19,6 +52,8 @@ pub struct KeyPolicy {
     pub tokens_per_minute: u64,
     #[serde(default = "default_concurrency")]
     pub max_concurrency: u32,
+    #[serde(default)]
+    pub enforcement_mode: EnforcementMode,
     pub daily_budget: Option<String>,
     pub weekly_budget: Option<String>,
     pub lifetime_budget: Option<String>,
@@ -35,6 +70,8 @@ pub struct KeyPolicyInput {
     pub tokens_per_minute: u64,
     #[serde(default = "default_concurrency")]
     pub max_concurrency: u32,
+    #[serde(default)]
+    pub enforcement_mode: EnforcementMode,
     pub daily_budget: Option<String>,
     pub weekly_budget: Option<String>,
     pub lifetime_budget: Option<String>,
@@ -53,6 +90,7 @@ impl From<KeyPolicyInput> for KeyPolicy {
             requests_per_minute: value.requests_per_minute,
             tokens_per_minute: value.tokens_per_minute,
             max_concurrency: value.max_concurrency,
+            enforcement_mode: value.enforcement_mode,
             daily_budget: value.daily_budget,
             weekly_budget: value.weekly_budget,
             lifetime_budget: value.lifetime_budget,
@@ -66,6 +104,7 @@ impl From<KeyPolicy> for KeyPolicyInput {
             requests_per_minute: value.requests_per_minute,
             tokens_per_minute: value.tokens_per_minute,
             max_concurrency: value.max_concurrency,
+            enforcement_mode: value.enforcement_mode,
             daily_budget: value.daily_budget,
             weekly_budget: value.weekly_budget,
             lifetime_budget: value.lifetime_budget,
@@ -80,6 +119,7 @@ impl Default for KeyPolicy {
             requests_per_minute: default_rpm(),
             tokens_per_minute: default_tpm(),
             max_concurrency: default_concurrency(),
+            enforcement_mode: EnforcementMode::Prepaid,
             daily_budget: None,
             weekly_budget: None,
             lifetime_budget: None,
@@ -103,7 +143,28 @@ fn default_concurrency() -> u32 {
 mod key_policy_contract_tests {
     use serde_json::json;
 
-    use super::{KeyPolicy, KeyPolicyInput};
+    use super::{EnforcementMode, KeyPolicy, KeyPolicyInput};
+
+    #[test]
+    fn public_policy_defaults_to_prepaid_and_round_trips_metered_unlimited() {
+        let defaulted: KeyPolicyInput = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(defaulted.enforcement_mode, EnforcementMode::Prepaid);
+
+        let unlimited: KeyPolicyInput = serde_json::from_value(json!({
+            "enforcement_mode": "metered_unlimited"
+        }))
+        .unwrap();
+        assert_eq!(
+            unlimited.enforcement_mode,
+            EnforcementMode::MeteredUnlimited
+        );
+        assert_eq!(
+            serde_json::to_value(unlimited)
+                .unwrap()
+                .get("enforcement_mode"),
+            Some(&json!("metered_unlimited"))
+        );
+    }
 
     #[test]
     fn public_policy_rejects_legacy_model_names_and_views_never_emit_them() {
@@ -921,6 +982,7 @@ pub struct UsageReservation {
     pub id: Uuid,
     pub account_id: Uuid,
     pub key_id: Uuid,
+    pub enforcement_mode: EnforcementMode,
     pub reserved_micros: i64,
     pub input_micros_per_million: i64,
     pub output_micros_per_million: i64,

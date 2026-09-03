@@ -11,7 +11,8 @@ use memeloop_token_center::{
         FinishSynchronousImageResult, ProxyConversationInput, StartProxyRequest,
         StartSynchronousImageRequest, StartSynchronousImageResult, StatsFilter, unix_millis,
     },
-    model::{ArchivedGenerationAsset, KeyPolicy, TokenUsage},
+    error::{AppError, LimitReason},
+    model::{ArchivedGenerationAsset, EnforcementMode, KeyPolicy, TokenUsage},
     provider::UpstreamCredential,
 };
 use rust_decimal::Decimal;
@@ -137,6 +138,427 @@ async fn postgres_pending_proxy_failover_assignment_is_tenant_scoped_and_idempot
     .await
     .unwrap();
     assert_eq!(row, (accounts[1].to_string(), routes[1].to_string()));
+}
+
+#[tokio::test]
+async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_without_shared_budget_rows() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
+    let database = Database::connect_with_max(&database_url, 64).await.unwrap();
+    database.migrate().await.unwrap();
+    let unique = Uuid::now_v7();
+    let model = format!("metered-unlimited-1024-{unique}");
+    let pepper = b"postgres metered unlimited 1024 pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("metered-unlimited-1024-{unique}"),
+                principal_external_id: "member".to_owned(),
+                alias: "metered-unlimited-1024".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    requests_per_minute: 1,
+                    tokens_per_minute: 1,
+                    max_concurrency: 1,
+                    enforcement_mode: EnforcementMode::MeteredUnlimited,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::ZERO,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    assert_eq!(key.policy.enforcement_mode, EnforcementMode::MeteredUnlimited);
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+
+    const REQUESTS: usize = 1024;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUESTS));
+    let mut admissions = Vec::with_capacity(REQUESTS);
+    for index in 0..REQUESTS {
+        let database = database.clone();
+        let key = key.clone();
+        let price = price.clone();
+        let model = model.clone();
+        let barrier = barrier.clone();
+        admissions.push(tokio::spawn(async move {
+            let request_id = Uuid::now_v7();
+            let request_object = format!("objects/blake3/metered-unlimited-request-{index}");
+            barrier.wait().await;
+            let reservation = database
+                .start_proxy_request(StartProxyRequest {
+                    request_id,
+                    key: &key,
+                    price: &price,
+                    input_token_ceiling: 1,
+                    output_token_ceiling: 1,
+                    protocol: "openai",
+                    model: &model,
+                    request_object: &request_object,
+                    upstream_account_id: None,
+                    model_route_id: None,
+                })
+                .await
+                .unwrap();
+            (request_id, reservation)
+        }));
+    }
+    let mut admitted = Vec::with_capacity(REQUESTS);
+    for admission in admissions {
+        admitted.push(admission.await.unwrap());
+    }
+
+    let inspection = PgPool::connect(&database_url).await.unwrap();
+    let admission_state: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1 AND status = 'reserved' AND enforcement_mode = 'metered_unlimited'),
+            (SELECT COUNT(*) FROM rate_limit_windows WHERE key_id = $2),
+            (SELECT COALESCE(reserved_micros, 0) FROM key_budget_state WHERE key_id = $3),
+            (SELECT available_micros FROM credit_accounts WHERE id = $4),
+            (SELECT reserved_micros FROM credit_accounts WHERE id = $5)",
+    )
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.account_id.to_string())
+    .bind(key.account_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(admission_state, (REQUESTS as i64, 0, 0, 0, 0));
+
+    let finish_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUESTS));
+    let mut finishes = Vec::with_capacity(REQUESTS);
+    for (request_id, reservation) in admitted {
+        let database = database.clone();
+        let finish_barrier = finish_barrier.clone();
+        let tenant_id = key.tenant_id;
+        finishes.push(tokio::spawn(async move {
+            finish_barrier.wait().await;
+            database
+                .finish_proxy_request(FinishProxyRequest {
+                    request_id,
+                    tenant_id,
+                    reservation: &reservation,
+                    input_token_ceiling: 1,
+                    output_token_ceiling: 1,
+                    requested_service_tier: None,
+                    status_code: 200,
+                    duration_ms: 1,
+                    usage: TokenUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        ..TokenUsage::default()
+                    },
+                    charge_contract_ceiling: false,
+                    error_code: None,
+                    response_object: "objects/blake3/metered-unlimited-response",
+                    conversation: None,
+                })
+                .await
+                .unwrap()
+        }));
+    }
+    for finish in finishes {
+        assert_eq!(
+            finish.await.unwrap(),
+            FinishProxyRequestResult::Finished {
+                cost_micros: 2,
+                usage_invalid: false,
+            }
+        );
+    }
+
+    let terminal_state: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1 AND status = 'settled' AND actual_micros = 2),
+            (SELECT COUNT(*) FROM ledger_entries WHERE key_id = $2 AND kind = 'usage'),
+            (SELECT COALESCE(SUM(amount_micros), 0)::BIGINT FROM ledger_entries WHERE key_id = $3 AND kind = 'usage'),
+            (SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE key_id = $4 AND actual_micros = 2 AND projected_at IS NULL),
+            (SELECT COUNT(*) FROM request_stats_facts WHERE key_id = $5 AND cost_micros = 2),
+            (SELECT COUNT(*) FROM rate_limit_windows WHERE key_id = $6),
+            (SELECT COALESCE(reserved_micros, 0) FROM key_budget_state WHERE key_id = $7)",
+    )
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal_state,
+        (
+            REQUESTS as i64,
+            REQUESTS as i64,
+            -(REQUESTS as i64 * 2),
+            REQUESTS as i64,
+            REQUESTS as i64,
+            0,
+            0,
+        )
+    );
+}
+
+#[tokio::test]
+async fn postgres_metered_unlimited_terminal_replay_is_exactly_once() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
+    let database = Database::connect_with_max(&database_url, 32).await.unwrap();
+    database.migrate().await.unwrap();
+    let unique = Uuid::now_v7();
+    let model = format!("metered-unlimited-replay-{unique}");
+    let pepper = b"postgres metered unlimited replay pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("metered-unlimited-replay-{unique}"),
+                principal_external_id: "member".to_owned(),
+                alias: "metered-unlimited-replay".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    enforcement_mode: EnforcementMode::MeteredUnlimited,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::ZERO,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 1,
+            output_token_ceiling: 1,
+            protocol: "openai",
+            model: &model,
+            request_object: "objects/blake3/metered-unlimited-replay-request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(64));
+    let mut finishes = Vec::with_capacity(64);
+    for _ in 0..64 {
+        let database = database.clone();
+        let reservation = reservation.clone();
+        let barrier = barrier.clone();
+        let tenant_id = key.tenant_id;
+        finishes.push(tokio::spawn(async move {
+            barrier.wait().await;
+            database
+                .finish_proxy_request(FinishProxyRequest {
+                    request_id,
+                    tenant_id,
+                    reservation: &reservation,
+                    input_token_ceiling: 1,
+                    output_token_ceiling: 1,
+                    requested_service_tier: None,
+                    status_code: 200,
+                    duration_ms: 1,
+                    usage: TokenUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        ..TokenUsage::default()
+                    },
+                    charge_contract_ceiling: false,
+                    error_code: None,
+                    response_object: "objects/blake3/metered-unlimited-replay-response",
+                    conversation: None,
+                })
+                .await
+                .unwrap()
+        }));
+    }
+    let mut winners = 0;
+    let mut replays = 0;
+    for finish in finishes {
+        match finish.await.unwrap() {
+            FinishProxyRequestResult::Finished {
+                cost_micros: 2,
+                usage_invalid: false,
+            } => winners += 1,
+            FinishProxyRequestResult::AlreadyFinished { cost_micros: 2, .. } => replays += 1,
+            result => panic!("unexpected metered replay result: {result:?}"),
+        }
+    }
+    assert_eq!((winners, replays), (1, 63));
+    let inspection = PgPool::connect(&database_url).await.unwrap();
+    let exact_once: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM ledger_entries WHERE source = $1),
+            (SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE reservation_id = $2),
+            (SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $3)",
+    )
+    .bind(reservation.id.to_string())
+    .bind(reservation.id.to_string())
+    .bind(request_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(exact_once, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn postgres_prepaid_boundary_remains_fail_closed_under_parallel_admission() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
+    let database = Database::connect_with_max(&database_url, 16).await.unwrap();
+    database.migrate().await.unwrap();
+    let unique = Uuid::now_v7();
+    let model = format!("prepaid-boundary-{unique}");
+    let pepper = b"postgres prepaid boundary pepper";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: format!("prepaid-boundary-{unique}"),
+                principal_external_id: "member".to_owned(),
+                alias: "prepaid-boundary".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    requests_per_minute: 100,
+                    tokens_per_minute: 100,
+                    max_concurrency: 8,
+                    enforcement_mode: EnforcementMode::Prepaid,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::new(4, 6),
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let mut admissions = Vec::with_capacity(8);
+    for index in 0..8 {
+        let database = database.clone();
+        let key = key.clone();
+        let price = price.clone();
+        let model = model.clone();
+        let barrier = barrier.clone();
+        admissions.push(tokio::spawn(async move {
+            let request_id = Uuid::now_v7();
+            let request_object = format!("objects/blake3/prepaid-boundary-request-{index}");
+            barrier.wait().await;
+            (
+                request_id,
+                database
+                    .start_proxy_request(StartProxyRequest {
+                        request_id,
+                        key: &key,
+                        price: &price,
+                        input_token_ceiling: 1,
+                        output_token_ceiling: 1,
+                        protocol: "openai",
+                        model: &model,
+                        request_object: &request_object,
+                        upstream_account_id: None,
+                        model_route_id: None,
+                    })
+                    .await,
+            )
+        }));
+    }
+    let mut admitted = Vec::new();
+    let mut rejected = 0;
+    for admission in admissions {
+        let (request_id, result) = admission.await.unwrap();
+        match result {
+            Ok(reservation) => admitted.push((request_id, reservation)),
+            Err(AppError::LimitExceeded {
+                reason: LimitReason::BalanceExhausted,
+                ..
+            }) => rejected += 1,
+            Err(error) => panic!("finite prepaid admission failed open or ambiguously: {error:?}"),
+        }
+    }
+    assert_eq!((admitted.len(), rejected), (2, 6));
+    for (request_id, reservation) in admitted {
+        assert_eq!(
+            database
+                .finish_proxy_request(FinishProxyRequest {
+                    request_id,
+                    tenant_id: key.tenant_id,
+                    reservation: &reservation,
+                    input_token_ceiling: 1,
+                    output_token_ceiling: 1,
+                    requested_service_tier: None,
+                    status_code: 200,
+                    duration_ms: 1,
+                    usage: TokenUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        ..TokenUsage::default()
+                    },
+                    charge_contract_ceiling: false,
+                    error_code: None,
+                    response_object: "objects/blake3/prepaid-boundary-response",
+                    conversation: None,
+                })
+                .await
+                .unwrap(),
+            FinishProxyRequestResult::Finished {
+                cost_micros: 2,
+                usage_invalid: false,
+            }
+        );
+    }
+    let inspection = PgPool::connect(&database_url).await.unwrap();
+    let terminal_state: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT available_micros FROM credit_accounts WHERE id = $1),
+            (SELECT reserved_micros FROM credit_accounts WHERE id = $2),
+            (SELECT settled_lifetime_micros FROM key_budget_state WHERE key_id = $3),
+            (SELECT COALESCE(-SUM(amount_micros), 0)::BIGINT FROM ledger_entries WHERE key_id = $4 AND kind = 'usage')",
+    )
+    .bind(key.account_id.to_string())
+    .bind(key.account_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(terminal_state, (0, 0, 4, 4));
 }
 
 #[tokio::test]

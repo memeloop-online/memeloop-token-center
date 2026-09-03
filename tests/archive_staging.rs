@@ -66,8 +66,14 @@ async fn fresh_sqlite_migrates_latest_schema_and_rejects_untyped_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(latest, 60);
+    assert_eq!(latest, 61);
     database.readiness_check().await.unwrap();
+    sqlx::query(
+        "SELECT r.enforcement_mode, o.projected_at FROM usage_reservations r CROSS JOIN metered_usage_projection_outbox o WHERE 1 = 0",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
 
     let invalid = sqlx::query(
         "INSERT INTO archive_staging_attempts (attempt_id, owner_kind, owner_id, purpose, intent_digest, state, writer_owner, writer_token, lease_owner, lease_token, lease_expires_at, created_at, updated_at) VALUES ($1, 'proxy_request', $2, 'assets', $3, 'writing', 'writer', $4, 'writer', $4, 100, 0, 0)",

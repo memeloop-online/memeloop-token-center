@@ -18,9 +18,10 @@ use crate::{
     model::{
         ArchivedGenerationAsset, AuthenticatedKey, AuthenticatedService, ConversationClusterDetail,
         ConversationClusterView, ConversationCursor, ConversationEdgeView, ConversationRequestView,
-        EntitlementReconcileResult, EntitlementView, GenerationAssetDownload, GenerationAssetView,
-        GenerationJobView, GenerationJobWork, GenerationPrice, GenerationStagedAssets, IssuedKey,
-        IssuedServiceToken, JSON_SAFE_INTEGER_MAX, KeyAliasView, KeyBudgetSnapshot,
+        EnforcementMode, EntitlementReconcileResult, EntitlementView, GenerationAssetDownload,
+        GenerationAssetView, GenerationJobView, GenerationJobWork, GenerationPrice,
+        GenerationStagedAssets, IssuedKey, IssuedServiceToken, JSON_SAFE_INTEGER_MAX,
+        KeyAliasView, KeyBudgetSnapshot,
         KeyConcurrencySnapshot, KeyLimitSnapshot, KeyPolicy, KeyRateLimitSnapshot, KeyView,
         LedgerEntryView, ManagedKeyView, ModelPrice, ModelPriceTier,
         ModelPriceTierView, ModelPriceView, OperatorGenerationJobView, OperatorStats,

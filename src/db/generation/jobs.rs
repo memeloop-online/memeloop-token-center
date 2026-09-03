@@ -828,10 +828,10 @@ impl Database {
         let mut transaction = self.pool.begin().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT j.status, j.lease_owner, j.lease_expires_at, j.staged_assets_json, j.created_at, j.tenant_id, j.public_model, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 AND j.key_id = $2 FOR UPDATE"
+                "SELECT j.status, j.lease_owner, j.lease_expires_at, j.staged_assets_json, j.created_at, j.tenant_id, j.public_model, r.id AS reservation_id, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 AND j.key_id = $2 FOR UPDATE"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT j.status, j.lease_owner, j.lease_expires_at, j.staged_assets_json, j.created_at, j.tenant_id, j.public_model, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 AND j.key_id = $2"
+                "SELECT j.status, j.lease_owner, j.lease_expires_at, j.staged_assets_json, j.created_at, j.tenant_id, j.public_model, r.id AS reservation_id, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 AND j.key_id = $2"
             }
         };
         let row = sqlx::query(select)
@@ -887,11 +887,21 @@ impl Database {
             ));
         }
 
-        let reservation_id: String = row.try_get("reservation_id")?;
-        let account_id: String = row.try_get("account_id")?;
-        let reserved_micros: i64 = row.try_get("reserved_micros")?;
-        let reserved_tokens: i64 = row.try_get("reserved_tokens")?;
-        let rate_window_start: i64 = row.try_get("rate_window_start")?;
+        let reservation = UsageReservation {
+            id: parse_uuid(row.try_get("reservation_id")?)?,
+            account_id: parse_uuid(row.try_get("account_id")?)?,
+            key_id,
+            enforcement_mode: EnforcementMode::from_storage(
+                row.try_get::<String, _>("enforcement_mode")?.as_str(),
+            )
+            .ok_or(AppError::Internal)?,
+            reserved_micros: row.try_get("reserved_micros")?,
+            input_micros_per_million: 0,
+            output_micros_per_million: 0,
+            price_tiers: Vec::new(),
+            rate_window_start: row.try_get("rate_window_start")?,
+            reserved_tokens: row.try_get("reserved_tokens")?,
+        };
         let reservation_status: String = row.try_get("reservation_status")?;
         let actual_micros: Option<i64> = row.try_get("actual_micros")?;
         let created_at: i64 = row.try_get("created_at")?;
@@ -904,75 +914,12 @@ impl Database {
             ));
         }
         if reservation_status == "reserved" {
-            lock_key_budget_state(&mut transaction, key_id, now).await?;
-            sqlx::query("UPDATE credit_accounts SET updated_at = updated_at WHERE id = $1")
-                .bind(&account_id)
-                .execute(&mut *transaction)
-                .await?;
-            let settled = sqlx::query(
-                "UPDATE usage_reservations SET actual_micros = 0, status = 'settled', settled_at = $1 WHERE id = $2 AND status = 'reserved'",
+            settle_token_usage_in_transaction(
+                &mut transaction,
+                &reservation,
+                &TokenUsage::default(),
+                now,
             )
-            .bind(now)
-            .bind(&reservation_id)
-            .execute(&mut *transaction)
-            .await?;
-            if settled.rows_affected() != 1 {
-                return Err(AppError::Internal);
-            }
-            let budget_state = sqlx::query(
-                "UPDATE key_budget_state SET reserved_micros = reserved_micros - $1, updated_at = $2 WHERE key_id = $3 AND reserved_micros >= $4",
-            )
-            .bind(reserved_micros)
-            .bind(now)
-            .bind(key_id.to_string())
-            .bind(reserved_micros)
-            .execute(&mut *transaction)
-            .await?;
-            if budget_state.rows_affected() != 1 {
-                return Err(AppError::Internal);
-            }
-            sqlx::query(
-                "UPDATE credit_accounts SET available_micros = available_micros + $1, reserved_micros = reserved_micros - $2, updated_at = $3 WHERE id = $4",
-            )
-            .bind(reserved_micros)
-            .bind(reserved_micros)
-            .bind(now)
-            .bind(&account_id)
-            .execute(&mut *transaction)
-            .await?;
-            sqlx::query(
-                "UPDATE rate_limit_windows SET tokens = CASE WHEN tokens > $1 THEN tokens - $2 ELSE 0 END WHERE key_id = $3 AND window_start = $4",
-            )
-            .bind(reserved_tokens)
-            .bind(reserved_tokens)
-            .bind(key_id.to_string())
-            .bind(rate_window_start)
-            .execute(&mut *transaction)
-            .await?;
-            let usage_ledger_entry_id = Uuid::now_v7();
-            let usage_ledger = sqlx::query(
-                "INSERT INTO ledger_entries (id, account_id, key_id, kind, amount_micros, currency, source, created_at) SELECT $1, $2, $3, 'usage', 0, currency, $4, $5 FROM credit_accounts WHERE id = $6",
-            )
-            .bind(usage_ledger_entry_id.to_string())
-            .bind(&account_id)
-            .bind(key_id.to_string())
-            .bind(&reservation_id)
-            .bind(now)
-            .bind(&account_id)
-            .execute(&mut *transaction)
-            .await?;
-            if usage_ledger.rows_affected() != 1 {
-                return Err(AppError::Internal);
-            }
-            sqlx::query(
-                "INSERT INTO key_budget_usage_events (usage_entry_id, reservation_id, key_id, account_id, amount_micros, settled_at) VALUES ($1, $2, $3, $4, 0, $5)",
-            )
-            .bind(usage_ledger_entry_id.to_string())
-            .bind(&reservation_id)
-            .bind(key_id.to_string())
-            .bind(&account_id)
-            .bind(now)
-            .execute(&mut *transaction)
             .await?;
         }
 
@@ -1061,7 +1008,7 @@ impl Database {
             return Ok(None);
         }
         let row = sqlx::query(
-            "SELECT j.id, j.created_at, j.tenant_id, j.key_id, j.model_route_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.submission_nonce, j.staged_assets_json, j.billing_unit_snapshot, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, j.micros_per_unit_snapshot FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
+            "SELECT j.id, j.created_at, j.tenant_id, j.key_id, j.model_route_id, j.upstream_account_id, j.public_model, j.upstream_model, j.driver, j.status, j.request_object, j.upstream_job_id, j.submission_nonce, j.staged_assets_json, j.billing_unit_snapshot, j.estimated_units, j.attempt_count, j.failure_count, r.id AS reservation_id, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, j.micros_per_unit_snapshot FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
         )
         .bind(&job_id)
         .fetch_one(&mut *transaction)
@@ -1092,6 +1039,10 @@ impl Database {
                 id: parse_uuid(row.try_get("reservation_id")?)?,
                 account_id: parse_uuid(row.try_get("account_id")?)?,
                 key_id,
+                enforcement_mode: EnforcementMode::from_storage(
+                    row.try_get::<String, _>("enforcement_mode")?.as_str(),
+                )
+                .ok_or(AppError::Internal)?,
                 reserved_micros: row.try_get("reserved_micros")?,
                 input_micros_per_million: 0,
                 output_micros_per_million: if billing_unit == "megapixel" {
@@ -1386,7 +1337,7 @@ async fn fail_preparing_generation_in_transaction(
 ) -> Result<bool, AppError> {
     validate_generation_preparation_error(error_code)?;
     let row = sqlx::query(
-        "SELECT j.status, j.created_at, j.tenant_id, j.key_id, j.public_model, r.id AS reservation_id, r.account_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
+        "SELECT j.status, j.created_at, j.tenant_id, j.key_id, j.public_model, r.id AS reservation_id, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1",
     )
     .bind(job_id.to_string())
     .fetch_optional(&mut **tx)
@@ -1404,6 +1355,10 @@ async fn fail_preparing_generation_in_transaction(
         id: parse_uuid(row.try_get("reservation_id")?)?,
         account_id: parse_uuid(row.try_get("account_id")?)?,
         key_id,
+        enforcement_mode: EnforcementMode::from_storage(
+            row.try_get::<String, _>("enforcement_mode")?.as_str(),
+        )
+        .ok_or(AppError::Internal)?,
         reserved_micros: row.try_get("reserved_micros")?,
         input_micros_per_million: 0,
         output_micros_per_million: 0,

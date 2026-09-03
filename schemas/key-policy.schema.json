@@ -8,6 +8,15 @@
     "requests_per_minute": { "title": "Requests per minute", "type": "integer", "minimum": 1, "maximum": 4294967295, "default": 60 },
     "tokens_per_minute": { "title": "Tokens per minute", "type": "integer", "minimum": 1, "maximum": 9007199254740991, "default": 100000 },
     "max_concurrency": { "title": "Maximum concurrency", "type": "integer", "minimum": 1, "maximum": 4294967295, "default": 4 },
+    "enforcement_mode": {
+      "title": "Enforcement mode",
+      "description": "Prepaid enforces balance and policy limits synchronously. Metered unlimited records exact postpaid usage without those shared admission limits.",
+      "oneOf": [
+        { "const": "prepaid", "title": "Prepaid limits" },
+        { "const": "metered_unlimited", "title": "Metered unlimited" }
+      ],
+      "default": "prepaid"
+    },
     "daily_budget": { "$ref": "#/$defs/decimal" },
     "weekly_budget": { "$ref": "#/$defs/decimal" },
     "lifetime_budget": { "$ref": "#/$defs/decimal" }

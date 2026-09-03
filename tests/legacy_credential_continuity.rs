@@ -7,7 +7,7 @@ use memeloop_token_center::{
     config::Config,
     crypto,
     db::{CreateKeyInput, FinishRequest, NewRequest},
-    model::KeyPolicy,
+    model::{EnforcementMode, KeyPolicy},
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -61,6 +61,7 @@ async fn opaque_normal_credential_preserves_identity_history_policy_and_balance(
         requests_per_minute: 7,
         tokens_per_minute: 7000,
         max_concurrency: 2,
+        enforcement_mode: EnforcementMode::Prepaid,
         daily_budget: Some("5".into()),
         weekly_budget: Some("20".into()),
         lifetime_budget: Some("50".into()),

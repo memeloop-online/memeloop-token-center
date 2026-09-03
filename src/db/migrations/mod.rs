@@ -325,6 +325,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "normalize imported key credentials",
         sql: include_str!("../../../migrations/sqlite/0060_normalize_key_credentials.sql"),
     },
+    Migration {
+        version: 61,
+        name: "metered unlimited usage projection outbox",
+        sql: include_str!("../../../migrations/common/0061_metered_unlimited_usage.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -635,6 +640,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 60,
         name: "normalize imported key credentials",
         sql: include_str!("../../../migrations/postgres/0060_normalize_key_credentials.sql"),
+    },
+    Migration {
+        version: 61,
+        name: "metered unlimited usage projection outbox",
+        sql: include_str!("../../../migrations/common/0061_metered_unlimited_usage.sql"),
     },
 ];
 

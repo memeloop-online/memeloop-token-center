@@ -91,7 +91,7 @@ impl Database {
         let now = unix_millis();
         let cutoff = now.saturating_sub(30 * 60 * 1_000);
         let rows = sqlx::query(
-            "SELECT r.id, r.account_id, r.key_id, r.reserved_micros, r.reserved_tokens, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at, q.tenant_id AS request_tenant_id, q.error_code AS pending_error_code, q.input_tokens AS pending_input_tokens, q.output_tokens AS pending_output_tokens, q.service_tier AS pending_service_tier FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE (r.status = 'reserved' OR (r.status = 'settled' AND q.id IS NOT NULL)) AND r.created_at < $1 AND q.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.reservation_id = r.id AND s.status = 'pending' AND s.lease_expires_at > $2) ORDER BY r.created_at, r.id LIMIT $3",
+            "SELECT r.id, r.account_id, r.key_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, q.id AS request_id, q.created_at AS request_created_at, q.tenant_id AS request_tenant_id, q.error_code AS pending_error_code, q.input_tokens AS pending_input_tokens, q.output_tokens AS pending_output_tokens, q.service_tier AS pending_service_tier FROM usage_reservations r LEFT JOIN request_records q ON q.reservation_id = r.id WHERE (r.status = 'reserved' OR (r.status = 'settled' AND q.id IS NOT NULL)) AND r.created_at < $1 AND q.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM generation_jobs g WHERE g.reservation_id = r.id) AND NOT EXISTS (SELECT 1 FROM synchronous_image_idempotency s WHERE s.reservation_id = r.id AND s.status = 'pending' AND s.lease_expires_at > $2) ORDER BY r.created_at, r.id LIMIT $3",
         )
         .bind(cutoff)
         .bind(now)
@@ -113,6 +113,10 @@ impl Database {
                 id: parse_uuid(row.try_get("id")?)?,
                 account_id: parse_uuid(row.try_get("account_id")?)?,
                 key_id: parse_uuid(row.try_get("key_id")?)?,
+                enforcement_mode: EnforcementMode::from_storage(
+                    row.try_get::<String, _>("enforcement_mode")?.as_str(),
+                )
+                .ok_or(AppError::Internal)?,
                 reserved_micros: row.try_get("reserved_micros")?,
                 input_micros_per_million: 0,
                 output_micros_per_million: 0,
@@ -327,13 +331,44 @@ pub(crate) async fn reserve_usage_in_transaction(
             reason: LimitReason::TpmExhausted,
             retry_after_seconds: Some(60),
         })?;
+    let window_start = now / 60_000 * 60_000;
+    if !key.policy.enforcement_mode.enforces_prepaid_limits() {
+        let id = Uuid::now_v7();
+        let price_snapshot_json = serde_json::to_string(price).map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, rate_window_start, status, created_at, price_snapshot_json, enforcement_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, 'reserved', $8, $9, $10)",
+        )
+        .bind(id.to_string())
+        .bind(key.account_id.to_string())
+        .bind(key.key_id.to_string())
+        .bind(price.id.to_string())
+        .bind(reserved_micros)
+        .bind(reserved_tokens)
+        .bind(window_start)
+        .bind(now)
+        .bind(price_snapshot_json)
+        .bind(key.policy.enforcement_mode.as_str())
+        .execute(&mut **tx)
+        .await?;
+        return Ok(UsageReservation {
+            id,
+            account_id: key.account_id,
+            key_id: key.key_id,
+            enforcement_mode: key.policy.enforcement_mode,
+            reserved_micros,
+            input_micros_per_million: price.input_micros_per_million,
+            output_micros_per_million: price.output_micros_per_million,
+            price_tiers: price.tiers.clone(),
+            rate_window_start: window_start,
+            reserved_tokens,
+        });
+    }
     if reserved_tokens > key.policy.tokens_per_minute as i64 {
         return Err(AppError::LimitExceeded {
             reason: LimitReason::TpmExhausted,
             retry_after_seconds: Some(retry_after_until(now / 60_000 * 60_000 + 60_000, now)),
         });
     }
-    let window_start = now / 60_000 * 60_000;
     let (settled_lifetime_micros, active_reserved) =
         lock_key_budget_state(tx, key.key_id, now).await?;
 
@@ -477,7 +512,7 @@ pub(crate) async fn reserve_usage_in_transaction(
     let id = Uuid::now_v7();
     let price_snapshot_json = serde_json::to_string(price).map_err(|_| AppError::Internal)?;
     sqlx::query(
-        "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, rate_window_start, status, created_at, price_snapshot_json) VALUES ($1, $2, $3, $4, $5, $6, $7, 'reserved', $8, $9)",
+        "INSERT INTO usage_reservations (id, account_id, key_id, price_id, reserved_micros, reserved_tokens, rate_window_start, status, created_at, price_snapshot_json, enforcement_mode) VALUES ($1, $2, $3, $4, $5, $6, $7, 'reserved', $8, $9, $10)",
     )
     .bind(id.to_string())
     .bind(key.account_id.to_string())
@@ -488,12 +523,14 @@ pub(crate) async fn reserve_usage_in_transaction(
     .bind(window_start)
     .bind(now)
     .bind(price_snapshot_json)
+    .bind(key.policy.enforcement_mode.as_str())
     .execute(&mut **tx)
     .await?;
     Ok(UsageReservation {
         id,
         account_id: key.account_id,
         key_id: key.key_id,
+        enforcement_mode: key.policy.enforcement_mode,
         reserved_micros,
         input_micros_per_million: price.input_micros_per_million,
         output_micros_per_million: price.output_micros_per_million,
@@ -525,6 +562,76 @@ pub(crate) async fn settle_token_usage_in_transaction_with_charge(
         Some(_) => return Err(AppError::Internal),
         None => price_token_usage(reservation, usage)?,
     };
+    if !reservation.enforcement_mode.enforces_prepaid_limits() {
+        let claimed = sqlx::query(
+            "UPDATE usage_reservations SET actual_micros = $1, status = 'settled', settled_at = $2 WHERE id = $3 AND key_id = $4 AND account_id = $5 AND enforcement_mode = 'metered_unlimited' AND status = 'reserved'",
+        )
+        .bind(calculated_micros)
+        .bind(now)
+        .bind(reservation.id.to_string())
+        .bind(reservation.key_id.to_string())
+        .bind(reservation.account_id.to_string())
+        .execute(&mut **tx)
+        .await?;
+        if claimed.rows_affected() == 0 {
+            return sqlx::query(
+                "SELECT actual_micros FROM usage_reservations WHERE id = $1 AND key_id = $2 AND account_id = $3 AND enforcement_mode = 'metered_unlimited' AND status = 'settled'",
+            )
+            .bind(reservation.id.to_string())
+            .bind(reservation.key_id.to_string())
+            .bind(reservation.account_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(AppError::NotFound)?
+            .try_get("actual_micros")
+            .map_err(AppError::from);
+        }
+
+        let usage_ledger_entry_id = Uuid::now_v7();
+        let idempotency_key = format!("metered-usage:{}", reservation.id);
+        let usage_ledger = sqlx::query(
+            "INSERT INTO ledger_entries (id, account_id, key_id, kind, amount_micros, currency, source, idempotency_key, created_at) SELECT $1, $2, $3, 'usage', $4, currency, $5, $6, $7 FROM credit_accounts WHERE id = $8 ON CONFLICT DO NOTHING",
+        )
+        .bind(usage_ledger_entry_id.to_string())
+        .bind(reservation.account_id.to_string())
+        .bind(reservation.key_id.to_string())
+        .bind(-calculated_micros)
+        .bind(reservation.id.to_string())
+        .bind(&idempotency_key)
+        .bind(now)
+        .bind(reservation.account_id.to_string())
+        .execute(&mut **tx)
+        .await?;
+        if usage_ledger.rows_affected() != 1 {
+            let replay_matches: i64 = sqlx::query(
+                "SELECT COUNT(*) AS matching FROM ledger_entries WHERE idempotency_key = $1 AND account_id = $2 AND key_id = $3 AND kind = 'usage' AND amount_micros = $4 AND source = $5",
+            )
+            .bind(&idempotency_key)
+            .bind(reservation.account_id.to_string())
+            .bind(reservation.key_id.to_string())
+            .bind(-calculated_micros)
+            .bind(reservation.id.to_string())
+            .fetch_one(&mut **tx)
+            .await?
+            .try_get("matching")?;
+            if replay_matches != 1 {
+                return Err(AppError::Conflict(
+                    "metered usage ledger ownership mismatch".into(),
+                ));
+            }
+        }
+        sqlx::query(
+            "INSERT INTO metered_usage_projection_outbox (reservation_id, account_id, key_id, actual_micros, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(reservation_id) DO NOTHING",
+        )
+        .bind(reservation.id.to_string())
+        .bind(reservation.account_id.to_string())
+        .bind(reservation.key_id.to_string())
+        .bind(calculated_micros)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(calculated_micros);
+    }
     let (settled_lifetime_micros, reserved_micros) =
         lock_key_budget_state(tx, reservation.key_id, now).await?;
     sqlx::query("UPDATE credit_accounts SET updated_at = updated_at WHERE id = $1")

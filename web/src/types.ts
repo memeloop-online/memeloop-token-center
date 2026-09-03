@@ -224,6 +224,7 @@ export interface KeyView {
     requests_per_minute: number;
     tokens_per_minute: number;
     max_concurrency: number;
+    enforcement_mode: 'prepaid' | 'metered_unlimited';
     daily_budget: string | null;
     weekly_budget: string | null;
     lifetime_budget: string | null;
