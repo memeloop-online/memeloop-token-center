@@ -109,9 +109,7 @@ async fn interactive_reauthorization_preserves_stable_identity_routes_and_replay
                     header: "authorization".into(),
                     prefix: "Bearer ".into(),
                     adapter_state: None,
-                    proxy_url: Some(
-                        "socks5://proxy-user:proxy-secret@100.64.0.16:1080".into(),
-                    ),
+                    proxy_url: Some("socks5://proxy-user:proxy-secret@100.64.0.16:1080".into()),
                     proxy_network_scope: Some(
                         memeloop_token_center::network::OutboundScope::Private,
                     ),
