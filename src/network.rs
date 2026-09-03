@@ -339,7 +339,15 @@ pub fn is_public_ip(address: IpAddr) -> bool {
 
 pub(crate) fn is_safe_private_upstream_ip(address: IpAddr) -> bool {
     match address {
-        IpAddr::V4(address) => address.is_private(),
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            let is_tailnet = octets[0] == 100
+                && (64..=127).contains(&octets[1])
+                // The Tailscale local API / metadata address is never a
+                // provider or operator proxy endpoint.
+                && octets != [100, 100, 100, 200];
+            address.is_private() || is_tailnet
+        }
         IpAddr::V6(address) => {
             address.to_ipv4_mapped().is_none() && (address.segments()[0] & 0xfe00) == 0xfc00
         }
@@ -510,8 +518,20 @@ mod tests {
             .await
             .is_ok()
         );
+        assert!(
+            client_for_url(
+                &shared,
+                "https://100.64.0.16/provider",
+                OutboundScope::Private,
+                false,
+            )
+            .await
+            .is_ok()
+        );
         for endpoint in [
             "https://169.254.169.254/latest/meta-data",
+            "https://100.100.100.200/localapi",
+            "https://127.0.0.1/provider",
             "https://[::1]/provider",
             "https://[::ffff:169.254.169.254]/provider",
             "https://[64:ff9b::a9fe:a9fe]/provider",
@@ -578,6 +598,12 @@ mod tests {
         ];
         assert!(validate_addresses(&private, OutboundScope::Private, false).is_ok());
         assert!(validate_addresses(&private, OutboundScope::Public, false).is_err());
+
+        let tailnet = ["100.64.0.16:443".parse().unwrap()];
+        assert!(validate_addresses(&tailnet, OutboundScope::Private, false).is_ok());
+        assert!(validate_addresses(&tailnet, OutboundScope::Public, false).is_err());
+        let tailnet_metadata = ["100.100.100.200:443".parse().unwrap()];
+        assert!(validate_addresses(&tailnet_metadata, OutboundScope::Private, false).is_err());
 
         let addresses = [
             "1.1.1.1:443".parse().unwrap(),

@@ -410,6 +410,8 @@ mod tests {
             header: "authorization".into(),
             prefix: "Bearer ".into(),
             adapter_state: None,
+            proxy_url: None,
+            proxy_network_scope: None,
         };
         let error = refresh_cursor_credential(
             &crate::build_http_client().unwrap(),

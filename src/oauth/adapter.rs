@@ -63,7 +63,19 @@ pub async fn normalize_managed_oauth_document(
 ) -> Result<ManagedOAuthNormalizedAccount, AppError> {
     match adapter.backend() {
         ManagedOAuthAdapterBackend::BuiltinCodex => {
-            return managed::codex::normalize(payload);
+            let normalized = managed::codex::normalize(payload)?;
+            if normalized.credential.proxy().is_some() {
+                network::client_for_config_url(
+                    http,
+                    &validate_config(&normalized.config)?,
+                    &normalized.config,
+                    normalized.credential.proxy(),
+                    allow_test_loopback,
+                )
+                .await
+                .map_err(|_| AppError::BadRequest("CPA Codex OAuth document is invalid".into()))?;
+            }
+            return Ok(normalized);
         }
         ManagedOAuthAdapterBackend::BuiltinLegacyGemini => {
             return managed::legacy_gemini::normalize(payload);

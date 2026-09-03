@@ -188,6 +188,8 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
                         "schema": "openai-codex-oauth-v1",
                         "account_id": "account-123"
                     })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
                 },
                 oauth_session_id: Some(Uuid::now_v7()),
                 oauth_driver: Some("openai_codex_device".into()),

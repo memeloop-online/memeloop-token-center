@@ -290,6 +290,8 @@ impl ProviderCatalog {
                         "expires_at": {"type": "integer", "description": "Unix milliseconds"},
                         "header": {"type": "string", "default": "authorization"},
                         "prefix": {"type": "string", "default": "Bearer "},
+                        "proxy_url": {"type": "string", "pattern": "^socks5://", "minLength": 1, "maxLength": 2048, "writeOnly": true},
+                        "proxy_network_scope": {"type": "string", "const": "private"},
                         "adapter_state": {
                             "description": "Opaque encrypted state for a server-installed managed OAuth adapter.",
                             "writeOnly": true
@@ -740,6 +742,8 @@ fn builtin_managed_oauth_provider(
                 "expires_at": {"type": "integer", "description": "Unix milliseconds"},
                 "header": {"const": "authorization"},
                 "prefix": {"const": "Bearer "},
+                "proxy_url": {"type": "string", "pattern": "^socks5://", "minLength": 1, "maxLength": 2048, "writeOnly": true},
+                "proxy_network_scope": {"type": "string", "const": "private"},
                 "adapter_state": {"type": "object", "writeOnly": true}
             }
         }),

@@ -208,6 +208,8 @@ async fn seed_replay_with_expiry(
                     header: "authorization".into(),
                     prefix: "Bearer ".into(),
                     adapter_state: None,
+                    proxy_url: None,
+                    proxy_network_scope: None,
                 },
                 status: ManagedOAuthImportStatus::Active,
                 adapter: state
@@ -446,6 +448,8 @@ async fn legacy_gemini_remains_importable_without_advertising_or_scheduling_refr
                         "schema": "cpa-gemini-cli-oauth-v1",
                         "project_id": "legacy-project-123"
                     })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
                 },
                 status: ManagedOAuthImportStatus::Active,
                 adapter: state

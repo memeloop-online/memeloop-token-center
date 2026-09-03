@@ -40,6 +40,8 @@ struct CodexDocument {
     expired: String,
     #[serde(default)]
     disabled: bool,
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -64,6 +66,12 @@ pub fn normalize(payload: &Value) -> Result<ManagedOAuthNormalizedAccount, AppEr
         super::account_name(document.email.as_deref(), "Codex account", "CPA Codex")?;
     let _ = super::timestamp_millis(&document.last_refresh, "CPA Codex")?;
     let expires_at = super::timestamp_millis(&document.expired, "CPA Codex")?;
+    let proxy_url = document
+        .proxy_url
+        .as_deref()
+        .map(normalize_private_proxy_url)
+        .transpose()?;
+    let proxy_network_scope = proxy_url.as_ref().map(|_| OutboundScope::Private);
 
     Ok(ManagedOAuthNormalizedAccount {
         account_name,
@@ -86,8 +94,48 @@ pub fn normalize(payload: &Value) -> Result<ManagedOAuthNormalizedAccount, AppEr
                 "schema": "cpa-codex-oauth-v1",
                 "account_id": document.account_id,
             })),
+            proxy_url,
+            proxy_network_scope,
         },
     })
+}
+
+/// CPA accepted both SOCKS spellings. MTC deliberately uses local DNS
+/// resolution and address pinning, so only an IP-literal `socks5h` URL has an
+/// unambiguous safe equivalent. DNS names must already use `socks5` and are
+/// resolved/classified by the outbound network boundary before persistence.
+fn normalize_private_proxy_url(value: &str) -> Result<String, AppError> {
+    if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
+        return Err(invalid_document());
+    }
+    let mut parsed = url::Url::parse(value).map_err(|_| invalid_document())?;
+    if !matches!(parsed.scheme(), "socks5" | "socks5h")
+        || parsed.host_str().is_none()
+        || parsed.port().is_none_or(|port| port == 0)
+        || (parsed.path() != "" && parsed.path() != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(invalid_document());
+    }
+    match parsed.host().ok_or_else(invalid_document)? {
+        url::Host::Ipv4(address) => {
+            if !network::is_safe_private_upstream_ip(address.into()) {
+                return Err(invalid_document());
+            }
+        }
+        url::Host::Ipv6(address) => {
+            if !network::is_safe_private_upstream_ip(address.into()) {
+                return Err(invalid_document());
+            }
+        }
+        url::Host::Domain(_) if parsed.scheme() == "socks5h" => return Err(invalid_document()),
+        url::Host::Domain(_) => {}
+    }
+    parsed
+        .set_scheme("socks5")
+        .map_err(|_| invalid_document())?;
+    Ok(parsed.to_string())
 }
 
 pub async fn refresh(
@@ -118,10 +166,15 @@ async fn refresh_at(
         .map_err(|_| AppError::BadRequest("OpenAI Codex OAuth credential is invalid".into()))?;
     validate_adapter_state(adapter_state.as_ref())?;
 
-    let client =
-        network::client_for_url(http, endpoint, OutboundScope::Public, allow_test_loopback)
-            .await
-            .map_err(|_| refresh_failed())?;
+    let client = network::client_for_config_url(
+        http,
+        endpoint,
+        &json!({"network_scope": "public"}),
+        credential.proxy(),
+        allow_test_loopback,
+    )
+    .await
+    .map_err(|_| refresh_failed())?;
     let form = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", "refresh_token")
         .append_pair("client_id", CLIENT_ID)
@@ -177,6 +230,8 @@ async fn refresh_at(
         header: "authorization".to_owned(),
         prefix: "Bearer ".to_owned(),
         adapter_state: adapter_state.clone(),
+        proxy_url: credential.proxy().map(|(url, _)| url.to_owned()),
+        proxy_network_scope: credential.proxy().map(|(_, scope)| scope),
     })
 }
 
@@ -269,7 +324,13 @@ fn refresh_failed() -> AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, SocketAddr};
+
     use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_string_contains, header, method, path},
@@ -305,6 +366,8 @@ mod tests {
                 "schema": schema,
                 "account_id": "account-123"
             })),
+            proxy_url: None,
+            proxy_network_scope: None,
         }
     }
 
@@ -348,6 +411,59 @@ mod tests {
         let mut unnamed = document();
         unnamed.as_object_mut().unwrap().remove("email");
         assert_eq!(normalize(&unnamed).unwrap().account_name, "Codex account");
+    }
+
+    #[test]
+    fn normalizes_only_reviewable_private_cpa_proxy_shapes() {
+        let mut literal = document();
+        literal["proxy_url"] = json!("socks5h://proxy-user:proxy-secret@100.64.0.16:1080");
+        let normalized = normalize(&literal).unwrap();
+        assert_eq!(
+            normalized.credential.proxy(),
+            Some((
+                "socks5://proxy-user:proxy-secret@100.64.0.16:1080",
+                OutboundScope::Private
+            ))
+        );
+        let debug = format!("{:?}", normalized.credential);
+        assert!(!debug.contains("proxy-secret"));
+        assert!(!debug.contains("100.64.0.16"));
+
+        let mut private_dns = document();
+        private_dns["proxy_url"] = json!("socks5://proxy.service.svc.cluster.local:1080");
+        assert_eq!(
+            normalize(&private_dns).unwrap().credential.proxy(),
+            Some((
+                "socks5://proxy.service.svc.cluster.local:1080",
+                OutboundScope::Private
+            ))
+        );
+
+        for value in [
+            "socks5h://proxy.service.svc.cluster.local:1080",
+            "socks5h://8.8.8.8:1080",
+            "socks5://127.0.0.1:1080",
+            "socks5://169.254.169.254:1080",
+            "socks5://100.100.100.200:1080",
+            "http://100.64.0.16:1080",
+            "socks5://100.64.0.16",
+            "socks5://100.64.0.16:1080/path",
+            "socks5://100.64.0.16:1080?token=secret",
+            "socks5://100.64.0.16:1080#secret",
+            " socks5://100.64.0.16:1080",
+            "socks5://100.64.0.16:1080\nnext",
+        ] {
+            let mut rejected = document();
+            rejected["proxy_url"] = json!(value);
+            let error = normalize(&rejected).unwrap_err();
+            let rendered = format!("{error:?} {error}");
+            assert_eq!(
+                error.to_string(),
+                "invalid request: CPA Codex OAuth document is invalid",
+                "{value}"
+            );
+            assert!(!rendered.contains(value));
+        }
     }
 
     #[test]
@@ -449,18 +565,73 @@ mod tests {
             .and(body_string_contains(format!("client_id={CLIENT_ID}")))
             .and(body_string_contains("refresh_token=old-refresh-secret"))
             .and(body_string_contains("scope=openid+profile+email"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "access_token": "new-access-secret",
-                "refresh_token": "new-refresh-secret",
-                "expires_in": 3600,
-                "token_type": "Bearer"
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("connection", "close")
+                    .set_body_json(json!({
+                        "access_token": "new-access-secret",
+                        "refresh_token": "new-refresh-secret",
+                        "expires_in": 3600,
+                        "token_type": "Bearer"
+                    })),
+            )
             .mount(&server)
             .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let target_address = *server.address();
+        let proxy = tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut greeting = [0_u8; 2];
+            client.read_exact(&mut greeting).await.unwrap();
+            let mut methods = vec![0_u8; usize::from(greeting[1])];
+            client.read_exact(&mut methods).await.unwrap();
+            client.write_all(&[5, 0]).await.unwrap();
+
+            let mut request = [0_u8; 4];
+            client.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..3], &[5, 1, 0]);
+            let ip = match request[3] {
+                1 => {
+                    let mut bytes = [0_u8; 4];
+                    client.read_exact(&mut bytes).await.unwrap();
+                    IpAddr::from(bytes)
+                }
+                4 => {
+                    let mut bytes = [0_u8; 16];
+                    client.read_exact(&mut bytes).await.unwrap();
+                    IpAddr::from(bytes)
+                }
+                value => panic!("unexpected SOCKS5 address type {value}"),
+            };
+            let mut port = [0_u8; 2];
+            client.read_exact(&mut port).await.unwrap();
+            let requested = SocketAddr::new(ip, u16::from_be_bytes(port));
+            assert_eq!(requested, target_address);
+            let mut upstream = TcpStream::connect(requested).await.unwrap();
+            client
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .unwrap();
+        });
+        let mut old_credential =
+            credential_with_schema("old-refresh-secret", NATIVE_ADAPTER_SCHEMA);
+        if let UpstreamCredential::OAuth {
+            proxy_url,
+            proxy_network_scope,
+            ..
+        } = &mut old_credential
+        {
+            *proxy_url = Some(format!("socks5://{proxy_address}"));
+            *proxy_network_scope = Some(OutboundScope::Private);
+        }
         let before = crate::db::unix_millis();
         let refreshed = refresh_at(
             &crate::build_http_client().unwrap(),
-            &credential_with_schema("old-refresh-secret", NATIVE_ADAPTER_SCHEMA),
+            &old_credential,
             true,
             &format!("{}/token", server.uri()),
         )
@@ -473,6 +644,8 @@ mod tests {
         assert_eq!(rendered["prefix"], "Bearer ");
         assert_eq!(rendered["adapter_state"]["account_id"], "account-123");
         assert_eq!(rendered["adapter_state"]["schema"], NATIVE_ADAPTER_SCHEMA);
+        assert_eq!(rendered["proxy_url"], format!("socks5://{proxy_address}"));
+        assert_eq!(rendered["proxy_network_scope"], "private");
         assert!(rendered["expires_at"].as_i64().unwrap() >= before + 3_600_000);
 
         let requests = server.received_requests().await.unwrap();
@@ -486,6 +659,10 @@ mod tests {
         );
         assert!(!body.contains("client_secret"));
         assert!(!body.contains("old-access-secret"));
+        tokio::time::timeout(Duration::from_secs(2), proxy)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

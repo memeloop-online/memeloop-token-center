@@ -925,6 +925,8 @@ mod tests {
                 "schema": "cpa-codex-oauth-v1",
                 "account_id": "account-123"
             })),
+            proxy_url: None,
+            proxy_network_scope: None,
         };
         let request_id = Uuid::nil();
         let request = apply_wire_headers(
@@ -965,6 +967,8 @@ mod tests {
                     "schema": "cpa-codex-oauth-v1",
                     "account_id": "account-123"
                 })),
+                proxy_url: None,
+                proxy_network_scope: None,
             };
             assert!(
                 apply_wire_headers(

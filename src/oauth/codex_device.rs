@@ -479,6 +479,8 @@ async fn poll_codex_device_login_at(
                 "schema": "openai-codex-oauth-v1",
                 "account_id": claims.openai_auth.chatgpt_account_id,
             })),
+            proxy_url: None,
+            proxy_network_scope: None,
         },
         reauthorize: state.reauthorize,
     };

@@ -160,6 +160,8 @@ async fn codex_route_fixture(label: &str) -> CodexRouteFixture {
                         "schema": "cpa-codex-oauth-v1",
                         "account_id": "account-123"
                     })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
                 },
                 oauth_session_id: None,
                 oauth_driver: Some(codex_transport::DRIVER.to_owned()),
@@ -1108,6 +1110,8 @@ async fn malformed_codex_credential_and_config_fail_before_side_effects() {
                     "schema": "cpa-codex-oauth-v1",
                     "account_id": "account-123"
                 })),
+                proxy_url: None,
+                proxy_network_scope: None,
             };
             let ciphertext = crate::provider::seal_credential(
                 &invalid,

@@ -57,6 +57,13 @@ pub enum UpstreamCredential {
         /// response view.
         #[serde(default, deserialize_with = "deserialize_adapter_state")]
         adapter_state: Option<Value>,
+        /// Optional operator-approved SOCKS5 transport for this OAuth account.
+        /// Proxy authentication and private topology stay encrypted alongside
+        /// the OAuth tokens and never enter the public account configuration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy_network_scope: Option<OutboundScope>,
     },
 }
 
@@ -81,6 +88,7 @@ impl std::fmt::Debug for UpstreamCredential {
                 refresh_token,
                 expires_at,
                 adapter_state,
+                proxy_url,
                 ..
             } => formatter
                 .debug_struct("UpstreamCredential::OAuth")
@@ -88,6 +96,7 @@ impl std::fmt::Debug for UpstreamCredential {
                 .field("has_refresh_token", &refresh_token.is_some())
                 .field("expires_at", expires_at)
                 .field("has_adapter_state", &adapter_state.is_some())
+                .field("has_proxy", &proxy_url.is_some())
                 .finish(),
         }
     }
@@ -171,11 +180,14 @@ impl UpstreamCredential {
                 header,
                 prefix,
                 adapter_state,
+                proxy_url,
+                proxy_network_scope,
                 ..
             } => {
                 if let Some(state) = adapter_state {
                     validate_adapter_state(state)?;
                 }
+                validate_optional_private_proxy(proxy_url.as_deref(), *proxy_network_scope)?;
                 if expires_at.is_some_and(|expires_at| expires_at <= now) {
                     return Err(AppError::Upstream(
                         "upstream OAuth credential is expired and must be refreshed".into(),
@@ -226,6 +238,11 @@ impl UpstreamCredential {
                 proxy_network_scope,
                 ..
             } => Some((proxy_url.as_str(), *proxy_network_scope)),
+            Self::OAuth {
+                proxy_url: Some(proxy_url),
+                proxy_network_scope: Some(proxy_network_scope),
+                ..
+            } => Some((proxy_url.as_str(), *proxy_network_scope)),
             _ => None,
         }
     }
@@ -255,8 +272,47 @@ impl UpstreamCredential {
                 proxy_url: proxy_url.clone(),
                 proxy_network_scope: *proxy_network_scope,
             },
+            (
+                Self::OAuth {
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    header,
+                    prefix,
+                    adapter_state,
+                    proxy_url: None,
+                    proxy_network_scope: None,
+                },
+                Self::OAuth {
+                    proxy_url: Some(proxy_url),
+                    proxy_network_scope: Some(proxy_network_scope),
+                    ..
+                },
+            ) => Self::OAuth {
+                access_token,
+                refresh_token,
+                expires_at,
+                header,
+                prefix,
+                adapter_state,
+                proxy_url: Some(proxy_url.clone()),
+                proxy_network_scope: Some(*proxy_network_scope),
+            },
             (replacement, _) => replacement,
         }
+    }
+}
+
+fn validate_optional_private_proxy(
+    proxy_url: Option<&str>,
+    proxy_network_scope: Option<OutboundScope>,
+) -> Result<(), AppError> {
+    match (proxy_url, proxy_network_scope) {
+        (None, None) => Ok(()),
+        (Some(proxy_url), Some(OutboundScope::Private)) => validate_proxy_url(proxy_url),
+        _ => Err(AppError::BadRequest(
+            "upstream SOCKS5 proxy must use private network scope".into(),
+        )),
     }
 }
 
@@ -479,6 +535,22 @@ mod proxy_tests {
         }
     }
 
+    fn proxied_oauth() -> UpstreamCredential {
+        UpstreamCredential::OAuth {
+            access_token: "oauth-access-secret".into(),
+            refresh_token: Some("oauth-refresh-secret".into()),
+            expires_at: Some(i64::MAX),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: Some(serde_json::json!({
+                "schema": "cpa-codex-oauth-v1",
+                "account_id": "account-123"
+            })),
+            proxy_url: Some("socks5://proxy-user:proxy-secret@100.64.0.16:1080".into()),
+            proxy_network_scope: Some(OutboundScope::Private),
+        }
+    }
+
     #[test]
     fn proxied_api_key_is_encrypted_redacted_and_round_trips() {
         let credential = proxied();
@@ -542,5 +614,78 @@ mod proxy_tests {
             *proxy_network_scope = OutboundScope::Public;
         }
         assert!(public_scope.validate(0).is_err());
+    }
+
+    #[test]
+    fn oauth_proxy_is_encrypted_redacted_optional_and_preserved() {
+        let credential = proxied_oauth();
+        credential.validate(0).unwrap();
+        let debug = format!("{credential:?}");
+        for secret in [
+            "oauth-access-secret",
+            "oauth-refresh-secret",
+            "proxy-secret",
+            "100.64.0.16",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        let envelope = seal_credential(&credential, b"test-key-material").unwrap();
+        assert!(!envelope.contains("proxy-secret"));
+        let opened = open_credential(&envelope, b"test-key-material").unwrap();
+        assert_eq!(opened.proxy(), credential.proxy());
+
+        let legacy_json = serde_json::json!({
+            "type": "oauth",
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "expires_at": i64::MAX,
+            "header": "authorization",
+            "prefix": "Bearer ",
+            "adapter_state": null
+        });
+        let legacy: UpstreamCredential = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.proxy(), None);
+        legacy.validate(0).unwrap();
+
+        let replacement = UpstreamCredential::OAuth {
+            access_token: "replacement-access".into(),
+            refresh_token: Some("replacement-refresh".into()),
+            expires_at: Some(i64::MAX),
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: None,
+            proxy_network_scope: None,
+        }
+        .preserve_proxy_from(&credential);
+        assert_eq!(replacement.proxy(), credential.proxy());
+    }
+
+    #[test]
+    fn oauth_proxy_fields_must_be_paired_and_private() {
+        for (proxy_url, scope) in [
+            (Some("socks5://100.64.0.16:1080".into()), None),
+            (None, Some(OutboundScope::Private)),
+            (
+                Some("socks5://100.64.0.16:1080".into()),
+                Some(OutboundScope::Public),
+            ),
+            (
+                Some("https://100.64.0.16:1080".into()),
+                Some(OutboundScope::Private),
+            ),
+        ] {
+            let mut credential = proxied_oauth();
+            if let UpstreamCredential::OAuth {
+                proxy_url: current_url,
+                proxy_network_scope: current_scope,
+                ..
+            } = &mut credential
+            {
+                *current_url = proxy_url;
+                *current_scope = scope;
+            }
+            assert!(credential.validate(0).is_err());
+        }
     }
 }

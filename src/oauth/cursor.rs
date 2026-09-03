@@ -476,6 +476,8 @@ pub async fn poll_cursor_login(
             header: "authorization".to_owned(),
             prefix: "Bearer ".to_owned(),
             adapter_state,
+            proxy_url: None,
+            proxy_network_scope: None,
         },
         reauthorize: state.reauthorize,
     };
@@ -603,6 +605,8 @@ pub async fn refresh_cursor_credential(
         header: "authorization".to_owned(),
         prefix: "Bearer ".to_owned(),
         adapter_state,
+        proxy_url: None,
+        proxy_network_scope: None,
     })
 }
 
@@ -737,6 +741,8 @@ mod tests {
                 "schema": CURSOR_ADAPTER_SCHEMA,
                 "account_id": account_id,
             })),
+            proxy_url: None,
+            proxy_network_scope: None,
         }
     }
 
@@ -832,6 +838,8 @@ mod tests {
                 "schema": CURSOR_ADAPTER_SCHEMA,
                 "display_name": "identity-display-secret"
             })),
+            proxy_url: None,
+            proxy_network_scope: None,
         };
         let rendered = cursor_account_id(&malformed).unwrap_err().to_string();
         assert_eq!(

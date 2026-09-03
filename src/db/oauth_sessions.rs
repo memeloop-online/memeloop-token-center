@@ -553,6 +553,8 @@ mod tests {
                             "schema": "openai-codex-oauth-v1",
                             "account_id": "account-test"
                         })),
+                        proxy_url: None,
+                        proxy_network_scope: None,
                     },
                     oauth_session_id: Some(session_id),
                     oauth_driver: Some("openai_codex_device".to_owned()),
@@ -779,6 +781,8 @@ mod tests {
                 "schema": "openai-codex-oauth-v1",
                 "account_id": "account-stable"
             })),
+            proxy_url: None,
+            proxy_network_scope: None,
         }
     }
 }

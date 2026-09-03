@@ -623,6 +623,8 @@ async fn poll_at(
             adapter_state: Some(
                 serde_json::to_value(adapter_state).map_err(|_| AppError::Internal)?,
             ),
+            proxy_url: None,
+            proxy_network_scope: None,
         },
         stable_account_id,
         login: user.login,
@@ -995,6 +997,8 @@ async fn refresh_at(
         header: "authorization".into(),
         prefix: "Bearer ".into(),
         adapter_state: Some(serde_json::to_value(state).map_err(|_| AppError::Internal)?),
+        proxy_url: None,
+        proxy_network_scope: None,
     })
 }
 
@@ -1317,6 +1321,8 @@ mod tests {
             header: "authorization".into(),
             prefix: "Bearer ".into(),
             adapter_state: Some(state),
+            proxy_url: None,
+            proxy_network_scope: None,
         }
     }
 
@@ -2051,6 +2057,8 @@ mod tests {
                 header: "authorization".into(),
                 prefix: "Bearer ".into(),
                 adapter_state: None,
+                proxy_url: None,
+                proxy_network_scope: None,
             })
             .is_err()
         );

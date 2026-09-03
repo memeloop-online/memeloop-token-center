@@ -77,6 +77,8 @@ async fn two_postgres_pools_share_single_poll_and_finalize_owners() {
                         "schema": "openai-codex-oauth-v1",
                         "account_id": format!("account-{suffix}")
                     })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
                 },
                 oauth_session_id: Some(session_id),
                 oauth_driver: Some("openai_codex_device".to_owned()),

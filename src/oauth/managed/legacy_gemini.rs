@@ -77,6 +77,8 @@ pub fn normalize(payload: &Value) -> Result<ManagedOAuthNormalizedAccount, AppEr
                 "schema": "cpa-gemini-cli-oauth-v1",
                 "project_id": document.project_id,
             })),
+            proxy_url: None,
+            proxy_network_scope: None,
         },
     })
 }

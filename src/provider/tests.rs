@@ -21,6 +21,8 @@ fn credential_envelope_round_trips_without_plaintext() {
         header: authorization_header(),
         prefix: bearer_prefix(),
         adapter_state: None,
+        proxy_url: None,
+        proxy_network_scope: None,
     };
     let envelope = seal_credential(&credential, b"a key material with at least 32 bytes").unwrap();
     assert!(envelope.starts_with("v2."));
@@ -125,6 +127,8 @@ fn credential_debug_omits_custom_auth_metadata_and_secrets() {
         header: "MTC-CANARY-OAUTH-HEADER".to_owned(),
         prefix: "MTC_CANARY_OAUTH_PREFIX ".to_owned(),
         adapter_state: Some(json!({"secret": "MTC_CANARY_ADAPTER_STATE"})),
+        proxy_url: None,
+        proxy_network_scope: None,
     };
 
     for (credential, kind, canaries) in [

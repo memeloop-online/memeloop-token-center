@@ -478,6 +478,8 @@ async fn finish_claimed_login(
                 "schema": "anthropic-claude-oauth-v1",
                 "account_id": account_id,
             })),
+            proxy_url: None,
+            proxy_network_scope: None,
         },
         reauthorize: state.reauthorize,
     })
@@ -540,6 +542,8 @@ async fn refresh_claude_credential_at(
         header: "authorization".into(),
         prefix: "Bearer ".into(),
         adapter_state: adapter_state.clone(),
+        proxy_url: None,
+        proxy_network_scope: None,
     })
 }
 
@@ -837,6 +841,8 @@ mod tests {
                 "schema": "anthropic-claude-oauth-v1",
                 "account_id": ACCOUNT_UUID,
             })),
+            proxy_url: None,
+            proxy_network_scope: None,
         }
     }
 
