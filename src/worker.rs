@@ -5,14 +5,16 @@ use uuid::Uuid;
 
 use crate::{
     AppState, api, archive_reaper::ArchiveReaper, archive_staging::ArchiveStagingLeaseOwner,
-    generation,
+    generation, metrics::BackgroundProjectionKind,
 };
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const ORPHANED_RESERVATION_REAPER_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const GENERATION_INTERVAL: Duration = Duration::from_millis(500);
+const PROJECTION_INTERVAL: Duration = Duration::from_secs(1);
 const OAUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const OAUTH_REFRESH_AHEAD_MILLIS: i64 = 5 * 60 * 1_000;
+const PROJECTION_BATCH_LIMIT: i64 = 32;
 
 pub async fn run(state: AppState) {
     let (shutdown_sender, shutdown) = watch::channel(false);
@@ -28,6 +30,7 @@ pub async fn run_until_shutdown(state: AppState, mut shutdown: watch::Receiver<b
         return;
     }
     let worker_id = format!("worker-{}", Uuid::now_v7());
+    let projection_owner = Uuid::now_v7();
     let reaper_owner = ArchiveStagingLeaseOwner::new(format!("archive-reaper-{}", Uuid::now_v7()))
         .expect("reaper owner is canonical safe ASCII");
     let reaper = ArchiveReaper::new(state.db.clone(), state.archive.clone(), reaper_owner);
@@ -42,6 +45,8 @@ pub async fn run_until_shutdown(state: AppState, mut shutdown: watch::Receiver<b
     orphaned_reservation_reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut generations = tokio::time::interval(GENERATION_INTERVAL);
     generations.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut projections = tokio::time::interval(PROJECTION_INTERVAL);
+    projections.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut oauth_refresh = tokio::time::interval(OAUTH_REFRESH_INTERVAL);
     oauth_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -108,6 +113,10 @@ pub async fn run_until_shutdown(state: AppState, mut shutdown: watch::Receiver<b
                     tracing::error!(%error, "worker failed to claim or update a generation job");
                 }
             }
+            _ = projections.tick() => {
+                process_metered_usage_projection_batch(&state, projection_owner).await;
+                process_conversation_projection_batch(&state, projection_owner).await;
+            }
             _ = oauth_refresh.tick() => {
                 let refresh_before = crate::db::unix_millis()
                     .saturating_add(OAUTH_REFRESH_AHEAD_MILLIS);
@@ -146,6 +155,84 @@ pub async fn run_until_shutdown(state: AppState, mut shutdown: watch::Receiver<b
     }
 }
 
+async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: Uuid) {
+    let tasks = match state
+        .db
+        .claim_metered_usage_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            state
+                .metrics
+                .observe_background_projection(BackgroundProjectionKind::MeteredUsage, false);
+            tracing::error!(%error, "worker failed to claim metered usage projection tasks");
+            return;
+        }
+    };
+    for task in tasks {
+        match state
+            .db
+            .project_claimed_metered_usage_projection_task(lease_owner, task.reservation_id)
+            .await
+        {
+            Ok(true) => state
+                .metrics
+                .observe_background_projection(BackgroundProjectionKind::MeteredUsage, true),
+            Ok(false) => {}
+            Err(error) => {
+                state
+                    .metrics
+                    .observe_background_projection(BackgroundProjectionKind::MeteredUsage, false);
+                tracing::error!(
+                    %error,
+                    reservation_id = %task.reservation_id,
+                    "worker failed to project metered usage task"
+                );
+            }
+        }
+    }
+}
+
+async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
+    let tasks = match state
+        .db
+        .claim_conversation_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            state
+                .metrics
+                .observe_background_projection(BackgroundProjectionKind::Conversation, false);
+            tracing::error!(%error, "worker failed to claim conversation projection tasks");
+            return;
+        }
+    };
+    for task in tasks {
+        match state
+            .db
+            .project_claimed_conversation_projection_task(lease_owner, task.request_id)
+            .await
+        {
+            Ok(true) => state
+                .metrics
+                .observe_background_projection(BackgroundProjectionKind::Conversation, true),
+            Ok(false) => {}
+            Err(error) => {
+                state
+                    .metrics
+                    .observe_background_projection(BackgroundProjectionKind::Conversation, false);
+                tracing::error!(
+                    %error,
+                    request_id = %task.request_id,
+                    "worker failed to project conversation task"
+                );
+            }
+        }
+    }
+}
+
 struct AbortTaskOnDrop {
     handle: Option<JoinHandle<()>>,
 }
@@ -170,5 +257,113 @@ impl Drop for AbortTaskOnDrop {
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        config::Config,
+        db::{CreateKeyInput, FinishProxyRequest, StartProxyRequest},
+        metrics::RuntimeMetrics,
+        model::{EnforcementMode, KeyPolicy, TokenUsage},
+    };
+    use rust_decimal::Decimal;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn projection_tick_drains_metered_usage_and_records_a_fixed_metric() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("worker-metered-projection.db").display()
+        );
+        let state = AppState::initialize(Config::for_test(database_url)).await.unwrap();
+        let pepper = state.config.key_pepper.as_bytes();
+        let issued = state
+            .db
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "worker-metered-projection".to_owned(),
+                    principal_external_id: "member".to_owned(),
+                    alias: "worker-metered-projection".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy {
+                        enforcement_mode: EnforcementMode::MeteredUnlimited,
+                        ..KeyPolicy::default()
+                    },
+                    initial_balance: Decimal::ONE,
+                    idempotency_key: None,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        let key = state.db.authenticate_key(&issued.key, pepper).await.unwrap();
+        let price = state
+            .db
+            .upsert_model_price(
+                "worker-metered-projection",
+                "USD",
+                Decimal::ONE,
+                Decimal::ONE,
+            )
+            .await
+            .unwrap();
+        let request_id = Uuid::now_v7();
+        let reservation = state
+            .db
+            .start_proxy_request(StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 1,
+                output_token_ceiling: 1,
+                protocol: "openai",
+                model: "worker-metered-projection",
+                request_object: "gap://worker-metered-projection/request",
+                upstream_account_id: None,
+                model_route_id: None,
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .finish_proxy_request(FinishProxyRequest {
+                request_id,
+                tenant_id: key.tenant_id,
+                reservation: &reservation,
+                input_token_ceiling: 1,
+                output_token_ceiling: 1,
+                requested_service_tier: None,
+                status_code: 200,
+                duration_ms: 1,
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..TokenUsage::default()
+                },
+                charge_contract_ceiling: false,
+                error_code: None,
+                response_object: "gap://worker-metered-projection/response",
+                conversation: None,
+            })
+            .await
+            .unwrap();
+
+        process_metered_usage_projection_batch(&state, Uuid::now_v7()).await;
+
+        assert!(
+            state
+                .db
+                .claim_metered_usage_projection_tasks(Uuid::now_v7(), PROJECTION_BATCH_LIMIT)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(state.metrics.render(&RuntimeMetrics::default()).contains(
+            "memeloop_token_center_background_projections_total{queue=\"metered_usage\",outcome=\"completed\"} 1"
+        ));
     }
 }

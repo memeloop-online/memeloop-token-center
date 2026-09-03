@@ -1,5 +1,6 @@
 mod conversations;
 mod lifecycle;
+mod metered_projection;
 mod queries;
 mod session_archive;
 mod session_archive_commit;
@@ -18,6 +19,7 @@ pub use lifecycle::{
     AttachProxyArchiveResult, FinishProxyRequest, FinishProxyRequestResult, FinishRequest,
     NewRequest, ProxyConversationInput, StartProxyRequest,
 };
+pub use metered_projection::MeteredUsageProjectionTask;
 pub use conversations::ConversationProjectionTask;
 pub(crate) use lifecycle::{
     claim_request_event_locator, record_request_finished_in_transaction,

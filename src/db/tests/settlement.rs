@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::conversation::ConversationHints;
 
 #[test]
 fn responses_auto_tier_alias_settles_against_the_admitted_default_contract() {
@@ -144,6 +145,160 @@ async fn concurrent_budget_reservations_and_settlement_replays_are_exact() {
     .unwrap()
     .get("count");
     assert_eq!(ledger_count, 1);
+}
+
+#[tokio::test]
+async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("metered-projection.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    let pepper = b"a metered projection test pepper longer than thirty-two bytes";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "metered-projection".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "metered-projection".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy {
+                    enforcement_mode: EnforcementMode::MeteredUnlimited,
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price("metered-projection", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 1,
+            output_token_ceiling: 1,
+            protocol: "openai",
+            model: "metered-projection",
+            request_object: "gap://metered-projection/request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let request_json = serde_json::json!({"input": [{"role": "user", "content": "metered"}]});
+    let hints = ConversationHints {
+        session_id: Some("metered-projection-session".to_owned()),
+        ..ConversationHints::default()
+    };
+    database
+        .finish_proxy_request(FinishProxyRequest {
+            request_id,
+            tenant_id: key.tenant_id,
+            reservation: &reservation,
+            input_token_ceiling: 1,
+            output_token_ceiling: 1,
+            requested_service_tier: None,
+            status_code: 200,
+            duration_ms: 12,
+            usage: TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..TokenUsage::default()
+            },
+            charge_contract_ceiling: false,
+            error_code: None,
+            response_object: "gap://metered-projection/response",
+            conversation: Some(ProxyConversationInput {
+                key: &key,
+                request_json: &request_json,
+                hints: &hints,
+                client_name: None,
+                upstream_response_id: None,
+            }),
+        })
+        .await
+        .unwrap();
+
+    // Project conversation first to force the cross-queue order in which the
+    // session projector has already materialized this fact before the metered
+    // statistics projector acknowledges its own task.
+    let conversation_projector = Uuid::now_v7();
+    let conversation_tasks = database
+        .claim_conversation_projection_tasks(conversation_projector, 32)
+        .await
+        .unwrap();
+    assert_eq!(conversation_tasks.len(), 1);
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(conversation_projector, request_id)
+            .await
+            .unwrap()
+    );
+
+    let projector = Uuid::now_v7();
+    let tasks = database
+        .claim_metered_usage_projection_tasks(projector, 32)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].reservation_id, reservation.id);
+    assert!(
+        database
+            .project_claimed_metered_usage_projection_task(projector, reservation.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !database
+            .project_claimed_metered_usage_projection_task(projector, reservation.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        database
+            .claim_metered_usage_projection_tasks(Uuid::now_v7(), 32)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let projection: (i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE reservation_id = $1 AND projected_at IS NOT NULL),
+            (SELECT COALESCE(SUM(requests), 0) FROM usage_daily_aggregates WHERE key_id = $2),
+            (SELECT COALESCE(SUM(requests), 0) FROM request_daily_aggregates WHERE key_id = $3),
+            (SELECT COALESCE(SUM(requests), 0) FROM usage_analysis_hourly WHERE key_id = $4 AND source_kind = 'request'),
+            (SELECT COALESCE(SUM(requests), 0) FROM usage_analysis_daily WHERE key_id = $5 AND source_kind = 'request'),
+            (SELECT COALESCE(SUM(requests), 0) FROM session_usage_totals WHERE key_id = $6),
+            (SELECT settled_lifetime_micros FROM key_budget_state WHERE key_id = $7),
+            (SELECT available_micros FROM credit_accounts WHERE id = $8)",
+    )
+    .bind(reservation.id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(key.key_id.to_string())
+    .bind(issued.account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(projection, (1, 1, 1, 1, 1, 1, 0, 1_000_000));
 }
 
 #[tokio::test]

@@ -335,6 +335,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "durable conversation projection outbox",
         sql: include_str!("../../../migrations/common/0062_conversation_projection_outbox.sql"),
     },
+    Migration {
+        version: 63,
+        name: "metered usage projection leases",
+        sql: include_str!("../../../migrations/common/0063_metered_usage_projection_leases.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -655,6 +660,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 62,
         name: "durable conversation projection outbox",
         sql: include_str!("../../../migrations/common/0062_conversation_projection_outbox.sql"),
+    },
+    Migration {
+        version: 63,
+        name: "metered usage projection leases",
+        sql: include_str!("../../../migrations/common/0063_metered_usage_projection_leases.sql"),
     },
 ];
 

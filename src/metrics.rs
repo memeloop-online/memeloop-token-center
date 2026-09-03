@@ -4,7 +4,7 @@ use std::{
     future::Future,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -39,6 +39,8 @@ struct MetricsInner {
     active_streams: [AtomicI64; ActiveStreamKind::COUNT],
     active_upstreams: Mutex<BTreeMap<UpstreamActivityLabels, i64>>,
     component_memory_bytes: [AtomicI64; MemoryComponent::COUNT],
+    background_projection_completed: [AtomicU64; BackgroundProjectionKind::COUNT],
+    background_projection_failed: [AtomicU64; BackgroundProjectionKind::COUNT],
     profiling: AtomicBool,
     database_ready: AtomicI64,
     archive_ready: AtomicI64,
@@ -55,6 +57,8 @@ impl Default for MetricsInner {
             active_streams: std::array::from_fn(|_| AtomicI64::new(0)),
             active_upstreams: Mutex::default(),
             component_memory_bytes: std::array::from_fn(|_| AtomicI64::new(0)),
+            background_projection_completed: std::array::from_fn(|_| AtomicU64::new(0)),
+            background_projection_failed: std::array::from_fn(|_| AtomicU64::new(0)),
             profiling: AtomicBool::new(false),
             database_ready: AtomicI64::new(0),
             archive_ready: AtomicI64::new(0),
@@ -118,6 +122,30 @@ pub enum MemoryComponent {
     ResponseBuffer,
     StreamCapture,
     ArchiveMultipart,
+}
+
+/// Fixed worker projection queues. These labels deliberately exclude tenant,
+/// key, reservation, and request identities so retries cannot create metric
+/// cardinality proportional to traffic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackgroundProjectionKind {
+    MeteredUsage,
+    Conversation,
+}
+
+impl BackgroundProjectionKind {
+    const COUNT: usize = 2;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::MeteredUsage => "metered_usage",
+            Self::Conversation => "conversation",
+        }
+    }
 }
 
 impl MemoryComponent {
@@ -236,6 +264,16 @@ impl Metrics {
             component,
             bytes,
         }
+    }
+
+    /// Records one terminal worker projection attempt with a fixed queue label.
+    pub fn observe_background_projection(&self, kind: BackgroundProjectionKind, succeeded: bool) {
+        let counter = if succeeded {
+            &self.inner.background_projection_completed[kind.index()]
+        } else {
+            &self.inner.background_projection_failed[kind.index()]
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn try_begin_profile(&self, _kind: ProfileKind) -> Option<ProfileGuard> {
@@ -382,6 +420,7 @@ impl Metrics {
         render_http(&mut output, &http);
         render_upstream(&mut output, &upstream);
         render_active(&mut output, &self.inner);
+        render_background_projections(&mut output, &self.inner);
         render_runtime(&mut output, runtime);
         render_process(&mut output, &self.inner);
         render_allocator(&mut output);
@@ -621,6 +660,30 @@ fn render_active(output: &mut String, inner: &MetricsInner) {
             "memeloop_token_center_component_memory_bytes{{component=\"{}\"}} {}",
             component.label(),
             inner.component_memory_bytes[component.index()].load(Ordering::Relaxed)
+        );
+    }
+}
+
+fn render_background_projections(output: &mut String, inner: &MetricsInner) {
+    output.push_str(
+        "# HELP memeloop_token_center_background_projections_total Worker projection attempts by fixed queue and outcome.\n",
+    );
+    output.push_str("# TYPE memeloop_token_center_background_projections_total counter\n");
+    for kind in [
+        BackgroundProjectionKind::MeteredUsage,
+        BackgroundProjectionKind::Conversation,
+    ] {
+        let _ = writeln!(
+            output,
+            "memeloop_token_center_background_projections_total{{queue=\"{}\",outcome=\"completed\"}} {}",
+            kind.label(),
+            inner.background_projection_completed[kind.index()].load(Ordering::Relaxed),
+        );
+        let _ = writeln!(
+            output,
+            "memeloop_token_center_background_projections_total{{queue=\"{}\",outcome=\"failed\"}} {}",
+            kind.label(),
+            inner.background_projection_failed[kind.index()].load(Ordering::Relaxed),
         );
     }
 }
@@ -916,6 +979,20 @@ mod tests {
         assert!(rendered.contains("provider=\"other\""));
         assert!(!rendered.contains("tenant-controlled-provider-name"));
         assert!(rendered.contains("status_class=\"transport_error\""));
+    }
+
+    #[test]
+    fn background_projection_labels_are_fixed() {
+        let metrics = Metrics::default();
+        metrics.observe_background_projection(BackgroundProjectionKind::MeteredUsage, true);
+        metrics.observe_background_projection(BackgroundProjectionKind::Conversation, false);
+        let rendered = metrics.render(&RuntimeMetrics::default());
+        assert!(rendered.contains(
+            "memeloop_token_center_background_projections_total{queue=\"metered_usage\",outcome=\"completed\"} 1"
+        ));
+        assert!(rendered.contains(
+            "memeloop_token_center_background_projections_total{queue=\"conversation\",outcome=\"failed\"} 1"
+        ));
     }
 
     #[tokio::test]
