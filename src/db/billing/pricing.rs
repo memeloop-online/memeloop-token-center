@@ -83,18 +83,8 @@ impl Database {
             .bind(now)
             .execute(&mut *tx)
             .await?;
-        } else if sqlx::query("SELECT id FROM model_prices WHERE model = $1 AND currency = $2")
-            .bind(model)
-            .bind(&currency)
-            .fetch_optional(&mut *tx)
-            .await?
-            .is_none()
-        {
-            return Err(AppError::BadRequest(
-                "create the default service tier before an additional tier".into(),
-            ));
         }
-        upsert_price_tier(
+        let tier_updated = upsert_price_tier(
             &mut tx,
             model,
             &currency,
@@ -108,6 +98,11 @@ impl Database {
             cache_price_estimated,
         )
         .await?;
+        if !tier_updated {
+            return Err(AppError::BadRequest(
+                "create the default service tier before an additional tier".into(),
+            ));
+        }
         tx.commit().await?;
         self.model_price(model, &currency).await
     }
@@ -573,9 +568,12 @@ async fn upsert_price_tier(
     source: &str,
     now: i64,
     cache_price_estimated: bool,
-) -> Result<(), AppError> {
-    sqlx::query(
-        "INSERT INTO model_price_tiers (id, model, currency, service_tier, input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million, source, updated_at, cache_price_estimated) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT(model, currency, service_tier) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, cached_input_micros_per_million = excluded.cached_input_micros_per_million, cache_write_micros_per_million = excluded.cache_write_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, source = excluded.source, updated_at = excluded.updated_at, cache_price_estimated = excluded.cache_price_estimated",
+) -> Result<bool, AppError> {
+    // Keep the base-price existence check and tier write in one write statement. In SQLite, a
+    // deferred transaction that first reads and then upgrades to a writer can fail immediately
+    // with SQLITE_BUSY when a background worker owns the writer slot, bypassing busy_timeout.
+    let result = sqlx::query(
+        "INSERT INTO model_price_tiers (id, model, currency, service_tier, input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million, source, updated_at, cache_price_estimated) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 FROM model_prices WHERE model = $2 AND currency = $3 ON CONFLICT(model, currency, service_tier) DO UPDATE SET input_micros_per_million = excluded.input_micros_per_million, cached_input_micros_per_million = excluded.cached_input_micros_per_million, cache_write_micros_per_million = excluded.cache_write_micros_per_million, output_micros_per_million = excluded.output_micros_per_million, source = excluded.source, updated_at = excluded.updated_at, cache_price_estimated = excluded.cache_price_estimated",
     )
     .bind(Uuid::now_v7().to_string())
     .bind(model)
@@ -590,5 +588,5 @@ async fn upsert_price_tier(
     .bind(i64::from(cache_price_estimated))
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
