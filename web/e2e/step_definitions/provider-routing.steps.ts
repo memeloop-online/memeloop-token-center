@@ -292,6 +292,14 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
   await routeGroupInput.press('Enter');
   const exactCredentials = routeEditor.getByRole('combobox', { name: '授权给具体凭据', exact: true });
   await exactCredentials.fill(seed.clientKeyId);
+  const exactCredentialOption = routeEditor.getByRole('option').filter({ hasText: seed.clientKeyId });
+  await assertCount(exactCredentialOption, 1);
+  await exactCredentials.press('ArrowDown');
+  await eventually(async () => {
+    const activeCredentialId = await exactCredentials.getAttribute('aria-activedescendant');
+    assert.ok(activeCredentialId);
+    assert.equal(await exactCredentialOption.getAttribute('id'), activeCredentialId);
+  }, 10_000, 'exact credential did not become the active keyboard option');
   await exactCredentials.press('Enter');
   await exactCredentials.press('Escape');
   const createdRoute = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
