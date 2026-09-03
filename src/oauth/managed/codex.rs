@@ -118,19 +118,13 @@ fn normalize_private_proxy_url(value: &str) -> Result<String, AppError> {
     {
         return Err(invalid_document());
     }
-    match parsed.host().ok_or_else(invalid_document)? {
-        url::Host::Ipv4(address) => {
-            if !network::is_safe_private_upstream_ip(address.into()) {
-                return Err(invalid_document());
-            }
+    let host = parsed.host_str().ok_or_else(invalid_document)?;
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        if !network::is_safe_private_upstream_ip(address) {
+            return Err(invalid_document());
         }
-        url::Host::Ipv6(address) => {
-            if !network::is_safe_private_upstream_ip(address.into()) {
-                return Err(invalid_document());
-            }
-        }
-        url::Host::Domain(_) if parsed.scheme() == "socks5h" => return Err(invalid_document()),
-        url::Host::Domain(_) => {}
+    } else if parsed.scheme() == "socks5h" {
+        return Err(invalid_document());
     }
     parsed
         .set_scheme("socks5")
