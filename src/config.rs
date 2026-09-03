@@ -599,7 +599,10 @@ mod tests {
             MAX_RESPONSES_BODY_READ_CONCURRENCY
         );
         let config = Config::for_test("sqlite::memory:".to_owned());
-        assert_eq!(config.responses_body_max_bytes, DEFAULT_RESPONSES_BODY_MAX_BYTES);
+        assert_eq!(
+            config.responses_body_max_bytes,
+            DEFAULT_RESPONSES_BODY_MAX_BYTES
+        );
         assert_eq!(
             config.responses_body_read_concurrency,
             DEFAULT_RESPONSES_BODY_READ_CONCURRENCY

@@ -277,9 +277,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database_url = format!(
             "sqlite://{}?mode=rwc",
-            directory.path().join("worker-metered-projection.db").display()
+            directory
+                .path()
+                .join("worker-metered-projection.db")
+                .display()
         );
-        let state = AppState::initialize(Config::for_test(database_url)).await.unwrap();
+        let state = AppState::initialize(Config::for_test(database_url))
+            .await
+            .unwrap();
         let pepper = state.config.key_pepper.as_bytes();
         let issued = state
             .db
@@ -300,7 +305,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let key = state.db.authenticate_key(&issued.key, pepper).await.unwrap();
+        let key = state
+            .db
+            .authenticate_key(&issued.key, pepper)
+            .await
+            .unwrap();
         let price = state
             .db
             .upsert_model_price(

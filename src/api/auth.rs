@@ -339,9 +339,11 @@ mod response_body_guard_tests {
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .expect("error body");
-        assert!(std::str::from_utf8(&body)
-            .expect("UTF-8 error")
-            .contains("service_overloaded"));
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("UTF-8 error")
+                .contains("service_overloaded")
+        );
     }
 
     #[test]
@@ -355,7 +357,9 @@ mod response_body_guard_tests {
         assert_eq!(safe_gateway_request_id(&headers), request_id.to_string());
         headers.insert(
             REQUEST_ID_HEADER,
-            "user-controlled-value".parse().expect("valid non-UUID header"),
+            "user-controlled-value"
+                .parse()
+                .expect("valid non-UUID header"),
         );
         assert_eq!(safe_gateway_request_id(&headers), "unavailable");
     }

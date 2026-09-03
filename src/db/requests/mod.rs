@@ -8,6 +8,7 @@ mod session_archive_quarantine;
 mod settlement;
 mod stats;
 
+pub use conversations::ConversationProjectionTask;
 pub use conversations::{ConversationDetailFilter, ConversationListFilter};
 pub(crate) use conversations::{
     ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
@@ -18,12 +19,11 @@ pub use lifecycle::{
     AttachProxyArchiveResult, FinishProxyRequest, FinishProxyRequestResult, FinishRequest,
     NewRequest, ProxyConversationInput, StartProxyRequest,
 };
-pub use metered_projection::MeteredUsageProjectionTask;
-pub use conversations::ConversationProjectionTask;
 pub(crate) use lifecycle::{
     claim_request_event_locator, record_request_finished_in_transaction,
     record_request_started_in_transaction,
 };
+pub use metered_projection::MeteredUsageProjectionTask;
 pub use queries::RequestListFilter;
 pub(crate) use queries::search_prefix;
 pub(crate) use session_archive::valid_archive_identifier;

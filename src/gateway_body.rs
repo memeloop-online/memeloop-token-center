@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -25,12 +28,8 @@ pub(crate) enum GatewayBodyRouteClass {
 }
 
 impl GatewayBodyRouteClass {
-    pub(crate) const ALL: [Self; GATEWAY_BODY_ROUTE_CLASS_COUNT] = [
-        Self::Default,
-        Self::Responses,
-        Self::Images,
-        Self::Other,
-    ];
+    pub(crate) const ALL: [Self; GATEWAY_BODY_ROUTE_CLASS_COUNT] =
+        [Self::Default, Self::Responses, Self::Images, Self::Other];
 
     pub(crate) const fn index(self) -> usize {
         match self {
@@ -276,8 +275,8 @@ mod tests {
                     Arc::new(tokio::sync::Semaphore::new(1)),
                     responses_maximum,
                 )
-                    .await
-                    .is_ok(),
+                .await
+                .is_ok(),
                 "{path} exact limit"
             );
             let over = Request::post(path)
@@ -422,7 +421,10 @@ mod tests {
     async fn responses_body_has_an_independent_bounded_admission() {
         let standard = Arc::new(tokio::sync::Semaphore::new(1));
         let responses = Arc::new(tokio::sync::Semaphore::new(1));
-        let held = responses.clone().try_acquire_owned().expect("responses permit");
+        let held = responses
+            .clone()
+            .try_acquire_owned()
+            .expect("responses permit");
         let rejected = Request::post("/v1/responses")
             .body(Body::empty())
             .expect("responses request");
@@ -442,15 +444,17 @@ mod tests {
         let ordinary = Request::post("/v1/chat/completions")
             .body(Body::empty())
             .expect("ordinary request");
-        assert!(admit_gateway_request_body(
-            ordinary,
-            Duration::from_secs(1),
-            standard.clone(),
-            responses.clone(),
-            16 * 1024 * 1024,
-        )
-        .await
-        .is_ok());
+        assert!(
+            admit_gateway_request_body(
+                ordinary,
+                Duration::from_secs(1),
+                standard.clone(),
+                responses.clone(),
+                16 * 1024 * 1024,
+            )
+            .await
+            .is_ok()
+        );
         drop(held);
     }
 

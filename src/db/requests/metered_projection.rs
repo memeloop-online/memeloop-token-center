@@ -130,14 +130,13 @@ impl Database {
         }
         if let Some(row) = request_ids.into_iter().next() {
             let request_id: String = row.try_get("id")?;
-            let fact_cost: Option<i64> = sqlx::query(
-                "SELECT cost_micros FROM request_stats_facts WHERE request_id = $1",
-            )
-            .bind(&request_id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .map(|row| row.try_get("cost_micros"))
-            .transpose()?;
+            let fact_cost: Option<i64> =
+                sqlx::query("SELECT cost_micros FROM request_stats_facts WHERE request_id = $1")
+                    .bind(&request_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .map(|row| row.try_get("cost_micros"))
+                    .transpose()?;
             if fact_cost != Some(actual_micros) {
                 return Err(AppError::Conflict(
                     "metered request fact is missing or does not match its settlement".into(),
@@ -200,8 +199,22 @@ async fn project_metered_request_fact_in_transaction(
     if project_session_rollups {
         add_request_fact_to_session_projection_in_transaction(transaction, request_id).await?;
     }
-    project_metered_request_analysis_in_transaction(transaction, request_id, "usage_analysis_hourly", "hour_bucket", 3_600_000).await?;
-    project_metered_request_analysis_in_transaction(transaction, request_id, "usage_analysis_daily", "day_bucket", 86_400_000).await?;
+    project_metered_request_analysis_in_transaction(
+        transaction,
+        request_id,
+        "usage_analysis_hourly",
+        "hour_bucket",
+        3_600_000,
+    )
+    .await?;
+    project_metered_request_analysis_in_transaction(
+        transaction,
+        request_id,
+        "usage_analysis_daily",
+        "day_bucket",
+        86_400_000,
+    )
+    .await?;
     Ok(())
 }
 

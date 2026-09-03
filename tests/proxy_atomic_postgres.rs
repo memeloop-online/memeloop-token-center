@@ -9,8 +9,8 @@ use memeloop_token_center::{
         ConversationDetailFilter, ConversationListFilter, CreateKeyInput, CreateModelRouteInput,
         CreateUpstreamAccountInput, Database, FinishProxyRequest, FinishProxyRequestResult,
         FinishSynchronousImageRequest, FinishSynchronousImageResult, ProxyConversationInput,
-        StartProxyRequest, StartSynchronousImageRequest, StartSynchronousImageResult,
-        StatsFilter, unix_millis,
+        StartProxyRequest, StartSynchronousImageRequest, StartSynchronousImageResult, StatsFilter,
+        unix_millis,
     },
     error::{AppError, LimitReason},
     model::{ArchivedGenerationAsset, EnforcementMode, KeyPolicy, TokenUsage},
@@ -373,8 +373,8 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
 }
 
 #[tokio::test]
-async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_requests_off_cluster_hotspots(
-) {
+async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_requests_off_cluster_hotspots()
+{
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
@@ -491,7 +491,8 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
         let admission_barrier = admission_barrier.clone();
         admissions.push(tokio::spawn(async move {
             let request_id = Uuid::now_v7();
-            let request_object = format!("objects/blake3/metered-conversation-child-request-{index}");
+            let request_object =
+                format!("objects/blake3/metered-conversation-child-request-{index}");
             admission_barrier.wait().await;
             let reservation = database
                 .start_proxy_request(StartProxyRequest {
@@ -622,7 +623,10 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
         .await
         .unwrap();
     assert_eq!(clusters.len(), 1);
-    assert_eq!(clusters[0].explicit_session_id.as_deref(), Some(session_id.as_str()));
+    assert_eq!(
+        clusters[0].explicit_session_id.as_deref(),
+        Some(session_id.as_str())
+    );
     assert_eq!(clusters[0].request_count, REQUESTS as i64 + 1);
     let detail = database
         .conversation_cluster_detail(
