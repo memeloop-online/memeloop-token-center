@@ -66,19 +66,32 @@ pub struct ConversationProjectionTask {
     pub observed_at: i64,
 }
 
+pub(crate) struct ConversationProjectionEnqueueInput<'a> {
+    pub(crate) request_id: Uuid,
+    pub(crate) key: &'a AuthenticatedKey,
+    pub(crate) request_json: &'a serde_json::Value,
+    pub(crate) hints: &'a ConversationHints,
+    pub(crate) client_name: Option<&'a str>,
+    pub(crate) upstream_response_id: Option<&'a str>,
+    pub(crate) observed_at: i64,
+}
+
 const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
 const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
 
 pub(crate) async fn enqueue_conversation_projection_in_transaction(
     transaction: &mut Transaction<'_, Any>,
-    request_id: Uuid,
-    key: &AuthenticatedKey,
-    request_json: &serde_json::Value,
-    hints: &ConversationHints,
-    client_name: Option<&str>,
-    upstream_response_id: Option<&str>,
-    observed_at: i64,
+    input: ConversationProjectionEnqueueInput<'_>,
 ) -> Result<(), AppError> {
+    let ConversationProjectionEnqueueInput {
+        request_id,
+        key,
+        request_json,
+        hints,
+        client_name,
+        upstream_response_id,
+        observed_at,
+    } = input;
     let request_json = serde_json::to_string(request_json).map_err(|_| AppError::Internal)?;
     let hints_json = serde_json::to_string(hints).map_err(|_| AppError::Internal)?;
     sqlx::query(

@@ -1,6 +1,8 @@
 use super::super::archive_staging::bind_archive_staging_attempt_in_transaction;
 use super::super::*;
-use super::conversations::enqueue_conversation_projection_in_transaction;
+use super::conversations::{
+    ConversationProjectionEnqueueInput, enqueue_conversation_projection_in_transaction,
+};
 use crate::archive_staging::{
     ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingWriteLease,
 };
@@ -620,13 +622,15 @@ impl Database {
             if trusted_reservation.enforcement_mode == EnforcementMode::MeteredUnlimited {
                 enqueue_conversation_projection_in_transaction(
                     &mut transaction,
-                    input.request_id,
-                    conversation.key,
-                    conversation.request_json,
-                    conversation.hints,
-                    conversation.client_name,
-                    conversation.upstream_response_id,
-                    now,
+                    ConversationProjectionEnqueueInput {
+                        request_id: input.request_id,
+                        key: conversation.key,
+                        request_json: conversation.request_json,
+                        hints: conversation.hints,
+                        client_name: conversation.client_name,
+                        upstream_response_id: conversation.upstream_response_id,
+                        observed_at: now,
+                    },
                 )
                 .await?;
             } else {
