@@ -6,6 +6,8 @@ pub const DEFAULT_PRICING_MODELS_DEV_URL: &str = "https://models.dev/catalog.jso
 pub const DEFAULT_PRICING_LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 pub const DEFAULT_PRICING_OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
+pub const DEFAULT_GATEWAY_BODY_READ_CONCURRENCY: u32 = 1_024;
+pub const MAX_GATEWAY_BODY_READ_CONCURRENCY: u32 = 8_192;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +42,9 @@ pub struct Config {
     /// Service saturation is distinct from a credential policy limit and is
     /// reported as HTTP 503, never as a per-key 429.
     pub proxy_lifecycle_concurrency: u32,
+    /// Maximum gateway request bodies buffered concurrently. The permit covers
+    /// only the bounded body read, not the complete proxy lifecycle.
+    pub gateway_body_read_concurrency: u32,
     pub run_migrations_on_start: bool,
     pub key_pepper: String,
     pub service_token: String,
@@ -78,6 +83,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "proxy_lifecycle_concurrency",
                 &self.proxy_lifecycle_concurrency,
+            )
+            .field(
+                "gateway_body_read_concurrency",
+                &self.gateway_body_read_concurrency,
             )
             .field("run_migrations_on_start", &self.run_migrations_on_start)
             .field("key_pepper", &"[redacted]")
@@ -181,6 +190,10 @@ impl Config {
             database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
             proxy_lifecycle_concurrency: env_u32("MTC_PROXY_LIFECYCLE_CONCURRENCY", 64)?
                 .clamp(1, 4_096),
+            gateway_body_read_concurrency: gateway_body_read_concurrency(env_u32(
+                "MTC_GATEWAY_BODY_READ_CONCURRENCY",
+                DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
+            )?),
             run_migrations_on_start: env_bool("MTC_RUN_MIGRATIONS_ON_START", true),
             key_pepper,
             service_token,
@@ -218,6 +231,7 @@ impl Config {
             database_url: required("MTC_DATABASE_URL")?,
             database_max_connections: 2,
             proxy_lifecycle_concurrency: 1,
+            gateway_body_read_concurrency: 1,
             run_migrations_on_start: false,
             key_pepper: "unused-by-session-archive-importer".to_owned(),
             service_token: "unused-by-session-archive-importer".to_owned(),
@@ -249,6 +263,7 @@ impl Config {
             database_url,
             database_max_connections: 8,
             proxy_lifecycle_concurrency: 64,
+            gateway_body_read_concurrency: DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
             run_migrations_on_start: true,
             key_pepper: "test-pepper-must-have-at-least-32-bytes".to_owned(),
             service_token: "test-service-token".to_owned(),
@@ -368,6 +383,10 @@ fn env_u32(name: &'static str, default: u32) -> Result<u32, ConfigError> {
             .map_err(|_| ConfigError::InvalidInteger(name, value)),
         Err(_) => Ok(default),
     }
+}
+
+fn gateway_body_read_concurrency(value: u32) -> u32 {
+    value.clamp(1, MAX_GATEWAY_BODY_READ_CONCURRENCY)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -511,6 +530,21 @@ mod tests {
         assert_eq!(
             Config::for_test("sqlite::memory:".to_owned()).archive_backend,
             ArchiveBackend::Memory
+        );
+    }
+
+    #[test]
+    fn gateway_body_read_concurrency_defaults_to_a_thousand_and_clamps() {
+        assert_eq!(DEFAULT_GATEWAY_BODY_READ_CONCURRENCY, 1_024);
+        assert_eq!(gateway_body_read_concurrency(0), 1);
+        assert_eq!(gateway_body_read_concurrency(1_024), 1_024);
+        assert_eq!(
+            gateway_body_read_concurrency(MAX_GATEWAY_BODY_READ_CONCURRENCY + 1),
+            MAX_GATEWAY_BODY_READ_CONCURRENCY
+        );
+        assert_eq!(
+            Config::for_test("sqlite::memory:".to_owned()).gateway_body_read_concurrency,
+            DEFAULT_GATEWAY_BODY_READ_CONCURRENCY
         );
     }
 }

@@ -56,6 +56,7 @@ pub struct AppState {
     pub plugins: PluginRuntime,
     pub metrics: metrics::Metrics,
     pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
+    pub(crate) gateway_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) proxy_lifecycle_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) proxy_archive_stream_permits: Arc<tokio::sync::Semaphore>,
 }
@@ -75,6 +76,7 @@ pub enum InitializationError {
 impl AppState {
     pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
         let proxy_lifecycle_concurrency = config.proxy_lifecycle_concurrency as usize;
+        let gateway_body_read_concurrency = config.gateway_body_read_concurrency as usize;
         if config.run_migrations_on_start {
             let migration_db = Database::connect_for_migration(
                 &config.database_url,
@@ -113,6 +115,9 @@ impl AppState {
             plugins,
             metrics: metrics::Metrics::default(),
             request_event_streams: request_event_stream::RequestEventStreamLimiter::default(),
+            gateway_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
+                gateway_body_read_concurrency,
+            )),
             proxy_lifecycle_permits: Arc::new(tokio::sync::Semaphore::new(
                 proxy_lifecycle_concurrency,
             )),

@@ -37,6 +37,15 @@ replicas for the desired availability and queue latency. Configure topology
 spread or affinity explicitly; incidental scheduler placement is not an
 availability guarantee.
 
+`MTC_GATEWAY_BODY_READ_CONCURRENCY` (Helm
+`config.gatewayBodyReadConcurrency`) independently bounds bodies being
+buffered by each gateway process. It defaults to 1024 and accepts 1 through
+8192. When exhausted, a gateway returns HTTP 503 before reading a request
+body; it is not a credential rate/concurrency rejection and never returns
+HTTP 429. The permit ends as soon as the bounded body read completes, times
+out or fails, rather than spanning proxy execution. Synchronous image requests
+retain their separate two-request lifecycle limit.
+
 Before enabling an HPA, keep the maximum application connection demand,
 including rollout surge, migration connections and an operational reserve,
 within the PostgreSQL or PgBouncer connection budget. Alert on database pool
@@ -140,8 +149,8 @@ The fixed-label runtime series are:
 - `memeloop_token_center_upstream_active_requests{provider,operation}` for an
   upstream exchange whose response has not been consumed or released;
 - `memeloop_token_center_background_work_items{queue,state="active"}` for
-  request-event streams, proxy lifecycle capacity and response-archive stream
-  capacity;
+  request-event streams, gateway body reads, proxy lifecycle capacity and
+  response-archive stream capacity;
 - `memeloop_token_center_generation_jobs{status}` and
   `memeloop_token_center_db_pool_connections{state}` for durable queue and pool
   state;

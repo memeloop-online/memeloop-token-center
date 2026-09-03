@@ -150,6 +150,9 @@ async fn health_version_and_metrics_contract_is_operational() {
     assert!(metrics.contains("memeloop_token_center_upstream_active_requests"));
     assert!(metrics.contains("memeloop_token_center_component_memory_bytes"));
     assert!(metrics.contains("memeloop_token_center_background_work_items"));
+    assert!(metrics.contains(
+        "memeloop_token_center_background_work_items{queue=\"gateway_body_reads\",state=\"active\"} 0"
+    ));
     assert!(metrics.contains("memeloop_token_center_plugin_cache_bytes"));
     assert!(metrics.contains("process_resident_memory_bytes"));
     assert!(metrics.contains("process_cpu_seconds_total"));

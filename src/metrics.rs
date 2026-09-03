@@ -453,6 +453,7 @@ pub struct DatabaseRuntimeMetrics {
 pub struct RuntimeMetrics {
     pub database: Option<DatabaseRuntimeMetrics>,
     pub request_event_streams: usize,
+    pub gateway_body_reads: usize,
     pub proxy_lifecycles: usize,
     pub proxy_archive_streams: usize,
     pub plugin_cache_entries: usize,
@@ -660,6 +661,7 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
     output.push_str("# TYPE memeloop_token_center_background_work_items gauge\n");
     for (queue, value) in [
         ("request_event_streams", runtime.request_event_streams),
+        ("gateway_body_reads", runtime.gateway_body_reads),
         ("proxy_lifecycles", runtime.proxy_lifecycles),
         ("proxy_archive_streams", runtime.proxy_archive_streams),
     ] {

@@ -65,6 +65,11 @@ pub(super) async fn authenticate_control_before_body(
         .await
         {
             Ok(request) => request,
+            // The control-plane reader has its own permit, but preserve the
+            // service-capacity classification if that implementation changes.
+            Err(crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted) => {
+                return Err(AppError::Overloaded);
+            }
             Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
                 return Ok(control_body_rejection(
                     StatusCode::REQUEST_TIMEOUT,
@@ -144,30 +149,12 @@ pub(super) async fn authenticate_gateway_before_body(
         request = match crate::gateway_body::admit_gateway_request_body(
             request,
             crate::gateway_body::GATEWAY_BODY_READ_DEADLINE,
+            state.gateway_body_read_permits.clone(),
         )
         .await
         {
             Ok(request) => request,
-            Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
-                return Ok((
-                    StatusCode::REQUEST_TIMEOUT,
-                    Json(json!({"error": {
-                        "code": "request_body_timeout",
-                        "message": "request body was not received before the deadline"
-                    }})),
-                )
-                    .into_response());
-            }
-            Err(crate::gateway_body::GatewayBodyAdmissionError::Rejected) => {
-                return Ok((
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    Json(json!({"error": {
-                        "code": "request_body_too_large",
-                        "message": "request body exceeds the supported limit"
-                    }})),
-                )
-                    .into_response());
-            }
+            Err(error) => return Ok(gateway_body_admission_rejection(error)),
         };
     }
     let response = next.run(request).await;
@@ -175,6 +162,32 @@ pub(super) async fn authenticate_gateway_before_body(
         Some(permit) => hold_response_body_permit(response, permit),
         None => response,
     })
+}
+
+fn gateway_body_admission_rejection(
+    error: crate::gateway_body::GatewayBodyAdmissionError,
+) -> Response {
+    match error {
+        crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted => {
+            AppError::Overloaded.into_response()
+        }
+        crate::gateway_body::GatewayBodyAdmissionError::Timeout => (
+            StatusCode::REQUEST_TIMEOUT,
+            Json(json!({"error": {
+                "code": "request_body_timeout",
+                "message": "request body was not received before the deadline"
+            }})),
+        )
+            .into_response(),
+        crate::gateway_body::GatewayBodyAdmissionError::Rejected => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": {
+                "code": "request_body_too_large",
+                "message": "request body exceeds the supported limit"
+            }})),
+        )
+            .into_response(),
+    }
 }
 
 /// Keeps a lifecycle guard alive until the response body reaches EOF, errors,
@@ -210,6 +223,11 @@ pub(super) async fn admit_cloud_webhook_before_body(
     .await
     {
         Ok(request) => request,
+        // This path has an independent webhook permit. See the same note on
+        // the control-plane reader above.
+        Err(crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted) => {
+            return Err(AppError::Overloaded);
+        }
         Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
             return Ok(control_body_rejection(
                 StatusCode::REQUEST_TIMEOUT,
@@ -280,6 +298,20 @@ mod response_body_guard_tests {
         assert_eq!(failed.available_permits(), 0);
         drop(body);
         assert_eq!(failed.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_body_capacity_exhaustion_is_a_service_overload_not_a_rate_limit() {
+        let response = gateway_body_admission_rejection(
+            crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted,
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("error body");
+        assert!(std::str::from_utf8(&body)
+            .expect("UTF-8 error")
+            .contains("service_overloaded"));
     }
 }
 

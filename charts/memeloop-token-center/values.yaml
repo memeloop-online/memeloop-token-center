@@ -117,6 +117,9 @@ config:
   # Per-gateway active proxy lifecycles. Capacity exhaustion is a service 503;
   # credential RPM/TPM/concurrency policies remain the only sources of 429.
   proxyLifecycleConcurrency: 64
+  # Gateway request bodies are admitted independently of proxy lifecycles.
+  # Saturation returns 503 before reading the body; supported range is 1..8192.
+  gatewayBodyReadConcurrency: 1024
   databaseUrlSecret:
     name: memeloop-token-center-secrets
     key: database-url
