@@ -96,7 +96,7 @@ impl Database {
             .try_get("id")?;
 
         let existing = sqlx::query(
-            "SELECT k.id, k.account_id, k.alias, k.currency, k.status, k.credential_generation, k.issued_key_ciphertext, p.external_id AS principal_external_id, COALESCE((SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation ORDER BY (c.revoked_at IS NULL) DESC, c.id LIMIT 1), (SELECT lc.fingerprint FROM legacy_key_credentials lc WHERE lc.key_id = k.id AND lc.generation = k.credential_generation ORDER BY (lc.revoked_at IS NULL) DESC, lc.id LIMIT 1)) AS fingerprint, CASE WHEN EXISTS (SELECT 1 FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL) OR EXISTS (SELECT 1 FROM legacy_key_credentials lc WHERE lc.key_id = k.id AND lc.generation = k.credential_generation AND lc.revoked_at IS NULL) THEN 1 ELSE 0 END AS generation_active FROM key_records k JOIN principals p ON p.id = k.principal_id WHERE k.tenant_id = $1 AND k.provisioning_idempotency_key = $2",
+            "SELECT k.id, k.account_id, k.alias, k.currency, k.status, k.credential_generation, k.issued_key_ciphertext, p.external_id AS principal_external_id, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation ORDER BY (c.revoked_at IS NULL) DESC, c.id LIMIT 1) AS fingerprint, CASE WHEN EXISTS (SELECT 1 FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL) THEN 1 ELSE 0 END AS generation_active FROM key_records k JOIN principals p ON p.id = k.principal_id WHERE k.tenant_id = $1 AND k.provisioning_idempotency_key = $2",
         )
         .bind(&tenant_id)
         .bind(provisioning_idempotency_key)
@@ -238,7 +238,7 @@ impl Database {
             .map(|(created_at, id)| (created_at, id.to_string()))
             .unwrap_or_else(|| (i64::MAX, "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned()));
         let rows = sqlx::query(
-            "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, COALESCE((SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1), (SELECT lc.fingerprint FROM legacy_key_credentials lc WHERE lc.key_id = k.id AND lc.generation = k.credential_generation AND lc.revoked_at IS NULL ORDER BY lc.id LIMIT 1)) AS fingerprint, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND (k.created_at < $3 OR (k.created_at = $3 AND k.id < $4)) ORDER BY k.created_at DESC, k.id DESC LIMIT $5",
+            "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND (k.created_at < $3 OR (k.created_at = $3 AND k.id < $4)) ORDER BY k.created_at DESC, k.id DESC LIMIT $5",
         )
         .bind(tenant_external_id.unwrap_or_default())
         .bind(principal_external_id.unwrap_or_default())
@@ -282,13 +282,6 @@ impl Database {
             let now = unix_millis();
             sqlx::query(
                 "UPDATE key_credentials SET revoked_at = $1 WHERE key_id = $2 AND revoked_at IS NULL",
-            )
-            .bind(now)
-            .bind(key_id.to_string())
-            .execute(&mut *transaction)
-            .await?;
-            sqlx::query(
-                "UPDATE legacy_key_credentials SET revoked_at = $1 WHERE key_id = $2 AND revoked_at IS NULL",
             )
             .bind(now)
             .bind(key_id.to_string())
@@ -608,13 +601,6 @@ impl Database {
         .bind(key_id.to_string())
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            "UPDATE legacy_key_credentials SET revoked_at = $1 WHERE key_id = $2 AND revoked_at IS NULL",
-        )
-        .bind(now)
-        .bind(key_id.to_string())
-        .execute(&mut *tx)
-        .await?;
         insert_credential(&mut tx, &issued, generation, now).await?;
         sqlx::query(
             "UPDATE key_records SET credential_generation = $1, updated_at = $2 WHERE id = $3",
@@ -652,13 +638,14 @@ impl Database {
         value: &str,
         pepper: &[u8],
     ) -> Result<AuthenticatedKey, AppError> {
-        let Some(parsed) = crypto::parse_credential(value) else {
-            return super::legacy::authenticate_legacy_key(self, value, pepper).await;
-        };
+        if value.len() < 16 || value.len() > 512 || value.contains(['\0', '\r', '\n']) {
+            return Err(AppError::Unauthorized);
+        }
+        let (secret_hash, _) = crypto::hash_credential(value, pepper);
         let row = sqlx::query(
-            "SELECT k.id AS key_id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_records k JOIN key_credentials c ON c.key_id = k.id AND c.generation = k.credential_generation WHERE k.id = $1 AND c.revoked_at IS NULL",
+            "SELECT k.id AS key_id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_credentials c JOIN key_records k ON k.id = c.key_id AND k.credential_generation = c.generation WHERE c.secret_hash = $1 AND c.revoked_at IS NULL",
         )
-        .bind(parsed.key_id.to_string())
+        .bind(secret_hash)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::Unauthorized)?;

@@ -1,4 +1,5 @@
 use memeloop_token_center::{
+    crypto,
     db::{
         CreateKeyInput, Database, NewRequest, RequestListFilter, SessionArchiveImportMatch,
         SessionArchiveImportMatchInput, SessionArchiveQuarantineBatchInput,
@@ -76,6 +77,27 @@ async fn create_key(db: &Database, tenant: &str, principal: &str) -> (IssuedKey,
         .await
         .expect("authenticate quarantine fixture key");
     (issued, key)
+}
+
+async fn insert_retained_source_mapping(
+    pool: &AnyPool,
+    key_id: Uuid,
+    credential: &str,
+    source_hash: &str,
+) {
+    let (secret_hash, fingerprint) = crypto::hash_credential(credential, PEPPER);
+    sqlx::query(
+        "INSERT INTO legacy_key_credentials (id,key_id,generation,secret_hash,fingerprint,source_hash,created_at) SELECT $1,id,credential_generation,$2,$3,$4,$5 FROM key_records WHERE id=$6",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(secret_hash)
+    .bind(fingerprint)
+    .bind(source_hash)
+    .bind(STARTED_AT)
+    .bind(key_id.to_string())
+    .execute(pool)
+    .await
+    .expect("insert retained source mapping fixture");
 }
 
 fn hex_digest(value: impl AsRef<[u8]>) -> String {
@@ -1028,11 +1050,13 @@ async fn sqlite_dismissal_cannot_be_bypassed_by_a_later_key_mapping() {
         })
         .await
         .expect("dismiss quarantine");
-    fixture
-        .db
-        .register_legacy_key_credential(issued.key_id, &legacy_credential, &source_hash, PEPPER)
-        .await
-        .expect("add later stable key mapping");
+    insert_retained_source_mapping(
+        &fixture.pool,
+        issued.key_id,
+        &legacy_credential,
+        &source_hash,
+    )
+    .await;
     let replay = classify(
         &fixture.db,
         &tenant,
@@ -1348,9 +1372,7 @@ async fn postgres_quarantine_core_invariants_match_sqlite() {
     })
     .await
     .unwrap();
-    db.register_legacy_key_credential(later_owner.key_id, &legacy_credential, &late_hash, PEPPER)
-        .await
-        .unwrap();
+    insert_retained_source_mapping(&pool, later_owner.key_id, &legacy_credential, &late_hash).await;
     let dismissed_replay = quarantined(
         classify(
             &db,

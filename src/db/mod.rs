@@ -22,7 +22,7 @@ use crate::{
         GenerationJobView, GenerationJobWork, GenerationPrice, GenerationStagedAssets, IssuedKey,
         IssuedServiceToken, JSON_SAFE_INTEGER_MAX, KeyAliasView, KeyBudgetSnapshot,
         KeyConcurrencySnapshot, KeyLimitSnapshot, KeyPolicy, KeyRateLimitSnapshot, KeyView,
-        LedgerEntryView, LegacyCredentialView, ManagedKeyView, ModelPrice, ModelPriceTier,
+        LedgerEntryView, ManagedKeyView, ModelPrice, ModelPriceTier,
         ModelPriceTierView, ModelPriceView, OperatorGenerationJobView, OperatorStats,
         RequestArchiveRefs, RequestEventView, RequestProvenanceView, RequestSessionAssociation,
         RequestSessionContext, RequestView, SelfStats, ServiceTokenView, StatsBucket, StatsSummary,

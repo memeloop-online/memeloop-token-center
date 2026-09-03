@@ -238,14 +238,6 @@ pub struct ManagedKeyView {
     pub reserved_balance: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct LegacyCredentialView {
-    pub key_id: Uuid,
-    pub generation: i64,
-    pub fingerprint: String,
-    pub source_hash: String,
-}
-
 #[derive(Clone, Debug)]
 pub struct AuthenticatedService {
     pub service_id: Option<Uuid>,

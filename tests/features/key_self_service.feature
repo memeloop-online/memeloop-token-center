@@ -37,14 +37,14 @@ Feature: Stable key identity and read-only self-service statistics
     And the client calls model "denied-model"
     Then the response status is 403
 
-  Scenario: A migrated CPA key keeps its exact credential and historical identity
+  Scenario: An imported opaque key keeps its exact credential and historical identity
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI upstream returns a successful completion
     When the service creates a key for principal "legacy-linux" allowing model "gpt-test"
-    And the service attaches an unchanged legacy CPA key
+    And the service installs an imported opaque CPA key
     And the client calls model "gpt-test"
     Then the response status is 200
-    When the client views statistics with the legacy CPA key
+    When the client views statistics with the imported opaque CPA key
     Then the statistics contain 1 request and 10 tokens
     When the service rotates the key
     Then the old credential is rejected

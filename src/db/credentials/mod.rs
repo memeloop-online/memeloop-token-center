@@ -1,7 +1,6 @@
 use super::*;
 
 mod keys;
-mod legacy;
 mod service_tokens;
 
 pub(crate) use keys::{

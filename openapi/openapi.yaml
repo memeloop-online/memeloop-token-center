@@ -30,7 +30,7 @@ tags:
   - name: System
     description: Process status and runtime-discovered schemas/plugins.
   - name: Client credentials
-    description: Stable downstream identities, secrets, policy, status, and CPA compatibility.
+    description: Stable downstream identities, secrets, policy, status, and imported credential continuity.
   - name: Service credentials
     description: Least-privilege control-plane credentials for internal integrations.
   - name: Upstream providers
@@ -425,37 +425,6 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-
-  /internal/v1/keys/{key_id}/legacy-credentials:
-    post:
-      tags: [Client credentials]
-      operationId: attachLegacyClientCredential
-      summary: Attach an unchanged CPA credential to a stable identity
-      security: [{ serviceBearer: [] }]
-      x-required-scope: keys:write
-      parameters: [{ $ref: '#/components/parameters/KeyId' }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [credential, source_hash]
-              properties:
-                credential: { type: string, writeOnly: true, minLength: 16, maxLength: 512, pattern: '^[^\r\n]+$' }
-                source_hash: { type: string, minLength: 64, maxLength: 64, pattern: '^[0-9A-Fa-f]{64}$' }
-      responses:
-        '201':
-          description: Legacy credential metadata; no plaintext secret.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/LegacyCredential' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
 
   /internal/v1/service-tokens:
     get:
@@ -3588,8 +3557,8 @@ components:
     clientBearer:
       type: http
       scheme: bearer
-      bearerFormat: mtc_… or migrated CPA credential
-      description: Current native generation or an active migrated CPA credential attached to one stable client identity.
+      bearerFormat: mtc_… or imported opaque credential
+      description: The active normal credential generation for one stable client identity.
     memeloopCloudHmac:
       type: apiKey
       in: header
@@ -4229,15 +4198,6 @@ components:
         daily_budget: { $ref: '#/components/schemas/ClientCredentialBudgetSnapshot' }
         weekly_budget: { $ref: '#/components/schemas/ClientCredentialBudgetSnapshot' }
         lifetime_budget: { $ref: '#/components/schemas/ClientCredentialBudgetSnapshot' }
-    LegacyCredential:
-      type: object
-      additionalProperties: false
-      required: [key_id, generation, fingerprint, source_hash]
-      properties:
-        key_id: { type: string, format: uuid }
-        generation: { type: integer, format: int64 }
-        fingerprint: { type: string }
-        source_hash: { type: string }
     StatusRequest:
       type: object
       additionalProperties: false

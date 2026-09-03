@@ -1,6 +1,100 @@
 use super::super::*;
 
 #[tokio::test]
+async fn sqlite_v60_moves_opaque_credentials_into_the_normal_model() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("normal-key-credentials.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 1, 59)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let key_id = Uuid::now_v7();
+    let tenant_id = Uuid::now_v7();
+    let principal_id = Uuid::now_v7();
+    let account_id = Uuid::now_v7();
+    let credential_id = Uuid::now_v7();
+    let credential = "opaque-cpa-credential-normalized-by-v60";
+    let pepper = b"v60 credential normalization pepper is long enough";
+    let (secret_hash, fingerprint) = crypto::hash_credential(credential, pepper);
+    let source_hash = format!("{:x}", Sha256::digest(credential.as_bytes()));
+    sqlx::query(
+        "INSERT INTO key_records (id,tenant_id,principal_id,account_id,alias,currency,policy_json,status,credential_generation,created_at,updated_at) VALUES ($1,$2,$3,$4,'imported','USD',$5,'active',0,1,1)",
+    )
+    .bind(key_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(principal_id.to_string())
+    .bind(account_id.to_string())
+    .bind(serde_json::to_string(&KeyPolicy::default()).unwrap())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO legacy_key_credentials (id,key_id,generation,secret_hash,fingerprint,source_hash,created_at) VALUES ($1,$2,0,$3,$4,$5,1)",
+    )
+    .bind(credential_id.to_string())
+    .bind(key_id.to_string())
+    .bind(secret_hash.clone())
+    .bind(&fingerprint)
+    .bind(&source_hash)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 60, 60)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let copied = sqlx::query(
+        "SELECT key_id,generation,secret_hash,fingerprint,created_at,revoked_at FROM key_credentials WHERE id=$1",
+    )
+    .bind(credential_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(copied.get::<String, _>("key_id"), key_id.to_string());
+    assert_eq!(copied.get::<i64, _>("generation"), 0);
+    assert_eq!(copied.get::<Vec<u8>, _>("secret_hash"), secret_hash);
+    assert_eq!(copied.get::<String, _>("fingerprint"), fingerprint);
+    assert_eq!(copied.get::<i64, _>("created_at"), 1);
+    assert_eq!(copied.get::<Option<i64>, _>("revoked_at"), None);
+    let proof = sqlx::query(
+        "SELECT proof_kind,source_digest,created_at FROM key_credential_source_proofs WHERE credential_id=$1",
+    )
+    .bind(credential_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(proof.get::<String, _>("proof_kind"), "legacy-source-hash-v1");
+    assert_eq!(proof.get::<String, _>("source_digest"), source_hash);
+    assert_eq!(proof.get::<i64, _>("created_at"), 1);
+    assert!(
+        sqlx::query("SELECT id FROM legacy_key_credentials WHERE id=$1")
+            .bind(credential_id.to_string())
+            .fetch_optional(&database.pool)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let authenticated = database.authenticate_key(credential, pepper).await.unwrap();
+    assert_eq!(authenticated.key_id, key_id);
+    assert_eq!(authenticated.credential_generation, 0);
+}
+
+#[tokio::test]
 async fn sqlite_global_model_history_indexes_drive_both_top_n_sources() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

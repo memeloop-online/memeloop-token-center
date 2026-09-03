@@ -13,10 +13,6 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route("/internal/v1/keys/{key_id}/status", patch(set_key_status))
         .route(
-            "/internal/v1/keys/{key_id}/legacy-credentials",
-            post(register_legacy_key_credential),
-        )
-        .route(
             "/internal/v1/service-tokens",
             get(list_service_tokens).post(create_service_token),
         )

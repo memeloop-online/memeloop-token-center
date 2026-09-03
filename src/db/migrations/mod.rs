@@ -320,6 +320,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "global model-filtered request history indexes",
         sql: include_str!("../../../migrations/sqlite/0059_global_request_model_indexes.sql"),
     },
+    Migration {
+        version: 60,
+        name: "normalize imported key credentials",
+        sql: include_str!("../../../migrations/sqlite/0060_normalize_key_credentials.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -625,6 +630,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 59,
         name: "global model-filtered request history indexes",
         sql: include_str!("../../../migrations/postgres/0059_global_request_model_indexes.sql"),
+    },
+    Migration {
+        version: 60,
+        name: "normalize imported key credentials",
+        sql: include_str!("../../../migrations/postgres/0060_normalize_key_credentials.sql"),
     },
 ];
 

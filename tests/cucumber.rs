@@ -16,12 +16,12 @@ use memeloop_token_center::{
         BeginArchiveStagingResult,
     },
     config::Config,
+    crypto,
     model::{ArchivedGenerationAsset, GenerationStagedAssets},
     worker,
 };
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use sqlx::{AnyPool, PgPool, Row};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -5563,28 +5563,31 @@ async fn rotated_credential_retains_all_state(world: &mut TokenCenterWorld) {
     );
 }
 
-#[when("the service attaches an unchanged legacy CPA key")]
-async fn attach_legacy_cpa_key(world: &mut TokenCenterWorld) {
-    let legacy = "sk-cpa-linux-codex-unchanged-credential-1234567890";
-    let source_hash = format!("{:x}", Sha256::digest(legacy.as_bytes()));
+#[when("the service installs an imported opaque CPA key")]
+async fn install_imported_opaque_cpa_key(world: &mut TokenCenterWorld) {
+    let opaque = "sk-cpa-linux-codex-unchanged-credential-1234567890";
     let key_id = world.stable_key_id.expect("stable key id");
-    let response = world
-        .client
-        .post(format!(
-            "{}/internal/v1/keys/{key_id}/legacy-credentials",
-            world.service_url
-        ))
-        .bearer_auth("test-service-token")
-        .json(&json!({"credential": legacy, "source_hash": source_hash}))
-        .send()
+    let state = world.state.as_ref().expect("token center state");
+    let (secret_hash, fingerprint) =
+        crypto::hash_credential(opaque, state.config.key_pepper.as_bytes());
+    let pool = AnyPool::connect(&state.config.database_url)
         .await
-        .expect("register legacy CPA credential");
-    assert_eq!(response.status(), StatusCode::CREATED);
-    world.current_key = legacy.to_owned();
+        .expect("connect imported credential fixture");
+    let updated = sqlx::query(
+        "UPDATE key_credentials SET secret_hash=$1,fingerprint=$2 WHERE key_id=$3 AND generation=1 AND revoked_at IS NULL",
+    )
+    .bind(secret_hash)
+    .bind(fingerprint)
+    .bind(key_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("install imported opaque credential");
+    assert_eq!(updated.rows_affected(), 1);
+    world.current_key = opaque.to_owned();
 }
 
-#[when("the client views statistics with the legacy CPA key")]
-async fn view_stats_with_legacy_cpa_key(world: &mut TokenCenterWorld) {
+#[when("the client views statistics with the imported opaque CPA key")]
+async fn view_stats_with_imported_opaque_cpa_key(world: &mut TokenCenterWorld) {
     view_stats(world).await;
 }
 

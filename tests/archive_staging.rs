@@ -66,7 +66,7 @@ async fn fresh_sqlite_migrates_latest_schema_and_rejects_untyped_rows() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(latest, 59);
+    assert_eq!(latest, 60);
     database.readiness_check().await.unwrap();
 
     let invalid = sqlx::query(
