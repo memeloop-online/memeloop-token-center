@@ -337,7 +337,12 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
             projected += 1;
         }
     }
-    assert_eq!(projected, REQUESTS);
+    // The projector is intentionally global rather than key-scoped. Other
+    // serial PostgreSQL acceptance cases can leave ready work in the same
+    // database, so this worker may safely drain more than this test created.
+    // The key-scoped assertions below prove that all of this test's rows were
+    // projected exactly once.
+    assert!(projected >= REQUESTS);
     let projection_state: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
             (SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE key_id = $1 AND projected_at IS NOT NULL),
@@ -580,7 +585,7 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
         "SELECT
             (SELECT COUNT(*) FROM conversation_projection_outbox WHERE key_id = $1 AND projected_at IS NULL),
             (SELECT COUNT(*) FROM conversation_observations WHERE key_id = $2),
-            (SELECT COALESCE(SUM(request_count), 0) FROM conversation_key_clusters WHERE key_id = $3)",
+            (SELECT COALESCE(SUM(request_count), 0)::BIGINT FROM conversation_key_clusters WHERE key_id = $3)",
     )
     .bind(key.key_id.to_string())
     .bind(key.key_id.to_string())
