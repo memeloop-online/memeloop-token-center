@@ -3333,6 +3333,23 @@ paths:
         '502': { $ref: '#/components/responses/UpstreamError' }
 
   /v1/responses:
+    get:
+      tags: [OpenAI compatible]
+      operationId: negotiateResponsesWebSocket
+      summary: Negotiate the Responses transport before native WebSocket support is available
+      description: |
+        Temporary authenticated compatibility response for clients that probe the
+        Responses WebSocket endpoint before using HTTP. This operation returns 426
+        immediately so the client can use `POST /v1/responses`. It does not remove or
+        replace the planned native Responses WebSocket transport.
+      x-transport-negotiation:
+        lifecycle: temporary-until-native-websocket
+        fallback-operation: POST /v1/responses
+        native-websocket-planned: true
+      security: [{ clientBearer: [] }]
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '426': { $ref: '#/components/responses/ResponsesWebSocketUpgradeRequired' }
     post:
       tags: [OpenAI compatible]
       operationId: createResponse
@@ -3826,6 +3843,17 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
+    ResponsesWebSocketUpgradeRequired:
+      description: Native Responses WebSocket transport is not available in this release; use the authenticated HTTP POST operation.
+      headers:
+        Upgrade:
+          description: Requested protocol token; this release responds with 426 instead of switching transports.
+          schema: { type: string, const: websocket }
+        X-MTC-Request-Id: { $ref: '#/components/headers/RequestId' }
+        X-MTC-API-Version: { $ref: '#/components/headers/ApiVersion' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
     Unauthorized:
       description: Missing, malformed, revoked, expired, or invalid bearer credential.
       headers:
@@ -4056,7 +4084,7 @@ components:
           properties:
             code:
               type: string
-              enum: [unauthorized, forbidden, unpriced_model, insufficient_quota, rate_limit_exceeded, not_found, conflict, invalid_request, upstream_error, internal_error]
+              enum: [unauthorized, forbidden, unpriced_model, insufficient_quota, rate_limit_exceeded, not_found, conflict, invalid_request, websocket_upgrade_required, upstream_error, internal_error]
             message: { type: string }
     UsageLimitErrorResponse:
       type: object

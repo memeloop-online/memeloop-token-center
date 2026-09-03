@@ -51,6 +51,10 @@ test("lifetime apostrophe is not parsed as a character literal", () => assert.eq
 test("unknown merged router fails closed", () => assert.throws(() => sourceRoutes(sourceWith(".merge(helper_router())")), /unparsed Router/u));
 
 test("asset and image semantics are complete", () => validateProductContracts(cloneDocument()));
+test("Responses WebSocket negotiation remains an authenticated temporary fallback", () => {
+  const document = cloneDocument(); const operation = document.paths["/v1/responses"].get; assert.deepEqual(operation.security, [{ clientBearer: [] }]); assert.deepEqual(operation.responses["426"], { $ref: "#/components/responses/ResponsesWebSocketUpgradeRequired" }); assert.equal(operation["x-transport-negotiation"]["native-websocket-planned"], true); validateProductContracts(document);
+  delete operation["x-transport-negotiation"]["native-websocket-planned"]; assert.throws(() => validateProductContracts(document), /native WebSocket direction/u);
+});
 test("self limit snapshot security regression fails closed", () => { const document = cloneDocument(); document.paths["/self/v1/key/limits"].get.security = [{ serviceBearer: [] }]; assert.throws(() => validateProductContracts(document), /credential security/u); });
 test("usage limit reason regression fails closed", () => { const document = cloneDocument(); const required: string[] = document.components.schemas.UsageLimitErrorResponse.properties.error.required; required.splice(required.indexOf("retryable"), 1); assert.throws(() => validateProductContracts(document), /reason\/retryable/u); });
 test("asset range response regression fails closed", () => { const document = cloneDocument(); delete document.paths["/self/v1/requests/{request_id}/assets/{asset_id}"].get.responses["416"]; assert.throws(() => validateProductContracts(document), /must retain responses/u); });

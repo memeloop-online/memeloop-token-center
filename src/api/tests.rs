@@ -49,6 +49,72 @@ fn file_count(root: &std::path::Path) -> usize {
         .unwrap_or_default()
 }
 
+#[tokio::test]
+async fn responses_websocket_probe_authenticates_then_returns_upgrade_required() {
+    let (state, _directory) = test_state().await;
+    let issued = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "responses-websocket-negotiation".to_owned(),
+                principal_external_id: "codex-client".to_owned(),
+                alias: "responses-websocket-negotiation".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ZERO,
+                idempotency_key: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let application = router_for_role(state, RuntimeRole::Gateway);
+    let websocket_probe = |authorization: Option<&str>| {
+        let mut request = Request::get("/v1/responses")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+        if let Some(authorization) = authorization {
+            request = request.header(header::AUTHORIZATION, authorization);
+        }
+        request.body(Body::empty()).unwrap()
+    };
+
+    let unauthenticated = application
+        .clone()
+        .oneshot(websocket_probe(None))
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let authorization = format!("Bearer {}", issued.key);
+    let response = application
+        .oneshot(websocket_probe(Some(&authorization)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(
+        response.headers().get(header::UPGRADE),
+        Some(&HeaderValue::from_static("websocket"))
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+    assert_eq!(
+        response.headers().get("x-mtc-api-version"),
+        Some(&HeaderValue::from_static("v1"))
+    );
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["code"], "websocket_upgrade_required");
+}
+
 struct GenerationApiFixture {
     state: AppState,
     database_url: String,

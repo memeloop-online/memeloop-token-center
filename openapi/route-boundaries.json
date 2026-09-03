@@ -67,13 +67,24 @@
       "path_prefixes": ["/self/v1/"]
     },
     {
+      "name": "responses-compatible-api",
+      "source_role": "gateway",
+      "runtime_roles": ["gateway", "all"],
+      "exposure": "public-client",
+      "authentication": "client credential bound to stable key_id",
+      "in_openapi": true,
+      "transport_contract": "POST is the HTTP proxy; GET temporarily returns authenticated 426 negotiation until native WebSocket support replaces that handler",
+      "exact_paths": ["/v1/responses"]
+    },
+    {
       "name": "compatible-model-api",
       "source_role": "gateway",
       "runtime_roles": ["gateway", "all"],
       "exposure": "public-client",
       "authentication": "client credential bound to stable key_id",
       "in_openapi": true,
-      "path_prefixes": ["/v1/"]
+      "path_prefixes": ["/v1/"],
+      "excluded_paths": ["/v1/responses"]
     }
   ]
 }

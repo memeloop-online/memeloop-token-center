@@ -34,7 +34,9 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
         .route("/self/v1/sessions/{session_id}", get(self_session_detail))
         .route(
             "/v1/responses",
-            post(proxy_openai_responses).layer(DefaultBodyLimit::max(MAX_RESPONSES_REQUEST_BODY)),
+            get(negotiate_openai_responses_websocket)
+                .post(proxy_openai_responses)
+                .layer(DefaultBodyLimit::max(MAX_RESPONSES_REQUEST_BODY)),
         )
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(proxy_openai_chat))

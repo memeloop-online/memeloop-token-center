@@ -1,6 +1,12 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use axum::{body::Bytes, extract::State, http::HeaderMap, response::Response};
+use axum::{
+    Json,
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -48,6 +54,27 @@ pub(super) async fn proxy_openai_responses(
     body: Bytes,
 ) -> Result<Response, AppError> {
     super::proxy::proxy(state, headers, body, Protocol::OpenAiResponses).await
+}
+
+/// Temporary transport negotiation for clients that probe the Responses
+/// WebSocket endpoint before falling back to the supported HTTP POST flow.
+/// Keep this separate from the POST handler so native WebSocket support can
+/// replace only this GET handler without changing authentication or routing.
+pub(super) async fn negotiate_openai_responses_websocket() -> Response {
+    let mut response = (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(serde_json::json!({
+            "error": {
+                "code": "websocket_upgrade_required",
+                "message": "Responses WebSocket transport is not available in this release; retry with HTTP POST"
+            }
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+    response
 }
 
 pub(super) async fn proxy_openai_embeddings(
