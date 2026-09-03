@@ -543,12 +543,14 @@ mod tests {
 
     #[test]
     fn empty_base64_is_compatible_with_a_valid_url() {
-        let response = Bytes::from_static(
-            br#"{"data":[{"url":"https://example.test/image","b64_json":""}]}"#,
-        );
+        let response =
+            Bytes::from_static(br#"{"data":[{"url":"https://example.test/image","b64_json":""}]}"#);
         let parsed = parse_openai_image_response(&response, 1)
             .expect("an empty alternate representation is equivalent to absence");
-        assert!(matches!(parsed.items.as_slice(), [OpenAiImageItem::Url { .. }]));
+        assert!(matches!(
+            parsed.items.as_slice(),
+            [OpenAiImageItem::Url { .. }]
+        ));
     }
 
     #[test]

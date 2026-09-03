@@ -1005,7 +1005,9 @@ async fn native_codex_upgrade_api_is_global_allowlisted_and_never_returns_proxy_
                         "account_id": "native-account-123"
                     })),
                     proxy_url: Some("socks5://operator:proxy-secret@100.64.0.16:1080".into()),
-                    proxy_network_scope: Some(memeloop_token_center::network::OutboundScope::Private),
+                    proxy_network_scope: Some(
+                        memeloop_token_center::network::OutboundScope::Private,
+                    ),
                 },
                 status: ManagedOAuthImportStatus::Active,
                 adapter: state
@@ -1054,7 +1056,10 @@ async fn native_codex_upgrade_api_is_global_allowlisted_and_never_returns_proxy_
     let result: Value = serde_json::from_slice(&result_body).unwrap();
     assert_eq!(result["upgraded_count"], 0);
     assert_eq!(result["already_native_count"], 1);
-    assert_eq!(result["already_native_account_ids"][0], account.id.to_string());
+    assert_eq!(
+        result["already_native_account_ids"][0],
+        account.id.to_string()
+    );
 }
 
 #[tokio::test]

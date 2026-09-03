@@ -450,11 +450,11 @@ impl ProviderCatalog {
             },
         ));
         let legacy_types = vec![builtin_managed_oauth_provider(
-                "cpa-gemini-oauth-legacy",
-                "Legacy Gemini OAuth import",
-                "https://cloudcode-pa.googleapis.com",
-                false,
-            )];
+            "cpa-gemini-oauth-legacy",
+            "Legacy Gemini OAuth import",
+            "https://cloudcode-pa.googleapis.com",
+            false,
+        )];
         Self {
             types: Arc::new(types),
             legacy_types: Arc::new(legacy_types),

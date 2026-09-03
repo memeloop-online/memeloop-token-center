@@ -254,13 +254,12 @@ impl Database {
         let credential_expires_at = input.credential.expires_at();
         let can_refresh = input.adapter.can_refresh();
         let oauth_refresh_url = can_refresh.then(|| input.adapter.refresh_url().to_owned());
-        let oauth_driver = if input.adapter.provider_driver()
-            == crate::oauth::codex_device::PROVIDER_DRIVER
-        {
-            crate::oauth::codex_device::OAUTH_DRIVER
-        } else {
-            input.adapter.provider_driver()
-        };
+        let oauth_driver =
+            if input.adapter.provider_driver() == crate::oauth::codex_device::PROVIDER_DRIVER {
+                crate::oauth::codex_device::OAUTH_DRIVER
+            } else {
+                input.adapter.provider_driver()
+            };
         let account_id = Uuid::now_v7();
         let mut tx = self.pool.begin().await?;
 
@@ -303,8 +302,9 @@ impl Database {
         .await?;
 
         if claimed.rows_affected() == 0 {
-            let row = managed_oauth_import_row(self.backend, &mut tx, &tenant_id, &input.source_key)
-                .await?;
+            let row =
+                managed_oauth_import_row(self.backend, &mut tx, &tenant_id, &input.source_key)
+                    .await?;
             let existing_digest: String = row.try_get("payload_digest")?;
             let existing_contract: i64 = row.try_get("contract_version")?;
             if existing_contract != input.contract_version {
@@ -355,7 +355,9 @@ impl Database {
                 ));
             }
             let current_generation: i64 = row.try_get("credential_generation")?;
-            let generation = current_generation.checked_add(1).ok_or(AppError::Internal)?;
+            let generation = current_generation
+                .checked_add(1)
+                .ok_or(AppError::Internal)?;
             let current_updated_at: i64 = row.try_get("updated_at")?;
             let updated_at = now.max(current_updated_at.saturating_add(1));
             let replacement_ciphertext = seal_credential(&replacement, key_material)?;
@@ -533,7 +535,10 @@ fn validate_native_codex_upgrade_ids(account_ids: &[Uuid]) -> Result<(), AppErro
         ));
     }
     let mut unique = std::collections::BTreeSet::new();
-    if account_ids.iter().any(|account_id| !unique.insert(*account_id)) {
+    if account_ids
+        .iter()
+        .any(|account_id| !unique.insert(*account_id))
+    {
         return Err(AppError::BadRequest(
             "native OpenAI Codex migration account ids must be unique".into(),
         ));
@@ -587,10 +592,14 @@ fn validate_imported_codex_account_shape(
 ) -> Result<(), AppError> {
     if row.try_get::<String, _>("driver")? != crate::oauth::codex_device::IMPORTED_PROVIDER_DRIVER
         || row.try_get::<String, _>("auth_kind")? != "oauth"
-        || row.try_get::<Option<String>, _>("oauth_session_id")?.is_none()
+        || row
+            .try_get::<Option<String>, _>("oauth_session_id")?
+            .is_none()
         || row.try_get::<Option<String>, _>("oauth_driver")?.as_deref()
             != Some(crate::oauth::codex_device::IMPORTED_PROVIDER_DRIVER)
-        || row.try_get::<Option<String>, _>("oauth_refresh_url")?.as_deref()
+        || row
+            .try_get::<Option<String>, _>("oauth_refresh_url")?
+            .as_deref()
             != Some(crate::oauth::codex_device::TOKEN_ENDPOINT)
     {
         return Err(AppError::BadRequest(
@@ -608,10 +617,14 @@ fn validate_native_codex_account_shape(
     credential: &UpstreamCredential,
 ) -> Result<(), AppError> {
     if row.try_get::<String, _>("auth_kind")? != "oauth"
-        || row.try_get::<Option<String>, _>("oauth_session_id")?.is_none()
+        || row
+            .try_get::<Option<String>, _>("oauth_session_id")?
+            .is_none()
         || row.try_get::<Option<String>, _>("oauth_driver")?.as_deref()
             != Some(crate::oauth::codex_device::OAUTH_DRIVER)
-        || row.try_get::<Option<String>, _>("oauth_refresh_url")?.as_deref()
+        || row
+            .try_get::<Option<String>, _>("oauth_refresh_url")?
+            .as_deref()
             != Some(crate::oauth::codex_device::TOKEN_ENDPOINT)
     {
         return Err(AppError::BadRequest(
@@ -639,16 +652,20 @@ async fn managed_oauth_import_row(
     source_key: &str,
 ) -> Result<sqlx::any::AnyRow, AppError> {
     let select = match backend {
-        DatabaseBackend::PostgreSql => "SELECT i.payload_digest, i.contract_version, a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_account_imports i JOIN upstream_accounts a ON a.id = i.upstream_account_id JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE i.tenant_id = $1 AND i.import_kind = $2 AND i.source_key = $3 FOR UPDATE OF i, a, c",
-        DatabaseBackend::Sqlite => "SELECT i.payload_digest, i.contract_version, a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_account_imports i JOIN upstream_accounts a ON a.id = i.upstream_account_id JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE i.tenant_id = $1 AND i.import_kind = $2 AND i.source_key = $3",
+        DatabaseBackend::PostgreSql => {
+            "SELECT i.payload_digest, i.contract_version, a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_account_imports i JOIN upstream_accounts a ON a.id = i.upstream_account_id JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE i.tenant_id = $1 AND i.import_kind = $2 AND i.source_key = $3 FOR UPDATE OF i, a, c"
+        }
+        DatabaseBackend::Sqlite => {
+            "SELECT i.payload_digest, i.contract_version, a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_account_imports i JOIN upstream_accounts a ON a.id = i.upstream_account_id JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE i.tenant_id = $1 AND i.import_kind = $2 AND i.source_key = $3"
+        }
     };
     sqlx::query(select)
-    .bind(tenant_id)
-    .bind(CPA_MANAGED_OAUTH_IMPORT_KIND)
-    .bind(source_key)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(AppError::Internal)
+        .bind(tenant_id)
+        .bind(CPA_MANAGED_OAUTH_IMPORT_KIND)
+        .bind(source_key)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(AppError::Internal)
 }
 
 fn validate_managed_oauth_import(input: &ImportManagedOAuthAccountInput) -> Result<(), AppError> {
@@ -805,11 +822,11 @@ mod native_codex_upgrade_tests {
             .await
             .unwrap();
         assert_eq!(upgraded.id, account.id);
+        assert_eq!(upgraded.driver, crate::oauth::codex_device::PROVIDER_DRIVER);
         assert_eq!(
-            upgraded.driver,
-            crate::oauth::codex_device::PROVIDER_DRIVER
+            upgraded.credential_generation,
+            account.credential_generation
         );
-        assert_eq!(upgraded.credential_generation, account.credential_generation);
         assert_eq!(
             credential.adapter_state(),
             Some(&serde_json::json!({

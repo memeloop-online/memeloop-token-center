@@ -193,7 +193,10 @@ pub(crate) fn native_config_from_import(config: &Value) -> Result<Value, AppErro
             "imported OpenAI Codex account has an invalid configuration".into(),
         ));
     }
-    let Some(bounds) = object.get("reservation_token_bounds").and_then(Value::as_object) else {
+    let Some(bounds) = object
+        .get("reservation_token_bounds")
+        .and_then(Value::as_object)
+    else {
         return Err(AppError::BadRequest(
             "imported OpenAI Codex account has an invalid configuration".into(),
         ));
@@ -202,7 +205,9 @@ pub(crate) fn native_config_from_import(config: &Value) -> Result<Value, AppErro
         || bounds.iter().any(|(model, bound)| {
             model.is_empty()
                 || model.len() > 500
-                || bound.as_i64().is_none_or(|value| !(1..=1_000_000_000).contains(&value))
+                || bound
+                    .as_i64()
+                    .is_none_or(|value| !(1..=1_000_000_000).contains(&value))
         })
     {
         return Err(AppError::BadRequest(
