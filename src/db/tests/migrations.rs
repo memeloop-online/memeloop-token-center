@@ -92,7 +92,10 @@ async fn sqlite_v60_normalizes_matching_coexisting_credentials_without_legacy_ru
     .fetch_one(&database.pool)
     .await
     .unwrap();
-    assert_eq!(proof.get::<String, _>("proof_kind"), "external-source-key-hash-v1");
+    assert_eq!(
+        proof.get::<String, _>("proof_kind"),
+        "external-source-key-hash-v1"
+    );
     assert_eq!(proof.get::<String, _>("source_digest"), source_hash);
     assert_eq!(proof.get::<i64, _>("created_at"), 1);
     let retained_legacy_table: i64 = sqlx::query_scalar(
@@ -112,7 +115,10 @@ async fn sqlite_v60_refuses_to_choose_between_different_active_credentials() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
-        directory.path().join("conflicting-key-credentials.db").display()
+        directory
+            .path()
+            .join("conflicting-key-credentials.db")
+            .display()
     );
     let database = Database::connect(&database_url).await.unwrap();
     sqlx::query(
@@ -143,7 +149,8 @@ async fn sqlite_v60_refuses_to_choose_between_different_active_credentials() {
     .await
     .unwrap();
     let pepper = b"v60 conflicting credential normalization pepper is long enough";
-    let (normal_hash, normal_fingerprint) = crypto::hash_credential("normal-active-credential", pepper);
+    let (normal_hash, normal_fingerprint) =
+        crypto::hash_credential("normal-active-credential", pepper);
     let (imported_hash, imported_fingerprint) =
         crypto::hash_credential("imported-active-credential", pepper);
     sqlx::query(

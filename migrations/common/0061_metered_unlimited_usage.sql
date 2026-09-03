@@ -3,7 +3,7 @@ ALTER TABLE usage_reservations
         CHECK (enforcement_mode IN ('prepaid', 'metered_unlimited'));
 
 CREATE TABLE IF NOT EXISTS metered_usage_projection_outbox (
-    reservation_id TEXT PRIMARY KEY,
+    reservation_id TEXT PRIMARY KEY REFERENCES usage_reservations(id) ON DELETE CASCADE,
     account_id TEXT NOT NULL,
     key_id TEXT NOT NULL,
     actual_micros BIGINT NOT NULL CHECK (actual_micros >= 0),

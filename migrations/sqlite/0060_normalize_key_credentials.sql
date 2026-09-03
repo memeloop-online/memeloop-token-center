@@ -76,7 +76,7 @@ HAVING COUNT(*) > 1
 LIMIT 1;
 
 CREATE TABLE IF NOT EXISTS key_credential_source_proofs (
-    credential_id TEXT NOT NULL,
+    credential_id TEXT NOT NULL REFERENCES key_credentials(id) ON DELETE CASCADE,
     proof_kind TEXT NOT NULL,
     source_digest TEXT NOT NULL,
     created_at BIGINT NOT NULL,

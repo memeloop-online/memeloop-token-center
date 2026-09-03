@@ -78,11 +78,7 @@ async fn create_key(db: &Database, tenant: &str, principal: &str) -> (IssuedKey,
     (issued, key)
 }
 
-async fn insert_retained_source_mapping(
-    pool: &AnyPool,
-    key_id: Uuid,
-    source_hash: &str,
-) {
+async fn insert_retained_source_mapping(pool: &AnyPool, key_id: Uuid, source_hash: &str) {
     sqlx::query(
         "INSERT INTO key_credential_source_proofs (credential_id,proof_kind,source_digest,created_at) SELECT credential.id,'external-source-key-hash-v1',$1,$2 FROM key_credentials credential JOIN key_records stable_key ON stable_key.id = credential.key_id AND stable_key.credential_generation = credential.generation WHERE credential.key_id = $3 AND credential.revoked_at IS NULL",
     )
@@ -1044,12 +1040,7 @@ async fn sqlite_dismissal_cannot_be_bypassed_by_a_later_key_mapping() {
         })
         .await
         .expect("dismiss quarantine");
-    insert_retained_source_mapping(
-        &fixture.pool,
-        issued.key_id,
-        &source_hash,
-    )
-    .await;
+    insert_retained_source_mapping(&fixture.pool, issued.key_id, &source_hash).await;
     let replay = classify(
         &fixture.db,
         &tenant,

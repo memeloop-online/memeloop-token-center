@@ -90,11 +90,6 @@ DELETE FROM cpamp_import_event_provenance
    AND source = :'import_source';
 DELETE FROM request_records
  WHERE tenant_id IN (SELECT id FROM tenants WHERE external_id = :'tenant_external_id');
-DELETE FROM legacy_key_credentials
- WHERE key_id IN (
-   SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id
-    WHERE t.external_id = :'tenant_external_id'
- );
 DELETE FROM key_credentials
  WHERE key_id IN (
    SELECT k.id FROM key_records k JOIN tenants t ON t.id = k.tenant_id

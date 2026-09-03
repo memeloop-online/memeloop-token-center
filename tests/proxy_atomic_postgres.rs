@@ -141,7 +141,8 @@ async fn postgres_pending_proxy_failover_assignment_is_tenant_scoped_and_idempot
 }
 
 #[tokio::test]
-async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_without_shared_budget_rows() {
+async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_without_shared_budget_rows()
+{
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
@@ -176,7 +177,10 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
         .authenticate_key(&issued.key, pepper)
         .await
         .unwrap();
-    assert_eq!(key.policy.enforcement_mode, EnforcementMode::MeteredUnlimited);
+    assert_eq!(
+        key.policy.enforcement_mode,
+        EnforcementMode::MeteredUnlimited
+    );
     let price = database
         .upsert_model_price(&model, "USD", Decimal::ONE, Decimal::ONE)
         .await
