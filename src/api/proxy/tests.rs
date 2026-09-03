@@ -1712,6 +1712,14 @@ fn responses_sse_requires_terminal_event_and_payload_to_match() {
 #[test]
 fn upstream_usage_rejects_negative_and_extreme_token_counts() {
     assert!(matches!(
+        usage_from_value_checked(&json!({"usage":{"total_tokens":7,"provider_trace":"opaque"}})),
+        Ok(None)
+    ));
+    assert!(matches!(
+        usage_from_value_checked(&json!({"usage":{"prompt_tokens":"7"}})),
+        Err(())
+    ));
+    assert!(matches!(
         extract_usage_checked(
             b"data: {\"type\":\"response.output_text.delta\",\"usage\":null}\n\ndata: [DONE]\n\n"
         ),

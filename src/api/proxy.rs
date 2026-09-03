@@ -1360,7 +1360,11 @@ fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsage>, ()> {
         (Some(input), Some(output)) => (input, output),
         (Some(input), None) => (input, 0),
         (None, Some(output)) => (0, output),
-        (None, None) => return Err(()),
+        // Some OpenAI-compatible providers emit a metadata-only `usage`
+        // object (for example only `total_tokens`). Treat that exactly like
+        // omitted usage so the caller charges the already-reserved ceilings.
+        // A present input/output field with an invalid type still fails above.
+        (None, None) => return Ok(None),
     };
     let details_integer = |details_field: &str| -> Result<Option<i64>, ()> {
         let Some(details) = usage.get(details_field) else {

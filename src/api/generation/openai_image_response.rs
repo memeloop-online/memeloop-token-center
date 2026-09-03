@@ -192,7 +192,15 @@ struct RawItem<'input> {
 
 impl RawItem<'_> {
     fn into_item(self, bytes: &Bytes) -> Result<OpenAiImageItem, OpenAiImageParseError> {
-        match (self.url, self.b64) {
+        let b64 = match self.b64 {
+            Some(encoded)
+                if serde_json::from_str::<&str>(encoded.get()).is_ok_and(str::is_empty) =>
+            {
+                None
+            }
+            value => value,
+        };
+        match (self.url, b64) {
             (Some(url), None) => {
                 if url.get().len() > MAX_PROVIDER_URL_JSON_BYTES {
                     return Err(OpenAiImageParseError::InvalidPayload);
@@ -531,6 +539,16 @@ mod tests {
             parse_openai_image_response(&Bytes::copy_from_slice(response), 1)
                 .expect("null is equivalent to an absent alternate field");
         }
+    }
+
+    #[test]
+    fn empty_base64_is_compatible_with_a_valid_url() {
+        let response = Bytes::from_static(
+            br#"{"data":[{"url":"https://example.test/image","b64_json":""}]}"#,
+        );
+        let parsed = parse_openai_image_response(&response, 1)
+            .expect("an empty alternate representation is equivalent to absence");
+        assert!(matches!(parsed.items.as_slice(), [OpenAiImageItem::Url { .. }]));
     }
 
     #[test]
