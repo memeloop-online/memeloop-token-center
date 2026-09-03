@@ -13,9 +13,9 @@ WHERE stable_key.id IS NULL
    OR (legacy.revoked_at IS NULL AND legacy.generation <> stable_key.credential_generation)
 LIMIT 1;
 
--- Preserve the exact SHA-256 source identity used by CPAMP and archive
--- correlation. This is generic credential provenance, not an authentication
--- fallback. Authentication uses only key_credentials after this migration.
+-- Preserve the exact SHA-256 source identity used for archive correlation.
+-- This is generic credential provenance, not an authentication fallback.
+-- Authentication uses only key_credentials after this migration.
 INSERT INTO key_credential_v60_guard (invalid)
 SELECT 1
 FROM legacy_key_credentials
@@ -29,26 +29,39 @@ WHERE fingerprint !~ '^[0-9a-f]{16}$'
    OR fingerprint <> SUBSTRING(ENCODE(secret_hash, 'hex') FROM 1 FOR 16)
 LIMIT 1;
 
--- The normal credential model is one secret per stable key generation. Do not
--- weaken that invariant or choose one of two secrets implicitly.
+-- A normal credential is canonical when it already owns the stable key
+-- generation. An active imported credential may share that slot only when it
+-- has the same secret material. Choosing between two different active secrets
+-- would silently revoke one of them, so make that operator-reconciliation work
+-- explicit instead of guessing during a schema migration.
 INSERT INTO key_credential_v60_guard (invalid)
 SELECT 1
 FROM legacy_key_credentials legacy
 JOIN key_credentials credential
   ON credential.key_id = legacy.key_id
  AND credential.generation = legacy.generation
+WHERE legacy.revoked_at IS NULL
+  AND (credential.revoked_at IS NOT NULL
+       OR credential.secret_hash <> legacy.secret_hash
+       OR credential.fingerprint <> legacy.fingerprint)
 LIMIT 1;
 
 INSERT INTO key_credential_v60_guard (invalid)
 SELECT 1
 FROM legacy_key_credentials legacy
 JOIN key_credentials credential ON credential.id = legacy.id
+WHERE credential.key_id <> legacy.key_id
+   OR credential.generation <> legacy.generation
+   OR credential.secret_hash <> legacy.secret_hash
+   OR credential.fingerprint <> legacy.fingerprint
 LIMIT 1;
 
 INSERT INTO key_credential_v60_guard (invalid)
 SELECT 1
 FROM legacy_key_credentials legacy
 JOIN key_credentials credential ON credential.secret_hash = legacy.secret_hash
+WHERE credential.key_id <> legacy.key_id
+   OR credential.generation <> legacy.generation
 LIMIT 1;
 
 INSERT INTO key_credential_v60_guard (invalid)
@@ -73,40 +86,81 @@ CREATE INDEX IF NOT EXISTS key_credential_source_proofs_digest_idx
 CREATE UNIQUE INDEX IF NOT EXISTS key_credentials_secret_hash_unique_idx
     ON key_credentials (secret_hash);
 
+-- Rows that do not already have a normal sibling are copied verbatim. For a
+-- safe coexistence the existing normal row remains canonical, retaining its
+-- stable credential id and lifecycle metadata.
 INSERT INTO key_credentials
     (id, key_id, generation, secret_hash, fingerprint, created_at, revoked_at)
-SELECT id, key_id, generation, secret_hash, fingerprint, created_at, revoked_at
-FROM legacy_key_credentials;
+SELECT legacy.id,
+       legacy.key_id,
+       legacy.generation,
+       legacy.secret_hash,
+       legacy.fingerprint,
+       legacy.created_at,
+       legacy.revoked_at
+FROM legacy_key_credentials legacy
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM key_credentials credential
+    WHERE credential.key_id = legacy.key_id
+      AND credential.generation = legacy.generation
+);
+
+-- A stale partial application must never silently redirect a source digest to
+-- a different credential. Matching proof rows are safe to replay.
+INSERT INTO key_credential_v60_guard (invalid)
+SELECT 1
+FROM legacy_key_credentials legacy
+JOIN key_credentials credential
+  ON credential.key_id = legacy.key_id
+ AND credential.generation = legacy.generation
+JOIN key_credential_source_proofs proof
+  ON proof.proof_kind = 'external-source-key-hash-v1'
+ AND (proof.source_digest = legacy.source_hash OR proof.credential_id = credential.id)
+WHERE proof.source_digest <> legacy.source_hash
+   OR proof.credential_id <> credential.id
+   OR proof.created_at <> legacy.created_at
+LIMIT 1;
 
 INSERT INTO key_credential_source_proofs
     (credential_id, proof_kind, source_digest, created_at)
-SELECT id, 'legacy-source-hash-v1', source_hash, created_at
-FROM legacy_key_credentials;
+SELECT credential.id,
+       'external-source-key-hash-v1',
+       legacy.source_hash,
+       legacy.created_at
+FROM legacy_key_credentials legacy
+JOIN key_credentials credential
+  ON credential.key_id = legacy.key_id
+ AND credential.generation = legacy.generation
+ON CONFLICT (credential_id, proof_kind) DO NOTHING;
 
--- Verify the exact copied credential and provenance sets before committing.
+-- Verify the canonical credential and provenance sets before committing.
 INSERT INTO key_credential_v60_guard (invalid)
 SELECT 1
 FROM legacy_key_credentials legacy
 LEFT JOIN key_credentials credential
-  ON credential.id = legacy.id
- AND credential.key_id = legacy.key_id
+  ON credential.key_id = legacy.key_id
  AND credential.generation = legacy.generation
- AND credential.secret_hash = legacy.secret_hash
- AND credential.fingerprint = legacy.fingerprint
- AND credential.created_at = legacy.created_at
- AND COALESCE(credential.revoked_at, -1) = COALESCE(legacy.revoked_at, -1)
 WHERE credential.id IS NULL
+   OR (legacy.revoked_at IS NULL
+       AND (credential.revoked_at IS NOT NULL
+            OR credential.secret_hash <> legacy.secret_hash
+            OR credential.fingerprint <> legacy.fingerprint))
 LIMIT 1;
 
 INSERT INTO key_credential_v60_guard (invalid)
 SELECT 1
 FROM legacy_key_credentials legacy
+JOIN key_credentials credential
+  ON credential.key_id = legacy.key_id
+ AND credential.generation = legacy.generation
 LEFT JOIN key_credential_source_proofs proof
-  ON proof.credential_id = legacy.id
- AND proof.proof_kind = 'legacy-source-hash-v1'
+  ON proof.credential_id = credential.id
+ AND proof.proof_kind = 'external-source-key-hash-v1'
  AND proof.source_digest = legacy.source_hash
  AND proof.created_at = legacy.created_at
 WHERE proof.credential_id IS NULL
 LIMIT 1;
 
+DROP TABLE legacy_key_credentials;
 DROP TABLE key_credential_v60_guard;

@@ -1,5 +1,4 @@
 use memeloop_token_center::{
-    crypto,
     db::{
         CreateKeyInput, Database, NewRequest, RequestListFilter, SessionArchiveImportMatch,
         SessionArchiveImportMatchInput, SessionArchiveQuarantineBatchInput,
@@ -82,16 +81,11 @@ async fn create_key(db: &Database, tenant: &str, principal: &str) -> (IssuedKey,
 async fn insert_retained_source_mapping(
     pool: &AnyPool,
     key_id: Uuid,
-    credential: &str,
     source_hash: &str,
 ) {
-    let (secret_hash, fingerprint) = crypto::hash_credential(credential, PEPPER);
     sqlx::query(
-        "INSERT INTO legacy_key_credentials (id,key_id,generation,secret_hash,fingerprint,source_hash,created_at) SELECT $1,id,credential_generation,$2,$3,$4,$5 FROM key_records WHERE id=$6",
+        "INSERT INTO key_credential_source_proofs (credential_id,proof_kind,source_digest,created_at) SELECT credential.id,'external-source-key-hash-v1',$1,$2 FROM key_credentials credential JOIN key_records stable_key ON stable_key.id = credential.key_id AND stable_key.credential_generation = credential.generation WHERE credential.key_id = $3 AND credential.revoked_at IS NULL",
     )
-    .bind(Uuid::now_v7().to_string())
-    .bind(secret_hash)
-    .bind(fingerprint)
     .bind(source_hash)
     .bind(STARTED_AT)
     .bind(key_id.to_string())
@@ -1053,7 +1047,6 @@ async fn sqlite_dismissal_cannot_be_bypassed_by_a_later_key_mapping() {
     insert_retained_source_mapping(
         &fixture.pool,
         issued.key_id,
-        &legacy_credential,
         &source_hash,
     )
     .await;
@@ -1372,7 +1365,7 @@ async fn postgres_quarantine_core_invariants_match_sqlite() {
     })
     .await
     .unwrap();
-    insert_retained_source_mapping(&pool, later_owner.key_id, &legacy_credential, &late_hash).await;
+    insert_retained_source_mapping(&pool, later_owner.key_id, &late_hash).await;
     let dismissed_replay = quarantined(
         classify(
             &db,
