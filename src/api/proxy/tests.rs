@@ -1144,6 +1144,7 @@ fn assert_codex_wire(request: &wiremock::Request, upstream_model: &str) {
     assert_eq!(request.url.path(), codex_transport::RESPONSES_PATH);
     assert_eq!(request.headers[header::ACCEPT], "text/event-stream");
     assert_eq!(request.headers[header::CONTENT_TYPE], "application/json");
+    assert_eq!(request.headers[header::CONNECTION], "Keep-Alive");
     assert_eq!(
         request.headers[header::USER_AGENT],
         "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)"
@@ -1154,14 +1155,14 @@ fn assert_codex_wire(request: &wiremock::Request, upstream_model: &str) {
         request.headers[header::AUTHORIZATION],
         "Bearer upstream-access-secret"
     );
-    assert_ne!(request.headers["session_id"], "downstream-spoof");
+    assert_ne!(request.headers["session-id"], "downstream-spoof");
     assert!(request.headers.get("anthropic-version").is_none());
     assert!(request.headers.get("anthropic-beta").is_none());
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body["model"], upstream_model);
     assert_eq!(body["stream"], true);
     assert_eq!(body["store"], false);
-    assert_eq!(body["parallel_tool_calls"], true);
+    assert!(body.get("parallel_tool_calls").is_none());
     assert_eq!(body["instructions"], "");
     assert_eq!(body["input"][0]["role"], "developer");
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
@@ -1319,8 +1320,7 @@ async fn codex_buffered_route_rewrites_wire_and_archives_final_json_once() {
         .and(body_partial_json(json!({
             "model": fixture.upstream_model,
             "stream": true,
-            "store": false,
-            "parallel_tool_calls": true
+            "store": false
         })))
         .respond_with(
             ResponseTemplate::new(200)
