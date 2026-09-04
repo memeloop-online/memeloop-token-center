@@ -23,6 +23,33 @@ pub(super) async fn deprecated_health() -> Response {
     response
 }
 
+fn readiness_contract(database_ready: bool, archive_ready: bool) -> (StatusCode, Value) {
+    // Kubernetes may safely send traffic while the durable database is
+    // reachable. Archive availability is still surfaced as an explicit
+    // degradation, but must not withdraw every gateway endpoint during an
+    // object-store outage.
+    let status = if database_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let readiness = match (database_ready, archive_ready) {
+        (true, true) => "ready",
+        (true, false) => "degraded",
+        (false, _) => "not_ready",
+    };
+    (
+        status,
+        json!({
+            "status": readiness,
+            "checks": {
+                "database": if database_ready { "ok" } else { "failed" },
+                "archive": if archive_ready { "ok" } else { "failed" }
+            }
+        }),
+    )
+}
+
 pub(super) async fn readiness(State(state): State<AppState>) -> Response {
     let database = state.db.clone();
     let archive = state.archive.clone();
@@ -50,22 +77,8 @@ pub(super) async fn readiness(State(state): State<AppState>) -> Response {
             (database_ready, archive_ready)
         })
         .await;
-    let status = if database_ready && archive_ready {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (
-        status,
-        Json(json!({
-            "status": if status.is_success() { "ready" } else { "not_ready" },
-            "checks": {
-                "database": if database_ready { "ok" } else { "failed" },
-                "archive": if archive_ready { "ok" } else { "failed" }
-            }
-        })),
-    )
-        .into_response()
+    let (status, body) = readiness_contract(database_ready, archive_ready);
+    (status, Json(body)).into_response()
 }
 
 pub(super) async fn prometheus_metrics(
@@ -207,5 +220,45 @@ mod tests {
     #[test]
     fn dependency_readiness_checks_have_a_bounded_six_second_deadline() {
         assert_eq!(CHECK_TIMEOUT, Duration::from_secs(6));
+    }
+
+    #[test]
+    fn healthy_database_and_archive_report_ready() {
+        let (status, body) = readiness_contract(true, true);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["checks"]["database"], "ok");
+        assert_eq!(body["checks"]["archive"], "ok");
+    }
+
+    #[test]
+    fn archive_failure_is_reported_as_degraded_without_withdrawing_readiness() {
+        let (status, body) = readiness_contract(true, false);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["checks"]["database"], "ok");
+        assert_eq!(body["checks"]["archive"], "failed");
+    }
+
+    #[test]
+    fn database_failure_withdraws_readiness_even_when_archive_is_healthy() {
+        let (status, body) = readiness_contract(false, true);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["checks"]["database"], "failed");
+        assert_eq!(body["checks"]["archive"], "ok");
+    }
+
+    #[test]
+    fn simultaneous_database_and_archive_failure_remains_not_ready() {
+        let (status, body) = readiness_contract(false, false);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["checks"]["database"], "failed");
+        assert_eq!(body["checks"]["archive"], "failed");
     }
 }

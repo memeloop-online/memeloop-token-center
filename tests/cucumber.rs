@@ -4003,19 +4003,48 @@ async fn mock_successful_openai(world: &mut TokenCenterWorld) {
         .await;
 }
 
-#[given("the mock OpenAI upstream returns cached priority usage")]
+#[given("the mock OpenAI Responses upstream returns cached priority usage")]
 async fn mock_cached_priority_openai(world: &mut TokenCenterWorld) {
     Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
+        .and(path("/v1/responses"))
         .and(body_partial_json(json!({"service_tier": "priority"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "chatcmpl-cache-tier",
+            "id": "resp-cache-tier",
+            "object": "response",
+            "status": "completed",
             "service_tier": "priority",
-            "choices": [{"message": {"role": "assistant", "content": "cached"}}],
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "cached"}]
+            }],
             "usage": {
-                "prompt_tokens": 100,
-                "completion_tokens": 20,
-                "prompt_tokens_details": {"cached_tokens": 40}
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "input_tokens_details": {"cached_tokens": 40}
+            }
+        })))
+        .mount(world.mock.as_ref().expect("mock server"))
+        .await;
+}
+
+#[given("the mock Anthropic upstream returns cache write usage")]
+async fn mock_cache_write_anthropic(world: &mut TokenCenterWorld) {
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg-cache-write",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "cache populated"}],
+            "usage": {
+                "input_tokens": 60,
+                "cache_read_input_tokens": 30,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 7,
+                    "ephemeral_1h_input_tokens": 3
+                },
+                "output_tokens": 2
             }
         })))
         .mount(world.mock.as_ref().expect("mock server"))
@@ -4049,16 +4078,16 @@ async fn configure_cache_tier_prices(world: &mut TokenCenterWorld, model: String
     }
 }
 
-#[when(expr = "the client calls priority model {string}")]
+#[when(expr = "the client calls priority Responses model {string}")]
 async fn call_priority_model(world: &mut TokenCenterWorld, model: String) {
     let response = world
         .client
-        .post(format!("{}/v1/chat/completions", world.service_url))
+        .post(format!("{}/v1/responses", world.service_url))
         .bearer_auth(&world.current_key)
         .json(&json!({
             "model": model,
             "service_tier": "priority",
-            "messages": [{"role": "user", "content": "hi"}]
+            "input": "cached Responses usage fixture with enough admitted input capacity for exact upstream accounting"
         }))
         .send()
         .await
@@ -4069,6 +4098,11 @@ async fn call_priority_model(world: &mut TokenCenterWorld, model: String) {
 
 #[then(expr = "the cache-aware priority request costs {float} for {int} tokens")]
 async fn cache_tier_request_cost(world: &mut TokenCenterWorld, cost: f64, tokens: i64) {
+    assert_eq!(world.response["usage"]["input_tokens"], 100);
+    assert_eq!(
+        world.response["usage"]["input_tokens_details"]["cached_tokens"],
+        40
+    );
     for _ in 0..20 {
         let stats = world
             .client
@@ -4094,11 +4128,88 @@ async fn cache_tier_request_cost(world: &mut TokenCenterWorld, cost: f64, tokens
                 stats["summary"]["total_cost"],
                 Value::String(format!("{cost:.6}").trim_end_matches('0').to_owned())
             );
+            let state = world.state.as_ref().expect("state");
+            let inspection = AnyPool::connect(&state.config.database_url)
+                .await
+                .expect("connect cache-aware request inspection pool");
+            let record = sqlx::query(
+                "SELECT input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, service_tier, cost_micros FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(world.stable_key_id.expect("stable key id").to_string())
+            .fetch_one(&inspection)
+            .await
+            .expect("cache-aware request record");
+            assert_eq!(record.get::<i64, _>("input_tokens"), 100);
+            assert_eq!(record.get::<i64, _>("cached_input_tokens"), 40);
+            assert_eq!(record.get::<i64, _>("cache_write_tokens"), 0);
+            assert_eq!(record.get::<i64, _>("output_tokens"), 20);
+            assert_eq!(record.get::<String, _>("service_tier"), "priority");
+            assert_eq!(record.get::<i64, _>("cost_micros"), 460);
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("cache-aware request did not settle");
+}
+
+#[then(expr = "the cache-writing request costs {float} for {int} tokens")]
+async fn cache_write_request_cost(world: &mut TokenCenterWorld, cost: f64, tokens: i64) {
+    assert_eq!(world.response["usage"]["cache_read_input_tokens"], 30);
+    assert_eq!(
+        world.response["usage"]["cache_creation"]["ephemeral_5m_input_tokens"],
+        7
+    );
+    assert_eq!(
+        world.response["usage"]["cache_creation"]["ephemeral_1h_input_tokens"],
+        3
+    );
+    for _ in 0..20 {
+        let stats = world
+            .client
+            .get(format!("{}/self/v1/stats", world.service_url))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("cache-write stats")
+            .json::<Value>()
+            .await
+            .expect("cache-write stats JSON");
+        if stats["summary"]["total_requests"] == 1 {
+            assert_eq!(
+                stats["summary"]["input_tokens"]
+                    .as_i64()
+                    .unwrap_or_default()
+                    + stats["summary"]["output_tokens"]
+                        .as_i64()
+                        .unwrap_or_default(),
+                tokens
+            );
+            assert_eq!(
+                stats["summary"]["total_cost"],
+                Value::String(format!("{cost:.6}").trim_end_matches('0').to_owned())
+            );
+            let state = world.state.as_ref().expect("state");
+            let inspection = AnyPool::connect(&state.config.database_url)
+                .await
+                .expect("connect cache-write request inspection pool");
+            let record = sqlx::query(
+                "SELECT input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, service_tier, cost_micros FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(world.stable_key_id.expect("stable key id").to_string())
+            .fetch_one(&inspection)
+            .await
+            .expect("cache-write request record");
+            assert_eq!(record.get::<i64, _>("input_tokens"), 100);
+            assert_eq!(record.get::<i64, _>("cached_input_tokens"), 30);
+            assert_eq!(record.get::<i64, _>("cache_write_tokens"), 10);
+            assert_eq!(record.get::<i64, _>("output_tokens"), 2);
+            assert_eq!(record.get::<String, _>("service_tier"), "default");
+            assert_eq!(record.get::<i64, _>("cost_micros"), 89);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("cache-writing request did not settle");
 }
 
 #[when(expr = "the service records requests for tenants {string} and {string}")]

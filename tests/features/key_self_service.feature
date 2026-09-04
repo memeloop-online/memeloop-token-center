@@ -95,12 +95,21 @@ Feature: Stable key identity and read-only self-service statistics
 
   Scenario: Cached tokens and service tiers are charged from one immutable snapshot
     Given a token center backed by SQLite and memory object storage
-    And the mock OpenAI upstream returns cached priority usage
+    And the mock OpenAI Responses upstream returns cached priority usage
     When the service creates a key for principal "cache-tier-user" allowing model "cache-tier-model"
     And the operator configures cache-aware default and priority prices for model "cache-tier-model"
-    And the client calls priority model "cache-tier-model"
+    And the client calls priority Responses model "cache-tier-model"
     Then the response status is 200
     And the cache-aware priority request costs 0.00046 for 120 tokens
+
+  Scenario: Cache writes are charged through the public Anthropic HTTP endpoint
+    Given a token center backed by SQLite and memory object storage
+    And the mock Anthropic upstream returns cache write usage
+    When the service creates a key for principal "cache-write-user" allowing model "claude-cache-write-model"
+    And the operator configures cache-aware default and priority prices for model "claude-cache-write-model"
+    And the Claude client calls model "claude-cache-write-model"
+    Then the response status is 200
+    And the cache-writing request costs 0.000089 for 102 tokens
 
   Scenario: API key and OAuth credentials share stable upstream routing
     Given a token center backed by SQLite and memory object storage

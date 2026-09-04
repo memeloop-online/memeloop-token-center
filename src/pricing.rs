@@ -828,6 +828,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_falls_back_to_input_price_when_upstream_omits_cache_prices() {
+        let (_directory, database) = test_database().await;
+        let server = MockServer::start().await;
+        mount_json(
+            &server,
+            "/models-dev-without-cache-prices",
+            r#"{
+                "providers": {
+                    "openai": {
+                        "models": {
+                            "gpt-no-cache-prices": {
+                                "cost": {"input": "4.25", "output": "8.5"}
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .await;
+
+        let source_url = format!("{}/models-dev-without-cache-prices", server.uri());
+        let result = sync_model_prices_with_sources(
+            &database,
+            &reqwest::Client::new(),
+            vec!["openai/gpt-no-cache-prices".to_owned()],
+            "USD",
+            &[("models.dev", source_url.as_str())],
+            true,
+        )
+        .await
+        .expect("price synchronization without upstream cache prices");
+
+        assert_eq!(result.imported, 1);
+        let price = database
+            .model_price_view("openai/gpt-no-cache-prices", "USD")
+            .await
+            .expect("fallback cache price view");
+        assert_eq!(price.tiers[0].input_per_million, "4.25");
+        assert_eq!(price.tiers[0].cached_input_per_million, "4.25");
+        assert_eq!(price.tiers[0].cache_write_per_million, "4.25");
+        assert!(price.tiers[0].cache_price_estimated);
+    }
+
+    #[tokio::test]
     async fn sync_preserves_manual_and_last_known_preferred_prices() {
         let (_directory, database) = test_database().await;
         database

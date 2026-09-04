@@ -30,17 +30,22 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         buffered_request,
         proxy_lifecycle_permit,
     } = input;
-    let (archive_stream_permit, response_archive_attempt, archive_writer) =
-        begin_streaming_response_archive(state, request_id).await;
+    // Archive capacity is advisory for text traffic. Never wait for it before
+    // constructing the downstream response or reading the first upstream byte.
+    let archive_stream_permit = buffered_request.archive_available.then(|| {
+        state
+            .proxy_archive_stream_permits
+            .clone()
+            .try_acquire_owned()
+            .ok()
+    });
+    let archive_stream_permit = archive_stream_permit.flatten();
+    if buffered_request.archive_available && archive_stream_permit.is_none() {
+        tracing::warn!(%request_id, stage = "response_archive_capacity", "proxy archive gap");
+    }
     let stream_activity = state
         .metrics
         .active_stream(crate::metrics::ActiveStreamKind::ProxyResponse);
-    let archive_memory = archive_stream_permit.as_ref().map(|_| {
-        state.metrics.memory_usage(
-            crate::metrics::MemoryComponent::ArchiveMultipart,
-            crate::archive::ARCHIVE_MULTIPART_PART_BYTES,
-        )
-    });
     let (body_sender, body_receiver) = tokio::sync::mpsc::channel(PROXY_BODY_CHANNEL_CAPACITY);
     let background_state = state.clone();
     let status_code = i64::from(status.as_u16());
@@ -58,8 +63,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         // Streaming responses outlive the handler response. Keep the workload
         // permit inside this task until archive and billing finalization end.
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
-        let _archive_stream_permit = archive_stream_permit;
-        let _archive_memory = archive_memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
         let lifecycle_started = tokio::time::Instant::now();
@@ -67,8 +70,21 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let lifecycle_deadline = lifecycle_started + MAX_PROXY_LIFETIME;
         let lifecycle = async move {
             let mut upstream_stream = upstream.bytes_stream();
-            let mut archive_writer = archive_writer;
-            let mut response_archive_attempt = response_archive_attempt;
+            let archive_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (mut archive_sender, archive_task) = if let Some(permit) = archive_stream_permit {
+                let (sender, receiver) =
+                    tokio::sync::mpsc::channel::<Bytes>(PROXY_BODY_CHANNEL_CAPACITY);
+                let task = tokio::spawn(stream_response_archive(
+                    background_state.clone(),
+                    request_id,
+                    permit,
+                    receiver,
+                    archive_complete.clone(),
+                ));
+                (Some(sender), Some(task))
+            } else {
+                (None, None)
+            };
             let mut usage_capture = Vec::new();
             let mut capture_memory = background_state
                 .metrics
@@ -87,51 +103,13 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut response_bytes = 0_usize;
             let mut delivered_any = false;
             let mut delivered_billable = false;
-            let (archive_lease_lost_sender, mut archive_lease_lost_receiver) =
-                tokio::sync::mpsc::channel(1);
-            let archive_heartbeat_task = response_archive_attempt.clone().map(|mut attempt| {
-                let heartbeat_database = background_state.db.clone();
-                AbortTaskOnDrop::new(tokio::spawn(async move {
-                    let mut heartbeat = tokio::time::interval(Duration::from_millis(
-                        u64::try_from(ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS).unwrap_or(20_000),
-                    ));
-                    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    heartbeat.tick().await;
-                    loop {
-                        heartbeat.tick().await;
-                        if !heartbeat_proxy_archive_attempt(&heartbeat_database, &mut attempt)
-                            .await
-                            .unwrap_or(false)
-                        {
-                            let _ = archive_lease_lost_sender.send(()).await;
-                            break;
-                        }
-                    }
-                }))
-            });
             loop {
-                let polled = tokio::select! {
-                    biased;
-                    _ = archive_lease_lost_receiver.recv(), if response_archive_attempt.is_some() => None,
-                    next = tokio::time::timeout_at(stream_deadline, upstream_stream.next()) => Some(next),
-                };
-                let Some(polled) = polled else {
-                    if let Some(writer) = archive_writer.take() {
-                        drop(tokio::spawn(async move {
-                            let _ = writer.abort().await;
-                        }));
-                    }
-                    response_archive_attempt = None;
-                    tracing::warn!(%request_id, stage = "response_archive_heartbeat", "proxy archive lease lost; downstream response continues with an archive gap");
-                    continue;
-                };
-                let next = match polled {
+                let next = match tokio::time::timeout_at(stream_deadline, upstream_stream.next()).await
+                {
                     Ok(next) => next,
                     Err(_) => {
                         transport_error = Some("upstream_timeout");
-                        if let Some(writer) = archive_writer.take() {
-                            let _ = writer.abort().await;
-                        }
+                        cancel_stream_archive(&archive_complete, &mut archive_sender);
                         let _ = tokio::time::timeout(
                             MAX_DOWNSTREAM_SEND_WAIT,
                             body_sender
@@ -159,9 +137,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         response_bytes = response_bytes.saturating_add(raw_chunk.len());
                         if response_bytes > MAX_PROXY_RESPONSE_BODY {
                             transport_error = Some("upstream_response_too_large");
-                            if let Some(writer) = archive_writer.take() {
-                                let _ = writer.abort().await;
-                            }
+                            cancel_stream_archive(&archive_complete, &mut archive_sender);
                             let _ = tokio::time::timeout(
                                 MAX_DOWNSTREAM_SEND_WAIT,
                                 body_sender.send(Err(std::io::Error::other(
@@ -190,9 +166,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     }
                                     Err(error_code) => {
                                         transport_error = Some(error_code);
-                                        if let Some(writer) = archive_writer.take() {
-                                            let _ = writer.abort().await;
-                                        }
+                                        cancel_stream_archive(
+                                            &archive_complete,
+                                            &mut archive_sender,
+                                        );
                                         let _ = tokio::time::timeout(
                                             MAX_DOWNSTREAM_SEND_WAIT,
                                             body_sender.send(Err(std::io::Error::other(
@@ -213,21 +190,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         if let Some(capture) = sse_capture.as_mut() {
                             capture.push(&chunk);
                         }
-                        if let Some(mut writer) = archive_writer.take() {
-                            match writer.write(chunk.clone()).await {
-                                Ok(()) => archive_writer = Some(writer),
-                                Err(_) => {
-                                    tracing::warn!(%request_id, stage = "response_archive_stream", "proxy archive gap");
-                                    let _ = writer.abort().await;
-                                    if let Some(attempt) = response_archive_attempt.take() {
-                                        abandon_proxy_archive_attempt(
-                                            &background_state.db,
-                                            &attempt,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
+                        if let Some(sender) = archive_sender.as_ref()
+                            && sender.try_send(chunk.clone()).is_err()
+                        {
+                            tracing::warn!(%request_id, stage = "response_archive_backpressure", "proxy archive gap");
+                            cancel_stream_archive(&archive_complete, &mut archive_sender);
                         }
                         if chunk.is_empty() {
                             continue;
@@ -326,17 +293,13 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             }
                         }
                         if transport_error.is_some() {
-                            if let Some(writer) = archive_writer.take() {
-                                let _ = writer.abort().await;
-                            }
+                            cancel_stream_archive(&archive_complete, &mut archive_sender);
                             break;
                         }
                     }
                     Err(_) => {
                         transport_error = Some("upstream_stream");
-                        if let Some(writer) = archive_writer.take() {
-                            let _ = writer.abort().await;
-                        }
+                        cancel_stream_archive(&archive_complete, &mut archive_sender);
                         let _ = tokio::time::timeout(
                             MAX_DOWNSTREAM_SEND_WAIT,
                             body_sender.send(Err(std::io::Error::other("upstream stream failed"))),
@@ -347,35 +310,24 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 }
             }
             if transport_error.is_some() {
-                if let Some(writer) = archive_writer.take() {
-                    let _ = writer.abort().await;
-                }
-                if let Some(attempt) = response_archive_attempt.take() {
-                    abandon_proxy_archive_attempt(&background_state.db, &attempt).await;
-                }
+                cancel_stream_archive(&archive_complete, &mut archive_sender);
             }
+            // EOF is part of downstream delivery. Close it before awaiting the
+            // archive sidecar or terminal settlement so neither can prolong
+            // the client-visible stream lifetime.
+            drop(body_sender);
+            drop(archive_sender.take());
             let sse_summary = sse_capture.map(ResponsesSseCapture::finish_summary);
-            let stored_response = if transport_error.is_none()
-                && let Some(writer) = archive_writer
-            {
-                match writer.finish_staged().await {
-                    Ok(staged)
-                        if response_archive_attempt.as_ref().is_some_and(|attempt| {
-                            attempt.object_locator == staged.object_locator
-                        }) =>
-                    {
-                        staged.object_locator
+            let gap_response = format!("gap://{request_id}/response");
+            let (response_archive_attempt, stored_response) = match archive_task {
+                Some(task) => match task.await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(%request_id, stage = "response_archive_task", "proxy archive gap");
+                        (None, gap_response.clone())
                     }
-                    Ok(_) | Err(_) => {
-                        if let Some(attempt) = response_archive_attempt.take() {
-                            abandon_proxy_archive_attempt(&background_state.db, &attempt).await;
-                        }
-                        tracing::warn!(%request_id, stage = "response_archive_finish", "proxy archive gap");
-                        format!("gap://{request_id}/response")
-                    }
-                }
-            } else {
-                format!("gap://{request_id}/response")
+                },
+                None => (None, gap_response.clone()),
             };
             let protocol_error = match sse_summary.as_ref().map(|summary| &summary.outcome) {
                 Some(ResponsesSseOutcome::Failed) => Some("upstream_failed_response"),
@@ -485,7 +437,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         client_name: conversation.client_name.as_deref(),
                         upstream_response_id: response_id.as_deref(),
                     });
-            let terminal_result = finish_proxy_request_with_retry(
+            let terminal_result = finish_proxy_request_with_archive_fallback(
                 &background_state.db,
                 FinishProxyRequest {
                     request_id,
@@ -503,16 +455,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     conversation: conversation_input,
                 },
                 response_archive_attempt.as_ref(),
+                &gap_response,
             )
             .await;
-            if response_archive_requires_cleanup(&terminal_result, &stored_response)
-                && let Some(attempt) = response_archive_attempt.as_ref()
-            {
-                abandon_proxy_archive_attempt(&background_state.db, attempt).await;
-            }
-            if let Some(mut task) = archive_heartbeat_task {
-                task.abort();
-            }
             if terminal_result.is_err() {
                 // The commit can be durable even when its acknowledgement is lost.
                 // Preserve this request-scoped archive until its database owner is
@@ -540,4 +485,119 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
     response
         .body(Body::from_stream(ReceiverStream::new(body_receiver)))
         .map_err(|_| AppError::Internal)
+}
+
+fn cancel_stream_archive(
+    complete: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sender: &mut Option<tokio::sync::mpsc::Sender<Bytes>>,
+) {
+    complete.store(false, std::sync::atomic::Ordering::Release);
+    drop(sender.take());
+}
+
+async fn stream_response_archive(
+    state: AppState,
+    request_id: Uuid,
+    archive_stream_permit: tokio::sync::OwnedSemaphorePermit,
+    mut receiver: tokio::sync::mpsc::Receiver<Bytes>,
+    complete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (Option<crate::proxy_lifecycle::ProxyArchiveAttempt>, String) {
+    // This sidecar is deliberately independent from downstream delivery. Its
+    // bounded channel may fail closed into a gap, but can never backpressure
+    // the client-facing SSE stream.
+    let _archive_stream_permit = archive_stream_permit;
+    let _archive_memory = state.metrics.memory_usage(
+        crate::metrics::MemoryComponent::ArchiveMultipart,
+        crate::archive::ARCHIVE_MULTIPART_PART_BYTES,
+    );
+    let gap = format!("gap://{request_id}/response");
+    let (mut attempt, writer) = begin_streaming_response_archive(&state, request_id).await;
+    let Some(mut writer) = writer else {
+        return (None, gap);
+    };
+    let (archive_lease_lost_sender, mut archive_lease_lost_receiver) =
+        tokio::sync::mpsc::channel(1);
+    let mut archive_heartbeat_task = attempt.clone().map(|mut heartbeat_attempt| {
+        let heartbeat_database = state.db.clone();
+        AbortTaskOnDrop::new(tokio::spawn(async move {
+            let mut heartbeat = tokio::time::interval(Duration::from_millis(
+                u64::try_from(ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS).unwrap_or(20_000),
+            ));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await;
+            loop {
+                heartbeat.tick().await;
+                if !heartbeat_proxy_archive_attempt(
+                    &heartbeat_database,
+                    &mut heartbeat_attempt,
+                )
+                .await
+                .unwrap_or(false)
+                {
+                    let _ = archive_lease_lost_sender.send(()).await;
+                    break;
+                }
+            }
+        }))
+    });
+    let mut archive_failed = false;
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = archive_lease_lost_receiver.recv() => {
+                tracing::warn!(%request_id, stage = "response_archive_heartbeat", "proxy archive gap");
+                archive_failed = true;
+                None
+            }
+            chunk = receiver.recv() => chunk,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if !complete.load(std::sync::atomic::Ordering::Acquire) {
+            archive_failed = true;
+            break;
+        }
+        match run_bounded_text_archive(writer.write(chunk)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(%request_id, stage = "response_archive_stream", "proxy archive gap");
+                archive_failed = true;
+                break;
+            }
+        }
+    }
+    if !complete.load(std::sync::atomic::Ordering::Acquire) {
+        archive_failed = true;
+    }
+    if archive_failed {
+        // Dropping the writer schedules a best-effort multipart abort without
+        // adding a second object-store wait to this failed attempt. The fenced
+        // staging row remains the durable cleanup source of truth.
+        drop(writer);
+        if let Some(current) = attempt.take() {
+            abandon_proxy_archive_attempt(&state.db, &current).await;
+        }
+        return (None, gap);
+    }
+    let stored = match run_bounded_text_archive(writer.finish_staged()).await {
+        Ok(Ok(staged))
+            if attempt
+                .as_ref()
+                .is_some_and(|current| current.object_locator == staged.object_locator) =>
+        {
+            staged.object_locator
+        }
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+            if let Some(current) = attempt.take() {
+                abandon_proxy_archive_attempt(&state.db, &current).await;
+            }
+            tracing::warn!(%request_id, stage = "response_archive_finish", "proxy archive gap");
+            return (None, gap);
+        }
+    };
+    if let Some(task) = archive_heartbeat_task.as_mut() {
+        task.abort();
+    }
+    (attempt, stored)
 }

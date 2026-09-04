@@ -9,8 +9,10 @@ info:
     The production Helm deployment separates the **control** and **gateway** roles.
     `/internal/v1/*` is served only by the control role. `/self/v1/*` and `/v1/*`
     are served only by the gateway role. `/healthz` is present on every HTTP-serving
-    role. `/livez` is process liveness and `/readyz` checks PostgreSQL plus archive
-    readiness. `/healthz` is a deprecated compatibility alias for `/livez`.
+    role. `/livez` is process liveness and `/readyz` runs bounded PostgreSQL and
+    archive probes. PostgreSQL determines the readiness HTTP status; archive
+    failure is reported as degraded without withdrawing gateway endpoints.
+    `/healthz` is a deprecated compatibility alias for `/livez`.
 
     All monetary amounts are decimal strings with at most six fractional digits.
     All timestamps named `*_at` are Unix epoch milliseconds unless stated otherwise.
@@ -99,20 +101,23 @@ paths:
     get:
       tags: [System]
       operationId: getReadiness
-      summary: Probe database and archive readiness
+      summary: Probe database readiness and archive degradation
       description: |
         Available on every HTTP role for Kubernetes probes. PostgreSQL and archive
-        checks run concurrently with a two-second bound and a five-second singleflight
-        cache, so probe bursts do not amplify dependency traffic.
+        checks run concurrently with bounded deadlines and a five-second singleflight
+        cache, so probe bursts do not amplify dependency traffic. PostgreSQL alone
+        determines the HTTP status. An archive failure is returned as HTTP 200 with
+        `status: degraded` and `checks.archive: failed`; archive-dependent image/video
+        operations still fail closed.
       security: []
       responses:
         '200':
-          description: Both dependencies are ready.
+          description: PostgreSQL is ready; archive is either ready or explicitly degraded.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Readiness' }
         '503':
-          description: PostgreSQL or archive readiness failed or timed out.
+          description: PostgreSQL readiness failed or timed out.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Readiness' }
@@ -4082,7 +4087,7 @@ components:
       additionalProperties: false
       required: [status, checks]
       properties:
-        status: { type: string, enum: [ready, not_ready] }
+        status: { type: string, enum: [ready, degraded, not_ready] }
         checks:
           type: object
           additionalProperties: false

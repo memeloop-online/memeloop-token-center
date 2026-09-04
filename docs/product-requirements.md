@@ -431,7 +431,12 @@ are in [CPA to Token Center cutover](operations/cutover-runbook.md).
   remain unchanged until the release agent records complete browser and Codex
   CLI evidence and explicitly releases the same digests.
 - Every release exposes anonymous process-only `/livez` and bounded dependency
-  `/readyz` probes. The internal control role exposes authenticated,
+  `/readyz` probes. Database health alone determines whether `/readyz` returns
+  HTTP 200 or 503. The bounded archive canary and its dependency metric remain
+  mandatory, but archive failure is reported as explicit degraded readiness and
+  must not remove every gateway endpoint. Required image/video archive reads,
+  writes and finalization remain fail-closed independently of Kubernetes
+  readiness. The internal control role exposes authenticated,
   low-cardinality Prometheus metrics for request/upstream traffic, active
   work, queues, process CPU/RSS, allocator totals and bounded component memory.
   Release builds provide explicitly enabled, `metrics:read`-protected CPU and

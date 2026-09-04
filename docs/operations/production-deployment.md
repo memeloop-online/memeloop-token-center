@@ -95,7 +95,16 @@ Pruning raw history is a separate, explicit retention operation.
 
 - `/livez` reports process and event-loop health. Dependency outages must not
   cause restart loops.
-- `/readyz` checks the bounded dependencies required by the active role.
+- `/readyz` runs bounded, coalesced database and archive probes. Database health
+  alone determines HTTP readiness: a database failure or timeout returns 503.
+  An archive failure returns 200 with `status: "degraded"` and
+  `checks.archive: "failed"`, and sets the archive dependency metric to failed,
+  so an object-store incident does not remove every gateway endpoint.
+- Degraded readiness does not authorize incomplete asset behavior. Image/video
+  archive reads, writes and finalization continue to fail closed when their
+  required object-store operation is unavailable. Alert on the degraded JSON or
+  dependency metric and restore archive service without restarting healthy
+  gateway processes.
 - `/healthz` is a compatibility alias for `/livez`.
 
 The public gateway ingress may expose `/healthz`; it must not expose

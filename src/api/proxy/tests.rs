@@ -125,8 +125,15 @@ struct CodexRouteFixture {
 }
 
 async fn codex_route_fixture(label: &str) -> CodexRouteFixture {
+    codex_route_fixture_with_archive_directory(label, "archive").await
+}
+
+async fn codex_route_fixture_with_archive_directory(
+    label: &str,
+    archive_directory: &str,
+) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
-    let archive_path = directory.path().join("archive");
+    let archive_path = directory.path().join(archive_directory);
     let database_url = format!(
         "sqlite://{}?mode=rwc",
         directory.path().join(format!("codex-{label}.db")).display()
@@ -1398,6 +1405,70 @@ async fn codex_buffered_route_rewrites_wire_and_archives_final_json_once() {
 }
 
 #[tokio::test]
+async fn buffered_text_response_survives_total_archive_failure_with_gap_locators() {
+    let fixture = codex_route_fixture("buffered-archive-gap").await;
+    std::fs::remove_dir_all(&fixture.archive_path).unwrap();
+    std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
+    let upstream = MockServer::start().await;
+    let sse = completed_codex_sse("delivered despite archive failure");
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({
+            "model": fixture.model,
+            "input": "archive failures are non-fatal for text",
+            "stream": false
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["output"][0]["content"][0]["text"],
+        "delivered despite archive failure"
+    );
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_eq!(rows[0].cost, "0.000005");
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.request_object,
+        format!("gap://{}/request", rows[0].request_id)
+    );
+    assert_eq!(
+        refs.response_object.as_deref(),
+        Some(format!("gap://{}/response", rows[0].request_id).as_str())
+    );
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn codex_streaming_route_preserves_sse_and_settles_usage_once() {
     let fixture = codex_route_fixture("streaming").await;
     let upstream = MockServer::start().await;
@@ -1482,6 +1553,63 @@ async fn codex_streaming_route_preserves_sse_and_settles_usage_once() {
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_codex_wire(&requests[0], &fixture.upstream_model);
+}
+
+#[tokio::test]
+async fn streaming_text_delivery_does_not_wait_for_a_timed_out_archive() {
+    let fixture = codex_route_fixture_with_archive_directory(
+        "streaming-archive-timeout",
+        "proxy-response-archive-timeout",
+    )
+    .await;
+    let upstream = MockServer::start().await;
+    let sse = completed_codex_sse("archive-independent stream");
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse.clone().into_bytes(), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "stream now", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(1),
+        to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY),
+    )
+    .await
+    .expect("downstream SSE bytes and EOF must not wait for the archive timeout")
+    .unwrap();
+    assert_eq!(body.as_ref(), sse.as_bytes());
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_eq!(rows[0].cost, "0.000005");
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert!(!refs.request_object.starts_with("gap://"));
+    let expected_gap = format!("gap://{}/response", rows[0].request_id);
+    assert_eq!(refs.response_object.as_deref(), Some(expected_gap.as_str()));
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
