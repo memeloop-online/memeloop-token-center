@@ -965,11 +965,12 @@ stable contract requires canonical six-digit UTC `Z`. The exporter now compares
 legacy timestamps at nanosecond precision and normalizes only the legacy
 projection; stable responses remain byte-form strict.
 
-The controlled imported-Codex-to-native upgrade also repairs credentials
-already distorted by the earlier runtime: a safe private IP-literal
+The controlled Codex native upgrade also repairs credentials already converted
+to the native driver by the earlier runtime: a safe private IP-literal
 `socks5://` proxy is restored to `socks5h://` without exposing or changing its
 endpoint/authentication, OAuth material, generation or stable account ID.
-Hostname-addressed or unsafe proxies fail closed.
+Hostname-addressed or unsafe proxies fail closed, and a completed repair is
+idempotent.
 
 Current local release evidence after these changes: rustfmt, Clippy with
 `-D warnings`, and `cargo test --locked --all-targets --all-features` pass,

@@ -120,7 +120,52 @@ impl Database {
             )?;
             if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
                 validate_native_codex_account_shape(&row, &config, &credential)?;
-                already_native_account_ids.push(target.account_id);
+                let (credential, repaired) =
+                    crate::oauth::managed::codex::restore_remote_dns_proxy(credential)?;
+                if !repaired {
+                    already_native_account_ids.push(target.account_id);
+                    continue;
+                }
+                let current_updated_at: i64 = row.try_get("updated_at")?;
+                let current_generation: i64 = row.try_get("credential_generation")?;
+                if current_updated_at != target.expected_updated_at
+                    || current_generation != target.expected_credential_generation
+                {
+                    return Err(AppError::Conflict(
+                        "an OpenAI Codex account changed after migration review".into(),
+                    ));
+                }
+                crate::oauth::managed::codex::validate_native_credential(&credential)?;
+                let ciphertext = seal_credential(&credential, key_material)?;
+                let updated_at = unix_millis().max(current_updated_at.saturating_add(1));
+                let changed = sqlx::query(
+                    "UPDATE upstream_accounts SET updated_at = $1 WHERE id = $2 AND updated_at = $3 AND credential_generation = $4",
+                )
+                .bind(updated_at)
+                .bind(target.account_id.to_string())
+                .bind(target.expected_updated_at)
+                .bind(target.expected_credential_generation)
+                .execute(&mut *tx)
+                .await?;
+                if changed.rows_affected() != 1 {
+                    return Err(AppError::Conflict(
+                        "an OpenAI Codex account changed during proxy repair".into(),
+                    ));
+                }
+                let sealed = sqlx::query(
+                    "UPDATE upstream_credentials SET credential_ciphertext = $1 WHERE upstream_account_id = $2 AND generation = $3 AND revoked_at IS NULL",
+                )
+                .bind(ciphertext)
+                .bind(target.account_id.to_string())
+                .bind(target.expected_credential_generation)
+                .execute(&mut *tx)
+                .await?;
+                if sealed.rows_affected() != 1 {
+                    return Err(AppError::Conflict(
+                        "an OpenAI Codex credential changed during proxy repair".into(),
+                    ));
+                }
+                upgraded_account_ids.push(target.account_id);
                 continue;
             }
             validate_imported_codex_account_shape(&row, &config, &credential)?;

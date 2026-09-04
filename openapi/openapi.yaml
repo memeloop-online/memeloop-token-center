@@ -1443,13 +1443,14 @@ paths:
       operationId: applyNativeOpenAICodexUpgrade
       summary: Apply a reviewed native OpenAI Codex account migration
       description: |
-        Transactional native-only upgrade for the exact targets returned by
-        prepare. It preserves each stable account id, encrypted refresh state,
-        proxy endpoint and proxy authentication while restoring the required
-        `socks5h` remote-DNS scheme for safe IP-literal imported proxies and
-        atomically changing the provider driver and adapter-state ABI. Repeating
-        a completed request returns ids as already native; an unreviewed or
-        changed row fails with 409 rather than being silently rewritten.
+        Transactional native-only upgrade or repair for the exact targets
+        returned by prepare. It preserves each stable account id, encrypted
+        refresh state, proxy endpoint and proxy authentication while restoring
+        the required `socks5h` remote-DNS scheme for safe IP-literal proxies.
+        Imported accounts atomically change provider driver and adapter-state
+        ABI; already-native accounts with a collapsed `socks5` scheme are
+        repaired in place. Repeating a completed request returns ids as already
+        native; an unreviewed or changed row fails with 409.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:write
       x-global-service-only: true

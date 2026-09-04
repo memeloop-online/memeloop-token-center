@@ -155,7 +155,6 @@ pub(crate) fn upgrade_imported_credential(
         "schema".to_owned(),
         Value::String(NATIVE_ADAPTER_SCHEMA.to_owned()),
     );
-    let proxy_url = restore_imported_remote_dns_proxy(proxy_url)?;
     let upgraded = UpstreamCredential::OAuth {
         access_token,
         refresh_token,
@@ -166,11 +165,47 @@ pub(crate) fn upgrade_imported_credential(
         proxy_url,
         proxy_network_scope,
     };
+    let (upgraded, _) = restore_remote_dns_proxy(upgraded)?;
     // `i64::MIN` validates the credential shape and encrypted transport
     // metadata without rejecting an intentionally disabled expired account.
     upgraded.validate(i64::MIN)?;
     validate_adapter_state(upgraded.adapter_state())?;
     Ok(upgraded)
+}
+
+pub(crate) fn restore_remote_dns_proxy(
+    credential: UpstreamCredential,
+) -> Result<(UpstreamCredential, bool), AppError> {
+    let UpstreamCredential::OAuth {
+        access_token,
+        refresh_token,
+        expires_at,
+        header,
+        prefix,
+        adapter_state,
+        proxy_url,
+        proxy_network_scope,
+    } = credential
+    else {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex account has an invalid credential".into(),
+        ));
+    };
+    let restored_proxy_url = restore_imported_remote_dns_proxy(proxy_url.clone())?;
+    let changed = restored_proxy_url != proxy_url;
+    Ok((
+        UpstreamCredential::OAuth {
+            access_token,
+            refresh_token,
+            expires_at,
+            header,
+            prefix,
+            adapter_state,
+            proxy_url: restored_proxy_url,
+            proxy_network_scope,
+        },
+        changed,
+    ))
 }
 
 fn restore_imported_remote_dns_proxy(
