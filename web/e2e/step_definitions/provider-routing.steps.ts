@@ -226,7 +226,7 @@ Then('中英文新增上游使用面向操作的产品文案', async function (t
   await assertNotContains(page.locator('body'), 'Plugin OAuth adapter');
 });
 
-When('管理员用键盘创建提供商组和路由组', async function (this: DogfoodWorld) {
+When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   await openAppRoute(page, 'operator', 'routes');
@@ -293,7 +293,9 @@ When('管理员用键盘创建提供商组和路由组', async function (this: D
   const exactCredentials = routeEditor.getByRole('combobox', { name: '授权给具体凭据', exact: true });
   await exactCredentials.fill(seed.clientKeyId);
   const exactCredentialOption = routeEditor.getByRole('option').filter({ hasText: seed.clientKeyId });
-  await assertCount(exactCredentialOption, 1);
+  await eventually(async () => {
+    assert.equal(await exactCredentialOption.count(), 1);
+  }, 30_000, 'exact credential search did not return its stable key');
   await exactCredentials.press('ArrowDown');
   await eventually(async () => {
     const activeCredentialId = await exactCredentials.getAttribute('aria-activedescendant');

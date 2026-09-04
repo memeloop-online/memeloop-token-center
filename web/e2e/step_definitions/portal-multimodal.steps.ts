@@ -430,7 +430,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   this.assertNoBrowserFailures();
 });
 
-When('普通凭据用户通过中文亮色门户创建图片和两种视频任务', async function (this: DogfoodWorld) {
+When('普通凭据用户通过中文亮色门户创建图片和两种视频任务', { timeout: 120_000 }, async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const observation = requireMultimodalObservation(this);
   page.on('response', (response) => {

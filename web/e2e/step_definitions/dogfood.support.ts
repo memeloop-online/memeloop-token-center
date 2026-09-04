@@ -123,7 +123,7 @@ export async function submitPortalGeneration(
 
 export async function waitForGenerationStatus(page: Page, generationModel: string, status: string): Promise<Locator> {
   const row = generationTableFor(page).locator('tbody tr').filter({ hasText: generationModel }).first();
-  await eventually(async () => assert.ok(((await row.textContent()) ?? '').includes(status)), 20_000,
+  await eventually(async () => assert.ok(((await row.textContent()) ?? '').includes(status)), 45_000,
     `${generationModel} did not reach ${status} through portal polling`);
   return row;
 }

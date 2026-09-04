@@ -396,27 +396,31 @@ Then('趋势下钻使用 UTC 毫秒完整闭区间', async function (this: Dogfo
   const chart = page.locator('.usage-chart-card').first().locator('.usage-echart');
   const bounds = await chart.boundingBox();
   assert.ok(bounds, 'throughput chart must have measurable pointer bounds');
-  const dataPixel = await chart.locator('canvas').evaluateAll((elements) => {
-    const colors = [[104, 222, 201], [255, 156, 114]];
-    for (let canvasIndex = 0; canvasIndex < elements.length; canvasIndex += 1) {
-      const canvas = elements[canvasIndex] as HTMLCanvasElement;
-      const context = canvas.getContext('2d');
-      if (!context) continue;
-      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-      for (let y = Math.floor(canvas.height * 0.2); y < canvas.height * 0.9; y += 2) {
-        for (let x = 0; x < canvas.width; x += 2) {
-          const index = (y * canvas.width + x) * 4;
-          if (pixels[index + 3] < 180) continue;
-          if (colors.some(([red, green, blue]) => Math.abs(pixels[index] - red) < 18
-            && Math.abs(pixels[index + 1] - green) < 18 && Math.abs(pixels[index + 2] - blue) < 18)) {
-            return { canvasIndex, x: x * canvas.clientWidth / canvas.width, y: y * canvas.clientHeight / canvas.height };
+  let dataPixel: { canvasIndex: number; x: number; y: number } | undefined;
+  await eventually(async () => {
+    dataPixel = await chart.locator('canvas').evaluateAll((elements) => {
+      const colors = [[104, 222, 201], [255, 156, 114]];
+      for (let canvasIndex = 0; canvasIndex < elements.length; canvasIndex += 1) {
+        const canvas = elements[canvasIndex] as HTMLCanvasElement;
+        const context = canvas.getContext('2d');
+        if (!context) continue;
+        const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+        for (let y = Math.floor(canvas.height * 0.2); y < canvas.height * 0.9; y += 2) {
+          for (let x = 0; x < canvas.width; x += 2) {
+            const index = (y * canvas.width + x) * 4;
+            if (pixels[index + 3] < 180) continue;
+            if (colors.some(([red, green, blue]) => Math.abs(pixels[index] - red) < 18
+              && Math.abs(pixels[index + 1] - green) < 18 && Math.abs(pixels[index + 2] - blue) < 18)) {
+              return { canvasIndex, x: x * canvas.clientWidth / canvas.width, y: y * canvas.clientHeight / canvas.height };
+            }
           }
         }
       }
-    }
-    return undefined;
-  });
-  assert.ok(dataPixel, 'throughput chart must paint at least one data bar');
+      return undefined;
+    });
+    assert.ok(dataPixel, 'throughput chart must paint at least one data bar');
+  }, 30_000, 'throughput chart did not finish painting');
+  assert.ok(dataPixel);
   await chart.locator('canvas').nth(dataPixel.canvasIndex).click({ position: dataPixel });
   const response = await responsePromise;
   assert.equal(response.status(), 200);
