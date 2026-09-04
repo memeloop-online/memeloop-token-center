@@ -119,10 +119,11 @@ impl Database {
                 key_material,
             )?;
             if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
-                validate_native_codex_account_shape(&row, &config, &credential)?;
-                let (credential, repaired) =
+                let repair_lifecycle =
+                    validate_native_codex_account_shape(&row, &config, &credential)?;
+                let (credential, repair_proxy) =
                     crate::oauth::managed::codex::restore_remote_dns_proxy(credential)?;
-                if !repaired {
+                if !repair_lifecycle && !repair_proxy {
                     already_native_account_ids.push(target.account_id);
                     continue;
                 }
@@ -136,11 +137,12 @@ impl Database {
                     ));
                 }
                 crate::oauth::managed::codex::validate_native_credential(&credential)?;
-                let ciphertext = seal_credential(&credential, key_material)?;
                 let updated_at = unix_millis().max(current_updated_at.saturating_add(1));
                 let changed = sqlx::query(
-                    "UPDATE upstream_accounts SET updated_at = $1 WHERE id = $2 AND updated_at = $3 AND credential_generation = $4",
+                    "UPDATE upstream_accounts SET oauth_session_id = COALESCE(oauth_session_id, id), oauth_driver = $1, oauth_refresh_url = $2, updated_at = $3 WHERE id = $4 AND updated_at = $5 AND credential_generation = $6",
                 )
+                .bind(crate::oauth::codex_device::OAUTH_DRIVER)
+                .bind(crate::oauth::codex_device::TOKEN_ENDPOINT)
                 .bind(updated_at)
                 .bind(target.account_id.to_string())
                 .bind(target.expected_updated_at)
@@ -152,18 +154,21 @@ impl Database {
                         "an OpenAI Codex account changed during proxy repair".into(),
                     ));
                 }
-                let sealed = sqlx::query(
-                    "UPDATE upstream_credentials SET credential_ciphertext = $1 WHERE upstream_account_id = $2 AND generation = $3 AND revoked_at IS NULL",
-                )
-                .bind(ciphertext)
-                .bind(target.account_id.to_string())
-                .bind(target.expected_credential_generation)
-                .execute(&mut *tx)
-                .await?;
-                if sealed.rows_affected() != 1 {
-                    return Err(AppError::Conflict(
-                        "an OpenAI Codex credential changed during proxy repair".into(),
-                    ));
+                if repair_proxy {
+                    let ciphertext = seal_credential(&credential, key_material)?;
+                    let sealed = sqlx::query(
+                        "UPDATE upstream_credentials SET credential_ciphertext = $1 WHERE upstream_account_id = $2 AND generation = $3 AND revoked_at IS NULL",
+                    )
+                    .bind(ciphertext)
+                    .bind(target.account_id.to_string())
+                    .bind(target.expected_credential_generation)
+                    .execute(&mut *tx)
+                    .await?;
+                    if sealed.rows_affected() != 1 {
+                        return Err(AppError::Conflict(
+                            "an OpenAI Codex credential changed during proxy repair".into(),
+                        ));
+                    }
                 }
                 upgraded_account_ids.push(target.account_id);
                 continue;
@@ -660,25 +665,36 @@ fn validate_native_codex_account_shape(
     row: &sqlx::any::AnyRow,
     config: &Value,
     credential: &UpstreamCredential,
-) -> Result<(), AppError> {
-    if row.try_get::<String, _>("auth_kind")? != "oauth"
-        || row
-            .try_get::<Option<String>, _>("oauth_session_id")?
-            .is_none()
-        || row.try_get::<Option<String>, _>("oauth_driver")?.as_deref()
-            != Some(crate::oauth::codex_device::OAUTH_DRIVER)
-        || row
-            .try_get::<Option<String>, _>("oauth_refresh_url")?
-            .as_deref()
-            != Some(crate::oauth::codex_device::TOKEN_ENDPOINT)
-    {
+) -> Result<bool, AppError> {
+    if row.try_get::<String, _>("auth_kind")? != "oauth" {
         return Err(AppError::BadRequest(
             "native OpenAI Codex account has an unsupported lifecycle".into(),
         ));
     }
+    let oauth_session_id = row.try_get::<Option<String>, _>("oauth_session_id")?;
+    let oauth_driver = row.try_get::<Option<String>, _>("oauth_driver")?;
+    let oauth_refresh_url = row.try_get::<Option<String>, _>("oauth_refresh_url")?;
+    let repair_lifecycle = match (
+        oauth_session_id.as_deref(),
+        oauth_driver.as_deref(),
+        oauth_refresh_url.as_deref(),
+    ) {
+        (
+            Some(_),
+            Some(crate::oauth::codex_device::OAUTH_DRIVER),
+            Some(crate::oauth::codex_device::TOKEN_ENDPOINT),
+        ) => false,
+        (None, None, None) => true,
+        _ => {
+            return Err(AppError::BadRequest(
+                "native OpenAI Codex account has an unsupported lifecycle".into(),
+            ));
+        }
+    };
     crate::oauth::managed::codex::native_config_from_import(config)?;
     crate::oauth::managed::codex::validate_native_credential(credential)?;
-    require_private_codex_proxy(credential)
+    require_private_codex_proxy(credential)?;
+    Ok(repair_lifecycle)
 }
 
 fn require_private_codex_proxy(credential: &UpstreamCredential) -> Result<(), AppError> {
@@ -892,5 +908,77 @@ mod native_codex_upgrade_tests {
             .unwrap();
         assert_eq!(repeated.upgraded_account_ids, Vec::<Uuid>::new());
         assert_eq!(repeated.already_native_account_ids, vec![account.id]);
+
+        let damaged_updated_at = upgraded.updated_at.saturating_add(1);
+        sqlx::query(
+            "UPDATE upstream_accounts SET oauth_session_id = NULL, oauth_driver = NULL, oauth_refresh_url = NULL, updated_at = $1 WHERE id = $2",
+        )
+        .bind(damaged_updated_at)
+        .bind(account.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let repair_plan = database
+            .prepare_native_codex_upgrade(&[account.id], key_material)
+            .await
+            .unwrap();
+        let repaired = database
+            .apply_native_codex_upgrade(&repair_plan, key_material)
+            .await
+            .unwrap();
+        assert_eq!(repaired.upgraded_account_ids, vec![account.id]);
+        assert_eq!(repaired.already_native_account_ids, Vec::<Uuid>::new());
+
+        let lifecycle = sqlx::query(
+            "SELECT oauth_session_id, oauth_driver, oauth_refresh_url, credential_generation FROM upstream_accounts WHERE id = $1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        let expected_session_id = account.id.to_string();
+        assert_eq!(
+            lifecycle
+                .try_get::<Option<String>, _>("oauth_session_id")
+                .unwrap()
+                .as_deref(),
+            Some(expected_session_id.as_str())
+        );
+        assert_eq!(
+            lifecycle
+                .try_get::<Option<String>, _>("oauth_driver")
+                .unwrap()
+                .as_deref(),
+            Some(crate::oauth::codex_device::OAUTH_DRIVER)
+        );
+        assert_eq!(
+            lifecycle
+                .try_get::<Option<String>, _>("oauth_refresh_url")
+                .unwrap()
+                .as_deref(),
+            Some(crate::oauth::codex_device::TOKEN_ENDPOINT)
+        );
+        assert_eq!(
+            lifecycle
+                .try_get::<i64, _>("credential_generation")
+                .unwrap(),
+            account.credential_generation
+        );
+        let (_, repaired_credential) = database
+            .upstream_account_with_credential(account.id, key_material)
+            .await
+            .unwrap();
+        assert_eq!(
+            repaired_credential.proxy(),
+            Some((
+                "socks5h://operator:proxy-secret@100.64.0.16:1080",
+                crate::network::OutboundScope::Private
+            ))
+        );
+        let repeated_repair = database
+            .apply_native_codex_upgrade(&repair_plan, key_material)
+            .await
+            .unwrap();
+        assert_eq!(repeated_repair.already_native_account_ids, vec![account.id]);
     }
 }
