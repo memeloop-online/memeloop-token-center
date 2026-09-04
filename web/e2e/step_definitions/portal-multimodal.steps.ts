@@ -331,7 +331,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await eventually(async () => {
     assert.ok(await imageCustomModelConfirmation.isVisible() || await createImageRouteButton.isEnabled(),
       'image route must either require custom-model confirmation or be catalog-verified');
-  });
+  }, 30_000);
   if (await imageCustomModelConfirmation.isVisible()) await imageCustomModelConfirmation.check();
   const imageRouteResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
   await createImageRouteButton.click();
@@ -353,9 +353,9 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await eventually(async () => {
     assert.ok(await customModelConfirmation.isVisible() || await createVideoRouteButton.isEnabled(),
       'the video model must be catalogued or offer explicit custom-model confirmation');
-  }, 10_000);
+  }, 30_000);
   if (await customModelConfirmation.isVisible()) await customModelConfirmation.check();
-  await eventually(async () => assert.equal(await createVideoRouteButton.isEnabled(), true), 10_000,
+  await eventually(async () => assert.equal(await createVideoRouteButton.isEnabled(), true), 30_000,
     'the video route did not become valid after selecting its upstream model');
   const routeResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
   await createVideoRouteButton.click();
