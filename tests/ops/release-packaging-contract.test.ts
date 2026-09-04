@@ -97,7 +97,7 @@ test('release workflow and Docker packaging remain immutable and attested', () =
   run(process.execPath, ['web/scripts/verify-github-workflow-policy.mjs', '.github/workflows/ci.yml', repository]);
   for (const line of workflow.split('\n').filter((line) => /cargo (?:build|clippy|test|run|tree)(?:\s|$)/.test(line))) assert.ok(line.includes('--locked'), `Cargo command lacks --locked: ${line}`);
   for (const needle of [
-    'repository-security:', 'dependency-security:', 'scanners: secret,misconfig',
+    'repository-security:', 'dependency-security:', 'scanners: vuln,secret,misconfig',
     'command: check advisories bans licenses sources', 'memory-acceptance:',
     'uses: ./.github/workflows/memory-acceptance.yml',
     'node ops/ci/validate-release-inputs.ts', 'node ops/ci/run-release-source-contracts.ts',
@@ -122,7 +122,7 @@ test('release workflow and Docker packaging remain immutable and attested', () =
     'chmod -R u+w -- "$acceptance"',
     '--volume "$acceptance:/acceptance:ro"', '/acceptance/cpamp-import-postgres-acceptance.test.ts',
     'cargo fmt --all -- --check', 'cargo clippy --locked --all-targets --all-features -- -D warnings',
-    'cargo test --locked --all-targets --all-features', 'npm audit --audit-level=high', 'npm run test:e2e',
+    'cargo test --locked --all-targets --all-features', 'scanners: vuln,secret,misconfig', 'npm run test:e2e',
     'node --test tests/ops/repository-script-language-contract.test.ts',
   ]) assert.ok(workflow.includes(needle), `CI workflow lacks ${needle}`);
   for (const gate of ['repository-security','dependency-security','web','rust','migration-smoke','api-contract','packaging','memory-acceptance']) assert.ok(workflow.includes(`- ${gate}`));

@@ -21,12 +21,12 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-      - name: Reject committed secrets and high-risk infrastructure misconfiguration
+      - name: Reject secrets, high-risk dependency vulnerabilities and infrastructure misconfiguration
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
-          scanners: secret,misconfig
+          scanners: vuln,secret,misconfig
           severity: HIGH,CRITICAL
           ignore-unfixed: false
           exit-code: 1
@@ -45,11 +45,6 @@ jobs:
           node-version: 24.18.0
           cache: npm
       - run: npm ci --ignore-scripts
-      - name: Reject high and critical Node dependency vulnerabilities
-        run: >-
-          npm audit --audit-level=high --fetch-retries=3
-          --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=5000
-          --fetch-timeout=60000
       - run: npm run typecheck
       - name: Validate the CPA upstream importer policy and replay contract
         run: node --test tests/ops/test-cpa-upstream-import.ts
@@ -108,11 +103,6 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: npm ci
-      - name: Reject high and critical Node dependency vulnerabilities
-        run: >-
-          npm audit --audit-level=high --fetch-retries=3
-          --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=5000
-          --fetch-timeout=60000
       - run: npm run typecheck
       - run: npm run test:localization
       - run: npm run build
