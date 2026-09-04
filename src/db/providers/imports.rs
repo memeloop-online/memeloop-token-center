@@ -194,7 +194,7 @@ impl Database {
             let ciphertext = seal_credential(&native_credential, key_material)?;
             let updated_at = unix_millis().max(current_updated_at.saturating_add(1));
             let changed = sqlx::query(
-                "UPDATE upstream_accounts SET driver = $1, auth_kind = 'oauth', config_json = $2, oauth_driver = $3, oauth_refresh_url = $4, updated_at = $5 WHERE id = $6 AND updated_at = $7 AND credential_generation = $8",
+                "UPDATE upstream_accounts SET driver = $1, auth_kind = 'oauth', config_json = $2, oauth_session_id = id, oauth_driver = $3, oauth_refresh_url = $4, updated_at = $5 WHERE id = $6 AND updated_at = $7 AND credential_generation = $8",
             )
             .bind(crate::oauth::codex_device::PROVIDER_DRIVER)
             .bind(serde_json::to_string(&native_config).map_err(|_| AppError::Internal)?)
