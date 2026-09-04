@@ -45,7 +45,11 @@ jobs:
           node-version: 24.18.0
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm audit --audit-level=high
+      - name: Reject high and critical Node dependency vulnerabilities
+        run: >-
+          npm audit --audit-level=high --fetch-retries=3
+          --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=5000
+          --fetch-timeout=60000
       - run: npm run typecheck
       - name: Validate the CPA upstream importer policy and replay contract
         run: node --test tests/ops/test-cpa-upstream-import.ts
@@ -105,7 +109,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: npm ci
       - name: Reject high and critical Node dependency vulnerabilities
-        run: npm audit --audit-level=high
+        run: >-
+          npm audit --audit-level=high --fetch-retries=3
+          --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=5000
+          --fetch-timeout=60000
       - run: npm run typecheck
       - run: npm run test:localization
       - run: npm run build

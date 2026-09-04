@@ -230,11 +230,11 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
       max_tokens: 32,
     }),
   });
-  // Make the root/worker semantic pair own the two available concurrency
-  // slots before the two rate-limit probes arrive. Starting all four in one
-  // tick made the only worker request nondeterministically become a 429,
-  // turning the semantic hierarchy assertion into a scheduler lottery.
-  const calls = [sendCall(0), sendCall(1), ...[2, 3].map(async (index) => {
+  // Put both successful requests in the two available concurrency slots before
+  // the rate-limit probes arrive. Once either probe receives a 429, the sole
+  // account enters cooldown and both failed client requests correctly collapse
+  // to the public 503/Retry-After contract instead of leaking account state.
+  const calls = [sendCall(0), sendCall(2), ...[1, 3].map(async (index) => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     return sendCall(index);
   })];
@@ -277,7 +277,10 @@ Then('连续事件期间会话计数有界前进且活跃筛选移除已完成�
     'coalesced refresh starved under continuous events',
   );
   const responses = await Promise.all(observation.liveRequests);
-  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 200, 429, 429]);
+  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 200, 503, 503]);
+  for (const response of responses.filter((candidate) => candidate.status === 503)) {
+    assert.equal(response.headers.get('retry-after'), '1');
+  }
   await eventually(async () => assert.equal(await page.locator('.session-card').count(), 0), 5_000, 'completed session remained in the active filter');
   const refreshes = observation.sessionListRequests.length - observation.baselineSessionListRequests;
   assert.ok(refreshes >= 1 && refreshes <= 6, `continuous event refresh count was not bounded: ${refreshes}`);
