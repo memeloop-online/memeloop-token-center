@@ -37,7 +37,11 @@ export async function api<T>(
   return body as T;
 }
 
-const retryableReadStatuses = new Set([429, 502, 503, 504]);
+const retryableReadStatuses = new Set([502, 503, 504]);
+
+function waitForReadRetry(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
 /**
  * Retry an idempotent JSON read across a short transient gateway or database
@@ -57,7 +61,7 @@ export async function apiRead<T>(
       const retryable = reason instanceof TypeError
         || (reason instanceof ApiError && retryableReadStatuses.has(reason.status));
       if (!retryable || attempt + 1 >= attempts) throw reason;
-      await delay(150 * (2 ** attempt));
+      await waitForReadRetry(150 * (2 ** attempt));
     }
   }
   throw lastError;
