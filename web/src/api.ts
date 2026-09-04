@@ -37,6 +37,32 @@ export async function api<T>(
   return body as T;
 }
 
+const retryableReadStatuses = new Set([429, 502, 503, 504]);
+
+/**
+ * Retry an idempotent JSON read across a short transient gateway or database
+ * outage. Mutating requests intentionally continue to use `api` directly.
+ */
+export async function apiRead<T>(
+  path: string,
+  credential: string,
+  attempts = 4,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await api<T>(path, credential);
+    } catch (reason) {
+      lastError = reason;
+      const retryable = reason instanceof TypeError
+        || (reason instanceof ApiError && retryableReadStatuses.has(reason.status));
+      if (!retryable || attempt + 1 >= attempts) throw reason;
+      await delay(150 * (2 ** attempt));
+    }
+  }
+  throw lastError;
+}
+
 /**
  * Data-bearing SSE messages emitted by Token Center.
  *

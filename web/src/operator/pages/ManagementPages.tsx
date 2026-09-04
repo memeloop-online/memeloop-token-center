@@ -1,7 +1,7 @@
 import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { ApiError, api } from '../../api';
+import { ApiError, api, apiRead } from '../../api';
 import { formatCurrency, formatNumber } from '../../format';
 import { localizeSchema, useI18n } from '../../i18n';
 import { LimitSnapshot } from '../../LimitSnapshot';
@@ -435,8 +435,8 @@ function RouteWorkspace({ token, tenant, upstreams, providers }: { token: string
     if (!loadToken || !loadTenant) { setRoutes([]); setCredentials([]); return; }
     try {
       const [nextRoutes, nextCredentials] = await Promise.all([
-        api<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant)}`, loadToken),
-        api<KeyView[]>(`/internal/v1/keys${queryForTenant(loadTenant)}`, loadToken),
+        apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant)}`, loadToken),
+        apiRead<KeyView[]>(`/internal/v1/keys${queryForTenant(loadTenant)}`, loadToken),
       ]);
       if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
       setRoutes(nextRoutes); setCredentials(nextCredentials); setError('');
