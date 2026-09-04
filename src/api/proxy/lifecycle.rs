@@ -49,19 +49,16 @@ pub(super) async fn begin_streaming_response_archive(
     Option<ProxyArchiveAttempt>,
     Option<crate::archive::ArchiveWriter>,
 ) {
-    let mut attempt = match begin_proxy_archive_attempt(
-        &state.db,
-        request_id,
-        ArchiveStagingPurpose::Response,
-    )
-    .await
-    {
-        Ok(attempt) => Some(attempt),
-        Err(_) => {
-            tracing::warn!(%request_id, stage = "response_archive_begin", "proxy archive gap");
-            None
-        }
-    };
+    let mut attempt =
+        match begin_proxy_archive_attempt(&state.db, request_id, ArchiveStagingPurpose::Response)
+            .await
+        {
+            Ok(attempt) => Some(attempt),
+            Err(_) => {
+                tracing::warn!(%request_id, stage = "response_archive_begin", "proxy archive gap");
+                None
+            }
+        };
     let writer = if let Some(current) = attempt.as_ref() {
         let start = async {
             #[cfg(test)]
@@ -123,9 +120,7 @@ pub(super) async fn finish_proxy_request_with_archive_fallback<'a>(
     .await;
     let cleanup = matches!(&fallback, Ok(FinishProxyRequestResult::Finished { .. }))
         || response_archive_requires_cleanup(&fallback, stored_response);
-    if cleanup
-        && let Some(attempt) = archive_attempt
-    {
+    if cleanup && let Some(attempt) = archive_attempt {
         abandon_proxy_archive_attempt(database, attempt).await;
     }
     fallback

@@ -14,9 +14,8 @@ use crate::{
 };
 use conversation_hints::{client_name, conversation_hints, safe_conversation_hint};
 use lifecycle::{
-    AbortTaskOnDrop, begin_streaming_response_archive,
-    finish_proxy_request_with_archive_fallback, run_bounded_proxy_lifecycle,
-    run_bounded_text_archive,
+    AbortTaskOnDrop, begin_streaming_response_archive, finish_proxy_request_with_archive_fallback,
+    run_bounded_proxy_lifecycle, run_bounded_text_archive,
 };
 use routing::{
     MAX_UPSTREAM_ATTEMPTS, ProxySendError, prepare_proxy_route, retryable_upstream_status,
@@ -153,19 +152,16 @@ pub(super) async fn proxy(
     }
     let request_digest = blake3::hash(&body).to_hex();
     let admitted_request_object = format!("gap://{request_id}/request");
-    let request_archive_attempt = match begin_proxy_archive_attempt(
-        &state.db,
-        request_id,
-        ArchiveStagingPurpose::Request,
-    )
-    .await
-    {
-        Ok(attempt) => Some(attempt),
-        Err(_) => {
-            tracing::warn!(%request_id, stage = "request_archive_begin", "proxy archive gap");
-            None
-        }
-    };
+    let request_archive_attempt =
+        match begin_proxy_archive_attempt(&state.db, request_id, ArchiveStagingPurpose::Request)
+            .await
+        {
+            Ok(attempt) => Some(attempt),
+            Err(_) => {
+                tracing::warn!(%request_id, stage = "request_archive_begin", "proxy archive gap");
+                None
+            }
+        };
     let reservation = match state
         .db
         .start_proxy_request(StartProxyRequest {
