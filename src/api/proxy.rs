@@ -331,6 +331,7 @@ pub(super) async fn proxy(
                     UpstreamHealthReason::Connection,
                 ))
             }
+            Ok(_) => None,
             Err(ProxySendError::NonRetryableTransport | ProxySendError::Credential) => None,
         };
         if let Some((kind, reason)) = failure {
