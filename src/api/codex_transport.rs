@@ -21,8 +21,7 @@ pub(super) const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub(super) const RESPONSES_PATH: &str = "/responses";
 // Keep a fixed, audited Codex-compatible identity. It must not be supplied by
 // downstream callers or vary with arbitrary account configuration.
-pub(super) const USER_AGENT: &str =
-    "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)";
+pub(super) const USER_AGENT: &str = crate::oauth::managed::codex::USER_AGENT;
 const MAX_OUTPUT_ITEMS: usize = 16_384;
 const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
 

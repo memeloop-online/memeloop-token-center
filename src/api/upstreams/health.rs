@@ -102,7 +102,7 @@ pub(in crate::api) async fn probe_upstream_health(
             }
         };
         request
-            .header(header::USER_AGENT, crate::api::codex_transport::USER_AGENT)
+            .header(header::USER_AGENT, crate::oauth::managed::codex::USER_AGENT)
             .header(header::CONNECTION, "Keep-Alive")
             .header("originator", "codex-tui")
             .header("chatgpt-account-id", account_id)
