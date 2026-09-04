@@ -5907,7 +5907,10 @@ async fn call_anthropic_model(world: &mut TokenCenterWorld, model: String) {
         .json(&json!({
             "model": model,
             "max_tokens": 128,
-            "messages": [{"role": "user", "content": "hi"}]
+            "messages": [{
+                "role": "user",
+                "content": "cache-aware Anthropic acceptance request with sufficient admitted input capacity"
+            }]
         }))
         .send()
         .await
