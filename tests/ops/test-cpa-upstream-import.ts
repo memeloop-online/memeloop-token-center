@@ -86,7 +86,7 @@ describe("CPA upstream TypeScript operators", () => {
   });
 
   it("rejects remote-DNS and public proxy endpoints without echoing them", () => {
-    for (const rejectedProxy of ["socks5h://fixture-proxy.internal:1080", "socks5://[2001:4860:4860::8888]:1080"]) {
+    for (const rejectedProxy of ["socks5h://fixture-proxy.internal:1080", "socks5h://8.8.8.8:1080", "socks5://[2001:4860:4860::8888]:1080"]) {
       const root = mkdtempSync(join(tmpdir(), "mtc-cpa-proxy-reject-"));
       const source = join(root, "source");
       cpSync(join(fixtures, "supported"), source, { recursive: true });
@@ -95,7 +95,7 @@ describe("CPA upstream TypeScript operators", () => {
       privateTree(source);
       const result = spawnSync(process.execPath, [importer, "--config", config, "--auth-dir", join(source, "auth")], { encoding: "utf8" });
       assert.equal(result.status, 2);
-      assert.doesNotMatch(result.stderr, /fixture-proxy|2001:4860/);
+      assert.doesNotMatch(result.stderr, /fixture-proxy|8\.8\.8\.8|2001:4860/);
     }
   });
 
@@ -210,7 +210,10 @@ describe("CPA upstream TypeScript operators", () => {
 
   it("applies and replays stable direct accounts without leaking credentials", async () => {
     const root = mkdtempSync(join(tmpdir(), "mtc-cpa-apply-"));
-    const source = join(root, "source"); cpSync(join(fixtures, "supported"), source, { recursive: true }); privateTree(source);
+    const source = join(root, "source"); cpSync(join(fixtures, "supported"), source, { recursive: true });
+    const config = join(source, "config.yaml");
+    writeFileSync(config, readFileSync(config, "utf8").replaceAll("socks5://fixture-proxy.internal:1080", "socks5h://100.64.0.16:1080"));
+    privateTree(source);
     const key = join(source, "source-identity.key"); assert.equal(spawnSync(process.execPath, [generator, key]).status, 0);
     const token = join(root, "service-token"); writeFileSync(token, "fixture-only-target-service-token\n", { mode: 0o600 });
     const policy = writeTransportPolicy(root, ["https://openai-compatible.example.test/v1"], {
@@ -254,7 +257,7 @@ describe("CPA upstream TypeScript operators", () => {
       const proxied = credentials.filter((credential) => credential.type === "api_key_proxy");
       assert.equal(proxied.length, 6);
       for (const credential of proxied) {
-        assert.equal(credential.proxy_url, "socks5://fixture-proxy.internal:1080");
+        assert.equal(credential.proxy_url, "socks5h://100.64.0.16:1080");
         assert.equal(credential.proxy_network_scope, "private");
       }
       assert.doesNotMatch(firstRun.stdout + firstRun.stderr + secondRun.stdout + secondRun.stderr, /fixture-only-/);

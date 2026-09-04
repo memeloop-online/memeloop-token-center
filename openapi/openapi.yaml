@@ -4440,7 +4440,7 @@ components:
         value: { type: string, minLength: 1, writeOnly: true }
         header: { type: string, default: authorization }
         prefix: { type: string, default: 'Bearer ' }
-        proxy_url: { type: string, pattern: '^socks5://', minLength: 1, maxLength: 2048, writeOnly: true }
+        proxy_url: { type: string, pattern: '^socks5h?://', minLength: 1, maxLength: 2048, writeOnly: true, description: 'Explicit private SOCKS proxy. socks5 resolves targets locally; socks5h preserves remote DNS and requires a private IP-literal proxy endpoint.' }
         proxy_network_scope: { type: string, const: private }
     OAuthCredential:
       type: object
@@ -4453,6 +4453,11 @@ components:
         expires_at: { type: [integer, 'null'], format: int64 }
         header: { type: string, default: authorization }
         prefix: { type: string, default: 'Bearer ' }
+        proxy_url: { type: [string, 'null'], pattern: '^socks5h?://', minLength: 1, maxLength: 2048, writeOnly: true, description: 'Explicit private SOCKS proxy. socks5 resolves targets locally; socks5h preserves remote DNS and requires a private IP-literal proxy endpoint.' }
+        proxy_network_scope:
+          oneOf:
+            - { type: string, const: private }
+            - { type: 'null' }
     NoAuthCredential:
       type: object
       additionalProperties: false

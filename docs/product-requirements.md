@@ -379,17 +379,20 @@ nothing. Acceptance reconciles event, day, model and credential dimensions
 against the sealed CPAMP snapshot, including Codex/OpenAI inclusive cache,
 Claude separate cache, service/context tiers and live rows outside the import.
 
-Legacy CPA upstream migration must preserve its private SOCKS5 account proxy
-rather than silently bypassing it. Proxy credentials/topology are encrypted
-write-only material; dry-run output is count-only, and proxy creation or change
-is restricted to a global service credential. The local-DNS SOCKS5 form is
-required so the validated target address remains pinned through the handshake.
-Target and proxy scope are independent: public is the target default, while an
-exact private target requires a separate, versioned, owner-only operator policy
+Historical upstream migration must preserve each private SOCKS5 account proxy
+rather than silently bypassing it or changing its DNS semantics. Proxy
+credentials/topology are encrypted write-only material; dry-run output is
+count-only, and proxy creation or change is restricted to a global service
+credential. `socks5` keeps locally validated and pinned target resolution.
+`socks5h` preserves proxy-side target resolution and is accepted only when the
+operator-approved proxy endpoint is a safe private IP literal. The server still
+resolves and classifies the target before the request; proxy-side resolution is
+an explicit operator trust boundary, not an SSRF-policy bypass. Target and
+proxy scope are independent: public is the target default, while an exact
+private target requires a separate, versioned, owner-only operator policy
 approved before dry-run. Scope is never inferred from proxy presence, but every
-private target must also have an approved private local-DNS SOCKS5 proxy; a
-missing proxy fails inventory before any target request. The server must still
-independently validate target DNS/IP and operator authority.
+private target must also have an approved private SOCKS5 proxy; a missing proxy
+fails inventory before any target request.
 Legacy CPA archive timestamps with
 explicit offsets and up to nanosecond precision may be normalized to canonical
 six-digit UTC only in the pre-stable legacy projection. The stable snapshot

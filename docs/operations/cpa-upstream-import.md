@@ -23,13 +23,16 @@ these CPA configuration sections:
 - Codex and legacy Gemini OAuth documents, imported into the matching managed
   OAuth provider supplied by Token Center.
 
-Per-account private `socks5` proxy URLs are preserved in
+Per-account private `socks5` and `socks5h` proxy URLs are preserved in
 the same encrypted credential envelope as the API key. The URL is write-only and
 may contain proxy authentication; inventory, account views and errors expose only
 the proxied-account count. Proxied accounts require a global service credential.
-The target and proxy addresses are resolved and checked independently; only
-local-DNS `socks5` is accepted so the target uses the client's pinned resolution,
-while `socks5h`, HTTP(S) proxies and public SOCKS endpoints fail closed. Custom
+The target and proxy addresses are resolved and checked independently.
+Local-DNS `socks5` uses the client's pinned target resolution. Remote-DNS
+`socks5h` is preserved only for a safe private IP-literal proxy; the target is
+still locally policy-checked, while the trusted proxy resolves the hostname for
+the connection. HTTP(S), public SOCKS and hostname-addressed `socks5h` proxies
+fail closed. Custom
 upstream headers and Claude request cloaking still stop the entire import.
 Unknown `*-api-key`/`*-compatibility` sections and unknown auth JSON types also
 stop the import. No supported accounts are written before source inventory and
@@ -40,11 +43,11 @@ public by default. A reviewed owner-only transport-policy file may classify an
 exact normalized base URL as private; the importer then writes
 `network_scope: "private"` for every source account using that URL. It never
 infers a private target merely because an account has a proxy. Every account
-classified as a private target must also carry an approved private local-DNS
-SOCKS5 proxy; the complete inventory fails before any target request if even one
-such account lacks it. The control plane still resolves, classifies and pins the
-target and proxy independently and requires global authority for private
-transport.
+classified as a private target must also carry an approved private SOCKS5
+proxy; the complete inventory fails before any target request if even one
+such account lacks it. The control plane still resolves and classifies the
+target and proxy independently, pins local-DNS connections, and requires global
+authority for private transport.
 
 Opaque Copilot and Cursor handle records cannot be used as native credentials.
 The importer never sends their handle, login, label or source document to Token

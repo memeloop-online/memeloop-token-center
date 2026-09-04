@@ -33,14 +33,15 @@ state of its successor. It is not rollout or production evidence.
 - The importer defaults direct targets to public. A separate strict owner-only
   versioned policy may approve exact target base URLs as private; output adds
   only `private_target_api_account_count`. Scope is not inferred from proxy
-  presence, but every private-target account must have a private local-DNS
-  SOCKS5 proxy or inventory fails before any target request. The server
+  presence, but every private-target account must have a private SOCKS5 proxy
+  or inventory fails before any target request. The server
   revalidates both scopes.
-- Only private local-DNS `socks5` is accepted. `socks5h`, HTTP(S) proxies and
-  public SOCKS endpoints fail closed. MTC resolves and classifies the target and
-  proxy independently, pins both for the one operation, and disables inherited
-  environment proxies. A real in-process SOCKS handshake test proves the proxy
-  receives the pinned target IP while HTTP keeps the original Host.
+- Private `socks5` and `socks5h` are accepted with their original DNS semantics.
+  `socks5` pins the locally validated target IP. `socks5h` is restricted to a
+  safe private IP-literal proxy and sends the original hostname to that trusted
+  proxy after MTC's local target policy check. HTTP(S), public SOCKS and
+  hostname-addressed `socks5h` proxies fail closed. In-process SOCKS handshake
+  tests cover both the pinned-IP and original-hostname paths.
 - Creating or explicitly changing the private proxy requires a global service
   credential. A tenant-scoped API-key-only rotation preserves the already
   approved proxy and cannot replace or remove it.

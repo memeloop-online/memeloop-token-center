@@ -138,7 +138,7 @@ Imported direct targets default to the public destination policy. Migration may
 select `network_scope: private` only through a separate versioned owner-only
 policy listing exact normalized base URLs. This decision is independent of
 whether proxy presence caused the classification, but every private target must
-carry an approved private local-DNS SOCKS5 proxy. The importer validates this
+carry an approved private SOCKS5 proxy. The importer validates this
 before any target request; server global-authority and independent DNS/IP checks
 still apply. Stable source identity does not include scope, so changing an
 approved scope conflicts with the existing account instead of creating a
@@ -149,12 +149,14 @@ proxy. The proxy URL—including optional proxy authentication and private
 topology—is sealed inside the credential envelope, never copied to account
 configuration or response views. The control plane independently resolves and
 classifies the final target and proxy endpoint, disables environment proxy
-inheritance, pins both resolutions for the operation and requires a global
-service authority to create or change it. Only local-DNS `socks5` is accepted,
-so the SOCKS handshake receives the already pinned target address; `socks5h`,
-HTTP(S) proxies and public SOCKS endpoints fail closed. A tenant-scoped key-only
-rotation may preserve an already-approved proxy but cannot replace or remove its
-transport boundary.
+inheritance and requires a global service authority to create or change it.
+With `socks5`, both target and proxy resolutions are pinned for the operation.
+With `socks5h`, MTC still validates the target locally but deliberately sends
+the original hostname in the SOCKS handshake; this is allowed only through a
+safe private IP-literal proxy whose resolver is an explicit operator trust
+boundary. HTTP(S), public SOCKS and hostname-addressed `socks5h` proxies fail
+closed. A tenant-scoped key-only rotation may preserve an already-approved
+proxy but cannot replace or remove its transport boundary.
 
 ## Request lifecycle and accounting
 

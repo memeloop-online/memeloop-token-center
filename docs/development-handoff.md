@@ -682,8 +682,10 @@ This section supersedes the older release-truth snapshots below.
   credential was revoked. The current continuation adds a separate strict
   owner-only version-1 transport policy for exact private target base URLs.
   Scope is not inferred from proxy presence, but each approved private target
-  must carry a private local-DNS SOCKS5 proxy before any target request. URLs
-  remain write-only, the server still revalidates DNS/IP and global authority,
+  must carry a private SOCKS5 proxy before any target request. `socks5` uses
+  locally pinned DNS; `socks5h` preserves remote DNS only for a safe private
+  IP-literal proxy. URLs remain write-only; the server still revalidates DNS/IP
+  and global authority,
   and changing scope on replay conflicts instead of duplicating an account.
 - External probes of the claimed trial operator URL alternated between HTTP 403
   and 200 over six consecutive requests. No upstream apply/exact replay,
@@ -952,9 +954,10 @@ fixtures.
 
 The real source has one API-key-entry-level private SOCKS5 proxy without proxy
 authentication. The current local continuation adds a write-only
-`api_key_proxy` credential, encrypted proxy URL, independently pinned target and
-proxy endpoints, local-DNS-only SOCKS5 (no `socks5h`/HTTP proxy resolution
-bypass), global authority for private-proxy creation/change, ordinary
+`api_key_proxy` credential, encrypted proxy URL, independently validated target
+and proxy endpoints, exact preservation of local-DNS `socks5` versus remote-DNS
+`socks5h` semantics, safe private IP-literal enforcement for `socks5h`, no HTTP
+proxy bypass, global authority for private-proxy creation/change, ordinary
 key rotation that preserves the approved route, OpenAPI/catalog support and a
 count-only TypeScript importer migration. The real v0.7.21 archive source also
 returns RFC3339 numeric offsets with 5–9 fractional digits, while the later

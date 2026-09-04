@@ -170,12 +170,13 @@ pub async fn client_for_config_url(
         .await;
     };
 
-    // A proxy is an explicit global-operator trust boundary. Only `socks5`
-    // (never `socks5h`) is accepted: reqwest resolves its destination through
-    // this client's pinned resolver before the SOCKS handshake. Validate the
-    // final target exactly as for a direct request, then independently resolve,
-    // classify and pin the proxy endpoint. Environment proxy inheritance is
-    // disabled by the base builder.
+    // A proxy is an explicit global-operator trust boundary. `socks5` keeps
+    // local DNS resolution and pins the final target before the handshake.
+    // `socks5h` delegates connection-time DNS to the trusted proxy and is only
+    // accepted when that proxy is an explicit private IP literal. In both
+    // modes the target is still resolved and classified here before any
+    // request, and the proxy endpoint is independently validated. Environment
+    // proxy inheritance is disabled by the base builder.
     let target = checked_http_url(value)?;
     let (target_host, target_addresses, target_test_loopback) =
         validated_endpoint(&target, target_scope, allow_test_loopback).await?;
@@ -187,6 +188,21 @@ pub async fn client_for_config_url(
     )?;
 
     let proxy = checked_proxy_url(proxy_url)?;
+    let proxy_resolves_target = proxy.scheme() == "socks5h";
+    if proxy_resolves_target
+        && !matches!(
+            proxy.host(),
+            Some(Host::Ipv4(address)) if is_safe_private_upstream_ip(IpAddr::V4(address))
+        )
+        && !matches!(
+            proxy.host(),
+            Some(Host::Ipv6(address)) if is_safe_private_upstream_ip(IpAddr::V6(address))
+        )
+    {
+        return Err(AppError::BadRequest(
+            "remote-DNS SOCKS5 proxies must use an explicitly private IP endpoint".into(),
+        ));
+    }
     let (proxy_host, proxy_addresses, proxy_test_loopback) =
         validated_endpoint(&proxy, proxy_scope, allow_test_loopback).await?;
     let private_proxy = proxy_scope == OutboundScope::Private
@@ -200,7 +216,7 @@ pub async fn client_for_config_url(
     }
 
     let mut pins: Vec<(&str, &[SocketAddr])> = Vec::new();
-    if let Some(host) = target_host.as_deref() {
+    if !proxy_resolves_target && let Some(host) = target_host.as_deref() {
         pins.push((host, &target_addresses));
     }
     if let Some(host) = proxy_host.as_deref() {
@@ -219,7 +235,7 @@ async fn validated_endpoint(
         .ok_or_else(|| AppError::BadRequest("outbound URL must include a host".into()))?;
     let port = url
         .port_or_known_default()
-        .or_else(|| (url.scheme() == "socks5").then_some(1080))
+        .or_else(|| matches!(url.scheme(), "socks5" | "socks5h").then_some(1080))
         .ok_or_else(|| {
             AppError::BadRequest("outbound URL must use a known or explicit port".into())
         })?;
@@ -252,7 +268,7 @@ fn checked_proxy_url(value: &str) -> Result<Url, AppError> {
     }
     let url = Url::parse(value)
         .map_err(|_| AppError::BadRequest("upstream proxy URL is invalid".into()))?;
-    if url.scheme() != "socks5"
+    if !matches!(url.scheme(), "socks5" | "socks5h")
         || url.host_str().is_none()
         || url.port() == Some(0)
         || (url.path() != "" && url.path() != "/")
@@ -569,6 +585,44 @@ mod tests {
                 &shared,
                 "https://1.1.1.1/v1/models",
                 &config,
+                Some(("socks5h://10.20.30.40:1080", OutboundScope::Private)),
+                false,
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            client_for_config_url(
+                &shared,
+                "https://1.1.1.1/v1/models",
+                &config,
+                Some((
+                    "socks5h://proxy.service.cluster.local:1080",
+                    OutboundScope::Private,
+                )),
+                false,
+            )
+            .await
+            .is_err(),
+            "a remote-DNS SOCKS proxy endpoint must be an IP literal"
+        );
+        assert!(
+            client_for_config_url(
+                &shared,
+                "https://1.1.1.1/v1/models",
+                &config,
+                Some(("socks5h://8.8.8.8:1080", OutboundScope::Private)),
+                false,
+            )
+            .await
+            .is_err(),
+            "a remote-DNS SOCKS proxy endpoint must be private"
+        );
+        assert!(
+            client_for_config_url(
+                &shared,
+                "https://1.1.1.1/v1/models",
+                &config,
                 Some(("socks5://8.8.8.8:1080", OutboundScope::Public)),
                 false,
             )
@@ -581,7 +635,7 @@ mod tests {
                 &shared,
                 "https://169.254.169.254/latest/meta-data",
                 &config,
-                Some(("socks5://10.20.30.40:1080", OutboundScope::Private)),
+                Some(("socks5h://10.20.30.40:1080", OutboundScope::Private)),
                 false,
             )
             .await

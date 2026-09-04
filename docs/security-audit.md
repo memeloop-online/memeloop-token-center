@@ -74,10 +74,12 @@ shared cluster-aware client and can be persisted only by a global operator.
 The CPA importer defaults targets to public and accepts private scope only from
 a strict owner-only versioned policy of exact normalized base URLs. Its output
 reports only total/private-target/proxied counts. Target and proxy approval are
-separate, but each private target must carry an approved private local-DNS
-SOCKS5 proxy; inventory enforces this before any target request. The server still
-resolves, classifies and pins both endpoints, so an importer policy is not an
-SSRF bypass.
+separate, but each private target must carry an approved private SOCKS5 proxy;
+inventory enforces this before any target request. The server still resolves
+and classifies both endpoints. Local-DNS `socks5` pins the target address;
+remote-DNS `socks5h` preserves the hostname only for a safe private IP-literal
+proxy whose resolver is an explicit operator trust boundary. Neither mode turns
+an importer policy into an SSRF bypass.
 Installed provider-adapter plugins are also administrator-owned and may use
 their declared internal OAuth endpoints. Plugin HTTP contributions themselves
 currently have no equivalent per-capability approval record and therefore fail

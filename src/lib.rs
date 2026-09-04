@@ -320,4 +320,69 @@ mod tests {
             .unwrap()
             .unwrap();
     }
+
+    #[tokio::test]
+    async fn socks5h_proxy_receives_the_original_target_hostname() {
+        let target = MockServer::start().await;
+        let expected_host = format!("remote-target.invalid:{}", target.address().port());
+        Mock::given(path("/through-remote-dns-proxy"))
+            .and(header("host", expected_host))
+            .respond_with(ResponseTemplate::new(204).insert_header("connection", "close"))
+            .expect(1)
+            .mount(&target)
+            .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let target_address = *target.address();
+        let proxy = tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut greeting = [0_u8; 2];
+            client.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0_u8; usize::from(greeting[1])];
+            client.read_exact(&mut methods).await.unwrap();
+            assert!(methods.contains(&0));
+            client.write_all(&[5, 0]).await.unwrap();
+
+            let mut request = [0_u8; 4];
+            client.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, &[5, 1, 0, 3]);
+            let mut hostname_length = [0_u8; 1];
+            client.read_exact(&mut hostname_length).await.unwrap();
+            let mut hostname = vec![0_u8; usize::from(hostname_length[0])];
+            client.read_exact(&mut hostname).await.unwrap();
+            assert_eq!(hostname, b"remote-target.invalid");
+            let mut port = [0_u8; 2];
+            client.read_exact(&mut port).await.unwrap();
+            assert_eq!(u16::from_be_bytes(port), target_address.port());
+
+            let mut upstream = TcpStream::connect(target_address).await.unwrap();
+            client
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .unwrap();
+        });
+
+        let client =
+            build_explicit_proxy_http_client(&format!("socks5h://{proxy_address}"), &[]).unwrap();
+        let response = client
+            .get(format!(
+                "http://remote-target.invalid:{}/through-remote-dns-proxy",
+                target.address().port()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        drop(response);
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(2), proxy)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

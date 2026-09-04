@@ -9,7 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
-use crate::network::OutboundScope;
+use crate::network::{OutboundScope, is_safe_private_upstream_ip};
 
 const CURRENT_ENVELOPE_VERSION: &str = "v2";
 pub(super) const LEGACY_ENVELOPE_VERSION: &str = "v1";
@@ -322,12 +322,26 @@ fn validate_proxy_url(value: &str) -> Result<(), AppError> {
     }
     let parsed = url::Url::parse(value)
         .map_err(|_| AppError::BadRequest("upstream proxy URL is invalid".into()))?;
-    if parsed.scheme() != "socks5"
+    if !matches!(parsed.scheme(), "socks5" | "socks5h")
         || parsed.host_str().is_none()
         || parsed.port() == Some(0)
         || (parsed.path() != "" && parsed.path() != "/")
         || parsed.query().is_some()
         || parsed.fragment().is_some()
+    {
+        return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
+    }
+    if parsed.scheme() == "socks5h"
+        && !matches!(
+            parsed.host(),
+            Some(url::Host::Ipv4(address))
+                if is_safe_private_upstream_ip(std::net::IpAddr::V4(address))
+        )
+        && !matches!(
+            parsed.host(),
+            Some(url::Host::Ipv6(address))
+                if is_safe_private_upstream_ip(std::net::IpAddr::V6(address))
+        )
     {
         return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
     }
@@ -589,8 +603,9 @@ mod proxy_tests {
             ))
         );
         for proxy_url in [
-            "socks5h://10.20.30.40:1080",
             "https://10.20.30.40:8443",
+            "socks5h://proxy.internal:1080",
+            "socks5h://8.8.8.8:1080",
             "socks5://10.20.30.40:1080/path",
             "socks5://10.20.30.40:1080?secret=value",
             "socks5://10.20.30.40:0",
@@ -605,6 +620,21 @@ mod proxy_tests {
             }
             assert!(credential.validate(0).is_err(), "{proxy_url}");
         }
+        let mut remote_dns = proxied();
+        if let UpstreamCredential::ProxiedApiKey {
+            proxy_url: value, ..
+        } = &mut remote_dns
+        {
+            *value = "socks5h://proxy-user:proxy-secret@10.20.30.40:1080".into();
+        }
+        remote_dns.validate(0).unwrap();
+        assert_eq!(
+            remote_dns.proxy(),
+            Some((
+                "socks5h://proxy-user:proxy-secret@10.20.30.40:1080",
+                OutboundScope::Private
+            ))
+        );
         let mut public_scope = proxied();
         if let UpstreamCredential::ProxiedApiKey {
             proxy_network_scope,

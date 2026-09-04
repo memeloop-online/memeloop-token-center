@@ -215,7 +215,8 @@ function privateAddress(host: string): boolean {
   if (isIP(address) === 4) {
     const octets = address.split(".").map(Number);
     return octets[0] === 10 || (octets[0] === 172 && octets[1]! >= 16 && octets[1]! <= 31)
-      || (octets[0] === 192 && octets[1] === 168);
+      || (octets[0] === 192 && octets[1] === 168)
+      || (octets[0] === 100 && octets[1]! >= 64 && octets[1]! <= 127 && address !== "100.100.100.200");
   }
   if (isIP(address) === 6) {
     const normalized = address.toLowerCase().split("%")[0]!;
@@ -231,8 +232,10 @@ function proxyUrl(value: unknown, label: string): { value: string; scope: ProxyN
   if (Buffer.byteLength(raw) > 2_048) throw new ImportFailure(`${label} is invalid`);
   let parsed: URL;
   try { parsed = new URL(raw); } catch { throw new ImportFailure(`${label} is invalid`); }
-  if (parsed.protocol !== "socks5:" || !parsed.hostname
+  if ((parsed.protocol !== "socks5:" && parsed.protocol !== "socks5h:") || !parsed.hostname
     || parsed.port === "0" || (parsed.pathname !== "" && parsed.pathname !== "/") || parsed.search || parsed.hash) throw new ImportFailure(`${label} is invalid`);
+  const proxyHost = parsed.hostname.startsWith("[") && parsed.hostname.endsWith("]") ? parsed.hostname.slice(1, -1) : parsed.hostname;
+  if (parsed.protocol === "socks5h:" && isIP(proxyHost) === 0) throw new ImportFailure(`${label} is invalid`);
   if (!privateAddress(parsed.hostname)) throw new ImportFailure(`${label} must use a private SOCKS5 endpoint`);
   return { value: raw, scope: "private" };
 }

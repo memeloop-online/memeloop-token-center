@@ -221,15 +221,15 @@ pub(crate) fn native_config_from_import(config: &Value) -> Result<Value, AppErro
     }))
 }
 
-/// CPA accepted both SOCKS spellings. MTC deliberately uses local DNS
-/// resolution and address pinning, so only an IP-literal `socks5h` URL has an
-/// unambiguous safe equivalent. DNS names must already use `socks5` and are
-/// resolved/classified by the outbound network boundary before persistence.
+/// Preserve the operator-selected SOCKS DNS semantics. `socks5` may use a
+/// private DNS name because MTC resolves and pins it locally. `socks5h` is
+/// accepted only with a safe private IP-literal proxy so the connection-time
+/// resolver is an explicit, reviewable operator trust boundary.
 fn normalize_private_proxy_url(value: &str) -> Result<String, AppError> {
     if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
         return Err(invalid_document());
     }
-    let mut parsed = url::Url::parse(value).map_err(|_| invalid_document())?;
+    let parsed = url::Url::parse(value).map_err(|_| invalid_document())?;
     if !matches!(parsed.scheme(), "socks5" | "socks5h")
         || parsed.host_str().is_none()
         || parsed.port().is_none_or(|port| port == 0)
@@ -247,10 +247,7 @@ fn normalize_private_proxy_url(value: &str) -> Result<String, AppError> {
     } else if parsed.scheme() == "socks5h" {
         return Err(invalid_document());
     }
-    parsed
-        .set_scheme("socks5")
-        .map_err(|_| invalid_document())?;
-    Ok(parsed.to_string())
+    Ok(value.to_owned())
 }
 
 pub async fn refresh(
@@ -536,7 +533,7 @@ mod tests {
         assert_eq!(
             normalized.credential.proxy(),
             Some((
-                "socks5://proxy-user:proxy-secret@100.64.0.16:1080",
+                "socks5h://proxy-user:proxy-secret@100.64.0.16:1080",
                 OutboundScope::Private
             ))
         );
