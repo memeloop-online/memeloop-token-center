@@ -393,6 +393,12 @@ private target requires a separate, versioned, owner-only operator policy
 approved before dry-run. Scope is never inferred from proxy presence, but every
 private target must also have an approved private SOCKS5 proxy; a missing proxy
 fails inventory before any target request.
+For imported Codex accounts whose earlier importer collapsed a source
+`socks5h://` URL to `socks5://`, the explicit native-account upgrade must
+restore `socks5h://` inside the encrypted credential without exposing or
+changing the proxy endpoint, authentication, OAuth tokens or stable account ID.
+The restoration fails closed unless the proxy endpoint is a safe private IP
+literal.
 Legacy CPA archive timestamps with
 explicit offsets and up to nanosecond precision may be normalized to canonical
 six-digit UTC only in the pre-stable legacy projection. The stable snapshot

@@ -104,9 +104,10 @@ pub fn normalize(payload: &Value) -> Result<ManagedOAuthNormalizedAccount, AppEr
 }
 
 /// Convert the credential envelope produced by the retired importer to the
-/// native Codex ABI. This deliberately touches only the encrypted adapter
-/// state: access/refresh tokens, expiry, and an optional private SOCKS
-/// transport remain byte-for-byte represented by their existing fields.
+/// native Codex ABI. Access/refresh tokens, expiry, proxy endpoint and proxy
+/// authentication remain byte-for-byte represented. A safe IP-literal
+/// `socks5://` proxy is restored to `socks5h://` because the retired importer
+/// collapsed the source's remote-DNS scheme while storing the credential.
 ///
 /// The database migration owns the transaction and CAS guards. Keeping the
 /// conversion here makes it impossible for an API response or a caller-owned
@@ -154,6 +155,7 @@ pub(crate) fn upgrade_imported_credential(
         "schema".to_owned(),
         Value::String(NATIVE_ADAPTER_SCHEMA.to_owned()),
     );
+    let proxy_url = restore_imported_remote_dns_proxy(proxy_url)?;
     let upgraded = UpstreamCredential::OAuth {
         access_token,
         refresh_token,
@@ -169,6 +171,28 @@ pub(crate) fn upgrade_imported_credential(
     upgraded.validate(i64::MIN)?;
     validate_adapter_state(upgraded.adapter_state())?;
     Ok(upgraded)
+}
+
+fn restore_imported_remote_dns_proxy(
+    proxy_url: Option<String>,
+) -> Result<Option<String>, AppError> {
+    let Some(proxy_url) = proxy_url else {
+        return Ok(None);
+    };
+    let parsed = url::Url::parse(&proxy_url).map_err(|_| invalid_document())?;
+    if parsed.scheme() == "socks5h" {
+        normalize_private_proxy_url(&proxy_url)?;
+        return Ok(Some(proxy_url));
+    }
+    if parsed.scheme() != "socks5" || !network::has_safe_private_ip_literal_host(&parsed) {
+        return Err(invalid_document());
+    }
+    let suffix = proxy_url
+        .strip_prefix("socks5://")
+        .ok_or_else(invalid_document)?;
+    let restored = format!("socks5h://{suffix}");
+    normalize_private_proxy_url(&restored)?;
+    Ok(Some(restored))
 }
 
 pub(crate) fn validate_native_credential(credential: &UpstreamCredential) -> Result<(), AppError> {
@@ -619,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn controlled_upgrade_changes_only_the_adapter_abi_and_preserves_private_proxy() {
+    fn controlled_upgrade_restores_remote_dns_without_exposing_private_proxy() {
         let imported = UpstreamCredential::OAuth {
             access_token: "access-secret".to_owned(),
             refresh_token: Some("refresh-secret".to_owned()),
@@ -641,12 +665,49 @@ mod tests {
         assert_eq!(
             upgraded.proxy(),
             Some((
-                "socks5://operator:secret@100.64.0.16:1080",
+                "socks5h://operator:secret@100.64.0.16:1080",
                 OutboundScope::Private
             ))
         );
         assert!(!format!("{upgraded:?}").contains("operator:secret"));
         assert!(!format!("{upgraded:?}").contains("access-secret"));
+    }
+
+    #[test]
+    fn controlled_upgrade_preserves_existing_remote_dns_and_rejects_hostname_proxy() {
+        let build = |proxy_url: &str| UpstreamCredential::OAuth {
+            access_token: "access-secret".to_owned(),
+            refresh_token: Some("refresh-secret".to_owned()),
+            expires_at: Some(4_070_908_800_000),
+            header: "authorization".to_owned(),
+            prefix: "Bearer ".to_owned(),
+            adapter_state: Some(json!({
+                "schema": IMPORTED_ADAPTER_SCHEMA,
+                "account_id": "account-123"
+            })),
+            proxy_url: Some(proxy_url.to_owned()),
+            proxy_network_scope: Some(OutboundScope::Private),
+        };
+
+        let preserved =
+            upgrade_imported_credential(build("socks5h://operator:secret@100.64.0.16:1080"))
+                .unwrap();
+        assert_eq!(
+            preserved.proxy(),
+            Some((
+                "socks5h://operator:secret@100.64.0.16:1080",
+                OutboundScope::Private
+            ))
+        );
+
+        let error = upgrade_imported_credential(build(
+            "socks5://operator:secret@proxy.service.svc.cluster.local:1080",
+        ))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid request: CPA Codex document is invalid"
+        );
     }
 
     #[test]

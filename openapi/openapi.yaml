@@ -1445,10 +1445,11 @@ paths:
       description: |
         Transactional native-only upgrade for the exact targets returned by
         prepare. It preserves each stable account id, encrypted refresh state,
-        and approved private proxy, while atomically changing the provider
-        driver and adapter-state ABI. Repeating a completed request returns
-        ids as already native; an unreviewed or changed legacy row fails with
-        409 rather than being silently rewritten.
+        proxy endpoint and proxy authentication while restoring the required
+        `socks5h` remote-DNS scheme for safe IP-literal imported proxies and
+        atomically changing the provider driver and adapter-state ABI. Repeating
+        a completed request returns ids as already native; an unreviewed or
+        changed row fails with 409 rather than being silently rewritten.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:write
       x-global-service-only: true

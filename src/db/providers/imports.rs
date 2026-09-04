@@ -837,7 +837,7 @@ mod native_codex_upgrade_tests {
         assert_eq!(
             credential.proxy(),
             Some((
-                "socks5://operator:proxy-secret@100.64.0.16:1080",
+                "socks5h://operator:proxy-secret@100.64.0.16:1080",
                 crate::network::OutboundScope::Private
             ))
         );
