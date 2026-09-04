@@ -1054,12 +1054,12 @@ async fn native_codex_upgrade_api_is_global_allowlisted_and_never_returns_proxy_
     .await;
     assert_eq!(status, StatusCode::OK);
     let result: Value = serde_json::from_slice(&result_body).unwrap();
-    assert_eq!(result["upgraded_count"], 0);
-    assert_eq!(result["already_native_count"], 1);
+    assert_eq!(result["upgraded_count"], 1);
     assert_eq!(
-        result["already_native_account_ids"][0],
+        result["upgraded_account_ids"][0],
         account.id.to_string()
     );
+    assert_eq!(result["already_native_count"], 0);
 }
 
 #[tokio::test]
