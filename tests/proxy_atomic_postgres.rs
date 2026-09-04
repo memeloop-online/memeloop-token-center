@@ -346,11 +346,11 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
     let projection_state: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
             (SELECT COUNT(*) FROM metered_usage_projection_outbox WHERE key_id = $1 AND projected_at IS NOT NULL),
-            (SELECT COALESCE(SUM(requests), 0) FROM usage_daily_aggregates WHERE key_id = $2),
-            (SELECT COALESCE(SUM(requests), 0) FROM request_daily_aggregates WHERE key_id = $3),
-            (SELECT COALESCE(SUM(requests), 0) FROM usage_analysis_hourly WHERE key_id = $4 AND source_kind = 'request'),
-            (SELECT COALESCE(SUM(requests), 0) FROM usage_analysis_daily WHERE key_id = $5 AND source_kind = 'request'),
-            (SELECT COALESCE(SUM(requests), 0) FROM session_usage_totals WHERE key_id = $6),
+            (SELECT COALESCE(SUM(requests), 0)::BIGINT FROM usage_daily_aggregates WHERE key_id = $2),
+            (SELECT COALESCE(SUM(requests), 0)::BIGINT FROM request_daily_aggregates WHERE key_id = $3),
+            (SELECT COALESCE(SUM(requests), 0)::BIGINT FROM usage_analysis_hourly WHERE key_id = $4 AND source_kind = 'request'),
+            (SELECT COALESCE(SUM(requests), 0)::BIGINT FROM usage_analysis_daily WHERE key_id = $5 AND source_kind = 'request'),
+            (SELECT COALESCE(SUM(requests), 0)::BIGINT FROM session_usage_totals WHERE key_id = $6),
             (SELECT COALESCE(settled_lifetime_micros, 0) FROM key_budget_state WHERE key_id = $7)",
     )
     .bind(key.key_id.to_string())
