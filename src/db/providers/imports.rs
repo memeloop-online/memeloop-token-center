@@ -119,8 +119,12 @@ impl Database {
                 key_material,
             )?;
             if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
-                let repair_lifecycle =
-                    validate_native_codex_account_shape(&row, &config, &credential)?;
+                let repair_lifecycle = validate_native_codex_account_shape(
+                    &row,
+                    target.account_id,
+                    &config,
+                    &credential,
+                )?;
                 let (credential, repair_proxy) =
                     crate::oauth::managed::codex::restore_remote_dns_proxy(credential)?;
                 if !repair_lifecycle && !repair_proxy {
@@ -139,8 +143,9 @@ impl Database {
                 crate::oauth::managed::codex::validate_native_credential(&credential)?;
                 let updated_at = unix_millis().max(current_updated_at.saturating_add(1));
                 let changed = sqlx::query(
-                    "UPDATE upstream_accounts SET oauth_session_id = COALESCE(oauth_session_id, id), oauth_driver = $1, oauth_refresh_url = $2, updated_at = $3 WHERE id = $4 AND updated_at = $5 AND credential_generation = $6",
+                    "UPDATE upstream_accounts SET oauth_session_id = $1, oauth_driver = $2, oauth_refresh_url = $3, updated_at = $4 WHERE id = $5 AND updated_at = $6 AND credential_generation = $7",
                 )
+                .bind(target.account_id.to_string())
                 .bind(crate::oauth::codex_device::OAUTH_DRIVER)
                 .bind(crate::oauth::codex_device::TOKEN_ENDPOINT)
                 .bind(updated_at)
@@ -663,6 +668,7 @@ fn validate_imported_codex_account_shape(
 
 fn validate_native_codex_account_shape(
     row: &sqlx::any::AnyRow,
+    account_id: Uuid,
     config: &Value,
     credential: &UpstreamCredential,
 ) -> Result<bool, AppError> {
@@ -674,23 +680,10 @@ fn validate_native_codex_account_shape(
     let oauth_session_id = row.try_get::<Option<String>, _>("oauth_session_id")?;
     let oauth_driver = row.try_get::<Option<String>, _>("oauth_driver")?;
     let oauth_refresh_url = row.try_get::<Option<String>, _>("oauth_refresh_url")?;
-    let repair_lifecycle = match (
-        oauth_session_id.as_deref(),
-        oauth_driver.as_deref(),
-        oauth_refresh_url.as_deref(),
-    ) {
-        (
-            Some(_),
-            Some(crate::oauth::codex_device::OAUTH_DRIVER),
-            Some(crate::oauth::codex_device::TOKEN_ENDPOINT),
-        ) => false,
-        (None, None, None) => true,
-        _ => {
-            return Err(AppError::BadRequest(
-                "native OpenAI Codex account has an unsupported lifecycle".into(),
-            ));
-        }
-    };
+    let expected_session_id = account_id.to_string();
+    let repair_lifecycle = oauth_session_id.as_deref() != Some(expected_session_id.as_str())
+        || oauth_driver.as_deref() != Some(crate::oauth::codex_device::OAUTH_DRIVER)
+        || oauth_refresh_url.as_deref() != Some(crate::oauth::codex_device::TOKEN_ENDPOINT);
     crate::oauth::managed::codex::native_config_from_import(config)?;
     crate::oauth::managed::codex::validate_native_credential(credential)?;
     require_private_codex_proxy(credential)?;
@@ -911,7 +904,7 @@ mod native_codex_upgrade_tests {
 
         let damaged_updated_at = upgraded.updated_at.saturating_add(1);
         sqlx::query(
-            "UPDATE upstream_accounts SET oauth_session_id = NULL, oauth_driver = NULL, oauth_refresh_url = NULL, updated_at = $1 WHERE id = $2",
+            "UPDATE upstream_accounts SET oauth_session_id = 'damaged-session', oauth_driver = 'damaged-driver', oauth_refresh_url = 'https://damaged.invalid', updated_at = $1 WHERE id = $2",
         )
         .bind(damaged_updated_at)
         .bind(account.id.to_string())
