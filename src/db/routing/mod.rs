@@ -1,6 +1,7 @@
 mod associations;
 mod grant_revisions;
 mod grants;
+mod health;
 mod list;
 mod resolver;
 mod routes;
@@ -17,3 +18,4 @@ pub(crate) use associations::{
 pub(crate) use grant_revisions::{
     bump_credential_grant_revisions, bump_route_grant_revisions, lock_routing_relation_writes,
 };
+pub(crate) use health::{UpstreamAttemptAdmission, UpstreamFailureKind};

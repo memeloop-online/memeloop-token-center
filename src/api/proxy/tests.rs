@@ -512,12 +512,15 @@ async fn rate_limit_response_fails_over_and_records_the_actual_upstream() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(successful_chat_response())
-        .expect(1)
+        .expect(2)
         .mount(&healthy)
         .await;
     let fixture =
         resilient_route_fixture("failover", &[(unavailable.uri(), 0), (healthy.uri(), 10)]).await;
     let response = send_resilient_chat(&fixture, Some("failover-session"), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let response = send_resilient_chat(&fixture, Some("failover-session-2"), false).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     unavailable.verify().await;
@@ -532,6 +535,130 @@ async fn rate_limit_response_fails_over_and_records_the_actual_upstream() {
     .unwrap();
     assert_eq!(actual, fixture.accounts[1].to_string());
     pool.close().await;
+}
+
+#[tokio::test]
+async fn codex_http_200_error_envelope_fails_over_before_downstream_delivery() {
+    let fixture = codex_route_fixture("high-demand-failover").await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "error": {"message": "temporary high demand"}
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let sse = completed_codex_sse("standby answer");
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-456"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream"),
+        )
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    let tenant = "codex-route-high-demand-failover";
+    let standby = fixture
+        .state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.to_owned(),
+                name: "codex-high-demand-standby".to_owned(),
+                driver: codex_transport::DRIVER.to_owned(),
+                config: json!({
+                    "base_url": codex_transport::BASE_URL,
+                    "network_scope": "public",
+                    "reservation_token_bounds": {fixture.upstream_model.clone(): 64}
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "standby-access-secret".to_owned(),
+                    refresh_token: Some("standby-refresh-secret".to_owned()),
+                    expires_at: Some(i64::MAX),
+                    header: "authorization".to_owned(),
+                    prefix: "Bearer ".to_owned(),
+                    adapter_state: Some(json!({
+                        "schema": "openai-codex-oauth-v1",
+                        "account_id": "account-456"
+                    })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
+                },
+                oauth_session_id: None,
+                oauth_driver: Some(codex_transport::DRIVER.to_owned()),
+                oauth_refresh_url: Some(crate::oauth::managed::codex::TOKEN_ENDPOINT.to_owned()),
+            },
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let standby_route = fixture
+        .state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.to_owned(),
+            public_model: fixture.model.clone(),
+            upstream_account_id: standby.id,
+            upstream_model: fixture.upstream_model.clone(),
+            protocol: "openai".to_owned(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let tenant_id: String = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1")
+        .bind(fixture.key_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at)
+         VALUES ($1, $2, $3, NULL, $4)",
+    )
+    .bind(&tenant_id)
+    .bind(fixture.key_id.to_string())
+    .bind(standby_route.id.to_string())
+    .bind(crate::db::unix_millis())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    for input in ["first", "second"] {
+        let response = send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({"model": fixture.model, "input": input, "stream": false}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("standby answer"));
+    }
+    let actual: String = sqlx::query_scalar(
+        "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(fixture.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(actual, standby.id.to_string());
+    let failure_kind: String = sqlx::query_scalar(
+        "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failure_kind, "invalid_response");
+    pool.close().await;
+    upstream.verify().await;
 }
 
 #[tokio::test]

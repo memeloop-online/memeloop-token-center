@@ -340,6 +340,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "metered usage projection leases",
         sql: include_str!("../../../migrations/common/0063_metered_usage_projection_leases.sql"),
     },
+    Migration {
+        version: 64,
+        name: "upstream account health circuit breaker",
+        sql: include_str!("../../../migrations/common/0064_upstream_account_health.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -665,6 +670,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 63,
         name: "metered usage projection leases",
         sql: include_str!("../../../migrations/common/0063_metered_usage_projection_leases.sql"),
+    },
+    Migration {
+        version: 64,
+        name: "upstream account health circuit breaker",
+        sql: include_str!("../../../migrations/common/0064_upstream_account_health.sql"),
     },
 ];
 

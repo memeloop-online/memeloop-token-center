@@ -8,6 +8,10 @@ mod lifecycle;
 mod routing;
 mod streaming;
 
+use crate::{
+    db::{UpstreamAttemptAdmission, UpstreamFailureKind},
+    metrics::{UpstreamHealthEvent, UpstreamHealthReason},
+};
 use conversation_hints::{client_name, conversation_hints, safe_conversation_hint};
 use lifecycle::{AbortTaskOnDrop, begin_streaming_response_archive, run_bounded_proxy_lifecycle};
 use routing::{
@@ -268,13 +272,87 @@ pub(super) async fn proxy(
         .await;
     }
     let (upstream, upstream_activity) = loop {
+        let admission = state
+            .db
+            .claim_upstream_account_attempt(active_route.route.account_id)
+            .await?;
+        if admission == UpstreamAttemptAdmission::Unavailable {
+            state.metrics.observe_upstream_health(
+                UpstreamHealthEvent::Skipped,
+                UpstreamHealthReason::Cooldown,
+            );
+            let Some(next_route) = route_attempts.next() else {
+                return finish_proxy_unavailable(&buffered_request, "upstream_cooldown").await;
+            };
+            if state
+                .db
+                .reassign_pending_proxy_upstream(
+                    request_id,
+                    key.tenant_id,
+                    buffered_request.reservation.id,
+                    (active_route.route.account_id, active_route.route.route_id),
+                    (next_route.route.account_id, next_route.route.route_id),
+                )
+                .await
+                .is_err()
+            {
+                return finish_proxy_failure(&buffered_request, "upstream_failover_state").await;
+            }
+            state.metrics.observe_upstream_health(
+                UpstreamHealthEvent::Failover,
+                UpstreamHealthReason::Cooldown,
+            );
+            active_route = next_route;
+            continue;
+        }
         let result = send_proxy_route(&state, &headers, protocol, request_id, &active_route).await;
-        let retry = match &result {
-            Ok((response, _)) => retryable_upstream_status(response.status()),
-            Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => true,
-            Err(ProxySendError::NonRetryableTransport | ProxySendError::Credential) => false,
+        let failure = match &result {
+            Ok((response, _)) if response.status() == StatusCode::TOO_MANY_REQUESTS => Some((
+                UpstreamFailureKind::RateLimited,
+                UpstreamHealthReason::RateLimited,
+            )),
+            Ok((response, _)) if retryable_upstream_status(response.status()) => Some((
+                UpstreamFailureKind::Unavailable,
+                UpstreamHealthReason::Unavailable,
+            )),
+            Ok((response, _))
+                if active_route.is_codex()
+                    && response.status().is_success()
+                    && !codex_transport::is_event_stream(response) =>
+            {
+                Some((
+                    UpstreamFailureKind::InvalidResponse,
+                    UpstreamHealthReason::InvalidResponse,
+                ))
+            }
+            Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => {
+                Some((
+                    UpstreamFailureKind::Connection,
+                    UpstreamHealthReason::Connection,
+                ))
+            }
+            Err(ProxySendError::NonRetryableTransport | ProxySendError::Credential) => None,
         };
-        if retry && let Some(next_route) = route_attempts.next() {
+        if let Some((kind, reason)) = failure {
+            if let Err(error) = state
+                .db
+                .record_upstream_account_failure(active_route.route.account_id, kind)
+                .await
+            {
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %active_route.route.account_id,
+                    error = %error,
+                    "failed to persist upstream account cooldown"
+                );
+            }
+            state
+                .metrics
+                .observe_upstream_health(UpstreamHealthEvent::Failure, reason);
+        }
+        if let Some((_, reason)) = failure
+            && let Some(next_route) = route_attempts.next()
+        {
             if let Ok((response, _activity)) = result {
                 drop(response);
             }
@@ -299,16 +377,51 @@ pub(super) async fn proxy(
                 stage = "upstream_failover",
                 "proxy is switching to the next authorized upstream before downstream delivery"
             );
+            state
+                .metrics
+                .observe_upstream_health(UpstreamHealthEvent::Failover, reason);
             active_route = next_route;
             continue;
         }
         match result {
-            Ok(response) => break response,
+            Ok((response, upstream_activity)) => {
+                if matches!(failure, Some((UpstreamFailureKind::InvalidResponse, _))) {
+                    drop(response);
+                    return finish_proxy_unavailable(
+                        &buffered_request,
+                        "upstream_invalid_content_type",
+                    )
+                    .await;
+                }
+                if admission == UpstreamAttemptAdmission::Probe
+                    && failure.is_none()
+                    && response.status().is_success()
+                {
+                    match state
+                        .db
+                        .record_upstream_account_success(active_route.route.account_id)
+                        .await
+                    {
+                        Ok(true) => state.metrics.observe_upstream_health(
+                            UpstreamHealthEvent::Recovered,
+                            UpstreamHealthReason::Success,
+                        ),
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            %request_id,
+                            upstream_account_id = %active_route.route.account_id,
+                            error = %error,
+                            "failed to clear upstream account cooldown"
+                        ),
+                    }
+                }
+                break (response, upstream_activity);
+            }
             Err(ProxySendError::Credential) => {
                 return finish_proxy_failure(&buffered_request, "provider_credential").await;
             }
             Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => {
-                return finish_proxy_failure(&buffered_request, "upstream_connection").await;
+                return finish_proxy_unavailable(&buffered_request, "upstream_connection").await;
             }
             Err(ProxySendError::NonRetryableTransport) => {
                 return finish_proxy_failure(&buffered_request, "upstream_transport").await;
@@ -732,6 +845,27 @@ async fn finish_proxy_failure(
         Some(error_code.to_owned()),
     )
     .await
+}
+
+async fn finish_proxy_unavailable(
+    request: &BufferedRequest<'_>,
+    error_code: &str,
+) -> Result<Response, AppError> {
+    let mut response = finish_buffered_request(
+        request,
+        StatusCode::SERVICE_UNAVAILABLE,
+        Bytes::from_static(
+            b"{\"error\":{\"message\":\"no healthy upstream is currently available\",\"type\":\"upstream_error\"}}",
+        ),
+        "application/json",
+        TokenUsage::default(),
+        Some(error_code.to_owned()),
+    )
+    .await?;
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    Ok(response)
 }
 
 async fn finish_buffered_request(

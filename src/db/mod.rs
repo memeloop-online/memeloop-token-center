@@ -149,6 +149,7 @@ pub use routing::{
     CreateRoutedModelRouteInput, CredentialRoutingView, ReplaceCredentialRoutingInput,
     ReplaceRouteRoutingInput, RouteRoutingView, RouteSelectionOptions, UpdateRoutedModelRouteInput,
 };
+pub(crate) use routing::{UpstreamAttemptAdmission, UpstreamFailureKind};
 pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
 
 #[derive(Clone)]

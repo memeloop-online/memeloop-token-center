@@ -35,6 +35,7 @@ pub struct Metrics {
 struct MetricsInner {
     http: Mutex<BTreeMap<HttpLabels, RequestSeries>>,
     upstream: Mutex<BTreeMap<UpstreamLabels, RequestSeries>>,
+    upstream_health: Mutex<BTreeMap<UpstreamHealthLabels, u64>>,
     active_http_requests: AtomicI64,
     active_streams: [AtomicI64; ActiveStreamKind::COUNT],
     active_upstreams: Mutex<BTreeMap<UpstreamActivityLabels, i64>>,
@@ -53,6 +54,7 @@ impl Default for MetricsInner {
         Self {
             http: Mutex::default(),
             upstream: Mutex::default(),
+            upstream_health: Mutex::default(),
             active_http_requests: AtomicI64::new(0),
             active_streams: std::array::from_fn(|_| AtomicI64::new(0)),
             active_upstreams: Mutex::default(),
@@ -93,6 +95,54 @@ struct UpstreamLabels {
 struct UpstreamActivityLabels {
     provider: &'static str,
     operation: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct UpstreamHealthLabels {
+    event: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpstreamHealthEvent {
+    Failure,
+    Skipped,
+    Failover,
+    Recovered,
+}
+
+impl UpstreamHealthEvent {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Failure => "failure",
+            Self::Skipped => "skipped",
+            Self::Failover => "failover",
+            Self::Recovered => "recovered",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpstreamHealthReason {
+    RateLimited,
+    Unavailable,
+    InvalidResponse,
+    Connection,
+    Cooldown,
+    Success,
+}
+
+impl UpstreamHealthReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate_limited",
+            Self::Unavailable => "unavailable",
+            Self::InvalidResponse => "invalid_response",
+            Self::Connection => "connection",
+            Self::Cooldown => "cooldown",
+            Self::Success => "success",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,6 +381,25 @@ impl Metrics {
         );
     }
 
+    pub fn observe_upstream_health(
+        &self,
+        event: UpstreamHealthEvent,
+        reason: UpstreamHealthReason,
+    ) {
+        let mut values = self
+            .inner
+            .upstream_health
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let value = values
+            .entry(UpstreamHealthLabels {
+                event: event.label(),
+                reason: reason.label(),
+            })
+            .or_default();
+        *value = value.saturating_add(1);
+    }
+
     pub fn set_dependency_ready(&self, dependency: &'static str, ready: bool) {
         let value = i64::from(ready);
         match dependency {
@@ -391,6 +460,12 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let upstream_health = self
+            .inner
+            .upstream_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut output = String::with_capacity(16 * 1024);
 
         output
@@ -419,12 +494,26 @@ impl Metrics {
 
         render_http(&mut output, &http);
         render_upstream(&mut output, &upstream);
+        render_upstream_health(&mut output, &upstream_health);
         render_active(&mut output, &self.inner);
         render_background_projections(&mut output, &self.inner);
         render_runtime(&mut output, runtime);
         render_process(&mut output, &self.inner);
         render_allocator(&mut output);
         output
+    }
+}
+
+fn render_upstream_health(output: &mut String, values: &BTreeMap<UpstreamHealthLabels, u64>) {
+    output.push_str("# HELP memeloop_token_center_upstream_candidate_health_events_total Account candidate circuit-breaker events with fixed low-cardinality labels.\n");
+    output
+        .push_str("# TYPE memeloop_token_center_upstream_candidate_health_events_total counter\n");
+    for (labels, value) in values {
+        let _ = writeln!(
+            output,
+            "memeloop_token_center_upstream_candidate_health_events_total{{event=\"{}\",reason=\"{}\"}} {value}",
+            labels.event, labels.reason
+        );
     }
 }
 
@@ -1008,6 +1097,26 @@ mod tests {
         ));
         assert!(rendered.contains(
             "memeloop_token_center_background_projections_total{queue=\"conversation\",outcome=\"failed\"} 1"
+        ));
+    }
+
+    #[test]
+    fn upstream_health_labels_are_fixed() {
+        let metrics = Metrics::default();
+        metrics.observe_upstream_health(
+            UpstreamHealthEvent::Failure,
+            UpstreamHealthReason::InvalidResponse,
+        );
+        metrics.observe_upstream_health(
+            UpstreamHealthEvent::Failover,
+            UpstreamHealthReason::InvalidResponse,
+        );
+        let rendered = metrics.render(&RuntimeMetrics::default());
+        assert!(rendered.contains(
+            "memeloop_token_center_upstream_candidate_health_events_total{event=\"failure\",reason=\"invalid_response\"} 1"
+        ));
+        assert!(rendered.contains(
+            "memeloop_token_center_upstream_candidate_health_events_total{event=\"failover\",reason=\"invalid_response\"} 1"
         ));
     }
 

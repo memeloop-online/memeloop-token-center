@@ -218,5 +218,8 @@ pub(super) async fn send_proxy_route(
 }
 
 pub(super) fn retryable_upstream_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
+    matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+    )
 }
