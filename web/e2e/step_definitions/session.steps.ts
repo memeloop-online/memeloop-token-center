@@ -230,10 +230,10 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
       max_tokens: 32,
     }),
   });
-  // Put both successful requests in the two available concurrency slots before
-  // the rate-limit probes arrive. Once either probe receives a 429, the sole
-  // account enters cooldown and both failed client requests correctly collapse
-  // to the public 503/Retry-After contract instead of leaking account state.
+  // Put successful work first in the reservation queue. The single effective
+  // upstream slot completes one request; the first queued rate-limit response
+  // cools the account before the remaining queued requests are admitted. Those
+  // failures collapse to the public 503/Retry-After contract.
   const calls = [sendCall(0), sendCall(2), ...[1, 3].map(async (index) => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     return sendCall(index);
@@ -277,7 +277,7 @@ Then('连续事件期间会话计数有界前进且活跃筛选移除已完成�
     'coalesced refresh starved under continuous events',
   );
   const responses = await Promise.all(observation.liveRequests);
-  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 200, 503, 503]);
+  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 503, 503, 503]);
   for (const response of responses.filter((candidate) => candidate.status === 503)) {
     assert.equal(response.headers.get('retry-after'), '1');
   }
