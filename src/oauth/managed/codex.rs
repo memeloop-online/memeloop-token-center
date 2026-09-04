@@ -741,7 +741,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "invalid request: CPA Codex document is invalid"
+            "invalid request: CPA Codex OAuth document is invalid"
         );
     }
 
