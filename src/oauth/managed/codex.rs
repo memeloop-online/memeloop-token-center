@@ -240,7 +240,11 @@ fn normalize_private_proxy_url(value: &str) -> Result<String, AppError> {
         return Err(invalid_document());
     }
     let host = parsed.host_str().ok_or_else(invalid_document)?;
-    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(address) = unbracketed.parse::<std::net::IpAddr>() {
         if !network::is_safe_private_upstream_ip(address) {
             return Err(invalid_document());
         }

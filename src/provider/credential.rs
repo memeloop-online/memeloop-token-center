@@ -9,7 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
-use crate::network::{OutboundScope, is_safe_private_upstream_ip};
+use crate::network::{OutboundScope, has_safe_private_ip_literal_host};
 
 const CURRENT_ENVELOPE_VERSION: &str = "v2";
 pub(super) const LEGACY_ENVELOPE_VERSION: &str = "v1";
@@ -331,18 +331,7 @@ fn validate_proxy_url(value: &str) -> Result<(), AppError> {
     {
         return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
     }
-    if parsed.scheme() == "socks5h"
-        && !matches!(
-            parsed.host(),
-            Some(url::Host::Ipv4(address))
-                if is_safe_private_upstream_ip(std::net::IpAddr::V4(address))
-        )
-        && !matches!(
-            parsed.host(),
-            Some(url::Host::Ipv6(address))
-                if is_safe_private_upstream_ip(std::net::IpAddr::V6(address))
-        )
-    {
+    if parsed.scheme() == "socks5h" && !has_safe_private_ip_literal_host(&parsed) {
         return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
     }
     Ok(())

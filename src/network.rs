@@ -189,16 +189,7 @@ pub async fn client_for_config_url(
 
     let proxy = checked_proxy_url(proxy_url)?;
     let proxy_resolves_target = proxy.scheme() == "socks5h";
-    if proxy_resolves_target
-        && !matches!(
-            proxy.host(),
-            Some(Host::Ipv4(address)) if is_safe_private_upstream_ip(IpAddr::V4(address))
-        )
-        && !matches!(
-            proxy.host(),
-            Some(Host::Ipv6(address)) if is_safe_private_upstream_ip(IpAddr::V6(address))
-        )
-    {
+    if proxy_resolves_target && !has_safe_private_ip_literal_host(&proxy) {
         return Err(AppError::BadRequest(
             "remote-DNS SOCKS5 proxies must use an explicitly private IP endpoint".into(),
         ));
@@ -368,6 +359,19 @@ pub(crate) fn is_safe_private_upstream_ip(address: IpAddr) -> bool {
             address.to_ipv4_mapped().is_none() && (address.segments()[0] & 0xfe00) == 0xfc00
         }
     }
+}
+
+pub(crate) fn has_safe_private_ip_literal_host(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    unbracketed
+        .parse::<IpAddr>()
+        .is_ok_and(is_safe_private_upstream_ip)
 }
 
 fn is_forbidden_outbound_ip(address: IpAddr) -> bool {
