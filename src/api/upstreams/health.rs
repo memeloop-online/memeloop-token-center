@@ -3,6 +3,9 @@ use super::super::*;
 fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     match driver {
+        "openai-codex" => {
+            format!("{base}/models?client_version={}", env!("CARGO_PKG_VERSION"))
+        }
         "http-json" => {
             if base.ends_with("/v1") {
                 format!("{base}/models")
@@ -86,6 +89,26 @@ pub(in crate::api) async fn probe_upstream_health(
         .get(probe_url)
         .header(header::ACCEPT, "application/json")
         .timeout(Duration::from_secs(5));
+    let request = if account.driver == "openai-codex" {
+        let account_id = match crate::oauth::managed::codex::account_header_value(&credential) {
+            Ok(account_id) => account_id,
+            Err(_) => {
+                return Ok(Json(json!({
+                    "account_id": account_id,
+                    "status": "unhealthy",
+                    "error_code": "credential_invalid",
+                    "checked_at": unix_millis()
+                })));
+            }
+        };
+        request
+            .header(header::USER_AGENT, crate::api::codex_transport::USER_AGENT)
+            .header(header::CONNECTION, "Keep-Alive")
+            .header("originator", "codex-tui")
+            .header("chatgpt-account-id", account_id)
+    } else {
+        request
+    };
     let request = match credential.apply(request, unix_millis()) {
         Ok(request) => request,
         Err(_) => {
@@ -127,5 +150,28 @@ pub(in crate::api) async fn probe_upstream_health(
             "latency_ms": latency_ms,
             "checked_at": checked_at
         }))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::upstream_health_probe_url;
+
+    #[test]
+    fn codex_health_uses_the_authenticated_model_catalog_endpoint() {
+        let url = upstream_health_probe_url(
+            "openai-codex",
+            &json!({}),
+            "https://chatgpt.com/backend-api/codex/",
+        );
+        assert_eq!(
+            url,
+            format!(
+                "https://chatgpt.com/backend-api/codex/models?client_version={}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
     }
 }

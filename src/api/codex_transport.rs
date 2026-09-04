@@ -21,7 +21,7 @@ pub(super) const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub(super) const RESPONSES_PATH: &str = "/responses";
 // Keep a fixed, audited Codex-compatible identity. It must not be supplied by
 // downstream callers or vary with arbitrary account configuration.
-const USER_AGENT: &str =
+pub(super) const USER_AGENT: &str =
     "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)";
 const MAX_OUTPUT_ITEMS: usize = 16_384;
 const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
@@ -121,7 +121,15 @@ pub(super) fn prepare_request(
     object.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
     object.insert("stream".to_owned(), Value::Bool(true));
     object.insert("store".to_owned(), Value::Bool(false));
-    object.insert("parallel_tool_calls".to_owned(), Value::Bool(true));
+    if object
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        object.insert("parallel_tool_calls".to_owned(), Value::Bool(true));
+    } else {
+        object.remove("parallel_tool_calls");
+    }
     match object.get("instructions") {
         None | Some(Value::Null) => {
             object.insert("instructions".to_owned(), Value::String(String::new()));
@@ -298,9 +306,10 @@ pub(super) fn apply_wire_headers(
     Ok(request
         .header(header::ACCEPT, "text/event-stream")
         .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONNECTION, "Keep-Alive")
         .header("originator", "codex-tui")
         .header(header::USER_AGENT, USER_AGENT)
-        .header("session_id", request_id.to_string())
+        .header("session-id", request_id.to_string())
         .header("chatgpt-account-id", account_id))
 }
 
@@ -765,7 +774,7 @@ mod tests {
         assert_eq!(plan.output_token_ceiling, 65_536);
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
-        assert_eq!(body["parallel_tool_calls"], true);
+        assert!(body.get("parallel_tool_calls").is_none());
         assert_eq!(body["instructions"], "");
         assert!(body.get("temperature").is_none());
         assert_eq!(body["input"][0]["role"], "user");
@@ -773,6 +782,15 @@ mod tests {
         assert_eq!(body["nested"]["role"], "developer");
         assert_eq!(body["nested"]["children"][0]["role"], "developer");
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+
+        let mut with_tools = json!({
+            "model": "public",
+            "input": [],
+            "tools": [{"type": "function", "name": "lookup"}],
+            "parallel_tool_calls": false
+        });
+        prepare_request(&mut with_tools, "gpt-codex", &config("gpt-codex", 65_536)).unwrap();
+        assert_eq!(with_tools["parallel_tool_calls"], true);
 
         let once = body.clone();
         let second = prepare_request(&mut body, "gpt-codex", &config("gpt-codex", 65_536)).unwrap();
@@ -944,9 +962,10 @@ mod tests {
         );
         assert_eq!(request.headers()[header::ACCEPT], "text/event-stream");
         assert_eq!(request.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(request.headers()[header::CONNECTION], "Keep-Alive");
         assert_eq!(request.headers()[header::USER_AGENT], USER_AGENT);
         assert_eq!(request.headers()["originator"], "codex-tui");
-        assert_eq!(request.headers()["session_id"], request_id.to_string());
+        assert_eq!(request.headers()["session-id"], request_id.to_string());
         assert_eq!(request.headers()["chatgpt-account-id"], "account-123");
         assert_eq!(
             request.headers()[header::AUTHORIZATION],
