@@ -421,18 +421,18 @@ impl Database {
         key_material: &[u8],
     ) -> Result<Option<ResolvedUpstream>, AppError> {
         let sql = if upstream_account_id.is_some() {
-            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND a.id = $4 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $5) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND a.id = $4 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
         } else {
-            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $4) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
         };
         let query = sqlx::query(sql)
             .bind(tenant_id.to_string())
             .bind(public_model)
             .bind(protocol);
         let query = if let Some(account_id) = upstream_account_id {
-            query.bind(account_id.to_string())
+            query.bind(account_id.to_string()).bind(unix_millis())
         } else {
-            query
+            query.bind(unix_millis())
         };
         let row = query.fetch_optional(&self.pool).await?;
         let Some(row) = row else {
@@ -636,6 +636,66 @@ mod tests {
                 .await
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn expired_only_credential_cannot_activate_a_route() {
+        let (_directory, database, _upstream_account_id) = sqlite_database().await;
+        let expired = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: TENANT.to_owned(),
+                    name: "expired-oauth-upstream".to_owned(),
+                    driver: "http-json".to_owned(),
+                    config: serde_json::json!({"base_url": "http://127.0.0.1:2"}),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "expired-access-token".to_owned(),
+                        refresh_token: None,
+                        expires_at: Some(unix_millis()),
+                        header: "authorization".to_owned(),
+                        prefix: "Bearer ".to_owned(),
+                        adapter_state: None,
+                        proxy_url: None,
+                        proxy_network_scope: None,
+                    },
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                PEPPER,
+            )
+            .await
+            .expect("create expired OAuth account");
+        let route = database
+            .create_model_route(CreateModelRouteInput {
+                tenant_external_id: TENANT.to_owned(),
+                public_model: "expired-only-public".to_owned(),
+                upstream_account_id: expired.id,
+                upstream_model: "expired-only-upstream".to_owned(),
+                protocol: "openai".to_owned(),
+                priority: 0,
+            })
+            .await
+            .expect("create route fixture");
+        let disabled = database
+            .set_model_route_enabled(route.id, TENANT, false, route.updated_at)
+            .await
+            .expect("disable route fixture");
+        assert!(matches!(
+            database
+                .set_model_route_enabled(route.id, TENANT, true, disabled.updated_at)
+                .await,
+            Err(AppError::BadRequest(_))
+        ));
+        let persisted = database
+            .list_model_routes(Some(TENANT))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == route.id)
+            .unwrap();
+        assert!(!persisted.enabled);
+        assert_eq!(persisted.updated_at, disabled.updated_at);
     }
 
     #[tokio::test]

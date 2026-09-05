@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, any::AnyRow};
 use uuid::Uuid;
 
-use super::super::{AppError, Database, parse_uuid};
+use super::super::{AppError, Database, parse_uuid, unix_millis};
 use crate::provider::{ResolvedUpstream, open_credential, validate_config};
 
 use super::types::{GrantedModelCapabilitySource, RouteSelectionOptions};
@@ -23,7 +23,7 @@ impl Database {
              JOIN model_route_eligible_upstream_accounts candidate
                ON candidate.tenant_id = r.tenant_id AND candidate.model_route_id = r.id
              JOIN upstream_accounts a ON a.tenant_id = r.tenant_id AND a.id = candidate.upstream_account_id AND a.status = 'active'
-             JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL
+             JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $4)
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = 'generation'
                AND candidate.upstream_account_id = $3
              ORDER BY r.priority, r.id LIMIT 1",
@@ -31,6 +31,7 @@ impl Database {
         .bind(tenant_id.to_string())
         .bind(public_model)
         .bind(upstream_account_id.to_string())
+        .bind(unix_millis())
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else {
@@ -100,7 +101,7 @@ impl Database {
              JOIN model_route_eligible_upstream_accounts candidates
                ON candidates.tenant_id = r.tenant_id AND candidates.model_route_id = r.id
              JOIN upstream_accounts a ON a.id = candidates.upstream_account_id AND a.tenant_id = r.tenant_id
-             JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL
+             JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $6)
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
                AND r.enabled = 1 AND a.status = 'active'
                AND ($4 = '' OR a.id = $4)
@@ -126,6 +127,7 @@ impl Database {
                 .unwrap_or_default(),
         )
         .bind(key_id.to_string())
+        .bind(unix_millis())
         .fetch_all(&self.pool)
         .await?;
         if rows.len() > 1000 {
@@ -155,9 +157,10 @@ impl Database {
                 .then_with(|| left.route_id.cmp(&right.route_id))
                 .then_with(|| left.account_id.cmp(&right.account_id))
         });
-        candidates
-            .into_iter()
-            .map(|candidate| {
+        let mut resolved = Vec::with_capacity(candidates.len());
+        let mut first_unusable = None;
+        for candidate in candidates {
+            let prepared: Result<ResolvedUpstream, AppError> = (|| {
                 let config: serde_json::Value =
                     serde_json::from_str(&candidate.config_json).map_err(|_| AppError::Internal)?;
                 let base_url = validate_config(&config)?;
@@ -170,8 +173,20 @@ impl Database {
                     upstream_model: candidate.upstream_model,
                     credential: open_credential(&candidate.credential_ciphertext, key_material)?,
                 })
-            })
-            .collect()
+            })();
+            match prepared {
+                Ok(candidate) => resolved.push(candidate),
+                Err(error) => {
+                    first_unusable.get_or_insert(error);
+                }
+            }
+        }
+        if resolved.is_empty()
+            && let Some(error) = first_unusable
+        {
+            return Err(error);
+        }
+        Ok(resolved)
     }
 
     pub async fn granted_available_models(
@@ -196,12 +211,14 @@ impl Database {
                AND EXISTS (
                  SELECT 1 FROM model_route_eligible_upstream_accounts candidate
                  JOIN upstream_accounts account ON account.id = candidate.upstream_account_id AND account.tenant_id = r.tenant_id AND account.status = 'active'
+                 JOIN upstream_credentials credential ON credential.upstream_account_id = account.id AND credential.generation = account.credential_generation AND credential.revoked_at IS NULL AND (credential.expires_at IS NULL OR credential.expires_at > $3)
                  WHERE candidate.tenant_id = r.tenant_id AND candidate.model_route_id = r.id
                )
              ORDER BY model",
         )
         .bind(tenant_id.to_string())
         .bind(key_id.to_string())
+        .bind(unix_millis())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -228,6 +245,7 @@ impl Database {
                ON credential.upstream_account_id = account.id
               AND credential.generation = account.credential_generation
               AND credential.revoked_at IS NULL
+              AND (credential.expires_at IS NULL OR credential.expires_at > $3)
              WHERE r.tenant_id = $1 AND r.enabled = 1
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $2 AND g.model_route_id = r.id)
@@ -244,6 +262,7 @@ impl Database {
         )
         .bind(tenant_id.to_string())
         .bind(key_id.to_string())
+        .bind(unix_millis())
         .fetch_all(&self.pool)
         .await?;
         if rows.len() > 1000 {
@@ -288,6 +307,7 @@ impl Database {
                AND EXISTS (
                  SELECT 1 FROM model_route_eligible_upstream_accounts candidate
                  JOIN upstream_accounts account ON account.id = candidate.upstream_account_id AND account.tenant_id = r.tenant_id AND account.status = 'active'
+                 JOIN upstream_credentials credential ON credential.upstream_account_id = account.id AND credential.generation = account.credential_generation AND credential.revoked_at IS NULL AND (credential.expires_at IS NULL OR credential.expires_at > $5)
                  WHERE candidate.tenant_id = r.tenant_id AND candidate.model_route_id = r.id
                )
              LIMIT 1",
@@ -296,6 +316,7 @@ impl Database {
         .bind(public_model)
         .bind(protocol)
         .bind(key_id.to_string())
+        .bind(unix_millis())
         .fetch_optional(&self.pool)
         .await?;
         Ok(found.is_some())

@@ -334,11 +334,12 @@ pub(super) async fn ensure_route_has_eligible_candidate(
     let candidate = sqlx::query(
         "SELECT 1 FROM model_route_eligible_upstream_accounts eligible
          JOIN upstream_accounts account ON account.tenant_id = eligible.tenant_id AND account.id = eligible.upstream_account_id AND account.status = 'active'
-         JOIN upstream_credentials credential ON credential.upstream_account_id = account.id AND credential.generation = account.credential_generation AND credential.revoked_at IS NULL
+         JOIN upstream_credentials credential ON credential.upstream_account_id = account.id AND credential.generation = account.credential_generation AND credential.revoked_at IS NULL AND (credential.expires_at IS NULL OR credential.expires_at > $3)
          WHERE eligible.tenant_id = $1 AND eligible.model_route_id = $2 LIMIT 1",
     )
     .bind(tenant_id)
     .bind(route_id.to_string())
+    .bind(unix_millis())
     .fetch_optional(&mut **tx)
     .await?;
     if candidate.is_none() {

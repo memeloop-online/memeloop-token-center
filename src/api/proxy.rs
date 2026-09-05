@@ -21,9 +21,9 @@ use lifecycle::{
     run_bounded_proxy_lifecycle, run_bounded_text_archive,
 };
 use routing::{
-    CodexRetryTerminal, CodexRetryTerminalGuard, MAX_UPSTREAM_ATTEMPTS, ProxySendError,
-    UpstreamAttemptGuard, UpstreamAttemptTerminal, prepare_proxy_route, retryable_upstream_status,
-    send_proxy_route,
+    CodexRetryTerminal, CodexRetryTerminalGuard, MAX_UPSTREAM_ATTEMPTS, PreparedProxyRoute,
+    ProxySendError, UpstreamAttemptGuard, UpstreamAttemptTerminal, prepare_proxy_route,
+    retryable_upstream_status, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -57,6 +57,84 @@ fn requires_strict_openai_chat_usage(
             .pointer("/stream_options/include_usage")
             .and_then(Value::as_bool)
             == Some(true)
+}
+
+async fn prepare_authorized_proxy_routes(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    model: &str,
+    protocol: Protocol,
+    request_id: Uuid,
+    request_json: &Value,
+    resolved_routes: Vec<ResolvedUpstream>,
+) -> Result<Vec<PreparedProxyRoute>, AppError> {
+    let strict_choice_count_is_incompatible =
+        validate_openai_chat_choice_count(request_json).is_err();
+    let mut skipped_incompatible_strict_route = false;
+    let mut first_prepare_error = None;
+    let mut prepared_routes = Vec::new();
+    for route in resolved_routes {
+        if strict_choice_count_is_incompatible
+            && requires_strict_openai_chat_usage(
+                protocol,
+                &route.driver,
+                &route.config,
+                request_json,
+            )
+        {
+            skipped_incompatible_strict_route = true;
+            continue;
+        }
+        if prepared_routes.len() == MAX_UPSTREAM_ATTEMPTS {
+            break;
+        }
+        let is_component = state
+            .providers
+            .get(&route.driver)
+            .and_then(|provider| provider.component_adapter.as_ref())
+            .is_some();
+        if !prepared_routes.is_empty() && is_component {
+            // Plugin prepare may perform HTTP/KV side effects and component
+            // requests may use arbitrary methods. A standby component route
+            // must be rejected before its prepare hook sees the request.
+            continue;
+        }
+        let route_id = route.route_id;
+        let account_id = route.account_id;
+        match prepare_proxy_route(state, key, model, protocol, request_id, request_json, route)
+            .await
+        {
+            Ok(prepared) => {
+                let prepared_is_component = prepared.is_component(state);
+                prepared_routes.push(prepared);
+                if prepared_is_component {
+                    break;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %request_id,
+                    %route_id,
+                    upstream_account_id = %account_id,
+                    stage = "candidate_prepare",
+                    "authorized proxy candidate is unusable"
+                );
+                first_prepare_error.get_or_insert(error);
+            }
+        }
+    }
+    if prepared_routes.is_empty() {
+        if let Some(error) = first_prepare_error {
+            return Err(error);
+        }
+        // Normalized grants are the sole downstream authorization source. A
+        // missing route must never fall back to unscoped process secrets.
+        if skipped_incompatible_strict_route {
+            validate_openai_chat_choice_count(request_json)?;
+        }
+        return Err(AppError::Forbidden);
+    }
+    Ok(prepared_routes)
 }
 
 pub(super) async fn proxy(
@@ -102,88 +180,16 @@ pub(super) async fn proxy(
             state.config.key_pepper.as_bytes(),
         )
         .await?;
-    let strict_choice_count_is_incompatible =
-        validate_openai_chat_choice_count(&request_json).is_err();
-    let mut resolved_routes = resolved_routes.into_iter();
-    let mut skipped_incompatible_strict_route = false;
-    let primary_route = loop {
-        let Some(route) = resolved_routes.next() else {
-            // Normalized grants are the sole downstream authorization source.
-            // A missing route must never fall back to process-wide legacy secrets.
-            if skipped_incompatible_strict_route {
-                validate_openai_chat_choice_count(&request_json)?;
-            }
-            return Err(AppError::Forbidden);
-        };
-        if strict_choice_count_is_incompatible
-            && requires_strict_openai_chat_usage(
-                protocol,
-                &route.driver,
-                &route.config,
-                &request_json,
-            )
-        {
-            skipped_incompatible_strict_route = true;
-            continue;
-        }
-        break route;
-    };
-    let primary = prepare_proxy_route(
+    let prepared_routes = prepare_authorized_proxy_routes(
         &state,
         &key,
         &model,
         protocol,
         request_id,
         &request_json,
-        primary_route,
+        resolved_routes,
     )
     .await?;
-    let primary_is_component = primary.is_component(&state);
-    let mut prepared_routes = vec![primary];
-    if !primary_is_component {
-        for route in resolved_routes {
-            if strict_choice_count_is_incompatible
-                && requires_strict_openai_chat_usage(
-                    protocol,
-                    &route.driver,
-                    &route.config,
-                    &request_json,
-                )
-            {
-                continue;
-            }
-            if prepared_routes.len() == MAX_UPSTREAM_ATTEMPTS {
-                break;
-            }
-            if state
-                .providers
-                .get(&route.driver)
-                .and_then(|provider| provider.component_adapter.as_ref())
-                .is_some()
-            {
-                // Plugin prepare may perform HTTP/KV side effects and component
-                // requests may use arbitrary methods. A standby component route
-                // must be rejected before its prepare hook sees the request.
-                continue;
-            }
-            match prepare_proxy_route(
-                &state,
-                &key,
-                &model,
-                protocol,
-                request_id,
-                &request_json,
-                route,
-            )
-            .await
-            {
-                Ok(prepared) => prepared_routes.push(prepared),
-                Err(error) => {
-                    tracing::warn!(%request_id, error = %error, stage = "candidate_prepare", "proxy failover candidate is unusable");
-                }
-            }
-        }
-    }
     let primary = prepared_routes.first().ok_or(AppError::Internal)?;
     let upstream_account_id = Some(primary.route.account_id);
     let model_route_id = Some(primary.route.route_id);
