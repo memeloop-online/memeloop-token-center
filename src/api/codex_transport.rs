@@ -616,8 +616,7 @@ pub(super) enum BadRequestDisposition {
 /// ordinary 400. This prevents an upstream error body from reaching logs,
 /// archives, or the downstream client.
 pub(super) async fn classify_bad_request(response: UpstreamResponse) -> BadRequestDisposition {
-    if response.status() != http::StatusCode::BAD_REQUEST
-    {
+    if response.status() != http::StatusCode::BAD_REQUEST {
         return BadRequestDisposition::Ordinary(CodexBadRequestClassification::Ordinary);
     }
     if !has_single_json_content_type(&response) {

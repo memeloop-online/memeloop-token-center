@@ -864,6 +864,21 @@ async fn codex_transient_400_fails_over_before_downstream_delivery() {
 #[tokio::test]
 async fn codex_definite_ordinary_400_retries_the_same_account_once_with_a_large_body() {
     let fixture = codex_route_fixture("definite-400-same-account-retry").await;
+    // This fixture intentionally sends about 1 MiB of JSON. Raise this test
+    // credential's TPM only so pre-admission does not reject it before the
+    // upstream 400/retry behavior under test; production defaults stay fixed.
+    fixture
+        .state
+        .db
+        .update_key_policy(
+            fixture.key_id,
+            KeyPolicy {
+                tokens_per_minute: 2_000_000,
+                ..KeyPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
     fixture
         .state
         .db
@@ -953,9 +968,11 @@ async fn codex_definite_ordinary_400_retries_the_same_account_once_with_a_large_
     assert!(rendered_metrics.contains(
         "memeloop_token_center_codex_bad_request_classifications_total{classification=\"ordinary\"} 1"
     ));
-    assert!(rendered_metrics.contains(
-        "memeloop_token_center_codex_bad_request_retries_total{outcome=\"started\"} 1"
-    ));
+    assert!(
+        rendered_metrics.contains(
+            "memeloop_token_center_codex_bad_request_retries_total{outcome=\"started\"} 1"
+        )
+    );
     assert!(rendered_metrics.contains(
         "memeloop_token_center_codex_bad_request_retries_total{outcome=\"succeeded\"} 1"
     ));
@@ -973,20 +990,18 @@ async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or
         .and(path(codex_transport::RESPONSES_PATH))
         .and(header_matcher("chatgpt-account-id", "account-123"))
         .respond_with(move |_| {
-            let error = if attempts_for_response
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                == 0
-            {
-                json!({
-                    "type": "temporarily_unavailable",
-                    "message": "private transient rejection"
-                })
-            } else {
-                json!({
-                    "type": "invalid_request_error",
-                    "message": "private ordinary rejection"
-                })
-            };
+            let error =
+                if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    json!({
+                        "type": "temporarily_unavailable",
+                        "message": "private transient rejection"
+                    })
+                } else {
+                    json!({
+                        "type": "invalid_request_error",
+                        "message": "private ordinary rejection"
+                    })
+                };
             ResponseTemplate::new(400).set_body_json(json!({"error": error}))
         })
         .expect(2)
@@ -1058,6 +1073,12 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
     use tokio::io::AsyncReadExt as _;
 
     let fixture = codex_route_fixture("native-ambiguous-transport").await;
+    let standby = add_codex_standby_route(
+        &fixture,
+        "codex-route-native-ambiguous-transport",
+        "account-456",
+    )
+    .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let accepted = tokio::spawn(async move {
@@ -1100,6 +1121,18 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
     assert_eq!(rows[0].status_code, Some(502));
     assert_eq!(rows[0].error_code.as_deref(), Some("upstream_transport"));
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let selected_account: String = sqlx::query_scalar(
+        "SELECT upstream_account_id FROM request_records WHERE id = $1 AND key_id = $2",
+    )
+    .bind(rows[0].request_id.to_string())
+    .bind(fixture.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert_eq!(selected_account, fixture.upstream_account_id.to_string());
+    assert_ne!(selected_account, standby.to_string());
 }
 
 #[tokio::test]

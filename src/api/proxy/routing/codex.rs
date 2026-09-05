@@ -29,25 +29,18 @@ pub(super) async fn send_proxy_route(
     let can_retry_definite_bad_request = route.codex_store_disabled;
     let mut retried_definite_bad_request = false;
     loop {
-        let (response, upstream_activity) = match send_codex_attempt(
-            state,
-            headers,
-            &target_url,
-            route,
-            session_id,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                if retried_definite_bad_request {
-                    state
-                        .metrics
-                        .observe_codex_bad_request_retry(CodexBadRequestRetry::Exhausted);
+        let (response, upstream_activity) =
+            match send_codex_attempt(state, headers, &target_url, route, session_id).await {
+                Ok(response) => response,
+                Err(error) => {
+                    if retried_definite_bad_request {
+                        state
+                            .metrics
+                            .observe_codex_bad_request_retry(CodexBadRequestRetry::Exhausted);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         let response = UpstreamResponse::Codex(response);
         if response.status() == StatusCode::BAD_REQUEST {
             match codex_transport::classify_bad_request(response).await {

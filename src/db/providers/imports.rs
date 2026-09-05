@@ -797,10 +797,7 @@ mod native_codex_upgrade_tests {
         expected_proxy_url: &'static str,
     }
 
-    async fn assert_native_codex_upgrade_fixture(
-        database: &Database,
-        fixture: NativeCodexFixture,
-    ) {
+    async fn assert_native_codex_upgrade_fixture(database: &Database, fixture: NativeCodexFixture) {
         let key_material = b"native Codex upgrade key material longer than thirty-two bytes";
         let tenant = format!("native-upgrade-{}", fixture.label);
         let expires_at = unix_millis() + 3_600_000;
@@ -997,7 +994,11 @@ mod native_codex_upgrade_tests {
         .unwrap();
         assert_eq!(credential_history.len(), 5);
         for row in &credential_history[..4] {
-            assert!(row.try_get::<Option<i64>, _>("revoked_at").unwrap().is_some());
+            assert!(
+                row.try_get::<Option<i64>, _>("revoked_at")
+                    .unwrap()
+                    .is_some()
+            );
         }
         assert_eq!(
             credential_history[4]
@@ -1124,7 +1125,8 @@ mod native_codex_upgrade_tests {
     }
 
     #[tokio::test]
-    async fn native_upgrade_recovers_generation_five_old_and_native_envelopes_without_touching_history() {
+    async fn native_upgrade_recovers_generation_five_old_and_native_envelopes_without_touching_history()
+     {
         let directory = tempfile::tempdir().unwrap();
         for fixture in [
             NativeCodexFixture {
@@ -1159,7 +1161,10 @@ mod native_codex_upgrade_tests {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::connect(&format!(
             "sqlite://{}?mode=rwc",
-            directory.path().join("native-codex-upgrade-cas.db").display()
+            directory
+                .path()
+                .join("native-codex-upgrade-cas.db")
+                .display()
         ))
         .await
         .unwrap();

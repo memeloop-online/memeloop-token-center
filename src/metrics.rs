@@ -615,7 +615,8 @@ fn render_codex_bad_requests(
     retries: &BTreeMap<CodexBadRequestRetry, u64>,
 ) {
     output.push_str("# HELP memeloop_token_center_codex_bad_request_classifications_total Native Codex HTTP 400 classifications with fixed, body-free labels.\n");
-    output.push_str("# TYPE memeloop_token_center_codex_bad_request_classifications_total counter\n");
+    output
+        .push_str("# TYPE memeloop_token_center_codex_bad_request_classifications_total counter\n");
     for (classification, value) in classifications {
         let _ = writeln!(
             output,
@@ -1240,12 +1241,9 @@ mod tests {
     #[test]
     fn codex_bad_request_labels_are_fixed_and_body_free() {
         let metrics = Metrics::default();
-        metrics.observe_codex_bad_request_classification(
-            CodexBadRequestClassification::Retryable,
-        );
-        metrics.observe_codex_bad_request_classification(
-            CodexBadRequestClassification::InvalidJson,
-        );
+        metrics.observe_codex_bad_request_classification(CodexBadRequestClassification::Retryable);
+        metrics
+            .observe_codex_bad_request_classification(CodexBadRequestClassification::InvalidJson);
         metrics.observe_codex_bad_request_retry(CodexBadRequestRetry::Started);
         metrics.observe_codex_bad_request_retry(CodexBadRequestRetry::Succeeded);
         let rendered = metrics.render(&RuntimeMetrics::default());
