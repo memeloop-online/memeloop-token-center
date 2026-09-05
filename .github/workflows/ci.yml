@@ -104,13 +104,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: npm ci --no-audit
       - run: npm run typecheck
-      - run: npm run test:localization
       - run: npm run build
-      - name: Build the browser-test service before Cucumber.js starts it
-        run: cargo build --locked --manifest-path ../Cargo.toml --bin memeloop-token-center
       - name: Install the Chromium driver used by Cucumber.js steps
         timeout-minutes: 15
         run: npx playwright install --with-deps chromium
+      - name: Run browser-backed web contracts
+        run: MTC_REQUIRE_BROWSER=1 npm run test:localization
+      - name: Build the browser-test service before Cucumber.js starts it
+        run: cargo build --locked --manifest-path ../Cargo.toml --bin memeloop-token-center
       - run: npm run test:e2e
 
   rust:

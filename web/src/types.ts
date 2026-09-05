@@ -235,6 +235,18 @@ export interface KeyView {
   fingerprint?: string | null;
 }
 
+/** Public fields accepted by the managed-key keyset endpoint. */
+export interface KeyListCursor {
+  before_created_at: number;
+  before_id: string;
+}
+
+/** A browser page derived from the array response and its look-ahead row. */
+export interface KeyListPage {
+  values: KeyView[];
+  nextCursor?: KeyListCursor;
+}
+
 export interface ModelCatalogItem {
   id: string;
   object: 'model';

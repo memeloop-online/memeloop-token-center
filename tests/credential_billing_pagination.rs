@@ -258,6 +258,27 @@ async fn exercise_credential_and_ledger_acceptance(state: AppState, label: &str)
     assert_eq!(target_row["available_balance"], "7");
     assert_eq!(target_row["credential_generation"], 1);
 
+    // Exercise the actual HTTP/DB cursor contract with a tie that crosses the
+    // first-page boundary.  The secondary UUID must make the three stable
+    // identities disjoint across `limit=2` pages on both SQLite and Postgres.
+    let same_created_at = 1_700_000_000_000_i64;
+    let forced_time_pool = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    for key_id in [
+        Uuid::parse_str(prior["key_id"].as_str().unwrap()).unwrap(),
+        target_key_id,
+        Uuid::parse_str(other["key_id"].as_str().unwrap()).unwrap(),
+    ] {
+        sqlx::query("UPDATE key_records SET created_at = $1 WHERE id = $2")
+            .bind(same_created_at)
+            .bind(key_id.to_string())
+            .execute(&forced_time_pool)
+            .await
+            .unwrap();
+    }
+    forced_time_pool.close().await;
+
     let mut changed_body = target_body.clone();
     changed_body["alias"] = Value::String("must not create another identity".into());
     let (status, _) = json_request(
@@ -311,16 +332,27 @@ async fn exercise_credential_and_ledger_acceptance(state: AppState, label: &str)
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let old_expected = HashSet::from([
+    let mut old_expected = vec![
         Uuid::parse_str(prior["key_id"].as_str().unwrap()).unwrap(),
         target_key_id,
         Uuid::parse_str(other["key_id"].as_str().unwrap()).unwrap(),
-    ]);
-    let all_old = ids(&first_page, "key_id")
-        .into_iter()
-        .chain(ids(&second_page, "key_id"))
-        .collect::<HashSet<_>>();
+    ];
+    // The endpoint's secondary keyset order is `id DESC`; assert each page's
+    // exact order and cardinality, not merely the set union.  An inclusive
+    // cursor could otherwise repeat the boundary row and still produce the
+    // same set of three identities.
+    old_expected.sort_by_key(|id| std::cmp::Reverse(id.to_string()));
+    let first_old = ids(&first_page, "key_id");
+    let second_old = ids(&second_page, "key_id");
+    assert_eq!(first_old, old_expected[..2]);
+    assert_eq!(second_old, old_expected[2..]);
+    let all_old = first_old
+        .iter()
+        .chain(second_old.iter())
+        .copied()
+        .collect::<Vec<_>>();
     assert_eq!(all_old, old_expected);
+    assert_eq!(all_old.iter().collect::<HashSet<_>>().len(), all_old.len());
     assert!(!all_old.contains(&inserted_after_cursor_id));
 
     let (status, _) = json_request(

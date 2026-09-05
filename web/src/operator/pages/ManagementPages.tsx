@@ -8,13 +8,19 @@ import { LimitSnapshot } from '../../LimitSnapshot';
 import { schemaFormFields, schemaFormTemplates } from '../../SchemaTemplates';
 import { safeValidator as validator } from '../../safeValidator';
 import type {
-  ConfigurationSchemas, CredentialRoutingView, GenerationPriceView, GroupView, KeyLimitSnapshot, KeyView,
+  ConfigurationSchemas, CredentialRoutingView, GenerationPriceView, GroupView, KeyLimitSnapshot, KeyListCursor, KeyView,
   ModelPriceSyncResult, ModelPriceUsageSummary, ModelPriceView, ModelRouteView, ProviderType,
   ServiceTokenView, UpstreamAccount, UpstreamHealth,
 } from '../../types';
 import { GroupManager, useGroups } from '../GroupManager';
 import { MultiCombobox, type ComboboxOption } from '../MultiCombobox';
 import { UpstreamModelCombobox } from '../UpstreamModelCombobox';
+import {
+  applyKeyPage, canLoadMoreKeys, canReadCredentialLimits, canWriteCredential, credentialStatuses,
+  credentialListPresentation, keyListPath, matchesCredentialSearch, matchesCredentialStatus,
+  ownsKeyListRequest, shouldLoadCredentialRoutes,
+  type KeyListLoadState, type KeyListRequestIdentity,
+} from '../keyPagination';
 import { directCredentialSchema, supportsDirectConnection } from '../providerConnectionMethods';
 import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
 import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
@@ -551,40 +557,131 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
   const [newRouteIds, setNewRouteIds] = useState<string[]>([]);
   const [newRouteGroupIds, setNewRouteGroupIds] = useState<string[]>([]);
   const [groupFilter, setGroupFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [search, setSearch] = useState('');
+  const [nextCursor, setNextCursor] = useState<KeyListCursor>();
+  const [keyListState, setKeyListState] = useState<KeyListLoadState>('idle');
+  const [keyError, setKeyError] = useState('');
+  const [routeError, setRouteError] = useState('');
   const [secret, setSecret] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const loadSequence = useRef(0);
+  const scopeGeneration = useRef(0);
+  const keyRequestGeneration = useRef(0);
+  const routeRequestGeneration = useRef(0);
+  const keyRequest = useRef<{ identity: KeyListRequestIdentity; controller: AbortController }>();
+  const routeRequest = useRef<{ generation: number; scopeGeneration: number; controller: AbortController }>();
   const scopeRef = useRef({ token, tenant });
   scopeRef.current = { token, tenant };
   const credentialGroups = useGroups('credential', token, tenant);
   const routeGroups = useGroups('route', token, tenant);
   const createFormSchema = createSchema;
   const policyFormSchema = policySchema;
-  const load = async () => {
-    const sequence = ++loadSequence.current;
-    const loadToken = token; const loadTenant = tenant;
-    if (!loadToken || !loadTenant) { setValues([]); setRoutes([]); return; }
+  const ownsKeyRequest = (request: { identity: KeyListRequestIdentity; controller: AbortController }) => ownsKeyListRequest(keyRequest.current?.identity, request.identity)
+    && scopeGeneration.current === request.identity.scopeGeneration
+    && scopeRef.current.token === token && scopeRef.current.tenant === tenant;
+  const startKeyRequest = (state: Extract<KeyListLoadState, 'initial-loading' | 'loading-more'>) => {
+    keyRequest.current?.controller.abort();
+    const request = {
+      identity: { generation: ++keyRequestGeneration.current, scopeGeneration: scopeGeneration.current },
+      controller: new AbortController(),
+    };
+    keyRequest.current = request;
+    setKeyListState(state);
+    return request;
+  };
+  const loadRoutes = async (loadToken: string, loadTenant: string, currentScopeGeneration: number) => {
+    routeRequest.current?.controller.abort();
+    routeRequest.current = undefined;
+    if (!shouldLoadCredentialRoutes(loadTenant)) { setRoutes([]); setRouteError(''); return; }
+    const request = {
+      generation: ++routeRequestGeneration.current,
+      scopeGeneration: currentScopeGeneration,
+      controller: new AbortController(),
+    };
+    routeRequest.current = request;
+    setRouteError('');
     try {
-      const [nextValues, nextRoutes] = await Promise.all([
-        api<KeyView[]>(`/internal/v1/keys${queryForTenant(loadTenant)}`, loadToken),
-        api<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant)}`, loadToken),
-      ]);
-      if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
-      setValues(nextValues); setRoutes(nextRoutes); setError('');
+      const nextRoutes = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant)}`, loadToken, { signal: request.controller.signal });
+      const active = routeRequest.current;
+      if (!active || active.generation !== request.generation || active.scopeGeneration !== request.scopeGeneration || scopeGeneration.current !== request.scopeGeneration || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
+      routeRequest.current = undefined;
+      setRoutes(nextRoutes); setRouteError('');
+    } catch (reason) {
+      const active = routeRequest.current;
+      if (request.controller.signal.aborted || !active || active.generation !== request.generation || active.scopeGeneration !== request.scopeGeneration || scopeGeneration.current !== request.scopeGeneration || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
+      routeRequest.current = undefined;
+      setRouteError(messageOf(reason, t('common.requestFailed')));
     }
-    catch (reason) { if (sequence === loadSequence.current && scopeRef.current.token === loadToken && scopeRef.current.tenant === loadTenant) setError(messageOf(reason, t('common.requestFailed'))); }
+  };
+  const load = async () => {
+    const loadToken = token; const loadTenant = tenant;
+    if (!loadToken) {
+      keyRequest.current?.controller.abort(); keyRequest.current = undefined;
+      routeRequest.current?.controller.abort(); routeRequest.current = undefined;
+      setValues([]); setRoutes([]); setNextCursor(undefined); setKeyListState('idle'); setKeyError(''); setRouteError('');
+      return;
+    }
+    const request = startKeyRequest('initial-loading');
+    setKeyError('');
+    void loadRoutes(loadToken, loadTenant, scopeGeneration.current);
+    try {
+      const keyRows = await apiRead<KeyView[]>(keyListPath(loadTenant), loadToken, { signal: request.controller.signal });
+      if (!ownsKeyRequest(request) || request.controller.signal.aborted) return;
+      const page = applyKeyPage([], keyRows);
+      keyRequest.current = undefined;
+      if (!page.ok) {
+        setNextCursor(undefined); setKeyListState('failed'); setKeyError(t('credentials.paginationStalled'));
+        return;
+      }
+      setValues(page.values); setNextCursor(page.nextCursor); setKeyListState(page.nextCursor ? 'more' : 'complete');
+    }
+    catch (reason) {
+      if (!ownsKeyRequest(request) || request.controller.signal.aborted) return;
+      keyRequest.current = undefined;
+      setKeyListState('failed'); setKeyError(messageOf(reason, t('common.requestFailed')));
+    }
   };
   useEffect(() => {
-    loadSequence.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
+    scopeGeneration.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
     setRenaming(undefined); setAliasDraft(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
-    setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSecret(''); setMessage(''); setError(''); void load();
+    setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setStatusFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(''); setMessage(''); setError(''); void load();
+    return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); };
   }, [token, tenant]);
+  const loadMore = async () => {
+    if (!canLoadMoreKeys(keyListState, Boolean(nextCursor), Boolean(keyRequest.current)) || !nextCursor || !token) return;
+    const loadToken = token; const loadTenant = tenant; const cursor = nextCursor;
+    const request = startKeyRequest('loading-more');
+    setKeyError('');
+    try {
+      const keyRows = await apiRead<KeyView[]>(keyListPath(loadTenant, cursor), loadToken, { signal: request.controller.signal });
+      if (!ownsKeyRequest(request) || request.controller.signal.aborted) return;
+      const page = applyKeyPage(values, keyRows, cursor);
+      keyRequest.current = undefined;
+      if (!page.ok) {
+        setNextCursor(undefined); setKeyListState('failed'); setKeyError(t('credentials.paginationStalled'));
+        return;
+      }
+      setValues(page.values); setNextCursor(page.nextCursor); setKeyListState(page.nextCursor ? 'more' : 'complete');
+    } catch (reason) {
+      if (!ownsKeyRequest(request) || request.controller.signal.aborted) return;
+      keyRequest.current = undefined;
+      setKeyListState('failed'); setKeyError(messageOf(reason, t('common.requestFailed')));
+    }
+  };
   const filteredValues = values.filter((value) => {
-    if (groupFilter === 'all') return true;
+    if (!matchesCredentialStatus(value, statusFilter)) return false;
+    if (!matchesCredentialSearch(value, search, locale)) return false;
+    if (groupFilter === 'all' || !tenant) return true;
     const memberships = credentialGroups.groups.filter((group) => group.member_ids.includes(value.key_id));
     return groupFilter === 'unassigned' ? memberships.length === 0 : memberships.some((group) => group.id === groupFilter);
   });
+  const filtersApplied = Boolean(search.trim()) || statusFilter !== 'all' || groupFilter !== 'all';
+  const loadingKeys = keyListState === 'initial-loading' || keyListState === 'loading-more';
+  const canLoadMore = canLoadMoreKeys(keyListState, Boolean(nextCursor), Boolean(keyRequest.current));
+  const listPresentation = credentialListPresentation(keyListState, filtersApplied);
+  const canReadLimits = canReadCredentialLimits(token);
+  const canWrite = canWriteCredential(tenant);
   const routeOptions = routes.map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }));
   const routeGroupOptions = routeGroups.groups.map((group) => ({ value: group.id, label: group.name, description: t('groups.memberCount', { count: formatNumber(group.member_count, locale) }) }));
   const openRouting = async (value: KeyView) => {
@@ -614,25 +711,26 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
   };
   return <><WriteScopeNotice tenant={tenant} />{secret && <OneTimeSecret value={secret} message={t('credentials.oneTimeSecret')} />}<section className="management-layout">
     <article className="panel"><div className="panel-title"><div><h2>{t('credentials.title')}</h2><p className="muted">{t('credentials.description')}</p></div><span>{formatNumber(filteredValues.length, locale)}</span></div>
-      <label className="credential-group-filter">{t('credentials.groupFilter')}<select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></label>
-      {error && <div className="notice error" role="alert">{error}</div>}{credentialGroups.error && <div className="notice error" role="alert">{credentialGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}
-      <div className="account-list">{filteredValues.length === 0 && <div className="empty">{values.length === 0 ? t('credentials.empty') : t('credentials.noGroupResults')}</div>}{filteredValues.map((value) => {
+      <div className="credential-list-controls"><label>{t('credentials.search')}<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label><label>{t('credentials.statusFilter')}<select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">{t('common.all')}</option>{credentialStatuses.map((status) => <option key={status} value={status}>{enumLabel(t, 'status', status)}</option>)}</select></label>{tenant && <label>{t('credentials.groupFilter')}<select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></label>}</div>
+      <p className="credential-list-summary" role="status">{listPresentation === 'loading' ? t('credentials.loadingList') : listPresentation === 'loading-more' ? t('credentials.loadingMore', { count: formatNumber(values.length, locale) }) : listPresentation === 'failed' ? t('credentials.loadFailed', { count: formatNumber(values.length, locale) }) : listPresentation === 'filtered' ? t('credentials.filteredLoaded', { shown: formatNumber(filteredValues.length, locale), loaded: formatNumber(values.length, locale) }) : listPresentation === 'more' ? t('credentials.loadedMore', { count: formatNumber(values.length, locale) }) : t('credentials.loadedComplete', { count: formatNumber(values.length, locale) })}</p>
+      {keyError && <div className="notice error" role="alert">{keyError}</div>}{routeError && <div className="notice error" role="alert">{routeError}</div>}{error && <div className="notice error" role="alert">{error}</div>}{credentialGroups.error && <div className="notice error" role="alert">{credentialGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}
+      <div className="account-list">{filteredValues.length === 0 && <div className="empty">{loadingKeys ? t('common.loading') : keyListState === 'failed' ? t('credentials.loadFailed', { count: formatNumber(values.length, locale) }) : values.length === 0 ? t('credentials.empty') : filtersApplied ? t('credentials.noFilterResults') : t('credentials.noGroupResults')}</div>}{filteredValues.map((value) => {
         const memberships = credentialGroups.groups.filter((group) => group.member_ids.includes(value.key_id));
-        return <div className="managed-resource" key={value.key_id}><div className="managed-resource-header"><div><b>{value.alias}</b><small>{value.key_id}</small><span>{value.principal_external_id ?? t('common.unknownPrincipal')} · {formatCurrency(value.available_balance, value.currency, locale)}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div>
+        return <div className="managed-resource" key={value.key_id}><div className="managed-resource-header"><div><b>{value.alias}</b><small>{value.key_id}</small><span>{!tenant && <>{t('credentials.tenant')}: {value.tenant_external_id ?? '—'} · </>}{value.principal_external_id ?? t('common.unknownPrincipal')} · {formatCurrency(value.available_balance, value.currency, locale)}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div>
           {memberships.length > 0 && <div className="table-chip-list credential-group-chips" aria-label={t('groups.credential.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
           <div className="policy-chips"><span>{enumLabel(t, 'enforcementMode', value.policy.enforcement_mode)}</span><span>RPM {formatNumber(value.policy.requests_per_minute, locale)}</span><span>TPM {formatNumber(value.policy.tokens_per_minute, locale)}</span><span>{t('self.concurrency')} {formatNumber(value.policy.max_concurrency, locale)}</span><span>{t('budget.daily')}: {value.policy.daily_budget === null ? '—' : formatCurrency(value.policy.daily_budget, value.currency, locale)}</span><span>{t('budget.weekly')}: {value.policy.weekly_budget === null ? '—' : formatCurrency(value.policy.weekly_budget, value.currency, locale)}</span><span>{t('budget.lifetime')}: {value.policy.lifetime_budget === null ? '—' : formatCurrency(value.policy.lifetime_budget, value.currency, locale)}</span></div>
-          <div className="row-actions"><button type="button" className="secondary" disabled={!tenant} onClick={() => { setRenaming(renaming === value.key_id ? undefined : value.key_id); setAliasDraft(value.alias); }}>{t('credentials.rename')}</button><button type="button" className="secondary" disabled={!tenant} onClick={async () => { try { const snapshot = await api<KeyLimitSnapshot>(`/internal/v1/keys/${value.key_id}/limits`, token); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setLimitSnapshots((current) => ({ ...current, [value.key_id]: snapshot })); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('credentials.viewLimits')}</button><button type="button" className="secondary" disabled={!tenant || value.status === 'revoked' || Boolean(busy)} onClick={async () => { if (!window.confirm(`${t('credentials.rotate')} · ${value.alias}\n${value.key_id}`)) return; setBusy(`rotate-${value.key_id}`); try { const result = await api<{ key: string }>(`/internal/v1/keys/${value.key_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setSecret(result.key); setMessage(t('credentials.rotated', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.rotate')}</button><button type="button" className="secondary" disabled={!tenant || value.status === 'revoked'} onClick={() => setEditingPolicy(editingPolicy === value.key_id ? undefined : value.key_id)}>{t('credentials.editPolicy')}</button><button type="button" className="secondary" disabled={!tenant || value.status === 'revoked'} onClick={() => void openRouting(value)}>{t('credentials.routing')}</button><button type="button" className="secondary" disabled={!tenant || !value.account_id || value.status === 'revoked'} title={!value.account_id ? t('credentials.accountMissing') : undefined} onClick={() => setGranting(granting === value.key_id ? undefined : value.key_id)}>{t('credentials.grant')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!tenant} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; try { await api(`/internal/v1/keys/${value.key_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setMessage(t(nextStatus === 'active' ? 'credentials.resumed' : 'credentials.suspended', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{value.status === 'active' ? t('credentials.suspend') : t('credentials.resume')}</button>}</div>
-          {renaming === value.key_id && <div className="inline-editor form-panel"><h3>{t('credentials.renameFor', { alias: value.alias })}</h3><label>{t('schema.Credential alias')}<input value={aliasDraft} maxLength={200} onChange={(event) => setAliasDraft(event.target.value)} /></label><button type="button" disabled={!aliasDraft.trim()} onClick={async () => { try { await api(`/internal/v1/keys/${value.key_id}/alias`, token, { method: 'PATCH', body: JSON.stringify({ alias: aliasDraft }) }); setRenaming(undefined); setMessage(t('credentials.renamed', { alias: aliasDraft.trim() })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('common.save')}</button></div>}
+          <div className="row-actions"><button type="button" className="secondary" disabled={!canWrite} onClick={() => { setRenaming(renaming === value.key_id ? undefined : value.key_id); setAliasDraft(value.alias); }}>{t('credentials.rename')}</button><button type="button" className="secondary" disabled={!canReadLimits} onClick={async () => { try { const snapshot = await api<KeyLimitSnapshot>(`/internal/v1/keys/${value.key_id}/limits`, token); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setLimitSnapshots((current) => ({ ...current, [value.key_id]: snapshot })); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('credentials.viewLimits')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked' || Boolean(busy)} onClick={async () => { if (!window.confirm(`${t('credentials.rotate')} · ${value.alias}\n${value.key_id}`)) return; setBusy(`rotate-${value.key_id}`); try { const result = await api<{ key: string }>(`/internal/v1/keys/${value.key_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setSecret(result.key); setMessage(t('credentials.rotated', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.rotate')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked'} onClick={() => setEditingPolicy(editingPolicy === value.key_id ? undefined : value.key_id)}>{t('credentials.editPolicy')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked'} onClick={() => void openRouting(value)}>{t('credentials.routing')}</button><button type="button" className="secondary" disabled={!canWrite || !value.account_id || value.status === 'revoked'} title={!value.account_id ? t('credentials.accountMissing') : undefined} onClick={() => setGranting(granting === value.key_id ? undefined : value.key_id)}>{t('credentials.grant')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canWrite} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; try { await api(`/internal/v1/keys/${value.key_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setMessage(t(nextStatus === 'active' ? 'credentials.resumed' : 'credentials.suspended', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{value.status === 'active' ? t('credentials.suspend') : t('credentials.resume')}</button>}</div>
+          {renaming === value.key_id && <div className="inline-editor form-panel"><h3>{t('credentials.renameFor', { alias: value.alias })}</h3><label>{t('schema.Credential alias')}<input value={aliasDraft} maxLength={200} onChange={(event) => setAliasDraft(event.target.value)} /></label><button type="button" disabled={!canWrite || !aliasDraft.trim()} onClick={async () => { try { await api(`/internal/v1/keys/${value.key_id}/alias`, token, { method: 'PATCH', body: JSON.stringify({ alias: aliasDraft }) }); setRenaming(undefined); setMessage(t('credentials.renamed', { alias: aliasDraft.trim() })); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('common.save')}</button></div>}
           {limitSnapshots[value.key_id] && <LimitSnapshot value={limitSnapshots[value.key_id]} />}
-          {editingPolicy === value.key_id && policyFormSchema && <div className="inline-editor form-panel"><h3>{t('credentials.policyFor', { alias: value.alias })}</h3><Form key={`${value.key_id}-${locale}`} schema={localizeSchema(policyFormSchema as RJSFSchema, locale)} formData={value.policy} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { try { await api(`/internal/v1/keys/${value.key_id}/policy`, token, { method: 'PUT', body: JSON.stringify(formData) }); setEditingPolicy(undefined); setMessage(t('credentials.policySaved')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant}>{t('common.save')}</button></Form></div>}
+          {editingPolicy === value.key_id && policyFormSchema && <div className="inline-editor form-panel"><h3>{t('credentials.policyFor', { alias: value.alias })}</h3><Form key={`${value.key_id}-${locale}`} schema={localizeSchema(policyFormSchema as RJSFSchema, locale)} formData={value.policy} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { try { await api(`/internal/v1/keys/${value.key_id}/policy`, token, { method: 'PUT', body: JSON.stringify(formData) }); setEditingPolicy(undefined); setMessage(t('credentials.policySaved')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!canWrite}>{t('common.save')}</button></Form></div>}
           {editingRouting === value.key_id && routingDraft && <div className="inline-editor form-panel routing-editor"><h3>{t('credentials.routingFor', { alias: value.alias })}</h3><p className="muted">{t('credentials.routingHint')}</p>
             <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(routingDraft.route_ids, routeOptions)} onChange={(selected) => setRoutingDraft({ ...routingDraft, route_ids: selected.map((item) => item.value) })} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
             <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(routingDraft.route_group_ids, routeGroupOptions)} onChange={(selected) => setRoutingDraft({ ...routingDraft, route_group_ids: selected.map((item) => item.value) })} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
             {routingDraft.effective_route_ids.length > 0 && <small className="field-hint">{t('credentials.effectiveRoutes', { count: formatNumber(routingDraft.effective_route_ids.length, locale) })}</small>}
-            <button type="button" onClick={() => void saveRouting(value, routingDraft)}>{t('common.save')}</button>
+            <button type="button" disabled={!canWrite} onClick={() => void saveRouting(value, routingDraft)}>{t('common.save')}</button>
           </div>}
-          {granting === value.key_id && value.account_id && <div className="inline-editor form-panel"><h3>{t('credentials.grantFor', { alias: value.alias })}</h3><label>{t('credentials.grantAmount')} ({value.currency})<input inputMode="decimal" value={grant.amount} onChange={(event) => setGrant({ ...grant, amount: event.target.value })} /></label><label>{t('credentials.grantSource')}<input value={grant.source} onChange={(event) => setGrant({ ...grant, source: event.target.value })} /></label><button type="button" disabled={Boolean(busy) || !isPositiveDecimal(grant.amount) || !grant.source.trim()} onClick={async () => { const amount = grant.amount.trim(); const source = grant.source.trim(); if (!window.confirm(`${t('credentials.grantFor', { alias: value.alias })}\n${t('credentials.grantAmount')}: ${amount} ${value.currency}\n${t('credentials.grantSource')}: ${source}`)) return; setBusy(`grant-${value.key_id}`); try { await api(`/internal/v1/accounts/${value.account_id}/grants`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ amount, source }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setGranting(undefined); setGrant({ amount: '', source: '' }); setMessage(t('credentials.granted')); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.confirmGrant')}</button></div>}
-        </div>})}</div></article>
+          {granting === value.key_id && value.account_id && <div className="inline-editor form-panel"><h3>{t('credentials.grantFor', { alias: value.alias })}</h3><label>{t('credentials.grantAmount')} ({value.currency})<input inputMode="decimal" value={grant.amount} onChange={(event) => setGrant({ ...grant, amount: event.target.value })} /></label><label>{t('credentials.grantSource')}<input value={grant.source} onChange={(event) => setGrant({ ...grant, source: event.target.value })} /></label><button type="button" disabled={!canWrite || Boolean(busy) || !isPositiveDecimal(grant.amount) || !grant.source.trim()} onClick={async () => { const amount = grant.amount.trim(); const source = grant.source.trim(); if (!window.confirm(`${t('credentials.grantFor', { alias: value.alias })}\n${t('credentials.grantAmount')}: ${amount} ${value.currency}\n${t('credentials.grantSource')}: ${source}`)) return; setBusy(`grant-${value.key_id}`); try { await api(`/internal/v1/accounts/${value.account_id}/grants`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ amount, source }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setGranting(undefined); setGrant({ amount: '', source: '' }); setMessage(t('credentials.granted')); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.confirmGrant')}</button></div>}
+        </div>})}</div>{keyListState === 'failed' ? <div className="load-more"><button type="button" className="secondary" onClick={() => void load()}>{t('credentials.retryLoad')}</button></div> : nextCursor && (keyListState === 'more' || keyListState === 'loading-more') && <div className="load-more"><button type="button" className="secondary" disabled={!canLoadMore} onClick={() => void loadMore()}>{loadingKeys ? t('common.loading') : t('credentials.loadMore')}</button></div>}</article>
     <details className="panel create-resource"><summary><span><b>{t('credentials.createTitle')}</b><small>{t('credentials.createRoutingHint')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">
       <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(newRouteIds, routeOptions)} onChange={(selected) => setNewRouteIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
       <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(newRouteGroupIds, routeGroupOptions)} onChange={(selected) => setNewRouteGroupIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
@@ -640,9 +738,9 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
         const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }) });
         if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return;
         setNewRouteIds([]); setNewRouteGroupIds([]); setSecret(created.key); setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
-      } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant}>{t('credentials.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+      } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!canWrite}>{t('credentials.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
     </div></details>
-  </section><GroupManager kind="credential" token={token} tenant={tenant} groups={credentialGroups.groups} resources={values.map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} /></>;
+  </section>{tenant && <GroupManager kind="credential" token={token} tenant={tenant} groups={credentialGroups.groups} resources={values.map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} />}</>;
 }
 
 function ServiceCredentialWorkspace({ token, tenant, schema }: { token: string; tenant: string; schema?: Record<string, unknown> }) {
