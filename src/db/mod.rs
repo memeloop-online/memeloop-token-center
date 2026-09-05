@@ -152,7 +152,7 @@ pub use routing::{
     UpdateRoutedModelRouteInput,
 };
 pub(crate) use routing::{
-    UPSTREAM_PROBE_HEARTBEAT_MILLIS, UpstreamAttemptAdmission, UpstreamFailureKind,
+    UpstreamAttemptAdmission, UpstreamFailureKind, upstream_probe_heartbeat_interval,
 };
 pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
 

@@ -53,9 +53,7 @@ impl UpstreamAttemptGuard {
                 loop {
                     tokio::select! {
                         _ = &mut stopped => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(
-                            crate::db::UPSTREAM_PROBE_HEARTBEAT_MILLIS,
-                        )) => {
+                        _ = tokio::time::sleep(crate::db::upstream_probe_heartbeat_interval()) => {
                             match database
                                 .renew_upstream_account_probe(
                                     upstream_account_id,
