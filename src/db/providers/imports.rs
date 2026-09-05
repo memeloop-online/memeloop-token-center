@@ -647,15 +647,6 @@ fn validate_imported_codex_account_shape(
 ) -> Result<(), AppError> {
     if row.try_get::<String, _>("driver")? != crate::oauth::codex_device::IMPORTED_PROVIDER_DRIVER
         || row.try_get::<String, _>("auth_kind")? != "oauth"
-        || row
-            .try_get::<Option<String>, _>("oauth_session_id")?
-            .is_none()
-        || row.try_get::<Option<String>, _>("oauth_driver")?.as_deref()
-            != Some(crate::oauth::codex_device::IMPORTED_PROVIDER_DRIVER)
-        || row
-            .try_get::<Option<String>, _>("oauth_refresh_url")?
-            .as_deref()
-            != Some(crate::oauth::codex_device::TOKEN_ENDPOINT)
     {
         return Err(AppError::BadRequest(
             "imported OpenAI Codex account has an unsupported lifecycle".into(),
@@ -834,10 +825,8 @@ mod native_codex_upgrade_tests {
                         proxy_network_scope: Some(crate::network::OutboundScope::Private),
                     },
                     oauth_session_id: Some(Uuid::now_v7()),
-                    oauth_driver: Some(
-                        crate::oauth::codex_device::IMPORTED_PROVIDER_DRIVER.to_owned(),
-                    ),
-                    oauth_refresh_url: Some(crate::oauth::codex_device::TOKEN_ENDPOINT.to_owned()),
+                    oauth_driver: Some("damaged-driver".to_owned()),
+                    oauth_refresh_url: Some("https://damaged.invalid".to_owned()),
                 },
                 key_material,
             )
@@ -894,6 +883,35 @@ mod native_codex_upgrade_tests {
                 "socks5h://operator:proxy-secret@100.64.0.16:1080",
                 crate::network::OutboundScope::Private
             ))
+        );
+        let upgraded_lifecycle = sqlx::query(
+            "SELECT oauth_session_id, oauth_driver, oauth_refresh_url FROM upstream_accounts WHERE id = $1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        let expected_session_id = account.id.to_string();
+        assert_eq!(
+            upgraded_lifecycle
+                .try_get::<Option<String>, _>("oauth_session_id")
+                .unwrap()
+                .as_deref(),
+            Some(expected_session_id.as_str())
+        );
+        assert_eq!(
+            upgraded_lifecycle
+                .try_get::<Option<String>, _>("oauth_driver")
+                .unwrap()
+                .as_deref(),
+            Some(crate::oauth::codex_device::OAUTH_DRIVER)
+        );
+        assert_eq!(
+            upgraded_lifecycle
+                .try_get::<Option<String>, _>("oauth_refresh_url")
+                .unwrap()
+                .as_deref(),
+            Some(crate::oauth::codex_device::TOKEN_ENDPOINT)
         );
         let repeated = database
             .apply_native_codex_upgrade(&plan, key_material)
