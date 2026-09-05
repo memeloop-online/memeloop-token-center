@@ -1329,6 +1329,52 @@ async fn codex_retry_buffered_incomplete_sse_records_failed_terminal() {
 }
 
 #[tokio::test]
+async fn buffered_codex_output_with_malformed_usage_is_rejected_before_delivery() {
+    let fixture = codex_route_fixture("buffered-malformed-usage").await;
+    let upstream = MockServer::start().await;
+    let body = concat!(
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
+        "\"item\":{\"id\":\"item-private\",\"type\":\"message\",\"role\":\"assistant\",",
+        "\"content\":[{\"type\":\"output_text\",\"text\":\"private billable output\"}]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-malformed-usage\",",
+        "\"output\":[],\"usage\":{\"input_tokens\":3,\"total_tokens\":3}}}\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "billable", "stream": false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let response_body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&response_body).contains("private billable output"));
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_invalid_usage")
+    );
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    assert_response_archives_omit(&fixture, "private billable output").await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn incomplete_sse_probe_stays_unhealthy_and_next_request_fails_over() {
     let fixture = codex_route_fixture("probe-incomplete-sse").await;
     let upstream = MockServer::start().await;
@@ -1449,19 +1495,19 @@ async fn valid_settled_sse_probe_recovers_the_account() {
 async fn codex_retry_buffered_completion_requires_a_single_matching_response_id() {
     let matching = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-buffered\"}}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
     );
     let missing = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-buffered\"}}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
     );
     let mismatched = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-buffered\"}}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-other\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-other\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
     );
     let duplicate = concat!(
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
     );
     for (label, body, success) in [
         ("matching", matching, true),
@@ -2278,7 +2324,7 @@ fn completed_codex_sse(output: &str) -> String {
             "event: response.output_item.done\r\n",
             "data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"item-codex\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{output}\"}}]}}}}\r\n\r\n",
             "event: response.completed\n",
-            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-codex\",\"object\":\"response\",\"output\":[{{\"id\":\"item-codex\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{output}\"}}]}}],\"usage\":{{\"input_tokens\":3,\"output_tokens\":2}}}}}}\n\n",
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-codex\",\"object\":\"response\",\"output\":[{{\"id\":\"item-codex\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{output}\"}}]}}],\"usage\":{{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}}}}\n\n",
             "data: [DONE]\n\n"
         ),
         output = output

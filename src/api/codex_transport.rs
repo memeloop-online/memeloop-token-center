@@ -12,7 +12,6 @@ use super::{
     MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS,
     MAX_RESPONSES_SSE_EVENT_BYTES, Protocol, TokenUsage,
     conversation_hints::safe_conversation_hint, upstream_response::UpstreamResponse,
-    usage_from_value_checked,
 };
 use crate::{
     error::AppError, oauth::managed::codex::account_header_value, provider::UpstreamCredential,
@@ -840,9 +839,7 @@ impl BufferedResponsesParser {
                 return Err("upstream_invalid_response");
             }
         }
-        let usage = usage_from_value_checked(&response)
-            .map_err(|_| "upstream_invalid_usage")?
-            .ok_or("upstream_invalid_usage")?;
+        let usage = canonical_responses_usage(&response).map_err(|_| "upstream_invalid_usage")?;
         let body = serde_json::to_vec(&response).map_err(|_| "upstream_invalid_response")?;
         if body.len() > MAX_PROXY_RESPONSE_BODY {
             return Err("upstream_response_too_large");
@@ -1010,6 +1007,61 @@ impl BufferedResponsesParser {
         }
         Ok(())
     }
+}
+
+fn canonical_responses_usage(response: &Value) -> Result<TokenUsage, ()> {
+    let usage = response.get("usage").and_then(Value::as_object).ok_or(())?;
+    let required_integer = |field: &str| -> Result<i64, ()> {
+        usage
+            .get(field)
+            .and_then(Value::as_i64)
+            .filter(|value| (0..=MAX_REPORTED_TOKENS).contains(value))
+            .ok_or(())
+    };
+    let reported_input = required_integer("input_tokens")?;
+    let output_tokens = required_integer("output_tokens")?;
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or(())?;
+    if reported_input.checked_add(output_tokens) != Some(total_tokens) {
+        return Err(());
+    }
+    let cached_input_tokens = match usage.get("input_tokens_details") {
+        None => 0,
+        Some(details) => details
+            .as_object()
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_i64)
+            .filter(|value| (0..=reported_input).contains(value))
+            .ok_or(())?,
+    };
+    if usage
+        .get("output_tokens_details")
+        .is_some_and(|details| !details.is_object())
+    {
+        return Err(());
+    }
+    let service_tier = match response.get("service_tier") {
+        None => None,
+        Some(Value::String(tier))
+            if matches!(
+                tier.as_str(),
+                "default" | "auto" | "standard_only" | "priority"
+            ) =>
+        {
+            Some(tier.clone())
+        }
+        Some(_) => return Err(()),
+    };
+    Ok(TokenUsage {
+        input_tokens: reported_input.checked_sub(cached_input_tokens).ok_or(())?,
+        cached_input_tokens,
+        cache_write_tokens: 0,
+        output_tokens,
+        service_tier,
+    })
 }
 
 #[cfg(test)]
@@ -1182,7 +1234,7 @@ mod tests {
             "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"item-1\"}}\r\n\r\n",
             "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item-0\"}}\n\n",
             "event: response.completed\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"object\":\"response\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"object\":\"response\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n",
             "data: [DONE]\n\n"
         )
         .as_bytes()
@@ -1204,15 +1256,71 @@ mod tests {
         assert_eq!(result.usage.output_tokens, 2);
     }
 
+    fn completed_stream_with_usage(usage: &Value) -> Vec<u8> {
+        format!(
+            concat!(
+                "data: {{\"type\":\"response.output_item.done\",\"output_index\":0,",
+                "\"item\":{{\"id\":\"item-billable\",\"type\":\"message\",",
+                "\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",",
+                "\"text\":\"billable output\"}}]}}}}\n\n",
+                "data: {{\"type\":\"response.completed\",\"response\":{{",
+                "\"id\":\"resp-usage\",\"output\":[],\"service_tier\":\"priority\",",
+                "\"usage\":{usage}}}}}\n\n"
+            ),
+            usage = usage
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn buffered_parser_requires_canonical_consistent_responses_usage() {
+        let valid = json!({
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 3},
+            "output_tokens": 2,
+            "output_tokens_details": {"reasoning_tokens": 1},
+            "total_tokens": 12
+        });
+        let parsed = parse_buffered_sse_for_test(&completed_stream_with_usage(&valid)).unwrap();
+        assert_eq!(
+            parsed.usage,
+            TokenUsage {
+                input_tokens: 7,
+                cached_input_tokens: 3,
+                cache_write_tokens: 0,
+                output_tokens: 2,
+                service_tier: Some("priority".to_owned()),
+            }
+        );
+        let response: Value = serde_json::from_slice(&parsed.body).unwrap();
+        assert_eq!(response["output"][0]["id"], "item-billable");
+
+        for malformed in [
+            json!({"input_tokens": 10, "total_tokens": 10}),
+            json!({"input_tokens": 10, "output_tokens": 2}),
+            json!({"input_tokens": 10, "output_tokens": 2, "total_tokens": 11}),
+            json!({"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}),
+            json!({"input_tokens": 10, "input_tokens_details": {}, "output_tokens": 2, "total_tokens": 12}),
+            json!({"input_tokens": 10, "input_tokens_details": {"cached_tokens": 11}, "output_tokens": 2, "total_tokens": 12}),
+            json!({"input_tokens": 10, "output_tokens": 2, "output_tokens_details": 1, "total_tokens": 12}),
+            json!({"input_tokens": 10, "output_tokens": -1, "total_tokens": 9}),
+        ] {
+            assert!(matches!(
+                parse_buffered_sse_for_test(&completed_stream_with_usage(&malformed)),
+                Err("upstream_invalid_usage")
+            ));
+        }
+    }
+
     #[test]
     fn buffered_parser_requires_a_single_matching_completed_response_id() {
         let completed = |id: Option<&str>| {
             match id {
             Some(id) => format!(
-                "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}\n\n"
             ),
             None => concat!(
-                "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+                "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
             )
             .to_owned(),
         }
@@ -1262,8 +1370,8 @@ mod tests {
             b"data: {\"type\":\"response.incomplete\"}\n\n".to_vec(),
             b"data: {\"type\":\"error\"}\n\n".to_vec(),
             concat!(
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"a\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"b\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"a\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"b\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
             ).as_bytes().to_vec(),
             b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"a\"}}\n\n".to_vec(),
         ];
@@ -1283,19 +1391,19 @@ mod tests {
         let cases = [
             concat!(
                 "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item-0\"}}\n\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"output\":[{\"id\":\"item-0\"},{\"id\":\"item-1\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"output\":[{\"id\":\"item-0\"},{\"id\":\"item-1\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
             ),
             concat!(
                 "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"captured\"}}\n\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"output\":[{\"id\":\"different\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"output\":[{\"id\":\"different\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
             ),
             concat!(
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"post-terminal\"}\n\n"
             ),
             concat!(
                 "event: response.failed\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
             ),
         ];
         for stream in cases {
