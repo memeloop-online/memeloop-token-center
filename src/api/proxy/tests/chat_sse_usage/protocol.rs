@@ -149,6 +149,57 @@ fn chat_no_op_preambles_are_control_frames() {
 }
 
 #[test]
+fn chat_logprobs_or_unknown_choice_fields_are_never_control_frames() {
+    let cases = [
+        json!([{
+            "index": 0,
+            "delta": {"role": "assistant", "content": null},
+            "finish_reason": null,
+            "logprobs": {},
+        }]),
+        json!([{
+            "index": 0,
+            "delta": {"role": "assistant", "content": null},
+            "finish_reason": null,
+            "provider_output": "must-not-be-ignored",
+        }]),
+    ];
+    for choices in cases {
+        let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+        let frames = capture
+            .push_delivery_frames(chat_chunk("chatcmpl-choice-schema", choices, None).as_bytes());
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].billable);
+        assert!(capture.finish_summary().usage_invalid);
+    }
+}
+
+#[test]
+fn strict_chat_rejects_named_events_before_they_can_complete() {
+    for event in [
+        b"error".as_slice(),
+        b"response.failed".as_slice(),
+        b"message".as_slice(),
+    ] {
+        let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+        let mut wire = Vec::from(b"event: ".as_slice());
+        wire.extend_from_slice(event);
+        wire.extend_from_slice(b"\ndata: {\"error\":{\"message\":\"failure\"}}\n\n");
+        wire.extend_from_slice(done().as_bytes());
+        let frames = capture.push_delivery_frames(&wire);
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].billable);
+        assert!(!frames[1].billable);
+        let summary = capture.finish_summary();
+        assert!(summary.usage_invalid);
+        assert!(matches!(
+            summary.outcome,
+            ResponsesSseOutcome::Failed | ResponsesSseOutcome::Incomplete
+        ));
+    }
+}
+
+#[test]
 fn chat_sse_requires_complete_canonical_usage_and_one_consistent_chat_id() {
     let valid = [
         chat_content("chatcmpl-one"),

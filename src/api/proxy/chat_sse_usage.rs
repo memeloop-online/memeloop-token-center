@@ -228,23 +228,25 @@ struct CanonicalChatChunk {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CanonicalChatChoice {
     index: i64,
     delta: Map<String, Value>,
     #[serde(default)]
     finish_reason: Option<String>,
-    #[serde(default, rename = "logprobs")]
-    _logprobs: Option<Value>,
+    #[serde(default)]
+    logprobs: Option<Value>,
 }
 
 impl CanonicalChatChoice {
     fn is_control(&self) -> bool {
-        let terminal = self
-            .finish_reason
-            .as_deref()
-            .is_some_and(is_terminal_finish_reason)
-            && self.delta_is_control_preamble();
-        terminal || (self.finish_reason.is_none() && self.delta_is_control_preamble())
+        self.logprobs.is_none()
+            && ((self
+                .finish_reason
+                .as_deref()
+                .is_some_and(is_terminal_finish_reason)
+                && self.delta_is_control_preamble())
+                || (self.finish_reason.is_none() && self.delta_is_control_preamble()))
     }
 
     fn delta_is_control_preamble(&self) -> bool {

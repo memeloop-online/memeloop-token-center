@@ -32,6 +32,44 @@ async fn non_opt_in_chat_routes_transparently_forward_n() {
         .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("\"content\":\"ok\""));
     upstream.verify().await;
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].output_tokens, 32);
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+#[tokio::test]
+async fn non_opt_in_chat_n_output_reservation_overflow_is_rejected_before_admission() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let fixture =
+        response_usage_fixture_with_contract("chat-n-reservation-overflow", &upstream, 0, None)
+            .await;
+    let mut request = chat_request(&fixture.model);
+    request["n"] = json!(MAX_REPORTED_TOKENS);
+    let response = send_chat_usage_request(&fixture, &request).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    upstream.verify().await;
 }
 
 async fn add_http_chat_standby(

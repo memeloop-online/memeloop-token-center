@@ -174,6 +174,97 @@ async fn chat_usage_reported_priority_tier_and_standard_nullable_details_settle_
 }
 
 #[tokio::test]
+async fn strict_chat_success_with_a_non_sse_body_fails_closed_before_delivery() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-buffered",
+            "object": "chat.completion",
+            "choices": [{"message": {"content": "must-not-forward"}}],
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = response_usage_fixture("chat-non-sse-success", &upstream, 0).await;
+    let response = send_chat_usage_request(&fixture, &chat_request(&fixture.model)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("must-not-forward"));
+    upstream.verify().await;
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_invalid_response")
+    );
+    assert_eq!(rows[0].cost, "0");
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+#[tokio::test]
+async fn strict_chat_logprobs_and_named_failure_start_delivery_and_charge_once() {
+    let upstream = MockServer::start().await;
+    let sse = [
+        chat_chunk(
+            "chatcmpl-logprobs",
+            json!([{
+                "index": 0,
+                "delta": {"role": "assistant", "content": null},
+                "finish_reason": null,
+                "logprobs": {"content": []},
+            }]),
+            None,
+        ),
+        concat!(
+            "event: response.failed\n",
+            "data: {\"error\":{\"message\":\"must-fail\"}}\n\n"
+        )
+        .to_owned(),
+        done().to_owned(),
+    ]
+    .concat();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = response_usage_fixture("chat-logprobs-named-failure", &upstream, 0).await;
+    let response = send_chat_usage_request(&fixture, &chat_request(&fixture.model)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("logprobs"));
+    assert!(body.contains("response.failed"));
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_failed_response")
+    );
+    assert_eq!(rows[0].output_tokens, 16);
+    assert_ne!(rows[0].cost, "0");
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+#[tokio::test]
 async fn strict_chat_usage_failures_charge_the_delivered_contract_once() {
     let mut cases = vec![
         (

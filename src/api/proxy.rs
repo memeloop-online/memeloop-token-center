@@ -33,11 +33,30 @@ const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
 
 fn validate_openai_chat_choice_count(request: &Value) -> Result<(), AppError> {
-    match request.get("n") {
-        None => Ok(()),
-        Some(Value::Number(number)) if number.as_i64() == Some(1) => Ok(()),
-        Some(_) => Err(AppError::BadRequest(
+    if openai_chat_choice_count(request)? == 1 {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
             "OpenAI Chat requests must use n = 1".to_owned(),
+        ))
+    }
+}
+
+/// Return the number of Chat completions the upstream is allowed to produce.
+///
+/// `n` multiplies only completion-side usage. Parsing it before admission
+/// avoids creating a reservation that can never cover a valid multi-choice
+/// response from a compatible (non-strict) route.
+fn openai_chat_choice_count(request: &Value) -> Result<i64, AppError> {
+    match request.get("n") {
+        None => Ok(1),
+        Some(Value::Number(number)) => {
+            number.as_i64().filter(|count| *count >= 1).ok_or_else(|| {
+                AppError::BadRequest("OpenAI Chat n must be a positive integer".to_owned())
+            })
+        }
+        Some(_) => Err(AppError::BadRequest(
+            "OpenAI Chat n must be a positive integer".to_owned(),
         )),
     }
 }
@@ -101,8 +120,11 @@ pub(super) async fn proxy(
             state.config.key_pepper.as_bytes(),
         )
         .await?;
+    let openai_chat_choice_count = matches!(protocol, Protocol::OpenAiChat)
+        .then(|| openai_chat_choice_count(&request_json))
+        .transpose()?;
     let strict_choice_count_is_incompatible =
-        validate_openai_chat_choice_count(&request_json).is_err();
+        openai_chat_choice_count.is_some_and(|count| count != 1);
     let mut resolved_routes = resolved_routes.into_iter();
     let mut skipped_incompatible_strict_route = false;
     let primary_route = loop {
@@ -187,6 +209,7 @@ pub(super) async fn proxy(
     let upstream_account_id = Some(primary.route.account_id);
     let model_route_id = Some(primary.route.route_id);
     let price = state.db.model_price(&model, &key.currency).await?;
+    let output_choice_count = openai_chat_choice_count.unwrap_or(1);
     let mut input_token_ceiling = 0_i64;
     let mut output_token_ceiling = 0_i64;
     for route in &prepared_routes {
@@ -204,7 +227,17 @@ pub(super) async fn proxy(
                 )
             })?;
         input_token_ceiling = input_token_ceiling.max(candidate_ceiling);
-        output_token_ceiling = output_token_ceiling.max(route.output_token_ceiling);
+        let candidate_output_ceiling = route
+            .output_token_ceiling
+            .checked_mul(output_choice_count)
+            .filter(|ceiling| (0..=MAX_REPORTED_TOKENS).contains(ceiling))
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "aggregate OpenAI Chat output token reservation is outside the supported range"
+                        .into(),
+                )
+            })?;
+        output_token_ceiling = output_token_ceiling.max(candidate_output_ceiling);
     }
     let requested_service_tier = match request_json.get("service_tier") {
         None => None,
@@ -589,6 +622,19 @@ pub(super) async fn proxy(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    let strict_openai_chat_usage = requires_strict_openai_chat_usage(
+        protocol,
+        &active_route.route.driver,
+        &active_route.route.config,
+        &request_json,
+    );
+    // An opted-in Chat usage stream has a terminal SSE usage contract. A
+    // successful JSON envelope cannot prove that contract and must never be
+    // forwarded or settled as a compatible buffered response.
+    if strict_openai_chat_usage && !is_sse {
+        drop(upstream);
+        return finish_proxy_failure(&buffered_request, "upstream_invalid_response").await;
+    }
     let capture_json_usage = should_capture_buffered_usage(is_sse, content_type.as_ref());
     if !is_sse {
         let response_content_type = content_type
@@ -646,12 +692,7 @@ pub(super) async fn proxy(
         protocol,
         is_codex_route,
         codex_retry,
-        strict_openai_chat_usage: requires_strict_openai_chat_usage(
-            protocol,
-            &active_route.route.driver,
-            &active_route.route.config,
-            &request_json,
-        ),
+        strict_openai_chat_usage,
         upstream_activity,
         request_id,
         buffered_request,
@@ -1472,6 +1513,17 @@ impl ResponsesSseCapture {
         let data = std::mem::take(&mut self.data);
         let event_kind = self.event_kind.take();
         let discard = std::mem::take(&mut self.discard_event);
+        // OpenAI Chat usage-only streams use anonymous `data:` events. A
+        // named event belongs to a different SSE dialect, so do not let a
+        // later syntactically valid Chat chunk turn this protocol violation
+        // into success. Named failures are terminal as well as invalid.
+        if self.chat_usage.is_some() && event_kind.is_some() {
+            self.invalid = true;
+            if matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
+                self.terminal_failure = true;
+            }
+            return ChatSseDeliveryClass::Billable;
+        }
         if discard {
             match event_kind {
                 Some(ResponsesSseEventKind::Completed) if self.require_explicit_completed => {
