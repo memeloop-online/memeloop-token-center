@@ -185,6 +185,13 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         } else {
                             (raw_chunk, true)
                         };
+                        // A Responses sanitizer may need several network
+                        // fragments before it can emit one complete, redacted
+                        // SSE event. Empty partial output must not occupy the
+                        // bounded archive channel or cancel a healthy archive.
+                        if chunk.is_empty() {
+                            continue;
+                        }
                         if capture_json_usage {
                             append_bounded(&mut usage_capture, &chunk, 2 * 1024 * 1024);
                             capture_memory.set_bytes(usage_capture.capacity());
@@ -197,9 +204,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         {
                             tracing::warn!(%request_id, stage = "response_archive_backpressure", "proxy archive gap");
                             cancel_stream_archive(&archive_complete, &mut archive_sender);
-                        }
-                        if chunk.is_empty() {
-                            continue;
                         }
                         if !delivered_any {
                             match tokio::time::timeout(

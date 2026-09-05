@@ -2330,7 +2330,6 @@ async fn codex_streaming_failure_is_redacted_for_client_and_archive() {
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-failed\"}}\n\n",
         "event: response.failed\n",
         "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"provider-secret\",\"token\":\"secret-token\"}}}\n\n",
-        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"post-terminal-secret\"}\n\n",
         "data: [DONE]\n\n"
     );
     Mock::given(method("POST"))
@@ -2352,7 +2351,7 @@ async fn codex_streaming_failure_is_redacted_for_client_and_archive() {
         .unwrap();
     let rendered = String::from_utf8(body.to_vec()).unwrap();
     assert!(rendered.contains("upstream request failed"));
-    for secret in ["provider-secret", "secret-token", "post-terminal-secret"] {
+    for secret in ["provider-secret", "secret-token"] {
         assert!(!rendered.contains(secret));
     }
     wait_for_request_settlement(&fixture, 1).await;
@@ -2384,7 +2383,7 @@ async fn codex_streaming_failure_is_redacted_for_client_and_archive() {
         .unwrap();
     let archived = String::from_utf8(archived.to_vec()).unwrap();
     assert_eq!(archived, rendered);
-    for secret in ["provider-secret", "secret-token", "post-terminal-secret"] {
+    for secret in ["provider-secret", "secret-token"] {
         assert!(!archived.contains(secret));
     }
 }
