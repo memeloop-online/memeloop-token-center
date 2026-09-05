@@ -397,6 +397,7 @@ struct PostgresNativeCodexFixture {
 
 async fn assert_postgres_native_codex_upgrade_fixture(
     database: &Database,
+    pool: &sqlx::AnyPool,
     fixture: PostgresNativeCodexFixture,
 ) {
     let unique = Uuid::now_v7();
@@ -469,7 +470,7 @@ async fn assert_postgres_native_codex_upgrade_fixture(
         "SELECT credential_ciphertext FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = 1",
     )
     .bind(account.id.to_string())
-    .fetch_one(&database.pool)
+    .fetch_one(pool)
     .await
     .unwrap();
     let history_created_at = unix_millis();
@@ -477,7 +478,7 @@ async fn assert_postgres_native_codex_upgrade_fixture(
         "UPDATE upstream_credentials SET generation = 5 WHERE upstream_account_id = $1 AND generation = 1",
     )
     .bind(account.id.to_string())
-    .execute(&database.pool)
+    .execute(pool)
     .await
     .unwrap();
     for generation in 1_i64..5 {
@@ -491,7 +492,7 @@ async fn assert_postgres_native_codex_upgrade_fixture(
         .bind(expires_at)
         .bind(history_created_at.saturating_sub(generation))
         .bind(history_created_at.saturating_sub(generation))
-        .execute(&database.pool)
+        .execute(pool)
         .await
         .unwrap();
     }
@@ -499,7 +500,7 @@ async fn assert_postgres_native_codex_upgrade_fixture(
         "UPDATE upstream_accounts SET credential_generation = 5, status = 'disabled' WHERE id = $1",
     )
     .bind(account.id.to_string())
-    .execute(&database.pool)
+    .execute(pool)
     .await
     .unwrap();
     sqlx::query(
@@ -510,7 +511,7 @@ async fn assert_postgres_native_codex_upgrade_fixture(
     .bind("b".repeat(64))
     .bind(account.id.to_string())
     .bind(unix_millis())
-    .execute(&database.pool)
+    .execute(pool)
     .await
     .unwrap();
 
@@ -581,7 +582,7 @@ async fn assert_postgres_native_codex_upgrade_fixture(
     .bind(account.tenant_id.to_string())
     .bind(issued_key.key_id.to_string())
     .bind(route.id.to_string())
-    .fetch_one(&database.pool)
+    .fetch_one(pool)
     .await
     .unwrap();
     assert_eq!(grant_count, 1);
@@ -589,14 +590,14 @@ async fn assert_postgres_native_codex_upgrade_fixture(
         "SELECT COUNT(*) FROM upstream_credentials WHERE upstream_account_id = $1",
     )
     .bind(account.id.to_string())
-    .fetch_one(&database.pool)
+    .fetch_one(pool)
     .await
     .unwrap();
     let revoked_history_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM upstream_credentials WHERE upstream_account_id = $1 AND revoked_at IS NOT NULL",
     )
     .bind(account.id.to_string())
-    .fetch_one(&database.pool)
+    .fetch_one(pool)
     .await
     .unwrap();
     assert_eq!(history_count, 5);
@@ -606,7 +607,7 @@ async fn assert_postgres_native_codex_upgrade_fixture(
     )
     .bind(account.id.to_string())
     .bind(&ciphertext)
-    .fetch_one(&database.pool)
+    .fetch_one(pool)
     .await
     .unwrap();
     assert_eq!(preserved_history_count, 4);
@@ -619,6 +620,7 @@ async fn postgres_native_codex_upgrade_recovers_generation_five_old_and_native_e
     };
     let database = Database::connect_with_max(&database_url, 16).await.unwrap();
     database.migrate().await.unwrap();
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
     for fixture in [
         PostgresNativeCodexFixture {
             label: "old-envelope",
@@ -633,8 +635,9 @@ async fn postgres_native_codex_upgrade_recovers_generation_five_old_and_native_e
             expected_proxy_url: "socks5h://operator:proxy-secret@100.64.0.16:1080",
         },
     ] {
-        assert_postgres_native_codex_upgrade_fixture(&database, fixture).await;
+        assert_postgres_native_codex_upgrade_fixture(&database, &pool, fixture).await;
     }
+    pool.close().await;
 }
 
 #[tokio::test]
