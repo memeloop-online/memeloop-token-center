@@ -1,13 +1,18 @@
 use super::*;
+use crate::metrics::CodexBadRequestRetry;
 
-use crate::metrics::{CodexBadRequestClassification, CodexBadRequestRetry};
+#[path = "codex/retry.rs"]
+mod retry;
+
+use retry::{AttemptControl, CodexRetryState, observe_bad_request_disposition};
+pub(super) use retry::{CodexRetryTerminal, CodexRetryTerminalGuard};
 
 pub(super) async fn send_proxy_route(
     state: &AppState,
     headers: &HeaderMap,
     request_id: Uuid,
     route: &PreparedProxyRoute,
-) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
+) -> Result<ProxyRouteResponse, ProxySendError> {
     let outbound_base_url = codex_transport::outbound_base_url(&route.route.base_url);
     network::validate_codex_transport(
         &outbound_base_url,
@@ -22,108 +27,69 @@ pub(super) async fn send_proxy_route(
         .codex_session_id
         .as_deref()
         .ok_or(ProxySendError::Credential)?;
-    // `prepare_request_with_id` must have already forced this exact outbound
-    // request to be non-persistent. Keep the retry guard explicit here so a
-    // future request-preparation change cannot silently make an uncertain
-    // operation replayable.
-    let can_retry_definite_bad_request = route.codex_store_disabled;
-    let mut retried_definite_bad_request = false;
+    // `prepare_request_with_id` has forced the exact outbound document to be
+    // non-persistent. An HTTP 400 is still replayable only after a complete,
+    // bounded, domain-level classification; connection ambiguity never enters
+    // this state machine.
+    let mut retry = CodexRetryState::new(route.codex_store_disabled);
     loop {
         let (response, upstream_activity) =
             match send_codex_attempt(state, headers, &target_url, route, session_id).await {
                 Ok(response) => response,
                 Err(error) => {
-                    if retried_definite_bad_request {
-                        state
-                            .metrics
-                            .observe_codex_bad_request_retry(CodexBadRequestRetry::Exhausted);
-                    }
+                    retry
+                        .outcome()
+                        .observe_terminal(&state.metrics, CodexRetryTerminal::Failed);
                     return Err(error);
                 }
             };
         let response = UpstreamResponse::Codex(response);
         if response.status() == StatusCode::BAD_REQUEST {
-            match codex_transport::classify_bad_request(response).await {
-                codex_transport::BadRequestDisposition::Retryable => {
-                    state.metrics.observe_codex_bad_request_classification(
-                        CodexBadRequestClassification::Retryable,
-                    );
-                    if !retried_definite_bad_request && can_retry_definite_bad_request {
-                        // An allowlisted, completely received HTTP 400 is the
-                        // only native Codex response we treat as a definite
-                        // pre-delivery rejection. Rebuild the request from the
-                        // immutable PreparedProxyRoute so the wire body,
-                        // headers, session identity, and store=false contract
-                        // remain identical. No SSE has been admitted and no
-                        // downstream bytes can have been sent on this path.
-                        retried_definite_bad_request = true;
-                        state
-                            .metrics
-                            .observe_codex_bad_request_retry(CodexBadRequestRetry::Started);
-                        drop(upstream_activity);
-                        continue;
-                    }
-                    if retried_definite_bad_request {
-                        state
-                            .metrics
-                            .observe_codex_bad_request_retry(CodexBadRequestRetry::Exhausted);
-                    }
-                    return Err(ProxySendError::RetryableCodexBadRequest);
-                }
-                codex_transport::BadRequestDisposition::Ordinary(classification) => {
+            let disposition = codex_transport::classify_bad_request(response).await;
+            observe_bad_request_disposition(&state.metrics, disposition);
+            match retry.after_bad_request(disposition) {
+                AttemptControl::RetrySameAccount => {
+                    // The immutable PreparedProxyRoute preserves the body,
+                    // identity, session, and `store: false` contract. This
+                    // is the sole same-account replay transition.
                     state
                         .metrics
-                        .observe_codex_bad_request_classification(classification);
-                    if classification == CodexBadRequestClassification::Ordinary
-                        && !retried_definite_bad_request
-                        && can_retry_definite_bad_request
-                    {
-                        // The full, bounded, single-JSON 400 was received
-                        // before any downstream bytes. Send the immutable
-                        // non-persistent wire request once more to this same
-                        // account; malformed, oversized, timed-out, and
-                        // content-type-ambiguous errors never take this path.
-                        retried_definite_bad_request = true;
-                        state
-                            .metrics
-                            .observe_codex_bad_request_retry(CodexBadRequestRetry::Started);
-                        drop(upstream_activity);
-                        continue;
-                    }
-                    if retried_definite_bad_request {
-                        state
-                            .metrics
-                            .observe_codex_bad_request_retry(CodexBadRequestRetry::Exhausted);
-                    }
-                    return Err(ProxySendError::CodexBadRequest);
+                        .observe_codex_bad_request_retry(CodexBadRequestRetry::Started);
+                    drop(upstream_activity);
+                    continue;
+                }
+                AttemptControl::Return(error) => {
+                    retry
+                        .outcome()
+                        .observe_terminal(&state.metrics, CodexRetryTerminal::Failed);
+                    return Err(error);
                 }
             }
         }
         if !response.status().is_success() {
-            if retried_definite_bad_request {
-                state
-                    .metrics
-                    .observe_codex_bad_request_retry(CodexBadRequestRetry::Exhausted);
-            }
-            return Ok((response, upstream_activity));
+            return Ok(ProxyRouteResponse {
+                response,
+                upstream_activity,
+                codex_retry: CodexRetryTerminalGuard::new(state.metrics.clone(), retry.outcome()),
+            });
         }
         let content_type_class = codex_transport::content_type_class(&response);
         let http_version = codex_transport::http_version_class(&response);
         match codex_transport::admit_event_stream_response(response).await {
             Ok(response) => {
-                if retried_definite_bad_request {
-                    state
-                        .metrics
-                        .observe_codex_bad_request_retry(CodexBadRequestRetry::Succeeded);
-                }
-                return Ok((response, upstream_activity));
+                return Ok(ProxyRouteResponse {
+                    response,
+                    upstream_activity,
+                    codex_retry: CodexRetryTerminalGuard::new(
+                        state.metrics.clone(),
+                        retry.outcome(),
+                    ),
+                });
             }
             Err(codex_transport::ResponseAdmissionError::Invalid(error_code)) => {
-                if retried_definite_bad_request {
-                    state
-                        .metrics
-                        .observe_codex_bad_request_retry(CodexBadRequestRetry::Exhausted);
-                }
+                retry
+                    .outcome()
+                    .observe_terminal(&state.metrics, CodexRetryTerminal::Failed);
                 tracing::warn!(
                     %request_id,
                     upstream_account_id = %route.route.account_id,
@@ -135,11 +101,9 @@ pub(super) async fn send_proxy_route(
                 return Err(ProxySendError::InvalidResponse(error_code));
             }
             Err(codex_transport::ResponseAdmissionError::Ambiguous(error_code)) => {
-                if retried_definite_bad_request {
-                    state
-                        .metrics
-                        .observe_codex_bad_request_retry(CodexBadRequestRetry::Exhausted);
-                }
+                retry
+                    .outcome()
+                    .observe_terminal(&state.metrics, CodexRetryTerminal::Failed);
                 tracing::warn!(
                     %request_id,
                     upstream_account_id = %route.route.account_id,
@@ -196,6 +160,8 @@ async fn send_codex_attempt(
         {
             Err(ProxySendError::RetryableConnection)
         }
+        // A send error after the request leaves the client is ambiguous and is
+        // never replayed by this state machine.
         Err(_) => Err(ProxySendError::NonRetryableTransport),
     }
 }

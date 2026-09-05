@@ -862,6 +862,107 @@ async fn codex_transient_400_fails_over_before_downstream_delivery() {
 }
 
 #[tokio::test]
+async fn codex_retry_then_retryable_http_response_fails_over_and_finishes_retry_once() {
+    for (label, second_status, failure_kind) in [
+        ("429", StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        ("5xx", StatusCode::BAD_GATEWAY, "unavailable"),
+    ] {
+        let fixture_name = format!("retry-then-{label}-failover");
+        let fixture = codex_route_fixture(&fixture_name).await;
+        let upstream = MockServer::start().await;
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_response = attempts.clone();
+        Mock::given(method("POST"))
+            .and(path(codex_transport::RESPONSES_PATH))
+            .and(header_matcher("chatgpt-account-id", "account-123"))
+            .respond_with(move |_: &wiremock::Request| {
+                if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "private definite rejection"
+                        }
+                    }))
+                } else {
+                    ResponseTemplate::new(second_status.as_u16())
+                }
+            })
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(codex_transport::RESPONSES_PATH))
+            .and(header_matcher("chatgpt-account-id", "account-456"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                completed_codex_sse("standby after retryable status").into_bytes(),
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let standby_route_name = format!("codex-route-retry-then-{label}-failover");
+        let standby = add_codex_standby_route(&fixture, &standby_route_name, "account-456").await;
+
+        let response = send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({"model": fixture.model, "input": "retry then status", "stream": true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{label}");
+        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("standby after retryable status"),
+            "{label}"
+        );
+        wait_for_request_settlement(&fixture, 1).await;
+        let rows = fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].status_code, Some(200), "{label}");
+        assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let actual: String = sqlx::query_scalar(
+            "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(fixture.key_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(actual, standby.to_string(), "{label}");
+        let actual_failure: String = sqlx::query_scalar(
+            "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
+        )
+        .bind(fixture.upstream_account_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(actual_failure, failure_kind, "{label}");
+        pool.close().await;
+        let rendered_metrics = fixture
+            .state
+            .metrics
+            .render(&crate::metrics::RuntimeMetrics::default());
+        assert!(rendered_metrics.contains(
+            "memeloop_token_center_codex_bad_request_retries_total{outcome=\"started\"} 1"
+        ));
+        assert!(rendered_metrics.contains(
+            "memeloop_token_center_codex_bad_request_retries_total{outcome=\"failed\"} 1"
+        ));
+        assert!(!rendered_metrics.contains(
+            "memeloop_token_center_codex_bad_request_retries_total{outcome=\"succeeded\"} 1"
+        ));
+        upstream.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn codex_definite_ordinary_400_retries_the_same_account_once_with_a_large_body() {
     let fixture = codex_route_fixture("definite-400-same-account-retry").await;
     // This fixture intentionally sends about 1 MiB of JSON. Raise this test
@@ -978,6 +1079,160 @@ async fn codex_definite_ordinary_400_retries_the_same_account_once_with_a_large_
     ));
     assert!(!rendered_metrics.contains("private ordinary rejection"));
     upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_retry_buffered_incomplete_sse_records_failed_terminal() {
+    let fixture = codex_route_fixture("retry-buffered-incomplete").await;
+    let upstream = MockServer::start().await;
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_for_response = attempts.clone();
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(move |_: &wiremock::Request| {
+            if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "private definite rejection"
+                    }
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_raw(
+                    b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-incomplete\"}}\n\n"
+                        .to_vec(),
+                    "text/event-stream",
+                )
+            }
+        })
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "buffered retry", "stream": false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_incomplete_response")
+    );
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    let rendered_metrics = fixture
+        .state
+        .metrics
+        .render(&crate::metrics::RuntimeMetrics::default());
+    assert!(
+        rendered_metrics.contains(
+            "memeloop_token_center_codex_bad_request_retries_total{outcome=\"started\"} 1"
+        )
+    );
+    assert!(
+        rendered_metrics.contains(
+            "memeloop_token_center_codex_bad_request_retries_total{outcome=\"failed\"} 1"
+        )
+    );
+    assert!(!rendered_metrics.contains(
+        "memeloop_token_center_codex_bad_request_retries_total{outcome=\"succeeded\"} 1"
+    ));
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_retry_buffered_completion_requires_a_single_matching_response_id() {
+    let matching = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-buffered\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+    );
+    let missing = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-buffered\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+    );
+    let mismatched = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-buffered\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-other\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+    );
+    let duplicate = concat!(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+    );
+    for (label, body, success) in [
+        ("matching", matching, true),
+        ("missing", missing, false),
+        ("mismatched", mismatched, false),
+        ("duplicate", duplicate, false),
+    ] {
+        let fixture_name = format!("retry-buffered-id-{label}");
+        let fixture = codex_route_fixture(&fixture_name).await;
+        let upstream = MockServer::start().await;
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_response = attempts.clone();
+        Mock::given(method("POST"))
+            .and(path(codex_transport::RESPONSES_PATH))
+            .respond_with(move |_: &wiremock::Request| {
+                if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "private definite rejection"
+                        }
+                    }))
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_raw(body.as_bytes().to_vec(), "text/event-stream")
+                }
+            })
+            .expect(2)
+            .mount(&upstream)
+            .await;
+
+        let response = send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({"model": fixture.model, "input": "buffered matching id", "stream": false}),
+        )
+        .await;
+        assert_eq!(response.status().is_success(), success, "{label}");
+        wait_for_request_settlement(&fixture, 1).await;
+        let rows = fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].status_code, Some(if success { 200 } else { 502 }));
+        assert_exactly_once_side_effects(
+            &fixture,
+            rows[0].request_id,
+            success.then_some("resp-buffered"),
+        )
+        .await;
+        let rendered_metrics = fixture
+            .state
+            .metrics
+            .render(&crate::metrics::RuntimeMetrics::default());
+        assert!(rendered_metrics.contains(
+            "memeloop_token_center_codex_bad_request_retries_total{outcome=\"started\"} 1"
+        ));
+        let expected_terminal = if success { "succeeded" } else { "failed" };
+        assert!(rendered_metrics.contains(&format!(
+            "memeloop_token_center_codex_bad_request_retries_total{{outcome=\"{expected_terminal}\"}} 1"
+        )));
+        upstream.verify().await;
+    }
 }
 
 #[tokio::test]
@@ -2323,8 +2578,8 @@ async fn streaming_text_delivery_does_not_wait_for_a_timed_out_archive() {
 }
 
 #[tokio::test]
-async fn codex_streaming_failure_is_redacted_for_client_and_archive() {
-    let fixture = codex_route_fixture("stream-failure").await;
+async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal() {
+    let fixture = codex_route_fixture("retry-stream-failure").await;
     let upstream = MockServer::start().await;
     let failed = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-failed\"}}\n\n",
@@ -2332,10 +2587,24 @@ async fn codex_streaming_failure_is_redacted_for_client_and_archive() {
         "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"provider-secret\",\"token\":\"secret-token\"}}}\n\n",
         "data: [DONE]\n\n"
     );
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_for_response = attempts.clone();
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(failed.as_bytes().to_vec()))
-        .expect(1)
+        .respond_with(move |_: &wiremock::Request| {
+            if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {
+                        "type": "temporarily_unavailable",
+                        "message": "retryable private detail"
+                    }
+                }))
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_raw(failed.as_bytes().to_vec(), "text/event-stream")
+            }
+        })
+        .expect(2)
         .mount(&upstream)
         .await;
     let response = send_codex_route(
@@ -2386,6 +2655,23 @@ async fn codex_streaming_failure_is_redacted_for_client_and_archive() {
     for secret in ["provider-secret", "secret-token"] {
         assert!(!archived.contains(secret));
     }
+    let rendered_metrics = fixture
+        .state
+        .metrics
+        .render(&crate::metrics::RuntimeMetrics::default());
+    assert!(
+        rendered_metrics.contains(
+            "memeloop_token_center_codex_bad_request_retries_total{outcome=\"started\"} 1"
+        )
+    );
+    assert!(
+        rendered_metrics.contains(
+            "memeloop_token_center_codex_bad_request_retries_total{outcome=\"failed\"} 1"
+        )
+    );
+    assert!(!rendered_metrics.contains(
+        "memeloop_token_center_codex_bad_request_retries_total{outcome=\"succeeded\"} 1"
+    ));
 }
 
 #[tokio::test]
@@ -2668,6 +2954,30 @@ fn responses_sse_requires_terminal_event_and_payload_to_match() {
         b"event: response.failed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-mismatch\",\"error\":null}}\n\n",
     );
     assert_eq!(capture.finish(), ResponsesSseOutcome::Failed);
+}
+
+#[test]
+fn responses_sse_strict_terminal_requires_a_matching_completed_response_id() {
+    let mut missing_completed_id = ResponsesSseCapture::for_responses();
+    missing_completed_id
+        .push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-strict\"}}\n\n");
+    missing_completed_id.push(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n");
+    assert_eq!(
+        missing_completed_id.finish(),
+        ResponsesSseOutcome::Incomplete
+    );
+
+    let mut matching_completed_id = ResponsesSseCapture::for_responses();
+    matching_completed_id
+        .push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-strict\"}}\n\n");
+    matching_completed_id
+        .push(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-strict\"}}\n\n");
+    assert_eq!(
+        matching_completed_id.finish(),
+        ResponsesSseOutcome::Completed {
+            response_id: Some("resp-strict".to_owned())
+        }
+    );
 }
 
 #[test]

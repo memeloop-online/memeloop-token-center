@@ -10,12 +10,21 @@ use uuid::Uuid;
 
 use super::{
     MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS,
-    MAX_RESPONSES_SSE_EVENT_BYTES, Protocol, TokenUsage, upstream_response::UpstreamResponse,
+    MAX_RESPONSES_SSE_EVENT_BYTES, Protocol, TokenUsage,
+    conversation_hints::safe_conversation_hint, upstream_response::UpstreamResponse,
     usage_from_value_checked,
 };
 use crate::{
-    error::AppError, metrics::CodexBadRequestClassification,
-    oauth::managed::codex::account_header_value, provider::UpstreamCredential,
+    error::AppError, oauth::managed::codex::account_header_value, provider::UpstreamCredential,
+};
+
+#[path = "codex_transport/bad_request.rs"]
+mod bad_request;
+
+#[cfg(test)]
+use bad_request::codex_transient_error;
+pub(super) use bad_request::{
+    BadRequestDisposition, BadRequestUnclassifiableReason, classify_bad_request,
 };
 
 pub(super) const DRIVER: &str = "openai-codex";
@@ -29,8 +38,6 @@ const MAX_OUTPUT_ITEMS: usize = 16_384;
 // health. Keep the exceptional definite-rejection inspection deliberately
 // small: it happens before any downstream bytes are delivered and its body is
 // never retained, archived, logged, or returned.
-const MAX_CODEX_RETRYABLE_ERROR_BYTES: usize = 16 * 1024;
-const MAX_CODEX_RETRYABLE_ERROR_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const MISSING_CONTENT_TYPE_SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
 
@@ -605,134 +612,6 @@ pub(super) fn is_event_stream(response: &UpstreamResponse) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum BadRequestDisposition {
-    Ordinary(CodexBadRequestClassification),
-    Retryable,
-}
-
-/// Classify the narrowly-defined subset of Codex 400 responses which are safe
-/// to retry before downstream delivery. The response is consumed regardless of
-/// the result: callers use the existing fixed, body-free error response for an
-/// ordinary 400. This prevents an upstream error body from reaching logs,
-/// archives, or the downstream client.
-pub(super) async fn classify_bad_request(response: UpstreamResponse) -> BadRequestDisposition {
-    if response.status() != http::StatusCode::BAD_REQUEST {
-        return BadRequestDisposition::Ordinary(CodexBadRequestClassification::Ordinary);
-    }
-    if !has_single_json_content_type(&response) {
-        return BadRequestDisposition::Ordinary(CodexBadRequestClassification::ContentType);
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_CODEX_RETRYABLE_ERROR_BYTES as u64)
-    {
-        return BadRequestDisposition::Ordinary(CodexBadRequestClassification::TooLarge);
-    }
-
-    match tokio::time::timeout(
-        MAX_CODEX_RETRYABLE_ERROR_WAIT,
-        read_bounded_bad_request_body(response),
-    )
-    .await
-    {
-        Ok(BoundedBadRequestBody::Value(value)) if codex_transient_error(&value) => {
-            BadRequestDisposition::Retryable
-        }
-        Ok(BoundedBadRequestBody::Value(_)) => {
-            BadRequestDisposition::Ordinary(CodexBadRequestClassification::Ordinary)
-        }
-        Ok(BoundedBadRequestBody::TooLarge) => {
-            BadRequestDisposition::Ordinary(CodexBadRequestClassification::TooLarge)
-        }
-        Ok(BoundedBadRequestBody::ReadFailed) => {
-            BadRequestDisposition::Ordinary(CodexBadRequestClassification::ReadFailed)
-        }
-        Ok(BoundedBadRequestBody::InvalidJson) => {
-            BadRequestDisposition::Ordinary(CodexBadRequestClassification::InvalidJson)
-        }
-        Err(_) => BadRequestDisposition::Ordinary(CodexBadRequestClassification::TimedOut),
-    }
-}
-
-enum BoundedBadRequestBody {
-    Value(Value),
-    TooLarge,
-    ReadFailed,
-    InvalidJson,
-}
-
-async fn read_bounded_bad_request_body(response: UpstreamResponse) -> BoundedBadRequestBody {
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else {
-            return BoundedBadRequestBody::ReadFailed;
-        };
-        if chunk.len() > MAX_CODEX_RETRYABLE_ERROR_BYTES.saturating_sub(body.len()) {
-            return BoundedBadRequestBody::TooLarge;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    match serde_json::from_slice(&body) {
-        Ok(value) => BoundedBadRequestBody::Value(value),
-        Err(_) => BoundedBadRequestBody::InvalidJson,
-    }
-}
-
-fn has_single_json_content_type(response: &UpstreamResponse) -> bool {
-    let mut values = response.headers().get_all(header::CONTENT_TYPE).iter();
-    let Some(value) = values.next() else {
-        return false;
-    };
-    if values.next().is_some() {
-        return false;
-    }
-    value
-        .to_str()
-        .ok()
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-        .is_some_and(|value| {
-            value.eq_ignore_ascii_case("application/json") || value.ends_with("+json")
-        })
-}
-
-fn codex_transient_error(value: &Value) -> bool {
-    let Some(error) = value.get("error").and_then(Value::as_object) else {
-        return false;
-    };
-    if error
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(is_explicit_transient_error_type)
-    {
-        return true;
-    }
-    error
-        .get("message")
-        .and_then(Value::as_str)
-        .is_some_and(is_known_high_demand_message)
-}
-
-fn is_explicit_transient_error_type(error_type: &str) -> bool {
-    matches!(
-        error_type,
-        "server_error"
-            | "internal_error"
-            | "temporarily_unavailable"
-            | "service_unavailable"
-            | "overloaded_error"
-            | "high_demand"
-            | "high_demand_error"
-    )
-}
-
-fn is_known_high_demand_message(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("high demand") || message.contains("high-demand")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ResponseAdmissionError {
     Invalid(&'static str),
     Ambiguous(&'static str),
@@ -912,6 +791,7 @@ struct BufferedResponsesParser {
     data: Vec<u8>,
     event_name: Option<Vec<u8>>,
     output_items: BTreeMap<usize, Value>,
+    response_id: Option<String>,
     completed_response: Option<Value>,
     terminal_failure: bool,
     invalid: bool,
@@ -1070,6 +950,12 @@ impl BufferedResponsesParser {
             self.terminal_failure = true;
             return Ok(());
         }
+        if matches!(
+            kind,
+            "response.created" | "response.in_progress" | "response.completed"
+        ) {
+            self.observe_response_id(&value, kind == "response.completed")?;
+        }
         match kind {
             "response.output_item.done" => {
                 if self.completed_response.is_some() || self.terminal_failure {
@@ -1111,6 +997,26 @@ impl BufferedResponsesParser {
                 self.terminal_failure = true;
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn observe_response_id(&mut self, value: &Value, required: bool) -> Result<(), &'static str> {
+        let response_id = match value.pointer("/response/id") {
+            Some(Value::String(response_id)) => safe_conversation_hint(response_id),
+            Some(_) => return Err("upstream_invalid_response"),
+            None if required => return Err("upstream_invalid_response"),
+            None => None,
+        };
+        if required && response_id.is_none() {
+            return Err("upstream_invalid_response");
+        }
+        if let Some(response_id) = response_id {
+            match self.response_id.as_deref() {
+                None => self.response_id = Some(response_id.to_owned()),
+                Some(current) if current == response_id => {}
+                Some(_) => return Err("upstream_invalid_response"),
+            }
         }
         Ok(())
     }
@@ -1306,6 +1212,57 @@ mod tests {
         assert_eq!(body["output"][1]["id"], "item-1");
         assert_eq!(result.usage.input_tokens, 3);
         assert_eq!(result.usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn buffered_parser_requires_a_single_matching_completed_response_id() {
+        let completed = |id: Option<&str>| {
+            match id {
+            Some(id) => format!(
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
+            ),
+            None => concat!(
+                "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+            )
+            .to_owned(),
+        }
+        };
+        let created = |id: &str| {
+            format!("data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{id}\"}}}}\n\n")
+        };
+
+        let mut matching = BufferedResponsesParser::default();
+        matching
+            .push(format!("{}{}", created("resp-1"), completed(Some("resp-1"))).as_bytes())
+            .unwrap();
+        assert!(matching.finish().is_ok());
+
+        // Response IDs share the streaming conversation-ID contract: outer
+        // whitespace is normalized before binding, whereas whitespace-only
+        // values are not an identifier.
+        let mut normalized = BufferedResponsesParser::default();
+        normalized
+            .push(
+                format!(
+                    "{}{}",
+                    created("  resp-trimmed "),
+                    completed(Some("resp-trimmed  "))
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert!(normalized.finish().is_ok());
+
+        for stream in [
+            format!("{}{}", created("resp-1"), completed(None)),
+            format!("{}{}", created("resp-1"), completed(Some("resp-2"))),
+            format!("{}{}", completed(Some("resp-1")), completed(Some("resp-1"))),
+            completed(Some(" \t ")),
+        ] {
+            let mut parser = BufferedResponsesParser::default();
+            parser.push(stream.as_bytes()).unwrap();
+            assert!(parser.finish().is_err());
+        }
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) capture_json_usage: bool,
     pub(super) protocol: Protocol,
     pub(super) is_codex_route: bool,
+    pub(super) codex_retry: CodexRetryTerminalGuard,
     pub(super) upstream_activity: crate::metrics::ActivityGuard,
     pub(super) request_id: Uuid,
     pub(super) buffered_request: BufferedRequest<'a>,
@@ -29,6 +30,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         capture_json_usage,
         protocol,
         is_codex_route,
+        mut codex_retry,
         upstream_activity,
         request_id,
         buffered_request,
@@ -433,6 +435,29 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             } else {
                 None
             };
+            // A retry's success is a protocol-terminal property, not a 2xx
+            // header or SSE framing property. Direct Codex streams must have
+            // exactly one matching `response.completed` carrying a stable
+            // response id; capture marks duplicate/mismatched terminal events
+            // incomplete before this point.
+            let retry_terminal = if is_codex_route
+                && error_code.is_none()
+                && (200..400).contains(&terminal_status)
+                && matches!(
+                    sse_summary.as_ref().map(|summary| &summary.outcome),
+                    Some(ResponsesSseOutcome::Completed {
+                        response_id: Some(_)
+                    })
+                ) {
+                CodexRetryTerminal::Succeeded
+            } else if matches!(
+                transport_error,
+                Some("downstream_disconnected" | "downstream_backpressure")
+            ) {
+                CodexRetryTerminal::Cancelled
+            } else {
+                CodexRetryTerminal::Failed
+            };
             let conversation_input =
                 conversation
                     .as_ref()
@@ -464,12 +489,18 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 &gap_response,
             )
             .await;
-            if terminal_result.is_err() {
+            let terminal_result_failed = terminal_result.is_err();
+            if terminal_result_failed {
                 // The commit can be durable even when its acknowledgement is lost.
                 // Preserve this request-scoped archive until its database owner is
                 // known; deleting it here could leave a committed row dangling.
                 tracing::error!(%request_id, stage = "terminal_transaction", "proxy request finalization failed");
             }
+            codex_retry.complete(if terminal_result_failed {
+                CodexRetryTerminal::Failed
+            } else {
+                retry_terminal
+            });
         };
         if run_bounded_proxy_lifecycle(lifecycle_deadline, lifecycle)
             .await

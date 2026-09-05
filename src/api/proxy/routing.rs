@@ -2,6 +2,8 @@ use super::*;
 
 mod codex;
 
+pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard};
+
 pub(super) const MAX_UPSTREAM_ATTEMPTS: usize = 3;
 
 pub(super) struct PreparedProxyRoute {
@@ -132,6 +134,7 @@ pub(super) async fn prepare_proxy_route(
     })
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub(super) enum ProxySendError {
     RetryableConnection,
     RetryableCodexBadRequest,
@@ -143,13 +146,19 @@ pub(super) enum ProxySendError {
     Credential,
 }
 
+pub(super) struct ProxyRouteResponse {
+    pub(super) response: UpstreamResponse,
+    pub(super) upstream_activity: crate::metrics::ActivityGuard,
+    pub(super) codex_retry: CodexRetryTerminalGuard,
+}
+
 pub(super) async fn send_proxy_route(
     state: &AppState,
     headers: &HeaderMap,
     protocol: Protocol,
     request_id: Uuid,
     route: &PreparedProxyRoute,
-) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
+) -> Result<ProxyRouteResponse, ProxySendError> {
     if route.is_codex() {
         return codex::send_proxy_route(state, headers, request_id, route).await;
     }
@@ -161,7 +170,7 @@ async fn send_reqwest_proxy_route(
     protocol: Protocol,
     request_id: Uuid,
     route: &PreparedProxyRoute,
-) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
+) -> Result<ProxyRouteResponse, ProxySendError> {
     let outbound_base_url = route.route.base_url.clone();
     let outbound_http = network::client_for_config_url(
         &state.http,
@@ -217,7 +226,11 @@ async fn send_reqwest_proxy_route(
         upstream_started.elapsed(),
     );
     match upstream_result {
-        Ok(response) => Ok((UpstreamResponse::Reqwest(response), upstream_activity)),
+        Ok(response) => Ok(ProxyRouteResponse {
+            response: UpstreamResponse::Reqwest(response),
+            upstream_activity,
+            codex_retry: CodexRetryTerminalGuard::inactive(),
+        }),
         Err(error) if error.is_connect() => Err(ProxySendError::RetryableConnection),
         // Do not replay ambiguous POST delivery.
         Err(_) => Err(ProxySendError::NonRetryableTransport),
@@ -228,5 +241,5 @@ pub(super) fn retryable_upstream_status(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
-    )
+    ) || status.is_server_error()
 }

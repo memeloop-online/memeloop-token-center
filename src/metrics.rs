@@ -9,6 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod codex;
+
+pub(crate) use codex::{CodexBadRequestClassification, CodexBadRequestRetry};
+
 const LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0,
 ];
@@ -134,54 +138,6 @@ pub enum UpstreamHealthReason {
     Connection,
     Cooldown,
     Success,
-}
-
-/// A fixed, body-free explanation for how a native Codex HTTP 400 was
-/// classified. These labels deliberately exclude upstream response text,
-/// account identities, and request identities.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum CodexBadRequestClassification {
-    Retryable,
-    Ordinary,
-    ContentType,
-    TooLarge,
-    TimedOut,
-    ReadFailed,
-    InvalidJson,
-}
-
-impl CodexBadRequestClassification {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Retryable => "retryable",
-            Self::Ordinary => "ordinary",
-            Self::ContentType => "content_type",
-            Self::TooLarge => "too_large",
-            Self::TimedOut => "timed_out",
-            Self::ReadFailed => "read_failed",
-            Self::InvalidJson => "invalid_json",
-        }
-    }
-}
-
-/// The outcome of the one permitted same-account retry for a complete,
-/// bounded native Codex HTTP 400. No account or request identity is a metric
-/// label.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum CodexBadRequestRetry {
-    Started,
-    Succeeded,
-    Exhausted,
-}
-
-impl CodexBadRequestRetry {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Started => "started",
-            Self::Succeeded => "succeeded",
-            Self::Exhausted => "exhausted",
-        }
-    }
 }
 
 impl UpstreamHealthReason {
@@ -452,29 +408,6 @@ impl Metrics {
         *value = value.saturating_add(1);
     }
 
-    pub fn observe_codex_bad_request_classification(
-        &self,
-        classification: CodexBadRequestClassification,
-    ) {
-        let mut values = self
-            .inner
-            .codex_bad_request_classifications
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let value = values.entry(classification).or_default();
-        *value = value.saturating_add(1);
-    }
-
-    pub fn observe_codex_bad_request_retry(&self, outcome: CodexBadRequestRetry) {
-        let mut values = self
-            .inner
-            .codex_bad_request_retries
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let value = values.entry(outcome).or_default();
-        *value = value.saturating_add(1);
-    }
-
     pub fn set_dependency_ready(&self, dependency: &'static str, ready: bool) {
         let value = i64::from(ready);
         match dependency {
@@ -582,7 +515,7 @@ impl Metrics {
         render_http(&mut output, &http);
         render_upstream(&mut output, &upstream);
         render_upstream_health(&mut output, &upstream_health);
-        render_codex_bad_requests(
+        codex::render_bad_requests(
             &mut output,
             &codex_bad_request_classifications,
             &codex_bad_request_retries,
@@ -605,32 +538,6 @@ fn render_upstream_health(output: &mut String, values: &BTreeMap<UpstreamHealthL
             output,
             "memeloop_token_center_upstream_candidate_health_events_total{{event=\"{}\",reason=\"{}\"}} {value}",
             labels.event, labels.reason
-        );
-    }
-}
-
-fn render_codex_bad_requests(
-    output: &mut String,
-    classifications: &BTreeMap<CodexBadRequestClassification, u64>,
-    retries: &BTreeMap<CodexBadRequestRetry, u64>,
-) {
-    output.push_str("# HELP memeloop_token_center_codex_bad_request_classifications_total Native Codex HTTP 400 classifications with fixed, body-free labels.\n");
-    output
-        .push_str("# TYPE memeloop_token_center_codex_bad_request_classifications_total counter\n");
-    for (classification, value) in classifications {
-        let _ = writeln!(
-            output,
-            "memeloop_token_center_codex_bad_request_classifications_total{{classification=\"{}\"}} {value}",
-            classification.label()
-        );
-    }
-    output.push_str("# HELP memeloop_token_center_codex_bad_request_retries_total Bounded same-account retries after a complete native Codex HTTP 400.\n");
-    output.push_str("# TYPE memeloop_token_center_codex_bad_request_retries_total counter\n");
-    for (outcome, value) in retries {
-        let _ = writeln!(
-            output,
-            "memeloop_token_center_codex_bad_request_retries_total{{outcome=\"{}\"}} {value}",
-            outcome.label()
         );
     }
 }
@@ -1241,9 +1148,12 @@ mod tests {
     #[test]
     fn codex_bad_request_labels_are_fixed_and_body_free() {
         let metrics = Metrics::default();
-        metrics.observe_codex_bad_request_classification(CodexBadRequestClassification::Retryable);
-        metrics
-            .observe_codex_bad_request_classification(CodexBadRequestClassification::InvalidJson);
+        metrics.observe_codex_bad_request_classification(
+            CodexBadRequestClassification::DefiniteTransient,
+        );
+        metrics.observe_codex_bad_request_classification(
+            CodexBadRequestClassification::UnclassifiableInvalidJson,
+        );
         metrics.observe_codex_bad_request_retry(CodexBadRequestRetry::Started);
         metrics.observe_codex_bad_request_retry(CodexBadRequestRetry::Succeeded);
         let rendered = metrics.render(&RuntimeMetrics::default());

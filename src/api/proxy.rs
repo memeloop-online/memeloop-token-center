@@ -19,8 +19,8 @@ use lifecycle::{
     run_bounded_proxy_lifecycle, run_bounded_text_archive,
 };
 use routing::{
-    MAX_UPSTREAM_ATTEMPTS, ProxySendError, prepare_proxy_route, retryable_upstream_status,
-    send_proxy_route,
+    CodexRetryTerminal, CodexRetryTerminalGuard, MAX_UPSTREAM_ATTEMPTS, ProxySendError,
+    prepare_proxy_route, retryable_upstream_status, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -281,7 +281,7 @@ pub(super) async fn proxy(
         )
         .await;
     }
-    let (upstream, upstream_activity) = loop {
+    let (upstream, upstream_activity, mut codex_retry) = loop {
         let admission = state
             .db
             .claim_upstream_account_attempt(active_route.route.account_id)
@@ -317,11 +317,11 @@ pub(super) async fn proxy(
         }
         let result = send_proxy_route(&state, &headers, protocol, request_id, &active_route).await;
         let failure = match &result {
-            Ok((response, _)) if response.status() == StatusCode::TOO_MANY_REQUESTS => Some((
+            Ok(result) if result.response.status() == StatusCode::TOO_MANY_REQUESTS => Some((
                 UpstreamFailureKind::RateLimited,
                 UpstreamHealthReason::RateLimited,
             )),
-            Ok((response, _)) if retryable_upstream_status(response.status()) => Some((
+            Ok(result) if retryable_upstream_status(result.response.status()) => Some((
                 UpstreamFailureKind::Unavailable,
                 UpstreamHealthReason::Unavailable,
             )),
@@ -329,6 +329,9 @@ pub(super) async fn proxy(
                 UpstreamFailureKind::InvalidResponse,
                 UpstreamHealthReason::InvalidResponse,
             )),
+            // The one same-account replay is exhausted. A second complete,
+            // definite transient 400 was received before downstream delivery,
+            // so the normal authorized-candidate failover remains safe.
             Err(ProxySendError::RetryableCodexBadRequest) => Some((
                 UpstreamFailureKind::Unavailable,
                 UpstreamHealthReason::Unavailable,
@@ -370,8 +373,8 @@ pub(super) async fn proxy(
             && let Some((_, reason)) = failure
             && let Some(next_route) = route_attempts.next()
         {
-            if let Ok((response, _activity)) = result {
-                drop(response);
+            if let Ok(result) = result {
+                drop(result);
             }
             if state
                 .db
@@ -401,10 +404,10 @@ pub(super) async fn proxy(
             continue;
         }
         match result {
-            Ok((response, upstream_activity)) => {
+            Ok(result) => {
                 if admission == UpstreamAttemptAdmission::Probe
                     && failure.is_none()
-                    && response.status().is_success()
+                    && result.response.status().is_success()
                 {
                     match state
                         .db
@@ -424,7 +427,11 @@ pub(super) async fn proxy(
                         ),
                     }
                 }
-                break (response, upstream_activity);
+                break (
+                    result.response,
+                    result.upstream_activity,
+                    result.codex_retry,
+                );
             }
             Err(ProxySendError::Credential) => {
                 return finish_proxy_failure(&buffered_request, "provider_credential").await;
@@ -473,7 +480,7 @@ pub(super) async fn proxy(
             status,
         );
         drop(upstream);
-        return finish_buffered_request(
+        let result = finish_buffered_request(
             &buffered_request,
             status,
             Bytes::from_static(
@@ -484,6 +491,8 @@ pub(super) async fn proxy(
             Some(format!("http_{}", status.as_u16())),
         )
         .await;
+        codex_retry.complete(CodexRetryTerminal::Failed);
+        return result;
     }
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     if is_codex_route && !codex_downstream_stream {
@@ -491,10 +500,12 @@ pub(super) async fn proxy(
             Ok(buffered) => buffered,
             Err(error_code) => {
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
-                return finish_proxy_failure(&buffered_request, error_code).await;
+                let result = finish_proxy_failure(&buffered_request, error_code).await;
+                codex_retry.complete(CodexRetryTerminal::Failed);
+                return result;
             }
         };
-        return finish_buffered_request(
+        let result = finish_buffered_request(
             &buffered_request,
             StatusCode::OK,
             buffered.body,
@@ -503,6 +514,17 @@ pub(super) async fn proxy(
             None,
         )
         .await;
+        codex_retry.complete(
+            if result
+                .as_ref()
+                .is_ok_and(|response| response.status().is_success())
+            {
+                CodexRetryTerminal::Succeeded
+            } else {
+                CodexRetryTerminal::Failed
+            },
+        );
+        return result;
     }
     let is_sse = content_type
         .as_ref()
@@ -565,6 +587,7 @@ pub(super) async fn proxy(
         capture_json_usage,
         protocol,
         is_codex_route,
+        codex_retry,
         upstream_activity,
         request_id,
         buffered_request,
@@ -1288,6 +1311,9 @@ impl ResponsesSseCapture {
         let discard = std::mem::take(&mut self.discard_event);
         if discard {
             match event_kind {
+                Some(ResponsesSseEventKind::Completed) if self.require_explicit_completed => {
+                    self.invalid = true;
+                }
                 Some(ResponsesSseEventKind::Completed) => self.terminal_success = true,
                 Some(ResponsesSseEventKind::Failed) => self.terminal_failure = true,
                 Some(ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other) | None => {}
@@ -1296,6 +1322,9 @@ impl ResponsesSseCapture {
         }
         if data.is_empty() {
             match event_kind {
+                Some(ResponsesSseEventKind::Completed) if self.require_explicit_completed => {
+                    self.invalid = true;
+                }
                 Some(ResponsesSseEventKind::Completed) => self.terminal_success = true,
                 Some(ResponsesSseEventKind::Failed) => self.terminal_failure = true,
                 Some(ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other) | None => {}
@@ -1355,23 +1384,26 @@ impl ResponsesSseCapture {
         let kind = payload_kind
             .or(event_kind)
             .unwrap_or(ResponsesSseEventKind::Other);
-        if kind.is_response_lifecycle()
-            && let Some(response_id) = value
+        let event_response_id = kind.is_response_lifecycle().then(|| {
+            value
                 .pointer("/response/id")
                 .or_else(|| value.get("id"))
                 .and_then(Value::as_str)
                 .and_then(safe_conversation_hint)
-        {
+        });
+        if let Some(Some(response_id)) = event_response_id.as_ref() {
             match self.response_id.as_deref() {
-                None => self.response_id = Some(response_id),
-                Some(current) if current == response_id => {}
+                None => self.response_id = Some(response_id.clone()),
+                Some(current) if current == response_id.as_str() => {}
                 Some(_) => self.invalid = true,
             }
         }
         match kind {
             ResponsesSseEventKind::Completed => {
                 if self.require_explicit_completed
-                    && (self.terminal_success || self.terminal_failure)
+                    && (self.terminal_success
+                        || self.terminal_failure
+                        || !matches!(event_response_id, Some(Some(_))))
                 {
                     self.invalid = true;
                 }
