@@ -29,6 +29,9 @@ use upstream_response::UpstreamResponse;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod sse_delivery_tests;
+
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
 
@@ -1228,12 +1231,8 @@ impl ResponsesSseEventKind {
 
 #[derive(Default)]
 struct ResponsesSseCapture {
-    line: Vec<u8>,
-    data: Vec<u8>,
-    event_kind: Option<ResponsesSseEventKind>,
+    framer: super::sse::BoundedSseFramer,
     response_id: Option<String>,
-    discard_line: bool,
-    discard_event: bool,
     invalid: bool,
     terminal_success: bool,
     terminal_failure: bool,
@@ -1254,9 +1253,7 @@ enum ResponsesDeliveryContract {
 
 #[derive(Default)]
 struct SseDeliveryState {
-    event: Vec<u8>,
     frames: Vec<SseDeliveryFrame>,
-    discard_event: bool,
 }
 
 pub(super) struct SseDeliveryFrame {
@@ -1312,23 +1309,22 @@ impl ResponsesSseCapture {
     }
 
     fn push(&mut self, chunk: &[u8]) {
-        for &byte in chunk {
+        let batch = self.framer.push(chunk);
+        self.invalid |= batch.rejection.is_some();
+        if matches!(
+            batch.rejection,
+            Some(super::sse::SseFramerRejection::BatchLimit)
+        ) {
+            // Do not classify or deliver a partial batch after the bounded
+            // framer has refused its remaining events.
+            return;
+        }
+        for event in batch.events {
             if self.saw_done {
                 break;
             }
-            self.push_delivery_byte(byte);
-            if byte == b'\n' {
-                self.finish_line();
-            } else if self.discard_line {
-                continue;
-            } else if self.line.len() >= MAX_RESPONSES_SSE_EVENT_BYTES {
-                self.line.clear();
-                self.discard_line = true;
-                self.discard_event = true;
-                self.invalid = true;
-            } else {
-                self.line.push(byte);
-            }
+            let class = self.dispatch_event(&event);
+            self.finish_delivery_event(event.bytes, class);
         }
     }
 
@@ -1340,11 +1336,8 @@ impl ResponsesSseCapture {
     }
 
     fn finish_summary(mut self) -> ResponsesSseSummary {
-        if !self.discard_line && !self.line.is_empty() {
-            self.finish_line();
-        }
-        if !self.data.is_empty() || self.discard_event || self.event_kind.is_some() {
-            let _ = self.dispatch_event();
+        if !self.framer.is_complete() {
+            self.invalid = true;
         }
         if let Some(chat_usage) = self.chat_usage.as_ref() {
             self.usage = chat_usage.usage();
@@ -1383,105 +1376,41 @@ impl ResponsesSseCapture {
         self.finish_summary().outcome
     }
 
-    fn push_delivery_byte(&mut self, byte: u8) {
+    fn finish_delivery_event(&mut self, bytes: Bytes, class: ChatSseDeliveryClass) {
         let Some(delivery) = self.delivery.as_mut() else {
             return;
         };
-        if delivery.discard_event {
-            return;
-        }
-        if delivery.event.len() >= MAX_RESPONSES_SSE_EVENT_BYTES {
-            delivery.event.clear();
-            delivery.discard_event = true;
-            self.invalid = true;
-            return;
-        }
-        delivery.event.push(byte);
-    }
-
-    fn finish_delivery_event(&mut self, class: ChatSseDeliveryClass) {
-        let Some(delivery) = self.delivery.as_mut() else {
-            return;
-        };
-        if delivery.discard_event {
-            delivery.discard_event = false;
-            delivery.event.clear();
-            return;
-        }
-        let event = std::mem::take(&mut delivery.event);
-        if !event.is_empty() {
+        if !bytes.is_empty() {
             delivery.frames.push(SseDeliveryFrame {
-                bytes: Bytes::from(event),
+                bytes,
                 billable: matches!(class, ChatSseDeliveryClass::Billable),
             });
         }
     }
 
-    fn finish_line(&mut self) {
-        if self.discard_line {
-            self.discard_line = false;
-            self.line.clear();
-            return;
-        }
-        let mut line = std::mem::take(&mut self.line);
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        if line.is_empty() {
-            let class = self.dispatch_event();
-            self.finish_delivery_event(class);
-            return;
-        }
-        if self.discard_event {
-            return;
-        }
-        if line == b"data" || line.starts_with(b"data:") {
-            let value = if line == b"data" {
-                &[][..]
-            } else {
-                line[5..].strip_prefix(b" ").unwrap_or(&line[5..])
-            };
-            let separator = usize::from(!self.data.is_empty());
-            if self
-                .data
-                .len()
-                .saturating_add(separator)
-                .saturating_add(value.len())
-                > MAX_RESPONSES_SSE_EVENT_BYTES
-            {
-                self.data.clear();
-                self.discard_event = true;
-                self.invalid = true;
-                return;
-            }
-            if separator == 1 {
-                self.data.push(b'\n');
-            }
-            self.data.extend_from_slice(value);
-        } else if line == b"event" || line.starts_with(b"event:") {
-            let value = if line == b"event" {
-                &[][..]
-            } else {
-                line[6..].strip_prefix(b" ").unwrap_or(&line[6..])
-            };
-            self.event_kind = Some(ResponsesSseEventKind::from_name(value));
-        }
-    }
-
-    fn dispatch_event(&mut self) -> ChatSseDeliveryClass {
-        let data = std::mem::take(&mut self.data);
-        let event_kind = self.event_kind.take();
-        let discard = std::mem::take(&mut self.discard_event);
-        if discard {
-            match event_kind {
-                Some(ResponsesSseEventKind::Completed) if self.require_explicit_completed => {
-                    self.invalid = true;
+    fn dispatch_event(&mut self, event: &super::sse::BoundedSseEvent) -> ChatSseDeliveryClass {
+        let mut data = Vec::new();
+        let mut event_kind = None;
+        for line in &event.lines {
+            let line = line.value.as_slice();
+            if line == b"data" || line.starts_with(b"data:") {
+                let value = if line == b"data" {
+                    &[][..]
+                } else {
+                    line[5..].strip_prefix(b" ").unwrap_or(&line[5..])
+                };
+                if !data.is_empty() {
+                    data.push(b'\n');
                 }
-                Some(ResponsesSseEventKind::Completed) => self.terminal_success = true,
-                Some(ResponsesSseEventKind::Failed) => self.terminal_failure = true,
-                Some(ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other) | None => {}
+                data.extend_from_slice(value);
+            } else if line == b"event" || line.starts_with(b"event:") {
+                let value = if line == b"event" {
+                    &[][..]
+                } else {
+                    line[6..].strip_prefix(b" ").unwrap_or(&line[6..])
+                };
+                event_kind = Some(ResponsesSseEventKind::from_name(value));
             }
-            return ChatSseDeliveryClass::Control;
         }
         if data.is_empty() {
             match event_kind {

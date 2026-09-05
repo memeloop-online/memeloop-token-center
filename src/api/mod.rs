@@ -50,6 +50,7 @@ mod routes;
 mod routing;
 mod self_service;
 mod sessions;
+mod sse;
 mod traffic;
 mod upstreams;
 mod usage_analysis;

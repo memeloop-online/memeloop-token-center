@@ -20,6 +20,7 @@ use crate::{
 };
 
 mod chat_sse_usage;
+mod sse_delivery;
 
 #[test]
 fn buffered_usage_capture_only_accepts_plausible_json_content_types() {
@@ -3305,8 +3306,6 @@ fn responses_sse_capture_bounds_and_skips_an_oversized_single_event() {
     capture.push(b"data: ");
     let oversized_event = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES + 1];
     capture.push(&oversized_event);
-    assert!(capture.line.len() <= MAX_RESPONSES_SSE_EVENT_BYTES);
-    assert!(capture.data.len() <= MAX_RESPONSES_SSE_EVENT_BYTES);
     capture.push(b"\n\ndata: {\"type\":\"response.completed\"}\n\n");
     assert_eq!(capture.finish(), ResponsesSseOutcome::Incomplete);
 

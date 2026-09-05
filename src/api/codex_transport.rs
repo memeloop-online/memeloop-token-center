@@ -8,6 +8,7 @@ use http::header;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
+use super::super::sse::{BoundedSseEvent, BoundedSseFramer, SseFramerRejection};
 use super::{
     MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS,
     MAX_RESPONSES_SSE_EVENT_BYTES, Protocol, TokenUsage,
@@ -438,45 +439,42 @@ enum StreamTerminal {
 /// contract so failures cannot leak provider response bodies downstream.
 #[derive(Default)]
 pub(super) struct ResponsesStreamingSanitizer {
-    pending: Vec<u8>,
+    framer: BoundedSseFramer,
     terminal: Option<StreamTerminal>,
     saw_protocol_event: bool,
+    response_id: Option<String>,
 }
 
 impl ResponsesStreamingSanitizer {
     pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Bytes, &'static str> {
         let mut output = Vec::new();
-        for byte in chunk {
-            self.pending.push(*byte);
-            if self.pending.len() > MAX_RESPONSES_SSE_EVENT_BYTES {
-                return Err("upstream_response_event_too_large");
-            }
-            if self.pending.ends_with(b"\n\n") || self.pending.ends_with(b"\r\n\r\n") {
-                let event = std::mem::take(&mut self.pending);
-                self.sanitize_event(&event, &mut output)?;
-            }
+        let batch = self.framer.push(chunk);
+        if let Some(rejection) = batch.rejection {
+            return Err(match rejection {
+                SseFramerRejection::EventLimit => "upstream_response_event_too_large",
+                SseFramerRejection::BatchLimit => "upstream_response_event_batch_too_large",
+            });
+        }
+        for event in batch.events {
+            self.sanitize_event(event, &mut output)?;
         }
         Ok(Bytes::from(output))
     }
 
     pub(super) fn is_complete(&self) -> bool {
-        // Some compatible Responses servers terminate the final event with an
-        // extra blank line. The first two newlines already framed and
-        // validated the event; a remaining CR/LF-only suffix is not a partial
-        // SSE field. Terminal success is still required independently by
-        // ResponsesSseCapture, so this does not accept a missing completed
-        // event or an arbitrary truncated line.
-        self.pending
-            .iter()
-            .all(|byte| matches!(byte, b'\r' | b'\n'))
+        self.framer.is_complete()
     }
 
     fn saw_protocol_event(&self) -> bool {
         self.saw_protocol_event
     }
 
-    fn sanitize_event(&mut self, event: &[u8], output: &mut Vec<u8>) -> Result<(), &'static str> {
-        let (event_name, data) = parse_sse_event(event)?;
+    fn sanitize_event(
+        &mut self,
+        event: BoundedSseEvent,
+        output: &mut Vec<u8>,
+    ) -> Result<(), &'static str> {
+        let (event_name, data) = parse_sse_event(&event)?;
         if data.as_deref() == Some(b"[DONE]") {
             if self.terminal.is_none() {
                 return Err("upstream_incomplete_response");
@@ -485,6 +483,7 @@ impl ResponsesStreamingSanitizer {
             return Ok(());
         }
         let Some(data) = data else {
+            append_safe_sse_fields(&event, output);
             return Ok(());
         };
         let value: Value =
@@ -502,6 +501,7 @@ impl ResponsesStreamingSanitizer {
         {
             return Err("upstream_invalid_response");
         }
+        self.observe_response_id(payload_name, &value)?;
         self.saw_protocol_event = true;
         let failure = matches!(terminal_kind(payload_name), Some(StreamTerminal::Failed))
             || value.get("error").is_some_and(|error| !error.is_null())
@@ -521,29 +521,69 @@ impl ResponsesStreamingSanitizer {
         if failure {
             output.extend_from_slice(SAFE_FAILURE_EVENT);
         } else {
-            append_safe_sse_fields(event, output);
+            append_safe_sse_fields(&event, output);
         }
         self.terminal = terminal;
         Ok(())
     }
-}
 
-fn append_safe_sse_fields(event: &[u8], output: &mut Vec<u8>) {
-    for raw_line in event.split_inclusive(|byte| *byte == b'\n') {
-        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() || is_sse_field_line(line, b"event") || is_sse_field_line(line, b"data")
-        {
-            output.extend_from_slice(raw_line);
+    fn observe_response_id(
+        &mut self,
+        payload_name: &str,
+        value: &Value,
+    ) -> Result<(), &'static str> {
+        let lifecycle = matches!(
+            payload_name,
+            "response.created"
+                | "response.queued"
+                | "response.in_progress"
+                | "response.completed"
+                | "response.failed"
+                | "response.incomplete"
+                | "response.error"
+        );
+        if !lifecycle {
+            return Ok(());
         }
+        let response_id = value
+            .pointer("/response/id")
+            .or_else(|| value.get("id"))
+            .and_then(Value::as_str)
+            .and_then(safe_conversation_hint);
+        if payload_name == "response.completed" && response_id.is_none() {
+            return Err("upstream_incomplete_response");
+        }
+        if let Some(response_id) = response_id {
+            match self.response_id.as_deref() {
+                None => self.response_id = Some(response_id),
+                Some(current) if current == response_id => {}
+                Some(_) => return Err("upstream_invalid_response"),
+            }
+        }
+        Ok(())
     }
 }
 
-fn parse_sse_event(event: &[u8]) -> Result<(Option<String>, Option<Vec<u8>>), &'static str> {
+fn append_safe_sse_fields(event: &BoundedSseEvent, output: &mut Vec<u8>) {
+    for line in &event.lines {
+        if line.value.starts_with(b":")
+            || is_sse_field_line(&line.value, b"event")
+            || is_sse_field_line(&line.value, b"data")
+        {
+            output.extend_from_slice(&line.value);
+            output.extend_from_slice(&line.ending);
+        }
+    }
+    output.extend_from_slice(&event.terminator);
+}
+
+fn parse_sse_event(
+    event: &BoundedSseEvent,
+) -> Result<(Option<String>, Option<Vec<u8>>), &'static str> {
     let mut event_name = None;
     let mut data = Vec::new();
-    for raw_line in event.split(|byte| *byte == b'\n') {
-        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+    for raw_line in &event.lines {
+        let line = raw_line.value.as_slice();
         if line == b"event" || line.starts_with(b"event:") {
             if event_name.is_some() {
                 return Err("upstream_invalid_response");
@@ -777,9 +817,7 @@ pub(super) async fn buffer_response(
 
 #[derive(Default)]
 struct BufferedResponsesParser {
-    line: Vec<u8>,
-    data: Vec<u8>,
-    event_name: Option<Vec<u8>>,
+    framer: BoundedSseFramer,
     output_items: BTreeMap<usize, Value>,
     response_id: Option<String>,
     completed_response: Option<Value>,
@@ -789,25 +827,22 @@ struct BufferedResponsesParser {
 
 impl BufferedResponsesParser {
     fn push(&mut self, chunk: &[u8]) -> Result<(), &'static str> {
-        for byte in chunk {
-            if *byte == b'\n' {
-                self.finish_line()?;
-            } else {
-                if self.line.len() >= MAX_RESPONSES_SSE_EVENT_BYTES {
-                    return Err("upstream_response_event_too_large");
-                }
-                self.line.push(*byte);
-            }
+        let batch = self.framer.push(chunk);
+        if let Some(rejection) = batch.rejection {
+            return Err(match rejection {
+                SseFramerRejection::EventLimit => "upstream_response_event_too_large",
+                SseFramerRejection::BatchLimit => "upstream_response_event_batch_too_large",
+            });
+        }
+        for event in batch.events {
+            self.dispatch(event)?;
         }
         Ok(())
     }
 
     fn finish(mut self) -> Result<BufferedCodexResponse, &'static str> {
-        if !self.line.is_empty() {
-            self.finish_line()?;
-        }
-        if !self.data.is_empty() || self.event_name.is_some() {
-            self.dispatch()?;
+        if !self.framer.is_complete() {
+            return Err("upstream_incomplete_response");
         }
         if self.invalid || self.terminal_failure {
             return Err("upstream_failed_response");
@@ -853,54 +888,11 @@ impl BufferedResponsesParser {
         })
     }
 
-    fn finish_line(&mut self) -> Result<(), &'static str> {
-        let mut line = std::mem::take(&mut self.line);
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        if line.is_empty() {
-            return self.dispatch();
-        }
-        if line == b"data" || line.starts_with(b"data:") {
-            let value = if line == b"data" {
-                &[][..]
-            } else {
-                line[5..].strip_prefix(b" ").unwrap_or(&line[5..])
-            };
-            let separator = usize::from(!self.data.is_empty());
-            if self
-                .data
-                .len()
-                .saturating_add(separator)
-                .saturating_add(value.len())
-                > MAX_RESPONSES_SSE_EVENT_BYTES
-            {
-                return Err("upstream_response_event_too_large");
-            }
-            if separator == 1 {
-                self.data.push(b'\n');
-            }
-            self.data.extend_from_slice(value);
-        } else if line == b"event" || line.starts_with(b"event:") {
-            if self.event_name.is_some() {
-                return Err("upstream_invalid_response");
-            }
-            let value = if line == b"event" {
-                &[][..]
-            } else {
-                line[6..].strip_prefix(b" ").unwrap_or(&line[6..])
-            };
-            if value.len() > 128 {
-                return Err("upstream_invalid_response");
-            }
-            self.event_name = Some(value.to_vec());
-        }
-        Ok(())
-    }
-
-    fn dispatch(&mut self) -> Result<(), &'static str> {
-        let data = std::mem::take(&mut self.data);
-        let event_name = self.event_name.take();
+    fn dispatch(&mut self, event: BoundedSseEvent) -> Result<(), &'static str> {
+        let (event_name, data) = parse_sse_event(&event)?;
+        let Some(data) = data else {
+            return Ok(());
+        };
         if data.is_empty() {
             return Ok(());
         }
@@ -920,10 +912,7 @@ impl BufferedResponsesParser {
         if payload_kind != "error" && !payload_kind.starts_with("response.") {
             return Err("upstream_invalid_response");
         }
-        let event_kind = match event_name.as_deref() {
-            Some(name) => Some(std::str::from_utf8(name).map_err(|_| "upstream_invalid_response")?),
-            None => None,
-        };
+        let event_kind = event_name.as_deref();
         if event_kind.is_some_and(|event_kind| event_kind != payload_kind) {
             return Err("upstream_invalid_response");
         }
@@ -1412,7 +1401,7 @@ mod tests {
         );
         let mut after_completed = ResponsesStreamingSanitizer::default();
         after_completed
-            .push(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n")
+            .push(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-complete\"}}\n\n")
             .unwrap();
         assert!(
             after_completed
@@ -1433,7 +1422,7 @@ mod tests {
                 concat!(
                     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n",
                     "<html>post-admission-secret</html>\n\n",
-                    "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\"}}\n\n"
                 )
                 .as_bytes(),
             )
@@ -1458,8 +1447,10 @@ mod tests {
         );
 
         let mut done = ResponsesStreamingSanitizer::default();
-        done.push(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n")
-            .unwrap();
+        done.push(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-done\"}}\n\n",
+        )
+        .unwrap();
         let output = done
             .push(b"event: provider-secret\ndata: [DONE]\n\n")
             .unwrap();
@@ -1558,8 +1549,8 @@ mod tests {
     #[test]
     fn streaming_sanitizer_accepts_only_blank_lines_after_a_framed_terminal_event() {
         for stream in [
-            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n\n".as_slice(),
-            b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{}}\r\n\r\n\r\n".as_slice(),
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-terminal\"}}\n\n\n".as_slice(),
+            b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-terminal\"}}\r\n\r\n\r\n".as_slice(),
         ] {
             for split in 0..=stream.len() {
                 let mut sanitizer = ResponsesStreamingSanitizer::default();
@@ -1579,7 +1570,7 @@ mod tests {
         let mut trailing_partial = ResponsesStreamingSanitizer::default();
         trailing_partial
             .push(
-                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n\ndata:",
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-terminal\"}}\n\n\ndata:",
             )
             .unwrap();
         assert!(!trailing_partial.is_complete());

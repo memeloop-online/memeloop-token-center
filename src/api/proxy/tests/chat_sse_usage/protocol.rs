@@ -19,6 +19,31 @@ fn stateful_sse_delivery_framer_keeps_split_comments_and_done_nonbillable() {
 }
 
 #[test]
+fn shared_delivery_framer_handles_all_line_endings_without_eof_dispatch() {
+    for heartbeat in [
+        b": lf\n\n".as_slice(),
+        b": cr\r\r".as_slice(),
+        b": crlf\r\n\r\n".as_slice(),
+    ] {
+        let mut capture = ResponsesSseCapture::for_delivery();
+        let frames = capture.push_delivery_frames(heartbeat);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].bytes.as_ref(), heartbeat);
+        assert!(!frames[0].billable);
+    }
+
+    let mut truncated = ResponsesSseCapture::for_responses();
+    assert!(
+        truncated
+            .push_delivery_frames(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-eof\"}}",
+            )
+            .is_empty()
+    );
+    assert_eq!(truncated.finish(), ResponsesSseOutcome::Incomplete);
+}
+
+#[test]
 fn openai_chat_admission_rejects_n_other_than_one() {
     assert!(validate_openai_chat_choice_count(&json!({})).is_ok());
     assert!(validate_openai_chat_choice_count(&json!({"n": 1})).is_ok());

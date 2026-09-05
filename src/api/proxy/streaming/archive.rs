@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) fn cancel_stream_archive(
     complete: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    sender: &mut Option<tokio::sync::mpsc::Sender<Bytes>>,
+    sender: &mut Option<tokio::sync::mpsc::Sender<ResponseArchiveBatch>>,
 ) {
     complete.store(false, std::sync::atomic::Ordering::Release);
     drop(sender.take());
@@ -12,7 +12,7 @@ pub(super) async fn stream_response_archive(
     state: AppState,
     request_id: Uuid,
     archive_stream_permit: tokio::sync::OwnedSemaphorePermit,
-    mut receiver: tokio::sync::mpsc::Receiver<Bytes>,
+    mut receiver: tokio::sync::mpsc::Receiver<ResponseArchiveBatch>,
     complete: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> (Option<crate::proxy_lifecycle::ProxyArchiveAttempt>, String) {
     // This sidecar is deliberately independent from downstream delivery. Its
@@ -61,20 +61,25 @@ pub(super) async fn stream_response_archive(
             }
             chunk = receiver.recv() => chunk,
         };
-        let Some(chunk) = chunk else {
+        let Some(batch) = chunk else {
             break;
         };
         if !complete.load(std::sync::atomic::Ordering::Acquire) {
             archive_failed = true;
             break;
         }
-        match run_bounded_text_archive(writer.write(chunk)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(_) => {
-                tracing::warn!(%request_id, stage = "response_archive_stream", "proxy archive gap");
-                archive_failed = true;
-                break;
+        for chunk in batch.chunks {
+            match run_bounded_text_archive(writer.write(chunk)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => {
+                    tracing::warn!(%request_id, stage = "response_archive_stream", "proxy archive gap");
+                    archive_failed = true;
+                    break;
+                }
             }
+        }
+        if archive_failed {
+            break;
         }
     }
     if !complete.load(std::sync::atomic::Ordering::Acquire) {

@@ -21,6 +21,53 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) proxy_lifecycle_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+/// One upstream network chunk can contain several fully-framed SSE events.
+/// Keep those immutable slices together so a capacity-one archive channel
+/// cannot mistake intra-chunk framing for archive backpressure.
+pub(super) struct ResponseArchiveBatch {
+    chunks: Vec<Bytes>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ResponseArchiveBatchError {
+    BatchLimit,
+    Backpressure,
+}
+
+impl ResponseArchiveBatch {
+    fn from_delivery_frames(
+        frames: &[SseDeliveryFrame],
+    ) -> Result<Option<Self>, ResponseArchiveBatchError> {
+        if frames.is_empty() {
+            return Ok(None);
+        }
+        let bytes = frames.iter().fold(0_usize, |total, frame| {
+            total.saturating_add(frame.bytes.len())
+        });
+        if frames.len() > MAX_SSE_FRAMES_PER_NETWORK_CHUNK
+            || bytes > MAX_PROXY_RESPONSE_BODY
+            || (frames.len() > 1 && bytes > MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK)
+        {
+            return Err(ResponseArchiveBatchError::BatchLimit);
+        }
+        Ok(Some(Self {
+            chunks: frames.iter().map(|frame| frame.bytes.clone()).collect(),
+        }))
+    }
+}
+
+fn try_queue_response_archive_batch(
+    sender: &tokio::sync::mpsc::Sender<ResponseArchiveBatch>,
+    frames: &[SseDeliveryFrame],
+) -> Result<(), ResponseArchiveBatchError> {
+    let Some(batch) = ResponseArchiveBatch::from_delivery_frames(frames)? else {
+        return Ok(());
+    };
+    sender
+        .try_send(batch)
+        .map_err(|_| ResponseArchiveBatchError::Backpressure)
+}
+
 pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Response, AppError> {
     let StreamingResponse {
         state,
@@ -81,7 +128,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let archive_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
             let (mut archive_sender, archive_task) = if let Some(permit) = archive_stream_permit {
                 let (sender, receiver) =
-                    tokio::sync::mpsc::channel::<Bytes>(PROXY_BODY_CHANNEL_CAPACITY);
+                    tokio::sync::mpsc::channel::<ResponseArchiveBatch>(PROXY_BODY_CHANNEL_CAPACITY);
                 let task = tokio::spawn(stream_response_archive(
                     background_state.clone(),
                     request_id,
@@ -214,14 +261,14 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             && sse_capture
                                 .as_ref()
                                 .is_some_and(ResponsesSseCapture::saw_done);
+                        if let Some(sender) = archive_sender.as_ref()
+                            && try_queue_response_archive_batch(sender, &delivery_frames).is_err()
+                        {
+                            tracing::warn!(%request_id, stage = "response_archive_backpressure", "proxy archive gap");
+                            cancel_stream_archive(&archive_complete, &mut archive_sender);
+                        }
                         for frame in delivery_frames {
                             let SseDeliveryFrame { bytes, billable } = frame;
-                            if let Some(sender) = archive_sender.as_ref()
-                                && sender.try_send(bytes.clone()).is_err()
-                            {
-                                tracing::warn!(%request_id, stage = "response_archive_backpressure", "proxy archive gap");
-                                cancel_stream_archive(&archive_complete, &mut archive_sender);
-                            }
                             if billable && !delivery_confirmed {
                                 // `delivery_started` is the durable signal the orphan reaper
                                 // uses to charge a stranded stream. Confirm it before any
@@ -316,12 +363,20 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             if transport_error.is_some() {
                 cancel_stream_archive(&archive_complete, &mut archive_sender);
             }
+            let sse_summary = sse_capture.map(ResponsesSseCapture::finish_summary);
+            if matches!(
+                sse_summary.as_ref().map(|summary| &summary.outcome),
+                Some(ResponsesSseOutcome::Incomplete)
+            ) {
+                // A partial SSE event is not a deliverable response and must
+                // not leave a complete-looking archive prefix behind.
+                cancel_stream_archive(&archive_complete, &mut archive_sender);
+            }
             // EOF is part of downstream delivery. Close it before awaiting the
             // archive sidecar or terminal settlement so neither can prolong
             // the client-visible stream lifetime.
             drop(body_sender);
             drop(archive_sender.take());
-            let sse_summary = sse_capture.map(ResponsesSseCapture::finish_summary);
             let gap_response = format!("gap://{request_id}/response");
             let (response_archive_attempt, stored_response) = match archive_task {
                 Some(task) => match task.await {
@@ -519,3 +574,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         .body(Body::from_stream(ReceiverStream::new(body_receiver)))
         .map_err(|_| AppError::Internal)
 }
+
+#[cfg(test)]
+#[path = "streaming/tests.rs"]
+mod tests;
