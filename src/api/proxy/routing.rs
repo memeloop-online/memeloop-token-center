@@ -1,8 +1,10 @@
 use super::*;
 
 mod codex;
+mod probe;
 
 pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard};
+pub(super) use probe::{UpstreamAttemptGuard, UpstreamAttemptTerminal};
 
 pub(super) const MAX_UPSTREAM_ATTEMPTS: usize = 3;
 

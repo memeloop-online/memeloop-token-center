@@ -22,7 +22,8 @@ use lifecycle::{
 };
 use routing::{
     CodexRetryTerminal, CodexRetryTerminalGuard, MAX_UPSTREAM_ATTEMPTS, ProxySendError,
-    prepare_proxy_route, retryable_upstream_status, send_proxy_route,
+    UpstreamAttemptGuard, UpstreamAttemptTerminal, prepare_proxy_route, retryable_upstream_status,
+    send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -339,7 +340,7 @@ pub(super) async fn proxy(
         )
         .await;
     }
-    let (upstream, upstream_activity, mut codex_retry) = loop {
+    let (upstream, upstream_activity, mut codex_retry, mut upstream_attempt) = loop {
         let admission = state
             .db
             .claim_upstream_account_attempt(active_route.route.account_id)
@@ -373,6 +374,8 @@ pub(super) async fn proxy(
             active_route = next_route;
             continue;
         }
+        let mut upstream_attempt =
+            UpstreamAttemptGuard::new(&state, request_id, active_route.route.account_id, admission);
         let result = send_proxy_route(&state, &headers, protocol, request_id, &active_route).await;
         let failure = match &result {
             Ok(result) if result.response.status() == StatusCode::TOO_MANY_REQUESTS => Some((
@@ -410,21 +413,9 @@ pub(super) async fn proxy(
             ) => None,
         };
         if let Some((kind, reason)) = failure {
-            if let Err(error) = state
-                .db
-                .record_upstream_account_failure(active_route.route.account_id, kind)
-                .await
-            {
-                tracing::warn!(
-                    %request_id,
-                    upstream_account_id = %active_route.route.account_id,
-                    error = %error,
-                    "failed to persist upstream account cooldown"
-                );
-            }
-            state
-                .metrics
-                .observe_upstream_health(UpstreamHealthEvent::Failure, reason);
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::Failed { kind, reason })
+                .await;
         }
         let can_failover = !matches!(&result, Err(ProxySendError::AmbiguousResponse(_)));
         if can_failover
@@ -463,35 +454,17 @@ pub(super) async fn proxy(
         }
         match result {
             Ok(result) => {
-                if admission == UpstreamAttemptAdmission::Probe
-                    && failure.is_none()
-                    && result.response.status().is_success()
-                {
-                    match state
-                        .db
-                        .record_upstream_account_success(active_route.route.account_id)
-                        .await
-                    {
-                        Ok(true) => state.metrics.observe_upstream_health(
-                            UpstreamHealthEvent::Recovered,
-                            UpstreamHealthReason::Success,
-                        ),
-                        Ok(false) => {}
-                        Err(error) => tracing::warn!(
-                            %request_id,
-                            upstream_account_id = %active_route.route.account_id,
-                            error = %error,
-                            "failed to clear upstream account cooldown"
-                        ),
-                    }
-                }
                 break (
                     result.response,
                     result.upstream_activity,
                     result.codex_retry,
+                    upstream_attempt,
                 );
             }
             Err(ProxySendError::Credential) => {
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .await;
                 return finish_proxy_failure(&buffered_request, "provider_credential").await;
             }
             Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => {
@@ -501,6 +474,9 @@ pub(super) async fn proxy(
                 return finish_proxy_unavailable(&buffered_request, "upstream_rejected").await;
             }
             Err(ProxySendError::CodexBadRequest) => {
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::Inconclusive)
+                    .await;
                 return finish_buffered_request(
                     &buffered_request,
                     StatusCode::BAD_REQUEST,
@@ -520,6 +496,12 @@ pub(super) async fn proxy(
                 return finish_proxy_failure(&buffered_request, error_code).await;
             }
             Err(ProxySendError::NonRetryableTransport) => {
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::Failed {
+                        kind: UpstreamFailureKind::Connection,
+                        reason: UpstreamHealthReason::Connection,
+                    })
+                    .await;
                 return finish_proxy_failure(&buffered_request, "upstream_transport").await;
             }
         }
@@ -549,6 +531,9 @@ pub(super) async fn proxy(
             Some(format!("http_{}", status.as_u16())),
         )
         .await;
+        upstream_attempt
+            .complete(UpstreamAttemptTerminal::invalid_response())
+            .await;
         codex_retry.complete(CodexRetryTerminal::Failed);
         return result;
     }
@@ -559,6 +544,9 @@ pub(super) async fn proxy(
             Err(error_code) => {
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
                 let result = finish_proxy_failure(&buffered_request, error_code).await;
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .await;
                 codex_retry.complete(CodexRetryTerminal::Failed);
                 return result;
             }
@@ -572,16 +560,20 @@ pub(super) async fn proxy(
             None,
         )
         .await;
-        codex_retry.complete(
-            if result
-                .as_ref()
-                .is_ok_and(|response| response.status().is_success())
-            {
-                CodexRetryTerminal::Succeeded
-            } else {
-                CodexRetryTerminal::Failed
-            },
-        );
+        let succeeded = result
+            .as_ref()
+            .is_ok_and(|response| response.status().is_success());
+        let attempt_terminal = match result.as_ref() {
+            Ok(response) if response.status().is_success() => UpstreamAttemptTerminal::Succeeded,
+            Ok(_) => UpstreamAttemptTerminal::invalid_response(),
+            Err(_) => UpstreamAttemptTerminal::Inconclusive,
+        };
+        upstream_attempt.complete(attempt_terminal).await;
+        codex_retry.complete(if succeeded {
+            CodexRetryTerminal::Succeeded
+        } else {
+            CodexRetryTerminal::Failed
+        });
         return result;
     }
     let is_sse = content_type
@@ -599,13 +591,21 @@ pub(super) async fn proxy(
         let response_body = match read_bounded_upstream(upstream, MAX_PROXY_RESPONSE_BODY).await {
             Ok(body) => Bytes::from(body),
             Err(error) => {
-                return finish_proxy_failure(&buffered_request, error.code()).await;
+                let result = finish_proxy_failure(&buffered_request, error.code()).await;
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .await;
+                return result;
             }
         };
         if matches!(protocol, Protocol::OpenAiResponses)
             && let Err(error_code) = validate_buffered_responses_success(&response_body)
         {
-            return finish_proxy_failure(&buffered_request, error_code).await;
+            let result = finish_proxy_failure(&buffered_request, error_code).await;
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::invalid_response())
+                .await;
+            return result;
         }
         let usage = if capture_json_usage {
             match extract_usage_checked(&response_body) {
@@ -616,7 +616,12 @@ pub(super) async fn proxy(
                     ..TokenUsage::default()
                 },
                 ExtractedUsage::Invalid => {
-                    return finish_proxy_failure(&buffered_request, "upstream_invalid_usage").await;
+                    let result =
+                        finish_proxy_failure(&buffered_request, "upstream_invalid_usage").await;
+                    upstream_attempt
+                        .complete(UpstreamAttemptTerminal::invalid_response())
+                        .await;
+                    return result;
                 }
             }
         } else {
@@ -626,7 +631,7 @@ pub(super) async fn proxy(
                 ..TokenUsage::default()
             }
         };
-        return finish_buffered_request(
+        let result = finish_buffered_request(
             &buffered_request,
             status,
             response_body,
@@ -635,6 +640,13 @@ pub(super) async fn proxy(
             None,
         )
         .await;
+        let attempt_terminal = match result.as_ref() {
+            Ok(response) if response.status().is_success() => UpstreamAttemptTerminal::Succeeded,
+            Ok(_) => UpstreamAttemptTerminal::invalid_response(),
+            Err(_) => UpstreamAttemptTerminal::Inconclusive,
+        };
+        upstream_attempt.complete(attempt_terminal).await;
+        return result;
     }
     streaming::stream_response(streaming::StreamingResponse {
         state: &state,
@@ -646,6 +658,7 @@ pub(super) async fn proxy(
         protocol,
         is_codex_route,
         codex_retry,
+        upstream_attempt,
         strict_openai_chat_usage: requires_strict_openai_chat_usage(
             protocol,
             &active_route.route.driver,

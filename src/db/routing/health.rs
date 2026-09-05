@@ -140,6 +140,21 @@ impl Database {
                 .await?;
         Ok(result.rows_affected() == 1)
     }
+
+    pub(crate) async fn release_upstream_account_probe(
+        &self,
+        upstream_account_id: Uuid,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE upstream_account_health SET probe_lease_until = 0, updated_at = $1
+             WHERE upstream_account_id = $2 AND consecutive_failures > 0",
+        )
+        .bind(unix_millis())
+        .bind(upstream_account_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
