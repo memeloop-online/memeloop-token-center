@@ -29,8 +29,7 @@ const MAX_OUTPUT_ITEMS: usize = 16_384;
 // small: it happens before any downstream bytes are delivered and its body is
 // never retained, archived, logged, or returned.
 const MAX_CODEX_RETRYABLE_ERROR_BYTES: usize = 16 * 1024;
-const MAX_CODEX_RETRYABLE_ERROR_WAIT: std::time::Duration =
-    std::time::Duration::from_secs(5);
+const MAX_CODEX_RETRYABLE_ERROR_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const MISSING_CONTENT_TYPE_SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
 

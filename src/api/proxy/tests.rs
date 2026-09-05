@@ -202,7 +202,13 @@ async fn add_codex_standby_route(
 }
 
 async fn assert_response_archives_omit(fixture: &CodexRouteFixture, sensitive: &str) {
-    for row in fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap() {
+    for row in fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap()
+    {
         let refs = fixture
             .state
             .db
@@ -805,12 +811,10 @@ async fn codex_transient_400_fails_over_before_downstream_delivery() {
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .and(header_matcher("chatgpt-account-id", "account-456"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(
-                completed_codex_sse("standby after transient rejection").into_bytes(),
-                "text/event-stream",
-            ),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("standby after transient rejection").into_bytes(),
+            "text/event-stream",
+        ))
         .expect(1)
         .mount(&upstream)
         .await;
