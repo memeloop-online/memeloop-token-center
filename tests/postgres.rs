@@ -613,6 +613,76 @@ async fn assert_postgres_native_codex_upgrade_fixture(
     assert_eq!(preserved_history_count, 4);
 }
 
+async fn create_postgres_native_codex_upgrade_refresh_lease_fixture(
+    database: &Database,
+    pool: &sqlx::AnyPool,
+) -> Uuid {
+    let unique = Uuid::now_v7();
+    let key_material = b"postgres native Codex refresh lease key material longer than thirty-two bytes";
+    let account = database
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: format!("postgres-native-codex-refresh-lease-{unique}"),
+                name: "Imported Codex refresh lease".to_owned(),
+                driver: "cpa-codex-oauth".to_owned(),
+                config: json!({
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {}
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "postgres-lease-access-secret".to_owned(),
+                    refresh_token: Some("postgres-lease-refresh-secret".to_owned()),
+                    expires_at: Some(unix_millis() + 3_600_000),
+                    header: "authorization".to_owned(),
+                    prefix: "Bearer ".to_owned(),
+                    adapter_state: Some(json!({
+                        "schema": "cpa-codex-oauth-v1",
+                        "account_id": "postgres-refresh-lease-account-123"
+                    })),
+                    proxy_url: Some(
+                        "socks5://operator:proxy-secret@100.64.0.16:1080".to_owned(),
+                    ),
+                    proxy_network_scope: Some(
+                        memeloop_token_center::network::OutboundScope::Private,
+                    ),
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("damaged-driver".to_owned()),
+                oauth_refresh_url: Some("https://damaged.invalid".to_owned()),
+            },
+            key_material,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE upstream_credentials SET generation = 5 WHERE upstream_account_id = $1 AND generation = 1",
+    )
+    .bind(account.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE upstream_accounts SET credential_generation = 5, status = 'disabled' WHERE id = $1",
+    )
+    .bind(account.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_account_imports (tenant_id, import_kind, source_key, contract_version, payload_digest, upstream_account_id, created_at) VALUES ($1, 'cpa_managed_oauth', $2, 1, $3, $4, $5)",
+    )
+    .bind(account.tenant_id.to_string())
+    .bind("e".repeat(64))
+    .bind("f".repeat(64))
+    .bind(account.id.to_string())
+    .bind(unix_millis())
+    .execute(pool)
+    .await
+    .unwrap();
+    account.id
+}
+
 #[tokio::test]
 async fn postgres_native_codex_upgrade_recovers_generation_five_old_and_native_envelopes() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
@@ -637,6 +707,153 @@ async fn postgres_native_codex_upgrade_recovers_generation_five_old_and_native_e
     ] {
         assert_postgres_native_codex_upgrade_fixture(&database, &pool, fixture).await;
     }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_native_codex_upgrade_fences_an_in_flight_oauth_refresh() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let database = Database::connect_with_max(&database_url, 16).await.unwrap();
+    database.migrate().await.unwrap();
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    let key_material = b"postgres native Codex refresh lease key material longer than thirty-two bytes";
+    let account_id =
+        create_postgres_native_codex_upgrade_refresh_lease_fixture(&database, &pool).await;
+    let reviewed_plan = database
+        .prepare_native_codex_upgrade(&[account_id], key_material)
+        .await
+        .unwrap();
+    let lease_key = format!("postgres-native-upgrade-refresh-{account_id}");
+
+    assert!(
+        database
+            .begin_upstream_oauth_refresh(account_id, &lease_key, key_material)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let blocked = database
+        .apply_native_codex_upgrade(&reviewed_plan, key_material)
+        .await
+        .unwrap_err();
+    assert!(matches!(blocked, AppError::Conflict(_)));
+    let active_lease_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+    )
+    .bind(account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active_lease_count, 1);
+    let (unmigrated, unmigrated_credential) = database
+        .upstream_account_with_credential(account_id, key_material)
+        .await
+        .unwrap();
+    assert_eq!(unmigrated.driver, "cpa-codex-oauth");
+    assert_eq!(unmigrated.status, "disabled");
+    assert_eq!(unmigrated.updated_at, reviewed_plan[0].expected_updated_at);
+    assert_eq!(unmigrated.credential_generation, 5);
+    assert_eq!(
+        unmigrated_credential.adapter_state(),
+        Some(&json!({
+            "schema": "cpa-codex-oauth-v1",
+            "account_id": "postgres-refresh-lease-account-123"
+        }))
+    );
+    assert_eq!(
+        unmigrated_credential.proxy(),
+        Some((
+            "socks5://operator:proxy-secret@100.64.0.16:1080",
+            memeloop_token_center::network::OutboundScope::Private
+        ))
+    );
+
+    database
+        .abort_upstream_oauth_refresh(account_id, &lease_key)
+        .await
+        .unwrap();
+    let cleared_lease_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+    )
+    .bind(account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cleared_lease_count, 0);
+    let refreshed_plan = database
+        .prepare_native_codex_upgrade(&[account_id], key_material)
+        .await
+        .unwrap();
+    let report = database
+        .apply_native_codex_upgrade(&refreshed_plan, key_material)
+        .await
+        .unwrap();
+    assert_eq!(report.upgraded_account_ids, vec![account_id]);
+    let (upgraded, upgraded_credential) = database
+        .upstream_account_with_credential(account_id, key_material)
+        .await
+        .unwrap();
+    assert_eq!(upgraded.id, account_id);
+    assert_eq!(upgraded.status, "disabled");
+    assert_eq!(upgraded.credential_generation, 5);
+    assert_eq!(upgraded.driver, "openai-codex");
+    assert_eq!(
+        upgraded_credential.adapter_state(),
+        Some(&json!({
+            "schema": "openai-codex-oauth-v1",
+            "account_id": "postgres-refresh-lease-account-123"
+        }))
+    );
+    assert_eq!(
+        upgraded_credential.proxy(),
+        Some((
+            "socks5h://operator:proxy-secret@100.64.0.16:1080",
+            memeloop_token_center::network::OutboundScope::Private
+        ))
+    );
+
+    let stale_finalize = database
+        .finish_upstream_oauth_refresh(
+            account_id,
+            UpstreamCredential::OAuth {
+                access_token: "postgres-stale-access-secret".to_owned(),
+                refresh_token: Some("postgres-stale-refresh-secret".to_owned()),
+                expires_at: Some(unix_millis() + 3_600_000),
+                header: "authorization".to_owned(),
+                prefix: "Bearer ".to_owned(),
+                adapter_state: Some(json!({
+                    "schema": "cpa-codex-oauth-v1",
+                    "account_id": "postgres-refresh-lease-account-123"
+                })),
+                proxy_url: Some("socks5://operator:proxy-secret@100.64.0.16:1080".to_owned()),
+                proxy_network_scope: Some(
+                    memeloop_token_center::network::OutboundScope::Private,
+                ),
+            },
+            &lease_key,
+            key_material,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_finalize,
+        AppError::BadRequest(_) | AppError::Conflict(_)
+    ));
+    let (after_stale_finalize, credential_after_stale_finalize) = database
+        .upstream_account_with_credential(account_id, key_material)
+        .await
+        .unwrap();
+    assert_eq!(after_stale_finalize.driver, "openai-codex");
+    assert_eq!(after_stale_finalize.credential_generation, 5);
+    assert_eq!(
+        credential_after_stale_finalize.adapter_state(),
+        Some(&json!({
+            "schema": "openai-codex-oauth-v1",
+            "account_id": "postgres-refresh-lease-account-123"
+        }))
+    );
     pool.close().await;
 }
 

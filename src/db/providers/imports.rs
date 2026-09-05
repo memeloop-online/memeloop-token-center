@@ -111,6 +111,8 @@ impl Database {
         let mut already_native_account_ids = Vec::new();
         for target in targets {
             let row = native_codex_upgrade_row(self, &mut tx, target.account_id).await?;
+            require_native_codex_upgrade_refresh_quiescence(&mut tx, target.account_id)
+                .await?;
             let driver: String = row.try_get("driver")?;
             let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
                 .map_err(|_| AppError::Internal)?;
@@ -581,6 +583,29 @@ async fn native_codex_upgrade_row(
         .fetch_optional(&mut **tx)
         .await?
         .ok_or(AppError::NotFound)
+}
+
+/// The account row is locked before this check. A refresh claimant takes the
+/// same account lock before it can create a lease. Keep every lease fenced,
+/// including an expired unfinalized one: an old refresher may still have its
+/// result and attempt to stage it against the unchanged generation.
+async fn require_native_codex_upgrade_refresh_quiescence(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    account_id: Uuid,
+) -> Result<(), AppError> {
+    let refresh_in_progress = sqlx::query(
+        "SELECT 1 FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+    )
+    .bind(account_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some();
+    if refresh_in_progress {
+        return Err(AppError::Conflict(
+            "OpenAI Codex migration conflicts with an active OAuth refresh".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_native_codex_upgrade_ids(account_ids: &[Uuid]) -> Result<(), AppError> {
@@ -1124,6 +1149,71 @@ mod native_codex_upgrade_tests {
         assert_eq!(repeated_repair.already_native_account_ids, vec![account.id]);
     }
 
+    async fn create_native_codex_upgrade_refresh_lease_fixture(database: &Database) -> Uuid {
+        let key_material = b"native Codex refresh lease key material longer than thirty-two bytes";
+        let account = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "native-upgrade-refresh-lease".to_owned(),
+                    name: "Imported Codex refresh lease".to_owned(),
+                    driver: crate::oauth::codex_device::IMPORTED_PROVIDER_DRIVER.to_owned(),
+                    config: serde_json::json!({
+                        "base_url": crate::oauth::codex_device::BASE_URL,
+                        "network_scope": "public",
+                        "reservation_token_bounds": {}
+                    }),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "lease-access-secret".to_owned(),
+                        refresh_token: Some("lease-refresh-secret".to_owned()),
+                        expires_at: Some(unix_millis() + 3_600_000),
+                        header: "authorization".to_owned(),
+                        prefix: "Bearer ".to_owned(),
+                        adapter_state: Some(serde_json::json!({
+                            "schema": "cpa-codex-oauth-v1",
+                            "account_id": "refresh-lease-account-123"
+                        })),
+                        proxy_url: Some(
+                            "socks5h://operator:proxy-secret@100.64.0.16:1080".to_owned(),
+                        ),
+                        proxy_network_scope: Some(crate::network::OutboundScope::Private),
+                    },
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some("damaged-driver".to_owned()),
+                    oauth_refresh_url: Some("https://damaged.invalid".to_owned()),
+                },
+                key_material,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE upstream_credentials SET generation = 5 WHERE upstream_account_id = $1 AND generation = 1",
+        )
+        .bind(account.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE upstream_accounts SET credential_generation = 5, status = 'disabled' WHERE id = $1",
+        )
+        .bind(account.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO upstream_account_imports (tenant_id, import_kind, source_key, contract_version, payload_digest, upstream_account_id, created_at) VALUES ($1, $2, $3, 1, $4, $5, $6)",
+        )
+        .bind(account.tenant_id.to_string())
+        .bind(CPA_MANAGED_OAUTH_IMPORT_KIND)
+        .bind("e".repeat(64))
+        .bind("f".repeat(64))
+        .bind(account.id.to_string())
+        .bind(unix_millis())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        account.id
+    }
+
     #[tokio::test]
     async fn native_upgrade_recovers_generation_five_old_and_native_envelopes_without_touching_history()
      {
@@ -1240,5 +1330,157 @@ mod native_codex_upgrade_tests {
             .unwrap()
             .unwrap_err();
         assert!(matches!(error, crate::error::AppError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_native_upgrade_fences_an_in_flight_oauth_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("native-codex-upgrade-refresh-lease.db")
+                .display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        let key_material = b"native Codex refresh lease key material longer than thirty-two bytes";
+        let account_id = create_native_codex_upgrade_refresh_lease_fixture(&database).await;
+        let reviewed_plan = database
+            .prepare_native_codex_upgrade(&[account_id], key_material)
+            .await
+            .unwrap();
+
+        assert!(
+            database
+                .begin_upstream_oauth_refresh(
+                    account_id,
+                    "native-upgrade-refresh-lease",
+                    key_material,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let blocked = database
+            .apply_native_codex_upgrade(&reviewed_plan, key_material)
+            .await
+            .unwrap_err();
+        assert!(matches!(blocked, crate::error::AppError::Conflict(_)));
+        let active_lease_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(active_lease_count, 1);
+        let (unmigrated, unmigrated_credential) = database
+            .upstream_account_with_credential(account_id, key_material)
+            .await
+            .unwrap();
+        assert_eq!(
+            unmigrated.driver,
+            crate::oauth::codex_device::IMPORTED_PROVIDER_DRIVER
+        );
+        assert_eq!(unmigrated.status, "disabled");
+        assert_eq!(unmigrated.updated_at, reviewed_plan[0].expected_updated_at);
+        assert_eq!(unmigrated.credential_generation, 5);
+        assert_eq!(
+            unmigrated_credential.adapter_state(),
+            Some(&serde_json::json!({
+                "schema": "cpa-codex-oauth-v1",
+                "account_id": "refresh-lease-account-123"
+            }))
+        );
+        assert_eq!(
+            unmigrated_credential.proxy(),
+            Some((
+                "socks5h://operator:proxy-secret@100.64.0.16:1080",
+                crate::network::OutboundScope::Private
+            ))
+        );
+
+        database
+            .abort_upstream_oauth_refresh(account_id, "native-upgrade-refresh-lease")
+            .await
+            .unwrap();
+        let cleared_lease_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(cleared_lease_count, 0);
+        let refreshed_plan = database
+            .prepare_native_codex_upgrade(&[account_id], key_material)
+            .await
+            .unwrap();
+        let report = database
+            .apply_native_codex_upgrade(&refreshed_plan, key_material)
+            .await
+            .unwrap();
+        assert_eq!(report.upgraded_account_ids, vec![account_id]);
+        let (upgraded, upgraded_credential) = database
+            .upstream_account_with_credential(account_id, key_material)
+            .await
+            .unwrap();
+        assert_eq!(upgraded.id, account_id);
+        assert_eq!(upgraded.status, "disabled");
+        assert_eq!(upgraded.credential_generation, 5);
+        assert_eq!(upgraded.driver, crate::oauth::codex_device::PROVIDER_DRIVER);
+        assert_eq!(
+            upgraded_credential.adapter_state(),
+            Some(&serde_json::json!({
+                "schema": "openai-codex-oauth-v1",
+                "account_id": "refresh-lease-account-123"
+            }))
+        );
+
+        let stale_finalize = database
+            .finish_upstream_oauth_refresh(
+                account_id,
+                UpstreamCredential::OAuth {
+                    access_token: "stale-access-secret".to_owned(),
+                    refresh_token: Some("stale-refresh-secret".to_owned()),
+                    expires_at: Some(unix_millis() + 3_600_000),
+                    header: "authorization".to_owned(),
+                    prefix: "Bearer ".to_owned(),
+                    adapter_state: Some(serde_json::json!({
+                        "schema": "cpa-codex-oauth-v1",
+                        "account_id": "refresh-lease-account-123"
+                    })),
+                    proxy_url: Some(
+                        "socks5h://operator:proxy-secret@100.64.0.16:1080".to_owned(),
+                    ),
+                    proxy_network_scope: Some(crate::network::OutboundScope::Private),
+                },
+                "native-upgrade-refresh-lease",
+                key_material,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            stale_finalize,
+            crate::error::AppError::BadRequest(_) | crate::error::AppError::Conflict(_)
+        ));
+        let (after_stale_finalize, credential_after_stale_finalize) = database
+            .upstream_account_with_credential(account_id, key_material)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_stale_finalize.driver,
+            crate::oauth::codex_device::PROVIDER_DRIVER
+        );
+        assert_eq!(after_stale_finalize.credential_generation, 5);
+        assert_eq!(
+            credential_after_stale_finalize.adapter_state(),
+            Some(&serde_json::json!({
+                "schema": "openai-codex-oauth-v1",
+                "account_id": "refresh-lease-account-123"
+            }))
+        );
     }
 }
