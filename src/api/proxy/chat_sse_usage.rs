@@ -235,12 +235,14 @@ struct CanonicalChatChoice {
     #[serde(default)]
     finish_reason: Option<String>,
     #[serde(default)]
-    logprobs: Option<Value>,
+    logprobs: Option<CanonicalChatLogprobs>,
 }
 
 impl CanonicalChatChoice {
     fn is_control(&self) -> bool {
-        self.logprobs.is_none()
+        self.logprobs
+            .as_ref()
+            .map_or(true, CanonicalChatLogprobs::is_empty)
             && ((self
                 .finish_reason
                 .as_deref()
@@ -261,6 +263,74 @@ impl CanonicalChatChoice {
                 // output and must start durable delivery before it is forwarded.
                 _ => false,
             })
+    }
+}
+
+/// The OpenAI Chat logprobs payload is part of a choice delta. Empty
+/// containers commonly accompany role-only preambles, while a token or byte
+/// sequence is user-observable output and must start durable delivery. Keep
+/// the schema typed and closed so an unrecognized output-bearing field cannot
+/// be mistaken for an empty preamble.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalChatLogprobs {
+    #[serde(default)]
+    content: Option<Vec<CanonicalChatLogprob>>,
+    #[serde(default)]
+    refusal: Option<Vec<CanonicalChatLogprob>>,
+}
+
+impl CanonicalChatLogprobs {
+    fn is_empty(&self) -> bool {
+        !self.content.as_ref().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(CanonicalChatLogprob::has_reconstructable_output)
+        }) && !self.refusal.as_ref().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(CanonicalChatLogprob::has_reconstructable_output)
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalChatLogprob {
+    token: String,
+    #[serde(default)]
+    bytes: Option<Vec<i64>>,
+    #[serde(default, rename = "logprob")]
+    _logprob: Option<Value>,
+    #[serde(default)]
+    top_logprobs: Option<Vec<CanonicalChatLogprobAlternative>>,
+}
+
+impl CanonicalChatLogprob {
+    fn has_reconstructable_output(&self) -> bool {
+        !self.token.is_empty()
+            || self.bytes.as_ref().is_some_and(|bytes| !bytes.is_empty())
+            || self.top_logprobs.as_ref().is_some_and(|alternatives| {
+                alternatives
+                    .iter()
+                    .any(CanonicalChatLogprobAlternative::has_reconstructable_output)
+            })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalChatLogprobAlternative {
+    token: String,
+    #[serde(default)]
+    bytes: Option<Vec<i64>>,
+    #[serde(default, rename = "logprob")]
+    _logprob: Option<Value>,
+}
+
+impl CanonicalChatLogprobAlternative {
+    fn has_reconstructable_output(&self) -> bool {
+        !self.token.is_empty() || self.bytes.as_ref().is_some_and(|bytes| !bytes.is_empty())
     }
 }
 

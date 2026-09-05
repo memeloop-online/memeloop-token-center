@@ -149,19 +149,54 @@ fn chat_no_op_preambles_are_control_frames() {
 }
 
 #[test]
-fn chat_logprobs_or_unknown_choice_fields_are_never_control_frames() {
+fn chat_empty_logprobs_remain_control_preambles() {
+    for logprobs in [json!({}), json!({"content": []})] {
+        let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+        let frames = capture.push_delivery_frames(
+            chat_chunk(
+                "chatcmpl-empty-logprobs",
+                json!([{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": null},
+                    "finish_reason": null,
+                    "logprobs": logprobs,
+                }]),
+                None,
+            )
+            .as_bytes(),
+        );
+        assert_eq!(frames.len(), 1);
+        assert!(!frames[0].billable);
+    }
+}
+
+#[test]
+fn chat_output_logprobs_or_unknown_choice_fields_are_never_control_frames() {
     let cases = [
         json!([{
             "index": 0,
             "delta": {"role": "assistant", "content": null},
             "finish_reason": null,
-            "logprobs": {},
+            "logprobs": {
+                "content": [{
+                    "token": "visible",
+                    "logprob": -0.01,
+                    "bytes": [118, 105, 115, 105, 98, 108, 101],
+                    "top_logprobs": [],
+                }],
+            },
         }]),
         json!([{
             "index": 0,
             "delta": {"role": "assistant", "content": null},
             "finish_reason": null,
             "provider_output": "must-not-be-ignored",
+        }]),
+        json!([{
+            "index": 0,
+            "delta": {"role": "assistant", "content": null},
+            "finish_reason": null,
+            "logprobs": {"opaque_output": "must-not-be-ignored"},
         }]),
     ];
     for choices in cases {
@@ -196,6 +231,26 @@ fn strict_chat_rejects_named_events_before_they_can_complete() {
             summary.outcome,
             ResponsesSseOutcome::Failed | ResponsesSseOutcome::Incomplete
         ));
+    }
+}
+
+#[test]
+fn strict_chat_empty_named_events_fail_without_starting_delivery() {
+    for (event, expected) in [
+        (b"error".as_slice(), ResponsesSseOutcome::Failed),
+        (b"response.failed".as_slice(), ResponsesSseOutcome::Failed),
+        (b"message".as_slice(), ResponsesSseOutcome::Incomplete),
+    ] {
+        let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+        let mut wire = Vec::from(b"event: ".as_slice());
+        wire.extend_from_slice(event);
+        wire.extend_from_slice(b"\n\n");
+        let frames = capture.push_delivery_frames(&wire);
+        assert_eq!(frames.len(), 1);
+        assert!(!frames[0].billable);
+        let summary = capture.finish_summary();
+        assert!(summary.usage_invalid);
+        assert_eq!(summary.outcome, expected);
     }
 }
 

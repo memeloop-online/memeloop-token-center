@@ -1522,7 +1522,12 @@ impl ResponsesSseCapture {
             if matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
                 self.terminal_failure = true;
             }
-            return ChatSseDeliveryClass::Billable;
+            // A lone event field does not carry model output. Preserve the
+            // fail-closed protocol result, but do not turn a control-only
+            // malformed frame into durable delivery and a ceiling charge.
+            return (!data.is_empty() && trim_ascii_whitespace(&data) != b"[DONE]")
+                .then_some(ChatSseDeliveryClass::Billable)
+                .unwrap_or(ChatSseDeliveryClass::Control);
         }
         if discard {
             match event_kind {

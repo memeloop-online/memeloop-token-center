@@ -220,7 +220,14 @@ async fn strict_chat_logprobs_and_named_failure_start_delivery_and_charge_once()
                 "index": 0,
                 "delta": {"role": "assistant", "content": null},
                 "finish_reason": null,
-                "logprobs": {"content": []},
+                "logprobs": {
+                    "content": [{
+                        "token": "visible",
+                        "logprob": -0.01,
+                        "bytes": [118, 105, 115, 105, 98, 108, 101],
+                        "top_logprobs": [],
+                    }],
+                },
             }]),
             None,
         ),
@@ -261,6 +268,80 @@ async fn strict_chat_logprobs_and_named_failure_start_delivery_and_charge_once()
     );
     assert_eq!(rows[0].output_tokens, 16);
     assert_ne!(rows[0].cost, "0");
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+#[tokio::test]
+async fn strict_chat_empty_named_event_fails_without_contract_charge() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw("event: message\n\n", "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = response_usage_fixture("chat-empty-named-event", &upstream, 0).await;
+    let response = send_chat_usage_request(&fixture, &chat_request(&fixture.model)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(body, Bytes::from_static(b"event: message\n\n"));
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_incomplete_response")
+    );
+    assert_eq!(rows[0].cost, "0");
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+#[tokio::test]
+async fn strict_chat_empty_logprobs_preamble_fails_without_contract_charge() {
+    let upstream = MockServer::start().await;
+    let sse = chat_chunk(
+        "chatcmpl-empty-logprobs",
+        json!([{
+            "index": 0,
+            "delta": {"role": "assistant", "content": null},
+            "finish_reason": null,
+            "logprobs": {"content": []},
+        }]),
+        None,
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = response_usage_fixture("chat-empty-logprobs", &upstream, 0).await;
+    let response = send_chat_usage_request(&fixture, &chat_request(&fixture.model)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("\"content\":[]"));
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(rows[0].cost, "0");
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 
