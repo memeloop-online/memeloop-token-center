@@ -896,7 +896,7 @@ async fn codex_definite_ordinary_400_retries_the_same_account_once_with_a_large_
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .and(header_matcher("chatgpt-account-id", "account-123"))
-        .respond_with(move |_| {
+        .respond_with(move |_: &wiremock::Request| {
             if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 ResponseTemplate::new(400).set_body_json(json!({
                     "error": {
@@ -989,7 +989,7 @@ async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .and(header_matcher("chatgpt-account-id", "account-123"))
-        .respond_with(move |_| {
+        .respond_with(move |_: &wiremock::Request| {
             let error =
                 if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     json!({
