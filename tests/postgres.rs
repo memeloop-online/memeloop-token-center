@@ -387,6 +387,256 @@ async fn postgres_oauth_refresh_has_one_account_generation_lease() {
     assert_eq!(replay.credential_generation, 2);
 }
 
+#[derive(Clone, Copy)]
+struct PostgresNativeCodexFixture {
+    label: &'static str,
+    schema: &'static str,
+    proxy_url: &'static str,
+    expected_proxy_url: &'static str,
+}
+
+async fn assert_postgres_native_codex_upgrade_fixture(
+    database: &Database,
+    fixture: PostgresNativeCodexFixture,
+) {
+    let unique = Uuid::now_v7();
+    let key_material = b"postgres native Codex upgrade key material longer than thirty-two bytes";
+    let tenant = format!("postgres-native-codex-{}-{unique}", fixture.label);
+    let expires_at = unix_millis() + 3_600_000;
+    let account = database
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.clone(),
+                name: format!("Imported Codex {}", fixture.label),
+                driver: "cpa-codex-oauth".to_owned(),
+                config: json!({
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {"gpt-5.6-sol": 128000}
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "postgres-native-access-secret".to_owned(),
+                    refresh_token: Some("postgres-native-refresh-secret".to_owned()),
+                    expires_at: Some(expires_at),
+                    header: "authorization".to_owned(),
+                    prefix: "Bearer ".to_owned(),
+                    adapter_state: Some(json!({
+                        "schema": fixture.schema,
+                        "account_id": "postgres-native-account-123"
+                    })),
+                    proxy_url: Some(fixture.proxy_url.to_owned()),
+                    proxy_network_scope: Some(
+                        memeloop_token_center::network::OutboundScope::Private,
+                    ),
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("damaged-driver".to_owned()),
+                oauth_refresh_url: Some("https://damaged.invalid".to_owned()),
+            },
+            key_material,
+        )
+        .await
+        .unwrap();
+    let route = database
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.clone(),
+            public_model: format!("postgres-native-upgrade-model-{}", fixture.label),
+            upstream_account_id: account.id,
+            upstream_model: "gpt-5.6-sol".to_owned(),
+            protocol: "openai".to_owned(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let issued_key = database
+        .create_key_with_routing(
+            CreateKeyInput {
+                tenant_external_id: tenant.clone(),
+                principal_external_id: format!("postgres-native-principal-{}", fixture.label),
+                alias: format!("postgres-native-key-{}", fixture.label),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            &[route.id],
+            &[],
+            key_material,
+        )
+        .await
+        .unwrap();
+    let ciphertext: String = sqlx::query_scalar(
+        "SELECT credential_ciphertext FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = 1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    let history_created_at = unix_millis();
+    sqlx::query(
+        "UPDATE upstream_credentials SET generation = 5 WHERE upstream_account_id = $1 AND generation = 1",
+    )
+    .bind(account.id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    for generation in 1_i64..5 {
+        sqlx::query(
+            "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at, revoked_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(account.id.to_string())
+        .bind(generation)
+        .bind(&ciphertext)
+        .bind(expires_at)
+        .bind(history_created_at.saturating_sub(generation))
+        .bind(history_created_at.saturating_sub(generation))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "UPDATE upstream_accounts SET credential_generation = 5, status = 'disabled' WHERE id = $1",
+    )
+    .bind(account.id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_account_imports (tenant_id, import_kind, source_key, contract_version, payload_digest, upstream_account_id, created_at) VALUES ($1, 'cpa_managed_oauth', $2, 1, $3, $4, $5)",
+    )
+    .bind(account.tenant_id.to_string())
+    .bind("a".repeat(64))
+    .bind("b".repeat(64))
+    .bind(account.id.to_string())
+    .bind(unix_millis())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+
+    let plan = database
+        .prepare_native_codex_upgrade(&[account.id], key_material)
+        .await
+        .unwrap();
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].account_id, account.id);
+    assert_eq!(plan[0].expected_credential_generation, 5);
+    let report = database
+        .apply_native_codex_upgrade(&plan, key_material)
+        .await
+        .unwrap();
+    assert_eq!(report.upgraded_account_ids, vec![account.id]);
+
+    let (upgraded, credential) = database
+        .upstream_account_with_credential(account.id, key_material)
+        .await
+        .unwrap();
+    assert_eq!(upgraded.id, account.id);
+    assert_eq!(upgraded.driver, "openai-codex");
+    assert_eq!(upgraded.auth_kind, "oauth");
+    assert_eq!(upgraded.status, "disabled");
+    assert_eq!(upgraded.credential_generation, 5);
+    assert_eq!(upgraded.credential_expires_at, Some(expires_at));
+    assert_eq!(upgraded.route_count, 1);
+    assert_eq!(
+        credential.adapter_state(),
+        Some(&json!({
+            "schema": "openai-codex-oauth-v1",
+            "account_id": "postgres-native-account-123"
+        }))
+    );
+    assert_eq!(
+        credential.proxy(),
+        Some((
+            fixture.expected_proxy_url,
+            memeloop_token_center::network::OutboundScope::Private
+        ))
+    );
+    let UpstreamCredential::OAuth {
+        access_token,
+        refresh_token,
+        expires_at: actual_expires_at,
+        ..
+    } = credential
+    else {
+        panic!("native upgrade must retain an OAuth credential");
+    };
+    assert_eq!(access_token, "postgres-native-access-secret");
+    assert_eq!(
+        refresh_token.as_deref(),
+        Some("postgres-native-refresh-secret")
+    );
+    assert_eq!(actual_expires_at, Some(expires_at));
+    assert_eq!(
+        database
+            .credential_routing(issued_key.key_id, &tenant)
+            .await
+            .unwrap()
+            .route_ids,
+        vec![route.id]
+    );
+    let grant_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM routing_grants WHERE tenant_id = $1 AND key_id = $2 AND model_route_id = $3",
+    )
+    .bind(account.tenant_id.to_string())
+    .bind(issued_key.key_id.to_string())
+    .bind(route.id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(grant_count, 1);
+    let history_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_credentials WHERE upstream_account_id = $1",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    let revoked_history_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_credentials WHERE upstream_account_id = $1 AND revoked_at IS NOT NULL",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(history_count, 5);
+    assert_eq!(revoked_history_count, 4);
+    let preserved_history_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_credentials WHERE upstream_account_id = $1 AND generation < 5 AND credential_ciphertext = $2 AND revoked_at IS NOT NULL",
+    )
+    .bind(account.id.to_string())
+    .bind(&ciphertext)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(preserved_history_count, 4);
+}
+
+#[tokio::test]
+async fn postgres_native_codex_upgrade_recovers_generation_five_old_and_native_envelopes() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let database = Database::connect_with_max(&database_url, 16).await.unwrap();
+    database.migrate().await.unwrap();
+    for fixture in [
+        PostgresNativeCodexFixture {
+            label: "old-envelope",
+            schema: "cpa-codex-oauth-v1",
+            proxy_url: "socks5://operator:proxy-secret@100.64.0.16:1080",
+            expected_proxy_url: "socks5h://operator:proxy-secret@100.64.0.16:1080",
+        },
+        PostgresNativeCodexFixture {
+            label: "native-envelope",
+            schema: "openai-codex-oauth-v1",
+            proxy_url: "socks5h://operator:proxy-secret@100.64.0.16:1080",
+            expected_proxy_url: "socks5h://operator:proxy-secret@100.64.0.16:1080",
+        },
+    ] {
+        assert_postgres_native_codex_upgrade_fixture(&database, fixture).await;
+    }
+}
+
 #[tokio::test]
 async fn postgres_migrations_queue_aggregates_and_events_work_together() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {

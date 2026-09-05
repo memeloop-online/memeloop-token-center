@@ -106,7 +106,7 @@ impl Database {
         key_material: &[u8],
     ) -> Result<NativeCodexUpgradeReport, AppError> {
         validate_native_codex_upgrade_targets(targets)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         let mut upgraded_account_ids = Vec::new();
         let mut already_native_account_ids = Vec::new();
         for target in targets {
@@ -785,24 +785,30 @@ fn validate_lowercase_hex_digest(value: &str, field: &str) -> Result<(), AppErro
 
 #[cfg(test)]
 mod native_codex_upgrade_tests {
+    use rust_decimal::Decimal;
+
     use super::*;
 
-    #[tokio::test]
-    async fn native_upgrade_preserves_stable_id_generation_and_private_proxy() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = Database::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            directory.path().join("native-codex-upgrade.db").display()
-        ))
-        .await
-        .unwrap();
-        database.migrate().await.unwrap();
+    #[derive(Clone, Copy)]
+    struct NativeCodexFixture {
+        label: &'static str,
+        schema: &'static str,
+        proxy_url: &'static str,
+        expected_proxy_url: &'static str,
+    }
+
+    async fn assert_native_codex_upgrade_fixture(
+        database: &Database,
+        fixture: NativeCodexFixture,
+    ) {
         let key_material = b"native Codex upgrade key material longer than thirty-two bytes";
+        let tenant = format!("native-upgrade-{}", fixture.label);
+        let expires_at = unix_millis() + 3_600_000;
         let account = database
             .create_upstream_account(
                 CreateUpstreamAccountInput {
-                    tenant_external_id: "native-upgrade".to_owned(),
-                    name: "Imported Codex".to_owned(),
+                    tenant_external_id: tenant.clone(),
+                    name: format!("Imported Codex {}", fixture.label),
                     driver: crate::oauth::codex_device::IMPORTED_PROVIDER_DRIVER.to_owned(),
                     config: serde_json::json!({
                         "base_url": crate::oauth::codex_device::BASE_URL,
@@ -812,16 +818,14 @@ mod native_codex_upgrade_tests {
                     credential: UpstreamCredential::OAuth {
                         access_token: "access-secret".to_owned(),
                         refresh_token: Some("refresh-secret".to_owned()),
-                        expires_at: Some(unix_millis() + 3_600_000),
+                        expires_at: Some(expires_at),
                         header: "authorization".to_owned(),
                         prefix: "Bearer ".to_owned(),
                         adapter_state: Some(serde_json::json!({
-                            "schema": "cpa-codex-oauth-v1",
+                            "schema": fixture.schema,
                             "account_id": "account-123"
                         })),
-                        proxy_url: Some(
-                            "socks5://operator:proxy-secret@100.64.0.16:1080".to_owned(),
-                        ),
+                        proxy_url: Some(fixture.proxy_url.to_owned()),
                         proxy_network_scope: Some(crate::network::OutboundScope::Private),
                     },
                     oauth_session_id: Some(Uuid::now_v7()),
@@ -832,6 +836,73 @@ mod native_codex_upgrade_tests {
             )
             .await
             .unwrap();
+        let route = database
+            .create_model_route(CreateModelRouteInput {
+                tenant_external_id: tenant.clone(),
+                public_model: format!("native-upgrade-model-{}", fixture.label),
+                upstream_account_id: account.id,
+                upstream_model: "gpt-5.6-sol".to_owned(),
+                protocol: "openai".to_owned(),
+                priority: 0,
+            })
+            .await
+            .unwrap();
+        let issued_key = database
+            .create_key_with_routing(
+                CreateKeyInput {
+                    tenant_external_id: tenant.clone(),
+                    principal_external_id: format!("native-upgrade-principal-{}", fixture.label),
+                    alias: format!("native-upgrade-key-{}", fixture.label),
+                    currency: "USD".to_owned(),
+                    policy: crate::model::KeyPolicy::default(),
+                    initial_balance: Decimal::ONE,
+                    idempotency_key: None,
+                },
+                &[route.id],
+                &[],
+                key_material,
+            )
+            .await
+            .unwrap();
+        let ciphertext: String = sqlx::query(
+            "SELECT credential_ciphertext FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = 1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap()
+        .try_get("credential_ciphertext")
+        .unwrap();
+        let history_created_at = unix_millis();
+        sqlx::query(
+            "UPDATE upstream_credentials SET generation = 5 WHERE upstream_account_id = $1 AND generation = 1",
+        )
+        .bind(account.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        for generation in 1_i64..5 {
+            sqlx::query(
+                "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at, revoked_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(account.id.to_string())
+            .bind(generation)
+            .bind(&ciphertext)
+            .bind(expires_at)
+            .bind(history_created_at.saturating_sub(generation))
+            .bind(history_created_at.saturating_sub(generation))
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "UPDATE upstream_accounts SET credential_generation = 5, status = 'disabled' WHERE id = $1",
+        )
+        .bind(account.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO upstream_account_imports (tenant_id, import_kind, source_key, contract_version, payload_digest, upstream_account_id, created_at) VALUES ($1, $2, $3, 1, $4, $5, $6)",
         )
@@ -850,6 +921,8 @@ mod native_codex_upgrade_tests {
             .await
             .unwrap();
         assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].account_id, account.id);
+        assert_eq!(plan[0].expected_credential_generation, 5);
         assert!(plan[0].has_proxy);
         assert_eq!(
             plan[0].proxy_network_scope,
@@ -866,10 +939,11 @@ mod native_codex_upgrade_tests {
             .unwrap();
         assert_eq!(upgraded.id, account.id);
         assert_eq!(upgraded.driver, crate::oauth::codex_device::PROVIDER_DRIVER);
-        assert_eq!(
-            upgraded.credential_generation,
-            account.credential_generation
-        );
+        assert_eq!(upgraded.auth_kind, "oauth");
+        assert_eq!(upgraded.status, "disabled");
+        assert_eq!(upgraded.credential_generation, 5);
+        assert_eq!(upgraded.credential_expires_at, Some(expires_at));
+        assert_eq!(upgraded.route_count, 1);
         assert_eq!(
             credential.adapter_state(),
             Some(&serde_json::json!({
@@ -880,10 +954,66 @@ mod native_codex_upgrade_tests {
         assert_eq!(
             credential.proxy(),
             Some((
-                "socks5h://operator:proxy-secret@100.64.0.16:1080",
+                fixture.expected_proxy_url,
                 crate::network::OutboundScope::Private
             ))
         );
+        let UpstreamCredential::OAuth {
+            access_token,
+            refresh_token,
+            expires_at: actual_expires_at,
+            ..
+        } = credential
+        else {
+            panic!("native upgrade must retain an OAuth credential");
+        };
+        assert_eq!(access_token, "access-secret");
+        assert_eq!(refresh_token.as_deref(), Some("refresh-secret"));
+        assert_eq!(actual_expires_at, Some(expires_at));
+        assert_eq!(
+            database
+                .credential_routing(issued_key.key_id, &tenant)
+                .await
+                .unwrap()
+                .route_ids,
+            vec![route.id]
+        );
+        let grant_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM routing_grants WHERE tenant_id = $1 AND key_id = $2 AND model_route_id = $3",
+        )
+        .bind(account.tenant_id.to_string())
+        .bind(issued_key.key_id.to_string())
+        .bind(route.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(grant_count, 1);
+        let credential_history = sqlx::query(
+            "SELECT generation, revoked_at FROM upstream_credentials WHERE upstream_account_id = $1 ORDER BY generation",
+        )
+        .bind(account.id.to_string())
+        .fetch_all(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(credential_history.len(), 5);
+        for row in &credential_history[..4] {
+            assert!(row.try_get::<Option<i64>, _>("revoked_at").unwrap().is_some());
+        }
+        assert_eq!(
+            credential_history[4]
+                .try_get::<Option<i64>, _>("revoked_at")
+                .unwrap(),
+            None
+        );
+        let preserved_history_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_credentials WHERE upstream_account_id = $1 AND generation < 5 AND credential_ciphertext = $2 AND revoked_at IS NOT NULL",
+        )
+        .bind(account.id.to_string())
+        .bind(&ciphertext)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(preserved_history_count, 4);
         let upgraded_lifecycle = sqlx::query(
             "SELECT oauth_session_id, oauth_driver, oauth_refresh_url FROM upstream_accounts WHERE id = $1",
         )
@@ -973,7 +1103,7 @@ mod native_codex_upgrade_tests {
             lifecycle
                 .try_get::<i64, _>("credential_generation")
                 .unwrap(),
-            account.credential_generation
+            5
         );
         let (_, repaired_credential) = database
             .upstream_account_with_credential(account.id, key_material)
@@ -982,7 +1112,7 @@ mod native_codex_upgrade_tests {
         assert_eq!(
             repaired_credential.proxy(),
             Some((
-                "socks5h://operator:proxy-secret@100.64.0.16:1080",
+                fixture.expected_proxy_url,
                 crate::network::OutboundScope::Private
             ))
         );
@@ -991,5 +1121,119 @@ mod native_codex_upgrade_tests {
             .await
             .unwrap();
         assert_eq!(repeated_repair.already_native_account_ids, vec![account.id]);
+    }
+
+    #[tokio::test]
+    async fn native_upgrade_recovers_generation_five_old_and_native_envelopes_without_touching_history() {
+        let directory = tempfile::tempdir().unwrap();
+        for fixture in [
+            NativeCodexFixture {
+                label: "old-envelope",
+                schema: "cpa-codex-oauth-v1",
+                proxy_url: "socks5://operator:proxy-secret@100.64.0.16:1080",
+                expected_proxy_url: "socks5h://operator:proxy-secret@100.64.0.16:1080",
+            },
+            NativeCodexFixture {
+                label: "native-envelope",
+                schema: "openai-codex-oauth-v1",
+                proxy_url: "socks5h://operator:proxy-secret@100.64.0.16:1080",
+                expected_proxy_url: "socks5h://operator:proxy-secret@100.64.0.16:1080",
+            },
+        ] {
+            let database = Database::connect(&format!(
+                "sqlite://{}?mode=rwc",
+                directory
+                    .path()
+                    .join(format!("native-codex-upgrade-{}.db", fixture.label))
+                    .display()
+            ))
+            .await
+            .unwrap();
+            database.migrate().await.unwrap();
+            assert_native_codex_upgrade_fixture(&database, fixture).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_native_upgrade_stale_plan_serializes_to_a_cas_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("native-codex-upgrade-cas.db").display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        let key_material = b"native Codex CAS key material longer than thirty-two bytes";
+        let account = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: "native-upgrade-cas".to_owned(),
+                    name: "Imported Codex CAS".to_owned(),
+                    driver: crate::oauth::codex_device::IMPORTED_PROVIDER_DRIVER.to_owned(),
+                    config: serde_json::json!({
+                        "base_url": crate::oauth::codex_device::BASE_URL,
+                        "network_scope": "public",
+                        "reservation_token_bounds": {}
+                    }),
+                    credential: UpstreamCredential::OAuth {
+                        access_token: "cas-access-secret".to_owned(),
+                        refresh_token: Some("cas-refresh-secret".to_owned()),
+                        expires_at: Some(unix_millis() + 3_600_000),
+                        header: "authorization".to_owned(),
+                        prefix: "Bearer ".to_owned(),
+                        adapter_state: Some(serde_json::json!({
+                            "schema": "cpa-codex-oauth-v1",
+                            "account_id": "cas-account-123"
+                        })),
+                        proxy_url: Some("socks5h://operator:secret@100.64.0.16:1080".to_owned()),
+                        proxy_network_scope: Some(crate::network::OutboundScope::Private),
+                    },
+                    oauth_session_id: Some(Uuid::now_v7()),
+                    oauth_driver: Some("damaged-driver".to_owned()),
+                    oauth_refresh_url: Some("https://damaged.invalid".to_owned()),
+                },
+                key_material,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO upstream_account_imports (tenant_id, import_kind, source_key, contract_version, payload_digest, upstream_account_id, created_at) VALUES ($1, $2, $3, 1, $4, $5, $6)",
+        )
+        .bind(account.tenant_id.to_string())
+        .bind(CPA_MANAGED_OAUTH_IMPORT_KIND)
+        .bind("c".repeat(64))
+        .bind("d".repeat(64))
+        .bind(account.id.to_string())
+        .bind(unix_millis())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let plan = database
+            .prepare_native_codex_upgrade(&[account.id], key_material)
+            .await
+            .unwrap();
+
+        let mut winner = database.begin_write_transaction().await.unwrap();
+        sqlx::query("UPDATE upstream_accounts SET updated_at = updated_at + 1 WHERE id = $1")
+            .bind(account.id.to_string())
+            .execute(&mut *winner)
+            .await
+            .unwrap();
+        let apply_database = database.clone();
+        let apply_task = tokio::spawn(async move {
+            apply_database
+                .apply_native_codex_upgrade(&plan, key_material)
+                .await
+        });
+        tokio::task::yield_now().await;
+        winner.commit().await.unwrap();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), apply_task)
+            .await
+            .expect("native upgrade must not remain blocked behind a committed writer")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, crate::error::AppError::Conflict(_)));
     }
 }
