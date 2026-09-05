@@ -98,7 +98,10 @@ pub(super) async fn send_proxy_route(
                     stage = error_code,
                     "Codex upstream response failed framing admission"
                 );
-                return Err(ProxySendError::InvalidResponse(error_code));
+                // A successful HTTP response means the POST may already have
+                // executed and become billable. Framing invalidity is safe to
+                // reject, but never safe to replay on another account.
+                return Err(ProxySendError::AmbiguousResponse(error_code));
             }
             Err(codex_transport::ResponseAdmissionError::Ambiguous(error_code)) => {
                 retry

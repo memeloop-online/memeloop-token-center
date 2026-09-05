@@ -883,114 +883,45 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
 }
 
 #[tokio::test]
-async fn codex_missing_content_type_json_fails_over_before_downstream_delivery() {
-    let fixture = codex_route_fixture("high-demand-failover").await;
+async fn codex_2xx_non_sse_is_ambiguous_and_never_crosses_accounts() {
+    let fixture = codex_route_fixture("ambiguous-non-sse").await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .and(header_matcher("chatgpt-account-id", "account-123"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_bytes(
-                serde_json::to_vec(&json!({
-                    "error": {"message": "temporary high demand secret"}
-                }))
-                .unwrap(),
-            ),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"error":{"message":"temporary high demand secret"}}"#,
+            "application/json",
+        ))
         .expect(1)
         .mount(&upstream)
         .await;
-    let sse = completed_codex_sse("standby answer");
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .and(header_matcher("chatgpt-account-id", "account-456"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream"),
+            ResponseTemplate::new(200)
+                .set_body_raw(completed_codex_sse("must not run"), "text/event-stream"),
         )
-        .expect(2)
+        .expect(0)
         .mount(&upstream)
         .await;
 
-    let tenant = "codex-route-high-demand-failover";
-    let standby = fixture
-        .state
-        .db
-        .create_upstream_account(
-            CreateUpstreamAccountInput {
-                tenant_external_id: tenant.to_owned(),
-                name: "codex-high-demand-standby".to_owned(),
-                driver: codex_transport::DRIVER.to_owned(),
-                config: json!({
-                    "base_url": codex_transport::BASE_URL,
-                    "network_scope": "public",
-                    "reservation_token_bounds": {fixture.upstream_model.clone(): 64}
-                }),
-                credential: UpstreamCredential::OAuth {
-                    access_token: "standby-access-secret".to_owned(),
-                    refresh_token: Some("standby-refresh-secret".to_owned()),
-                    expires_at: Some(i64::MAX),
-                    header: "authorization".to_owned(),
-                    prefix: "Bearer ".to_owned(),
-                    adapter_state: Some(json!({
-                        "schema": "openai-codex-oauth-v1",
-                        "account_id": "account-456"
-                    })),
-                    proxy_url: None,
-                    proxy_network_scope: None,
-                },
-                oauth_session_id: None,
-                oauth_driver: Some(codex_transport::DRIVER.to_owned()),
-                oauth_refresh_url: Some(crate::oauth::managed::codex::TOKEN_ENDPOINT.to_owned()),
-            },
-            fixture.state.config.key_pepper.as_bytes(),
-        )
-        .await
-        .unwrap();
-    let standby_route = fixture
-        .state
-        .db
-        .create_model_route(CreateModelRouteInput {
-            tenant_external_id: tenant.to_owned(),
-            public_model: fixture.model.clone(),
-            upstream_account_id: standby.id,
-            upstream_model: fixture.upstream_model.clone(),
-            protocol: "openai".to_owned(),
-            priority: 10,
-        })
-        .await
-        .unwrap();
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let tenant_id: String = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1")
-        .bind(fixture.key_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at)
-         VALUES ($1, $2, $3, NULL, $4)",
+    add_codex_standby_route(&fixture, "codex-route-ambiguous-non-sse", "account-456").await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "ambiguous", "stream": false}),
     )
-    .bind(&tenant_id)
-    .bind(fixture.key_id.to_string())
-    .bind(standby_route.id.to_string())
-    .bind(crate::db::unix_millis())
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    for input in ["first", "second"] {
-        let response = send_codex_route(
-            &fixture,
-            &upstream,
-            "/v1/responses",
-            json!({"model": fixture.model, "input": input, "stream": false}),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("standby answer"));
-    }
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("upstream request failed"));
+    assert!(!String::from_utf8_lossy(&body).contains("high demand secret"));
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let actual: String = sqlx::query_scalar(
         "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
     )
@@ -998,7 +929,7 @@ async fn codex_missing_content_type_json_fails_over_before_downstream_delivery()
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(actual, standby.id.to_string());
+    assert_eq!(actual, fixture.upstream_account_id.to_string());
     let failure_kind: String = sqlx::query_scalar(
         "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
     )
@@ -1006,14 +937,21 @@ async fn codex_missing_content_type_json_fails_over_before_downstream_delivery()
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(failure_kind, "invalid_response");
-    for row in fixture
+    assert_eq!(failure_kind, "connection");
+    let rows = fixture
         .state
         .db
         .list_requests(fixture.key_id, 10)
         .await
-        .unwrap()
-    {
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_invalid_content_type")
+    );
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    for row in rows {
         let refs = fixture
             .state
             .db
@@ -1026,7 +964,7 @@ async fn codex_missing_content_type_json_fails_over_before_downstream_delivery()
             .get(refs.response_object.as_deref().unwrap())
             .await
             .unwrap();
-        assert!(!String::from_utf8_lossy(&archived).contains("high demand secret"));
+        assert!(!String::from_utf8_lossy(&archived).contains("temporary high demand secret"));
     }
     pool.close().await;
     upstream.verify().await;
