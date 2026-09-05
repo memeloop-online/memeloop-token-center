@@ -329,6 +329,10 @@ pub(super) async fn proxy(
                 UpstreamFailureKind::InvalidResponse,
                 UpstreamHealthReason::InvalidResponse,
             )),
+            Err(ProxySendError::RetryableCodexBadRequest) => Some((
+                UpstreamFailureKind::Unavailable,
+                UpstreamHealthReason::Unavailable,
+            )),
             Err(
                 ProxySendError::RetryableConnection
                 | ProxySendError::CandidateUnavailable
@@ -338,7 +342,11 @@ pub(super) async fn proxy(
                 UpstreamHealthReason::Connection,
             )),
             Ok(_) => None,
-            Err(ProxySendError::NonRetryableTransport | ProxySendError::Credential) => None,
+            Err(
+                ProxySendError::CodexBadRequest
+                | ProxySendError::NonRetryableTransport
+                | ProxySendError::Credential,
+            ) => None,
         };
         if let Some((kind, reason)) = failure {
             if let Err(error) = state
@@ -423,6 +431,22 @@ pub(super) async fn proxy(
             }
             Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => {
                 return finish_proxy_unavailable(&buffered_request, "upstream_connection").await;
+            }
+            Err(ProxySendError::RetryableCodexBadRequest) => {
+                return finish_proxy_unavailable(&buffered_request, "upstream_rejected").await;
+            }
+            Err(ProxySendError::CodexBadRequest) => {
+                return finish_buffered_request(
+                    &buffered_request,
+                    StatusCode::BAD_REQUEST,
+                    Bytes::from_static(
+                        b"{\"error\":{\"message\":\"upstream rejected the request\",\"type\":\"upstream_error\"}}",
+                    ),
+                    "application/json",
+                    TokenUsage::default(),
+                    Some("http_400".to_owned()),
+                )
+                .await;
             }
             Err(ProxySendError::InvalidResponse(error_code)) => {
                 return finish_proxy_unavailable(&buffered_request, error_code).await;

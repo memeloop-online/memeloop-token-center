@@ -131,6 +131,8 @@ pub(super) async fn prepare_proxy_route(
 
 pub(super) enum ProxySendError {
     RetryableConnection,
+    RetryableCodexBadRequest,
+    CodexBadRequest,
     CandidateUnavailable,
     InvalidResponse(&'static str),
     AmbiguousResponse(&'static str),

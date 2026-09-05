@@ -24,6 +24,13 @@ pub(super) const RESPONSES_PATH: &str = "/responses";
 // downstream callers or vary with arbitrary account configuration.
 pub(super) const USER_AGENT: &str = crate::oauth::managed::codex::USER_AGENT;
 const MAX_OUTPUT_ITEMS: usize = 16_384;
+// A 400 is normally a client-side rejection and must not affect account
+// health. Keep the exceptional transient-rejection inspection deliberately
+// small: it happens before any downstream bytes are delivered and its body is
+// never retained, archived, logged, or returned.
+const MAX_CODEX_RETRYABLE_ERROR_BYTES: usize = 16 * 1024;
+const MAX_CODEX_RETRYABLE_ERROR_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 const MISSING_CONTENT_TYPE_SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
 
@@ -598,6 +605,104 @@ pub(super) fn is_event_stream(response: &UpstreamResponse) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BadRequestDisposition {
+    Ordinary,
+    Retryable,
+}
+
+/// Classify the narrowly-defined subset of Codex 400 responses which are safe
+/// to retry on another account. The response is consumed regardless of the
+/// result: callers use the existing fixed, body-free error response for an
+/// ordinary 400. This prevents an upstream error body from reaching logs,
+/// archives, or the downstream client.
+pub(super) async fn classify_bad_request(response: UpstreamResponse) -> BadRequestDisposition {
+    if response.status() != http::StatusCode::BAD_REQUEST
+        || !has_single_json_content_type(&response)
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_CODEX_RETRYABLE_ERROR_BYTES as u64)
+    {
+        return BadRequestDisposition::Ordinary;
+    }
+
+    match tokio::time::timeout(
+        MAX_CODEX_RETRYABLE_ERROR_WAIT,
+        read_bounded_bad_request_body(response),
+    )
+    .await
+    {
+        Ok(Some(value)) if codex_transient_error(&value) => BadRequestDisposition::Retryable,
+        Ok(Some(_) | None) | Err(_) => BadRequestDisposition::Ordinary,
+    }
+}
+
+async fn read_bounded_bad_request_body(response: UpstreamResponse) -> Option<Value> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if chunk.len() > MAX_CODEX_RETRYABLE_ERROR_BYTES.saturating_sub(body.len()) {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).ok()
+}
+
+fn has_single_json_content_type(response: &UpstreamResponse) -> bool {
+    let mut values = response.headers().get_all(header::CONTENT_TYPE).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("application/json") || value.ends_with("+json")
+        })
+}
+
+fn codex_transient_error(value: &Value) -> bool {
+    let Some(error) = value.get("error").and_then(Value::as_object) else {
+        return false;
+    };
+    if error
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(is_explicit_transient_error_type)
+    {
+        return true;
+    }
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(is_known_high_demand_message)
+}
+
+fn is_explicit_transient_error_type(error_type: &str) -> bool {
+    matches!(
+        error_type,
+        "server_error"
+            | "internal_error"
+            | "temporarily_unavailable"
+            | "service_unavailable"
+            | "overloaded_error"
+            | "high_demand"
+            | "high_demand_error"
+    )
+}
+
+fn is_known_high_demand_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("high demand") || message.contains("high-demand")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ResponseAdmissionError {
     Invalid(&'static str),
     Ambiguous(&'static str),
@@ -1003,6 +1108,22 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retryable_bad_request_classification_requires_known_transient_semantics() {
+        assert!(codex_transient_error(&json!({
+            "error": {"type": "temporarily_unavailable", "message": "private detail"}
+        })));
+        assert!(codex_transient_error(&json!({
+            "error": {"type": "request_error", "message": "The service is under high demand."}
+        })));
+        assert!(!codex_transient_error(&json!({
+            "error": {"type": "invalid_request_error", "message": "context is too long"}
+        })));
+        assert!(!codex_transient_error(&json!({
+            "error": {"type": "invalid_request_error"}
+        })));
+    }
 
     fn config(model: &str, limit: i64) -> Value {
         json!({

@@ -48,6 +48,16 @@ pub(super) async fn send_proxy_route(
     match upstream_result {
         Ok(response) => {
             let response = UpstreamResponse::Codex(response);
+            if response.status() == StatusCode::BAD_REQUEST {
+                return match codex_transport::classify_bad_request(response).await {
+                    codex_transport::BadRequestDisposition::Retryable => {
+                        Err(ProxySendError::RetryableCodexBadRequest)
+                    }
+                    codex_transport::BadRequestDisposition::Ordinary => {
+                        Err(ProxySendError::CodexBadRequest)
+                    }
+                };
+            }
             if !response.status().is_success() {
                 return Ok((response, upstream_activity));
             }

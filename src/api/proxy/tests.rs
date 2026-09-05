@@ -128,6 +128,98 @@ async fn codex_route_fixture(label: &str) -> CodexRouteFixture {
     codex_route_fixture_with_archive_directory(label, "archive").await
 }
 
+async fn add_codex_standby_route(
+    fixture: &CodexRouteFixture,
+    tenant: &str,
+    account_id: &str,
+) -> Uuid {
+    let standby = fixture
+        .state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.to_owned(),
+                name: format!("codex-standby-{account_id}"),
+                driver: codex_transport::DRIVER.to_owned(),
+                config: json!({
+                    "base_url": codex_transport::BASE_URL,
+                    "network_scope": "public",
+                    "reservation_token_bounds": {fixture.upstream_model.clone(): 64}
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "standby-access-secret".to_owned(),
+                    refresh_token: Some("standby-refresh-secret".to_owned()),
+                    expires_at: Some(i64::MAX),
+                    header: "authorization".to_owned(),
+                    prefix: "Bearer ".to_owned(),
+                    adapter_state: Some(json!({
+                        "schema": "openai-codex-oauth-v1",
+                        "account_id": account_id
+                    })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
+                },
+                oauth_session_id: None,
+                oauth_driver: Some(codex_transport::DRIVER.to_owned()),
+                oauth_refresh_url: Some(crate::oauth::managed::codex::TOKEN_ENDPOINT.to_owned()),
+            },
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let route = fixture
+        .state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.to_owned(),
+            public_model: fixture.model.clone(),
+            upstream_account_id: standby.id,
+            upstream_model: fixture.upstream_model.clone(),
+            protocol: "openai".to_owned(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let tenant_id: String = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1")
+        .bind(fixture.key_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at)
+         VALUES ($1, $2, $3, NULL, $4)",
+    )
+    .bind(&tenant_id)
+    .bind(fixture.key_id.to_string())
+    .bind(route.id.to_string())
+    .bind(crate::db::unix_millis())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    standby.id
+}
+
+async fn assert_response_archives_omit(fixture: &CodexRouteFixture, sensitive: &str) {
+    for row in fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap() {
+        let refs = fixture
+            .state
+            .db
+            .request_archive_refs(fixture.key_id, row.request_id)
+            .await
+            .unwrap();
+        let Some(response_object) = refs.response_object else {
+            continue;
+        };
+        let archived = fixture.state.archive.get(&response_object).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&archived).contains(sensitive),
+            "upstream error body must not be archived"
+        );
+    }
+}
+
 async fn codex_route_fixture_with_archive_directory(
     label: &str,
     archive_directory: &str,
@@ -692,6 +784,187 @@ async fn codex_missing_content_type_json_fails_over_before_downstream_delivery()
     }
     pool.close().await;
     upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_transient_400_fails_over_before_downstream_delivery() {
+    let fixture = codex_route_fixture("transient-400-failover").await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-123"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "type": "temporarily_unavailable",
+                "message": "transient upstream detail must stay private"
+            }
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-456"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(
+                completed_codex_sse("standby after transient rejection").into_bytes(),
+                "text/event-stream",
+            ),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let standby = add_codex_standby_route(
+        &fixture,
+        "codex-route-transient-400-failover",
+        "account-456",
+    )
+    .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "retry safely", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("standby after transient rejection"));
+    assert!(!body.contains("transient upstream detail must stay private"));
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let failure_kind: String = sqlx::query_scalar(
+        "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failure_kind, "unavailable");
+    let actual: String = sqlx::query_scalar(
+        "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(fixture.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(actual, standby.to_string());
+    pool.close().await;
+    assert_response_archives_omit(&fixture, "transient upstream detail must stay private").await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_invalid_request_400_does_not_fail_over_or_cool_down() {
+    let fixture = codex_route_fixture("ordinary-400").await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-123"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "type": "invalid_request_error",
+                "message": "private context rejection detail"
+            }
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(header_matcher("chatgpt-account-id", "account-456"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    add_codex_standby_route(&fixture, "codex-route-ordinary-400", "account-456").await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "ordinary rejection", "stream": false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("upstream rejected the request"));
+    assert!(!body.contains("private context rejection detail"));
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let health_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(health_rows, 0);
+    pool.close().await;
+    assert_response_archives_omit(&fixture, "private context rejection detail").await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_unclassifiable_400_bodies_fail_closed_without_leaking() {
+    for (label, body, sensitive) in [
+        (
+            "oversized-400",
+            format!(
+                "{{\"error\":{{\"type\":\"temporarily_unavailable\",\"message\":\"{}\"}}}}",
+                "oversized private upstream detail ".repeat(600),
+            )
+            .into_bytes(),
+            "oversized private upstream detail",
+        ),
+        (
+            "malformed-400",
+            b"{\"error\": {\"type\": \"temporarily_unavailable\", \"message\": \"malformed private upstream detail\""
+                .to_vec(),
+            "malformed private upstream detail",
+        ),
+    ] {
+        let fixture = codex_route_fixture(label).await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(codex_transport::RESPONSES_PATH))
+            .respond_with(ResponseTemplate::new(400).set_body_raw(body, "application/json"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let response = send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({"model": fixture.model, "input": "fail closed", "stream": false}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+        let response_body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&response_body).contains(sensitive),
+            "{label} response leaked upstream detail"
+        );
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let health_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        )
+        .bind(fixture.upstream_account_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(health_rows, 0, "{label}");
+        pool.close().await;
+        assert_response_archives_omit(&fixture, sensitive).await;
+        upstream.verify().await;
+    }
 }
 
 #[tokio::test]
