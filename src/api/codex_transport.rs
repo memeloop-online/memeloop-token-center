@@ -4,13 +4,14 @@ use std::future::Future;
 
 use axum::body::Bytes;
 use futures_util::StreamExt;
-use reqwest::{RequestBuilder, header};
+use http::header;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use super::{
     MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS,
-    MAX_RESPONSES_SSE_EVENT_BYTES, Protocol, TokenUsage, usage_from_value_checked,
+    MAX_RESPONSES_SSE_EVENT_BYTES, Protocol, TokenUsage, upstream_response::UpstreamResponse,
+    usage_from_value_checked,
 };
 use crate::{
     error::AppError, oauth::managed::codex::account_header_value, provider::UpstreamCredential,
@@ -55,10 +56,21 @@ const UNSUPPORTED_FIELDS: &[&str] = &[
     "safety_identifier",
     "stream_options",
 ];
+const PASSTHROUGH_HEADERS: &[&str] = &[
+    "version",
+    "x-codex-beta-features",
+    "x-codex-turn-metadata",
+    "x-client-request-id",
+    "x-codex-window-id",
+    "thread-id",
+    "x-openai-internal-codex-responses-lite",
+];
+const MAX_PASSTHROUGH_HEADER_BYTES: usize = 4 * 1024;
 
 pub(super) struct PreparedCodexRequest {
     pub downstream_stream: bool,
     pub output_token_ceiling: i64,
+    pub session_id: String,
 }
 
 pub(super) fn validate_protocol(protocol: Protocol) -> Result<(), AppError> {
@@ -92,10 +104,20 @@ where
 
 /// Rewrite only the upstream wire document. The original downstream body is
 /// archived by `proxy()` before this document is sent.
+#[cfg(test)]
 pub(super) fn prepare_request(
     request: &mut Value,
     upstream_model: &str,
     config: &Value,
+) -> Result<PreparedCodexRequest, AppError> {
+    prepare_request_with_id(request, upstream_model, config, Uuid::nil())
+}
+
+pub(super) fn prepare_request_with_id(
+    request: &mut Value,
+    upstream_model: &str,
+    config: &Value,
+    request_id: Uuid,
 ) -> Result<PreparedCodexRequest, AppError> {
     validate_route_config(config)?;
     let object = request
@@ -144,13 +166,39 @@ pub(super) fn prepare_request(
         object.remove(*field);
     }
     normalize_include(object)?;
+    let session_id = normalize_prompt_cache_key(object, request_id)?;
     normalize_string_input(object);
     rewrite_system_roles(request);
 
     Ok(PreparedCodexRequest {
         downstream_stream,
         output_token_ceiling,
+        session_id,
     })
+}
+
+fn normalize_prompt_cache_key(
+    object: &mut Map<String, Value>,
+    request_id: Uuid,
+) -> Result<String, AppError> {
+    let session_id = match object.get("prompt_cache_key") {
+        None | Some(Value::Null) => request_id.to_string(),
+        Some(Value::String(value))
+            if !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control) =>
+        {
+            value.clone()
+        }
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "prompt_cache_key must be a bounded non-empty string".into(),
+            ));
+        }
+    };
+    object.insert(
+        "prompt_cache_key".to_owned(),
+        Value::String(session_id.clone()),
+    );
+    Ok(session_id)
 }
 
 pub(super) fn validate_route_config(config: &Value) -> Result<(), AppError> {
@@ -294,21 +342,57 @@ fn rewrite_system_roles(value: &mut Value) {
     }
 }
 
-pub(super) fn apply_wire_headers(
-    request: RequestBuilder,
+#[cfg(test)]
+pub(super) fn apply_reqwest_wire_headers(
+    request: reqwest::RequestBuilder,
     credential: &UpstreamCredential,
-    request_id: Uuid,
-) -> Result<RequestBuilder, AppError> {
+    session_id: &str,
+) -> Result<reqwest::RequestBuilder, AppError> {
     validate_credential_contract(credential)?;
     let account_id = account_header_value(credential)?;
     let request = credential.apply(request, crate::db::unix_millis())?;
     Ok(request
         .header(header::ACCEPT, "text/event-stream")
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CONNECTION, "Keep-Alive")
         .header("originator", "codex-tui")
         .header(header::USER_AGENT, USER_AGENT)
-        .header("session-id", request_id.to_string())
+        .header("session-id", session_id)
+        .header("chatgpt-account-id", account_id))
+}
+
+pub(super) fn apply_wreq_wire_headers(
+    request: wreq::RequestBuilder,
+    downstream_headers: &http::HeaderMap,
+    credential: &UpstreamCredential,
+    session_id: &str,
+) -> Result<wreq::RequestBuilder, AppError> {
+    validate_credential_contract(credential)?;
+    let account_id = account_header_value(credential)?;
+    let Some((credential_header, credential_value)) =
+        credential.request_header(crate::db::unix_millis())?
+    else {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex credential is missing authorization".into(),
+        ));
+    };
+    let mut request = request.default_headers(false);
+    for name in PASSTHROUGH_HEADERS {
+        if let Some(value) = downstream_headers.get(*name) {
+            if value.as_bytes().len() > MAX_PASSTHROUGH_HEADER_BYTES {
+                return Err(AppError::BadRequest(
+                    "Codex metadata header exceeds its size limit".into(),
+                ));
+            }
+            request = request.header(*name, value.clone());
+        }
+    }
+    Ok(request
+        .header(credential_header, credential_value)
+        .header(header::ACCEPT, "text/event-stream")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("originator", "codex-tui")
+        .header(header::USER_AGENT, USER_AGENT)
+        .header("session-id", session_id)
         .header("chatgpt-account-id", account_id))
 }
 
@@ -473,7 +557,7 @@ fn terminal_kind(name: &str) -> Option<StreamTerminal> {
     }
 }
 
-pub(super) fn is_event_stream(response: &reqwest::Response) -> bool {
+pub(super) fn is_event_stream(response: &UpstreamResponse) -> bool {
     response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -482,13 +566,47 @@ pub(super) fn is_event_stream(response: &reqwest::Response) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
+pub(super) fn content_type_class(response: &UpstreamResponse) -> &'static str {
+    let Some(value) = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+    else {
+        return "missing";
+    };
+    if value.eq_ignore_ascii_case("text/event-stream") {
+        "sse"
+    } else if value.eq_ignore_ascii_case("application/json") || value.ends_with("+json") {
+        "json"
+    } else if value.eq_ignore_ascii_case("text/html") {
+        "html"
+    } else if value.starts_with("text/") {
+        "text"
+    } else {
+        "other"
+    }
+}
+
+pub(super) fn http_version_class(response: &UpstreamResponse) -> &'static str {
+    match response.version() {
+        http::Version::HTTP_09 => "0.9",
+        http::Version::HTTP_10 => "1.0",
+        http::Version::HTTP_11 => "1.1",
+        http::Version::HTTP_2 => "2",
+        http::Version::HTTP_3 => "3",
+        _ => "other",
+    }
+}
+
 pub(super) struct BufferedCodexResponse {
     pub body: Bytes,
     pub usage: TokenUsage,
 }
 
 pub(super) async fn buffer_response(
-    response: reqwest::Response,
+    response: UpstreamResponse,
 ) -> Result<BufferedCodexResponse, &'static str> {
     if !is_event_stream(&response) {
         return Err("upstream_invalid_content_type");
@@ -781,6 +899,8 @@ mod tests {
         assert_eq!(body["nested"]["role"], "developer");
         assert_eq!(body["nested"]["children"][0]["role"], "developer");
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["prompt_cache_key"], Uuid::nil().to_string());
+        assert_eq!(plan.session_id, Uuid::nil().to_string());
 
         let mut with_tools = json!({
             "model": "public",
@@ -807,6 +927,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(null_instructions["instructions"], "");
+    }
+
+    #[test]
+    fn prompt_cache_key_is_preserved_and_reused_as_the_session_id() {
+        let mut request = json!({
+            "model": "public",
+            "input": [],
+            "prompt_cache_key": "downstream-session-42"
+        });
+        let plan = prepare_request(&mut request, "gpt-codex", &config("gpt-codex", 10)).unwrap();
+        assert_eq!(plan.session_id, "downstream-session-42");
+        assert_eq!(request["prompt_cache_key"], "downstream-session-42");
+
+        for invalid in [
+            Value::String(String::new()),
+            Value::String("x".repeat(257)),
+            json!(7),
+        ] {
+            let mut request = json!({"model": "public", "input": [], "prompt_cache_key": invalid});
+            assert!(prepare_request(&mut request, "gpt-codex", &config("gpt-codex", 10)).is_err());
+        }
     }
 
     #[test]
@@ -945,12 +1086,12 @@ mod tests {
             proxy_network_scope: None,
         };
         let request_id = Uuid::nil();
-        let request = apply_wire_headers(
+        let request = apply_reqwest_wire_headers(
             reqwest::Client::new()
                 .post(format!("{BASE_URL}{RESPONSES_PATH}"))
                 .body("{}"),
             &credential,
-            request_id,
+            &request_id.to_string(),
         )
         .unwrap()
         .build()
@@ -961,7 +1102,7 @@ mod tests {
         );
         assert_eq!(request.headers()[header::ACCEPT], "text/event-stream");
         assert_eq!(request.headers()[header::CONTENT_TYPE], "application/json");
-        assert_eq!(request.headers()[header::CONNECTION], "Keep-Alive");
+        assert!(request.headers().get(header::CONNECTION).is_none());
         assert_eq!(request.headers()[header::USER_AGENT], USER_AGENT);
         assert_eq!(request.headers()["originator"], "codex-tui");
         assert_eq!(request.headers()["session-id"], request_id.to_string());
@@ -988,10 +1129,10 @@ mod tests {
                 proxy_network_scope: None,
             };
             assert!(
-                apply_wire_headers(
+                apply_reqwest_wire_headers(
                     reqwest::Client::new().post(format!("{BASE_URL}{RESPONSES_PATH}")),
                     &invalid,
-                    request_id,
+                    &request_id.to_string(),
                 )
                 .is_err()
             );

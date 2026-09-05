@@ -6,7 +6,7 @@ use archive::{cancel_stream_archive, stream_response_archive};
 
 pub(super) struct StreamingResponse<'a> {
     pub(super) state: &'a AppState,
-    pub(super) upstream: reqwest::Response,
+    pub(super) upstream: UpstreamResponse,
     pub(super) status: StatusCode,
     pub(super) content_type: Option<HeaderValue>,
     pub(super) is_sse: bool,

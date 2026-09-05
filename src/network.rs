@@ -216,6 +216,57 @@ pub async fn client_for_config_url(
     crate::build_explicit_proxy_http_client(proxy_url, &pins).map_err(|_| AppError::Internal)
 }
 
+/// Validate the fixed native Codex target and its remote-DNS proxy without
+/// constructing a second HTTP client. The caller uses a shared fingerprinted
+/// client and attaches the already validated proxy to the individual request.
+///
+/// Production Codex traffic is intentionally fail-closed unless it uses an
+/// operator-approved private IP-literal `socks5h://` endpoint. Unit tests may
+/// reach their task-local loopback server without a proxy when the normal test
+/// loopback switch is enabled.
+pub(crate) async fn validate_codex_transport(
+    value: &str,
+    config: &Value,
+    proxy: Option<(&str, OutboundScope)>,
+    allow_test_loopback: bool,
+) -> Result<(), AppError> {
+    let target_scope = scope_from_config(config);
+    let target = checked_http_url(value)?;
+    let Some((proxy_url, proxy_scope)) = proxy else {
+        let (_, target_addresses, target_test_loopback) =
+            validated_endpoint(&target, target_scope, allow_test_loopback).await?;
+        validate_transport_security(
+            target.scheme(),
+            &target_addresses,
+            target_scope,
+            target_test_loopback,
+        )?;
+        return target_test_loopback.then_some(()).ok_or_else(|| {
+            AppError::BadRequest("OpenAI Codex requires an approved remote-DNS proxy".into())
+        });
+    };
+    // The product Codex route has an independently enforced fixed public base
+    // URL. Do not repeat a local DNS lookup on every inference request: the
+    // approved socks5h endpoint owns connection-time DNS by contract.
+    if target_scope != OutboundScope::Public || target.scheme() != "https" {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex target must use its fixed public HTTPS endpoint".into(),
+        ));
+    }
+    let proxy = checked_proxy_url(proxy_url)?;
+    if proxy.scheme() != "socks5h" || !has_safe_private_ip_literal_host(&proxy) {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex requires a private IP-literal socks5h proxy".into(),
+        ));
+    }
+    if proxy_scope != OutboundScope::Private {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex proxy endpoint is outside the approved private network".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn validated_endpoint(
     url: &Url,
     scope: OutboundScope,
@@ -645,6 +696,49 @@ mod tests {
             .await
             .is_err(),
             "an approved proxy must not bypass final-target SSRF checks"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_transport_requires_private_remote_dns_proxy() {
+        let config = serde_json::json!({
+            "base_url": "https://1.1.1.1",
+            "network_scope": "public"
+        });
+        assert!(
+            validate_codex_transport("https://1.1.1.1", &config, None, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_codex_transport(
+                "https://1.1.1.1",
+                &config,
+                Some(("socks5://10.20.30.40:1080", OutboundScope::Private)),
+                false,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            validate_codex_transport(
+                "https://1.1.1.1",
+                &config,
+                Some(("socks5h://10.20.30.40:1080", OutboundScope::Private)),
+                false,
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            validate_codex_transport(
+                "https://1.1.1.1",
+                &config,
+                Some(("socks5h://8.8.8.8:1080", OutboundScope::Private)),
+                false,
+            )
+            .await
+            .is_err()
         );
     }
 

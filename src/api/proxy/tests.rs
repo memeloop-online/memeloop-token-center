@@ -1057,6 +1057,8 @@ async fn send_codex_route(
         .header("originator", "downstream-spoof")
         .header("session_id", "downstream-spoof")
         .header("chatgpt-account-id", "downstream-spoof")
+        .header("version", "0.150.0-alpha.8")
+        .header("x-codex-turn-metadata", "bounded-turn-metadata")
         .header("anthropic-version", "downstream-spoof")
         .header("anthropic-beta", "downstream-spoof")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -1144,18 +1146,34 @@ fn assert_codex_wire(request: &wiremock::Request, upstream_model: &str) {
     assert_eq!(request.url.path(), codex_transport::RESPONSES_PATH);
     assert_eq!(request.headers[header::ACCEPT], "text/event-stream");
     assert_eq!(request.headers[header::CONTENT_TYPE], "application/json");
-    assert_eq!(request.headers[header::CONNECTION], "Keep-Alive");
+    assert!(request.headers.get(header::CONNECTION).is_none());
     assert_eq!(
         request.headers[header::USER_AGENT],
         "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)"
     );
     assert_eq!(request.headers["originator"], "codex-tui");
     assert_eq!(request.headers["chatgpt-account-id"], "account-123");
+    assert_eq!(request.headers["version"], "0.150.0-alpha.8");
+    assert_eq!(
+        request.headers["x-codex-turn-metadata"],
+        "bounded-turn-metadata"
+    );
     assert_eq!(
         request.headers[header::AUTHORIZATION],
         "Bearer upstream-access-secret"
     );
     assert_ne!(request.headers["session-id"], "downstream-spoof");
+    for browser_header in [
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "accept-language",
+    ] {
+        assert!(
+            request.headers.get(browser_header).is_none(),
+            "{browser_header}"
+        );
+    }
     assert!(request.headers.get("anthropic-version").is_none());
     assert!(request.headers.get("anthropic-beta").is_none());
     let body: Value = serde_json::from_slice(&request.body).unwrap();
@@ -1164,6 +1182,10 @@ fn assert_codex_wire(request: &wiremock::Request, upstream_model: &str) {
     assert_eq!(body["store"], false);
     assert!(body.get("parallel_tool_calls").is_none());
     assert_eq!(body["instructions"], "");
+    assert_eq!(
+        body["prompt_cache_key"],
+        request.headers["session-id"].to_str().unwrap()
+    );
     assert_eq!(body["input"][0]["role"], "developer");
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     for removed in [

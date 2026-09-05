@@ -7,6 +7,7 @@ mod conversation_hints;
 mod lifecycle;
 mod routing;
 mod streaming;
+mod upstream_response;
 
 use crate::{
     db::{UpstreamAttemptAdmission, UpstreamFailureKind},
@@ -21,6 +22,7 @@ use routing::{
     MAX_UPSTREAM_ATTEMPTS, ProxySendError, prepare_proxy_route, retryable_upstream_status,
     send_proxy_route,
 };
+use upstream_response::UpstreamResponse;
 
 #[cfg(test)]
 mod tests;
@@ -77,8 +79,16 @@ pub(super) async fn proxy(
         // A missing route must never fall back to process-wide legacy secrets.
         return Err(AppError::Forbidden);
     };
-    let primary =
-        prepare_proxy_route(&state, &key, &model, protocol, &request_json, primary_route).await?;
+    let primary = prepare_proxy_route(
+        &state,
+        &key,
+        &model,
+        protocol,
+        request_id,
+        &request_json,
+        primary_route,
+    )
+    .await?;
     let primary_is_component = primary.is_component(&state);
     let mut prepared_routes = vec![primary];
     if !primary_is_component {
@@ -97,7 +107,17 @@ pub(super) async fn proxy(
                 // must be rejected before its prepare hook sees the request.
                 continue;
             }
-            match prepare_proxy_route(&state, &key, &model, protocol, &request_json, route).await {
+            match prepare_proxy_route(
+                &state,
+                &key,
+                &model,
+                protocol,
+                request_id,
+                &request_json,
+                route,
+            )
+            .await
+            {
                 Ok(prepared) => prepared_routes.push(prepared),
                 Err(error) => {
                     tracing::warn!(%request_id, error = %error, stage = "candidate_prepare", "proxy failover candidate is unusable");
@@ -296,6 +316,19 @@ pub(super) async fn proxy(
             continue;
         }
         let result = send_proxy_route(&state, &headers, protocol, request_id, &active_route).await;
+        if let Ok((response, _)) = &result
+            && active_route.is_codex()
+            && response.status().is_success()
+            && !codex_transport::is_event_stream(response)
+        {
+            tracing::warn!(
+                %request_id,
+                upstream_account_id = %active_route.route.account_id,
+                content_type_class = codex_transport::content_type_class(response),
+                http_version = codex_transport::http_version_class(response),
+                "Codex upstream returned a non-SSE success response"
+            );
+        }
         let failure = match &result {
             Ok((response, _)) if response.status() == StatusCode::TOO_MANY_REQUESTS => Some((
                 UpstreamFailureKind::RateLimited,
@@ -726,7 +759,7 @@ async fn execute_component_provider(
     else {
         return finish_component_provider_failure(&request, "provider_configuration").await;
     };
-    let upstream_body = match read_bounded_upstream(upstream, maximum).await {
+    let upstream_body = match read_bounded_upstream(upstream.into(), maximum).await {
         Ok(body) => body,
         Err(error) => {
             tracing::warn!(request_id = %request.request_id, stage = "component_response", "component provider request failed");
@@ -1003,7 +1036,7 @@ impl BoundedUpstreamError {
 }
 
 async fn read_bounded_upstream(
-    response: reqwest::Response,
+    response: UpstreamResponse,
     maximum: usize,
 ) -> Result<Vec<u8>, BoundedUpstreamError> {
     if response

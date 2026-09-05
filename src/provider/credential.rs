@@ -123,9 +123,22 @@ impl UpstreamCredential {
         request: reqwest::RequestBuilder,
         now: i64,
     ) -> Result<reqwest::RequestBuilder, AppError> {
+        let Some((header_name, value)) = self.request_header(now)? else {
+            return Ok(request);
+        };
+        Ok(request.header(header_name, value))
+    }
+
+    /// Return the validated credential header without coupling callers to a
+    /// specific HTTP client. Native Codex uses a fingerprinted client while
+    /// every other provider continues to use reqwest.
+    pub(crate) fn request_header(
+        &self,
+        now: i64,
+    ) -> Result<Option<(http::HeaderName, http::HeaderValue)>, AppError> {
         self.validate(now)?;
         let (secret, header, prefix) = match self {
-            Self::None => return Ok(request),
+            Self::None => return Ok(None),
             Self::ApiKey {
                 value,
                 header,
@@ -144,11 +157,12 @@ impl UpstreamCredential {
                 ..
             } => (access_token, header, prefix),
         };
-        let header_name = reqwest::header::HeaderName::from_bytes(header.as_bytes())
+        let header_name = http::HeaderName::from_bytes(header.as_bytes())
             .map_err(|_| AppError::BadRequest("invalid upstream credential header".into()))?;
-        let value = reqwest::header::HeaderValue::from_str(&format!("{prefix}{secret}"))
+        let mut value = http::HeaderValue::from_str(&format!("{prefix}{secret}"))
             .map_err(|_| AppError::BadRequest("invalid upstream credential value".into()))?;
-        Ok(request.header(header_name, value))
+        value.set_sensitive(true);
+        Ok(Some((header_name, value)))
     }
 
     pub fn validate(&self, now: i64) -> Result<(), AppError> {
