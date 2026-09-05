@@ -7,8 +7,8 @@ use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
     db::{
-        CreateServiceTokenInput, CreateUpstreamAccountInput, GroupKind, UpdateGroupInput,
-        UpdateRoutedModelRouteInput,
+        CreateGroupInput, CreateServiceTokenInput, CreateUpstreamAccountInput, GroupKind,
+        UpdateGroupInput, UpdateRoutedModelRouteInput,
     },
     error::AppError,
     provider::UpstreamCredential,
@@ -283,6 +283,52 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
+
+    let empty_provider_group = fixture
+        .state
+        .db
+        .create_group(
+            GroupKind::Provider,
+            CreateGroupInput {
+                tenant_external_id: fixture.tenant.clone(),
+                name: "route-create-empty-provider-group".to_owned(),
+            },
+        )
+        .await
+        .expect("empty provider group");
+    let no_candidate_key = "route-create-idempotency:no-candidate-disabled";
+    let mut no_candidate_body = json!({
+        "tenant_external_id": fixture.tenant,
+        "public_model": "route-create-no-candidate",
+        "included_provider_group_ids": [empty_provider_group.id],
+        "upstream_model": "route-create-no-candidate-upstream",
+        "protocol": "openai",
+        "priority": 0,
+        "enabled": false,
+        "custom_model_confirmed": true
+    });
+    let (status, headers, no_candidate_disabled) = request_json(
+        fixture.state.clone(),
+        &fixture.write_token,
+        no_candidate_body.clone(),
+        Some(no_candidate_key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(disposition(&headers), "created");
+    assert_eq!(no_candidate_disabled["enabled"].as_bool(), Some(false));
+
+    // A distinct operation with the otherwise identical enabled route still
+    // rejects before traffic could select a route without a viable upstream.
+    no_candidate_body["enabled"] = json!(true);
+    let (status, _, _) = request_json(
+        fixture.state.clone(),
+        &fixture.write_token,
+        no_candidate_body,
+        Some("route-create-idempotency:no-candidate-enabled"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // Expiry is a hard boundary even if a bounded global cleanup has a large
     // backlog: the exact key is removed before lookup/claim.

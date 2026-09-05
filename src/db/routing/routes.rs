@@ -488,7 +488,11 @@ impl Database {
             now,
         )
         .await?;
-        ensure_route_has_eligible_candidate(&mut tx, &tenant_id, route_id).await?;
+        // Preparation may intentionally point at an account or group that is
+        // not usable yet. An enabled route must still be traffic-ready.
+        if input.enabled {
+            ensure_route_has_eligible_candidate(&mut tx, &tenant_id, route_id).await?;
+        }
         tx.commit().await?;
         let route = ModelRouteView {
             id: route_id,
