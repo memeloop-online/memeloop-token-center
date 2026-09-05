@@ -19,6 +19,7 @@ interface MultiComboboxProps {
   createLabel?: (value: string) => string;
   disabled?: boolean;
   hint?: string;
+  onQueryChange?: (query: string) => void;
 }
 
 function normalized(value: string) {
@@ -39,7 +40,7 @@ function rowsForQuery(options: ComboboxOption[], value: ComboboxOption[], query:
 
 export function MultiCombobox({
   label, options, value, onChange, placeholder, emptyText, removeLabel, allowCreate = false,
-  createLabel, disabled = false, hint,
+  createLabel, disabled = false, hint, onQueryChange,
 }: MultiComboboxProps) {
   const id = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -98,7 +99,10 @@ export function MultiCombobox({
         value={query}
         onFocus={() => setOpen(true)}
         onBlur={() => window.setTimeout(() => setOpen(false), 100)}
-        onChange={(event) => { setQuery(event.target.value); setActiveIndex(-1); setOpen(true); }}
+        onChange={(event) => {
+          setQuery(event.target.value); setActiveIndex(-1); setOpen(true);
+          onQueryChange?.(event.target.value);
+        }}
         onKeyDown={onKeyDown}
       />
     </div>

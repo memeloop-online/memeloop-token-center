@@ -39,8 +39,25 @@ export async function api<T>(
 
 const retryableReadStatuses = new Set([502, 503, 504]);
 
-function waitForReadRetry(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function waitForReadRetry(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    }, milliseconds);
+    const abort = () => {
+      window.clearTimeout(timeout);
+      reject(signal?.reason);
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
+interface ApiReadOptions {
+  attempts?: number;
+  attemptTimeoutMilliseconds?: number;
+  signal?: AbortSignal;
 }
 
 /**
@@ -50,18 +67,23 @@ function waitForReadRetry(milliseconds: number): Promise<void> {
 export async function apiRead<T>(
   path: string,
   credential: string,
-  attempts = 4,
+  { attempts = 4, attemptTimeoutMilliseconds = 3_000, signal }: ApiReadOptions = {},
 ): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const attemptSignal = signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(attemptTimeoutMilliseconds)])
+      : AbortSignal.timeout(attemptTimeoutMilliseconds);
     try {
-      return await api<T>(path, credential);
+      return await api<T>(path, credential, { signal: attemptSignal });
     } catch (reason) {
+      if (signal?.aborted) throw reason;
       lastError = reason;
       const retryable = reason instanceof TypeError
+        || (reason instanceof DOMException && reason.name === 'TimeoutError')
         || (reason instanceof ApiError && retryableReadStatuses.has(reason.status));
       if (!retryable || attempt + 1 >= attempts) throw reason;
-      await waitForReadRetry(150 * (2 ** attempt));
+      await waitForReadRetry(150 * (2 ** attempt), signal);
     }
   }
   throw lastError;

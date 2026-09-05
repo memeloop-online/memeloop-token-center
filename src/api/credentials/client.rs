@@ -74,6 +74,7 @@ pub(in crate::api) async fn create_key(
 pub(in crate::api) struct KeysQuery {
     tenant_external_id: Option<String>,
     principal_external_id: Option<String>,
+    key_id: Option<Uuid>,
     #[serde(default = "default_key_list_limit")]
     limit: i64,
     before_created_at: Option<i64>,
@@ -112,7 +113,13 @@ pub(in crate::api) async fn list_keys(
     Ok(Json(
         state
             .db
-            .list_managed_keys_page(tenant.as_deref(), principal, query.limit, before)
+            .list_managed_keys_page(
+                tenant.as_deref(),
+                principal,
+                query.key_id,
+                query.limit,
+                before,
+            )
             .await?,
     ))
 }

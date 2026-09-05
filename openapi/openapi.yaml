@@ -187,6 +187,10 @@ paths:
         - name: principal_external_id
           in: query
           schema: { type: string, maxLength: 200 }
+        - name: key_id
+          in: query
+          description: Return only the exact stable credential identity. This never searches secret values.
+          schema: { type: string, format: uuid }
         - $ref: '#/components/parameters/CredentialListLimit500'
         - $ref: '#/components/parameters/BeforeCreatedAt'
         - $ref: '#/components/parameters/BeforeId'

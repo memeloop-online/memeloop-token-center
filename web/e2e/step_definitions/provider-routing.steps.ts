@@ -291,7 +291,17 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   await assertContains(routeEditor.locator(`#${routeGroupListId}`).getByRole('option'), '创建路由组“默认路由”');
   await routeGroupInput.press('Enter');
   const exactCredentials = routeEditor.getByRole('combobox', { name: '授权给具体凭据', exact: true });
+  const exactCredentialSearch = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === '/internal/v1/keys'
+      && url.searchParams.get('tenant_external_id') === tenant
+      && url.searchParams.get('key_id') === seed.clientKeyId;
+  });
   await exactCredentials.fill(seed.clientKeyId);
+  const exactCredentialResponse = await exactCredentialSearch;
+  assert.equal(exactCredentialResponse.status(), 200);
+  const exactCredentialBody = await exactCredentialResponse.json() as Array<{ key_id: string }>;
+  assert.deepEqual(exactCredentialBody.map((credential) => credential.key_id), [seed.clientKeyId]);
   const exactCredentialOption = routeEditor.getByRole('option').filter({ hasText: seed.clientKeyId });
   await eventually(async () => {
     assert.equal(await exactCredentialOption.count(), 1);

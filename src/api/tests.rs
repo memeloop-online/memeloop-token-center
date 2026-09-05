@@ -1327,6 +1327,7 @@ async fn operator_can_explicitly_set_and_read_metered_unlimited_enforcement() {
     assert_eq!(updated["enforcement_mode"], "metered_unlimited");
 
     let listed = control
+        .clone()
         .oneshot(
             Request::get("/internal/v1/keys?tenant_external_id=metered-policy-api")
                 .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
@@ -1343,6 +1344,27 @@ async fn operator_can_explicitly_set_and_read_metered_unlimited_enforcement() {
     )
     .unwrap();
     assert_eq!(listed[0]["policy"]["enforcement_mode"], "metered_unlimited");
+
+    let exact = control
+        .oneshot(
+            Request::get(format!(
+                "/internal/v1/keys?tenant_external_id=metered-policy-api&key_id={key_id}&limit=1"
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.status(), StatusCode::OK);
+    let exact: Value = serde_json::from_slice(
+        &axum::body::to_bytes(exact.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(exact.as_array().unwrap().len(), 1);
+    assert_eq!(exact[0]["key_id"], key_id);
 }
 
 #[tokio::test]

@@ -219,7 +219,7 @@ impl Database {
         tenant_external_id: Option<&str>,
         principal_external_id: Option<&str>,
     ) -> Result<Vec<ManagedKeyView>, AppError> {
-        self.list_managed_keys_page(tenant_external_id, principal_external_id, 500, None)
+        self.list_managed_keys_page(tenant_external_id, principal_external_id, None, 500, None)
             .await
     }
 
@@ -231,17 +231,20 @@ impl Database {
         &self,
         tenant_external_id: Option<&str>,
         principal_external_id: Option<&str>,
+        key_id: Option<Uuid>,
         limit: i64,
         before: Option<(i64, Uuid)>,
     ) -> Result<Vec<ManagedKeyView>, AppError> {
         let (before_created_at, before_id) = before
             .map(|(created_at, id)| (created_at, id.to_string()))
             .unwrap_or_else(|| (i64::MAX, "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned()));
+        let key_id = key_id.map(|id| id.to_string()).unwrap_or_default();
         let rows = sqlx::query(
-            "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND (k.created_at < $3 OR (k.created_at = $3 AND k.id < $4)) ORDER BY k.created_at DESC, k.id DESC LIMIT $5",
+            "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND ($3 = '' OR k.id = $3) AND (k.created_at < $4 OR (k.created_at = $4 AND k.id < $5)) ORDER BY k.created_at DESC, k.id DESC LIMIT $6",
         )
         .bind(tenant_external_id.unwrap_or_default())
         .bind(principal_external_id.unwrap_or_default())
+        .bind(key_id)
         .bind(before_created_at)
         .bind(before_id)
         .bind(limit.clamp(1, 500))
