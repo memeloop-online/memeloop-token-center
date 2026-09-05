@@ -111,8 +111,7 @@ impl Database {
         let mut already_native_account_ids = Vec::new();
         for target in targets {
             let row = native_codex_upgrade_row(self, &mut tx, target.account_id).await?;
-            require_native_codex_upgrade_refresh_quiescence(&mut tx, target.account_id)
-                .await?;
+            require_native_codex_upgrade_refresh_quiescence(&mut tx, target.account_id).await?;
             let driver: String = row.try_get("driver")?;
             let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
                 .map_err(|_| AppError::Internal)?;
@@ -593,13 +592,12 @@ async fn require_native_codex_upgrade_refresh_quiescence(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     account_id: Uuid,
 ) -> Result<(), AppError> {
-    let refresh_in_progress = sqlx::query(
-        "SELECT 1 FROM upstream_oauth_refresh_leases WHERE account_id = $1",
-    )
-    .bind(account_id.to_string())
-    .fetch_optional(&mut **tx)
-    .await?
-    .is_some();
+    let refresh_in_progress =
+        sqlx::query("SELECT 1 FROM upstream_oauth_refresh_leases WHERE account_id = $1")
+            .bind(account_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some();
     if refresh_in_progress {
         return Err(AppError::Conflict(
             "OpenAI Codex migration conflicts with an active OAuth refresh".into(),
@@ -1452,9 +1450,7 @@ mod native_codex_upgrade_tests {
                         "schema": "cpa-codex-oauth-v1",
                         "account_id": "refresh-lease-account-123"
                     })),
-                    proxy_url: Some(
-                        "socks5h://operator:proxy-secret@100.64.0.16:1080".to_owned(),
-                    ),
+                    proxy_url: Some("socks5h://operator:proxy-secret@100.64.0.16:1080".to_owned()),
                     proxy_network_scope: Some(crate::network::OutboundScope::Private),
                 },
                 "native-upgrade-refresh-lease",

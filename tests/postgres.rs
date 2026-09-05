@@ -618,7 +618,8 @@ async fn create_postgres_native_codex_upgrade_refresh_lease_fixture(
     pool: &sqlx::AnyPool,
 ) -> Uuid {
     let unique = Uuid::now_v7();
-    let key_material = b"postgres native Codex refresh lease key material longer than thirty-two bytes";
+    let key_material =
+        b"postgres native Codex refresh lease key material longer than thirty-two bytes";
     let account = database
         .create_upstream_account(
             CreateUpstreamAccountInput {
@@ -640,9 +641,7 @@ async fn create_postgres_native_codex_upgrade_refresh_lease_fixture(
                         "schema": "cpa-codex-oauth-v1",
                         "account_id": "postgres-refresh-lease-account-123"
                     })),
-                    proxy_url: Some(
-                        "socks5://operator:proxy-secret@100.64.0.16:1080".to_owned(),
-                    ),
+                    proxy_url: Some("socks5://operator:proxy-secret@100.64.0.16:1080".to_owned()),
                     proxy_network_scope: Some(
                         memeloop_token_center::network::OutboundScope::Private,
                     ),
@@ -718,7 +717,8 @@ async fn postgres_native_codex_upgrade_fences_an_in_flight_oauth_refresh() {
     let database = Database::connect_with_max(&database_url, 16).await.unwrap();
     database.migrate().await.unwrap();
     let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
-    let key_material = b"postgres native Codex refresh lease key material longer than thirty-two bytes";
+    let key_material =
+        b"postgres native Codex refresh lease key material longer than thirty-two bytes";
     let account_id =
         create_postgres_native_codex_upgrade_refresh_lease_fixture(&database, &pool).await;
     let reviewed_plan = database
@@ -828,9 +828,7 @@ async fn postgres_native_codex_upgrade_fences_an_in_flight_oauth_refresh() {
                     "account_id": "postgres-refresh-lease-account-123"
                 })),
                 proxy_url: Some("socks5://operator:proxy-secret@100.64.0.16:1080".to_owned()),
-                proxy_network_scope: Some(
-                    memeloop_token_center::network::OutboundScope::Private,
-                ),
+                proxy_network_scope: Some(memeloop_token_center::network::OutboundScope::Private),
             },
             &lease_key,
             key_material,
