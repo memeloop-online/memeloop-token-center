@@ -24,8 +24,7 @@ pub(super) const RESPONSES_PATH: &str = "/responses";
 // downstream callers or vary with arbitrary account configuration.
 pub(super) const USER_AGENT: &str = crate::oauth::managed::codex::USER_AGENT;
 const MAX_OUTPUT_ITEMS: usize = 16_384;
-const MISSING_CONTENT_TYPE_SNIFF_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(15);
+const MISSING_CONTENT_TYPE_SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
 
 pub(super) fn is_driver(driver: &str) -> bool {
@@ -529,9 +528,7 @@ fn append_safe_sse_fields(event: &[u8], output: &mut Vec<u8>) {
     for raw_line in event.split_inclusive(|byte| *byte == b'\n') {
         let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty()
-            || is_sse_field_line(line, b"event")
-            || is_sse_field_line(line, b"data")
+        if line.is_empty() || is_sse_field_line(line, b"event") || is_sse_field_line(line, b"data")
         {
             output.extend_from_slice(raw_line);
         }
@@ -1334,11 +1331,14 @@ mod tests {
 
         let mut unknown_field = ResponsesStreamingSanitizer::default();
         let output = unknown_field
-            .push(concat!(
-                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n",
-                "<html>post-admission-secret</html>\n\n",
-                "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
-            ).as_bytes())
+            .push(
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n",
+                    "<html>post-admission-secret</html>\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+                )
+                .as_bytes(),
+            )
             .unwrap();
         let output = String::from_utf8(output.to_vec()).unwrap();
         assert!(output.contains("response.created"));
@@ -1348,11 +1348,14 @@ mod tests {
         let mut duplicate_event = ResponsesStreamingSanitizer::default();
         assert!(
             duplicate_event
-                .push(concat!(
-                    "event: provider-secret\n",
-                    "event: response.created\n",
-                    "data: {\"type\":\"response.created\",\"response\":{}}\n\n"
-                ).as_bytes())
+                .push(
+                    concat!(
+                        "event: provider-secret\n",
+                        "event: response.created\n",
+                        "data: {\"type\":\"response.created\",\"response\":{}}\n\n"
+                    )
+                    .as_bytes()
+                )
                 .is_err()
         );
 
@@ -1408,11 +1411,8 @@ mod tests {
                 header::CONTENT_TYPE,
                 http::HeaderValue::from_bytes(content_type.as_bytes()).unwrap(),
             );
-            let response = UpstreamResponse::for_test(
-                headers,
-                http::Version::HTTP_2,
-                vec![Ok(body.clone())],
-            );
+            let response =
+                UpstreamResponse::for_test(headers, http::Version::HTTP_2, vec![Ok(body.clone())]);
             assert!(matches!(
                 admit_event_stream_response(response).await,
                 Err(ResponseAdmissionError::Invalid(
@@ -1430,11 +1430,7 @@ mod tests {
             header::CONTENT_TYPE,
             http::HeaderValue::from_static("text/event-stream"),
         );
-        let response = UpstreamResponse::for_test(
-            duplicate,
-            http::Version::HTTP_2,
-            vec![Ok(body)],
-        );
+        let response = UpstreamResponse::for_test(duplicate, http::Version::HTTP_2, vec![Ok(body)]);
         assert!(matches!(
             admit_event_stream_response(response).await,
             Err(ResponseAdmissionError::Invalid(
@@ -1524,11 +1520,14 @@ mod tests {
         let mut duplicate_event = BufferedResponsesParser::default();
         assert!(
             duplicate_event
-                .push(concat!(
-                    "event: provider-secret\n",
-                    "event: response.created\n",
-                    "data: {\"type\":\"response.created\",\"response\":{}}\n\n"
-                ).as_bytes())
+                .push(
+                    concat!(
+                        "event: provider-secret\n",
+                        "event: response.created\n",
+                        "data: {\"type\":\"response.created\",\"response\":{}}\n\n"
+                    )
+                    .as_bytes()
+                )
                 .is_err()
         );
     }

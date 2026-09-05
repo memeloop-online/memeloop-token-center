@@ -327,12 +327,20 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await routeForm.getByLabel('协议').selectOption('generation');
   await routeForm.getByLabel('上游模型').fill('browser-workflow-v1');
   const imageCustomModelConfirmation = routeForm.getByLabel(/未验证的自定义模型/);
+  const imagePartialCoverageConfirmation = routeForm.getByLabel(/候选支持此模型/);
   const createImageRouteButton = routeForm.getByRole('button', { name: '创建路由', exact: true });
   await eventually(async () => {
-    assert.ok(await imageCustomModelConfirmation.isVisible() || await createImageRouteButton.isEnabled(),
-      'image route must either require custom-model confirmation or be catalog-verified');
+    assert.ok(
+      await imageCustomModelConfirmation.isVisible()
+        || await imagePartialCoverageConfirmation.isVisible()
+        || await createImageRouteButton.isEnabled(),
+      'image route must be catalogued or offer the applicable model confirmation',
+    );
   }, 30_000);
   if (await imageCustomModelConfirmation.isVisible()) await imageCustomModelConfirmation.check();
+  if (await imagePartialCoverageConfirmation.isVisible()) await imagePartialCoverageConfirmation.check();
+  await eventually(async () => assert.equal(await createImageRouteButton.isEnabled(), true), 30_000,
+    'the image route did not become valid after selecting its upstream model');
   const imageRouteResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
   await createImageRouteButton.click();
   const imageRouteResponse = await imageRouteResponsePromise;
@@ -349,12 +357,18 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await routeForm.getByLabel('协议').selectOption('generation');
   await routeForm.getByLabel('上游模型').fill('seedance-browser-v1');
   const customModelConfirmation = routeForm.getByLabel(/未验证的自定义模型/);
+  const partialCoverageConfirmation = routeForm.getByLabel(/候选支持此模型/);
   const createVideoRouteButton = routeForm.getByRole('button', { name: '创建路由', exact: true });
   await eventually(async () => {
-    assert.ok(await customModelConfirmation.isVisible() || await createVideoRouteButton.isEnabled(),
-      'the video model must be catalogued or offer explicit custom-model confirmation');
+    assert.ok(
+      await customModelConfirmation.isVisible()
+        || await partialCoverageConfirmation.isVisible()
+        || await createVideoRouteButton.isEnabled(),
+      'the video route must be catalogued or offer the applicable model confirmation',
+    );
   }, 30_000);
   if (await customModelConfirmation.isVisible()) await customModelConfirmation.check();
+  if (await partialCoverageConfirmation.isVisible()) await partialCoverageConfirmation.check();
   await eventually(async () => assert.equal(await createVideoRouteButton.isEnabled(), true), 30_000,
     'the video route did not become valid after selecting its upstream model');
   const routeResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');

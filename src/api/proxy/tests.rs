@@ -551,12 +551,14 @@ async fn codex_missing_content_type_json_fails_over_before_downstream_delivery()
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .and(header_matcher("chatgpt-account-id", "account-123"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(
-            serde_json::to_vec(&json!({
-                "error": {"message": "temporary high demand secret"}
-            }))
-            .unwrap(),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(
+                serde_json::to_vec(&json!({
+                    "error": {"message": "temporary high demand secret"}
+                }))
+                .unwrap(),
+            ),
+        )
         .expect(1)
         .mount(&upstream)
         .await;
@@ -686,9 +688,7 @@ async fn codex_missing_content_type_json_fails_over_before_downstream_delivery()
             .get(refs.response_object.as_deref().unwrap())
             .await
             .unwrap();
-        assert!(
-            !String::from_utf8_lossy(&archived).contains("high demand secret")
-        );
+        assert!(!String::from_utf8_lossy(&archived).contains("high demand secret"));
     }
     pool.close().await;
     upstream.verify().await;

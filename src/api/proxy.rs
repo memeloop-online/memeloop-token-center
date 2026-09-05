@@ -325,22 +325,18 @@ pub(super) async fn proxy(
                 UpstreamFailureKind::Unavailable,
                 UpstreamHealthReason::Unavailable,
             )),
-            Err(ProxySendError::InvalidResponse(_)) => {
-                Some((
-                    UpstreamFailureKind::InvalidResponse,
-                    UpstreamHealthReason::InvalidResponse,
-                ))
-            }
+            Err(ProxySendError::InvalidResponse(_)) => Some((
+                UpstreamFailureKind::InvalidResponse,
+                UpstreamHealthReason::InvalidResponse,
+            )),
             Err(
                 ProxySendError::RetryableConnection
                 | ProxySendError::CandidateUnavailable
                 | ProxySendError::AmbiguousResponse(_),
-            ) => {
-                Some((
-                    UpstreamFailureKind::Connection,
-                    UpstreamHealthReason::Connection,
-                ))
-            }
+            ) => Some((
+                UpstreamFailureKind::Connection,
+                UpstreamHealthReason::Connection,
+            )),
             Ok(_) => None,
             Err(ProxySendError::NonRetryableTransport | ProxySendError::Credential) => None,
         };
