@@ -939,7 +939,7 @@ impl BufferedResponsesParser {
         }
         if matches!(
             kind,
-            "response.created" | "response.in_progress" | "response.completed"
+            "response.queued" | "response.created" | "response.in_progress" | "response.completed"
         ) {
             self.observe_response_id(&value, kind == "response.completed")?;
         }
@@ -1361,6 +1361,18 @@ mod tests {
             parser.push(stream.as_bytes()).unwrap();
             assert!(parser.finish().is_err());
         }
+
+        let mut queued_mismatch = BufferedResponsesParser::default();
+        queued_mismatch
+            .push(
+                concat!(
+                    "data: {\"type\":\"response.queued\",\"response\":{\"id\":\"resp-a\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item-a\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-b\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap_err();
     }
 
     #[test]
