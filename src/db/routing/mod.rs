@@ -19,6 +19,7 @@ pub use types::{
 
 pub(crate) use associations::{
     bump_model_route_relation_timestamps, bump_route_group_relation_timestamps,
+    ensure_route_has_eligible_candidate,
 };
 pub(crate) use grant_revisions::{
     bump_credential_grant_revisions, bump_route_grant_revisions, lock_routing_relation_writes,

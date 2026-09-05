@@ -162,6 +162,40 @@ async fn request_json_with_idempotency_values(
     (status, headers, body)
 }
 
+async fn patch_route_enabled(
+    state: AppState,
+    token: &str,
+    route_id: Uuid,
+    tenant_external_id: &str,
+    enabled: bool,
+    expected_updated_at: i64,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("PATCH")
+        .uri(format!("/internal/v1/model-routes/{route_id}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "tenant_external_id": tenant_external_id,
+                "enabled": enabled,
+                "expected_updated_at": expected_updated_at,
+            }))
+            .expect("route status JSON"),
+        ))
+        .expect("route status request");
+    let response = api::router_for_role(state, RuntimeRole::Control)
+        .oneshot(request)
+        .await
+        .expect("route status response");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("bounded route status response");
+    let body = serde_json::from_slice(&bytes).expect("route status JSON response");
+    (status, body)
+}
+
 fn create_body(fixture: &RouteCreateFixture, public_model: &str) -> Value {
     json!({
         "tenant_external_id": fixture.tenant,
@@ -317,6 +351,15 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(disposition(&headers), "created");
     assert_eq!(no_candidate_disabled["enabled"].as_bool(), Some(false));
+    let no_candidate_route_id = Uuid::parse_str(
+        no_candidate_disabled["id"]
+            .as_str()
+            .expect("no-candidate route ID"),
+    )
+    .expect("valid no-candidate route UUID");
+    let no_candidate_updated_at = no_candidate_disabled["updated_at"]
+        .as_i64()
+        .expect("no-candidate route version");
 
     // A distinct operation with the otherwise identical enabled route still
     // rejects before traffic could select a route without a viable upstream.
@@ -329,6 +372,49 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = patch_route_enabled(
+        fixture.state.clone(),
+        &fixture.write_token,
+        no_candidate_route_id,
+        &fixture.tenant,
+        true,
+        no_candidate_updated_at,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let persisted_no_candidate = fixture
+        .state
+        .db
+        .list_model_routes(Some(&fixture.tenant))
+        .await
+        .expect("list staged routes")
+        .into_iter()
+        .find(|route| route.id == no_candidate_route_id)
+        .expect("staged no-candidate route remains");
+    assert!(!persisted_no_candidate.enabled);
+    assert_eq!(persisted_no_candidate.updated_at, no_candidate_updated_at);
+
+    let disabled_route_id = Uuid::parse_str(
+        disabled_route["id"]
+            .as_str()
+            .expect("eligible disabled route ID"),
+    )
+    .expect("valid eligible disabled route UUID");
+    let (status, enabled_route) = patch_route_enabled(
+        fixture.state.clone(),
+        &fixture.write_token,
+        disabled_route_id,
+        &fixture.tenant,
+        true,
+        disabled_route["updated_at"]
+            .as_i64()
+            .expect("eligible disabled route version"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(enabled_route["id"], disabled_route["id"]);
+    assert_eq!(enabled_route["enabled"].as_bool(), Some(true));
 
     // Expiry is a hard boundary even if a bounded global cleanup has a large
     // backlog: the exact key is removed before lookup/claim.

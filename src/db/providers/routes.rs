@@ -1,6 +1,6 @@
 use super::super::routing::{
     bump_credential_grant_revisions, bump_route_group_relation_timestamps,
-    lock_routing_relation_writes,
+    ensure_route_has_eligible_candidate, lock_routing_relation_writes,
 };
 use super::super::*;
 
@@ -268,6 +268,13 @@ impl Database {
                 "reload the model route before changing its status".into(),
             ));
         }
+        let tenant_id = route.tenant_id.to_string();
+        if !route.enabled && enabled {
+            // Serialize this activation with routing-relation replacement, so
+            // the candidate verified below is part of this status change.
+            lock_routing_relation_writes(&mut tx, &tenant_id).await?;
+            ensure_route_has_eligible_candidate(&mut tx, &tenant_id, route_id).await?;
+        }
         let updated_at = unix_millis().max(route.updated_at.saturating_add(1));
         let changed = sqlx::query(
             "UPDATE model_routes SET enabled = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4 AND updated_at = $5",
@@ -275,7 +282,7 @@ impl Database {
         .bind(i64::from(enabled))
         .bind(updated_at)
         .bind(route_id.to_string())
-        .bind(route.tenant_id.to_string())
+        .bind(tenant_id)
         .bind(expected_updated_at)
         .execute(&mut *tx)
         .await?;
