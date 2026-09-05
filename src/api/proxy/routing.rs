@@ -130,6 +130,8 @@ pub(super) async fn prepare_proxy_route(
 pub(super) enum ProxySendError {
     RetryableConnection,
     CandidateUnavailable,
+    InvalidResponse(&'static str),
+    AmbiguousResponse(&'static str),
     NonRetryableTransport,
     Credential,
 }
@@ -142,13 +144,14 @@ pub(super) async fn send_proxy_route(
     route: &PreparedProxyRoute,
 ) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
     if route.is_codex() {
-        return send_codex_proxy_route(state, headers, route).await;
+        return send_codex_proxy_route(state, headers, request_id, route).await;
     }
     send_reqwest_proxy_route(state, headers, protocol, request_id, route).await
 }
 async fn send_codex_proxy_route(
     state: &AppState,
     headers: &HeaderMap,
+    request_id: Uuid,
     route: &PreparedProxyRoute,
 ) -> Result<(UpstreamResponse, crate::metrics::ActivityGuard), ProxySendError> {
     let outbound_base_url = codex_transport::outbound_base_url(&route.route.base_url);
@@ -191,7 +194,39 @@ async fn send_codex_proxy_route(
         upstream_started.elapsed(),
     );
     match upstream_result {
-        Ok(response) => Ok((UpstreamResponse::Codex(response), upstream_activity)),
+        Ok(response) => {
+            let response = UpstreamResponse::Codex(response);
+            if !response.status().is_success() {
+                return Ok((response, upstream_activity));
+            }
+            let content_type_class = codex_transport::content_type_class(&response);
+            let http_version = codex_transport::http_version_class(&response);
+            match codex_transport::admit_event_stream_response(response).await {
+                Ok(response) => Ok((response, upstream_activity)),
+                Err(codex_transport::ResponseAdmissionError::Invalid(error_code)) => {
+                    tracing::warn!(
+                        %request_id,
+                        upstream_account_id = %route.route.account_id,
+                        content_type_class,
+                        http_version,
+                        stage = error_code,
+                        "Codex upstream response failed framing admission"
+                    );
+                    Err(ProxySendError::InvalidResponse(error_code))
+                }
+                Err(codex_transport::ResponseAdmissionError::Ambiguous(error_code)) => {
+                    tracing::warn!(
+                        %request_id,
+                        upstream_account_id = %route.route.account_id,
+                        content_type_class,
+                        http_version,
+                        stage = error_code,
+                        "Codex upstream response failed before framing admission completed"
+                    );
+                    Err(ProxySendError::AmbiguousResponse(error_code))
+                }
+            }
+        }
         Err(error)
             if error.is_connect()
                 || error.is_proxy_connect()

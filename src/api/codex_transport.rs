@@ -24,6 +24,8 @@ pub(super) const RESPONSES_PATH: &str = "/responses";
 // downstream callers or vary with arbitrary account configuration.
 pub(super) const USER_AGENT: &str = crate::oauth::managed::codex::USER_AGENT;
 const MAX_OUTPUT_ITEMS: usize = 16_384;
+const MISSING_CONTENT_TYPE_SNIFF_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
 const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
 
 pub(super) fn is_driver(driver: &str) -> bool {
@@ -426,6 +428,7 @@ pub(super) struct ResponsesStreamingSanitizer {
     pending: Vec<u8>,
     terminal: Option<StreamTerminal>,
     last_push_billable: bool,
+    saw_protocol_event: bool,
 }
 
 impl ResponsesStreamingSanitizer {
@@ -461,19 +464,20 @@ impl ResponsesStreamingSanitizer {
         self.last_push_billable
     }
 
+    fn saw_protocol_event(&self) -> bool {
+        self.saw_protocol_event
+    }
+
     fn sanitize_event(&mut self, event: &[u8], output: &mut Vec<u8>) -> Result<(), &'static str> {
         let (event_name, data) = parse_sse_event(event)?;
         if data.as_deref() == Some(b"[DONE]") {
             if self.terminal.is_none() {
                 return Err("upstream_incomplete_response");
             }
-            output.extend_from_slice(event);
+            output.extend_from_slice(b"data: [DONE]\n\n");
             return Ok(());
         }
         let Some(data) = data else {
-            if self.terminal.is_none() {
-                output.extend_from_slice(event);
-            }
             return Ok(());
         };
         let value: Value =
@@ -482,12 +486,16 @@ impl ResponsesStreamingSanitizer {
             .get("type")
             .and_then(Value::as_str)
             .ok_or("upstream_invalid_response")?;
-        if let Some(event_name) = event_name.as_deref()
-            && event_name != payload_name
-            && (terminal_kind(event_name).is_some() || terminal_kind(payload_name).is_some())
+        if payload_name != "error" && !payload_name.starts_with("response.") {
+            return Err("upstream_invalid_response");
+        }
+        if event_name
+            .as_deref()
+            .is_some_and(|event_name| event_name != payload_name)
         {
             return Err("upstream_invalid_response");
         }
+        self.saw_protocol_event = true;
         let failure = matches!(terminal_kind(payload_name), Some(StreamTerminal::Failed))
             || value.get("error").is_some_and(|error| !error.is_null())
             || value
@@ -506,7 +514,7 @@ impl ResponsesStreamingSanitizer {
         if failure {
             output.extend_from_slice(SAFE_FAILURE_EVENT);
         } else {
-            output.extend_from_slice(event);
+            append_safe_sse_fields(event, output);
             self.last_push_billable |= !matches!(
                 payload_name,
                 "response.created" | "response.in_progress" | "response.queued"
@@ -517,13 +525,33 @@ impl ResponsesStreamingSanitizer {
     }
 }
 
+fn append_safe_sse_fields(event: &[u8], output: &mut Vec<u8>) {
+    for raw_line in event.split_inclusive(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty()
+            || is_sse_field_line(line, b"event")
+            || is_sse_field_line(line, b"data")
+        {
+            output.extend_from_slice(raw_line);
+        }
+    }
+}
+
 fn parse_sse_event(event: &[u8]) -> Result<(Option<String>, Option<Vec<u8>>), &'static str> {
     let mut event_name = None;
     let mut data = Vec::new();
     for raw_line in event.split(|byte| *byte == b'\n') {
         let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
-        if let Some(value) = line.strip_prefix(b"event:") {
-            let value = trim_ascii(value);
+        if line == b"event" || line.starts_with(b"event:") {
+            if event_name.is_some() {
+                return Err("upstream_invalid_response");
+            }
+            let value = if line == b"event" {
+                &[][..]
+            } else {
+                trim_ascii(&line[6..])
+            };
             if value.len() > 128 {
                 return Err("upstream_invalid_response");
             }
@@ -558,12 +586,122 @@ fn terminal_kind(name: &str) -> Option<StreamTerminal> {
 }
 
 pub(super) fn is_event_stream(response: &UpstreamResponse) -> bool {
-    response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
+    let mut values = response.headers().get_all(header::CONTENT_TYPE).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    value
+        .to_str()
+        .ok()
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ResponseAdmissionError {
+    Invalid(&'static str),
+    Ambiguous(&'static str),
+}
+
+pub(super) async fn admit_event_stream_response(
+    response: UpstreamResponse,
+) -> Result<UpstreamResponse, ResponseAdmissionError> {
+    if is_event_stream(&response) {
+        return Ok(response);
+    }
+    if response.headers().contains_key(header::CONTENT_TYPE) {
+        return Err(ResponseAdmissionError::Invalid(
+            "upstream_invalid_content_type",
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROXY_RESPONSE_BODY as u64)
+    {
+        return Err(ResponseAdmissionError::Invalid(
+            "upstream_response_too_large",
+        ));
+    }
+
+    let mut parts = response.into_parts();
+    let deadline = tokio::time::Instant::now() + MISSING_CONTENT_TYPE_SNIFF_TIMEOUT;
+    let mut prefetched = Vec::new();
+    let mut inspected = Vec::new();
+    let mut sanitizer = ResponsesStreamingSanitizer::default();
+    loop {
+        let next = tokio::time::timeout_at(deadline, parts.stream.next())
+            .await
+            .map_err(|_| ResponseAdmissionError::Ambiguous("upstream_timeout"))?;
+        let Some(next) = next else {
+            return Err(ResponseAdmissionError::Invalid(
+                "upstream_invalid_content_type",
+            ));
+        };
+        let chunk = next.map_err(|_| ResponseAdmissionError::Ambiguous("upstream_stream"))?;
+        let mut accepted_at = None;
+        for (index, byte) in chunk.iter().enumerate() {
+            if inspected.len() == MAX_RESPONSES_SSE_EVENT_BYTES {
+                return Err(ResponseAdmissionError::Invalid(
+                    "upstream_response_event_too_large",
+                ));
+            }
+            inspected.push(*byte);
+            sanitizer
+                .push(std::slice::from_ref(byte))
+                .map_err(ResponseAdmissionError::Invalid)?;
+            if sanitizer.saw_protocol_event() {
+                accepted_at = Some(index + 1);
+                break;
+            }
+        }
+        if let Some(accepted_at) = accepted_at {
+            validate_missing_content_type_prefix(&inspected)
+                .map_err(ResponseAdmissionError::Invalid)?;
+            prefetched.push(chunk.slice(..accepted_at));
+            if accepted_at < chunk.len() {
+                prefetched.push(chunk.slice(accepted_at..));
+            }
+            return Ok(UpstreamResponse::from_prefetched_parts(
+                parts,
+                prefetched,
+                http::HeaderValue::from_static("text/event-stream"),
+            ));
+        }
+        if !chunk.is_empty() {
+            prefetched.push(chunk);
+        }
+    }
+}
+
+fn validate_missing_content_type_prefix(prefix: &[u8]) -> Result<(), &'static str> {
+    for raw_line in prefix.split_inclusive(|byte| *byte == b'\n') {
+        if !raw_line.ends_with(b"\n") {
+            break;
+        }
+        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty()
+            || line.starts_with(b":")
+            || is_sse_field_line(line, b"event")
+            || is_sse_field_line(line, b"data")
+            || is_sse_field_line(line, b"id")
+            || is_sse_field_line(line, b"retry")
+        {
+            continue;
+        }
+        return Err("upstream_invalid_content_type");
+    }
+    Ok(())
+}
+
+fn is_sse_field_line(line: &[u8], field: &[u8]) -> bool {
+    line == field
+        || line
+            .strip_prefix(field)
+            .is_some_and(|rest| rest.starts_with(b":"))
 }
 
 pub(super) fn content_type_class(response: &UpstreamResponse) -> &'static str {
@@ -742,6 +880,9 @@ impl BufferedResponsesParser {
             }
             self.data.extend_from_slice(value);
         } else if line == b"event" || line.starts_with(b"event:") {
+            if self.event_name.is_some() {
+                return Err("upstream_invalid_response");
+            }
             let value = if line == b"event" {
                 &[][..]
             } else {
@@ -774,14 +915,14 @@ impl BufferedResponsesParser {
             .get("type")
             .and_then(Value::as_str)
             .ok_or("upstream_invalid_response")?;
+        if payload_kind != "error" && !payload_kind.starts_with("response.") {
+            return Err("upstream_invalid_response");
+        }
         let event_kind = match event_name.as_deref() {
             Some(name) => Some(std::str::from_utf8(name).map_err(|_| "upstream_invalid_response")?),
             None => None,
         };
-        if let Some(event_kind) = event_kind
-            && event_kind != payload_kind
-            && (terminal_kind(event_kind).is_some() || terminal_kind(payload_kind).is_some())
-        {
+        if event_kind.is_some_and(|event_kind| event_kind != payload_kind) {
             return Err("upstream_invalid_response");
         }
         let kind = payload_kind;
@@ -1183,6 +1324,123 @@ mod tests {
                 .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"secret\"}\n\n")
                 .is_err()
         );
+
+        let mut unknown_type = ResponsesStreamingSanitizer::default();
+        assert!(
+            unknown_type
+                .push(b"data: {\"type\":\"not-responses\",\"secret\":\"hidden\"}\n\n")
+                .is_err()
+        );
+
+        let mut unknown_field = ResponsesStreamingSanitizer::default();
+        let output = unknown_field
+            .push(concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n",
+                "<html>post-admission-secret</html>\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+            ).as_bytes())
+            .unwrap();
+        let output = String::from_utf8(output.to_vec()).unwrap();
+        assert!(output.contains("response.created"));
+        assert!(output.contains("response.completed"));
+        assert!(!output.contains("post-admission-secret"));
+
+        let mut duplicate_event = ResponsesStreamingSanitizer::default();
+        assert!(
+            duplicate_event
+                .push(concat!(
+                    "event: provider-secret\n",
+                    "event: response.created\n",
+                    "data: {\"type\":\"response.created\",\"response\":{}}\n\n"
+                ).as_bytes())
+                .is_err()
+        );
+
+        let mut done = ResponsesStreamingSanitizer::default();
+        done.push(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n")
+            .unwrap();
+        let output = done
+            .push(b"event: provider-secret\ndata: [DONE]\n\n")
+            .unwrap();
+        assert_eq!(output.as_ref(), b"data: [DONE]\n\n");
+    }
+
+    #[tokio::test]
+    async fn missing_content_type_admission_preserves_a_large_network_chunk() {
+        let event = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n";
+        let repeats = MAX_RESPONSES_SSE_EVENT_BYTES / event.len() + 2;
+        let body = Bytes::from(event.repeat(repeats));
+        assert!(body.len() > MAX_RESPONSES_SSE_EVENT_BYTES);
+        let response = UpstreamResponse::for_test(
+            http::HeaderMap::new(),
+            http::Version::HTTP_2,
+            vec![Ok(body.clone())],
+        );
+        let response = admit_event_stream_response(response).await.unwrap();
+        assert!(is_event_stream(&response));
+        assert_eq!(response.version(), http::Version::HTTP_2);
+        let mut stream = response.bytes_stream();
+        let mut actual = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            actual.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(actual.as_slice(), body.as_ref());
+    }
+
+    #[tokio::test]
+    async fn response_admission_rejects_non_sse_and_ambiguous_content_types() {
+        let body = Bytes::from_static(b"{\"error\":{\"message\":\"secret\"}}");
+        let missing = UpstreamResponse::for_test(
+            http::HeaderMap::new(),
+            http::Version::HTTP_2,
+            vec![Ok(body.clone())],
+        );
+        assert!(matches!(
+            admit_event_stream_response(missing).await,
+            Err(ResponseAdmissionError::Invalid(
+                "upstream_invalid_content_type"
+            ))
+        ));
+
+        for content_type in ["application/json", "text/html", ""] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                http::HeaderValue::from_bytes(content_type.as_bytes()).unwrap(),
+            );
+            let response = UpstreamResponse::for_test(
+                headers,
+                http::Version::HTTP_2,
+                vec![Ok(body.clone())],
+            );
+            assert!(matches!(
+                admit_event_stream_response(response).await,
+                Err(ResponseAdmissionError::Invalid(
+                    "upstream_invalid_content_type"
+                ))
+            ));
+        }
+
+        let mut duplicate = http::HeaderMap::new();
+        duplicate.append(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        duplicate.append(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let response = UpstreamResponse::for_test(
+            duplicate,
+            http::Version::HTTP_2,
+            vec![Ok(body)],
+        );
+        assert!(matches!(
+            admit_event_stream_response(response).await,
+            Err(ResponseAdmissionError::Invalid(
+                "upstream_invalid_content_type"
+            ))
+        ));
     }
 
     #[test]
@@ -1262,6 +1520,17 @@ mod tests {
             b"\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n",
         );
         assert!(invalid_event_name.push(&event).is_err());
+
+        let mut duplicate_event = BufferedResponsesParser::default();
+        assert!(
+            duplicate_event
+                .push(concat!(
+                    "event: provider-secret\n",
+                    "event: response.created\n",
+                    "data: {\"type\":\"response.created\",\"response\":{}}\n\n"
+                ).as_bytes())
+                .is_err()
+        );
     }
 
     #[test]

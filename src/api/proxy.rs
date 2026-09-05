@@ -316,19 +316,6 @@ pub(super) async fn proxy(
             continue;
         }
         let result = send_proxy_route(&state, &headers, protocol, request_id, &active_route).await;
-        if let Ok((response, _)) = &result
-            && active_route.is_codex()
-            && response.status().is_success()
-            && !codex_transport::is_event_stream(response)
-        {
-            tracing::warn!(
-                %request_id,
-                upstream_account_id = %active_route.route.account_id,
-                content_type_class = codex_transport::content_type_class(response),
-                http_version = codex_transport::http_version_class(response),
-                "Codex upstream returned a non-SSE success response"
-            );
-        }
         let failure = match &result {
             Ok((response, _)) if response.status() == StatusCode::TOO_MANY_REQUESTS => Some((
                 UpstreamFailureKind::RateLimited,
@@ -338,17 +325,17 @@ pub(super) async fn proxy(
                 UpstreamFailureKind::Unavailable,
                 UpstreamHealthReason::Unavailable,
             )),
-            Ok((response, _))
-                if active_route.is_codex()
-                    && response.status().is_success()
-                    && !codex_transport::is_event_stream(response) =>
-            {
+            Err(ProxySendError::InvalidResponse(_)) => {
                 Some((
                     UpstreamFailureKind::InvalidResponse,
                     UpstreamHealthReason::InvalidResponse,
                 ))
             }
-            Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => {
+            Err(
+                ProxySendError::RetryableConnection
+                | ProxySendError::CandidateUnavailable
+                | ProxySendError::AmbiguousResponse(_),
+            ) => {
                 Some((
                     UpstreamFailureKind::Connection,
                     UpstreamHealthReason::Connection,
@@ -374,7 +361,9 @@ pub(super) async fn proxy(
                 .metrics
                 .observe_upstream_health(UpstreamHealthEvent::Failure, reason);
         }
-        if let Some((_, reason)) = failure
+        let can_failover = !matches!(&result, Err(ProxySendError::AmbiguousResponse(_)));
+        if can_failover
+            && let Some((_, reason)) = failure
             && let Some(next_route) = route_attempts.next()
         {
             if let Ok((response, _activity)) = result {
@@ -409,14 +398,6 @@ pub(super) async fn proxy(
         }
         match result {
             Ok((response, upstream_activity)) => {
-                if matches!(failure, Some((UpstreamFailureKind::InvalidResponse, _))) {
-                    drop(response);
-                    return finish_proxy_unavailable(
-                        &buffered_request,
-                        "upstream_invalid_content_type",
-                    )
-                    .await;
-                }
                 if admission == UpstreamAttemptAdmission::Probe
                     && failure.is_none()
                     && response.status().is_success()
@@ -446,6 +427,12 @@ pub(super) async fn proxy(
             }
             Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => {
                 return finish_proxy_unavailable(&buffered_request, "upstream_connection").await;
+            }
+            Err(ProxySendError::InvalidResponse(error_code)) => {
+                return finish_proxy_unavailable(&buffered_request, error_code).await;
+            }
+            Err(ProxySendError::AmbiguousResponse(error_code)) => {
+                return finish_proxy_failure(&buffered_request, error_code).await;
             }
             Err(ProxySendError::NonRetryableTransport) => {
                 return finish_proxy_failure(&buffered_request, "upstream_transport").await;
@@ -479,10 +466,6 @@ pub(super) async fn proxy(
         .await;
     }
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
-    if is_codex_route && !codex_transport::is_event_stream(&upstream) {
-        drop(upstream);
-        return finish_proxy_failure(&buffered_request, "upstream_invalid_content_type").await;
-    }
     if is_codex_route && !codex_downstream_stream {
         let buffered = match codex_transport::buffer_response(upstream).await {
             Ok(buffered) => buffered,

@@ -545,15 +545,18 @@ async fn rate_limit_response_fails_over_and_records_the_actual_upstream() {
 }
 
 #[tokio::test]
-async fn codex_http_200_error_envelope_fails_over_before_downstream_delivery() {
+async fn codex_missing_content_type_json_fails_over_before_downstream_delivery() {
     let fixture = codex_route_fixture("high-demand-failover").await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .and(header_matcher("chatgpt-account-id", "account-123"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "error": {"message": "temporary high demand"}
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(
+            serde_json::to_vec(&json!({
+                "error": {"message": "temporary high demand secret"}
+            }))
+            .unwrap(),
+        ))
         .expect(1)
         .mount(&upstream)
         .await;
@@ -664,6 +667,29 @@ async fn codex_http_200_error_envelope_fails_over_before_downstream_delivery() {
     .await
     .unwrap();
     assert_eq!(failure_kind, "invalid_response");
+    for row in fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap()
+    {
+        let refs = fixture
+            .state
+            .db
+            .request_archive_refs(fixture.key_id, row.request_id)
+            .await
+            .unwrap();
+        let archived = fixture
+            .state
+            .archive
+            .get(refs.response_object.as_deref().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&archived).contains("high demand secret")
+        );
+    }
     pool.close().await;
     upstream.verify().await;
 }
@@ -1427,6 +1453,54 @@ async fn codex_buffered_route_rewrites_wire_and_archives_final_json_once() {
 }
 
 #[tokio::test]
+async fn codex_buffered_route_accepts_valid_sse_without_content_type() {
+    let fixture = codex_route_fixture("buffered-missing-content-type").await;
+    let upstream = MockServer::start().await;
+    let sse = completed_codex_sse("buffered missing header answer");
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(sse.into_bytes()))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({
+            "model": fixture.model,
+            "input": "admit a headerless but valid SSE response",
+            "stream": false
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["output"][0]["content"][0]["text"],
+        "buffered missing header answer"
+    );
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_eq!(rows[0].cost, "0.000005");
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn buffered_text_response_survives_total_archive_failure_with_gap_locators() {
     let fixture = codex_route_fixture("buffered-archive-gap").await;
     std::fs::remove_dir_all(&fixture.archive_path).unwrap();
@@ -1578,6 +1652,53 @@ async fn codex_streaming_route_preserves_sse_and_settles_usage_once() {
 }
 
 #[tokio::test]
+async fn codex_streaming_route_accepts_valid_sse_without_content_type() {
+    let fixture = codex_route_fixture("streaming-missing-content-type").await;
+    let upstream = MockServer::start().await;
+    let sse = completed_codex_sse("streamed missing header answer");
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(sse.clone().into_bytes()))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({
+            "model": fixture.model,
+            "input": "stream a headerless but valid SSE response",
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), sse.as_bytes());
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_eq!(rows[0].cost, "0.000005");
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn streaming_text_delivery_does_not_wait_for_a_timed_out_archive() {
     let fixture = codex_route_fixture_with_archive_directory(
         "streaming-archive-timeout",
@@ -1647,10 +1768,7 @@ async fn codex_streaming_failure_is_redacted_for_client_and_archive() {
     );
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(failed.as_bytes().to_vec(), "text/event-stream"),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(failed.as_bytes().to_vec()))
         .expect(1)
         .mount(&upstream)
         .await;
