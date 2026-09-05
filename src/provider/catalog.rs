@@ -194,6 +194,13 @@ impl ProviderCatalog {
                     "default": 0,
                     "description": "Trusted reservation allowance for input tokens added by a compatible upstream outside the forwarded request body."
                 },
+                "stream_usage_contract": {
+                    "title": "Streaming usage contract",
+                    "type": "string",
+                    "enum": ["none", "openai-chat-usage-only"],
+                    "default": "none",
+                    "description": "Require the OpenAI Chat include_usage terminal chunk for this compatible upstream."
+                },
                 "image_api_mode": {
                     "title": "Image generation API",
                     "type": "string",

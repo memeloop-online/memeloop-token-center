@@ -19,17 +19,7 @@ use crate::{
     model::KeyPolicy,
 };
 
-#[test]
-fn later_billable_stream_chunks_upgrade_nonbillable_lifecycle_delivery() {
-    let mut delivered_any = false;
-    let mut delivered_billable = false;
-    record_delivered_chunk(&mut delivered_any, &mut delivered_billable, false);
-    assert!(delivered_any);
-    assert!(!delivered_billable);
-    record_delivered_chunk(&mut delivered_any, &mut delivered_billable, true);
-    assert!(delivered_any);
-    assert!(delivered_billable);
-}
+mod chat_sse_usage;
 
 #[test]
 fn buffered_usage_capture_only_accepts_plausible_json_content_types() {
@@ -334,6 +324,50 @@ async fn response_usage_fixture(
     upstream: &MockServer,
     input_token_overhead_ceiling: i64,
 ) -> CodexRouteFixture {
+    response_usage_fixture_with_contract(
+        label,
+        upstream,
+        input_token_overhead_ceiling,
+        Some("openai-chat-usage-only"),
+    )
+    .await
+}
+
+async fn response_usage_fixture_with_contract(
+    label: &str,
+    upstream: &MockServer,
+    input_token_overhead_ceiling: i64,
+    stream_usage_contract: Option<&str>,
+) -> CodexRouteFixture {
+    response_usage_fixture_with_uri_and_contract(
+        label,
+        upstream.uri(),
+        input_token_overhead_ceiling,
+        stream_usage_contract,
+    )
+    .await
+}
+
+async fn response_usage_fixture_with_uri(
+    label: &str,
+    upstream_uri: String,
+    input_token_overhead_ceiling: i64,
+) -> CodexRouteFixture {
+    response_usage_fixture_with_uri_and_contract(
+        label,
+        upstream_uri,
+        input_token_overhead_ceiling,
+        Some("openai-chat-usage-only"),
+    )
+    .await
+}
+
+async fn response_usage_fixture_with_uri_and_contract(
+    label: &str,
+    upstream_uri: String,
+    input_token_overhead_ceiling: i64,
+    stream_usage_contract: Option<&str>,
+) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("archive");
     let database_url = format!(
@@ -349,6 +383,14 @@ async fn response_usage_fixture(
     let state = AppState::initialize(config).await.unwrap();
     let tenant = format!("compatibility-route-{label}");
     let model = "gpt-5.6-sol".to_owned();
+    let mut upstream_config = json!({
+        "base_url": upstream_uri,
+        "network_scope": "public",
+        "input_token_overhead_ceiling": input_token_overhead_ceiling,
+    });
+    if let Some(stream_usage_contract) = stream_usage_contract {
+        upstream_config["stream_usage_contract"] = json!(stream_usage_contract);
+    }
     let upstream_account = state
         .db
         .create_upstream_account(
@@ -356,11 +398,7 @@ async fn response_usage_fixture(
                 tenant_external_id: tenant.clone(),
                 name: format!("compatibility-{label}"),
                 driver: "http-json".to_owned(),
-                config: json!({
-                    "base_url": upstream.uri(),
-                    "network_scope": "public",
-                    "input_token_overhead_ceiling": input_token_overhead_ceiling
-                }),
+                config: upstream_config,
                 credential: UpstreamCredential::ApiKey {
                     value: "compatibility-upstream-secret".to_owned(),
                     header: "authorization".to_owned(),
@@ -431,6 +469,19 @@ async fn send_response_usage_request(fixture: &CodexRouteFixture, body: &Value) 
     router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
         .oneshot(
             Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+pub(super) async fn send_chat_usage_request(fixture: &CodexRouteFixture, body: &Value) -> Response {
+    router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
+        .oneshot(
+            Request::post("/v1/chat/completions")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
                 .body(Body::from(serde_json::to_vec(body).unwrap()))
@@ -2940,6 +2991,12 @@ async fn streaming_response_error_null_completes_and_non_null_error_fails() {
         assert_eq!(rows[0].error_code.as_deref(), expected_error);
         if expected_status == 200 {
             assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (309, 7));
+            assert_exactly_once_side_effects(
+                &fixture,
+                rows[0].request_id,
+                Some("resp-usage-contract"),
+            )
+            .await;
         } else {
             assert_ne!(rows[0].cost, "0", "delivered failed streams are billed");
             assert_eq!(rows[0].output_tokens, 16);

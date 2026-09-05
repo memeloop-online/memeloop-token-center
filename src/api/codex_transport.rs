@@ -440,13 +440,11 @@ enum StreamTerminal {
 pub(super) struct ResponsesStreamingSanitizer {
     pending: Vec<u8>,
     terminal: Option<StreamTerminal>,
-    last_push_billable: bool,
     saw_protocol_event: bool,
 }
 
 impl ResponsesStreamingSanitizer {
     pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Bytes, &'static str> {
-        self.last_push_billable = false;
         let mut output = Vec::new();
         for byte in chunk {
             self.pending.push(*byte);
@@ -471,10 +469,6 @@ impl ResponsesStreamingSanitizer {
         self.pending
             .iter()
             .all(|byte| matches!(byte, b'\r' | b'\n'))
-    }
-
-    pub(super) fn last_push_billable(&self) -> bool {
-        self.last_push_billable
     }
 
     fn saw_protocol_event(&self) -> bool {
@@ -528,10 +522,6 @@ impl ResponsesStreamingSanitizer {
             output.extend_from_slice(SAFE_FAILURE_EVENT);
         } else {
             append_safe_sse_fields(event, output);
-            self.last_push_billable |= !matches!(
-                payload_name,
-                "response.created" | "response.in_progress" | "response.queued"
-            );
         }
         self.terminal = terminal;
         Ok(())
@@ -1593,23 +1583,6 @@ mod tests {
             )
             .unwrap();
         assert!(!trailing_partial.is_complete());
-    }
-
-    #[test]
-    fn streaming_billable_classification_survives_separate_network_chunks() {
-        let mut sanitizer = ResponsesStreamingSanitizer::default();
-        sanitizer
-            .push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n")
-            .unwrap();
-        assert!(!sanitizer.last_push_billable());
-        sanitizer
-            .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"text\"}\n\n")
-            .unwrap();
-        assert!(sanitizer.last_push_billable());
-        sanitizer
-            .push(b"data: {\"type\":\"response.failed\"}\n\n")
-            .unwrap();
-        assert!(!sanitizer.last_push_billable());
     }
 
     #[test]

@@ -3,6 +3,7 @@ use super::*;
 #[path = "codex_transport.rs"]
 mod codex_transport;
 
+mod chat_sse_usage;
 mod conversation_hints;
 mod lifecycle;
 mod routing;
@@ -13,6 +14,7 @@ use crate::{
     db::{UpstreamAttemptAdmission, UpstreamFailureKind},
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},
 };
+use chat_sse_usage::{ChatSseDeliveryClass, ChatSseUsageContract, ChatSseUsageState};
 use conversation_hints::{client_name, conversation_hints, safe_conversation_hint};
 use lifecycle::{
     AbortTaskOnDrop, begin_streaming_response_archive, finish_proxy_request_with_archive_fallback,
@@ -29,6 +31,32 @@ mod tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
+
+fn validate_openai_chat_choice_count(request: &Value) -> Result<(), AppError> {
+    match request.get("n") {
+        None => Ok(()),
+        Some(Value::Number(number)) if number.as_i64() == Some(1) => Ok(()),
+        Some(_) => Err(AppError::BadRequest(
+            "OpenAI Chat requests must use n = 1".to_owned(),
+        )),
+    }
+}
+
+fn requires_strict_openai_chat_usage(
+    protocol: Protocol,
+    route_driver: &str,
+    route_config: &Value,
+    request: &Value,
+) -> bool {
+    matches!(protocol, Protocol::OpenAiChat)
+        && route_driver == "http-json"
+        && ChatSseUsageContract::from_route_config(route_config).requires_terminal_usage()
+        && request.get("stream").and_then(Value::as_bool) == Some(true)
+        && request
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
 
 pub(super) async fn proxy(
     state: AppState,
@@ -73,11 +101,31 @@ pub(super) async fn proxy(
             state.config.key_pepper.as_bytes(),
         )
         .await?;
+    let strict_choice_count_is_incompatible =
+        validate_openai_chat_choice_count(&request_json).is_err();
     let mut resolved_routes = resolved_routes.into_iter();
-    let Some(primary_route) = resolved_routes.next() else {
-        // Normalized grants are the sole downstream authorization source.
-        // A missing route must never fall back to process-wide legacy secrets.
-        return Err(AppError::Forbidden);
+    let mut skipped_incompatible_strict_route = false;
+    let primary_route = loop {
+        let Some(route) = resolved_routes.next() else {
+            // Normalized grants are the sole downstream authorization source.
+            // A missing route must never fall back to process-wide legacy secrets.
+            if skipped_incompatible_strict_route {
+                validate_openai_chat_choice_count(&request_json)?;
+            }
+            return Err(AppError::Forbidden);
+        };
+        if strict_choice_count_is_incompatible
+            && requires_strict_openai_chat_usage(
+                protocol,
+                &route.driver,
+                &route.config,
+                &request_json,
+            )
+        {
+            skipped_incompatible_strict_route = true;
+            continue;
+        }
+        break route;
     };
     let primary = prepare_proxy_route(
         &state,
@@ -93,6 +141,16 @@ pub(super) async fn proxy(
     let mut prepared_routes = vec![primary];
     if !primary_is_component {
         for route in resolved_routes {
+            if strict_choice_count_is_incompatible
+                && requires_strict_openai_chat_usage(
+                    protocol,
+                    &route.driver,
+                    &route.config,
+                    &request_json,
+                )
+            {
+                continue;
+            }
             if prepared_routes.len() == MAX_UPSTREAM_ATTEMPTS {
                 break;
             }
@@ -588,21 +646,18 @@ pub(super) async fn proxy(
         protocol,
         is_codex_route,
         codex_retry,
+        strict_openai_chat_usage: requires_strict_openai_chat_usage(
+            protocol,
+            &active_route.route.driver,
+            &active_route.route.config,
+            &request_json,
+        ),
         upstream_activity,
         request_id,
         buffered_request,
         proxy_lifecycle_permit,
     })
     .await
-}
-
-fn record_delivered_chunk(
-    delivered_any: &mut bool,
-    delivered_billable: &mut bool,
-    chunk_billable: bool,
-) {
-    *delivered_any = true;
-    *delivered_billable |= chunk_billable;
 }
 
 fn trusted_input_token_overhead_ceiling(
@@ -1157,7 +1212,7 @@ enum ResponsesSseEventKind {
 impl ResponsesSseEventKind {
     fn from_name(name: &[u8]) -> Self {
         match trim_ascii_whitespace(name) {
-            b"response.created" | b"response.in_progress" => Self::Lifecycle,
+            b"response.created" | b"response.queued" | b"response.in_progress" => Self::Lifecycle,
             b"response.completed" | b"message_stop" => Self::Completed,
             b"response.failed" | b"response.incomplete" | b"error" | b"response.error" => {
                 Self::Failed
@@ -1185,6 +1240,28 @@ struct ResponsesSseCapture {
     usage: Option<TokenUsage>,
     usage_invalid: bool,
     require_explicit_completed: bool,
+    responses_delivery: Option<ResponsesDeliveryContract>,
+    chat_usage: Option<ChatSseUsageState>,
+    delivery: Option<SseDeliveryState>,
+    saw_done: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ResponsesDeliveryContract {
+    Compatible,
+    Codex,
+}
+
+#[derive(Default)]
+struct SseDeliveryState {
+    event: Vec<u8>,
+    frames: Vec<SseDeliveryFrame>,
+    discard_event: bool,
+}
+
+pub(super) struct SseDeliveryFrame {
+    pub(super) bytes: Bytes,
+    pub(super) billable: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1204,12 +1281,42 @@ impl ResponsesSseCapture {
     fn for_responses() -> Self {
         Self {
             require_explicit_completed: true,
+            responses_delivery: Some(ResponsesDeliveryContract::Compatible),
+            delivery: Some(SseDeliveryState::default()),
+            ..Self::default()
+        }
+    }
+
+    fn for_codex_responses() -> Self {
+        Self {
+            require_explicit_completed: true,
+            responses_delivery: Some(ResponsesDeliveryContract::Codex),
+            delivery: Some(SseDeliveryState::default()),
+            ..Self::default()
+        }
+    }
+
+    fn for_delivery() -> Self {
+        Self {
+            delivery: Some(SseDeliveryState::default()),
+            ..Self::default()
+        }
+    }
+
+    fn for_openai_chat_usage() -> Self {
+        Self {
+            chat_usage: Some(ChatSseUsageState::default()),
+            delivery: Some(SseDeliveryState::default()),
             ..Self::default()
         }
     }
 
     fn push(&mut self, chunk: &[u8]) {
         for &byte in chunk {
+            if self.saw_done {
+                break;
+            }
+            self.push_delivery_byte(byte);
             if byte == b'\n' {
                 self.finish_line();
             } else if self.discard_line {
@@ -1225,12 +1332,23 @@ impl ResponsesSseCapture {
         }
     }
 
+    pub(super) fn push_delivery_frames(&mut self, chunk: &[u8]) -> Vec<SseDeliveryFrame> {
+        self.push(chunk);
+        self.delivery
+            .as_mut()
+            .map_or_else(Vec::new, |delivery| std::mem::take(&mut delivery.frames))
+    }
+
     fn finish_summary(mut self) -> ResponsesSseSummary {
         if !self.discard_line && !self.line.is_empty() {
             self.finish_line();
         }
         if !self.data.is_empty() || self.discard_event || self.event_kind.is_some() {
-            self.dispatch_event();
+            let _ = self.dispatch_event();
+        }
+        if let Some(chat_usage) = self.chat_usage.as_ref() {
+            self.usage = chat_usage.usage();
+            self.usage_invalid |= chat_usage.usage_invalid();
         }
         let outcome = if self.terminal_failure {
             ResponsesSseOutcome::Failed
@@ -1250,9 +1368,53 @@ impl ResponsesSseCapture {
         }
     }
 
+    fn chat_usage_done(&self) -> bool {
+        self.chat_usage
+            .as_ref()
+            .is_some_and(ChatSseUsageState::is_done)
+    }
+
+    fn saw_done(&self) -> bool {
+        self.saw_done
+    }
+
     #[cfg(test)]
     fn finish(self) -> ResponsesSseOutcome {
         self.finish_summary().outcome
+    }
+
+    fn push_delivery_byte(&mut self, byte: u8) {
+        let Some(delivery) = self.delivery.as_mut() else {
+            return;
+        };
+        if delivery.discard_event {
+            return;
+        }
+        if delivery.event.len() >= MAX_RESPONSES_SSE_EVENT_BYTES {
+            delivery.event.clear();
+            delivery.discard_event = true;
+            self.invalid = true;
+            return;
+        }
+        delivery.event.push(byte);
+    }
+
+    fn finish_delivery_event(&mut self, class: ChatSseDeliveryClass) {
+        let Some(delivery) = self.delivery.as_mut() else {
+            return;
+        };
+        if delivery.discard_event {
+            delivery.discard_event = false;
+            delivery.event.clear();
+            return;
+        }
+        let event = std::mem::take(&mut delivery.event);
+        if !event.is_empty() {
+            delivery.frames.push(SseDeliveryFrame {
+                bytes: Bytes::from(event),
+                billable: matches!(class, ChatSseDeliveryClass::Billable),
+            });
+        }
     }
 
     fn finish_line(&mut self) {
@@ -1266,7 +1428,8 @@ impl ResponsesSseCapture {
             line.pop();
         }
         if line.is_empty() {
-            self.dispatch_event();
+            let class = self.dispatch_event();
+            self.finish_delivery_event(class);
             return;
         }
         if self.discard_event {
@@ -1305,7 +1468,7 @@ impl ResponsesSseCapture {
         }
     }
 
-    fn dispatch_event(&mut self) {
+    fn dispatch_event(&mut self) -> ChatSseDeliveryClass {
         let data = std::mem::take(&mut self.data);
         let event_kind = self.event_kind.take();
         let discard = std::mem::take(&mut self.discard_event);
@@ -1318,7 +1481,7 @@ impl ResponsesSseCapture {
                 Some(ResponsesSseEventKind::Failed) => self.terminal_failure = true,
                 Some(ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other) | None => {}
             }
-            return;
+            return ChatSseDeliveryClass::Control;
         }
         if data.is_empty() {
             match event_kind {
@@ -1329,10 +1492,14 @@ impl ResponsesSseCapture {
                 Some(ResponsesSseEventKind::Failed) => self.terminal_failure = true,
                 Some(ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other) | None => {}
             }
-            return;
+            return ChatSseDeliveryClass::Control;
         }
         let data = trim_ascii_whitespace(&data);
         if data == b"[DONE]" {
+            self.saw_done = true;
+            if let Some(chat_usage) = self.chat_usage.as_mut() {
+                chat_usage.observe_done();
+            }
             if matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
                 if self.require_explicit_completed && self.terminal_failure {
                     self.invalid = true;
@@ -1341,11 +1508,14 @@ impl ResponsesSseCapture {
             } else if !self.require_explicit_completed {
                 self.terminal_success = true;
             }
-            return;
+            return ChatSseDeliveryClass::Control;
+        }
+        if let Some(chat_usage) = self.chat_usage.as_mut() {
+            return chat_usage.observe_data(data);
         }
         let Ok(value) = serde_json::from_slice::<Value>(data) else {
             self.invalid = true;
-            return;
+            return ChatSseDeliveryClass::Billable;
         };
         match usage_from_value_checked(&value) {
             Err(()) => self.usage_invalid = true,
@@ -1379,7 +1549,7 @@ impl ResponsesSseCapture {
             {
                 self.terminal_failure = true;
             }
-            return;
+            return ChatSseDeliveryClass::Billable;
         }
         let kind = payload_kind
             .or(event_kind)
@@ -1419,7 +1589,42 @@ impl ResponsesSseCapture {
             }
             ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other => {}
         }
+        if self.response_delivery_is_billable(kind, &value) {
+            ChatSseDeliveryClass::Billable
+        } else {
+            ChatSseDeliveryClass::Control
+        }
     }
+
+    fn response_delivery_is_billable(&self, kind: ResponsesSseEventKind, value: &Value) -> bool {
+        match (self.responses_delivery, kind) {
+            // Compatible Responses routes have historically charged a safe
+            // failure after it is delivered. Direct Codex failure envelopes
+            // remain a non-billable control frame unless output was already
+            // delivered in a preceding event.
+            (Some(ResponsesDeliveryContract::Compatible), ResponsesSseEventKind::Failed) => true,
+            (_, ResponsesSseEventKind::Other) => true,
+            (_, ResponsesSseEventKind::Completed) => completed_response_has_billable_result(value),
+            (_, ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Failed) => false,
+        }
+    }
+}
+
+/// A completed Responses event sometimes carries the entire output and usage
+/// instead of preceding output-delta events. It must durably start delivery
+/// before forwarding in that shape; a pure terminal lifecycle marker does not.
+fn completed_response_has_billable_result(value: &Value) -> bool {
+    let Some(response) = value.get("response").and_then(Value::as_object) else {
+        return false;
+    };
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .is_some_and(|output| !output.is_empty())
+        || response
+            .get("usage")
+            .and_then(Value::as_object)
+            .is_some_and(|usage| !usage.is_empty())
 }
 
 fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {

@@ -14,6 +14,7 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) protocol: Protocol,
     pub(super) is_codex_route: bool,
     pub(super) codex_retry: CodexRetryTerminalGuard,
+    pub(super) strict_openai_chat_usage: bool,
     pub(super) upstream_activity: crate::metrics::ActivityGuard,
     pub(super) request_id: Uuid,
     pub(super) buffered_request: BufferedRequest<'a>,
@@ -31,6 +32,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         protocol,
         is_codex_route,
         mut codex_retry,
+        strict_openai_chat_usage,
         upstream_activity,
         request_id,
         buffered_request,
@@ -95,19 +97,22 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut capture_memory = background_state
                 .metrics
                 .memory_usage(crate::metrics::MemoryComponent::StreamCapture, 0);
-            let mut sse_capture = is_sse.then(|| {
-                if matches!(protocol, Protocol::OpenAiResponses) {
-                    ResponsesSseCapture::for_responses()
-                } else {
-                    ResponsesSseCapture::default()
+            let mut sse_capture = is_sse.then(|| match protocol {
+                Protocol::OpenAiChat if strict_openai_chat_usage => {
+                    ResponsesSseCapture::for_openai_chat_usage()
                 }
+                Protocol::OpenAiResponses if is_codex_route => {
+                    ResponsesSseCapture::for_codex_responses()
+                }
+                Protocol::OpenAiResponses => ResponsesSseCapture::for_responses(),
+                _ => ResponsesSseCapture::for_delivery(),
             });
             let mut responses_streaming_sanitizer = (is_sse
                 && matches!(protocol, Protocol::OpenAiResponses))
             .then(codex_transport::ResponsesStreamingSanitizer::default);
             let mut transport_error: Option<&'static str> = None;
             let mut response_bytes = 0_usize;
-            let mut delivered_any = false;
+            let mut delivery_confirmed = false;
             let mut delivered_billable = false;
             loop {
                 let next =
@@ -153,24 +158,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             .await;
                             break;
                         }
-                        let (chunk, chunk_billable) = if let Some(sanitizer) =
-                            responses_streaming_sanitizer.as_mut()
+                        let chunk = if let Some(sanitizer) = responses_streaming_sanitizer.as_mut()
                         {
                             match sanitizer.push(&raw_chunk) {
-                                Ok(chunk) => {
-                                    let billable = if is_codex_route {
-                                        sanitizer.last_push_billable()
-                                    } else {
-                                        // Generic compatible Responses routes historically
-                                        // charge the admitted contract once any response event
-                                        // is delivered, including a redacted terminal failure.
-                                        // Direct Codex routes retain their narrower lifecycle
-                                        // classification because their trusted transport can
-                                        // distinguish non-billable control events.
-                                        !chunk.is_empty()
-                                    };
-                                    (chunk, billable)
-                                }
+                                Ok(chunk) => chunk,
                                 Err(error_code) => {
                                     transport_error = Some(error_code);
                                     cancel_stream_archive(&archive_complete, &mut archive_sender);
@@ -185,7 +176,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 }
                             }
                         } else {
-                            (raw_chunk, true)
+                            raw_chunk
                         };
                         // A Responses sanitizer may need several network
                         // fragments before it can emit one complete, redacted
@@ -198,24 +189,51 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             append_bounded(&mut usage_capture, &chunk, 2 * 1024 * 1024);
                             capture_memory.set_bytes(usage_capture.capacity());
                         }
-                        if let Some(capture) = sse_capture.as_mut() {
-                            capture.push(&chunk);
-                        }
-                        if let Some(sender) = archive_sender.as_ref()
-                            && sender.try_send(chunk.clone()).is_err()
-                        {
-                            tracing::warn!(%request_id, stage = "response_archive_backpressure", "proxy archive gap");
-                            cancel_stream_archive(&archive_complete, &mut archive_sender);
-                        }
-                        if !delivered_any {
-                            match tokio::time::timeout(
-                                MAX_DOWNSTREAM_SEND_WAIT,
-                                body_sender.reserve(),
-                            )
-                            .await
+                        // The capture is the single, stateful SSE classifier for
+                        // Responses and strict Chat. It emits whole events so a
+                        // fragmented comment/control frame never confirms
+                        // delivery or occupies the archive channel as output.
+                        let delivery_frames = if let Some(capture) = sse_capture.as_mut() {
+                            capture.push_delivery_frames(&chunk)
+                        } else if chunk.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![SseDeliveryFrame {
+                                bytes: chunk,
+                                billable: true,
+                            }]
+                        };
+                        let chat_usage_done = sse_capture
+                            .as_ref()
+                            .is_some_and(ResponsesSseCapture::chat_usage_done);
+                        // Strict Chat emits its terminal usage before `[DONE]`,
+                        // so its protocol contract is complete at the sentinel.
+                        // Responses must still consume EOF: the sanitizer rejects
+                        // a trailing partial frame after a valid terminal event.
+                        let strict_chat_done = strict_openai_chat_usage
+                            && sse_capture
+                                .as_ref()
+                                .is_some_and(ResponsesSseCapture::saw_done);
+                        for frame in delivery_frames {
+                            let SseDeliveryFrame { bytes, billable } = frame;
+                            if let Some(sender) = archive_sender.as_ref()
+                                && sender.try_send(bytes.clone()).is_err()
                             {
-                                Ok(Ok(permit)) => {
-                                    match prepare_proxy_delivery_with_retry(
+                                tracing::warn!(%request_id, stage = "response_archive_backpressure", "proxy archive gap");
+                                cancel_stream_archive(&archive_complete, &mut archive_sender);
+                            }
+                            if billable && !delivery_confirmed {
+                                // `delivery_started` is the durable signal the orphan reaper
+                                // uses to charge a stranded stream. Confirm it before any
+                                // billable byte is enqueued, while control frames never reach
+                                // this transition.
+                                match tokio::time::timeout(
+                                    MAX_DOWNSTREAM_SEND_WAIT,
+                                    body_sender.reserve(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(permit)) => match prepare_proxy_delivery_with_retry(
                                         &background_state.db,
                                         request_id,
                                         tenant_id,
@@ -227,16 +245,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     .await
                                     {
                                         Ok(()) => {
-                                            let initial_length =
-                                                chunk.len().min(MAX_UNCONFIRMED_DELIVERY_BYTES);
-                                            let initial = chunk.slice(..initial_length);
-                                            let remaining = chunk.slice(initial_length..);
-                                            permit.send(Ok::<Bytes, std::io::Error>(initial));
-                                            record_delivered_chunk(
-                                                &mut delivered_any,
-                                                &mut delivered_billable,
-                                                chunk_billable,
-                                            );
                                             if confirm_proxy_delivery_with_retry(
                                                 &background_state.db,
                                                 request_id,
@@ -246,26 +254,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                             .await
                                             .is_err()
                                             {
+                                                drop(permit);
                                                 transport_error = Some("delivery_state");
-                                            } else if !remaining.is_empty() {
-                                                match tokio::time::timeout(
-                                                    MAX_DOWNSTREAM_SEND_WAIT,
-                                                    body_sender.send(Ok::<Bytes, std::io::Error>(
-                                                        remaining,
-                                                    )),
-                                                )
-                                                .await
-                                                {
-                                                    Ok(Ok(())) => {}
-                                                    Ok(Err(_)) => {
-                                                        transport_error =
-                                                            Some("downstream_disconnected")
-                                                    }
-                                                    Err(_) => {
-                                                        transport_error =
-                                                            Some("downstream_backpressure")
-                                                    }
-                                                }
+                                            } else {
+                                                delivery_confirmed = true;
+                                                delivered_billable = true;
+                                                permit.send(Ok::<Bytes, std::io::Error>(bytes));
                                             }
                                         }
                                         Err(_) => {
@@ -279,29 +273,31 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                             )
                                             .await;
                                         }
-                                    }
+                                    },
+                                    Ok(Err(_)) => transport_error = Some("downstream_disconnected"),
+                                    Err(_) => transport_error = Some("downstream_backpressure"),
                                 }
-                                Ok(Err(_)) => transport_error = Some("downstream_disconnected"),
-                                Err(_) => transport_error = Some("downstream_backpressure"),
+                            } else {
+                                match tokio::time::timeout(
+                                    MAX_DOWNSTREAM_SEND_WAIT,
+                                    body_sender.send(Ok::<Bytes, std::io::Error>(bytes)),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => delivered_billable |= billable,
+                                    Ok(Err(_)) => transport_error = Some("downstream_disconnected"),
+                                    Err(_) => transport_error = Some("downstream_backpressure"),
+                                }
                             }
-                        } else {
-                            match tokio::time::timeout(
-                                MAX_DOWNSTREAM_SEND_WAIT,
-                                body_sender.send(Ok::<Bytes, std::io::Error>(chunk)),
-                            )
-                            .await
-                            {
-                                Ok(Ok(())) => record_delivered_chunk(
-                                    &mut delivered_any,
-                                    &mut delivered_billable,
-                                    chunk_billable,
-                                ),
-                                Ok(Err(_)) => transport_error = Some("downstream_disconnected"),
-                                Err(_) => transport_error = Some("downstream_backpressure"),
+                            if transport_error.is_some() {
+                                break;
                             }
                         }
                         if transport_error.is_some() {
                             cancel_stream_archive(&archive_complete, &mut archive_sender);
+                            break;
+                        }
+                        if chat_usage_done || strict_chat_done {
                             break;
                         }
                     }

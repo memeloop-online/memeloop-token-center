@@ -147,11 +147,10 @@ use crate::{
     provider::{ResolvedUpstream, UpstreamCredential, validate_config},
     proxy_lifecycle::{
         MAX_DOWNSTREAM_SEND_WAIT, MAX_PROXY_LIFETIME, MAX_PROXY_STREAM_LIFETIME,
-        MAX_UNCONFIRMED_DELIVERY_BYTES, abandon_proxy_archive_attempt,
-        attach_proxy_archive_with_retry, begin_proxy_archive_attempt,
-        confirm_proxy_delivery_with_retry, finish_proxy_request_with_retry,
-        heartbeat_proxy_archive_attempt, prepare_proxy_delivery_with_retry,
-        response_archive_requires_cleanup,
+        abandon_proxy_archive_attempt, attach_proxy_archive_with_retry,
+        begin_proxy_archive_attempt, confirm_proxy_delivery_with_retry,
+        finish_proxy_request_with_retry, heartbeat_proxy_archive_attempt,
+        prepare_proxy_delivery_with_retry, response_archive_requires_cleanup,
     },
 };
 
