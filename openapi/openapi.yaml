@@ -1614,6 +1614,8 @@ paths:
         selected upstream model is not in a complete synchronized catalog.
       security: [{ serviceBearer: [] }]
       x-required-scope: routes:write
+      parameters:
+        - $ref: '#/components/parameters/RouteCreateIdempotencyKey'
       requestBody:
         required: true
         content:
@@ -1621,7 +1623,18 @@ paths:
             schema: { $ref: '#/components/schemas/CreateModelRouteRequest' }
       responses:
         '201':
-          description: Enabled model route. An identical create replays the existing route with the same status.
+          description: A newly created enabled model route, or a header-less equivalent-route reuse that does not prove caller ownership.
+          headers:
+            X-MTC-Route-Create-Disposition:
+              $ref: '#/components/headers/RouteCreateCreatedDisposition'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelRoute' }
+        '200':
+          description: Exact replay of this caller's unexpired Idempotency-Key and canonical route-create request.
+          headers:
+            X-MTC-Route-Create-Disposition:
+              $ref: '#/components/headers/RouteCreateReusedDisposition'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ModelRoute' }
@@ -3665,6 +3678,16 @@ components:
     ApiVersion:
       description: API contract version selected for this response.
       schema: { const: v1 }
+    RouteCreateCreatedDisposition:
+      description: `created` is a new route; `equivalent_unowned` preserves header-less equality behaviour and cannot prove ownership.
+      schema:
+        type: string
+        enum: [created, equivalent_unowned]
+    RouteCreateReusedDisposition:
+      description: Exact replay bound to the caller's Idempotency-Key.
+      schema:
+        type: string
+        enum: [reused]
 
   parameters:
     TenantFilter:
@@ -3848,6 +3871,12 @@ components:
       name: Idempotency-Key
       in: header
       required: false
+      schema: { type: string, minLength: 1, maxLength: 200, pattern: '^[!-~]+$' }
+    RouteCreateIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: An exact replay within 30 days returns the same stable route with `X-MTC-Route-Create-Disposition: reused`. Use one opaque operation identifier per logical create, never credentials or request content. New automation must require this header and never use a header-less equivalent response as ownership proof.
       schema: { type: string, minLength: 1, maxLength: 200, pattern: '^[!-~]+$' }
     RequiredIdempotencyKey:
       name: Idempotency-Key

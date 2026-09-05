@@ -146,8 +146,10 @@ pub(crate) use requests::{
     FILTERED_ACTIVITY_SOURCE_ROLLUPS,
 };
 pub use routing::{
-    CreateRoutedModelRouteInput, CredentialRoutingView, ReplaceCredentialRoutingInput,
-    ReplaceRouteRoutingInput, RouteRoutingView, RouteSelectionOptions, UpdateRoutedModelRouteInput,
+    CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
+    ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput, RouteCreateDisposition,
+    RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
+    UpdateRoutedModelRouteInput,
 };
 pub(crate) use routing::{UpstreamAttemptAdmission, UpstreamFailureKind};
 pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};

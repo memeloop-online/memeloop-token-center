@@ -340,6 +340,22 @@ impl Database {
                 "the route has request history and must be retained in a disabled state".into(),
             ));
         }
+        let active_create_claim = sqlx::query(
+            "SELECT 1 FROM model_route_create_operations \
+             WHERE tenant_id = $1 AND route_id = $2 AND expires_at > $3 LIMIT 1",
+        )
+        .bind(&tenant_id)
+        .bind(route_id.to_string())
+        .bind(unix_millis())
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if active_create_claim {
+            return Err(AppError::Conflict(
+                "the route has an active create idempotency claim and must be retained until it expires"
+                    .into(),
+            ));
+        }
         let granted_key_ids = sqlx::query(
             "SELECT key_id AS id FROM routing_grants WHERE tenant_id = $1 AND model_route_id = $2 ORDER BY key_id",
         )

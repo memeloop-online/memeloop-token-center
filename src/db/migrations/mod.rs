@@ -345,6 +345,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "upstream account health circuit breaker",
         sql: include_str!("../../../migrations/common/0064_upstream_account_health.sql"),
     },
+    Migration {
+        version: 66,
+        name: "model route create idempotency claims",
+        sql: include_str!("../../../migrations/common/0066_model_route_create_idempotency.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -675,6 +680,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 64,
         name: "upstream account health circuit breaker",
         sql: include_str!("../../../migrations/common/0064_upstream_account_health.sql"),
+    },
+    Migration {
+        version: 66,
+        name: "model route create idempotency claims",
+        sql: include_str!("../../../migrations/common/0066_model_route_create_idempotency.sql"),
     },
 ];
 

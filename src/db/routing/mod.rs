@@ -1,15 +1,20 @@
 mod associations;
+mod create_idempotency;
+mod equivalence;
 mod grant_revisions;
 mod grants;
 mod health;
+mod input;
 mod list;
 mod resolver;
 mod routes;
 mod types;
 
 pub use types::{
-    CreateRoutedModelRouteInput, CredentialRoutingView, ReplaceCredentialRoutingInput,
-    ReplaceRouteRoutingInput, RouteRoutingView, RouteSelectionOptions, UpdateRoutedModelRouteInput,
+    CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
+    ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput, RouteCreateDisposition,
+    RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
+    UpdateRoutedModelRouteInput,
 };
 
 pub(crate) use associations::{

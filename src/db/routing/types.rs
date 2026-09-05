@@ -49,6 +49,51 @@ pub struct CreateRoutedModelRouteInput {
     pub custom_model_confirmed: bool,
 }
 
+/// A fixed-width, keyed digest of an operator-supplied route-create
+/// idempotency key. The raw header is deliberately never persisted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteCreateIdempotencyKey([u8; 32]);
+
+impl RouteCreateIdempotencyKey {
+    pub const fn from_hmac_sha256(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// The ownership semantics of a route-create response.
+///
+/// Only `Created` and `Reused` are backed by the caller's explicit
+/// idempotency claim. `EquivalentUnowned` exists solely to preserve the
+/// historical header-less create behaviour; automation must not treat it as
+/// proof that it created the route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteCreateDisposition {
+    Created,
+    Reused,
+    EquivalentUnowned,
+}
+
+impl RouteCreateDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Reused => "reused",
+            Self::EquivalentUnowned => "equivalent_unowned",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CreateRoutedModelRouteResult {
+    pub route: crate::provider::ModelRouteView,
+    pub routing: RouteRoutingView,
+    pub disposition: RouteCreateDisposition,
+}
+
 #[derive(Clone, Debug)]
 pub struct UpdateRoutedModelRouteInput {
     pub tenant_external_id: String,
