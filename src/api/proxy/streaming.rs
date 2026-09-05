@@ -1,8 +1,10 @@
 use super::*;
 
 mod archive;
+mod terminal_delivery;
 
 use archive::{cancel_stream_archive, stream_response_archive};
+use terminal_delivery::{ResponsesTerminalDelivery, TerminalEof};
 
 pub(super) struct StreamingResponse<'a> {
     pub(super) state: &'a AppState,
@@ -156,13 +158,18 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             });
             let mut responses_streaming_sanitizer = (is_sse
                 && matches!(protocol, Protocol::OpenAiResponses))
-            .then(codex_transport::ResponsesStreamingSanitizer::default);
+            .then(crate::api::sse::ResponsesStreamingSanitizer::default);
             let mut transport_error: Option<&'static str> = None;
             let mut response_bytes = 0_usize;
             let mut delivery_confirmed = false;
             let mut delivered_billable = false;
+            let mut terminal_delivery = ResponsesTerminalDelivery::default();
             loop {
-                let next =
+                let mut flushing_terminal = false;
+                let next = if let Some(chunk) = terminal_delivery.take_pending() {
+                    flushing_terminal = true;
+                    Some(Ok(chunk))
+                } else {
                     match tokio::time::timeout_at(stream_deadline, upstream_stream.next()).await {
                         Ok(next) => next,
                         Err(_) => {
@@ -176,54 +183,70 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             .await;
                             break;
                         }
-                    };
+                    }
+                };
                 let Some(next) = next else {
-                    if responses_streaming_sanitizer
-                        .as_ref()
-                        .is_some_and(|sanitizer| !sanitizer.is_complete())
-                    {
-                        transport_error = Some("upstream_incomplete_response");
+                    match terminal_delivery.finish_at_eof(responses_streaming_sanitizer.as_mut()) {
+                        TerminalEof::Flush => continue,
+                        TerminalEof::Complete => break,
+                        TerminalEof::Error(error_code) => {
+                            transport_error = Some(error_code);
+                            cancel_stream_archive(&archive_complete, &mut archive_sender);
+                            let _ = tokio::time::timeout(
+                                MAX_DOWNSTREAM_SEND_WAIT,
+                                body_sender.send(Err(std::io::Error::other(
+                                    "upstream Responses stream ended with an incomplete frame",
+                                ))),
+                            )
+                            .await;
+                        }
                     }
                     break;
                 };
                 match next {
                     Ok(raw_chunk) => {
-                        let _response_buffer = background_state.metrics.memory_usage(
-                            crate::metrics::MemoryComponent::ResponseBuffer,
-                            raw_chunk.len(),
-                        );
-                        response_bytes = response_bytes.saturating_add(raw_chunk.len());
-                        if response_bytes > MAX_PROXY_RESPONSE_BODY {
-                            transport_error = Some("upstream_response_too_large");
-                            cancel_stream_archive(&archive_complete, &mut archive_sender);
-                            let _ = tokio::time::timeout(
-                                MAX_DOWNSTREAM_SEND_WAIT,
-                                body_sender.send(Err(std::io::Error::other(
-                                    "upstream response exceeded the size limit",
-                                ))),
-                            )
-                            .await;
-                            break;
-                        }
-                        let chunk = if let Some(sanitizer) = responses_streaming_sanitizer.as_mut()
-                        {
-                            match sanitizer.push(&raw_chunk) {
-                                Ok(chunk) => chunk,
-                                Err(error_code) => {
-                                    transport_error = Some(error_code);
-                                    cancel_stream_archive(&archive_complete, &mut archive_sender);
-                                    let _ = tokio::time::timeout(
-                                        MAX_DOWNSTREAM_SEND_WAIT,
-                                        body_sender.send(Err(std::io::Error::other(
-                                            "upstream stream violated the Responses protocol",
-                                        ))),
-                                    )
-                                    .await;
-                                    break;
-                                }
-                            }
-                        } else {
+                        let chunk = if flushing_terminal {
                             raw_chunk
+                        } else {
+                            let _response_buffer = background_state.metrics.memory_usage(
+                                crate::metrics::MemoryComponent::ResponseBuffer,
+                                raw_chunk.len(),
+                            );
+                            response_bytes = response_bytes.saturating_add(raw_chunk.len());
+                            if response_bytes > MAX_PROXY_RESPONSE_BODY {
+                                transport_error = Some("upstream_response_too_large");
+                                cancel_stream_archive(&archive_complete, &mut archive_sender);
+                                let _ = tokio::time::timeout(
+                                    MAX_DOWNSTREAM_SEND_WAIT,
+                                    body_sender.send(Err(std::io::Error::other(
+                                        "upstream response exceeded the size limit",
+                                    ))),
+                                )
+                                .await;
+                                break;
+                            }
+                            if let Some(sanitizer) = responses_streaming_sanitizer.as_mut() {
+                                match sanitizer.push(&raw_chunk) {
+                                    Ok(chunk) => chunk,
+                                    Err(error_code) => {
+                                        transport_error = Some(error_code);
+                                        cancel_stream_archive(
+                                            &archive_complete,
+                                            &mut archive_sender,
+                                        );
+                                        let _ = tokio::time::timeout(
+                                            MAX_DOWNSTREAM_SEND_WAIT,
+                                            body_sender.send(Err(std::io::Error::other(
+                                                "upstream stream violated the Responses protocol",
+                                            ))),
+                                        )
+                                        .await;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                raw_chunk
+                            }
                         };
                         // A Responses sanitizer may need several network
                         // fragments before it can emit one complete, redacted
@@ -258,9 +281,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         // Responses must still consume EOF: the sanitizer rejects
                         // a trailing partial frame after a valid terminal event.
                         let strict_chat_done = strict_openai_chat_usage
-                            && sse_capture
-                                .as_ref()
-                                .is_some_and(ResponsesSseCapture::saw_done);
+                            && sse_capture.as_ref().is_some_and(|capture| {
+                                capture.saw_done() && !capture.has_pending_crlf_continuation()
+                            });
                         if let Some(sender) = archive_sender.as_ref()
                             && try_queue_response_archive_batch(sender, &delivery_frames).is_err()
                         {

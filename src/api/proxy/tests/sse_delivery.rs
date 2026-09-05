@@ -2,17 +2,14 @@ use super::*;
 
 use futures_util::StreamExt;
 
-#[tokio::test]
-async fn codex_terminal_id_conflict_never_archives_or_settles_as_success() {
-    let fixture = codex_route_fixture("terminal-id-conflict").await;
+async fn assert_codex_terminal_rejection(
+    label: &str,
+    sse: &str,
+    expected_error: &str,
+    expected_prefix: Option<&str>,
+) {
+    let fixture = codex_route_fixture(label).await;
     let upstream = MockServer::start().await;
-    let sse = concat!(
-        "event: response.created\n",
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-a\"}}\n\n",
-        "event: response.completed\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-b\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
-        "data: [DONE]\n\n"
-    );
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
@@ -37,11 +34,13 @@ async fn codex_terminal_id_conflict_never_archives_or_settles_as_success() {
             Err(_) => saw_error = true,
         }
     }
-    // The conflicting completed envelope shares this raw chunk with the
-    // created event. It is rejected before either the terminal frame or a
-    // prefix is placed on the client-facing body channel.
     assert!(saw_error);
-    assert!(delivered.is_empty());
+    let delivered = String::from_utf8(delivered).unwrap();
+    assert!(!delivered.contains("response.completed"));
+    assert!(!delivered.contains("[DONE]"));
+    if let Some(prefix) = expected_prefix {
+        assert!(delivered.contains(prefix));
+    }
 
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
@@ -51,10 +50,7 @@ async fn codex_terminal_id_conflict_never_archives_or_settles_as_success() {
         .await
         .unwrap();
     assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_invalid_response")
-    );
+    assert_eq!(rows[0].error_code.as_deref(), Some(expected_error));
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     let refs = fixture
         .state
@@ -66,5 +62,132 @@ async fn codex_terminal_id_conflict_never_archives_or_settles_as_success() {
         refs.response_object.as_deref(),
         Some(format!("gap://{}/response", rows[0].request_id).as_str())
     );
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_terminal_id_conflict_never_archives_or_settles_as_success() {
+    assert_codex_terminal_rejection(
+        "terminal-id-conflict",
+        concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-a\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-b\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        "upstream_invalid_response",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn codex_completed_without_id_never_archives_or_settles_as_success() {
+    assert_codex_terminal_rejection(
+        "terminal-id-missing",
+        concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-missing\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        "upstream_incomplete_response",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bare_completed_event_never_leaks_a_later_terminal() {
+    assert_codex_terminal_rejection(
+        "bare-terminal-event",
+        concat!(
+            "event: response.completed\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-bare\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        "upstream_invalid_response",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminal_followed_by_unterminated_data_never_leaks_terminal_or_archives_success() {
+    assert_codex_terminal_rejection(
+        "terminal-trailing-partial",
+        concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-trailing\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-trailing\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+            "data: [DONE]\n\n",
+            "data: truncated"
+        ),
+        "upstream_incomplete_response",
+        Some("response.created"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn codex_crlf_terminal_releases_at_eof_and_archives_only_safe_comments() {
+    let fixture = codex_route_fixture("terminal-crlf-safe-comment").await;
+    let upstream = MockServer::start().await;
+    let secret = "Authorization: provider-comment-secret";
+    let sse = concat!(
+        "event: response.completed\r\n",
+        ": Authorization: provider-comment-secret\r\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-crlf\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\r\n\r\n",
+        "data: [DONE]\r\n\r\n"
+    );
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "safe comment", "stream": true}),
+    )
+    .await;
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let delivered = String::from_utf8(body.to_vec()).unwrap();
+    assert!(delivered.contains(": heartbeat\r\n"));
+    assert!(delivered.contains("response.completed"));
+    assert!(delivered.contains("data: [DONE]\r\n\r\n"));
+    assert!(!delivered.contains(secret));
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-crlf")).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    let archived = fixture
+        .state
+        .archive
+        .get(refs.response_object.as_deref().expect("response archive"))
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&archived).contains(secret));
     upstream.verify().await;
 }

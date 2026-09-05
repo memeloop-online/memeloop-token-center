@@ -3,7 +3,7 @@ use super::*;
 use crate::api::limits::MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK;
 
 #[tokio::test]
-async fn archive_batch_keeps_control_and_content_when_writer_is_paused() {
+async fn archive_batch_queue_accepts_control_and_content_with_unpolled_receiver() {
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
     let frames = [
         SseDeliveryFrame {
@@ -16,9 +16,8 @@ async fn archive_batch_keeps_control_and_content_when_writer_is_paused() {
         },
     ];
 
-    // Do not poll `receiver` before queuing: this is a paused archive writer
-    // with the production capacity of one. A frame-at-a-time send would reject
-    // the second frame and cancel the archive.
+    // This is a queue-level gate with the production capacity of one; a
+    // frame-at-a-time send would reject the second frame before a writer polls.
     assert!(try_queue_response_archive_batch(&sender, &frames).is_ok());
     let batch = receiver.recv().await.expect("one archive batch");
     assert_eq!(

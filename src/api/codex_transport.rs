@@ -8,7 +8,10 @@ use http::header;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use super::super::sse::{BoundedSseEvent, BoundedSseFramer, SseFramerRejection};
+use super::super::sse::{
+    BoundedSseEvent, BoundedSseFramer, ResponsesStreamingSanitizer, SseFramerRejection,
+    is_sse_field_line, parse_sse_event, trim_ascii,
+};
 use super::{
     MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS,
     MAX_RESPONSES_SSE_EVENT_BYTES, Protocol, TokenUsage,
@@ -40,7 +43,6 @@ const MAX_OUTPUT_ITEMS: usize = 16_384;
 // small: it happens before any downstream bytes are delivered and its body is
 // never retained, archived, logged, or returned.
 const MISSING_CONTENT_TYPE_SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
 
 pub(super) fn is_driver(driver: &str) -> bool {
     driver == DRIVER
@@ -428,204 +430,6 @@ pub(super) fn validate_credential_contract(
     Ok(())
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum StreamTerminal {
-    Completed,
-    Failed,
-}
-
-/// Validates and redacts the standard Responses SSE protocol. Codex routes
-/// require it, and compatible HTTP JSON Responses routes share the same wire
-/// contract so failures cannot leak provider response bodies downstream.
-#[derive(Default)]
-pub(super) struct ResponsesStreamingSanitizer {
-    framer: BoundedSseFramer,
-    terminal: Option<StreamTerminal>,
-    saw_protocol_event: bool,
-    response_id: Option<String>,
-}
-
-impl ResponsesStreamingSanitizer {
-    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Bytes, &'static str> {
-        let mut output = Vec::new();
-        let batch = self.framer.push(chunk);
-        if let Some(rejection) = batch.rejection {
-            return Err(match rejection {
-                SseFramerRejection::EventLimit => "upstream_response_event_too_large",
-                SseFramerRejection::BatchLimit => "upstream_response_event_batch_too_large",
-            });
-        }
-        for event in batch.events {
-            self.sanitize_event(event, &mut output)?;
-        }
-        Ok(Bytes::from(output))
-    }
-
-    pub(super) fn is_complete(&self) -> bool {
-        self.framer.is_complete()
-    }
-
-    fn saw_protocol_event(&self) -> bool {
-        self.saw_protocol_event
-    }
-
-    fn sanitize_event(
-        &mut self,
-        event: BoundedSseEvent,
-        output: &mut Vec<u8>,
-    ) -> Result<(), &'static str> {
-        let (event_name, data) = parse_sse_event(&event)?;
-        if data.as_deref() == Some(b"[DONE]") {
-            if self.terminal.is_none() {
-                return Err("upstream_incomplete_response");
-            }
-            output.extend_from_slice(b"data: [DONE]\n\n");
-            return Ok(());
-        }
-        let Some(data) = data else {
-            append_safe_sse_fields(&event, output);
-            return Ok(());
-        };
-        let value: Value =
-            serde_json::from_slice(&data).map_err(|_| "upstream_invalid_response")?;
-        let payload_name = value
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or("upstream_invalid_response")?;
-        if payload_name != "error" && !payload_name.starts_with("response.") {
-            return Err("upstream_invalid_response");
-        }
-        if event_name
-            .as_deref()
-            .is_some_and(|event_name| event_name != payload_name)
-        {
-            return Err("upstream_invalid_response");
-        }
-        self.observe_response_id(payload_name, &value)?;
-        self.saw_protocol_event = true;
-        let failure = matches!(terminal_kind(payload_name), Some(StreamTerminal::Failed))
-            || value.get("error").is_some_and(|error| !error.is_null())
-            || value
-                .pointer("/response/error")
-                .is_some_and(|error| !error.is_null());
-        let terminal = if failure {
-            Some(StreamTerminal::Failed)
-        } else {
-            terminal_kind(payload_name)
-        };
-        match self.terminal {
-            Some(StreamTerminal::Failed) => return Ok(()),
-            Some(StreamTerminal::Completed) => return Err("upstream_invalid_response"),
-            None => {}
-        }
-        if failure {
-            output.extend_from_slice(SAFE_FAILURE_EVENT);
-        } else {
-            append_safe_sse_fields(&event, output);
-        }
-        self.terminal = terminal;
-        Ok(())
-    }
-
-    fn observe_response_id(
-        &mut self,
-        payload_name: &str,
-        value: &Value,
-    ) -> Result<(), &'static str> {
-        let lifecycle = matches!(
-            payload_name,
-            "response.created"
-                | "response.queued"
-                | "response.in_progress"
-                | "response.completed"
-                | "response.failed"
-                | "response.incomplete"
-                | "response.error"
-        );
-        if !lifecycle {
-            return Ok(());
-        }
-        let response_id = value
-            .pointer("/response/id")
-            .or_else(|| value.get("id"))
-            .and_then(Value::as_str)
-            .and_then(safe_conversation_hint);
-        if payload_name == "response.completed" && response_id.is_none() {
-            return Err("upstream_incomplete_response");
-        }
-        if let Some(response_id) = response_id {
-            match self.response_id.as_deref() {
-                None => self.response_id = Some(response_id),
-                Some(current) if current == response_id => {}
-                Some(_) => return Err("upstream_invalid_response"),
-            }
-        }
-        Ok(())
-    }
-}
-
-fn append_safe_sse_fields(event: &BoundedSseEvent, output: &mut Vec<u8>) {
-    for line in &event.lines {
-        if line.value.starts_with(b":")
-            || is_sse_field_line(&line.value, b"event")
-            || is_sse_field_line(&line.value, b"data")
-        {
-            output.extend_from_slice(&line.value);
-            output.extend_from_slice(&line.ending);
-        }
-    }
-    output.extend_from_slice(&event.terminator);
-}
-
-fn parse_sse_event(
-    event: &BoundedSseEvent,
-) -> Result<(Option<String>, Option<Vec<u8>>), &'static str> {
-    let mut event_name = None;
-    let mut data = Vec::new();
-    for raw_line in &event.lines {
-        let line = raw_line.value.as_slice();
-        if line == b"event" || line.starts_with(b"event:") {
-            if event_name.is_some() {
-                return Err("upstream_invalid_response");
-            }
-            let value = if line == b"event" {
-                &[][..]
-            } else {
-                trim_ascii(&line[6..])
-            };
-            if value.len() > 128 {
-                return Err("upstream_invalid_response");
-            }
-            event_name = Some(
-                std::str::from_utf8(value)
-                    .map_err(|_| "upstream_invalid_response")?
-                    .to_owned(),
-            );
-        } else if line == b"data" || line.starts_with(b"data:") {
-            let value = if line == b"data" {
-                &[][..]
-            } else {
-                line[5..].strip_prefix(b" ").unwrap_or(&line[5..])
-            };
-            if !data.is_empty() {
-                data.push(b'\n');
-            }
-            data.extend_from_slice(value);
-        }
-    }
-    Ok((event_name, (!data.is_empty()).then_some(data)))
-}
-
-fn terminal_kind(name: &str) -> Option<StreamTerminal> {
-    match name {
-        "response.completed" => Some(StreamTerminal::Completed),
-        "response.failed" | "response.incomplete" | "response.error" | "error" => {
-            Some(StreamTerminal::Failed)
-        }
-        _ => None,
-    }
-}
-
 pub(super) fn is_event_stream(response: &UpstreamResponse) -> bool {
     let mut values = response.headers().get_all(header::CONTENT_TYPE).iter();
     let Some(value) = values.next() else {
@@ -718,31 +522,29 @@ pub(super) async fn admit_event_stream_response(
 }
 
 fn validate_missing_content_type_prefix(prefix: &[u8]) -> Result<(), &'static str> {
-    for raw_line in prefix.split_inclusive(|byte| *byte == b'\n') {
-        if !raw_line.ends_with(b"\n") {
-            break;
-        }
-        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty()
-            || line.starts_with(b":")
-            || is_sse_field_line(line, b"event")
-            || is_sse_field_line(line, b"data")
-            || is_sse_field_line(line, b"id")
-            || is_sse_field_line(line, b"retry")
-        {
-            continue;
-        }
+    // Headerless admission uses the same CR/LF/CRLF bounded scanner as
+    // delivery; it must not grow a fourth LF-only parser with divergent EOF
+    // and line-ending semantics.
+    let mut framer = BoundedSseFramer::default();
+    let batch = framer.push(prefix);
+    if batch.rejection.is_some() || !framer.is_complete() {
         return Err("upstream_invalid_content_type");
     }
+    for event in batch.events {
+        for line in event.lines {
+            let line = line.value;
+            if line.starts_with(b":")
+                || is_sse_field_line(&line, b"event")
+                || is_sse_field_line(&line, b"data")
+                || is_sse_field_line(&line, b"id")
+                || is_sse_field_line(&line, b"retry")
+            {
+                continue;
+            }
+            return Err("upstream_invalid_content_type");
+        }
+    }
     Ok(())
-}
-
-fn is_sse_field_line(line: &[u8], field: &[u8]) -> bool {
-    line == field
-        || line
-            .strip_prefix(field)
-            .is_some_and(|rest| rest.starts_with(b":"))
 }
 
 pub(super) fn content_type_class(response: &UpstreamResponse) -> &'static str {
@@ -1008,16 +810,6 @@ pub(super) fn parse_buffered_sse_for_test(
     let mut parser = BufferedResponsesParser::default();
     parser.push(body)?;
     parser.finish()
-}
-
-fn trim_ascii(mut value: &[u8]) -> &[u8] {
-    while value.first().is_some_and(u8::is_ascii_whitespace) {
-        value = &value[1..];
-    }
-    while value.last().is_some_and(u8::is_ascii_whitespace) {
-        value = &value[..value.len() - 1];
-    }
-    value
 }
 
 #[cfg(test)]
@@ -1372,91 +1164,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn streaming_sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
-        let failed = concat!(
-            "event: response.failed\n",
-            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"provider-secret\",\"token\":\"secret-token\"}}}\n\n",
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"post-terminal-secret\"}\n\n",
-            "data: [DONE]\n\n"
-        );
-        let mut sanitizer = ResponsesStreamingSanitizer::default();
-        let mut output = Vec::new();
-        for byte in failed.as_bytes() {
-            output.extend_from_slice(&sanitizer.push(&[*byte]).unwrap());
-        }
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("upstream request failed"));
-        for secret in ["provider-secret", "secret-token", "post-terminal-secret"] {
-            assert!(!output.contains(secret));
-        }
-
-        let mut conflict = ResponsesStreamingSanitizer::default();
-        assert!(
-            conflict
-                .push(
-                    b"event: response.failed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n"
-                )
-                .is_err()
-        );
-        let mut after_completed = ResponsesStreamingSanitizer::default();
-        after_completed
-            .push(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-complete\"}}\n\n")
-            .unwrap();
-        assert!(
-            after_completed
-                .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"secret\"}\n\n")
-                .is_err()
-        );
-
-        let mut unknown_type = ResponsesStreamingSanitizer::default();
-        assert!(
-            unknown_type
-                .push(b"data: {\"type\":\"not-responses\",\"secret\":\"hidden\"}\n\n")
-                .is_err()
-        );
-
-        let mut unknown_field = ResponsesStreamingSanitizer::default();
-        let output = unknown_field
-            .push(
-                concat!(
-                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n",
-                    "<html>post-admission-secret</html>\n\n",
-                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\"}}\n\n"
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-        let output = String::from_utf8(output.to_vec()).unwrap();
-        assert!(output.contains("response.created"));
-        assert!(output.contains("response.completed"));
-        assert!(!output.contains("post-admission-secret"));
-
-        let mut duplicate_event = ResponsesStreamingSanitizer::default();
-        assert!(
-            duplicate_event
-                .push(
-                    concat!(
-                        "event: provider-secret\n",
-                        "event: response.created\n",
-                        "data: {\"type\":\"response.created\",\"response\":{}}\n\n"
-                    )
-                    .as_bytes()
-                )
-                .is_err()
-        );
-
-        let mut done = ResponsesStreamingSanitizer::default();
-        done.push(
-            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-done\"}}\n\n",
-        )
-        .unwrap();
-        let output = done
-            .push(b"event: provider-secret\ndata: [DONE]\n\n")
-            .unwrap();
-        assert_eq!(output.as_ref(), b"data: [DONE]\n\n");
-    }
-
     #[tokio::test]
     async fn missing_content_type_admission_preserves_a_large_network_chunk() {
         let event = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n";
@@ -1526,54 +1233,6 @@ mod tests {
                 "upstream_invalid_content_type"
             ))
         ));
-    }
-
-    #[test]
-    fn streaming_sanitizer_bounds_each_event_not_the_network_chunk() {
-        let event = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n";
-        let repeats = MAX_RESPONSES_SSE_EVENT_BYTES / event.len() + 2;
-        let network_chunk = event.repeat(repeats);
-        assert!(network_chunk.len() > MAX_RESPONSES_SSE_EVENT_BYTES);
-        let mut sanitizer = ResponsesStreamingSanitizer::default();
-        let output = sanitizer.push(&network_chunk).unwrap();
-        assert_eq!(output.as_ref(), network_chunk);
-        assert!(sanitizer.is_complete());
-
-        let mut oversized = ResponsesStreamingSanitizer::default();
-        let first = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES / 2];
-        let second = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES / 2 + 1];
-        assert!(oversized.push(&first).is_ok());
-        assert!(oversized.push(&second).is_err());
-    }
-
-    #[test]
-    fn streaming_sanitizer_accepts_only_blank_lines_after_a_framed_terminal_event() {
-        for stream in [
-            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-terminal\"}}\n\n\n".as_slice(),
-            b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-terminal\"}}\r\n\r\n\r\n".as_slice(),
-        ] {
-            for split in 0..=stream.len() {
-                let mut sanitizer = ResponsesStreamingSanitizer::default();
-                let mut output = sanitizer.push(&stream[..split]).unwrap().to_vec();
-                output.extend_from_slice(&sanitizer.push(&stream[split..]).unwrap());
-                assert!(String::from_utf8(output).unwrap().contains("response.completed"));
-                assert!(sanitizer.is_complete(), "split at byte {split}");
-            }
-        }
-
-        let mut partial = ResponsesStreamingSanitizer::default();
-        partial
-            .push(b"data: {\"type\":\"response.created\"}")
-            .unwrap();
-        assert!(!partial.is_complete());
-
-        let mut trailing_partial = ResponsesStreamingSanitizer::default();
-        trailing_partial
-            .push(
-                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-terminal\"}}\n\n\ndata:",
-            )
-            .unwrap();
-        assert!(!trailing_partial.is_complete());
     }
 
     #[test]

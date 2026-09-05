@@ -18,6 +18,15 @@ pub(super) const MAX_RESPONSES_SSE_EVENT_BYTES: usize = 256 * 1024;
 pub(super) const MAX_SSE_FRAMES_PER_NETWORK_CHUNK: usize = 4_096;
 pub(super) const MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK: usize = 2 * 1024 * 1024;
 pub(super) const MAX_SSE_FIELDS_PER_EVENT: usize = 4_096;
+// Each emitted event and retained field line owns vector metadata. Keep their
+// combined count below a process-safe ceiling even when 2 MiB is composed of
+// millions of two-byte fields.
+pub(super) const MAX_SSE_METADATA_ITEMS_PER_NETWORK_CHUNK: usize = 16 * 1024;
+// Successful Responses terminal frames are held until EOF confirms the raw
+// framing is complete. This shares the per-network-chunk framed product cap
+// and remains far below the 64 MiB response admission ceiling.
+pub(super) const MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES: usize =
+    MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK;
 pub(super) const SYNCHRONOUS_IMAGE_DEADLINE: Duration = Duration::from_secs(12 * 60);
 pub(super) const CLOUD_WEBHOOK_BODY_READ_DEADLINE: Duration = Duration::from_secs(10);
 pub(super) const MAX_CLOUD_WEBHOOK_BODY: usize = 64 * 1024;

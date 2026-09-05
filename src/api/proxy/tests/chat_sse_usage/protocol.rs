@@ -2,15 +2,19 @@ use super::support::*;
 use super::*;
 
 #[test]
-fn stateful_sse_delivery_framer_keeps_split_comments_and_done_nonbillable() {
+fn stateful_sse_delivery_framer_redacts_split_comments_and_keeps_done_nonbillable() {
     let mut capture = ResponsesSseCapture::for_openai_chat_usage();
     assert!(capture.push_delivery_frames(b": pi").is_empty());
-    assert!(capture.push_delivery_frames(b"ng\r\n").is_empty());
+    let frames = capture.push_delivery_frames(b"ng\r\n");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].bytes, Bytes::from_static(b": heartbeat\r\n"));
+    assert!(!frames[0].billable);
     let frames = capture.push_delivery_frames(b"\r\n: two\n\n");
-    assert_eq!(frames.len(), 2);
+    assert_eq!(frames.len(), 3);
     assert!(frames.iter().all(|frame| !frame.billable));
-    assert_eq!(frames[0].bytes, Bytes::from_static(b": ping\r\n\r\n"));
-    assert_eq!(frames[1].bytes, Bytes::from_static(b": two\n\n"));
+    assert_eq!(frames[0].bytes, Bytes::from_static(b"\r\n"));
+    assert_eq!(frames[1].bytes, Bytes::from_static(b": heartbeat\n"));
+    assert_eq!(frames[2].bytes, Bytes::from_static(b"\n"));
     let frames = capture.push_delivery_frames(done().as_bytes());
     assert_eq!(frames.len(), 1);
     assert!(!frames[0].billable);
@@ -19,17 +23,42 @@ fn stateful_sse_delivery_framer_keeps_split_comments_and_done_nonbillable() {
 }
 
 #[test]
+fn strict_done_waits_for_and_delivers_a_split_crlf_suffix() {
+    let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+    let before_lf = capture.push_delivery_frames(b"data: [DONE]\r\n\r");
+    assert_eq!(before_lf.len(), 1);
+    assert_eq!(
+        before_lf[0].bytes,
+        Bytes::from_static(b"data: [DONE]\r\n\r")
+    );
+    assert!(capture.saw_done());
+    assert!(capture.has_pending_crlf_continuation());
+
+    let suffix = capture.push_delivery_frames(b"\n");
+    assert_eq!(suffix.len(), 1);
+    assert_eq!(suffix[0].bytes, Bytes::from_static(b"\n"));
+    assert!(!capture.has_pending_crlf_continuation());
+}
+
+#[test]
 fn shared_delivery_framer_handles_all_line_endings_without_eof_dispatch() {
-    for heartbeat in [
-        b": lf\n\n".as_slice(),
-        b": cr\r\r".as_slice(),
-        b": crlf\r\n\r\n".as_slice(),
+    for (heartbeat, safe) in [
+        (b": lf\n\n".as_slice(), b": heartbeat\n\n".as_slice()),
+        (b": cr\r\r".as_slice(), b": heartbeat\r\r".as_slice()),
+        (
+            b": crlf\r\n\r\n".as_slice(),
+            b": heartbeat\r\n\r\n".as_slice(),
+        ),
     ] {
         let mut capture = ResponsesSseCapture::for_delivery();
         let frames = capture.push_delivery_frames(heartbeat);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].bytes.as_ref(), heartbeat);
-        assert!(!frames[0].billable);
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|frame| !frame.billable));
+        let actual = frames
+            .iter()
+            .flat_map(|frame| frame.bytes.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(actual.as_slice(), safe);
     }
 
     let mut truncated = ResponsesSseCapture::for_responses();

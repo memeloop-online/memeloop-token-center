@@ -231,7 +231,7 @@ fn first_hint_pointer(body: &Value, pointers: &[&str]) -> Option<String> {
     })
 }
 
-pub(super) fn safe_conversation_hint(value: &str) -> Option<String> {
+pub(in crate::api) fn safe_conversation_hint(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
         None

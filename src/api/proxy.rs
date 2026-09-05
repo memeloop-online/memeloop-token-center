@@ -15,6 +15,7 @@ use crate::{
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},
 };
 use chat_sse_usage::{ChatSseDeliveryClass, ChatSseUsageContract, ChatSseUsageState};
+pub(in crate::api) use conversation_hints::safe_conversation_hint as safe_response_id;
 use conversation_hints::{client_name, conversation_hints, safe_conversation_hint};
 use lifecycle::{
     AbortTaskOnDrop, begin_streaming_response_archive, finish_proxy_request_with_archive_fallback,
@@ -1321,10 +1322,21 @@ impl ResponsesSseCapture {
         }
         for event in batch.events {
             if self.saw_done {
-                break;
+                if event.is_line_ending_continuation {
+                    self.finish_delivery_event(
+                        super::sse::redacted_sse_event_bytes(&event),
+                        ChatSseDeliveryClass::Control,
+                    );
+                }
+                continue;
+            }
+            if (self.terminal_success || self.terminal_failure) && event.idle_control.is_some() {
+                // A provider comment after terminal state is never useful to
+                // delivery and must not reach the archive sidecar.
+                continue;
             }
             let class = self.dispatch_event(&event);
-            self.finish_delivery_event(event.bytes, class);
+            self.finish_delivery_event(super::sse::redacted_sse_event_bytes(&event), class);
         }
     }
 
@@ -1369,6 +1381,10 @@ impl ResponsesSseCapture {
 
     fn saw_done(&self) -> bool {
         self.saw_done
+    }
+
+    fn has_pending_crlf_continuation(&self) -> bool {
+        self.framer.has_pending_crlf_continuation()
     }
 
     #[cfg(test)]
