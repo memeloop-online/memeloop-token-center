@@ -252,6 +252,15 @@ fn strict_chat_empty_named_events_fail_without_starting_delivery() {
         assert!(summary.usage_invalid);
         assert_eq!(summary.outcome, expected);
     }
+
+    let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+    let frames = capture.push_delivery_frames(b"event: message\ndata:   \n\n");
+    assert_eq!(frames.len(), 1);
+    assert!(!frames[0].billable);
+    assert_eq!(
+        capture.finish_summary().outcome,
+        ResponsesSseOutcome::Incomplete
+    );
 }
 
 #[test]

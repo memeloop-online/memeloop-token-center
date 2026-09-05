@@ -1525,7 +1525,8 @@ impl ResponsesSseCapture {
             // A lone event field does not carry model output. Preserve the
             // fail-closed protocol result, but do not turn a control-only
             // malformed frame into durable delivery and a ceiling charge.
-            return (!data.is_empty() && trim_ascii_whitespace(&data) != b"[DONE]")
+            let data = trim_ascii_whitespace(&data);
+            return (!data.is_empty() && data != b"[DONE]")
                 .then_some(ChatSseDeliveryClass::Billable)
                 .unwrap_or(ChatSseDeliveryClass::Control);
         }
