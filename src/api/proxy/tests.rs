@@ -2032,6 +2032,8 @@ async fn assert_exactly_once_side_effects(
 fn completed_codex_sse(output: &str) -> String {
     format!(
         concat!(
+            "event: response.created\r\n",
+            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-codex\"}}}}\r\n\r\n",
             "event: response.output_item.done\r\n",
             "data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"item-codex\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{output}\"}}]}}}}\r\n\r\n",
             "event: response.completed\n",

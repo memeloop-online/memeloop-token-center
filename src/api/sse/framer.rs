@@ -18,6 +18,7 @@ pub(in crate::api) struct BoundedSseFramer {
     discarding_line_has_data: bool,
     skip_lf_after_cr: bool,
     emit_lf_continuation: bool,
+    emitted_cr_event_bytes: usize,
     completed_event: Option<PendingSseEvent>,
     batch_rejected: bool,
 }
@@ -33,6 +34,15 @@ pub(in crate::api) struct BoundedSseFrameBatch {
 pub(in crate::api) enum SseFramerRejection {
     EventLimit,
     BatchLimit,
+}
+
+impl SseFramerRejection {
+    pub(in crate::api) fn error_code(self) -> &'static str {
+        match self {
+            Self::EventLimit => "upstream_response_event_too_large",
+            Self::BatchLimit => "upstream_response_event_batch_too_large",
+        }
+    }
 }
 
 pub(in crate::api) struct BoundedSseEvent {
@@ -113,6 +123,13 @@ impl BoundedSseFramer {
             }
             if let Some(mut completed) = self.completed_event.take() {
                 if self.skip_lf_after_cr && byte == b'\n' {
+                    if completed.bytes.len() >= MAX_RESPONSES_SSE_EVENT_BYTES {
+                        self.skip_lf_after_cr = false;
+                        self.emit_lf_continuation = false;
+                        self.emitted_cr_event_bytes = 0;
+                        batch.reject(SseFramerRejection::EventLimit);
+                        continue;
+                    }
                     completed.bytes.push(byte);
                     match completed.crlf_target {
                         CrLfTarget::Terminator => completed.terminator.push(byte),
@@ -124,11 +141,13 @@ impl BoundedSseFramer {
                     }
                     self.skip_lf_after_cr = false;
                     self.emit_lf_continuation = false;
+                    self.emitted_cr_event_bytes = 0;
                     Self::emit(&mut batch, completed);
                     continue;
                 }
                 self.skip_lf_after_cr = false;
                 self.emit_lf_continuation = false;
+                self.emitted_cr_event_bytes = 0;
                 Self::emit(&mut batch, completed);
             }
             if self.skip_lf_after_cr {
@@ -150,21 +169,27 @@ impl BoundedSseFramer {
                         line.ending.push(byte);
                         self.event.push(byte);
                     } else if self.emit_lf_continuation {
-                        Self::emit(
-                            &mut batch,
-                            PendingSseEvent {
-                                bytes: vec![b'\n'],
-                                lines: Vec::new(),
-                                terminator: vec![b'\n'],
-                                crlf_target: CrLfTarget::Terminator,
-                                is_line_ending_continuation: true,
-                                idle_control: None,
-                            },
-                        );
+                        if self.emitted_cr_event_bytes >= MAX_RESPONSES_SSE_EVENT_BYTES {
+                            batch.reject(SseFramerRejection::EventLimit);
+                        } else {
+                            Self::emit(
+                                &mut batch,
+                                PendingSseEvent {
+                                    bytes: vec![b'\n'],
+                                    lines: Vec::new(),
+                                    terminator: vec![b'\n'],
+                                    crlf_target: CrLfTarget::Terminator,
+                                    is_line_ending_continuation: true,
+                                    idle_control: None,
+                                },
+                            );
+                        }
                     }
                     self.emit_lf_continuation = false;
+                    self.emitted_cr_event_bytes = 0;
                     continue;
                 }
+                self.emitted_cr_event_bytes = 0;
             }
             match byte {
                 b'\n' => self.finish_line(vec![byte], &mut batch),
@@ -176,6 +201,7 @@ impl BoundedSseFramer {
             }
         }
         if let Some(completed) = self.completed_event.take() {
+            self.emitted_cr_event_bytes = completed.bytes.len();
             Self::emit(&mut batch, completed);
             self.emit_lf_continuation = true;
         }

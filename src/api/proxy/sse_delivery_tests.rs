@@ -26,7 +26,7 @@ fn responses_delivery_rejects_large_small_event_batches_before_delivery() {
     let chunk = event.repeat(MAX_SSE_FRAMES_PER_NETWORK_CHUNK + 1);
     assert!(chunk.len() < MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK);
     let mut capture = ResponsesSseCapture::for_responses();
-    assert!(capture.push_delivery_frames(&chunk).is_empty());
+    assert!(capture.push_delivery_frames(&chunk).is_err());
     assert_eq!(capture.finish(), ResponsesSseOutcome::Incomplete);
 }
 
@@ -34,14 +34,23 @@ fn responses_delivery_rejects_large_small_event_batches_before_delivery() {
 fn field_overflow_is_an_event_limit_with_no_delivery_prefix() {
     let overflow = event_with_field_count(MAX_SSE_FIELDS_PER_EVENT + 1);
     let mut capture = ResponsesSseCapture::for_delivery();
-    assert!(capture.push_delivery_frames(&overflow).is_empty());
+    assert!(matches!(
+        capture.push_delivery_frames(&overflow),
+        Err(super::sse::SseFramerRejection::EventLimit)
+    ));
+    assert!(matches!(
+        capture.push_delivery_frames(b"data: [DONE]\n\n"),
+        Err(super::sse::SseFramerRejection::EventLimit)
+    ));
     assert_eq!(capture.finish(), ResponsesSseOutcome::Incomplete);
 }
 
 #[test]
 fn delivery_marks_trailing_unterminated_data_incomplete_even_after_done() {
     let mut capture = ResponsesSseCapture::for_delivery();
-    let frames = capture.push_delivery_frames(b"data: [DONE]\n\ndata: truncated");
+    let frames = capture
+        .push_delivery_frames(b"data: [DONE]\n\ndata: truncated")
+        .unwrap();
     assert_eq!(frames.len(), 1);
     assert!(!frames[0].billable);
     assert_eq!(capture.finish(), ResponsesSseOutcome::Incomplete);

@@ -105,6 +105,27 @@ fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
 }
 
 #[test]
+fn failed_terminal_drops_a_bare_secret_event_before_done() {
+    let stream = concat!(
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed\",\"error\":{\"message\":\"provider-secret\"}}}\n\n",
+        "event: Authorization-Bearer-bare-event-secret\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut sanitizer = ResponsesStreamingSanitizer::default();
+    let mut output = Vec::new();
+    for chunk in stream.as_bytes().chunks(7) {
+        output.extend_from_slice(&sanitizer.push(chunk).unwrap());
+    }
+    output.extend_from_slice(&sanitizer.finish().unwrap());
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("upstream request failed"));
+    assert!(output.contains("data: [DONE]"));
+    assert!(!output.contains("provider-secret"));
+    assert!(!output.contains("bare-event-secret"));
+}
+
+#[test]
 fn sanitizer_bounds_each_event_not_the_network_chunk() {
     let event = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n";
     let repeats = MAX_RESPONSES_SSE_EVENT_BYTES / event.len() + 2;
@@ -254,6 +275,35 @@ fn sanitizer_rejects_bad_ids_and_bare_lifecycle_events_before_terminal_delivery(
     let mut bare = ResponsesStreamingSanitizer::default();
     assert_eq!(
         bare.push(b"event: response.completed\n\n"),
+        Err("upstream_invalid_response")
+    );
+
+    for lifecycle in [
+        "response.queued",
+        "response.created",
+        "response.in_progress",
+    ] {
+        let missing_id = format!("data: {{\"type\":\"{lifecycle}\",\"response\":{{}}}}\n\n");
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
+        assert_eq!(
+            sanitizer.push(missing_id.as_bytes()),
+            Err("upstream_incomplete_response")
+        );
+
+        let non_string_id =
+            format!("data: {{\"type\":\"{lifecycle}\",\"response\":{{\"id\":42}}}}\n\n");
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
+        assert_eq!(
+            sanitizer.push(non_string_id.as_bytes()),
+            Err("upstream_invalid_response")
+        );
+    }
+
+    let mut item_before_id = ResponsesStreamingSanitizer::default();
+    assert_eq!(
+        item_before_id.push(
+            b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item-secret\"}}\n\n",
+        ),
         Err("upstream_invalid_response")
     );
 }

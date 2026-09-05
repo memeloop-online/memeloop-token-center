@@ -191,3 +191,68 @@ async fn codex_crlf_terminal_releases_at_eof_and_archives_only_safe_comments() {
     assert!(!String::from_utf8_lossy(&archived).contains(secret));
     upstream.verify().await;
 }
+
+#[tokio::test]
+async fn codex_failed_then_bare_secret_event_never_reaches_delivery_or_archive() {
+    let fixture = codex_route_fixture("failed-bare-secret-event").await;
+    let upstream = MockServer::start().await;
+    let sse = concat!(
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed\",\"error\":{\"message\":\"provider-payload-secret\"}}}\n\n",
+        "event: Authorization-Bearer-bare-event-secret\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "redact failure", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let delivered = String::from_utf8(body.to_vec()).unwrap();
+    assert!(delivered.contains("upstream request failed"));
+    assert!(delivered.contains("data: [DONE]"));
+    assert!(!delivered.contains("provider-payload-secret"));
+    assert!(!delivered.contains("bare-event-secret"));
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_failed_response")
+    );
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    let archived = fixture
+        .state
+        .archive
+        .get(refs.response_object.as_deref().expect("response archive"))
+        .await
+        .unwrap();
+    let archived = String::from_utf8(archived).unwrap();
+    assert!(archived.contains("upstream request failed"));
+    assert!(!archived.contains("provider-payload-secret"));
+    assert!(!archived.contains("bare-event-secret"));
+    upstream.verify().await;
+}

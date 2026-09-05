@@ -1,7 +1,7 @@
 use axum::body::Bytes;
 use serde_json::Value;
 
-use super::{BoundedSseEvent, BoundedSseFramer, SAFE_SSE_HEARTBEAT_COMMENT, SseFramerRejection};
+use super::{BoundedSseEvent, BoundedSseFramer, SAFE_SSE_HEARTBEAT_COMMENT, SseIdleControl};
 use crate::api::{limits::MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES, proxy::safe_response_id};
 
 const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
@@ -67,10 +67,7 @@ impl ResponsesStreamingSanitizer {
         let mut output = Vec::new();
         let batch = self.framer.push(chunk);
         if let Some(rejection) = batch.rejection {
-            return Err(match rejection {
-                SseFramerRejection::EventLimit => "upstream_response_event_too_large",
-                SseFramerRejection::BatchLimit => "upstream_response_event_batch_too_large",
-            });
+            return Err(rejection.error_code());
         }
         for event in batch.events {
             self.sanitize_event(event, &mut output)?;
@@ -125,12 +122,15 @@ impl ResponsesStreamingSanitizer {
             return Ok(());
         }
         let Some(data) = data else {
-            if self.terminal.is_some() && event.idle_control.is_some() {
-                // A terminal/failure must not be followed by an upstream
-                // diagnostic comment or other standalone control line.
+            if self.terminal.is_some() {
+                // Nothing without a data envelope is meaningful after a
+                // terminal. In particular, never retain an untrusted bare
+                // event name in the downstream or archive representation.
                 return Ok(());
             }
-            self.append_safe_sse_fields(&event, output)?;
+            if event.idle_control == Some(SseIdleControl::Comment) {
+                self.append_safe_sse_fields(&event, output)?;
+            }
             return Ok(());
         };
         let value: Value =
@@ -210,16 +210,23 @@ impl ResponsesStreamingSanitizer {
                 | "response.error"
         );
         if !lifecycle {
+            if payload_name.starts_with("response.") && self.response_id.is_none() {
+                return Err("upstream_invalid_response");
+            }
             return Ok(());
         }
-        let response_id = value
-            .pointer("/response/id")
-            .or_else(|| value.get("id"))
-            .and_then(Value::as_str)
-            .and_then(safe_response_id);
-        if payload_name == "response.completed" && response_id.is_none() {
-            return Err("upstream_incomplete_response");
-        }
+        let id_required = matches!(
+            payload_name,
+            "response.queued" | "response.created" | "response.in_progress" | "response.completed"
+        );
+        let response_id = match value.pointer("/response/id").or_else(|| value.get("id")) {
+            Some(Value::String(response_id)) => {
+                Some(safe_response_id(response_id).ok_or("upstream_invalid_response")?)
+            }
+            Some(_) => return Err("upstream_invalid_response"),
+            None if id_required => return Err("upstream_incomplete_response"),
+            None => None,
+        };
         if let Some(response_id) = response_id {
             match self.response_id.as_deref() {
                 None => self.response_id = Some(response_id),
@@ -266,7 +273,7 @@ pub(in crate::api) fn parse_sse_event(
     event: &BoundedSseEvent,
 ) -> Result<(Option<String>, Option<Vec<u8>>), &'static str> {
     let mut event_name = None;
-    let mut data = Vec::new();
+    let mut data = None::<Vec<u8>>;
     for raw_line in &event.lines {
         let line = raw_line.value.as_slice();
         if line == b"event" || line.starts_with(b"event:") {
@@ -292,13 +299,15 @@ pub(in crate::api) fn parse_sse_event(
             } else {
                 line[5..].strip_prefix(b" ").unwrap_or(&line[5..])
             };
-            if !data.is_empty() {
+            let append_separator = data.is_some();
+            let data = data.get_or_insert_with(Vec::new);
+            if append_separator {
                 data.push(b'\n');
             }
             data.extend_from_slice(value);
         }
     }
-    Ok((event_name, (!data.is_empty()).then_some(data)))
+    Ok((event_name, data))
 }
 
 pub(in crate::api) fn is_sse_field_line(line: &[u8], field: &[u8]) -> bool {

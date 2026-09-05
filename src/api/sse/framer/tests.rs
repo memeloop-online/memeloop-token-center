@@ -81,6 +81,27 @@ fn accepts_exact_field_limit_and_rejects_one_extra_field() {
 }
 
 #[test]
+fn rejects_crlf_that_crosses_the_exact_event_byte_limit() {
+    let mut split = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES - 2];
+    split.extend_from_slice(b"\r\r");
+    let mut framer = BoundedSseFramer::default();
+    let first = framer.push(&split);
+    assert_eq!(first.rejection, None);
+    assert_eq!(first.events.len(), 1);
+    assert!(framer.has_pending_crlf_continuation());
+    let suffix = framer.push(b"\n");
+    assert_eq!(suffix.rejection, Some(SseFramerRejection::EventLimit));
+    assert!(suffix.events.is_empty());
+
+    let mut same_chunk = vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES - 2];
+    same_chunk.extend_from_slice(b"\r\r\n");
+    let mut framer = BoundedSseFramer::default();
+    let batch = framer.push(&same_chunk);
+    assert_eq!(batch.rejection, Some(SseFramerRejection::EventLimit));
+    assert!(batch.events.is_empty());
+}
+
+#[test]
 fn accepts_exact_metadata_budget_and_rejects_million_short_fields_within_2mib() {
     // Four events with 4,095 fields use exactly 16,384 retained field/event
     // metadata entries: 4 * (4,095 field lines + 1 event frame).

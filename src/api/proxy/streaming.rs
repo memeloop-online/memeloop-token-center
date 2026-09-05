@@ -36,6 +36,33 @@ enum ResponseArchiveBatchError {
     Backpressure,
 }
 
+struct CapturedSseDelivery {
+    frames: Vec<SseDeliveryFrame>,
+    strict_chat_terminal_ready: bool,
+}
+
+fn capture_sse_delivery(
+    capture: Option<&mut ResponsesSseCapture>,
+    chunk: Bytes,
+    strict_openai_chat_usage: bool,
+) -> Result<CapturedSseDelivery, crate::api::sse::SseFramerRejection> {
+    let Some(capture) = capture else {
+        return Ok(CapturedSseDelivery {
+            frames: vec![SseDeliveryFrame {
+                bytes: chunk,
+                billable: true,
+            }],
+            strict_chat_terminal_ready: false,
+        });
+    };
+    let frames = capture.push_delivery_frames(&chunk)?;
+    Ok(CapturedSseDelivery {
+        frames,
+        strict_chat_terminal_ready: strict_openai_chat_usage
+            && capture.strict_chat_terminal_ready(),
+    })
+}
+
 impl ResponseArchiveBatch {
     fn from_delivery_frames(
         frames: &[SseDeliveryFrame],
@@ -169,6 +196,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 let next = if let Some(chunk) = terminal_delivery.take_pending() {
                     flushing_terminal = true;
                     Some(Ok(chunk))
+                } else if !terminal_delivery.upstream_poll_allowed() {
+                    break;
                 } else {
                     match tokio::time::timeout_at(stream_deadline, upstream_stream.next()).await {
                         Ok(next) => next,
@@ -263,27 +292,28 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         // Responses and strict Chat. It emits whole events so a
                         // fragmented comment/control frame never confirms
                         // delivery or occupies the archive channel as output.
-                        let delivery_frames = if let Some(capture) = sse_capture.as_mut() {
-                            capture.push_delivery_frames(&chunk)
-                        } else if chunk.is_empty() {
-                            Vec::new()
-                        } else {
-                            vec![SseDeliveryFrame {
-                                bytes: chunk,
-                                billable: true,
-                            }]
+                        let CapturedSseDelivery {
+                            frames: delivery_frames,
+                            strict_chat_terminal_ready,
+                        } = match capture_sse_delivery(
+                            sse_capture.as_mut(),
+                            chunk,
+                            strict_openai_chat_usage,
+                        ) {
+                            Ok(delivery) => delivery,
+                            Err(rejection) => {
+                                transport_error = Some(rejection.error_code());
+                                cancel_stream_archive(&archive_complete, &mut archive_sender);
+                                let _ = tokio::time::timeout(
+                                    MAX_DOWNSTREAM_SEND_WAIT,
+                                    body_sender.send(Err(std::io::Error::other(
+                                        "upstream SSE stream exceeded framing limits",
+                                    ))),
+                                )
+                                .await;
+                                break;
+                            }
                         };
-                        let chat_usage_done = sse_capture
-                            .as_ref()
-                            .is_some_and(ResponsesSseCapture::chat_usage_done);
-                        // Strict Chat emits its terminal usage before `[DONE]`,
-                        // so its protocol contract is complete at the sentinel.
-                        // Responses must still consume EOF: the sanitizer rejects
-                        // a trailing partial frame after a valid terminal event.
-                        let strict_chat_done = strict_openai_chat_usage
-                            && sse_capture.as_ref().is_some_and(|capture| {
-                                capture.saw_done() && !capture.has_pending_crlf_continuation()
-                            });
                         if let Some(sender) = archive_sender.as_ref()
                             && try_queue_response_archive_batch(sender, &delivery_frames).is_err()
                         {
@@ -367,7 +397,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             cancel_stream_archive(&archive_complete, &mut archive_sender);
                             break;
                         }
-                        if chat_usage_done || strict_chat_done {
+                        if strict_chat_terminal_ready {
                             break;
                         }
                     }

@@ -252,3 +252,97 @@ async fn no_op_chat_preamble_and_terminal_disconnect_do_not_start_contract_billi
     assert_ne!(delivery_state, "delivery_started");
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
+
+#[tokio::test]
+async fn strict_chat_consumes_the_lf_of_a_done_crlf_split_across_network_chunks() {
+    let first = [
+        chat_content("chatcmpl-split-done-crlf"),
+        chat_finish("chatcmpl-split-done-crlf"),
+        chat_usage_only("chatcmpl-split-done-crlf", usage(29, 7, 36)),
+        "data: [DONE]\r\n\r".to_owned(),
+    ]
+    .concat();
+    let (uri, upstream) = fragmented_sse_upstream(vec![first.into_bytes(), b"\n".to_vec()]).await;
+    let fixture = response_usage_fixture_with_uri("chat-split-done-crlf", uri, 0).await;
+    let response = send_chat_usage_request(&fixture, &chat_request(&fixture.model)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(body.ends_with(b"data: [DONE]\r\n\r\n"));
+    upstream.await.unwrap();
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    let archived = fixture
+        .state
+        .archive
+        .get(refs.response_object.as_deref().expect("response archive"))
+        .await
+        .unwrap();
+    assert!(archived.ends_with(b"data: [DONE]\r\n\r\n"));
+}
+
+#[tokio::test]
+async fn oversized_chat_event_errors_downstream_and_cannot_recover_into_done() {
+    let mut oversized = b"data: ".to_vec();
+    oversized.extend(vec![b'x'; MAX_RESPONSES_SSE_EVENT_BYTES + 1]);
+    let recovered_terminal = [
+        "\n\n".to_owned(),
+        chat_content("chatcmpl-after-oversize"),
+        chat_finish("chatcmpl-after-oversize"),
+        chat_usage_only("chatcmpl-after-oversize", usage(29, 7, 36)),
+        done().to_owned(),
+    ]
+    .concat();
+    let (uri, upstream) =
+        fragmented_sse_upstream(vec![oversized, recovered_terminal.into_bytes()]).await;
+    let fixture = response_usage_fixture_with_uri("chat-oversized-event", uri, 0).await;
+    let response = send_chat_usage_request(&fixture, &chat_request(&fixture.model)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let mut saw_error = false;
+    while let Some(next) = body.next().await {
+        if next.is_err() {
+            saw_error = true;
+        }
+    }
+    assert!(saw_error);
+    upstream.await.unwrap();
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_response_event_too_large")
+    );
+    assert_eq!(rows[0].cost, "0");
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.response_object.as_deref(),
+        Some(format!("gap://{}/response", rows[0].request_id).as_str())
+    );
+}
