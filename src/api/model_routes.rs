@@ -32,6 +32,8 @@ pub(super) struct CreateModelRouteRequest {
     protocol: String,
     #[serde(default)]
     priority: i64,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
     #[serde(default)]
     included_provider_group_ids: Vec<Uuid>,
     #[serde(default)]
@@ -44,6 +46,10 @@ pub(super) struct CreateModelRouteRequest {
     granted_credential_ids: Vec<Uuid>,
     #[serde(default)]
     custom_model_confirmed: bool,
+}
+
+const fn default_enabled() -> bool {
+    true
 }
 
 pub(super) async fn create_model_route(
@@ -66,6 +72,7 @@ pub(super) async fn create_model_route(
         upstream_model: body.upstream_model,
         protocol: body.protocol,
         priority: body.priority,
+        enabled: body.enabled,
         upstream_account_ids,
         included_provider_group_ids: body.included_provider_group_ids,
         excluded_provider_group_ids: body.excluded_provider_group_ids,

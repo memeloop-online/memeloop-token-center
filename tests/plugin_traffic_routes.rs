@@ -631,6 +631,7 @@ async fn create_account_and_routes(
                     upstream_model: fixture.upstream_model.into(),
                     protocol: (*protocol).into(),
                     priority: 0,
+                    enabled: true,
                     upstream_account_ids: vec![account.id],
                     included_provider_group_ids: Vec::new(),
                     excluded_provider_group_ids: Vec::new(),

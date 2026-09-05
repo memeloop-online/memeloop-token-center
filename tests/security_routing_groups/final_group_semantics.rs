@@ -232,6 +232,7 @@ async fn exercise_final_group_semantics(database_url: String, backend: &str) {
             upstream_model: "secure-upstream-model".to_owned(),
             protocol: "openai".to_owned(),
             priority: 0,
+            enabled: true,
             upstream_account_ids: vec![primary.id],
             included_provider_group_ids: vec![included.id],
             excluded_provider_group_ids: vec![excluded.id],

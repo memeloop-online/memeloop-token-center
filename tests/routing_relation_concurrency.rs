@@ -74,6 +74,7 @@ async fn exercise_relation_cas(database_url: String, tenant: &str) {
             upstream_model: "relation-cas-custom-model".to_owned(),
             protocol: "openai".to_owned(),
             priority: 0,
+            enabled: true,
             upstream_account_ids: vec![account.id],
             included_provider_group_ids: Vec::new(),
             excluded_provider_group_ids: Vec::new(),

@@ -257,6 +257,7 @@ impl Database {
             upstream_model: &input.upstream_model,
             protocol: &input.protocol,
             priority: input.priority,
+            enabled: input.enabled,
             custom_model_confirmed: input.custom_model_confirmed,
             upstream_account_ids: &upstream_ids,
             included_provider_group_ids: &included,
@@ -344,6 +345,7 @@ impl Database {
                     upstream_model: &input.upstream_model,
                     protocol: &input.protocol,
                     priority: input.priority,
+                    enabled: input.enabled,
                     custom_model_confirmed: input.custom_model_confirmed,
                     upstream_account_ids: &upstream_ids,
                     included_provider_group_ids: &included,
@@ -396,6 +398,7 @@ impl Database {
             &input.upstream_model,
             &input.protocol,
             input.priority,
+            input.enabled,
             input.custom_model_confirmed,
             &upstream_ids,
             &included,
@@ -447,10 +450,10 @@ impl Database {
         // This compatibility column is no longer used for candidate selection.
         // A nil UUID explicitly represents a provider-group-only route.
         let legacy_account_id = upstream_ids.first().copied().unwrap_or_else(Uuid::nil);
-        sqlx::query("INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9)")
+        sqlx::query("INSERT INTO model_routes (id, tenant_id, public_model, upstream_account_id, upstream_model, protocol, priority, enabled, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
             .bind(route_id.to_string()).bind(&tenant_id).bind(input.public_model.trim())
             .bind(legacy_account_id.to_string()).bind(input.upstream_model.trim())
-            .bind(&input.protocol).bind(input.priority).bind(now).bind(now)
+            .bind(&input.protocol).bind(input.priority).bind(i64::from(input.enabled)).bind(now).bind(now)
             .execute(&mut *tx).await?;
         let old_relations = route_relation_snapshot(&mut tx, &tenant_id, route_id).await?;
         compare_and_bump_route_grant_revision(
@@ -496,7 +499,7 @@ impl Database {
             upstream_model: input.upstream_model.trim().to_owned(),
             protocol: input.protocol,
             priority: input.priority,
-            enabled: true,
+            enabled: input.enabled,
             created_at: now,
             updated_at: now,
         };

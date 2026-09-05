@@ -4,6 +4,9 @@ Use a fresh visible-ASCII `Idempotency-Key` for each logical route creation.
 Retry an uncertain create with the same request and key. A successful first
 write returns HTTP `201` and `X-MTC-Route-Create-Disposition: created`; an
 exact replay returns HTTP `200` and `...: reused`, with the same route ID.
+The optional `enabled` field defaults to `true`; set it to `false` to prepare
+a route without making it eligible for traffic. It is part of the canonical
+create payload, so a retry cannot change that choice.
 
 The key is opaque control metadata, not a credential: use a bounded operation
 identifier (for example, a UUID), never an API key, bearer token, request

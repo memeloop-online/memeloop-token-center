@@ -5078,6 +5078,10 @@ components:
         upstream_model: { type: string, minLength: 1, maxLength: 500 }
         protocol: { type: string, enum: [openai, anthropic, generation] }
         priority: { type: integer, format: int64, minimum: -1000000, maximum: 1000000, default: 0 }
+        enabled:
+          type: boolean
+          default: true
+          description: Set false to prepare a disabled route without making it eligible for traffic.
         included_provider_group_ids:
           type: array
           maxItems: 500

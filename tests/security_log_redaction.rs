@@ -279,6 +279,7 @@ async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canari
                 upstream_model: "security-log-model".to_owned(),
                 protocol: "openai".to_owned(),
                 priority: 0,
+                enabled: true,
                 upstream_account_ids: vec![account.id],
                 included_provider_group_ids: Vec::new(),
                 excluded_provider_group_ids: Vec::new(),

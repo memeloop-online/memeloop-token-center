@@ -40,6 +40,7 @@ pub struct CreateRoutedModelRouteInput {
     pub upstream_model: String,
     pub protocol: String,
     pub priority: i64,
+    pub enabled: bool,
     pub upstream_account_ids: Vec<Uuid>,
     pub included_provider_group_ids: Vec<Uuid>,
     pub excluded_provider_group_ids: Vec<Uuid>,

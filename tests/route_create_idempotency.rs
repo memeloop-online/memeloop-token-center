@@ -194,6 +194,7 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
     .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(disposition(&headers), "created");
+    assert_eq!(legacy_route["enabled"].as_bool(), Some(true));
     let legacy_id = legacy_route["id"].clone();
 
     // An explicit key may never silently adopt a semantically equal route
@@ -245,6 +246,40 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
         &fixture.write_token,
         conflicting,
         Some(operation_key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let mut disabled_body = create_body(&fixture, "route-create-disabled");
+    disabled_body["enabled"] = json!(false);
+    let disabled_key = "route-create-idempotency:disabled";
+    let (status, headers, disabled_route) = request_json(
+        fixture.state.clone(),
+        &fixture.write_token,
+        disabled_body.clone(),
+        Some(disabled_key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(disposition(&headers), "created");
+    assert_eq!(disabled_route["enabled"].as_bool(), Some(false));
+    let (status, headers, disabled_replay) = request_json(
+        fixture.state.clone(),
+        &fixture.write_token,
+        disabled_body.clone(),
+        Some(disabled_key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(disposition(&headers), "reused");
+    assert_eq!(disabled_replay["id"], disabled_route["id"]);
+    assert_eq!(disabled_replay["enabled"].as_bool(), Some(false));
+    disabled_body["enabled"] = json!(true);
+    let (status, _, _) = request_json(
+        fixture.state.clone(),
+        &fixture.write_token,
+        disabled_body,
+        Some(disabled_key),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -694,4 +729,14 @@ fn openapi_documents_owned_route_create_replay_contract() {
     assert!(parameter.contains("name: Idempotency-Key"));
     assert!(parameter.contains("required: false"));
     assert!(parameter.contains("minLength: 1, maxLength: 200"));
+
+    let route_request = contract
+        .split_once("    CreateModelRouteRequest:\n")
+        .and_then(|(_, section)| section.split_once("    ReplaceModelRouteRequest:\n"))
+        .map(|(section, _)| section)
+        .expect("model-route create request schema");
+    assert!(
+        route_request
+            .contains("        enabled:\n          type: boolean\n          default: true")
+    );
 }
