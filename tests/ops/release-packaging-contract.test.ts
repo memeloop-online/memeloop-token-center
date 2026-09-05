@@ -6,7 +6,15 @@ import test from 'node:test';
 import { parse } from 'yaml';
 import { contains, occurrences, read, rejected, repository, run } from './contract-helpers.ts';
 
-type WorkflowStep = { name?: unknown; run?: unknown; uses?: unknown; with?: Record<string, unknown> };
+type WorkflowStep = {
+  id?: unknown;
+  name?: unknown;
+  run?: unknown;
+  uses?: unknown;
+  if?: unknown;
+  env?: Record<string, unknown>;
+  with?: Record<string, unknown>;
+};
 type WorkflowJob = { steps?: WorkflowStep[] };
 
 test('release workflow and Docker packaging remain immutable and attested', () => {
@@ -79,6 +87,25 @@ test('release workflow and Docker packaging remain immutable and attested', () =
   assert.ok(workflow.includes('node-version: 24.18.0'));
   const parsed = parse(workflow) as { jobs?: Record<string, WorkflowJob> };
   assert.ok(parsed.jobs !== undefined, 'CI workflow jobs are missing');
+  const publishSteps = parsed.jobs['publish-ghcr']?.steps ?? [];
+  const buildIndex = publishSteps.findIndex((step) => step.id === 'build');
+  assert.ok(buildIndex >= 0, 'publish-ghcr build step is missing');
+  const runtimeSmokeIndexes = publishSteps.flatMap((step, index) =>
+    step.name === 'Start the exact published service image' ? [index] : []);
+  assert.deepEqual(runtimeSmokeIndexes, [buildIndex + 1], 'service runtime smoke must immediately follow the image build');
+  const runtimeSmoke = publishSteps[runtimeSmokeIndexes[0]!]!;
+  assert.equal(runtimeSmoke.if, "matrix.cache_scope == 'service'");
+  assert.deepEqual(runtimeSmoke.env, {
+    IMAGE: '${{ matrix.image }}',
+    DIGEST: '${{ steps.build.outputs.digest }}',
+  });
+  assert.equal(typeof runtimeSmoke.run, 'string');
+  const runtimeSmokeCommand = runtimeSmoke.run as string;
+  for (const needle of [
+    'docker run --rm', '--network none', '--read-only', '--cap-drop ALL',
+    '--security-opt no-new-privileges', '--entrypoint /usr/local/bin/memeloop-token-center',
+    '"$IMAGE@$DIGEST" --help',
+  ]) assert.ok(runtimeSmokeCommand.includes(needle), `service runtime smoke lacks ${needle}`);
   for (const [jobName, job] of Object.entries(parsed.jobs)) {
     const steps = job.steps ?? [];
     const typeScriptSteps = steps.flatMap((step, index) => typeof step.run === 'string' && /(?:^|\s)node\s+[^\n]*\.ts(?:\s|$)/mu.test(step.run) ? [index] : []);
@@ -114,9 +141,6 @@ test('release workflow and Docker packaging remain immutable and attested', () =
     'go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz',
     '5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e',
     'node ops/ci/verify-published-image.ts "$IMAGE" "$DIGEST" "$CACHE_SCOPE" "$RUNNER_TEMP"',
-    'name: Start the exact published service image',
-    '--entrypoint /usr/local/bin/memeloop-token-center',
-    '"$IMAGE@$DIGEST" --help',
     'node ops/ci/verify-ghcr-release.ts "$RUNNER_TEMP/release-evidence" "$RUNNER_TEMP/release-manifest.json"',
     'node --test tests/ops/ghcr-release-contract.test.ts',
     'verify-ghcr-release:', 'name: ghcr-release-${{ github.sha }}',
