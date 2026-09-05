@@ -283,7 +283,10 @@ impl Database {
             .collect()
     }
 
-    pub async fn credential_has_available_route(
+    /// Checks only normalized route authorization. Runtime account and
+    /// credential readiness belongs to candidate resolution so an authorized
+    /// key receives a typed availability failure instead of a misleading 403.
+    pub async fn credential_has_authorized_route(
         &self,
         key_id: Uuid,
         tenant_id: Uuid,
@@ -304,19 +307,12 @@ impl Database {
                      AND g.route_group_id IS NOT NULL AND membership.model_route_id = r.id
                  )
                )
-               AND EXISTS (
-                 SELECT 1 FROM model_route_eligible_upstream_accounts candidate
-                 JOIN upstream_accounts account ON account.id = candidate.upstream_account_id AND account.tenant_id = r.tenant_id AND account.status = 'active'
-                 JOIN upstream_credentials credential ON credential.upstream_account_id = account.id AND credential.generation = account.credential_generation AND credential.revoked_at IS NULL AND (credential.expires_at IS NULL OR credential.expires_at > $5)
-                 WHERE candidate.tenant_id = r.tenant_id AND candidate.model_route_id = r.id
-               )
              LIMIT 1",
         )
         .bind(tenant_id.to_string())
         .bind(public_model)
         .bind(protocol)
         .bind(key_id.to_string())
-        .bind(unix_millis())
         .fetch_optional(&self.pool)
         .await?;
         Ok(found.is_some())
