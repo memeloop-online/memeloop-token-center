@@ -381,12 +381,11 @@ pub(super) fn apply_wreq_wire_headers(
     downstream_headers: &http::HeaderMap,
     credential: &UpstreamCredential,
     session_id: &str,
+    now: i64,
 ) -> Result<wreq::RequestBuilder, AppError> {
     validate_credential_contract(credential)?;
     let account_id = account_header_value(credential)?;
-    let Some((credential_header, credential_value)) =
-        credential.request_header(crate::db::unix_millis())?
-    else {
+    let Some((credential_header, credential_value)) = credential.request_header(now)? else {
         return Err(AppError::BadRequest(
             "OpenAI Codex credential is missing authorization".into(),
         ));
@@ -434,6 +433,37 @@ enum StreamTerminal {
     Failed,
 }
 
+/// Binds every event in one successful Responses lifecycle to the first
+/// canonical response identifier. Output items are not meaningful until that
+/// identity has been established by a queued/created/in-progress event.
+#[derive(Default)]
+struct ResponseIdentityGate {
+    response_id: Option<String>,
+}
+
+impl ResponseIdentityGate {
+    fn observe(&mut self, payload_name: &str, value: &Value) -> Result<(), &'static str> {
+        if matches!(
+            payload_name,
+            "response.queued" | "response.created" | "response.in_progress" | "response.completed"
+        ) {
+            let response_id = value
+                .pointer("/response/id")
+                .and_then(Value::as_str)
+                .and_then(safe_conversation_hint)
+                .ok_or("upstream_invalid_response")?;
+            match self.response_id.as_deref() {
+                None => self.response_id = Some(response_id),
+                Some(current) if current == response_id => {}
+                Some(_) => return Err("upstream_invalid_response"),
+            }
+        } else if payload_name.starts_with("response.output_item.") && self.response_id.is_none() {
+            return Err("upstream_invalid_response");
+        }
+        Ok(())
+    }
+}
+
 /// Validates and redacts the standard Responses SSE protocol. Codex routes
 /// require it, and compatible HTTP JSON Responses routes share the same wire
 /// contract so failures cannot leak provider response bodies downstream.
@@ -442,9 +472,17 @@ pub(super) struct ResponsesStreamingSanitizer {
     pending: Vec<u8>,
     terminal: Option<StreamTerminal>,
     saw_protocol_event: bool,
+    identity: Option<ResponseIdentityGate>,
 }
 
 impl ResponsesStreamingSanitizer {
+    pub(super) fn for_codex() -> Self {
+        Self {
+            identity: Some(ResponseIdentityGate::default()),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Bytes, &'static str> {
         let mut output = Vec::new();
         for byte in chunk {
@@ -488,8 +526,7 @@ impl ResponsesStreamingSanitizer {
         let Some(data) = data else {
             return Ok(());
         };
-        let value: Value =
-            serde_json::from_slice(&data).map_err(|_| "upstream_invalid_response")?;
+        let value = unique_json::parse(&data)?;
         let payload_name = value
             .get("type")
             .and_then(Value::as_str)
@@ -502,6 +539,9 @@ impl ResponsesStreamingSanitizer {
             .is_some_and(|event_name| event_name != payload_name)
         {
             return Err("upstream_invalid_response");
+        }
+        if let Some(identity) = self.identity.as_mut() {
+            identity.observe(payload_name, &value)?;
         }
         self.saw_protocol_event = true;
         let failure = matches!(terminal_kind(payload_name), Some(StreamTerminal::Failed))
@@ -632,7 +672,7 @@ pub(super) async fn admit_event_stream_response(
     let deadline = tokio::time::Instant::now() + MISSING_CONTENT_TYPE_SNIFF_TIMEOUT;
     let mut prefetched = Vec::new();
     let mut inspected = Vec::new();
-    let mut sanitizer = ResponsesStreamingSanitizer::default();
+    let mut sanitizer = ResponsesStreamingSanitizer::for_codex();
     loop {
         let next = tokio::time::timeout_at(deadline, parts.stream.next())
             .await
@@ -782,7 +822,7 @@ struct BufferedResponsesParser {
     data: Vec<u8>,
     event_name: Option<Vec<u8>>,
     output_items: BTreeMap<usize, Value>,
-    response_id: Option<String>,
+    identity: ResponseIdentityGate,
     completed_response: Option<Value>,
     terminal_failure: bool,
     invalid: bool,
@@ -939,20 +979,12 @@ impl BufferedResponsesParser {
             self.terminal_failure = true;
             return Ok(());
         }
-        if matches!(
-            kind,
-            "response.queued" | "response.created" | "response.in_progress" | "response.completed"
-        ) {
-            self.observe_response_id(&value, true)?;
-        }
+        self.identity.observe(kind, &value)?;
         match kind {
             "response.output_item.done" => {
                 if self.completed_response.is_some() || self.terminal_failure {
                     self.invalid = true;
                     return Ok(());
-                }
-                if self.response_id.is_none() {
-                    return Err("upstream_invalid_response");
                 }
                 let index = value
                     .get("output_index")
@@ -992,26 +1024,6 @@ impl BufferedResponsesParser {
         }
         Ok(())
     }
-
-    fn observe_response_id(&mut self, value: &Value, required: bool) -> Result<(), &'static str> {
-        let response_id = match value.pointer("/response/id") {
-            Some(Value::String(response_id)) => safe_conversation_hint(response_id),
-            Some(_) => return Err("upstream_invalid_response"),
-            None if required => return Err("upstream_invalid_response"),
-            None => None,
-        };
-        if required && response_id.is_none() {
-            return Err("upstream_invalid_response");
-        }
-        if let Some(response_id) = response_id {
-            match self.response_id.as_deref() {
-                None => self.response_id = Some(response_id.to_owned()),
-                Some(current) if current == response_id => {}
-                Some(_) => return Err("upstream_invalid_response"),
-            }
-        }
-        Ok(())
-    }
 }
 
 fn canonical_responses_usage(response: &Value) -> Result<TokenUsage, ()> {
@@ -1033,18 +1045,28 @@ fn canonical_responses_usage(response: &Value) -> Result<TokenUsage, ()> {
     if reported_input.checked_add(output_tokens) != Some(total_tokens) {
         return Err(());
     }
-    let cached_input_tokens = match usage.get("input_tokens_details") {
-        None => 0,
-        Some(details) => details
-            .as_object()
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_i64)
-            .filter(|value| (0..=reported_input).contains(value))
-            .ok_or(())?,
+    let (cached_input_tokens, cache_write_tokens) = match usage.get("input_tokens_details") {
+        None | Some(Value::Null) => (0, 0),
+        Some(Value::Object(details)) => {
+            let cached = details
+                .get("cached_tokens")
+                .and_then(Value::as_i64)
+                .filter(|value| (0..=reported_input).contains(value))
+                .ok_or(())?;
+            let cache_write = match details.get("cache_write_tokens") {
+                None => 0,
+                Some(value) => value
+                    .as_i64()
+                    .filter(|value| (0..=reported_input).contains(value))
+                    .ok_or(())?,
+            };
+            (cached, cache_write)
+        }
+        Some(_) => return Err(()),
     };
     if usage
         .get("output_tokens_details")
-        .is_some_and(|details| !details.is_object())
+        .is_some_and(|details| !details.is_null() && !details.is_object())
     {
         return Err(());
     }
@@ -1061,9 +1083,12 @@ fn canonical_responses_usage(response: &Value) -> Result<TokenUsage, ()> {
         Some(_) => return Err(()),
     };
     Ok(TokenUsage {
-        input_tokens: reported_input.checked_sub(cached_input_tokens).ok_or(())?,
+        input_tokens: reported_input
+            .checked_sub(cached_input_tokens)
+            .and_then(|tokens| tokens.checked_sub(cache_write_tokens))
+            .ok_or(())?,
         cached_input_tokens,
-        cache_write_tokens: 0,
+        cache_write_tokens,
         output_tokens,
         service_tier,
     })
@@ -1235,6 +1260,8 @@ mod tests {
 
     fn completed_stream() -> Vec<u8> {
         concat!(
+            "event: response.queued\r\n",
+            "data: {\"type\":\"response.queued\",\"response\":{\"id\":\"resp-1\"}}\r\n\r\n",
             "event: response.output_item.done\r\n",
             "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"item-1\"}}\r\n\r\n",
             "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item-0\"}}\n\n",
@@ -1282,24 +1309,43 @@ mod tests {
     fn buffered_parser_requires_canonical_consistent_responses_usage() {
         let valid = json!({
             "input_tokens": 10,
-            "input_tokens_details": {"cached_tokens": 3},
+            "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 2},
             "output_tokens": 2,
-            "output_tokens_details": {"reasoning_tokens": 1},
+            "output_tokens_details": null,
             "total_tokens": 12
         });
         let parsed = parse_buffered_sse_for_test(&completed_stream_with_usage(&valid)).unwrap();
         assert_eq!(
             parsed.usage,
             TokenUsage {
-                input_tokens: 7,
+                input_tokens: 5,
                 cached_input_tokens: 3,
-                cache_write_tokens: 0,
+                cache_write_tokens: 2,
                 output_tokens: 2,
                 service_tier: Some("priority".to_owned()),
             }
         );
         let response: Value = serde_json::from_slice(&parsed.body).unwrap();
         assert_eq!(response["output"][0]["id"], "item-billable");
+
+        let nullable_details = json!({
+            "input_tokens": 10,
+            "input_tokens_details": null,
+            "output_tokens": 2,
+            "output_tokens_details": null,
+            "total_tokens": 12
+        });
+        let parsed =
+            parse_buffered_sse_for_test(&completed_stream_with_usage(&nullable_details)).unwrap();
+        assert_eq!(
+            parsed.usage,
+            TokenUsage {
+                input_tokens: 10,
+                output_tokens: 2,
+                service_tier: Some("priority".to_owned()),
+                ..TokenUsage::default()
+            }
+        );
 
         for malformed in [
             json!({"input_tokens": 10, "total_tokens": 10}),
@@ -1308,6 +1354,7 @@ mod tests {
             json!({"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}),
             json!({"input_tokens": 10, "input_tokens_details": {}, "output_tokens": 2, "total_tokens": 12}),
             json!({"input_tokens": 10, "input_tokens_details": {"cached_tokens": 11}, "output_tokens": 2, "total_tokens": 12}),
+            json!({"input_tokens": 10, "input_tokens_details": {"cached_tokens": 9, "cache_write_tokens": 2}, "output_tokens": 2, "total_tokens": 12}),
             json!({"input_tokens": 10, "output_tokens": 2, "output_tokens_details": 1, "total_tokens": 12}),
             json!({"input_tokens": 10, "output_tokens": -1, "total_tokens": 9}),
         ] {
@@ -1442,10 +1489,12 @@ mod tests {
     fn buffered_parser_rejects_partial_or_mismatched_completed_output() {
         let cases = [
             concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n",
                 "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item-0\"}}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"output\":[{\"id\":\"item-0\"},{\"id\":\"item-1\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
             ),
             concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n",
                 "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"captured\"}}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"output\":[{\"id\":\"different\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
             ),
@@ -1624,6 +1673,54 @@ mod tests {
             .push(b"event: provider-secret\ndata: [DONE]\n\n")
             .unwrap();
         assert_eq!(output.as_ref(), b"data: [DONE]\n\n");
+    }
+
+    #[test]
+    fn codex_streaming_sanitizer_binds_identity_before_output_items() {
+        for lifecycle in [
+            "response.queued",
+            "response.created",
+            "response.in_progress",
+            "response.completed",
+        ] {
+            let mut sanitizer = ResponsesStreamingSanitizer::for_codex();
+            let event = format!("data: {{\"type\":\"{lifecycle}\",\"response\":{{}}}}\n\n");
+            assert!(sanitizer.push(event.as_bytes()).is_err(), "{lifecycle}");
+        }
+
+        let mut item_before_id = ResponsesStreamingSanitizer::for_codex();
+        assert!(
+            item_before_id
+                .push(
+                    b"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item-a\"}}\n\n"
+                )
+                .is_err()
+        );
+
+        let mut mismatched = ResponsesStreamingSanitizer::for_codex();
+        mismatched
+            .push(b"data: {\"type\":\"response.queued\",\"response\":{\"id\":\"resp-a\"}}\n\n")
+            .unwrap();
+        assert!(
+            mismatched
+                .push(
+                    b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-b\"}}\n\n"
+                )
+                .is_err()
+        );
+
+        let mut valid = ResponsesStreamingSanitizer::for_codex();
+        let output = valid
+            .push(
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-a\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item-a\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-a\"}}\n\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("item-a"));
     }
 
     #[tokio::test]

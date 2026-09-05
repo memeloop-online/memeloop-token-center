@@ -109,9 +109,14 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 Protocol::OpenAiResponses => ResponsesSseCapture::for_responses(),
                 _ => ResponsesSseCapture::for_delivery(),
             });
-            let mut responses_streaming_sanitizer = (is_sse
-                && matches!(protocol, Protocol::OpenAiResponses))
-            .then(codex_transport::ResponsesStreamingSanitizer::default);
+            let mut responses_streaming_sanitizer =
+                (is_sse && matches!(protocol, Protocol::OpenAiResponses)).then(|| {
+                    if is_codex_route {
+                        codex_transport::ResponsesStreamingSanitizer::for_codex()
+                    } else {
+                        codex_transport::ResponsesStreamingSanitizer::default()
+                    }
+                });
             let mut transport_error: Option<&'static str> = None;
             let mut response_bytes = 0_usize;
             let mut delivery_confirmed = false;
