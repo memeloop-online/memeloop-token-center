@@ -476,6 +476,16 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
           provenance: mode=max
           sbom: true
+      - name: Start the exact published service image
+        if: matrix.cache_scope == 'service'
+        env:
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: >-
+          docker run --rm --network none --read-only --cap-drop ALL
+          --security-opt no-new-privileges
+          --entrypoint /usr/local/bin/memeloop-token-center
+          "$IMAGE@$DIGEST" --help
       - name: Scan the exact published digest for high and critical vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:

@@ -49,14 +49,19 @@ RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA_INPUT}" \
     && cp target/release/memeloop-token-center /tmp/memeloop-token-center \
     && cp target/release/import-cpa-session-archive /tmp/import-cpa-session-archive \
     && cp "$(gcc -print-file-name=libgcc_s.so.1)" /tmp/libgcc_s.so.1 \
+    && cp "$(g++ -print-file-name=libstdc++.so.6)" /tmp/libstdc++.so.6 \
     && rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
 
 FROM ${RUNTIME_IMAGE}
 ENV LD_LIBRARY_PATH=/usr/local/lib
 COPY --from=builder /tmp/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
+COPY --from=builder /tmp/libstdc++.so.6 /usr/local/lib/libstdc++.so.6
 COPY --from=builder /tmp/memeloop-token-center /usr/local/bin/memeloop-token-center
 COPY --from=builder /tmp/import-cpa-session-archive /usr/local/bin/import-cpa-session-archive
 COPY --from=web-builder /build/web/dist /usr/share/memeloop-token-center/web
+# Execute the production binary inside the final distroless filesystem during
+# every image build so a missing shared library fails before publication.
+RUN ["/usr/local/bin/memeloop-token-center", "--help"]
 USER 10001:10001
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/memeloop-token-center"]
