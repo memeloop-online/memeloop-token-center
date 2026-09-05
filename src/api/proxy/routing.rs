@@ -9,6 +9,7 @@ pub(super) struct PreparedProxyRoute {
     forwarded_body: Vec<u8>,
     pub(super) output_token_ceiling: i64,
     pub(super) codex_downstream_stream: bool,
+    pub(super) codex_store_disabled: bool,
     codex_session_id: Option<String>,
     pub(super) component_request: Option<(PreparedProviderRequest, RequestContext)>,
 }
@@ -124,6 +125,8 @@ pub(super) async fn prepare_proxy_route(
         codex_downstream_stream: codex_plan
             .as_ref()
             .is_some_and(|plan| plan.downstream_stream),
+        codex_store_disabled: codex_plan.is_some()
+            && forwarded_json.get("store").and_then(Value::as_bool) == Some(false),
         codex_session_id: codex_plan.map(|plan| plan.session_id),
         component_request,
     })

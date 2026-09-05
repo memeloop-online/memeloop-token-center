@@ -805,7 +805,7 @@ async fn codex_transient_400_fails_over_before_downstream_delivery() {
                 "message": "transient upstream detail must stay private"
             }
         })))
-        .expect(1)
+        .expect(2)
         .mount(&upstream)
         .await;
     Mock::given(method("POST"))
@@ -862,7 +862,248 @@ async fn codex_transient_400_fails_over_before_downstream_delivery() {
 }
 
 #[tokio::test]
-async fn codex_invalid_request_400_does_not_fail_over_or_cool_down() {
+async fn codex_definite_ordinary_400_retries_the_same_account_once_with_a_large_body() {
+    let fixture = codex_route_fixture("definite-400-same-account-retry").await;
+    fixture
+        .state
+        .db
+        .upsert_model_price(
+            &fixture.model,
+            "USD",
+            Decimal::new(1, 4),
+            Decimal::new(1, 4),
+        )
+        .await
+        .unwrap();
+    let upstream = MockServer::start().await;
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_for_response = attempts.clone();
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-123"))
+        .respond_with(move |_| {
+            if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "private ordinary rejection"
+                    }
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_raw(
+                    completed_codex_sse("same-account retry answer").into_bytes(),
+                    "text/event-stream",
+                )
+            }
+        })
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({
+            "model": fixture.model,
+            "input": [{
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": "x".repeat(1_000_000)}]
+            }],
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("same-account retry answer"));
+    assert!(!body.contains("private ordinary rejection"));
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    assert_response_archives_omit(&fixture, "private ordinary rejection").await;
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
+    assert_eq!(
+        requests[0].headers.get("session-id"),
+        requests[1].headers.get("session-id")
+    );
+    assert_eq!(
+        requests[0].headers.get("chatgpt-account-id"),
+        requests[1].headers.get("chatgpt-account-id")
+    );
+    assert_codex_wire(&requests[0], &fixture.upstream_model);
+    assert_codex_wire(&requests[1], &fixture.upstream_model);
+    let rendered_metrics = fixture
+        .state
+        .metrics
+        .render(&crate::metrics::RuntimeMetrics::default());
+    assert!(rendered_metrics.contains(
+        "memeloop_token_center_codex_bad_request_classifications_total{classification=\"ordinary\"} 1"
+    ));
+    assert!(rendered_metrics.contains(
+        "memeloop_token_center_codex_bad_request_retries_total{outcome=\"started\"} 1"
+    ));
+    assert!(rendered_metrics.contains(
+        "memeloop_token_center_codex_bad_request_retries_total{outcome=\"succeeded\"} 1"
+    ));
+    assert!(!rendered_metrics.contains("private ordinary rejection"));
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or_failover() {
+    let fixture = codex_route_fixture("retryable-then-ordinary-400").await;
+    let upstream = MockServer::start().await;
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_for_response = attempts.clone();
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-123"))
+        .respond_with(move |_| {
+            let error = if attempts_for_response
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                json!({
+                    "type": "temporarily_unavailable",
+                    "message": "private transient rejection"
+                })
+            } else {
+                json!({
+                    "type": "invalid_request_error",
+                    "message": "private ordinary rejection"
+                })
+            };
+            ResponseTemplate::new(400).set_body_json(json!({"error": error}))
+        })
+        .expect(2)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(header_matcher("chatgpt-account-id", "account-456"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    add_codex_standby_route(
+        &fixture,
+        "codex-route-retryable-then-ordinary-400",
+        "account-456",
+    )
+    .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "retry once", "stream": false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("upstream rejected the request"));
+    assert!(!body.contains("private transient rejection"));
+    assert!(!body.contains("private ordinary rejection"));
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(400));
+    assert_eq!(rows[0].error_code.as_deref(), Some("http_400"));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    assert_response_archives_omit(&fixture, "private transient rejection").await;
+    assert_response_archives_omit(&fixture, "private ordinary rejection").await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let health_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(health_rows, 0);
+    pool.close().await;
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
+    assert_eq!(
+        requests[0].headers.get("session-id"),
+        requests[1].headers.get("session-id")
+    );
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() {
+    use tokio::io::AsyncReadExt as _;
+
+    let fixture = codex_route_fixture("native-ambiguous-transport").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut prefix = [0_u8; 4096];
+        assert!(stream.read(&mut prefix).await.unwrap() > 0);
+        // Close only after request bytes were received. The client cannot know
+        // whether the remote application accepted the POST, so this path must
+        // never enter the bounded same-account retry or a standby failover.
+        drop(stream);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "ambiguous native Codex transport must not open a second connection"
+        );
+    });
+
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "do not replay", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("upstream request failed"));
+    accepted.await.unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(rows[0].error_code.as_deref(), Some("upstream_transport"));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+#[tokio::test]
+async fn codex_invalid_request_400_retries_once_without_failing_over_or_cooling_down() {
     let fixture = codex_route_fixture("ordinary-400").await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
@@ -874,7 +1115,7 @@ async fn codex_invalid_request_400_does_not_fail_over_or_cool_down() {
                 "message": "private context rejection detail"
             }
         })))
-        .expect(1)
+        .expect(2)
         .mount(&upstream)
         .await;
     Mock::given(method("POST"))
@@ -910,6 +1151,13 @@ async fn codex_invalid_request_400_does_not_fail_over_or_cool_down() {
     assert_eq!(health_rows, 0);
     pool.close().await;
     assert_response_archives_omit(&fixture, "private context rejection detail").await;
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
+    assert_eq!(
+        requests[0].headers.get("session-id"),
+        requests[1].headers.get("session-id")
+    );
     upstream.verify().await;
 }
 
@@ -1353,6 +1601,15 @@ async fn send_codex_route(
     path: &str,
     body: Value,
 ) -> Response {
+    send_codex_route_to_endpoint(fixture, upstream.uri(), path, body).await
+}
+
+async fn send_codex_route_to_endpoint(
+    fixture: &CodexRouteFixture,
+    endpoint: String,
+    path: &str,
+    body: Value,
+) -> Response {
     let request = Request::post(path)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
@@ -1367,7 +1624,7 @@ async fn send_codex_route(
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     codex_transport::with_test_endpoint(
-        upstream.uri(),
+        endpoint,
         router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(request),
     )
     .await

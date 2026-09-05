@@ -14,7 +14,8 @@ use super::{
     usage_from_value_checked,
 };
 use crate::{
-    error::AppError, oauth::managed::codex::account_header_value, provider::UpstreamCredential,
+    error::AppError, metrics::CodexBadRequestClassification,
+    oauth::managed::codex::account_header_value, provider::UpstreamCredential,
 };
 
 pub(super) const DRIVER: &str = "openai-codex";
@@ -25,7 +26,7 @@ pub(super) const RESPONSES_PATH: &str = "/responses";
 pub(super) const USER_AGENT: &str = crate::oauth::managed::codex::USER_AGENT;
 const MAX_OUTPUT_ITEMS: usize = 16_384;
 // A 400 is normally a client-side rejection and must not affect account
-// health. Keep the exceptional transient-rejection inspection deliberately
+// health. Keep the exceptional definite-rejection inspection deliberately
 // small: it happens before any downstream bytes are delivered and its body is
 // never retained, archived, logged, or returned.
 const MAX_CODEX_RETRYABLE_ERROR_BYTES: usize = 16 * 1024;
@@ -605,23 +606,28 @@ pub(super) fn is_event_stream(response: &UpstreamResponse) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BadRequestDisposition {
-    Ordinary,
+    Ordinary(CodexBadRequestClassification),
     Retryable,
 }
 
 /// Classify the narrowly-defined subset of Codex 400 responses which are safe
-/// to retry on another account. The response is consumed regardless of the
-/// result: callers use the existing fixed, body-free error response for an
+/// to retry before downstream delivery. The response is consumed regardless of
+/// the result: callers use the existing fixed, body-free error response for an
 /// ordinary 400. This prevents an upstream error body from reaching logs,
 /// archives, or the downstream client.
 pub(super) async fn classify_bad_request(response: UpstreamResponse) -> BadRequestDisposition {
     if response.status() != http::StatusCode::BAD_REQUEST
-        || !has_single_json_content_type(&response)
-        || response
-            .content_length()
-            .is_some_and(|length| length > MAX_CODEX_RETRYABLE_ERROR_BYTES as u64)
     {
-        return BadRequestDisposition::Ordinary;
+        return BadRequestDisposition::Ordinary(CodexBadRequestClassification::Ordinary);
+    }
+    if !has_single_json_content_type(&response) {
+        return BadRequestDisposition::Ordinary(CodexBadRequestClassification::ContentType);
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CODEX_RETRYABLE_ERROR_BYTES as u64)
+    {
+        return BadRequestDisposition::Ordinary(CodexBadRequestClassification::TooLarge);
     }
 
     match tokio::time::timeout(
@@ -630,22 +636,48 @@ pub(super) async fn classify_bad_request(response: UpstreamResponse) -> BadReque
     )
     .await
     {
-        Ok(Some(value)) if codex_transient_error(&value) => BadRequestDisposition::Retryable,
-        Ok(Some(_) | None) | Err(_) => BadRequestDisposition::Ordinary,
+        Ok(BoundedBadRequestBody::Value(value)) if codex_transient_error(&value) => {
+            BadRequestDisposition::Retryable
+        }
+        Ok(BoundedBadRequestBody::Value(_)) => {
+            BadRequestDisposition::Ordinary(CodexBadRequestClassification::Ordinary)
+        }
+        Ok(BoundedBadRequestBody::TooLarge) => {
+            BadRequestDisposition::Ordinary(CodexBadRequestClassification::TooLarge)
+        }
+        Ok(BoundedBadRequestBody::ReadFailed) => {
+            BadRequestDisposition::Ordinary(CodexBadRequestClassification::ReadFailed)
+        }
+        Ok(BoundedBadRequestBody::InvalidJson) => {
+            BadRequestDisposition::Ordinary(CodexBadRequestClassification::InvalidJson)
+        }
+        Err(_) => BadRequestDisposition::Ordinary(CodexBadRequestClassification::TimedOut),
     }
 }
 
-async fn read_bounded_bad_request_body(response: UpstreamResponse) -> Option<Value> {
+enum BoundedBadRequestBody {
+    Value(Value),
+    TooLarge,
+    ReadFailed,
+    InvalidJson,
+}
+
+async fn read_bounded_bad_request_body(response: UpstreamResponse) -> BoundedBadRequestBody {
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.ok()?;
+        let Ok(chunk) = chunk else {
+            return BoundedBadRequestBody::ReadFailed;
+        };
         if chunk.len() > MAX_CODEX_RETRYABLE_ERROR_BYTES.saturating_sub(body.len()) {
-            return None;
+            return BoundedBadRequestBody::TooLarge;
         }
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).ok()
+    match serde_json::from_slice(&body) {
+        Ok(value) => BoundedBadRequestBody::Value(value),
+        Err(_) => BoundedBadRequestBody::InvalidJson,
+    }
 }
 
 fn has_single_json_content_type(response: &UpstreamResponse) -> bool {
