@@ -151,7 +151,9 @@ pub use routing::{
     RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
     UpdateRoutedModelRouteInput,
 };
-pub(crate) use routing::{UpstreamAttemptAdmission, UpstreamFailureKind};
+pub(crate) use routing::{
+    UPSTREAM_PROBE_HEARTBEAT_MILLIS, UpstreamAttemptAdmission, UpstreamFailureKind,
+};
 pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
 
 #[derive(Clone)]

@@ -739,6 +739,36 @@ async fn rate_limit_response_fails_over_and_records_the_actual_upstream() {
 }
 
 #[tokio::test]
+async fn ordinary_client_error_does_not_cool_down_a_shared_account() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "caller input is invalid"}
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = resilient_route_fixture("ordinary-client-error", &[(upstream.uri(), 0)]).await;
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let health_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.accounts[0].to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(health_rows, 0);
+    pool.close().await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn codex_missing_content_type_json_fails_over_before_downstream_delivery() {
     let fixture = codex_route_fixture("high-demand-failover").await;
     let upstream = MockServer::start().await;

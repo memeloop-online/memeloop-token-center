@@ -24,4 +24,6 @@ pub(crate) use associations::{
 pub(crate) use grant_revisions::{
     bump_credential_grant_revisions, bump_route_grant_revisions, lock_routing_relation_writes,
 };
-pub(crate) use health::{UpstreamAttemptAdmission, UpstreamFailureKind};
+pub(crate) use health::{
+    UPSTREAM_PROBE_HEARTBEAT_MILLIS, UpstreamAttemptAdmission, UpstreamFailureKind,
+};

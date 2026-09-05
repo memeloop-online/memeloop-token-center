@@ -532,7 +532,14 @@ pub(super) async fn proxy(
         )
         .await;
         upstream_attempt
-            .complete(UpstreamAttemptTerminal::invalid_response())
+            .complete(if status.is_client_error() {
+                // Ordinary caller-dependent 4xx responses are not evidence
+                // that a shared upstream account is unhealthy. Typed auth,
+                // rate-limit, and transient statuses were handled above.
+                UpstreamAttemptTerminal::Inconclusive
+            } else {
+                UpstreamAttemptTerminal::invalid_response()
+            })
             .await;
         codex_retry.complete(CodexRetryTerminal::Failed);
         return result;

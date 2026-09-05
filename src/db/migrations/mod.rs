@@ -350,6 +350,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "model route create idempotency claims",
         sql: include_str!("../../../migrations/common/0065_model_route_create_idempotency.sql"),
     },
+    Migration {
+        version: 66,
+        name: "fenced upstream account health probes",
+        sql: include_str!("../../../migrations/common/0066_upstream_probe_lease_fence.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -685,6 +690,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 65,
         name: "model route create idempotency claims",
         sql: include_str!("../../../migrations/common/0065_model_route_create_idempotency.sql"),
+    },
+    Migration {
+        version: 66,
+        name: "fenced upstream account health probes",
+        sql: include_str!("../../../migrations/common/0066_upstream_probe_lease_fence.sql"),
     },
 ];
 
