@@ -181,9 +181,12 @@ impl Database {
             now,
         )
         .await?;
-        ensure_route_has_eligible_candidate(&mut tx, &tenant_id, route_id).await?;
         let created_at: i64 = current.try_get("created_at")?;
         let enabled = current.try_get::<i64, _>("enabled")? != 0;
+        if enabled {
+            ensure_route_has_eligible_candidate(&mut tx, self.backend, &tenant_id, route_id)
+                .await?;
+        }
         tx.commit().await?;
         let route = ModelRouteView {
             id: route_id,
@@ -491,7 +494,8 @@ impl Database {
         // Preparation may intentionally point at an account or group that is
         // not usable yet. An enabled route must still be traffic-ready.
         if input.enabled {
-            ensure_route_has_eligible_candidate(&mut tx, &tenant_id, route_id).await?;
+            ensure_route_has_eligible_candidate(&mut tx, self.backend, &tenant_id, route_id)
+                .await?;
         }
         tx.commit().await?;
         let route = ModelRouteView {
@@ -597,7 +601,7 @@ impl Database {
         let tenant_id = tenant_id(&mut tx, &input.tenant_external_id).await?;
         lock_routing_relation_writes(&mut tx, &tenant_id).await?;
         let route = sqlx::query(
-            "SELECT upstream_model, updated_at FROM model_routes WHERE id = $1 AND tenant_id = $2",
+            "SELECT upstream_model, enabled, updated_at FROM model_routes WHERE id = $1 AND tenant_id = $2",
         )
         .bind(route_id.to_string())
         .bind(&tenant_id)
@@ -651,7 +655,10 @@ impl Database {
             },
         )
         .await?;
-        ensure_route_has_eligible_candidate(&mut tx, &tenant_id, route_id).await?;
+        if route.try_get::<i64, _>("enabled")? != 0 {
+            ensure_route_has_eligible_candidate(&mut tx, self.backend, &tenant_id, route_id)
+                .await?;
+        }
         let now = unix_millis().max(current_updated_at.saturating_add(1));
         finish_route_relation_replace(
             &mut tx,

@@ -73,7 +73,9 @@ async fn prepare_authorized_proxy_routes(
     let mut skipped_incompatible_strict_route = false;
     let mut first_prepare_error = None;
     let mut prepared_routes = Vec::new();
-    for route in resolved_routes {
+    // Candidate resolution has a larger defensive database cap, but request
+    // preparation and outbound work are bounded by the attempt contract.
+    for route in resolved_routes.into_iter().take(MAX_UPSTREAM_ATTEMPTS) {
         if strict_choice_count_is_incompatible
             && requires_strict_openai_chat_usage(
                 protocol,
@@ -85,8 +87,12 @@ async fn prepare_authorized_proxy_routes(
             skipped_incompatible_strict_route = true;
             continue;
         }
-        if prepared_routes.len() == MAX_UPSTREAM_ATTEMPTS {
-            break;
+        if route
+            .credential
+            .expires_at()
+            .is_some_and(|expires_at| expires_at <= unix_millis())
+        {
+            continue;
         }
         let is_component = state
             .providers
@@ -119,6 +125,12 @@ async fn prepare_authorized_proxy_routes(
                     stage = "candidate_prepare",
                     "authorized proxy candidate is unusable"
                 );
+                // The primary prepare path may invoke a component hook with
+                // external effects. Its failure is therefore ambiguous and
+                // must never be hidden by preparing another provider.
+                if prepared_routes.is_empty() {
+                    return Err(error);
+                }
                 first_prepare_error.get_or_insert(error);
             }
         }
@@ -132,7 +144,7 @@ async fn prepare_authorized_proxy_routes(
         if skipped_incompatible_strict_route {
             validate_openai_chat_choice_count(request_json)?;
         }
-        return Err(AppError::Forbidden);
+        return Err(AppError::Overloaded);
     }
     Ok(prepared_routes)
 }
@@ -335,6 +347,32 @@ pub(super) async fn proxy(
     let mut route_attempts = prepared_routes.into_iter();
     let mut active_route = route_attempts.next().ok_or(AppError::Internal)?;
     if let Some((prepared, component_context)) = active_route.component_request.take() {
+        let current_credential = match state
+            .db
+            .reload_current_upstream_credential(
+                active_route.route.account_id,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+        {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %active_route.route.account_id,
+                    error = %error,
+                    "current upstream credential is invalid"
+                );
+                return finish_proxy_failure(&buffered_request, "upstream_credential_invalid")
+                    .await;
+            }
+        };
+        let Some((credential_generation, credential)) = current_credential else {
+            return finish_proxy_unavailable(&buffered_request, "upstream_credential_unavailable")
+                .await;
+        };
+        active_route.route.credential_generation = credential_generation;
+        active_route.route.credential = credential;
         return execute_component_provider(
             buffered_request,
             &active_route.route.driver,
@@ -347,9 +385,67 @@ pub(super) async fn proxy(
         .await;
     }
     let (upstream, upstream_activity, mut codex_retry, mut upstream_attempt) = loop {
+        let current_credential = match state
+            .db
+            .reload_current_upstream_credential(
+                active_route.route.account_id,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+        {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %active_route.route.account_id,
+                    error = %error,
+                    "current upstream credential is invalid"
+                );
+                return finish_proxy_failure(&buffered_request, "upstream_credential_invalid")
+                    .await;
+            }
+        };
+        let Some((credential_generation, credential)) = current_credential else {
+            state.metrics.observe_upstream_health(
+                UpstreamHealthEvent::Skipped,
+                UpstreamHealthReason::Unavailable,
+            );
+            let Some(next_route) = route_attempts.next() else {
+                return finish_proxy_unavailable(
+                    &buffered_request,
+                    "upstream_credential_unavailable",
+                )
+                .await;
+            };
+            if state
+                .db
+                .reassign_pending_proxy_upstream(
+                    request_id,
+                    key.tenant_id,
+                    buffered_request.reservation.id,
+                    (active_route.route.account_id, active_route.route.route_id),
+                    (next_route.route.account_id, next_route.route.route_id),
+                )
+                .await
+                .is_err()
+            {
+                return finish_proxy_failure(&buffered_request, "upstream_failover_state").await;
+            }
+            state.metrics.observe_upstream_health(
+                UpstreamHealthEvent::Failover,
+                UpstreamHealthReason::Unavailable,
+            );
+            active_route = next_route;
+            continue;
+        };
+        active_route.route.credential_generation = credential_generation;
+        active_route.route.credential = credential;
         let admission = state
             .db
-            .claim_upstream_account_attempt(active_route.route.account_id)
+            .claim_upstream_account_attempt(
+                active_route.route.account_id,
+                active_route.route.credential_generation,
+            )
             .await?;
         if admission == UpstreamAttemptAdmission::Unavailable {
             state.metrics.observe_upstream_health(
@@ -380,8 +476,13 @@ pub(super) async fn proxy(
             active_route = next_route;
             continue;
         }
-        let mut upstream_attempt =
-            UpstreamAttemptGuard::new(&state, request_id, active_route.route.account_id, admission);
+        let mut upstream_attempt = UpstreamAttemptGuard::new(
+            &state,
+            request_id,
+            active_route.route.account_id,
+            active_route.route.credential_generation,
+            admission,
+        );
         let result = send_proxy_route(&state, &headers, protocol, request_id, &active_route).await;
         let failure = match &result {
             Ok(result) if result.response.status() == StatusCode::TOO_MANY_REQUESTS => Some((

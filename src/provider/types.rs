@@ -50,6 +50,9 @@ pub struct ModelRouteView {
 pub struct ResolvedUpstream {
     pub route_id: Uuid,
     pub account_id: Uuid,
+    /// Generation of the encrypted credential selected with this attempt.
+    /// Breaker and send transitions use it as a fence across OAuth rotation.
+    pub credential_generation: i64,
     pub driver: String,
     pub base_url: String,
     pub config: Value,

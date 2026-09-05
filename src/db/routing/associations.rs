@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use sqlx::{Any, Row, Transaction};
 use uuid::Uuid;
 
-use super::super::{AppError, unix_millis};
+use super::super::{AppError, DatabaseBackend, unix_millis};
 use super::grant_revisions::bump_credential_grant_revisions;
 
 const ASSOCIATION_CHUNK_SIZE: usize = 64;
@@ -328,20 +328,32 @@ fn values_placeholders(width: usize, rows: usize, literal_position: Option<usize
 
 pub(super) async fn ensure_route_has_eligible_candidate(
     tx: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
     tenant_id: &str,
     route_id: Uuid,
 ) -> Result<(), AppError> {
-    let candidate = sqlx::query(
-        "SELECT 1 FROM model_route_eligible_upstream_accounts eligible
+    let sql = match backend {
+        DatabaseBackend::PostgreSql => {
+            "SELECT account.id FROM model_route_eligible_upstream_accounts eligible
          JOIN upstream_accounts account ON account.tenant_id = eligible.tenant_id AND account.id = eligible.upstream_account_id AND account.status = 'active'
          JOIN upstream_credentials credential ON credential.upstream_account_id = account.id AND credential.generation = account.credential_generation AND credential.revoked_at IS NULL AND (credential.expires_at IS NULL OR credential.expires_at > $3)
-         WHERE eligible.tenant_id = $1 AND eligible.model_route_id = $2 LIMIT 1",
-    )
-    .bind(tenant_id)
-    .bind(route_id.to_string())
-    .bind(unix_millis())
-    .fetch_optional(&mut **tx)
-    .await?;
+         WHERE eligible.tenant_id = $1 AND eligible.model_route_id = $2
+         ORDER BY account.id LIMIT 1 FOR UPDATE OF account, credential"
+        }
+        DatabaseBackend::Sqlite => {
+            "SELECT account.id FROM model_route_eligible_upstream_accounts eligible
+         JOIN upstream_accounts account ON account.tenant_id = eligible.tenant_id AND account.id = eligible.upstream_account_id AND account.status = 'active'
+         JOIN upstream_credentials credential ON credential.upstream_account_id = account.id AND credential.generation = account.credential_generation AND credential.revoked_at IS NULL AND (credential.expires_at IS NULL OR credential.expires_at > $3)
+         WHERE eligible.tenant_id = $1 AND eligible.model_route_id = $2
+         ORDER BY account.id LIMIT 1"
+        }
+    };
+    let candidate = sqlx::query(sql)
+        .bind(tenant_id)
+        .bind(route_id.to_string())
+        .bind(unix_millis())
+        .fetch_optional(&mut **tx)
+        .await?;
     if candidate.is_none() {
         return Err(AppError::BadRequest(
             "the route has no eligible upstream for this model; sync the model catalog or explicitly confirm a custom model".into(),

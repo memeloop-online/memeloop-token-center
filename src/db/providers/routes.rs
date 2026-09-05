@@ -73,6 +73,7 @@ impl Database {
             .await?
             .ok_or(AppError::NotFound)?
             .try_get("id")?;
+        lock_routing_relation_writes(&mut tx, &tenant_id).await?;
         let account_tenant: String = sqlx::query(
             "SELECT tenant_id FROM upstream_accounts WHERE id = $1 AND status = 'active'",
         )
@@ -122,6 +123,7 @@ impl Database {
         sqlx::query("INSERT INTO model_route_upstream_accounts (tenant_id, model_route_id, upstream_account_id, upstream_model, scheduling_weight, created_at, catalog_policy) VALUES ($1, $2, $3, $4, 100, $5, 'explicit_custom')")
             .bind(&tenant_id).bind(route_id.to_string()).bind(input.upstream_account_id.to_string())
             .bind(input.upstream_model.trim()).bind(now).execute(&mut *tx).await?;
+        ensure_route_has_eligible_candidate(&mut tx, self.backend, &tenant_id, route_id).await?;
         tx.commit().await?;
         Ok(ModelRouteView {
             id: route_id,
@@ -161,6 +163,8 @@ impl Database {
         .await?
         .ok_or(AppError::NotFound)?;
         let current_view = model_route_view(current)?;
+        let tenant_id = current_view.tenant_id.to_string();
+        lock_routing_relation_writes(&mut tx, &tenant_id).await?;
         let unchanged = current_view.public_model == public_model
             && current_view.upstream_account_id == input.upstream_account_id
             && current_view.upstream_model == upstream_model
@@ -183,13 +187,13 @@ impl Database {
         .await?
         .ok_or(AppError::NotFound)?
         .try_get::<String, _>("tenant_id")?;
-        if account_tenant != current_view.tenant_id.to_string() {
+        if account_tenant != tenant_id {
             return Err(AppError::Forbidden);
         }
         let duplicate = sqlx::query(
             "SELECT id FROM model_routes WHERE tenant_id = $1 AND public_model = $2 AND protocol = $3 AND priority = $4 AND id <> $5",
         )
-        .bind(current_view.tenant_id.to_string())
+        .bind(&tenant_id)
         .bind(public_model)
         .bind(&input.protocol)
         .bind(input.priority)
@@ -223,10 +227,14 @@ impl Database {
             ));
         }
         sqlx::query("DELETE FROM model_route_upstream_accounts WHERE tenant_id = $1 AND model_route_id = $2")
-            .bind(current_view.tenant_id.to_string()).bind(route_id.to_string()).execute(&mut *tx).await?;
+            .bind(&tenant_id).bind(route_id.to_string()).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO model_route_upstream_accounts (tenant_id, model_route_id, upstream_account_id, upstream_model, scheduling_weight, created_at, catalog_policy) VALUES ($1, $2, $3, $4, 100, $5, 'explicit_custom')")
-            .bind(current_view.tenant_id.to_string()).bind(route_id.to_string()).bind(input.upstream_account_id.to_string())
+            .bind(&tenant_id).bind(route_id.to_string()).bind(input.upstream_account_id.to_string())
             .bind(upstream_model).bind(updated_at).execute(&mut *tx).await?;
+        if current_view.enabled {
+            ensure_route_has_eligible_candidate(&mut tx, self.backend, &tenant_id, route_id)
+                .await?;
+        }
         tx.commit().await?;
         Ok(ModelRouteView {
             id: route_id,
@@ -273,7 +281,8 @@ impl Database {
             // Serialize this activation with routing-relation replacement, so
             // the candidate verified below is part of this status change.
             lock_routing_relation_writes(&mut tx, &tenant_id).await?;
-            ensure_route_has_eligible_candidate(&mut tx, &tenant_id, route_id).await?;
+            ensure_route_has_eligible_candidate(&mut tx, self.backend, &tenant_id, route_id)
+                .await?;
         }
         let updated_at = unix_millis().max(route.updated_at.saturating_add(1));
         let changed = sqlx::query(
@@ -421,9 +430,9 @@ impl Database {
         key_material: &[u8],
     ) -> Result<Option<ResolvedUpstream>, AppError> {
         let sql = if upstream_account_id.is_some() {
-            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $5) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND a.id = $4 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $5) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND a.id = $4 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
         } else {
-            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $4) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $4) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
         };
         let query = sqlx::query(sql)
             .bind(tenant_id.to_string())
@@ -446,6 +455,7 @@ impl Database {
         Ok(Some(ResolvedUpstream {
             route_id: parse_uuid(row.try_get("route_id")?)?,
             account_id: parse_uuid(row.try_get("account_id")?)?,
+            credential_generation: row.try_get("credential_generation")?,
             driver: row.try_get("driver")?,
             base_url,
             config,
@@ -505,6 +515,10 @@ fn validate_model_route_fields(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "routes/readiness_tests.rs"]
+mod readiness_tests;
 
 #[cfg(test)]
 mod tests {
@@ -636,66 +650,6 @@ mod tests {
                 .await
         })
         .await;
-    }
-
-    #[tokio::test]
-    async fn expired_only_credential_cannot_activate_a_route() {
-        let (_directory, database, _upstream_account_id) = sqlite_database().await;
-        let expired = database
-            .create_upstream_account(
-                CreateUpstreamAccountInput {
-                    tenant_external_id: TENANT.to_owned(),
-                    name: "expired-oauth-upstream".to_owned(),
-                    driver: "http-json".to_owned(),
-                    config: serde_json::json!({"base_url": "http://127.0.0.1:2"}),
-                    credential: UpstreamCredential::OAuth {
-                        access_token: "expired-access-token".to_owned(),
-                        refresh_token: None,
-                        expires_at: Some(unix_millis()),
-                        header: "authorization".to_owned(),
-                        prefix: "Bearer ".to_owned(),
-                        adapter_state: None,
-                        proxy_url: None,
-                        proxy_network_scope: None,
-                    },
-                    oauth_session_id: None,
-                    oauth_driver: None,
-                    oauth_refresh_url: None,
-                },
-                PEPPER,
-            )
-            .await
-            .expect("create expired OAuth account");
-        let route = database
-            .create_model_route(CreateModelRouteInput {
-                tenant_external_id: TENANT.to_owned(),
-                public_model: "expired-only-public".to_owned(),
-                upstream_account_id: expired.id,
-                upstream_model: "expired-only-upstream".to_owned(),
-                protocol: "openai".to_owned(),
-                priority: 0,
-            })
-            .await
-            .expect("create route fixture");
-        let disabled = database
-            .set_model_route_enabled(route.id, TENANT, false, route.updated_at)
-            .await
-            .expect("disable route fixture");
-        assert!(matches!(
-            database
-                .set_model_route_enabled(route.id, TENANT, true, disabled.updated_at)
-                .await,
-            Err(AppError::BadRequest(_))
-        ));
-        let persisted = database
-            .list_model_routes(Some(TENANT))
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|candidate| candidate.id == route.id)
-            .unwrap();
-        assert!(!persisted.enabled);
-        assert_eq!(persisted.updated_at, disabled.updated_at);
     }
 
     #[tokio::test]

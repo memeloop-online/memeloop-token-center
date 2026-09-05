@@ -1084,7 +1084,7 @@ impl Database {
         key_material: &[u8],
     ) -> Result<Option<ResolvedUpstream>, AppError> {
         let row = sqlx::query(
-            "SELECT a.id AS account_id, a.driver, a.config_json, c.credential_ciphertext
+            "SELECT a.id AS account_id, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext
              FROM upstream_accounts a
              JOIN upstream_credentials c
                ON c.upstream_account_id = a.id
@@ -1111,6 +1111,7 @@ impl Database {
         Ok(Some(ResolvedUpstream {
             route_id: job.model_route_id.unwrap_or_else(Uuid::nil),
             account_id: parse_uuid(row.try_get("account_id")?)?,
+            credential_generation: row.try_get("credential_generation")?,
             driver: job.driver.clone(),
             base_url,
             config,
