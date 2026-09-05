@@ -19,6 +19,8 @@ use crate::{
 
 #[path = "codex_transport/bad_request.rs"]
 mod bad_request;
+#[path = "codex_transport/unique_json.rs"]
+mod unique_json;
 
 #[cfg(test)]
 use bad_request::codex_transient_error;
@@ -909,7 +911,7 @@ impl BufferedResponsesParser {
                 Err("upstream_incomplete_response")
             };
         }
-        let value: Value = serde_json::from_slice(data).map_err(|_| "upstream_invalid_response")?;
+        let value = unique_json::parse(data)?;
         let payload_kind = value
             .get("type")
             .and_then(Value::as_str)
@@ -941,13 +943,16 @@ impl BufferedResponsesParser {
             kind,
             "response.queued" | "response.created" | "response.in_progress" | "response.completed"
         ) {
-            self.observe_response_id(&value, kind == "response.completed")?;
+            self.observe_response_id(&value, true)?;
         }
         match kind {
             "response.output_item.done" => {
                 if self.completed_response.is_some() || self.terminal_failure {
                     self.invalid = true;
                     return Ok(());
+                }
+                if self.response_id.is_none() {
+                    return Err("upstream_invalid_response");
                 }
                 let index = value
                     .get("output_index")
@@ -1259,6 +1264,7 @@ mod tests {
     fn completed_stream_with_usage(usage: &Value) -> Vec<u8> {
         format!(
             concat!(
+                "data: {{\"type\":\"response.queued\",\"response\":{{\"id\":\"resp-usage\"}}}}\n\n",
                 "data: {{\"type\":\"response.output_item.done\",\"output_index\":0,",
                 "\"item\":{{\"id\":\"item-billable\",\"type\":\"message\",",
                 "\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",",
@@ -1373,6 +1379,40 @@ mod tests {
                 .as_bytes(),
             )
             .unwrap_err();
+
+        for lifecycle in [
+            "response.queued",
+            "response.created",
+            "response.in_progress",
+        ] {
+            let mut missing_id = BufferedResponsesParser::default();
+            missing_id
+                .push(
+                    format!("data: {{\"type\":\"{lifecycle}\",\"response\":{{}}}}\n\n").as_bytes(),
+                )
+                .unwrap_err();
+        }
+        let mut item_before_id = BufferedResponsesParser::default();
+        item_before_id
+            .push(
+                b"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item-a\"}}\n\n",
+            )
+            .unwrap_err();
+    }
+
+    #[test]
+    fn buffered_parser_rejects_duplicate_keys_at_every_semantic_level() {
+        for stream in [
+            concat!(
+                "data: {\"type\":\"response.created\",\"type\":\"response.queued\",\"response\":{\"id\":\"a\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"a\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+            ),
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"a\",\"id\":\"b\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"a\",\"output\":[],\"usage\":{\"input_tokens\":1,\"input_tokens\":0,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        ] {
+            let mut parser = BufferedResponsesParser::default();
+            parser.push(stream.as_bytes()).unwrap_err();
+        }
     }
 
     #[test]
