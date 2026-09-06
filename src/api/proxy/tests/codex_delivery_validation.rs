@@ -196,7 +196,10 @@ async fn buffered_codex_cache_usage_is_settled_at_distinct_prices() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].input_tokens, 5);
+    // Request records retain the upstream's inclusive input total. Cached and
+    // cache-write tokens are persisted separately and the exact-cost checks
+    // below prove that the three categories were settled at distinct prices.
+    assert_eq!(rows[0].input_tokens, 10);
     assert_eq!(rows[0].cached_input_tokens, 3);
     assert_eq!(rows[0].cache_write_tokens, 2);
     assert_eq!(rows[0].output_tokens, 1);
@@ -279,7 +282,9 @@ async fn streaming_codex_cache_usage_is_settled_at_distinct_prices() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(200));
-    assert_eq!(rows[0].input_tokens, 5);
+    // See the buffered counterpart: this is the upstream's inclusive input
+    // total, while the cache categories below remain independently priced.
+    assert_eq!(rows[0].input_tokens, 10);
     assert_eq!(rows[0].cached_input_tokens, 3);
     assert_eq!(rows[0].cache_write_tokens, 2);
     assert_eq!(rows[0].output_tokens, 1);

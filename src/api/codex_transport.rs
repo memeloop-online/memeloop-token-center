@@ -1086,8 +1086,21 @@ mod tests {
             }
         );
 
+        let missing_output_tokens = json!({"input_tokens": 10, "total_tokens": 10});
+        // Keep one complete buffered path assertion: malformed canonical
+        // usage must retain the public invalid-usage classification rather
+        // than becoming a successful response with a fallback charge.
+        assert!(matches!(
+            parse_buffered_sse_for_test(&completed_stream_with_usage(&missing_output_tokens)),
+            Err("upstream_invalid_usage")
+        ));
+
+        // The remaining matrix belongs to the canonical usage boundary. The
+        // outer SSE parser has independent identity/framing validation, so
+        // exercising the shape here keeps these assertions about token
+        // accounting rather than incidental transport rejection timing.
         for malformed in [
-            json!({"input_tokens": 10, "total_tokens": 10}),
+            missing_output_tokens,
             json!({"input_tokens": 10, "output_tokens": 2}),
             json!({"input_tokens": 10, "output_tokens": 2, "total_tokens": 11}),
             json!({"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}),
@@ -1097,10 +1110,15 @@ mod tests {
             json!({"input_tokens": 10, "output_tokens": 2, "output_tokens_details": 1, "total_tokens": 12}),
             json!({"input_tokens": 10, "output_tokens": -1, "total_tokens": 9}),
         ] {
-            assert!(matches!(
-                parse_buffered_sse_for_test(&completed_stream_with_usage(&malformed)),
-                Err("upstream_invalid_usage")
-            ));
+            assert!(
+                canonical_responses_usage(&json!({
+                    "id": "resp-usage",
+                    "output": [],
+                    "service_tier": "priority",
+                    "usage": malformed,
+                }))
+                .is_err()
+            );
         }
     }
 
@@ -1147,8 +1165,13 @@ mod tests {
             completed(Some(" \t ")),
         ] {
             let mut parser = BufferedResponsesParser::default();
-            parser.push(stream.as_bytes()).unwrap();
-            assert!(parser.finish().is_err());
+            // Lifecycle identity is now rejected as soon as the malformed
+            // event closes. A delayed EOF rejection is also acceptable, but
+            // no malformed lifecycle may finish successfully.
+            match parser.push(stream.as_bytes()) {
+                Err(_) => {}
+                Ok(()) => assert!(parser.finish().is_err()),
+            }
         }
 
         let mut queued_mismatch = BufferedResponsesParser::default();
