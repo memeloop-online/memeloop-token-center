@@ -213,6 +213,13 @@ async fn assert_response_archives_omit(fixture: &CodexRouteFixture, sensitive: &
         let Some(response_object) = refs.response_object else {
             continue;
         };
+        // Text delivery deliberately records a gap locator when the bounded
+        // archive sidecar cannot finish in time. There is no stored body to
+        // inspect in that accepted availability path; malformed non-gap
+        // locators must still fail below.
+        if response_object.starts_with("gap://") {
+            continue;
+        }
         let archived = fixture.state.archive.get(&response_object).await.unwrap();
         assert!(
             !String::from_utf8_lossy(&archived).contains(sensitive),
