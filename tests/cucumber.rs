@@ -6211,6 +6211,14 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
 
 #[when("the bootstrap service creates a tenant scoped service token")]
 async fn create_scoped_service_token(world: &mut TokenCenterWorld) {
+    world
+        .state
+        .as_ref()
+        .expect("test application state")
+        .db
+        .create_tenant("scoped-tenant", None)
+        .await
+        .expect("create active scoped tenant");
     let response = world
         .client
         .post(format!("{}/internal/v1/service-tokens", world.service_url))
