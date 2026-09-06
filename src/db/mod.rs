@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{
-    any::{AnyPoolOptions, AnyQueryResult, AnyRow},
     Any, AnyConnection, AnyPool, Row, Transaction,
+    any::{AnyPoolOptions, AnyQueryResult, AnyRow},
 };
 use uuid::Uuid;
 
@@ -52,8 +52,8 @@ mod routing;
 mod rows;
 mod session_analytics;
 mod session_projection;
-mod time;
 mod tenants;
+mod time;
 mod usage_analysis;
 mod validation;
 

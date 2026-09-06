@@ -157,13 +157,12 @@ impl Database {
                 "tenant already has this lifecycle state".into(),
             ));
         }
-        let changed =
-            sqlx::query("UPDATE tenants SET status = $1, updated_at = $2 WHERE id = $3")
-                .bind(status)
-                .bind(now)
-                .bind(tenant.0.to_string())
-                .execute(&mut *transaction)
-                .await?;
+        let changed = sqlx::query("UPDATE tenants SET status = $1, updated_at = $2 WHERE id = $3")
+            .bind(status)
+            .bind(now)
+            .bind(tenant.0.to_string())
+            .execute(&mut *transaction)
+            .await?;
         if changed.rows_affected() != 1 {
             return Err(AppError::Conflict(
                 "reload the tenant before changing its lifecycle state".into(),
