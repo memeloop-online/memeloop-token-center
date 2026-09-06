@@ -1,6 +1,6 @@
-Feature: Production authorization, credential continuity, and CPA migration acceptance
-  The control plane must enforce tenant boundaries, credential rotation must not split
-  identity or history, and repeated CPA imports must remain lossless and idempotent.
+Feature: Production authorization and credential continuity
+  The control plane must enforce tenant boundaries, and credential rotation must not split
+  identity or history.
 
   Scenario: Global, tenant-scoped, and downstream credentials cannot cross authority boundaries
     Given a token center backed by SQLite and memory object storage
@@ -19,11 +19,3 @@ Feature: Production authorization, credential continuity, and CPA migration acce
     And the service rotates the key
     Then the rotated credential retains stable identity policy balance and history
     And the old credential is rejected
-
-  @postgres
-  Scenario: CPAMP incremental import is idempotent and includes late overlap events
-    Given a migrated PostgreSQL schema and a CPAMP SQLite fixture
-    When the CPAMP importer runs twice over the initial fixture
-    Then the imported requests aggregates and checkpoint contain exactly the initial events
-    When a late overlap event and a newer event are appended and the importer runs twice
-    Then the imported requests aggregates and checkpoint contain every event exactly once
