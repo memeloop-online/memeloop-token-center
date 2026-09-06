@@ -3876,7 +3876,7 @@ components:
       name: Idempotency-Key
       in: header
       required: false
-      description: An exact replay within 30 days returns the same stable route with `X-MTC-Route-Create-Disposition: reused`. Use one opaque operation identifier per logical create, never credentials or request content. New automation must require this header and never use a header-less equivalent response as ownership proof.
+      description: 'An exact replay within 30 days returns the same stable route with `X-MTC-Route-Create-Disposition: reused`. Use one opaque operation identifier per logical create, never credentials or request content. New automation must require this header and never use a header-less equivalent response as ownership proof.'
       schema: { type: string, minLength: 1, maxLength: 200, pattern: '^[!-~]+$' }
     RequiredIdempotencyKey:
       name: Idempotency-Key

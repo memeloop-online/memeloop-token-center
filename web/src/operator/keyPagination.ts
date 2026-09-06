@@ -1,4 +1,4 @@
-import type { KeyListCursor, KeyListPage, KeyView } from '../types';
+import type { KeyListCursor, KeyListPage, KeyView } from '../types.js';
 
 /**
  * Keep the rendered page smaller than the API maximum and ask for one
