@@ -793,6 +793,11 @@ pub(super) async fn proxy(
                 .await;
         }
         let failover_reason = match &result {
+            // A 429 rejects the attempt before model execution, so moving to
+            // another healthy account cannot duplicate billable work.
+            Ok(result) if result.response.status() == StatusCode::TOO_MANY_REQUESTS => {
+                Some(UpstreamHealthReason::RateLimited)
+            }
             Err(ProxySendError::RetryableConnection) => failure.map(|(_, reason)| reason),
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable) => {
                 Some(UpstreamHealthReason::Unavailable)

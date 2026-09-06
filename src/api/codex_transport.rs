@@ -81,6 +81,7 @@ const PASSTHROUGH_HEADERS: &[&str] = &[
     "x-openai-internal-codex-responses-lite",
 ];
 const MAX_PASSTHROUGH_HEADER_BYTES: usize = 4 * 1024;
+const IMAGE_GENERATION_TOOL_TYPE: &str = "image_generation";
 
 pub(super) struct PreparedCodexRequest {
     pub downstream_stream: bool,
@@ -157,6 +158,7 @@ pub(super) fn prepare_request_with_id(
     object.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
     object.insert("stream".to_owned(), Value::Bool(true));
     object.insert("store".to_owned(), Value::Bool(false));
+    ensure_image_generation_tool(object, upstream_model);
     if object
         .get("tools")
         .and_then(Value::as_array)
@@ -190,6 +192,45 @@ pub(super) fn prepare_request_with_id(
         output_token_ceiling,
         session_id,
     })
+}
+
+fn ensure_image_generation_tool(object: &mut Map<String, Value>, upstream_model: &str) {
+    if upstream_model.ends_with("spark") {
+        return;
+    }
+    let tools = object
+        .entry("tools".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(tools) = tools.as_array_mut() else {
+        return;
+    };
+    if tools.iter().any(is_image_generation_tool) {
+        return;
+    }
+    tools.push(json!({
+        "type": IMAGE_GENERATION_TOOL_TYPE,
+        "output_format": "png"
+    }));
+}
+
+fn is_image_generation_tool(tool: &Value) -> bool {
+    let Some(tool) = tool.as_object() else {
+        return false;
+    };
+    match tool.get("type").and_then(Value::as_str) {
+        Some(IMAGE_GENERATION_TOOL_TYPE) => true,
+        Some("function") => tool.get("name").and_then(Value::as_str) == Some("image_gen.imagegen"),
+        Some("namespace") if tool.get("name").and_then(Value::as_str) == Some("image_gen") => tool
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool.get("type").and_then(Value::as_str) == Some("function")
+                        && tool.get("name").and_then(Value::as_str) == Some("imagegen")
+                })
+            }),
+        _ => false,
+    }
 }
 
 fn normalize_prompt_cache_key(
@@ -903,7 +944,11 @@ mod tests {
         assert_eq!(plan.output_token_ceiling, 65_536);
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
-        assert!(body.get("parallel_tool_calls").is_none());
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(
+            body["tools"],
+            json!([{"type": "image_generation", "output_format": "png"}])
+        );
         assert_eq!(body["instructions"], "");
         assert!(body.get("temperature").is_none());
         assert_eq!(body["input"][0]["role"], "user");
@@ -922,6 +967,7 @@ mod tests {
         });
         prepare_request(&mut with_tools, "gpt-codex", &config("gpt-codex", 65_536)).unwrap();
         assert_eq!(with_tools["parallel_tool_calls"], true);
+        assert_eq!(with_tools["tools"].as_array().unwrap().len(), 2);
 
         let once = body.clone();
         let second = prepare_request(&mut body, "gpt-codex", &config("gpt-codex", 65_536)).unwrap();
@@ -939,6 +985,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(null_instructions["instructions"], "");
+
+        let mut spark = json!({"model": "public", "input": []});
+        prepare_request(
+            &mut spark,
+            "gpt-5.3-codex-spark",
+            &config("gpt-5.3-codex-spark", 10),
+        )
+        .unwrap();
+        assert!(spark.get("tools").is_none());
+        assert!(spark.get("parallel_tool_calls").is_none());
+
+        let mut existing_image_tool = json!({
+            "model": "public",
+            "input": [],
+            "tools": [{"type": "image_generation", "output_format": "jpeg"}]
+        });
+        prepare_request(
+            &mut existing_image_tool,
+            "gpt-codex",
+            &config("gpt-codex", 10),
+        )
+        .unwrap();
+        assert_eq!(existing_image_tool["tools"].as_array().unwrap().len(), 1);
     }
 
     #[test]

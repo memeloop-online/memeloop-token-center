@@ -661,7 +661,7 @@ async fn stable_session_keeps_the_same_candidate_when_the_set_is_unchanged() {
 }
 
 #[tokio::test]
-async fn rate_limit_response_is_not_replayed_and_the_next_request_uses_standby() {
+async fn rate_limit_response_fails_over_to_standby_in_the_same_request() {
     let unavailable = MockServer::start().await;
     let healthy = MockServer::start().await;
     Mock::given(method("POST"))
@@ -679,9 +679,6 @@ async fn rate_limit_response_is_not_replayed_and_the_next_request_uses_standby()
     let fixture =
         resilient_route_fixture("failover", &[(unavailable.uri(), 0), (healthy.uri(), 10)]).await;
     let response = send_resilient_chat(&fixture, Some("failover-session"), false).await;
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    let response = send_resilient_chat(&fixture, Some("failover-session-2"), false).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     unavailable.verify().await;
@@ -768,7 +765,7 @@ async fn codex_transient_400_is_not_replayed_across_accounts() {
 }
 
 #[tokio::test]
-async fn codex_retry_then_http_response_is_not_replayed_across_accounts() {
+async fn codex_retry_then_definite_429_fails_over_but_5xx_does_not() {
     for (label, second_status, failure_kind) in [
         ("429", StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         ("5xx", StatusCode::BAD_GATEWAY, "unavailable"),
@@ -799,6 +796,7 @@ async fn codex_retry_then_http_response_is_not_replayed_across_accounts() {
             .expect(2)
             .mount(&upstream)
             .await;
+        let should_failover = second_status == StatusCode::TOO_MANY_REQUESTS;
         Mock::given(method("POST"))
             .and(path(codex_transport::RESPONSES_PATH))
             .and(header_matcher("chatgpt-account-id", "account-456"))
@@ -806,14 +804,14 @@ async fn codex_retry_then_http_response_is_not_replayed_across_accounts() {
                 completed_codex_sse("standby after retryable status").into_bytes(),
                 "text/event-stream",
             ))
-            .expect(0)
+            .expect(usize::from(should_failover) as u64)
             .mount(&upstream)
             .await;
         // The grant must remain in the key's tenant. The route label is only
         // descriptive; using it as a distinct tenant now correctly trips the
         // tenant-scoped routing-grant foreign key.
         let standby_tenant = format!("codex-route-{fixture_name}");
-        let _standby = add_codex_standby_route(&fixture, &standby_tenant, "account-456").await;
+        let standby = add_codex_standby_route(&fixture, &standby_tenant, "account-456").await;
 
         let response = send_codex_route(
             &fixture,
@@ -822,12 +820,18 @@ async fn codex_retry_then_http_response_is_not_replayed_across_accounts() {
             json!({"model": fixture.model, "input": "retry then status", "stream": true}),
         )
         .await;
-        assert_eq!(response.status(), second_status, "{label}");
+        let expected_status = if should_failover {
+            StatusCode::OK
+        } else {
+            second_status
+        };
+        assert_eq!(response.status(), expected_status, "{label}");
         let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        assert!(
-            !String::from_utf8_lossy(&body).contains("standby after retryable status"),
+        assert_eq!(
+            String::from_utf8_lossy(&body).contains("standby after retryable status"),
+            should_failover,
             "{label}"
         );
         assert!(
@@ -843,10 +847,9 @@ async fn codex_retry_then_http_response_is_not_replayed_across_accounts() {
             .unwrap();
         assert_eq!(
             rows[0].status_code,
-            Some(i64::from(second_status.as_u16())),
+            Some(i64::from(expected_status.as_u16())),
             "{label}"
         );
-        assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let actual: String = sqlx::query_scalar(
             "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -855,7 +858,25 @@ async fn codex_retry_then_http_response_is_not_replayed_across_accounts() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(actual, fixture.upstream_account_id.to_string(), "{label}");
+        let expected_account = if should_failover {
+            standby
+        } else {
+            fixture.upstream_account_id
+        };
+        assert_eq!(actual, expected_account.to_string(), "{label}");
+        let expected_route = if should_failover {
+            let route_id: String = sqlx::query_scalar(
+                "SELECT id FROM model_routes WHERE upstream_account_id = $1 AND public_model = $2",
+            )
+            .bind(standby.to_string())
+            .bind(&fixture.model)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            Uuid::parse_str(&route_id).unwrap()
+        } else {
+            fixture.route_id
+        };
         let actual_failure: String = sqlx::query_scalar(
             "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
         )
@@ -865,6 +886,14 @@ async fn codex_retry_then_http_response_is_not_replayed_across_accounts() {
         .unwrap();
         assert_eq!(actual_failure, failure_kind, "{label}");
         pool.close().await;
+        assert_exactly_once_side_effects_for(
+            &fixture,
+            rows[0].request_id,
+            None,
+            expected_account,
+            expected_route,
+        )
+        .await;
         let rendered_metrics = fixture
             .state
             .metrics
@@ -1858,6 +1887,23 @@ async fn assert_exactly_once_side_effects(
     request_id: Uuid,
     expected_response_id: Option<&str>,
 ) {
+    assert_exactly_once_side_effects_for(
+        fixture,
+        request_id,
+        expected_response_id,
+        fixture.upstream_account_id,
+        fixture.route_id,
+    )
+    .await;
+}
+
+async fn assert_exactly_once_side_effects_for(
+    fixture: &CodexRouteFixture,
+    request_id: Uuid,
+    expected_response_id: Option<&str>,
+    expected_account_id: Uuid,
+    expected_route_id: Uuid,
+) {
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let row = sqlx::query(
         "SELECT q.upstream_account_id, q.model_route_id, r.status AS reservation_status, (SELECT COUNT(*) FROM usage_reservations x WHERE x.id = q.reservation_id) AS reservation_count, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = q.id) AS fact_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS event_count, (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id) AS observation_count, (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id AND o.upstream_response_id = $2) AS response_observation_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1",
@@ -1869,11 +1915,11 @@ async fn assert_exactly_once_side_effects(
     .unwrap();
     assert_eq!(
         row.get::<String, _>("upstream_account_id"),
-        fixture.upstream_account_id.to_string()
+        expected_account_id.to_string()
     );
     assert_eq!(
         row.get::<String, _>("model_route_id"),
-        fixture.route_id.to_string()
+        expected_route_id.to_string()
     );
     assert_eq!(row.get::<String, _>("reservation_status"), "settled");
     for field in [
