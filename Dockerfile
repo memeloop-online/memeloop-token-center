@@ -4,7 +4,7 @@ ARG RUST_IMAGE=rust:1.95.0-bookworm
 ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
 
 FROM ${NODE_IMAGE} AS web-builder
-ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG NPM_REGISTRY=https://registry.npmjs.org
 WORKDIR /build/web
 COPY web/package.json web/package-lock.json ./
 RUN npm config set registry "${NPM_REGISTRY}" && npm ci
@@ -12,13 +12,9 @@ COPY web ./
 RUN npm run build
 
 FROM ${RUST_IMAGE} AS builder
-ARG CARGO_REGISTRY=sparse+https://rsproxy.cn/index/
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake clang perl pkg-config \
     && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /usr/local/cargo \
-    && printf '[source.crates-io]\nreplace-with = "build-mirror"\n[source.build-mirror]\nregistry = "%s"\n' "${CARGO_REGISTRY}" \
-      > /usr/local/cargo/config.toml
 WORKDIR /build
 # Keep dependency-cache cleanup deterministic even when a trusted mirror base
 # image defines its own global Cargo target directory.

@@ -37,6 +37,11 @@ test('release workflow and Docker packaging remain immutable and attested', () =
   ]) assert.ok(dockerfile.includes(needle), `Dockerfile lacks ${needle}`);
   assert.ok(plugin.includes('ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot'));
   assert.ok(!dockerfile.includes('DEBIAN_MIRROR') && !plugin.includes('DEBIAN_MIRROR'));
+  for (const source of [dockerfile, importer, plugin]) {
+    assert.ok(!source.includes('rsproxy.cn') && !source.includes('npmmirror.com'));
+  }
+  assert.ok(dockerfile.includes('ARG NPM_REGISTRY=https://registry.npmjs.org'));
+  assert.ok(importer.includes('ARG NPM_REGISTRY=https://registry.npmjs.org'));
   assert.ok(importer.includes('ARG RUNTIME_IMAGE=alpine:3.23.5'));
   for (const needle of [
     'COPY ops/migrate-cpamp.ts ops/audit-cpa-migration.ts ops/import-cpa-session-archive.ts ./ops/',

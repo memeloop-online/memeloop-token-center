@@ -3,7 +3,7 @@ ARG RUNTIME_IMAGE=alpine:3.23.5
 ARG NODE_IMAGE=node:24.18.0-bookworm-slim
 
 FROM ${NODE_IMAGE} AS scripts
-ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG NPM_REGISTRY=https://registry.npmjs.org
 WORKDIR /source
 COPY package.json package-lock.json ./
 RUN npm config set registry "${NPM_REGISTRY}" && npm ci --ignore-scripts
