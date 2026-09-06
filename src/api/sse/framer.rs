@@ -60,19 +60,30 @@ pub(in crate::api) struct BoundedSseLine {
 
 pub(in crate::api) const SAFE_SSE_HEARTBEAT_COMMENT: &[u8] = b": heartbeat";
 
-/// Preserve framing while replacing untrusted upstream comment bodies. The
-/// delivery/archive path uses this for protocols without the Responses
-/// sanitizer as well.
-pub(in crate::api) fn redacted_sse_event_bytes(event: &BoundedSseEvent) -> Bytes {
-    if !event.lines.iter().any(|line| line.value.starts_with(b":")) {
-        return event.bytes.clone();
-    }
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(in crate::api) enum SseEventMetadataPolicy {
+    DataOnly,
+    ValidatedEventNames,
+}
+
+/// Preserve data bytes and framing while allowing only a fixed heartbeat from
+/// upstream metadata. Event names require an explicit validated policy; ids,
+/// retry hints, and unknown fields are never copied to delivery or archive.
+pub(in crate::api) fn redacted_sse_event_bytes(
+    event: &BoundedSseEvent,
+    metadata_policy: SseEventMetadataPolicy,
+) -> Bytes {
     let mut output = Vec::with_capacity(event.bytes.len());
     for line in &event.lines {
         if line.value.starts_with(b":") {
             output.extend_from_slice(SAFE_SSE_HEARTBEAT_COMMENT);
-        } else {
+        } else if is_sse_field_line(&line.value, b"data")
+            || (metadata_policy == SseEventMetadataPolicy::ValidatedEventNames
+                && is_sse_field_line(&line.value, b"event"))
+        {
             output.extend_from_slice(&line.value);
+        } else {
+            continue;
         }
         output.extend_from_slice(&line.ending);
     }

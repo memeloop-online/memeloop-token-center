@@ -1330,10 +1330,8 @@ impl ResponsesSseCapture {
         for event in batch.events {
             if self.saw_done {
                 if event.is_line_ending_continuation {
-                    self.finish_delivery_event(
-                        super::sse::redacted_sse_event_bytes(&event),
-                        ChatSseDeliveryClass::Control,
-                    );
+                    let bytes = Self::delivery_event_bytes(&event);
+                    self.finish_delivery_event(bytes, ChatSseDeliveryClass::Control);
                 }
                 continue;
             }
@@ -1353,14 +1351,13 @@ impl ResponsesSseCapture {
                 {
                     continue;
                 }
-                self.finish_delivery_event(
-                    super::sse::redacted_sse_event_bytes(&event),
-                    ChatSseDeliveryClass::Control,
-                );
+                let bytes = Self::delivery_event_bytes(&event);
+                self.finish_delivery_event(bytes, ChatSseDeliveryClass::Control);
                 continue;
             }
             let class = self.dispatch_event(&event);
-            self.finish_delivery_event(super::sse::redacted_sse_event_bytes(&event), class);
+            let bytes = Self::delivery_event_bytes(&event);
+            self.finish_delivery_event(bytes, class);
         }
         Ok(())
     }
@@ -1410,10 +1407,12 @@ impl ResponsesSseCapture {
             && !self.framer.has_pending_crlf_continuation()
     }
 
+    #[cfg(test)]
     fn saw_done(&self) -> bool {
         self.saw_done
     }
 
+    #[cfg(test)]
     fn has_pending_crlf_continuation(&self) -> bool {
         self.framer.has_pending_crlf_continuation()
     }
@@ -1433,6 +1432,26 @@ impl ResponsesSseCapture {
                 billable: matches!(class, ChatSseDeliveryClass::Billable),
             });
         }
+    }
+
+    fn delivery_event_bytes(event: &super::sse::BoundedSseEvent) -> Bytes {
+        let metadata_policy = if Self::event_name_matches_payload(event) {
+            super::sse::SseEventMetadataPolicy::ValidatedEventNames
+        } else {
+            super::sse::SseEventMetadataPolicy::DataOnly
+        };
+        super::sse::redacted_sse_event_bytes(event, metadata_policy)
+    }
+
+    fn event_name_matches_payload(event: &super::sse::BoundedSseEvent) -> bool {
+        let Ok((Some(event_name), Some(data))) = super::sse::parse_sse_event(event) else {
+            return false;
+        };
+        serde_json::from_slice::<Value>(&data)
+            .ok()
+            .is_some_and(|value| {
+                value.get("type").and_then(Value::as_str) == Some(event_name.as_str())
+            })
     }
 
     fn dispatch_event(&mut self, event: &super::sse::BoundedSseEvent) -> ChatSseDeliveryClass {

@@ -346,3 +346,58 @@ async fn oversized_chat_event_errors_downstream_and_cannot_recover_into_done() {
         Some(format!("gap://{}/response", rows[0].request_id).as_str())
     );
 }
+
+#[tokio::test]
+async fn strict_chat_strips_secret_event_metadata_without_changing_settlement() {
+    let upstream = MockServer::start().await;
+    let secret = "Authorization-Bearer-event-secret";
+    let event_prefix = format!("event: {secret}\ndata: ");
+    let content = chat_content("chatcmpl-secret-event").replacen("data: ", &event_prefix, 1);
+    let sse = [
+        content,
+        chat_finish("chatcmpl-secret-event"),
+        chat_usage_only("chatcmpl-secret-event", usage(29, 7, 36)),
+        done().to_owned(),
+    ]
+    .concat();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = response_usage_fixture("chat-secret-event", &upstream, 0).await;
+    let response = send_chat_usage_request(&fixture, &chat_request(&fixture.model)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let delivered = String::from_utf8(body.to_vec()).unwrap();
+    assert!(delivered.contains("\"content\":\"ok\""));
+    assert!(!delivered.contains(secret));
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].cost, "0.000036");
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    let archived = fixture
+        .state
+        .archive
+        .get(refs.response_object.as_deref().expect("response archive"))
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&archived).contains(secret));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    upstream.verify().await;
+}

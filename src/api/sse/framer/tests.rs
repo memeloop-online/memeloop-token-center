@@ -146,3 +146,24 @@ fn emits_idle_comments_without_an_empty_line_and_keeps_pending_data_buffered() {
     assert!(batch.events.is_empty());
     assert!(!framer.is_complete());
 }
+
+#[test]
+fn delivery_bytes_strip_untrusted_metadata_and_preserve_data_crlf() {
+    let wire = concat!(
+        "event: Authorization-Bearer-event-secret\r\n",
+        "id: id-secret\r\n",
+        "retry: retry-secret\r\n",
+        "x-provider: metadata-secret\r\n",
+        "data: {\"safe\":true}\r\n",
+        ": comment-secret\r\n",
+        "\r\n"
+    );
+    let mut framer = BoundedSseFramer::default();
+    let batch = framer.push(wire.as_bytes());
+    assert_eq!(batch.rejection, None);
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(
+        redacted_sse_event_bytes(&batch.events[0], SseEventMetadataPolicy::DataOnly),
+        Bytes::from_static(b"data: {\"safe\":true}\r\n: heartbeat\r\n\r\n")
+    );
+}
