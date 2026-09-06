@@ -181,6 +181,13 @@ export async function requestJson<T>(path: string, options: JsonRequest = {}): P
 }
 
 async function seedThroughHttp(): Promise<SeedState> {
+  // Keep the browser contract representative of both supported scopes: the
+  // tenant-scoped service below sees only `tenant`, while the global service
+  // can select between it and this empty default tenant.
+  await requestJson('/internal/v1/tenant-management', {
+    method: 'POST', credential: bootstrapToken,
+    body: { external_id: 'default' },
+  });
   const upstream = await requestJson<{ id: string }>('/internal/v1/upstreams', {
     method: 'POST', credential: bootstrapToken,
     body: {

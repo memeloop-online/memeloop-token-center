@@ -127,7 +127,7 @@ Then('中英文都显示安全的无效凭据提示且浏览器没有失败', as
 });
 
 When('管理员以中文亮色主题打开模型计费', async function (this: DogfoodWorld) {
-  await connectOperator(this, 'light', runtime.requireSeed().globalServiceCredential);
+  await connectOperator(this, 'light', runtime.requireSeed().globalServiceCredential, 'visible');
   const page = this.requirePage();
   await openAppRoute(page, 'operator', 'pricing');
   await assertVisible(page.getByRole('heading', { name: '多模态生成价格', exact: true }));
@@ -216,7 +216,7 @@ When('管理员通过可见生成任务页查看排队任务详情并取消', as
     assert.equal(route.request().method(), 'GET');
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(job) });
   });
-  await connectOperator(this, 'light', seed.globalServiceCredential);
+  await connectOperator(this, 'light', seed.globalServiceCredential, 'visible');
   await openAppRoute(page, 'operator', 'generations');
   const panel = page.locator('.operator-generations');
   await assertContains(panel, 'browser-operator-generation');
@@ -245,7 +245,7 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const imageModel = 'browser-ui-comfy-image';
   const videoModel = 'browser-ui-seedance-video';
 
-  await connectOperator(this, 'light', seed.globalServiceCredential);
+  await connectOperator(this, 'light', seed.globalServiceCredential, 'visible');
   await openAppRoute(page, 'operator', 'providers');
   const onboarding = page.locator('.provider-onboarding');
   // Successful refresh keeps the workspace and its form state mounted. Open
@@ -673,7 +673,7 @@ When('浏览器模拟实时请求流断线超过五秒并重放最后事件', as
     await route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
   });
 
-  await connectOperator(this, 'dark');
+  await connectOperator(this, 'dark', runtime.requireSeed().globalServiceCredential, 'visible');
   await openAppRoute(page, 'operator', 'requests');
   await assertCount(operatorTrafficPanel(page).locator('tbody tr').filter({ hasText: baseline.model }), 1);
   await assertCount(operatorTrafficPanel(page).locator('tbody tr').filter({ hasText: missingOne.model }), 1);

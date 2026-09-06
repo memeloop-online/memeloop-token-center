@@ -6,7 +6,7 @@ import { baseURL, eventually, model, requestJson, runtime, tenant } from '../sup
 import type { DogfoodWorld } from '../support/world.js';
 
 import { appPreferenceControls, openAppRoute, openUsageDimension } from './app-route.support.js';
-import { assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertValue, assertVisible, applyUsageFilter, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
+import { assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertOperatorTenantScope, assertValue, assertVisible, applyUsageFilter, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
 
 Given('dogfood 服务已有隔离租户、统一上游、请求记录和多模态价格', function () {
   runtime.requireSeed();
@@ -21,7 +21,7 @@ When('管理员和下游用户验证凭据记忆与手动清空', async function
   await page.reload();
   await assertValue(page.locator('.operator-credential input[type="password"]'), '');
   await assertContains(page.locator('.console-context'), '已连接');
-  await assertContains(page.locator('.tenant-picker'), tenant);
+  await assertOperatorTenantScope(page, tenant, 'hidden');
 
   await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 375, height: 812 } });
   await page.getByPlaceholder('输入客户端凭据').fill(seed.clientCredential);
@@ -45,7 +45,7 @@ When('管理员和下游用户验证凭据记忆与手动清空', async function
 
   await this.open('/operator', { theme: 'dark', locale: 'zh-CN' });
   await assertValue(page.locator('.operator-credential input[type="password"]'), '');
-  await assertContains(page.locator('.tenant-picker'), tenant);
+  await assertOperatorTenantScope(page, tenant, 'hidden');
   await page.getByRole('button', { name: '清空凭据', exact: true }).click();
   await assertNoCount(page.locator('.console-context'));
   await page.reload();

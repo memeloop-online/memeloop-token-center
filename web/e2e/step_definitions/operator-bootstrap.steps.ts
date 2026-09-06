@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { Then, When } from '@cucumber/cucumber';
+import type { Page } from 'playwright';
 
 import { eventually } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
@@ -11,6 +12,28 @@ interface ObservedRequest {
 }
 
 const observations = new WeakMap<DogfoodWorld, ObservedRequest[]>();
+
+async function waitForTenantPicker(page: Page, expectedTenant: string) {
+  const tenantPicker = page.locator('.tenant-picker select');
+  await eventually(async () => {
+    assert.equal(await tenantPicker.count(), 1, 'a multi-tenant credential must render exactly one tenant picker');
+    assert.equal(await tenantPicker.inputValue(), expectedTenant);
+  });
+}
+
+async function waitForConsoleContext(page: Page, expectedText: RegExp) {
+  await eventually(async () => {
+    assert.match((await page.locator('.console-context').allTextContents()).join(' '), expectedText);
+  });
+}
+
+async function waitForSingleTenantScope(page: Page, expectedTenant: string) {
+  await eventually(async () => {
+    assert.equal(await page.locator('.tenant-picker select').count(), 0, 'a single-tenant credential must not render a tenant picker');
+    const contextText = (await page.locator('.console-context').allTextContents()).join(' ');
+    assert.ok(contextText.includes(expectedTenant), `operator context ${JSON.stringify(contextText)} does not identify ${expectedTenant}`);
+  });
+}
 
 function deferred() {
   let resolve!: () => void;
@@ -72,10 +95,9 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   await eventually(async () => connect.click());
   await eventually(() => assert.equal(observed.filter((value) => value.credential === 'singleton-credential').length, 1));
   assert.equal(observed.find((value) => value.credential === 'singleton-credential')?.path, '/internal/v1/tenants');
-  assert.equal(await page.locator('.console-context').textContent(), '载入中…');
+  await waitForConsoleContext(page, /^载入中…$/);
   singletonTenants.resolve();
-  await eventually(async () => assert.equal(await page.locator('.tenant-picker select').count(), 0));
-  assert.match(await page.locator('.console-context').textContent() ?? '', /singleton-tenant/);
+  await waitForSingleTenantScope(page, 'singleton-tenant');
   await eventually(() => assert.ok(observed.filter((value) => value.credential === 'singleton-credential'
     && ['/internal/v1/upstreams', '/internal/v1/requests'].includes(value.path)).length >= 2));
   const singletonResources = observed.filter((value) => value.credential === 'singleton-credential'
@@ -87,7 +109,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
     assert.equal(await credentialInput.inputValue(), 'multi-credential');
   });
   await eventually(async () => connect.click());
-  await eventually(async () => assert.equal(await page.locator('.tenant-picker select').inputValue(), ''));
+  await waitForTenantPicker(page, '');
   const multiRequests = observed.filter((value) => value.credential === 'multi-credential');
   assert.equal(multiRequests[0]?.path, '/internal/v1/tenants');
   await eventually(() => assert.ok(observed.filter((value) => value.credential === 'multi-credential'
@@ -104,17 +126,17 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   const failedRequests = observed.slice(failedRequestStart).filter((value) => value.credential === 'failed-credential');
   assert.deepEqual(failedRequests.map((value) => value.path), ['/internal/v1/tenants']);
   assert.equal(await page.evaluate(() => localStorage.getItem('mtc.operator.service-credential.v1')), 'multi-credential');
-  assert.equal(await page.locator('.tenant-picker select').inputValue(), '');
+  await waitForTenantPicker(page, '');
 
   await eventually(async () => { await credentialInput.fill('slow-credential'); assert.equal(await credentialInput.inputValue(), 'slow-credential'); });
   await eventually(async () => connect.click());
   await eventually(() => assert.ok(observed.some((value) => value.credential === 'slow-credential' && value.path === '/internal/v1/tenants')));
   await eventually(async () => { await credentialInput.fill('fast-credential'); assert.equal(await credentialInput.inputValue(), 'fast-credential'); });
   await eventually(async () => connect.click());
-  await eventually(async () => assert.equal(await page.locator('.tenant-picker select').inputValue(), 'fast-tenant'));
+  await waitForSingleTenantScope(page, 'fast-tenant');
   slowTenants.resolve();
   await page.waitForTimeout(100);
-  assert.equal(await page.locator('.tenant-picker select').inputValue(), 'fast-tenant');
+  await waitForSingleTenantScope(page, 'fast-tenant');
   assert.equal(await page.evaluate(() => localStorage.getItem('mtc.operator.service-credential.v1')), 'fast-credential');
   assert.deepEqual(observed.filter((value) => value.credential === 'slow-credential').map((value) => value.path), ['/internal/v1/tenants']);
   await eventually(() => assert.ok(observed.filter((value) => value.credential === 'fast-credential'

@@ -33,15 +33,51 @@ export const credentialGroupObservations = new WeakMap<DogfoodWorld, CredentialG
 export const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const groupedModel = 'browser-group-routed-model';
 
-export async function connectOperator(world: DogfoodWorld, theme: 'dark' | 'light', credential?: string): Promise<void> {
+type TenantPickerExpectation = 'hidden' | 'visible';
+
+/**
+ * A scoped single-tenant credential authenticates directly into its tenant and
+ * deliberately has no selector. Multi-tenant credentials retain the selector
+ * so the operator can select aggregate or tenant-specific read scope.
+ */
+export async function assertOperatorTenantScope(
+  page: Page,
+  expectedTenant: string,
+  pickerExpectation: TenantPickerExpectation,
+): Promise<Locator | undefined> {
+  const tenantPicker = page.locator('.tenant-picker select');
+  const context = page.locator('.console-context');
+  await eventually(async () => {
+    const count = await tenantPicker.count();
+    assert.equal(
+      count,
+      pickerExpectation === 'visible' ? 1 : 0,
+      `tenant picker must be ${pickerExpectation} for this credential scope`,
+    );
+    if (pickerExpectation === 'visible') {
+      const options = await tenantPicker.locator('option').allTextContents();
+      assert.ok(options.includes(expectedTenant), `tenant picker options ${JSON.stringify(options)} do not include ${expectedTenant}`);
+      return;
+    }
+    const contextText = (await context.allTextContents()).join(' ');
+    assert.ok(contextText.includes(expectedTenant), `operator context ${JSON.stringify(contextText)} does not identify ${expectedTenant}`);
+  });
+  return pickerExpectation === 'visible' ? tenantPicker : undefined;
+}
+
+export async function connectOperator(
+  world: DogfoodWorld,
+  theme: 'dark' | 'light',
+  credential?: string,
+  pickerExpectation: TenantPickerExpectation = 'hidden',
+): Promise<void> {
   const page = world.requirePage();
   const seed = runtime.requireSeed();
   await world.open('/operator', { theme, locale: 'zh-CN' });
   await page.locator('input[type="password"]').fill(credential ?? seed.serviceCredential);
   await page.getByRole('button', { name: '连接', exact: true }).click();
-  const tenantPicker = page.locator('.tenant-picker select');
-  await assertContains(tenantPicker, tenant);
-  if (await tenantPicker.inputValue() !== tenant) {
+  const tenantPicker = await assertOperatorTenantScope(page, tenant, pickerExpectation);
+  if (tenantPicker && await tenantPicker.inputValue() !== tenant) {
     const scopedReload = page.waitForResponse((response) => {
       const url = new URL(response.url());
       return response.request().method() === 'GET'
@@ -51,7 +87,7 @@ export async function connectOperator(world: DogfoodWorld, theme: 'dark' | 'ligh
     await tenantPicker.selectOption(tenant);
     assert.equal((await scopedReload).status(), 200);
   }
-  await assertValue(tenantPicker, tenant);
+  if (tenantPicker) await assertValue(tenantPicker, tenant);
   await assertNoCount(page.locator('.notice.error'));
 }
 
