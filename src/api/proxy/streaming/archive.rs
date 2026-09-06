@@ -1,9 +1,8 @@
 use super::*;
 
 /// A CR may be either a complete line ending or the first half of CRLF. Hold
-/// only the already bounded archive batch until that single-byte ambiguity is
-/// resolved, so the LF continuation is joined to its predecessor instead of
-/// consuming a second archive channel slot.
+/// only one already bounded batch until the single-byte ambiguity is resolved,
+/// then merge it with the optional LF and current frames before one send.
 #[derive(Default)]
 pub(super) struct DeferredResponseArchive(Option<ResponseArchiveBatch>);
 
@@ -44,13 +43,21 @@ impl DeferredResponseArchive {
                 joined.extend_from_slice(&continuation);
                 *last = Bytes::from(joined);
             }
-            try_send_response_archive_batch(sender, deferred)?;
-        }
-        if current
-            .as_ref()
-            .is_some_and(|current_batch| current_batch.chunks.is_empty())
-        {
-            current = None;
+            if current
+                .as_ref()
+                .is_some_and(|current_batch| current_batch.chunks.is_empty())
+            {
+                current = None;
+            }
+            if let Some(current) = current {
+                Self::merge(&mut deferred, current)?;
+            }
+            if defer_for_crlf {
+                self.0 = Some(deferred);
+            } else {
+                try_send_response_archive_batch(sender, deferred)?;
+            }
+            return Ok(());
         }
         if defer_for_crlf {
             self.0 = current;
@@ -59,6 +66,26 @@ impl DeferredResponseArchive {
         if let Some(current) = current {
             try_send_response_archive_batch(sender, current)?;
         }
+        Ok(())
+    }
+
+    fn merge(
+        deferred: &mut ResponseArchiveBatch,
+        current: ResponseArchiveBatch,
+    ) -> Result<(), ResponseArchiveBatchError> {
+        let frame_count = deferred.chunks.len().saturating_add(current.chunks.len());
+        let byte_count = deferred
+            .chunks
+            .iter()
+            .chain(current.chunks.iter())
+            .fold(0_usize, |total, bytes| total.saturating_add(bytes.len()));
+        if frame_count > MAX_SSE_FRAMES_PER_NETWORK_CHUNK
+            || byte_count > MAX_PROXY_RESPONSE_BODY
+            || (frame_count > 1 && byte_count > MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK)
+        {
+            return Err(ResponseArchiveBatchError::BatchLimit);
+        }
+        deferred.chunks.extend(current.chunks);
         Ok(())
     }
 

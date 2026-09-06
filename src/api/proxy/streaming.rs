@@ -203,10 +203,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut delivery_confirmed = false;
             let mut delivered_billable = false;
             let mut terminal_delivery = ResponsesTerminalDelivery::default();
-            // Keep an emitted CR-terminated event locally until the next
-            // network byte establishes whether it is a CRLF terminator. This
-            // prevents a single LF continuation from needing a second slot in
-            // the capacity-one archive channel while preserving wire bytes.
+            // A complete SSE event may end with a CR whose paired LF arrives
+            // in the next network chunk. Keep one already bounded batch so a
+            // continuation and immediately following event can be submitted
+            // together without consuming two capacity-one archive slots.
             let mut deferred_archive = DeferredResponseArchive::default();
             loop {
                 let mut flushing_terminal = false;
