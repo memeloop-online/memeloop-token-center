@@ -6,7 +6,9 @@ mod codex_transport;
 mod chat_sse_usage;
 mod conversation_hints;
 mod lifecycle;
+mod response_metadata;
 mod routing;
+mod sse_capture;
 mod streaming;
 mod upstream_response;
 
@@ -14,9 +16,9 @@ use crate::{
     db::{UpstreamAttemptAdmission, UpstreamFailureKind},
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},
 };
-use chat_sse_usage::{ChatSseDeliveryClass, ChatSseUsageContract, ChatSseUsageState};
+use chat_sse_usage::ChatSseUsageContract;
 pub(in crate::api) use conversation_hints::safe_conversation_hint as safe_response_id;
-use conversation_hints::{client_name, conversation_hints, safe_conversation_hint};
+use conversation_hints::{client_name, conversation_hints};
 use lifecycle::{
     AbortTaskOnDrop, begin_streaming_response_archive, finish_proxy_request_with_archive_fallback,
     run_bounded_proxy_lifecycle, run_bounded_text_archive,
@@ -28,6 +30,16 @@ use routing::{
     refresh_route_snapshot, retryable_upstream_status, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
+
+pub(super) use response_metadata::{
+    ExtractedUsage, append_bounded, extract_response_id, extract_usage_checked,
+    is_supported_service_tier, should_capture_buffered_usage,
+};
+#[cfg(test)]
+pub(super) use response_metadata::{
+    completed_response_id, usage_from_value, usage_from_value_checked,
+};
+pub(super) use sse_capture::{ResponsesSseCapture, ResponsesSseOutcome, SseDeliveryFrame};
 
 #[cfg(test)]
 mod tests;
@@ -376,6 +388,82 @@ async fn next_sendable_proxy_route(
         return Ok(Some((prepared, upstream_attempt)));
     }
     Ok(None)
+}
+
+async fn finish_non_sse_proxy_response(
+    buffered_request: &BufferedRequest<'_>,
+    upstream: UpstreamResponse,
+    status: StatusCode,
+    content_type: Option<HeaderValue>,
+    protocol: Protocol,
+    capture_json_usage: bool,
+    input_token_ceiling: i64,
+    output_token_ceiling: i64,
+    upstream_attempt: &mut UpstreamAttemptGuard,
+) -> Result<Response, AppError> {
+    let response_content_type = content_type
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_owned();
+    let response_body = match read_bounded_upstream(upstream, MAX_PROXY_RESPONSE_BODY).await {
+        Ok(body) => Bytes::from(body),
+        Err(error) => {
+            let result = finish_proxy_failure(buffered_request, error.code()).await;
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::invalid_response())
+                .await;
+            return result;
+        }
+    };
+    if matches!(protocol, Protocol::OpenAiResponses)
+        && let Err(error_code) = validate_buffered_responses_success(&response_body)
+    {
+        let result = finish_proxy_failure(buffered_request, error_code).await;
+        upstream_attempt
+            .complete(UpstreamAttemptTerminal::invalid_response())
+            .await;
+        return result;
+    }
+    let usage = if capture_json_usage {
+        match extract_usage_checked(&response_body) {
+            ExtractedUsage::Valid(usage) => usage,
+            ExtractedUsage::Missing => TokenUsage {
+                input_tokens: input_token_ceiling,
+                output_tokens: output_token_ceiling,
+                ..TokenUsage::default()
+            },
+            ExtractedUsage::Invalid => {
+                let result = finish_proxy_failure(buffered_request, "upstream_invalid_usage").await;
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .await;
+                return result;
+            }
+        }
+    } else {
+        TokenUsage {
+            input_tokens: input_token_ceiling,
+            output_tokens: output_token_ceiling,
+            ..TokenUsage::default()
+        }
+    };
+    let result = finish_buffered_request(
+        buffered_request,
+        status,
+        response_body,
+        &response_content_type,
+        usage,
+        None,
+    )
+    .await;
+    let attempt_terminal = match result.as_ref() {
+        Ok(response) if response.status().is_success() => UpstreamAttemptTerminal::Succeeded,
+        Ok(_) => UpstreamAttemptTerminal::invalid_response(),
+        Err(_) => UpstreamAttemptTerminal::Inconclusive,
+    };
+    upstream_attempt.complete(attempt_terminal).await;
+    result
 }
 
 pub(super) async fn proxy(
@@ -872,70 +960,18 @@ pub(super) async fn proxy(
     }
     let capture_json_usage = should_capture_buffered_usage(is_sse, content_type.as_ref());
     if !is_sse {
-        let response_content_type = content_type
-            .as_ref()
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/json")
-            .to_owned();
-        let response_body = match read_bounded_upstream(upstream, MAX_PROXY_RESPONSE_BODY).await {
-            Ok(body) => Bytes::from(body),
-            Err(error) => {
-                let result = finish_proxy_failure(&buffered_request, error.code()).await;
-                upstream_attempt
-                    .complete(UpstreamAttemptTerminal::invalid_response())
-                    .await;
-                return result;
-            }
-        };
-        if matches!(protocol, Protocol::OpenAiResponses)
-            && let Err(error_code) = validate_buffered_responses_success(&response_body)
-        {
-            let result = finish_proxy_failure(&buffered_request, error_code).await;
-            upstream_attempt
-                .complete(UpstreamAttemptTerminal::invalid_response())
-                .await;
-            return result;
-        }
-        let usage = if capture_json_usage {
-            match extract_usage_checked(&response_body) {
-                ExtractedUsage::Valid(usage) => usage,
-                ExtractedUsage::Missing => TokenUsage {
-                    input_tokens: input_token_ceiling,
-                    output_tokens: output_token_ceiling,
-                    ..TokenUsage::default()
-                },
-                ExtractedUsage::Invalid => {
-                    let result =
-                        finish_proxy_failure(&buffered_request, "upstream_invalid_usage").await;
-                    upstream_attempt
-                        .complete(UpstreamAttemptTerminal::invalid_response())
-                        .await;
-                    return result;
-                }
-            }
-        } else {
-            TokenUsage {
-                input_tokens: input_token_ceiling,
-                output_tokens: output_token_ceiling,
-                ..TokenUsage::default()
-            }
-        };
-        let result = finish_buffered_request(
+        return finish_non_sse_proxy_response(
             &buffered_request,
+            upstream,
             status,
-            response_body,
-            &response_content_type,
-            usage,
-            None,
+            content_type,
+            protocol,
+            capture_json_usage,
+            input_token_ceiling,
+            output_token_ceiling,
+            &mut upstream_attempt,
         )
         .await;
-        let attempt_terminal = match result.as_ref() {
-            Ok(response) if response.status().is_success() => UpstreamAttemptTerminal::Succeeded,
-            Ok(_) => UpstreamAttemptTerminal::invalid_response(),
-            Err(_) => UpstreamAttemptTerminal::Inconclusive,
-        };
-        upstream_attempt.complete(attempt_terminal).await;
-        return result;
     }
     streaming::stream_response(streaming::StreamingResponse {
         state: &state,
@@ -1435,793 +1471,6 @@ async fn read_bounded_upstream(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
-}
-
-enum ExtractedUsage {
-    Missing,
-    Valid(TokenUsage),
-    Invalid,
-}
-
-fn merge_streaming_usage(current: &mut TokenUsage, next: TokenUsage) -> Result<(), ()> {
-    current.input_tokens = current.input_tokens.max(next.input_tokens);
-    current.cached_input_tokens = current.cached_input_tokens.max(next.cached_input_tokens);
-    current.cache_write_tokens = current.cache_write_tokens.max(next.cache_write_tokens);
-    current.output_tokens = current.output_tokens.max(next.output_tokens);
-    if let Some(next_tier) = next.service_tier {
-        match current.service_tier.as_deref() {
-            None => current.service_tier = Some(next_tier),
-            Some(current_tier) if current_tier == next_tier => {}
-            Some(_) => return Err(()),
-        }
-    }
-    Ok(())
-}
-
-fn extract_usage_checked(body: &[u8]) -> ExtractedUsage {
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        return match usage_from_value_checked(&value) {
-            Ok(Some(usage)) => ExtractedUsage::Valid(usage),
-            Ok(None) => ExtractedUsage::Missing,
-            Err(()) => ExtractedUsage::Invalid,
-        };
-    }
-    let mut result: Option<TokenUsage> = None;
-    for line in body.split(|byte| *byte == b'\n') {
-        let Some(line) = line
-            .strip_prefix(b"data: ")
-            .or_else(|| line.strip_prefix(b"data:"))
-        else {
-            continue;
-        };
-        let line = trim_ascii_whitespace(line);
-        if line.is_empty() || line == b"[DONE]" {
-            continue;
-        }
-        let Ok(value) = serde_json::from_slice::<Value>(line) else {
-            return ExtractedUsage::Invalid;
-        };
-        match usage_from_value_checked(&value) {
-            Err(()) => return ExtractedUsage::Invalid,
-            Ok(None) => continue,
-            Ok(Some(next)) => {
-                let current = result.get_or_insert_with(TokenUsage::default);
-                if merge_streaming_usage(current, next).is_err() {
-                    return ExtractedUsage::Invalid;
-                }
-            }
-        }
-    }
-    match result {
-        Some(usage) => ExtractedUsage::Valid(usage),
-        None => ExtractedUsage::Missing,
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ResponsesSseEventKind {
-    Lifecycle,
-    Completed,
-    Failed,
-    Other,
-}
-
-impl ResponsesSseEventKind {
-    fn from_name(name: &[u8]) -> Self {
-        match trim_ascii_whitespace(name) {
-            b"response.created" | b"response.queued" | b"response.in_progress" => Self::Lifecycle,
-            b"response.completed" | b"message_stop" => Self::Completed,
-            b"response.failed" | b"response.incomplete" | b"error" | b"response.error" => {
-                Self::Failed
-            }
-            _ => Self::Other,
-        }
-    }
-
-    fn is_response_lifecycle(self) -> bool {
-        matches!(self, Self::Lifecycle | Self::Completed | Self::Failed)
-    }
-}
-
-#[derive(Default)]
-struct ResponsesSseCapture {
-    framer: super::sse::BoundedSseFramer,
-    framing_rejection: Option<super::sse::SseFramerRejection>,
-    response_id: Option<String>,
-    invalid: bool,
-    terminal_success: bool,
-    terminal_failure: bool,
-    usage: Option<TokenUsage>,
-    usage_invalid: bool,
-    require_explicit_completed: bool,
-    responses_delivery: Option<ResponsesDeliveryContract>,
-    chat_usage: Option<ChatSseUsageState>,
-    delivery: Option<SseDeliveryState>,
-    saw_done: bool,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ResponsesDeliveryContract {
-    Compatible,
-    Codex,
-}
-
-#[derive(Default)]
-struct SseDeliveryState {
-    frames: Vec<SseDeliveryFrame>,
-}
-
-pub(super) struct SseDeliveryFrame {
-    pub(super) bytes: Bytes,
-    pub(super) billable: bool,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ResponsesSseOutcome {
-    Completed { response_id: Option<String> },
-    Failed,
-    Incomplete,
-}
-
-struct ResponsesSseSummary {
-    outcome: ResponsesSseOutcome,
-    usage: Option<TokenUsage>,
-    usage_invalid: bool,
-}
-
-impl ResponsesSseCapture {
-    fn for_responses() -> Self {
-        Self {
-            require_explicit_completed: true,
-            responses_delivery: Some(ResponsesDeliveryContract::Compatible),
-            delivery: Some(SseDeliveryState::default()),
-            ..Self::default()
-        }
-    }
-
-    fn for_codex_responses() -> Self {
-        Self {
-            require_explicit_completed: true,
-            responses_delivery: Some(ResponsesDeliveryContract::Codex),
-            delivery: Some(SseDeliveryState::default()),
-            ..Self::default()
-        }
-    }
-
-    fn for_delivery() -> Self {
-        Self {
-            delivery: Some(SseDeliveryState::default()),
-            ..Self::default()
-        }
-    }
-
-    fn for_openai_chat_usage() -> Self {
-        Self {
-            chat_usage: Some(ChatSseUsageState::default()),
-            delivery: Some(SseDeliveryState::default()),
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
-    fn push(&mut self, chunk: &[u8]) {
-        let _ = self.push_framed(chunk);
-    }
-
-    fn push_framed(&mut self, chunk: &[u8]) -> Result<(), super::sse::SseFramerRejection> {
-        if let Some(rejection) = self.framing_rejection {
-            return Err(rejection);
-        }
-        let batch = self.framer.push(chunk);
-        if let Some(rejection) = batch.rejection {
-            // Any framing limit invalidates the delivery capture permanently.
-            // A later blank line must not let an oversized event recover into
-            // a complete-looking terminal stream.
-            self.invalid = true;
-            self.framing_rejection = Some(rejection);
-            return Err(rejection);
-        }
-        for event in batch.events {
-            if self.saw_done {
-                if event.is_line_ending_continuation {
-                    let bytes = self.delivery_event_bytes(&event);
-                    self.finish_delivery_event(bytes, ChatSseDeliveryClass::Control);
-                }
-                continue;
-            }
-            let has_data = event
-                .lines
-                .iter()
-                .any(|line| super::sse::is_sse_field_line(line.value.as_slice(), b"data"));
-            if !has_data {
-                if self.terminal_success || self.terminal_failure {
-                    continue;
-                }
-                if self.chat_usage.is_some()
-                    && event
-                        .lines
-                        .iter()
-                        .any(|line| super::sse::is_sse_field_line(line.value.as_slice(), b"event"))
-                {
-                    let class = self.dispatch_event(&event);
-                    let bytes = Self::strict_chat_named_control_bytes(&event);
-                    self.finish_delivery_event(bytes, class);
-                    continue;
-                }
-                // Only fixed, redacted heartbeats and field-less framing are
-                // safe to forward without a data envelope. Drop arbitrary
-                // event/id/retry metadata so it cannot carry provider secrets.
-                if event.idle_control != Some(super::sse::SseIdleControl::Comment)
-                    && !event.lines.is_empty()
-                {
-                    continue;
-                }
-                let bytes = self.delivery_event_bytes(&event);
-                self.finish_delivery_event(bytes, ChatSseDeliveryClass::Control);
-                continue;
-            }
-            let class = self.dispatch_event(&event);
-            let bytes = self.delivery_event_bytes(&event);
-            self.finish_delivery_event(bytes, class);
-        }
-        Ok(())
-    }
-
-    pub(super) fn push_delivery_frames(
-        &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<SseDeliveryFrame>, super::sse::SseFramerRejection> {
-        self.push_framed(chunk)?;
-        Ok(self
-            .delivery
-            .as_mut()
-            .map_or_else(Vec::new, |delivery| std::mem::take(&mut delivery.frames)))
-    }
-
-    fn finish_summary(mut self) -> ResponsesSseSummary {
-        if !self.framer.is_complete() {
-            self.invalid = true;
-        }
-        if let Some(chat_usage) = self.chat_usage.as_ref() {
-            self.usage = chat_usage.usage();
-            let usage_invalid = chat_usage.usage_invalid();
-            self.usage_invalid |= usage_invalid;
-            self.invalid |= usage_invalid;
-        }
-        let outcome = if self.terminal_failure {
-            ResponsesSseOutcome::Failed
-        } else if self.invalid {
-            ResponsesSseOutcome::Incomplete
-        } else if self.terminal_success {
-            ResponsesSseOutcome::Completed {
-                response_id: self.response_id,
-            }
-        } else {
-            ResponsesSseOutcome::Incomplete
-        };
-        ResponsesSseSummary {
-            outcome,
-            usage: self.usage,
-            usage_invalid: self.usage_invalid,
-        }
-    }
-
-    fn strict_chat_terminal_ready(&self) -> bool {
-        self.chat_usage
-            .as_ref()
-            .is_some_and(ChatSseUsageState::is_done)
-            && self.saw_done
-            && !self.framer.has_pending_crlf_continuation()
-    }
-
-    #[cfg(test)]
-    fn saw_done(&self) -> bool {
-        self.saw_done
-    }
-
-    #[cfg(test)]
-    fn has_pending_crlf_continuation(&self) -> bool {
-        self.framer.has_pending_crlf_continuation()
-    }
-
-    #[cfg(test)]
-    fn finish(self) -> ResponsesSseOutcome {
-        self.finish_summary().outcome
-    }
-
-    fn finish_delivery_event(&mut self, bytes: Bytes, class: ChatSseDeliveryClass) {
-        let Some(delivery) = self.delivery.as_mut() else {
-            return;
-        };
-        if !bytes.is_empty() {
-            delivery.frames.push(SseDeliveryFrame {
-                bytes,
-                billable: matches!(class, ChatSseDeliveryClass::Billable),
-            });
-        }
-    }
-
-    fn delivery_event_bytes(&self, event: &super::sse::BoundedSseEvent) -> Bytes {
-        let metadata_policy = if Self::event_name_matches_payload(event)
-            || (self.chat_usage.is_some() && Self::strict_chat_safe_event_name(event).is_some())
-        {
-            super::sse::SseEventMetadataPolicy::ValidatedEventNames
-        } else {
-            super::sse::SseEventMetadataPolicy::DataOnly
-        };
-        super::sse::redacted_sse_event_bytes(event, metadata_policy)
-    }
-
-    fn strict_chat_named_control_bytes(event: &super::sse::BoundedSseEvent) -> Bytes {
-        let Ok((_, None)) = super::sse::parse_sse_event(event) else {
-            return Bytes::new();
-        };
-        let Some(safe_name) = Self::strict_chat_safe_event_name(event) else {
-            return Bytes::new();
-        };
-        Bytes::from(format!("event: {safe_name}\n\n"))
-    }
-
-    fn strict_chat_safe_event_name(event: &super::sse::BoundedSseEvent) -> Option<&'static str> {
-        let (Some(event_name), _) = super::sse::parse_sse_event(event).ok()? else {
-            return None;
-        };
-        match event_name.as_str() {
-            "message" => Some("message"),
-            "error" => Some("error"),
-            "response.failed" => Some("response.failed"),
-            _ => None,
-        }
-    }
-
-    fn event_name_matches_payload(event: &super::sse::BoundedSseEvent) -> bool {
-        let Ok((Some(event_name), Some(data))) = super::sse::parse_sse_event(event) else {
-            return false;
-        };
-        serde_json::from_slice::<Value>(&data)
-            .ok()
-            .is_some_and(|value| {
-                value.get("type").and_then(Value::as_str) == Some(event_name.as_str())
-            })
-    }
-
-    fn dispatch_event(&mut self, event: &super::sse::BoundedSseEvent) -> ChatSseDeliveryClass {
-        let mut data = None::<Vec<u8>>;
-        let mut event_kind = None;
-        for line in &event.lines {
-            let line = line.value.as_slice();
-            if line == b"data" || line.starts_with(b"data:") {
-                let value = if line == b"data" {
-                    &[][..]
-                } else {
-                    line[5..].strip_prefix(b" ").unwrap_or(&line[5..])
-                };
-                let append_separator = data.is_some();
-                let data = data.get_or_insert_with(Vec::new);
-                if append_separator {
-                    data.push(b'\n');
-                }
-                data.extend_from_slice(value);
-            } else if line == b"event" || line.starts_with(b"event:") {
-                let value = if line == b"event" {
-                    &[][..]
-                } else {
-                    line[6..].strip_prefix(b" ").unwrap_or(&line[6..])
-                };
-                event_kind = Some(ResponsesSseEventKind::from_name(value));
-            }
-        }
-        // Explicit failure names remain authoritative, while unrelated event
-        // metadata is redacted and the typed Chat payload is still validated.
-        // This prevents provider metadata from changing settlement semantics.
-        if self.chat_usage.is_some() && matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
-            self.invalid = true;
-            self.terminal_failure = true;
-        }
-        let Some(data) = data else {
-            if self.chat_usage.is_some() && event_kind.is_some() {
-                self.usage_invalid = true;
-            }
-            match event_kind {
-                Some(ResponsesSseEventKind::Completed) if self.require_explicit_completed => {
-                    self.invalid = true;
-                }
-                Some(ResponsesSseEventKind::Completed) => self.terminal_success = true,
-                Some(ResponsesSseEventKind::Failed) => self.terminal_failure = true,
-                Some(ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other) | None => {}
-            }
-            return ChatSseDeliveryClass::Control;
-        };
-        if self.chat_usage.is_some() && trim_ascii_whitespace(&data).is_empty() {
-            self.usage_invalid = true;
-            self.invalid = true;
-            return ChatSseDeliveryClass::Control;
-        }
-        if data == b"[DONE]" {
-            self.saw_done = true;
-            if let Some(chat_usage) = self.chat_usage.as_mut() {
-                chat_usage.observe_done();
-            }
-            if matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
-                if self.require_explicit_completed && self.terminal_failure {
-                    self.invalid = true;
-                }
-                self.terminal_failure = true;
-            } else if !self.require_explicit_completed {
-                self.terminal_success = true;
-            }
-            return ChatSseDeliveryClass::Control;
-        }
-        if let Some(chat_usage) = self.chat_usage.as_mut() {
-            return chat_usage.observe_data(&data);
-        }
-        let Ok(value) = serde_json::from_slice::<Value>(&data) else {
-            self.invalid = true;
-            return ChatSseDeliveryClass::Billable;
-        };
-        let payload_kind = value
-            .get("type")
-            .and_then(Value::as_str)
-            .map(|name| ResponsesSseEventKind::from_name(name.as_bytes()));
-        let usage = if self.responses_delivery == Some(ResponsesDeliveryContract::Codex) {
-            if payload_kind == Some(ResponsesSseEventKind::Completed) {
-                value
-                    .get("response")
-                    .filter(|response| response.is_object())
-                    .ok_or(())
-                    .and_then(codex_transport::canonical_responses_usage)
-                    .map(Some)
-            } else {
-                Ok(None)
-            }
-        } else {
-            usage_from_value_checked(&value)
-        };
-        match usage {
-            Err(()) => self.usage_invalid = true,
-            Ok(None) => {}
-            Ok(Some(next)) => {
-                let current = self.usage.get_or_insert_with(TokenUsage::default);
-                if merge_streaming_usage(current, next).is_err() {
-                    self.usage_invalid = true;
-                }
-            }
-        }
-        if value.get("error").is_some_and(|error| !error.is_null())
-            || value
-                .pointer("/response/error")
-                .is_some_and(|error| !error.is_null())
-        {
-            self.terminal_failure = true;
-        }
-        if self.require_explicit_completed
-            && let (Some(event_kind), Some(payload_kind)) = (event_kind, payload_kind)
-            && event_kind != payload_kind
-            && (event_kind.is_response_lifecycle() || payload_kind.is_response_lifecycle())
-        {
-            self.invalid = true;
-            if matches!(event_kind, ResponsesSseEventKind::Failed)
-                || matches!(payload_kind, ResponsesSseEventKind::Failed)
-            {
-                self.terminal_failure = true;
-            }
-            return ChatSseDeliveryClass::Billable;
-        }
-        let kind = payload_kind
-            .or(event_kind)
-            .unwrap_or(ResponsesSseEventKind::Other);
-        let event_response_id = kind.is_response_lifecycle().then(|| {
-            value
-                .pointer("/response/id")
-                .or_else(|| value.get("id"))
-                .and_then(Value::as_str)
-                .and_then(safe_conversation_hint)
-        });
-        if let Some(Some(response_id)) = event_response_id.as_ref() {
-            match self.response_id.as_deref() {
-                None => self.response_id = Some(response_id.clone()),
-                Some(current) if current == response_id.as_str() => {}
-                Some(_) => self.invalid = true,
-            }
-        }
-        match kind {
-            ResponsesSseEventKind::Completed => {
-                if self.require_explicit_completed
-                    && (self.terminal_success
-                        || self.terminal_failure
-                        || !matches!(event_response_id, Some(Some(_))))
-                {
-                    self.invalid = true;
-                }
-                self.terminal_success = true;
-            }
-            ResponsesSseEventKind::Failed => {
-                if self.require_explicit_completed
-                    && (self.terminal_success || self.terminal_failure)
-                {
-                    self.invalid = true;
-                }
-                self.terminal_failure = true;
-            }
-            ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other => {}
-        }
-        if self.response_delivery_is_billable(kind, &value) {
-            ChatSseDeliveryClass::Billable
-        } else {
-            ChatSseDeliveryClass::Control
-        }
-    }
-
-    fn response_delivery_is_billable(&self, kind: ResponsesSseEventKind, value: &Value) -> bool {
-        match (self.responses_delivery, kind) {
-            // Compatible Responses routes have historically charged a safe
-            // failure after it is delivered. Direct Codex failure envelopes
-            // remain a non-billable control frame unless output was already
-            // delivered in a preceding event.
-            (Some(ResponsesDeliveryContract::Compatible), ResponsesSseEventKind::Failed) => true,
-            (_, ResponsesSseEventKind::Other) => true,
-            (_, ResponsesSseEventKind::Completed) => completed_response_has_billable_result(value),
-            (_, ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Failed) => false,
-        }
-    }
-}
-
-/// A completed Responses event sometimes carries the entire output and usage
-/// instead of preceding output-delta events. It must durably start delivery
-/// before forwarding in that shape; a pure terminal lifecycle marker does not.
-fn completed_response_has_billable_result(value: &Value) -> bool {
-    let Some(response) = value.get("response").and_then(Value::as_object) else {
-        return false;
-    };
-    response
-        .get("output")
-        .and_then(Value::as_array)
-        .is_some_and(|output| !output.is_empty())
-        || response
-            .get("usage")
-            .and_then(Value::as_object)
-            .is_some_and(|usage| !usage.is_empty())
-}
-
-fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
-    while value.first().is_some_and(u8::is_ascii_whitespace) {
-        value = &value[1..];
-    }
-    while value.last().is_some_and(u8::is_ascii_whitespace) {
-        value = &value[..value.len() - 1];
-    }
-    value
-}
-
-fn should_capture_buffered_usage(is_sse: bool, content_type: Option<&HeaderValue>) -> bool {
-    if is_sse {
-        return false;
-    }
-    let Some(media_type) = content_type
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-    else {
-        // Some compatible upstreams omit Content-Type even though their body
-        // is JSON. Preserve the existing usage parsing contract for them.
-        return content_type.is_none();
-    };
-    media_type.eq_ignore_ascii_case("application/json")
-        || media_type
-            .get(media_type.len().saturating_sub("+json".len())..)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+json"))
-}
-
-#[cfg(test)]
-fn completed_response_id(
-    status: StatusCode,
-    transport_complete: bool,
-    responses_sse: bool,
-    streamed_response_id: Option<String>,
-    buffered_tail: &[u8],
-) -> Option<String> {
-    if !status.is_success() || !transport_complete {
-        return None;
-    }
-    if responses_sse {
-        streamed_response_id
-    } else {
-        extract_response_id(buffered_tail)
-    }
-}
-
-fn extract_response_id(body: &[u8]) -> Option<String> {
-    const MAX_RESPONSE_ID_SCAN_BYTES: usize = 2 * 1024 * 1024;
-
-    fn id_from_value(value: &Value) -> Option<String> {
-        value
-            .pointer("/response/id")
-            .or_else(|| value.get("id"))
-            .and_then(Value::as_str)
-            .and_then(safe_conversation_hint)
-    }
-
-    let body = body.get(..body.len().min(MAX_RESPONSE_ID_SCAN_BYTES))?;
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        return id_from_value(&value);
-    }
-
-    let mut top_level_id = None;
-    for line in body.split(|byte| *byte == b'\n') {
-        let Some(data) = line.strip_prefix(b"data:") else {
-            continue;
-        };
-        let data = data.strip_prefix(b" ").unwrap_or(data);
-        let data = data.strip_suffix(b"\r").unwrap_or(data);
-        if data == b"[DONE]" {
-            continue;
-        }
-        let Ok(value) = serde_json::from_slice::<Value>(data) else {
-            continue;
-        };
-        if let Some(response_id) = value
-            .pointer("/response/id")
-            .and_then(Value::as_str)
-            .and_then(safe_conversation_hint)
-        {
-            return Some(response_id);
-        }
-        if top_level_id.is_none() {
-            top_level_id = value
-                .get("id")
-                .and_then(Value::as_str)
-                .and_then(safe_conversation_hint);
-        }
-    }
-    top_level_id
-}
-
-fn usage_from_value_checked(value: &Value) -> Result<Option<TokenUsage>, ()> {
-    let Some(usage) = value
-        .get("usage")
-        .or_else(|| value.pointer("/message/usage"))
-        .or_else(|| value.pointer("/response/usage"))
-    else {
-        return Ok(None);
-    };
-    if usage.is_null() {
-        return Ok(None);
-    }
-    let usage = usage.as_object().ok_or(())?;
-    let integer = |field: &str| -> Result<Option<i64>, ()> {
-        usage
-            .get(field)
-            .map(|value| value.as_i64().ok_or(()))
-            .transpose()
-    };
-    let input = match integer("input_tokens")? {
-        Some(value) => Some(value),
-        None => integer("prompt_tokens")?,
-    };
-    let output = match integer("output_tokens")? {
-        Some(value) => Some(value),
-        None => integer("completion_tokens")?,
-    };
-    let (reported_input, output) = match (input, output) {
-        (Some(input), Some(output)) => (input, output),
-        (Some(input), None) => (input, 0),
-        (None, Some(output)) => (0, output),
-        // Some OpenAI-compatible providers emit a metadata-only `usage`
-        // object (for example only `total_tokens`). Treat that exactly like
-        // omitted usage so the caller charges the already-reserved ceilings.
-        // A present input/output field with an invalid type still fails above.
-        (None, None) => return Ok(None),
-    };
-    let details_integer = |details_field: &str| -> Result<Option<i64>, ()> {
-        let Some(details) = usage.get(details_field) else {
-            return Ok(None);
-        };
-        let details = details.as_object().ok_or(())?;
-        details
-            .get("cached_tokens")
-            .map(|value| value.as_i64().ok_or(()))
-            .transpose()
-    };
-    let cached_input = match details_integer("input_tokens_details")? {
-        Some(value) => value,
-        None => match details_integer("prompt_tokens_details")? {
-            Some(value) => value,
-            None => integer("cache_read_input_tokens")?.unwrap_or_default(),
-        },
-    };
-    let cache_write = if let Some(value) = integer("cache_creation_input_tokens")? {
-        value
-    } else if let Some(details) = usage.get("cache_creation") {
-        let details = details.as_object().ok_or(())?;
-        let detail_integer = |field: &str| -> Result<i64, ()> {
-            details
-                .get(field)
-                .map(|value| value.as_i64().ok_or(()))
-                .transpose()
-                .map(Option::unwrap_or_default)
-        };
-        detail_integer("ephemeral_5m_input_tokens")?
-            .checked_add(detail_integer("ephemeral_1h_input_tokens")?)
-            .ok_or(())?
-    } else {
-        0
-    };
-    // OpenAI prompt/input counts include cached tokens; Anthropic input_tokens
-    // excludes its separately reported cache read/write counters.
-    let input_includes_cache = usage.contains_key("input_tokens_details")
-        || usage.contains_key("prompt_tokens_details")
-        || usage.contains_key("prompt_tokens");
-    let uncached_input = if input_includes_cache {
-        reported_input.checked_sub(cached_input).ok_or(())?
-    } else {
-        reported_input
-    };
-    let service_tier_value = value
-        .get("service_tier")
-        .or_else(|| value.pointer("/response/service_tier"));
-    let service_tier = match service_tier_value {
-        None => None,
-        Some(value) => {
-            let tier = value.as_str().ok_or(())?;
-            if !is_supported_service_tier(tier) {
-                return Err(());
-            }
-            Some(tier.to_owned())
-        }
-    };
-    let parsed = TokenUsage {
-        input_tokens: uncached_input,
-        cached_input_tokens: cached_input,
-        cache_write_tokens: cache_write,
-        output_tokens: output,
-        service_tier,
-    };
-    if [
-        parsed.input_tokens,
-        parsed.cached_input_tokens,
-        parsed.cache_write_tokens,
-        parsed.output_tokens,
-    ]
-    .into_iter()
-    .all(|tokens| (0..=MAX_REPORTED_TOKENS).contains(&tokens))
-        && parsed
-            .input_tokens
-            .checked_add(parsed.cached_input_tokens)
-            .and_then(|tokens| tokens.checked_add(parsed.cache_write_tokens))
-            .is_some()
-    {
-        Ok(Some(parsed))
-    } else {
-        Err(())
-    }
-}
-
-#[cfg(test)]
-fn usage_from_value(value: &Value) -> Option<TokenUsage> {
-    usage_from_value_checked(value).ok().flatten()
-}
-
-fn is_supported_service_tier(tier: &str) -> bool {
-    matches!(
-        tier,
-        "default" | "auto" | "priority" | "flex" | "scale" | "batch" | "standard_only"
-    )
-}
-
-fn append_bounded(capture: &mut Vec<u8>, chunk: &[u8], maximum: usize) {
-    if chunk.len() >= maximum {
-        capture.clear();
-        capture.extend_from_slice(&chunk[chunk.len() - maximum..]);
-        return;
-    }
-    let overflow = capture
-        .len()
-        .saturating_add(chunk.len())
-        .saturating_sub(maximum);
-    if overflow > 0 {
-        capture.drain(..overflow);
-    }
-    capture.extend_from_slice(chunk);
 }
 
 fn routing_selection_seed(
