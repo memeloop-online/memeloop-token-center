@@ -21,15 +21,24 @@ pub(super) async fn send_reqwest_proxy_route(
     let mut request = outbound_http
         .post(target_url)
         .body(route.forwarded_body.clone());
+    // For a CBCNX Responses call that has opted into streaming, pin the
+    // upstream representation to SSE instead of inheriting a downstream
+    // `Accept: application/json` default. Keep generic compatible routes
+    // transparent.
+    let accept = if route.route.driver == crate::provider::CBCNX_PROVIDER_DRIVER
+        && matches!(protocol, Protocol::OpenAiResponses)
+        && route.upstream_stream
+    {
+        HeaderValue::from_static("text/event-stream")
+    } else {
+        headers
+            .get(header::ACCEPT)
+            .cloned()
+            .unwrap_or(HeaderValue::from_static("application/json"))
+    };
     request = request
         .header(header::CONTENT_TYPE, "application/json")
-        .header(
-            header::ACCEPT,
-            headers
-                .get(header::ACCEPT)
-                .cloned()
-                .unwrap_or(HeaderValue::from_static("application/json")),
-        );
+        .header(header::ACCEPT, accept);
     let credential_now = credential_application_now();
     request = route
         .route

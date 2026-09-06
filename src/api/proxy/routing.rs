@@ -39,6 +39,7 @@ pub(super) use readiness::{
 pub(super) struct PreparedProxyRoute {
     pub(super) route: ResolvedUpstream,
     forwarded_body: Vec<u8>,
+    pub(super) upstream_stream: bool,
     pub(super) codex_downstream_stream: bool,
     pub(super) codex_store_disabled: bool,
     codex_session_id: Option<String>,
@@ -49,6 +50,7 @@ pub(super) struct PlannedProxyRoute {
     pub(super) route: ResolvedUpstream,
     forwarded_json: Value,
     pub(super) output_token_ceiling: i64,
+    upstream_stream: bool,
     codex_downstream_stream: bool,
     codex_store_disabled: bool,
     codex_session_id: Option<String>,
@@ -154,6 +156,7 @@ pub(super) fn plan_proxy_route(
         Some(plan) => plan.output_token_ceiling,
         None => inject_controlled_output_ceiling(protocol, &mut forwarded_json)?,
     };
+    let upstream_stream = forwarded_json.get("stream").and_then(Value::as_bool) == Some(true);
     let component_adapter = state
         .providers
         .get(&route.driver)
@@ -191,6 +194,7 @@ pub(super) fn plan_proxy_route(
         route,
         forwarded_json,
         output_token_ceiling,
+        upstream_stream,
         codex_downstream_stream,
         codex_store_disabled,
         codex_session_id,
@@ -220,6 +224,7 @@ pub(super) async fn materialize_proxy_route(
     Ok(PreparedProxyRoute {
         route: planned.route,
         forwarded_body,
+        upstream_stream: planned.upstream_stream,
         codex_downstream_stream: planned.codex_downstream_stream,
         codex_store_disabled: planned.codex_store_disabled,
         codex_session_id: planned.codex_session_id,

@@ -2897,6 +2897,65 @@ fn completed_response_with_usage(input_tokens: i64, output_tokens: i64) -> Value
 }
 
 #[tokio::test]
+async fn cbcnx_streaming_responses_request_negotiates_sse_without_rewriting_stream_options() {
+    let upstream = MockServer::start().await;
+    let completed = completed_response_with_usage(309, 7);
+    let sse = format!(
+        concat!(
+            "event: response.created\n",
+            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-usage-contract\",\"error\":null}}}}\n\n",
+            "event: response.completed\n",
+            "data: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        completed = completed
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(header_matcher("accept", "text/event-stream"))
+        .and(body_partial_json(json!({
+            "model": "gpt-5.6-sol",
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = response_usage_fixture_with_uri_contract_and_driver(
+        "cbcnx-responses-sse-accept",
+        upstream.uri(),
+        256,
+        Some("openai-chat-usage-only"),
+        crate::provider::CBCNX_PROVIDER_DRIVER,
+    )
+    .await;
+    let request = json!({
+        "model": fixture.model,
+        "input": "xxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "max_output_tokens": 16
+    });
+    let response = send_response_usage_request(&fixture, &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("response.completed"));
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (309, 7));
+    assert_eq!(rows[0].error_code, None);
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn buffered_response_usage_uses_trusted_overhead_and_settles_http_200() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
