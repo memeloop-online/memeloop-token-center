@@ -65,6 +65,14 @@ impl Fixture {
             .token
     }
 
+    async fn create_active_tenant(&self, tenant: &str) {
+        self.state
+            .db
+            .create_tenant(tenant, None)
+            .await
+            .expect("create active tenant before issuing scoped service credential");
+    }
+
     async fn client_key(&self) -> String {
         self.state
             .db
@@ -95,6 +103,7 @@ impl Drop for Fixture {
 #[tokio::test]
 async fn quarantine_operator_routes_require_exact_global_persistent_credentials() {
     let fixture = Fixture::new().await;
+    fixture.create_active_tenant("quarantine-auth-tenant").await;
     let read = fixture
         .service_token("quarantine-reader", READ_SCOPE, None)
         .await;

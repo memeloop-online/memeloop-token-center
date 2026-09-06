@@ -101,6 +101,14 @@ async fn service_token(state: &AppState, scopes: &[&str], tenant: Option<&str>) 
         .token
 }
 
+async fn create_active_tenant(state: &AppState, tenant: &str) {
+    state
+        .db
+        .create_tenant(tenant, None)
+        .await
+        .expect("create active tenant before issuing scoped service credential");
+}
+
 async fn call(
     state: &AppState,
     method: &str,
@@ -229,6 +237,9 @@ async fn seed_replay_with_expiry(
 async fn managed_refresh_dispatches_through_catalog_with_scope_idempotency_and_worker_generation() {
     let (_directory, state, adapter) = test_state().await;
     let tenant = "managed-refresh-tenant";
+    let other_tenant = "managed-refresh-other";
+    create_active_tenant(&state, tenant).await;
+    create_active_tenant(&state, other_tenant).await;
     let account_id = seed_replay_with_expiry(
         &state,
         tenant,
@@ -239,8 +250,7 @@ async fn managed_refresh_dispatches_through_catalog_with_scope_idempotency_and_w
     )
     .await;
     let tenant_token = service_token(&state, &["oauth:write"], Some(tenant)).await;
-    let other_tenant_token =
-        service_token(&state, &["oauth:write"], Some("managed-refresh-other")).await;
+    let other_tenant_token = service_token(&state, &["oauth:write"], Some(other_tenant)).await;
     let wrong_scope_token = service_token(&state, &["providers:write"], Some(tenant)).await;
 
     let candidates = state
@@ -338,11 +348,13 @@ async fn managed_refresh_dispatches_through_catalog_with_scope_idempotency_and_w
 #[tokio::test]
 async fn capabilities_and_import_are_global_only_and_dedicated_scope_only() {
     let (_directory, state, _adapter) = test_state().await;
+    let tenant_external_id = "managed-auth-tenant";
+    create_active_tenant(&state, tenant_external_id).await;
     let global = service_token(&state, &["imports:cpa:write"], None).await;
     let wrong_scope = service_token(&state, &["providers:write"], None).await;
-    let tenant = service_token(&state, &["imports:cpa:write"], Some("managed-auth-tenant")).await;
+    let tenant = service_token(&state, &["imports:cpa:write"], Some(tenant_external_id)).await;
     let request = serde_json::to_vec(&import_request(
-        "managed-auth-tenant",
+        tenant_external_id,
         "auth/codex.json",
         json!({"token": "never-call-adapter"}),
     ))
@@ -407,6 +419,7 @@ async fn capabilities_and_import_are_global_only_and_dedicated_scope_only() {
 async fn legacy_gemini_remains_importable_without_advertising_or_scheduling_refresh() {
     let (_directory, state, _adapter) = test_state().await;
     let tenant = "legacy-gemini-capability";
+    create_active_tenant(&state, tenant).await;
     let import_token = service_token(&state, &["imports:cpa:write"], None).await;
     let oauth_token = service_token(&state, &["oauth:write"], Some(tenant)).await;
     let (status, capabilities) = call(

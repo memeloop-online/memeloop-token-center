@@ -1150,6 +1150,11 @@ async fn private_proxy_requires_global_operator_and_never_appears_in_account_vie
     let state = AppState::initialize(Config::for_test(database_url))
         .await
         .unwrap();
+    state
+        .db
+        .create_tenant("proxied-tenant", None)
+        .await
+        .expect("create active tenant before issuing scoped service credential");
     let tenant_service = state
         .db
         .create_service_token(
