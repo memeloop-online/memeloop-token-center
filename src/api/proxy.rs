@@ -1310,6 +1310,7 @@ impl ResponsesSseCapture {
         }
     }
 
+    #[cfg(test)]
     fn push(&mut self, chunk: &[u8]) {
         let _ = self.push_framed(chunk);
     }
