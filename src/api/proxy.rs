@@ -40,7 +40,9 @@ pub(super) use response_metadata::{
 pub(super) use response_metadata::{
     completed_response_id, usage_from_value, usage_from_value_checked,
 };
-pub(super) use sse_capture::{ResponsesSseCapture, ResponsesSseOutcome, SseDeliveryFrame};
+pub(super) use sse_capture::{
+    ResponsesSseCapture, ResponsesSseOutcome, ResponsesSseSummary, SseDeliveryFrame,
+};
 
 #[cfg(test)]
 mod tests;
