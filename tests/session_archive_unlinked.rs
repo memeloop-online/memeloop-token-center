@@ -88,6 +88,9 @@ async fn archive_only_history_is_key_scoped_conversational_and_never_billed_twic
         .authenticate_key(&second_issued.key, pepper.as_bytes())
         .await
         .expect("authenticate second key");
+    db.create_tenant("another-tenant", None)
+        .await
+        .expect("create active tenant before issuing scoped service credential");
     let tenant_service = db
         .create_service_token(
             CreateServiceTokenInput {
