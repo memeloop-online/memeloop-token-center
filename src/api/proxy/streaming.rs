@@ -4,7 +4,7 @@ mod archive;
 mod lifecycle;
 mod terminal_delivery;
 
-use archive::{cancel_stream_archive, stream_response_archive};
+use archive::{DeferredResponseArchive, cancel_stream_archive, stream_response_archive};
 use lifecycle::{StreamingFinalizationInput, finalize_streaming_lifecycle};
 use terminal_delivery::{ResponsesTerminalDelivery, TerminalEof};
 
@@ -30,7 +30,7 @@ pub(super) struct StreamingResponse<'a> {
 /// Keep those immutable slices together so a capacity-one archive channel
 /// cannot mistake intra-chunk framing for archive backpressure.
 pub(super) struct ResponseArchiveBatch {
-    chunks: Vec<Bytes>,
+    pub(super) chunks: Vec<Bytes>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -88,6 +88,7 @@ impl ResponseArchiveBatch {
     }
 }
 
+#[cfg(test)]
 fn try_queue_response_archive_batch(
     sender: &tokio::sync::mpsc::Sender<ResponseArchiveBatch>,
     frames: &[SseDeliveryFrame],
@@ -95,6 +96,13 @@ fn try_queue_response_archive_batch(
     let Some(batch) = ResponseArchiveBatch::from_delivery_frames(frames)? else {
         return Ok(());
     };
+    try_send_response_archive_batch(sender, batch)
+}
+
+fn try_send_response_archive_batch(
+    sender: &tokio::sync::mpsc::Sender<ResponseArchiveBatch>,
+    batch: ResponseArchiveBatch,
+) -> Result<(), ResponseArchiveBatchError> {
     sender
         .try_send(batch)
         .map_err(|_| ResponseArchiveBatchError::Backpressure)
@@ -195,6 +203,11 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut delivery_confirmed = false;
             let mut delivered_billable = false;
             let mut terminal_delivery = ResponsesTerminalDelivery::default();
+            // Keep an emitted CR-terminated event locally until the next
+            // network byte establishes whether it is a CRLF terminator. This
+            // prevents a single LF continuation from needing a second slot in
+            // the capacity-one archive channel while preserving wire bytes.
+            let mut deferred_archive = DeferredResponseArchive::default();
             loop {
                 let mut flushing_terminal = false;
                 let next = if let Some(chunk) = terminal_delivery.take_pending() {
@@ -296,6 +309,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         // Responses and strict Chat. It emits whole events so a
                         // fragmented comment/control frame never confirms
                         // delivery or occupies the archive channel as output.
+                        let archive_continues_deferred_crlf =
+                            deferred_archive.has_pending() && chunk.starts_with(b"\n");
                         let CapturedSseDelivery {
                             frames: delivery_frames,
                             strict_chat_terminal_ready,
@@ -318,8 +333,19 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 break;
                             }
                         };
+                        let archive_defer_for_crlf = sse_capture.is_some()
+                            && delivery_frames
+                                .last()
+                                .is_some_and(|frame| frame.bytes.ends_with(b"\r"));
                         if let Some(sender) = archive_sender.as_ref()
-                            && try_queue_response_archive_batch(sender, &delivery_frames).is_err()
+                            && deferred_archive
+                                .queue(
+                                    sender,
+                                    &delivery_frames,
+                                    archive_defer_for_crlf,
+                                    archive_continues_deferred_crlf,
+                                )
+                                .is_err()
                         {
                             tracing::warn!(%request_id, stage = "response_archive_backpressure", "proxy archive gap");
                             cancel_stream_archive(&archive_complete, &mut archive_sender);
@@ -427,6 +453,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             ) {
                 // A partial SSE event is not a deliverable response and must
                 // not leave a complete-looking archive prefix behind.
+                cancel_stream_archive(&archive_complete, &mut archive_sender);
+            }
+            if let Some(sender) = archive_sender.as_ref()
+                && deferred_archive.flush(sender).is_err()
+            {
+                tracing::warn!(%request_id, stage = "response_archive_backpressure", "proxy archive gap");
                 cancel_stream_archive(&archive_complete, &mut archive_sender);
             }
             // EOF is part of downstream delivery. Close it before awaiting the

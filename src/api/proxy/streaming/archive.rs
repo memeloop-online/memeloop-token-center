@@ -1,5 +1,78 @@
 use super::*;
 
+/// A CR may be either a complete line ending or the first half of CRLF. Hold
+/// only the already bounded archive batch until that single-byte ambiguity is
+/// resolved, so the LF continuation is joined to its predecessor instead of
+/// consuming a second archive channel slot.
+#[derive(Default)]
+pub(super) struct DeferredResponseArchive(Option<ResponseArchiveBatch>);
+
+impl DeferredResponseArchive {
+    pub(super) fn has_pending(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub(super) fn queue(
+        &mut self,
+        sender: &tokio::sync::mpsc::Sender<ResponseArchiveBatch>,
+        frames: &[SseDeliveryFrame],
+        defer_for_crlf: bool,
+        starts_with_crlf_continuation: bool,
+    ) -> Result<(), ResponseArchiveBatchError> {
+        let mut current = ResponseArchiveBatch::from_delivery_frames(frames)?;
+        if let Some(mut deferred) = self.0.take() {
+            if starts_with_crlf_continuation
+                && let Some(current_batch) = current.as_mut()
+                && current_batch
+                    .chunks
+                    .first()
+                    .is_some_and(|bytes| bytes.as_ref() == b"\n")
+            {
+                let continuation = current_batch.chunks.remove(0);
+                let total = deferred
+                    .chunks
+                    .iter()
+                    .fold(0_usize, |total, bytes| total.saturating_add(bytes.len()));
+                if total.saturating_add(continuation.len()) > MAX_PROXY_RESPONSE_BODY {
+                    return Err(ResponseArchiveBatchError::BatchLimit);
+                }
+                let Some(last) = deferred.chunks.last_mut() else {
+                    return Err(ResponseArchiveBatchError::BatchLimit);
+                };
+                let mut joined = Vec::with_capacity(last.len().saturating_add(continuation.len()));
+                joined.extend_from_slice(last);
+                joined.extend_from_slice(&continuation);
+                *last = Bytes::from(joined);
+            }
+            try_send_response_archive_batch(sender, deferred)?;
+        }
+        if current
+            .as_ref()
+            .is_some_and(|current_batch| current_batch.chunks.is_empty())
+        {
+            current = None;
+        }
+        if defer_for_crlf {
+            self.0 = current;
+            return Ok(());
+        }
+        if let Some(current) = current {
+            try_send_response_archive_batch(sender, current)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn flush(
+        &mut self,
+        sender: &tokio::sync::mpsc::Sender<ResponseArchiveBatch>,
+    ) -> Result<(), ResponseArchiveBatchError> {
+        if let Some(batch) = self.0.take() {
+            try_send_response_archive_batch(sender, batch)?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn cancel_stream_archive(
     complete: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     sender: &mut Option<tokio::sync::mpsc::Sender<ResponseArchiveBatch>>,
