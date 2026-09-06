@@ -13,7 +13,7 @@ pub const CBCNX_PROVIDER_DRIVER: &str = "cbcnx";
 /// CBCNX shares the bounded, credentialed HTTP transport with the generic
 /// OpenAI-compatible driver.  Keep this classification narrow so driver
 /// additions cannot silently inherit an outbound protocol contract.
-pub const fn is_openai_compatible_http_driver(driver: &str) -> bool {
+pub fn is_openai_compatible_http_driver(driver: &str) -> bool {
     matches!(driver, "http-json" | CBCNX_PROVIDER_DRIVER)
 }
 

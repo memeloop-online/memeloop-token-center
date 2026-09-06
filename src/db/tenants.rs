@@ -53,7 +53,9 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         if inserted.rows_affected() != 1 {
-            return Err(AppError::Conflict("a tenant with this identifier already exists".into()));
+            return Err(AppError::Conflict(
+                "a tenant with this identifier already exists".into(),
+            ));
         }
         record_lifecycle_audit(
             &mut transaction,
@@ -96,7 +98,9 @@ impl Database {
         .await
         .map_err(lifecycle_write_error)?;
         if changed.rows_affected() != 1 {
-            return Err(AppError::Conflict("reload the tenant before renaming it".into()));
+            return Err(AppError::Conflict(
+                "reload the tenant before renaming it".into(),
+            ));
         }
         // Tenant UUIDs remain the source of truth for product relations. The
         // two external-ID columns below deliberately exist for management
@@ -149,16 +153,21 @@ impl Database {
         let mut transaction = self.begin_write_transaction().await?;
         let tenant = tenant_for_lifecycle(&mut transaction, &external_id).await?;
         if tenant.1 == status {
-            return Err(AppError::Conflict("tenant already has this lifecycle state".into()));
+            return Err(AppError::Conflict(
+                "tenant already has this lifecycle state".into(),
+            ));
         }
-        let changed = sqlx::query("UPDATE tenants SET status = $1, updated_at = $2 WHERE id = $3")
-            .bind(status)
-            .bind(now)
-            .bind(tenant.0.to_string())
-            .execute(&mut *transaction)
-            .await?;
+        let changed =
+            sqlx::query("UPDATE tenants SET status = $1, updated_at = $2 WHERE id = $3")
+                .bind(status)
+                .bind(now)
+                .bind(tenant.0.to_string())
+                .execute(&mut *transaction)
+                .await?;
         if changed.rows_affected() != 1 {
-            return Err(AppError::Conflict("reload the tenant before changing its lifecycle state".into()));
+            return Err(AppError::Conflict(
+                "reload the tenant before changing its lifecycle state".into(),
+            ));
         }
         record_lifecycle_audit(
             &mut transaction,
@@ -189,7 +198,9 @@ impl Database {
         let mut transaction = self.begin_write_transaction().await?;
         let tenant = tenant_for_lifecycle(&mut transaction, &external_id).await?;
         if tenant.1 != "archived" {
-            return Err(AppError::Conflict("archive the tenant before deleting it".into()));
+            return Err(AppError::Conflict(
+                "archive the tenant before deleting it".into(),
+            ));
         }
         require_empty_tenant(&mut transaction, &tenant.0).await?;
         record_lifecycle_audit(
@@ -207,7 +218,9 @@ impl Database {
             .await
             .map_err(lifecycle_write_error)?;
         if deleted.rows_affected() != 1 {
-            return Err(AppError::Conflict("reload the tenant before deleting it".into()));
+            return Err(AppError::Conflict(
+                "reload the tenant before deleting it".into(),
+            ));
         }
         transaction.commit().await?;
         Ok(())
@@ -237,15 +250,17 @@ async fn tenant_for_lifecycle(
     transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
     external_id: &str,
 ) -> Result<(Uuid, String, i64), AppError> {
-    let row = sqlx::query(
-        "SELECT id, status, created_at FROM tenants WHERE external_id = $1",
-    )
-    .bind(external_id)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(AppError::NotFound)?;
+    let row = sqlx::query("SELECT id, status, created_at FROM tenants WHERE external_id = $1")
+        .bind(external_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let id = row.try_get::<String, _>("id")?;
-    Ok((Uuid::parse_str(&id).map_err(|_| AppError::Internal)?, row.try_get("status")?, row.try_get("created_at")?))
+    Ok((
+        Uuid::parse_str(&id).map_err(|_| AppError::Internal)?,
+        row.try_get("status")?,
+        row.try_get("created_at")?,
+    ))
 }
 
 async fn require_empty_tenant(

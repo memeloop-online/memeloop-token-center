@@ -51,8 +51,8 @@ mod routing;
 mod self_service;
 mod sessions;
 mod sse;
-mod traffic;
 mod tenants;
+mod traffic;
 mod upstreams;
 mod usage_analysis;
 mod web;
@@ -100,6 +100,10 @@ use routes::{control_router, gateway_router};
 use routing::*;
 use self_service::*;
 use sessions::*;
+use tenants::{
+    archive_tenant, create_tenant, delete_tenant, list_tenant_management, rename_tenant,
+    restore_tenant,
+};
 use traffic::{
     AppliedTraffic, Protocol, TrafficPolicyProtocols,
     apply_traffic_plugin_for_existing_idempotency, apply_traffic_policy,
@@ -109,7 +113,6 @@ use traffic::{
     proxy_anthropic_count_tokens, proxy_openai_chat, proxy_openai_embeddings,
     proxy_openai_responses,
 };
-use tenants::{archive_tenant, create_tenant, delete_tenant, list_tenant_management, rename_tenant, restore_tenant};
 use upstreams::*;
 use web::{operator_index, portal_index, web_asset};
 

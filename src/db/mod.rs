@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{
-    Any, AnyConnection, AnyPool, Row, Transaction,
     any::{AnyPoolOptions, AnyQueryResult, AnyRow},
+    Any, AnyConnection, AnyPool, Row, Transaction,
 };
 use uuid::Uuid;
 
@@ -26,7 +26,8 @@ use crate::{
         ModelPriceTierView, ModelPriceView, OperatorGenerationJobView, OperatorStats,
         RequestArchiveRefs, RequestEventView, RequestProvenanceView, RequestSessionAssociation,
         RequestSessionContext, RequestView, SelfStats, ServiceTokenView, StatsBucket, StatsSummary,
-        TenantManagementView, TenantView, TokenUsage, UsageReservation, micros_to_decimal_string, priced_tokens,
+        TenantManagementView, TenantView, TokenUsage, UsageReservation, micros_to_decimal_string,
+        priced_tokens,
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,

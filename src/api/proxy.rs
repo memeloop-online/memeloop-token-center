@@ -804,11 +804,13 @@ pub(super) async fn proxy(
                 if retryable_upstream_status(result.response.status())
                     && !route_candidates.as_slice().is_empty() =>
             {
-                Some(if result.response.status() == StatusCode::TOO_MANY_REQUESTS {
-                    UpstreamHealthReason::RateLimited
-                } else {
-                    UpstreamHealthReason::Unavailable
-                })
+                Some(
+                    if result.response.status() == StatusCode::TOO_MANY_REQUESTS {
+                        UpstreamHealthReason::RateLimited
+                    } else {
+                        UpstreamHealthReason::Unavailable
+                    },
+                )
             }
             Err(ProxySendError::RetryableConnection) => failure.map(|(_, reason)| reason),
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable) => {

@@ -115,10 +115,12 @@ pub(super) async fn internal_requests(
     let mut query_filter = filter;
     query_filter.lookahead = paged;
     let values = match tenant {
-        Some(tenant) => state
-            .db
-            .list_all_requests_filtered(&tenant, query_filter)
-            .await?,
+        Some(tenant) => {
+            state
+                .db
+                .list_all_requests_filtered(&tenant, query_filter)
+                .await?
+        }
         None => state.db.list_global_requests_filtered(query_filter).await?,
     };
     if !paged {

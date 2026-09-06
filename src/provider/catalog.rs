@@ -328,7 +328,9 @@ impl ProviderCatalog {
             component_adapter: None,
             source: "builtin".to_owned(),
         }];
-        types.push(crate::provider::cbcnx::provider_type(credential_schema.clone()));
+        types.push(crate::provider::cbcnx::provider_type(
+            credential_schema.clone(),
+        ));
         types.push(ProviderType {
             id: "volcengine-seedance".to_owned(),
             display_name: "Volcengine Seedance".to_owned(),

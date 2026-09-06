@@ -1,9 +1,9 @@
-mod cbcnx;
 mod catalog;
+mod cbcnx;
 mod credential;
 mod types;
 
-pub use cbcnx::{CBCNX_PROVIDER_DRIVER, is_openai_compatible_http_driver};
+pub use cbcnx::{is_openai_compatible_http_driver, CBCNX_PROVIDER_DRIVER};
 pub(crate) use catalog::validate_managed_oauth_adapter_contribution;
 pub use catalog::{
     ComponentAdapterContribution, MANAGED_OAUTH_ADAPTER_API_VERSION, ManagedOAuthAdapterBackend,
