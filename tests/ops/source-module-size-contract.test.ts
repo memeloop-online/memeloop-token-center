@@ -17,14 +17,16 @@ test('focused source modules retain their extracted boundaries', () => {
   assertRange('src/db/generation/jobs.rs', 1, 1550);
   assertRange('src/db/generation/jobs/finish.rs', 300, 450);
 
-  for (const needle of ['mod streaming;', 'mod conversation_hints;', 'mod response_metadata;', 'mod routing;', 'mod sse_capture;', 'prepare_proxy_route(', 'send_proxy_route(', 'streaming::stream_response']) {
+  for (const needle of ['mod streaming;', 'mod conversation_hints;', 'mod response_metadata;', 'mod routing;', 'mod sse_capture;', 'plan_proxy_route(', 'materialize_proxy_route(', 'send_proxy_route(', 'streaming::stream_response']) {
     contains('src/api/proxy.rs', needle);
   }
-  contains('src/api/proxy/routing.rs', 'pub(super) async fn prepare_proxy_route');
+  contains('src/api/proxy/routing.rs', 'pub(super) fn plan_proxy_route');
+  contains('src/api/proxy/routing.rs', 'pub(super) async fn materialize_proxy_route');
   contains('src/api/proxy/routing.rs', 'pub(super) async fn send_proxy_route');
   contains('src/api/proxy/routing.rs', 'pub(super) fn retryable_upstream_status');
   contains('src/api/proxy/streaming.rs', 'pub(super) async fn stream_response');
-  excludes('src/api/proxy.rs', 'pub(super) async fn prepare_proxy_route');
+  excludes('src/api/proxy.rs', 'pub(super) fn plan_proxy_route');
+  excludes('src/api/proxy.rs', 'pub(super) async fn materialize_proxy_route');
   excludes('src/api/proxy.rs', 'pub(super) async fn send_proxy_route');
   excludes('src/api/proxy.rs', 'tokio::spawn(async move');
 
