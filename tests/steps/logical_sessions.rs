@@ -122,6 +122,7 @@ async fn issue_key(
 }
 
 async fn issue_reader(world: &TokenCenterWorld, tenant: &str) -> String {
+    ensure_active_tenant(world, tenant).await;
     let state = world.state.as_ref().expect("logical-session state");
     state
         .db
