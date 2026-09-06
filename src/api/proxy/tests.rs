@@ -483,7 +483,7 @@ async fn send_response_usage_request(fixture: &CodexRouteFixture, body: &Value) 
         .unwrap()
 }
 
-pub(super) async fn send_chat_usage_request(fixture: &CodexRouteFixture, body: &Value) -> Response {
+async fn send_chat_usage_request(fixture: &CodexRouteFixture, body: &Value) -> Response {
     router_for_role(fixture.state.clone(), RuntimeRole::Gateway)
         .oneshot(
             Request::post("/v1/chat/completions")

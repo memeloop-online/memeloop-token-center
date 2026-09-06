@@ -1111,10 +1111,7 @@ mod tests {
             Some(id) => format!(
                 "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}\n\n"
             ),
-            None => concat!(
-                "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
-            )
-            .to_owned(),
+            None => "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n".to_owned(),
         }
         };
         let created = |id: &str| {

@@ -122,7 +122,11 @@ fn accepts_exact_metadata_budget_and_rejects_million_short_fields_within_2mib() 
 
     let million_short_fields = event_with_field_count(MAX_SSE_FIELDS_PER_EVENT).repeat(255);
     assert!(million_short_fields.len() <= MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK);
-    assert!(MAX_SSE_FIELDS_PER_EVENT * 255 > 1_000_000);
+    let retained_field_count = million_short_fields
+        .iter()
+        .filter(|&&byte| byte == b'x')
+        .count();
+    assert!(retained_field_count > 1_000_000);
     let mut framer = BoundedSseFramer::default();
     let batch = framer.push(&million_short_fields);
     assert_eq!(batch.rejection, Some(SseFramerRejection::BatchLimit));
