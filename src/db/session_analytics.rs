@@ -445,18 +445,22 @@ impl Database {
         {
             sqlx::query(
                 r#"SELECT id, created_at, protocol, model, status_code, duration_ms,
-                          input_tokens, output_tokens, cost_micros, currency, error_code,
+                          input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
+                          cost_micros, currency, error_code,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
                          SELECT id, created_at, protocol, model, status_code, duration_ms,
-                                input_tokens, output_tokens, cost_micros, currency, error_code,
+                                input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
+                                cost_micros, currency, error_code,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
                            FROM request_records
                           WHERE key_id = $1 AND conversation_cluster_id IS NULL
                          UNION ALL
                          SELECT archive_request_id, source_started_at, protocol, model,
-                                status_code, duration_ms, input_tokens, output_tokens,
+                                status_code, duration_ms, input_tokens,
+                                CAST(0 AS BIGINT) AS cached_input_tokens,
+                                CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
                                 CAST(0 AS BIGINT), NULL AS currency, error_code, 'session_archive',
                                 'archive_unlinked', source, external_request_id
                            FROM session_archive_unlinked_requests
@@ -474,18 +478,22 @@ impl Database {
         } else {
             sqlx::query(
                 r#"SELECT id, created_at, protocol, model, status_code, duration_ms,
-                          input_tokens, output_tokens, cost_micros, currency, error_code,
+                          input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
+                          cost_micros, currency, error_code,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
                          SELECT id, created_at, protocol, model, status_code, duration_ms,
-                                input_tokens, output_tokens, cost_micros, currency, error_code,
+                                input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
+                                cost_micros, currency, error_code,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
                            FROM request_records
                           WHERE key_id = $1 AND conversation_cluster_id IS NULL
                          UNION ALL
                          SELECT archive_request_id, source_started_at, protocol, model,
-                                status_code, duration_ms, input_tokens, output_tokens,
+                                status_code, duration_ms, input_tokens,
+                                CAST(0 AS BIGINT) AS cached_input_tokens,
+                                CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
                                 CAST(0 AS BIGINT), NULL AS currency, error_code, 'session_archive',
                                 'archive_unlinked', source, external_request_id
                            FROM session_archive_unlinked_requests
@@ -510,6 +518,8 @@ impl Database {
                         status_code: row.try_get("status_code")?,
                         duration_ms: row.try_get("duration_ms")?,
                         input_tokens: row.try_get("input_tokens")?,
+                        cached_input_tokens: row.try_get("cached_input_tokens")?,
+                        cache_write_tokens: row.try_get("cache_write_tokens")?,
                         output_tokens: row.try_get("output_tokens")?,
                         cost: micros_to_decimal_string(row.try_get("cost_micros")?),
                         error_code: row.try_get("error_code")?,

@@ -131,6 +131,7 @@ impl ResponsesStreamingSanitizer {
         Ok(Bytes::from(output))
     }
 
+    #[cfg(test)]
     pub(in crate::api) fn is_complete(&self) -> bool {
         self.framer.is_complete()
     }
@@ -170,10 +171,11 @@ impl ResponsesStreamingSanitizer {
             // Keep a standard DONE event's original CR/LF spelling. A named
             // provider event is normalized so its untrusted event name never
             // escapes the sanitizer.
-            let done = event_name
-                .is_none()
-                .then(|| safe_sse_fields(&event))
-                .unwrap_or_else(|| b"data: [DONE]\n\n".to_vec());
+            let done = if event_name.is_none() {
+                safe_sse_fields(&event)
+            } else {
+                b"data: [DONE]\n\n".to_vec()
+            };
             self.append_output(output, &done)?;
             return Ok(());
         }

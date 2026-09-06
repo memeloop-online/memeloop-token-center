@@ -25,9 +25,10 @@ use lifecycle::{
 };
 use routing::{
     CandidateCompatibility, CodexRetryTerminal, CodexRetryTerminalGuard, PROXY_ROUTING_POLICY,
-    PreparedProxyRoute, PreparedRouteReadiness, ProxySendError, UpstreamAttemptGuard,
-    UpstreamAttemptTerminal, candidate_compatibility, materialize_proxy_route, plan_proxy_route,
-    refresh_route_snapshot, retryable_upstream_status, send_proxy_route,
+    PreparedProxyRoute, PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput,
+    ProxySendError, UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_compatibility,
+    materialize_proxy_route, plan_proxy_route, refresh_route_snapshot, retryable_upstream_status,
+    send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -102,6 +103,12 @@ struct AuthorizedProxyRoutes {
     output_token_ceiling: i64,
 }
 
+struct AuthorizedProxyRoutesInput<'a> {
+    request: ProxyRequestContext<'a>,
+    original_body_length: usize,
+    resolved_routes: Vec<ResolvedUpstream>,
+}
+
 impl AuthorizedProxyRoutes {
     fn primary_route(&self) -> Option<&ResolvedUpstream> {
         self.component_primary
@@ -136,15 +143,21 @@ fn extend_reservation_bounds(
 }
 
 async fn prepare_authorized_proxy_routes(
-    state: &AppState,
-    key: &AuthenticatedKey,
-    model: &str,
-    protocol: Protocol,
-    request_id: Uuid,
-    request_json: &Value,
-    original_body_length: usize,
-    resolved_routes: Vec<ResolvedUpstream>,
+    input: AuthorizedProxyRoutesInput<'_>,
 ) -> Result<AuthorizedProxyRoutes, AppError> {
+    let AuthorizedProxyRoutesInput {
+        request,
+        original_body_length,
+        resolved_routes,
+    } = input;
+    let ProxyRequestContext {
+        state,
+        key,
+        model,
+        protocol,
+        request_id,
+        request_json,
+    } = request;
     let openai_chat_choice_count = matches!(protocol, Protocol::OpenAiChat)
         .then(|| openai_chat_choice_count(request_json))
         .transpose()?;
@@ -183,16 +196,11 @@ async fn prepare_authorized_proxy_routes(
         }
         let route_id = route.route_id;
         let account_id = route.account_id;
-        match plan_proxy_route(
-            state,
-            key,
-            model,
-            protocol,
-            request_id,
-            request_json,
-            route.clone(),
+        match plan_proxy_route(ProxyRoutePlanInput {
+            request,
+            route: route.clone(),
             preparation_now,
-        ) {
+        }) {
             Ok(planned) => {
                 if planned.is_component() {
                     if !direct_candidates.is_empty() {
@@ -276,19 +284,33 @@ async fn prepare_authorized_proxy_routes(
     })
 }
 
-async fn next_sendable_proxy_route(
-    state: &AppState,
-    key: &AuthenticatedKey,
-    model: &str,
-    protocol: Protocol,
-    request_id: Uuid,
-    request_json: &Value,
+struct NextSendableProxyRouteInput<'a> {
+    request: ProxyRequestContext<'a>,
     reservation_id: Uuid,
-    assigned_route: &mut (Uuid, Uuid),
-    candidates: &mut std::vec::IntoIter<ResolvedUpstream>,
-    mut failover_reason: Option<UpstreamHealthReason>,
+    assigned_route: &'a mut (Uuid, Uuid),
+    candidates: &'a mut std::vec::IntoIter<ResolvedUpstream>,
+    failover_reason: Option<UpstreamHealthReason>,
+}
+
+async fn next_sendable_proxy_route(
+    input: NextSendableProxyRouteInput<'_>,
 ) -> Result<Option<(PreparedProxyRoute, UpstreamAttemptGuard)>, AppError> {
-    for mut route in candidates {
+    let NextSendableProxyRouteInput {
+        request,
+        reservation_id,
+        assigned_route,
+        candidates,
+        mut failover_reason,
+    } = input;
+    let ProxyRequestContext {
+        state,
+        key,
+        model,
+        protocol,
+        request_id,
+        request_json,
+    } = request;
+    for mut route in candidates.by_ref() {
         if refresh_route_snapshot(state, &mut route).await? != PreparedRouteReadiness::Ready {
             state.metrics.observe_upstream_health(
                 UpstreamHealthEvent::Skipped,
@@ -310,16 +332,11 @@ async fn next_sendable_proxy_route(
             failover_reason = Some(UpstreamHealthReason::Unavailable);
             continue;
         }
-        let planned = plan_proxy_route(
-            state,
-            key,
-            model,
-            protocol,
-            request_id,
-            request_json,
+        let planned = plan_proxy_route(ProxyRoutePlanInput {
+            request,
             route,
             preparation_now,
-        )?;
+        })?;
         if planned.is_component() {
             return Err(AppError::Internal);
         }
@@ -509,16 +526,19 @@ pub(super) async fn proxy(
             state.config.key_pepper.as_bytes(),
         )
         .await?;
-    let mut route_plan = prepare_authorized_proxy_routes(
-        &state,
-        &key,
-        &model,
+    let request_context = ProxyRequestContext {
+        state: &state,
+        key: &key,
+        model: &model,
         protocol,
         request_id,
-        &request_json,
-        body.len(),
+        request_json: &request_json,
+    };
+    let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+        request: request_context,
+        original_body_length: body.len(),
         resolved_routes,
-    )
+    })
     .await?;
     let primary = route_plan.primary_route().ok_or(AppError::Internal)?;
     let upstream_account_id = Some(primary.account_id);
@@ -687,18 +707,13 @@ pub(super) async fn proxy(
             return finish_proxy_unavailable(&buffered_request, "upstream_attempts_exhausted")
                 .await;
         }
-        let selected = match next_sendable_proxy_route(
-            &state,
-            &key,
-            &model,
-            protocol,
-            request_id,
-            &request_json,
-            buffered_request.reservation.id,
-            &mut assigned_route,
-            &mut route_candidates,
-            next_failover_reason.take(),
-        )
+        let selected = match next_sendable_proxy_route(NextSendableProxyRouteInput {
+            request: request_context,
+            reservation_id: buffered_request.reservation.id,
+            assigned_route: &mut assigned_route,
+            candidates: &mut route_candidates,
+            failover_reason: next_failover_reason.take(),
+        })
         .await
         {
             Ok(selected) => selected,
@@ -730,10 +745,6 @@ pub(super) async fn proxy(
             Ok(result) if retryable_upstream_status(result.response.status()) => Some((
                 UpstreamFailureKind::Unavailable,
                 UpstreamHealthReason::Unavailable,
-            )),
-            Err(ProxySendError::InvalidResponse(_)) => Some((
-                UpstreamFailureKind::InvalidResponse,
-                UpstreamHealthReason::InvalidResponse,
             )),
             // Same-account retry is exhausted. The complete 400 is evidence
             // of an upstream response, so the account is marked unavailable
@@ -784,7 +795,6 @@ pub(super) async fn proxy(
             | Err(
                 ProxySendError::RetryableCodexBadRequest
                 | ProxySendError::CodexBadRequest
-                | ProxySendError::InvalidResponse(_)
                 | ProxySendError::AmbiguousResponse(_)
                 | ProxySendError::NonRetryableTransport
                 | ProxySendError::Credential,
@@ -841,9 +851,6 @@ pub(super) async fn proxy(
                     Some("http_400".to_owned()),
                 )
                 .await;
-            }
-            Err(ProxySendError::InvalidResponse(error_code)) => {
-                return finish_proxy_unavailable(&buffered_request, error_code).await;
             }
             Err(ProxySendError::AmbiguousResponse(error_code)) => {
                 return finish_proxy_failure(&buffered_request, error_code).await;

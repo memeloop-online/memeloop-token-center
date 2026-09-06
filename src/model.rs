@@ -420,6 +420,8 @@ pub struct RequestView {
     pub status_code: Option<i64>,
     pub duration_ms: Option<i64>,
     pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub cache_write_tokens: i64,
     pub output_tokens: i64,
     pub cost: String,
     pub error_code: Option<String>,

@@ -11,6 +11,8 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
             status_code: Some(200),
             duration_ms: Some(1),
             input_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
             output_tokens: 1,
             cost: "0".to_owned(),
             error_code: None,

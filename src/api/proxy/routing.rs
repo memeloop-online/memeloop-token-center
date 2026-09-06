@@ -86,16 +86,38 @@ impl PreparedProxyRoute {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ProxyRequestContext<'a> {
+    pub(super) state: &'a AppState,
+    pub(super) key: &'a AuthenticatedKey,
+    pub(super) model: &'a str,
+    pub(super) protocol: Protocol,
+    pub(super) request_id: Uuid,
+    pub(super) request_json: &'a Value,
+}
+
+pub(super) struct ProxyRoutePlanInput<'a> {
+    pub(super) request: ProxyRequestContext<'a>,
+    pub(super) route: ResolvedUpstream,
+    pub(super) preparation_now: i64,
+}
+
 pub(super) fn plan_proxy_route(
-    state: &AppState,
-    key: &AuthenticatedKey,
-    model: &str,
-    protocol: Protocol,
-    request_id: Uuid,
-    request_json: &Value,
-    route: ResolvedUpstream,
-    preparation_now: i64,
+    input: ProxyRoutePlanInput<'_>,
 ) -> Result<PlannedProxyRoute, AppError> {
+    let ProxyRoutePlanInput {
+        request:
+            ProxyRequestContext {
+                state,
+                key,
+                model,
+                protocol,
+                request_id,
+                request_json,
+            },
+        route,
+        preparation_now,
+    } = input;
     if !state.providers.contains(&route.driver) {
         return Err(AppError::Upstream(format!(
             "provider driver {} is not loaded",
@@ -211,7 +233,6 @@ pub(super) enum ProxySendError {
     RetryableCodexBadRequest,
     CodexBadRequest,
     CandidateUnavailable,
-    InvalidResponse(&'static str),
     AmbiguousResponse(&'static str),
     NonRetryableTransport,
     CredentialUnavailable,

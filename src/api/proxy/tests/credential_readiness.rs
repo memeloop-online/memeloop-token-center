@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::proxy::routing::credential_application_error;
 
 async fn expire_current_credential_metadata(fixture: &CodexRouteFixture) {
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
@@ -99,16 +100,18 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
     };
     *expires_at = Some(crate::db::unix_millis());
 
-    let prepared = prepare_authorized_proxy_routes(
-        &fixture.state,
-        &key,
-        &fixture.model,
-        Protocol::OpenAiResponses,
-        request_id,
-        &request,
-        serde_json::to_vec(&request).unwrap().len(),
-        candidates,
-    )
+    let prepared = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+        request: ProxyRequestContext {
+            state: &fixture.state,
+            key: &key,
+            model: &fixture.model,
+            protocol: Protocol::OpenAiResponses,
+            request_id,
+            request_json: &request,
+        },
+        original_body_length: serde_json::to_vec(&request).unwrap().len(),
+        resolved_routes: candidates,
+    })
     .await
     .unwrap();
     assert_eq!(prepared.direct_candidates.len(), 1);
@@ -156,16 +159,18 @@ async fn local_codex_protocol_mismatch_skips_to_compatible_candidate() {
         "messages": [{"role": "user", "content": "local mismatch"}],
         "stream": false
     });
-    let prepared = prepare_authorized_proxy_routes(
-        &fixture.state,
-        &key,
-        &fixture.model,
-        Protocol::OpenAiChat,
-        request_id,
-        &request,
-        serde_json::to_vec(&request).unwrap().len(),
-        candidates,
-    )
+    let prepared = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
+        request: ProxyRequestContext {
+            state: &fixture.state,
+            key: &key,
+            model: &fixture.model,
+            protocol: Protocol::OpenAiChat,
+            request_id,
+            request_json: &request,
+        },
+        original_body_length: serde_json::to_vec(&request).unwrap().len(),
+        resolved_routes: candidates,
+    })
     .await
     .unwrap();
     assert_eq!(prepared.direct_candidates.len(), 1);

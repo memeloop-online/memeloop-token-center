@@ -88,12 +88,11 @@ impl ChatSseUsageState {
             }
             ChatSseDeliveryClass::Control
         } else {
-            let class = chunk
-                .choices
-                .iter()
-                .all(|choice| choice.is_control())
-                .then_some(ChatSseDeliveryClass::Control)
-                .unwrap_or(ChatSseDeliveryClass::Billable);
+            let class = if chunk.choices.iter().all(|choice| choice.is_control()) {
+                ChatSseDeliveryClass::Control
+            } else {
+                ChatSseDeliveryClass::Billable
+            };
             self.observe_choices(chunk.usage, &chunk.choices);
             class
         }
@@ -242,7 +241,7 @@ impl CanonicalChatChoice {
     fn is_control(&self) -> bool {
         self.logprobs
             .as_ref()
-            .map_or(true, CanonicalChatLogprobs::is_empty)
+            .is_none_or(CanonicalChatLogprobs::is_empty)
             && ((self
                 .finish_reason
                 .as_deref()
@@ -401,26 +400,23 @@ fn canonical_chat_usage(
         .as_ref()
         .and_then(|details| details.cache_write_tokens)
         .unwrap_or(0);
-    let prompt_details_are_valid = usage
-        .prompt_tokens_details
-        .as_ref()
-        .map_or(true, |details| {
-            [
-                details.cached_tokens,
-                details.cache_write_tokens,
-                details.audio_tokens,
-                details.image_tokens,
-                details.text_tokens,
-            ]
-            .into_iter()
-            .flatten()
-            .all(|tokens| (0..=usage.prompt_tokens).contains(&tokens))
-        });
+    let prompt_details_are_valid = usage.prompt_tokens_details.as_ref().is_none_or(|details| {
+        [
+            details.cached_tokens,
+            details.cache_write_tokens,
+            details.audio_tokens,
+            details.image_tokens,
+            details.text_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|tokens| (0..=usage.prompt_tokens).contains(&tokens))
+    });
     let completion_details_are_valid =
         usage
             .completion_tokens_details
             .as_ref()
-            .map_or(true, |details| {
+            .is_none_or(|details| {
                 [
                     details.accepted_prediction_tokens,
                     details.audio_tokens,
@@ -440,9 +436,7 @@ fn canonical_chat_usage(
         || cached > usage.prompt_tokens
         || cached
             .checked_add(cache_write)
-            .map_or(true, |cached_and_written| {
-                cached_and_written > usage.prompt_tokens
-            })
+            .is_none_or(|cached_and_written| cached_and_written > usage.prompt_tokens)
         || !prompt_details_are_valid
         || !completion_details_are_valid
         || usage.total_tokens != usage.prompt_tokens.checked_add(usage.completion_tokens)?
@@ -462,7 +456,6 @@ fn canonical_chat_usage(
             cache_write_tokens: cache_write,
             output_tokens: usage.completion_tokens,
             service_tier,
-            ..TokenUsage::default()
         })
 }
 
