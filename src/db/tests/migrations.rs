@@ -208,6 +208,12 @@ async fn sqlite_v60_normalizes_matching_coexisting_credentials_without_legacy_ru
     let pepper = b"v60 credential normalization pepper is long enough";
     let (secret_hash, fingerprint) = crypto::hash_credential(credential, pepper);
     let source_hash = format!("{:x}", Sha256::digest(credential.as_bytes()));
+    sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, 1)")
+        .bind(tenant_id.to_string())
+        .bind(format!("normalized-key-credentials-{tenant_id}"))
+        .execute(&database.pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO key_records (id,tenant_id,principal_id,account_id,alias,currency,policy_json,status,credential_generation,created_at,updated_at) VALUES ($1,$2,$3,$4,'imported','USD',$5,'active',0,1,1)",
     )
@@ -283,6 +289,16 @@ async fn sqlite_v60_normalizes_matching_coexisting_credentials_without_legacy_ru
     .await
     .unwrap();
     assert_eq!(retained_legacy_table, 0);
+
+    // The v60 assertions above exercise the historical boundary itself. The
+    // authentication contract belongs to the current runtime, so advance over
+    // every subsequently registered migration rather than coupling this test
+    // to whichever schema version happens to be current.
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, i64::MIN, i64::MAX)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
     let authenticated = database.authenticate_key(credential, pepper).await.unwrap();
     assert_eq!(authenticated.key_id, key_id);
     assert_eq!(authenticated.credential_generation, 0);
