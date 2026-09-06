@@ -78,7 +78,6 @@ const PASSTHROUGH_HEADERS: &[&str] = &[
     "x-client-request-id",
     "x-codex-window-id",
     "thread-id",
-    "x-openai-internal-codex-responses-lite",
 ];
 const MAX_PASSTHROUGH_HEADER_BYTES: usize = 4 * 1024;
 const IMAGE_GENERATION_TOOL_TYPE: &str = "image_generation";
@@ -1416,6 +1415,11 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn downstream_responses_lite_hint_is_not_forwarded_upstream() {
+        assert!(!PASSTHROUGH_HEADERS.contains(&"x-openai-internal-codex-responses-lite"));
     }
 
     #[test]
