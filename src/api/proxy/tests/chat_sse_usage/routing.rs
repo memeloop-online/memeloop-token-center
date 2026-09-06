@@ -133,9 +133,9 @@ async fn mixed_chat_candidates_skip_strict_usage_route_for_n_two() {
         .await;
     let label = "chat-mixed-n-two";
     let fixture = response_usage_fixture(label, &strict_upstream, 0).await;
-    // The resolver's attempt cap is three. Populate all three earlier slots
-    // with strict candidates, then prove the fourth compatible route remains
-    // discoverable for an `n = 2` request.
+    // Populate four request-local incompatible candidates, then prove a fifth
+    // compatible route remains discoverable without consuming the three-send
+    // attempt budget.
     add_http_chat_standby(
         &fixture,
         label,
@@ -152,7 +152,15 @@ async fn mixed_chat_candidates_skip_strict_usage_route_for_n_two() {
         20,
     )
     .await;
-    add_http_chat_standby(&fixture, label, &standby_upstream, None, 30).await;
+    add_http_chat_standby(
+        &fixture,
+        label,
+        &strict_upstream,
+        Some("openai-chat-usage-only"),
+        30,
+    )
+    .await;
+    add_http_chat_standby(&fixture, label, &standby_upstream, None, 40).await;
     let mut request = chat_request(&fixture.model);
     request["n"] = json!(2);
     let response = send_chat_usage_request(&fixture, &request).await;

@@ -21,9 +21,10 @@ use lifecycle::{
     run_bounded_proxy_lifecycle, run_bounded_text_archive,
 };
 use routing::{
-    CodexRetryTerminal, CodexRetryTerminalGuard, MAX_UPSTREAM_ATTEMPTS, PreparedProxyRoute,
-    ProxySendError, UpstreamAttemptGuard, UpstreamAttemptTerminal, prepare_proxy_route,
-    retryable_upstream_status, send_proxy_route,
+    CandidateCompatibility, CodexRetryTerminal, CodexRetryTerminalGuard, PROXY_ROUTING_POLICY,
+    PreparedProxyRoute, PreparedRouteReadiness, ProxySendError, UpstreamAttemptGuard,
+    UpstreamAttemptTerminal, candidate_compatibility, prepare_proxy_route,
+    refresh_prepared_route_snapshot, retryable_upstream_status, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -71,11 +72,16 @@ async fn prepare_authorized_proxy_routes(
     let strict_choice_count_is_incompatible =
         validate_openai_chat_choice_count(request_json).is_err();
     let mut skipped_incompatible_strict_route = false;
-    let mut first_prepare_error = None;
+    let mut skipped_local_protocol_mismatch = false;
     let mut prepared_routes = Vec::new();
-    // Candidate resolution has a larger defensive database cap, but request
-    // preparation and outbound work are bounded by the attempt contract.
-    for route in resolved_routes.into_iter().take(MAX_UPSTREAM_ATTEMPTS) {
+    for route in resolved_routes {
+        if prepared_routes.len() == PROXY_ROUTING_POLICY.max_attempts() {
+            break;
+        }
+        if candidate_compatibility(protocol, &route) == CandidateCompatibility::ProtocolMismatch {
+            skipped_local_protocol_mismatch = true;
+            continue;
+        }
         if strict_choice_count_is_incompatible
             && requires_strict_openai_chat_usage(
                 protocol,
@@ -87,10 +93,11 @@ async fn prepare_authorized_proxy_routes(
             skipped_incompatible_strict_route = true;
             continue;
         }
+        let preparation_now = unix_millis();
         if route
             .credential
             .expires_at()
-            .is_some_and(|expires_at| expires_at <= unix_millis())
+            .is_some_and(|expires_at| expires_at <= preparation_now)
         {
             continue;
         }
@@ -107,8 +114,17 @@ async fn prepare_authorized_proxy_routes(
         }
         let route_id = route.route_id;
         let account_id = route.account_id;
-        match prepare_proxy_route(state, key, model, protocol, request_id, request_json, route)
-            .await
+        match prepare_proxy_route(
+            state,
+            key,
+            model,
+            protocol,
+            request_id,
+            request_json,
+            route,
+            preparation_now,
+        )
+        .await
         {
             Ok(prepared) => {
                 let prepared_is_component = prepared.is_component(state);
@@ -131,16 +147,15 @@ async fn prepare_authorized_proxy_routes(
                 if prepared_routes.is_empty() {
                     return Err(error);
                 }
-                first_prepare_error.get_or_insert(error);
             }
         }
     }
     if prepared_routes.is_empty() {
-        if let Some(error) = first_prepare_error {
-            return Err(error);
-        }
         // Normalized grants are the sole downstream authorization source. A
         // missing route must never fall back to unscoped process secrets.
+        if skipped_local_protocol_mismatch {
+            codex_transport::validate_protocol(protocol)?;
+        }
         if skipped_incompatible_strict_route {
             validate_openai_chat_choice_count(request_json)?;
         }
@@ -347,15 +362,8 @@ pub(super) async fn proxy(
     let mut route_attempts = prepared_routes.into_iter();
     let mut active_route = route_attempts.next().ok_or(AppError::Internal)?;
     if let Some((prepared, component_context)) = active_route.component_request.take() {
-        let current_credential = match state
-            .db
-            .reload_current_upstream_credential(
-                active_route.route.account_id,
-                state.config.key_pepper.as_bytes(),
-            )
-            .await
-        {
-            Ok(current) => current,
+        let readiness = match refresh_prepared_route_snapshot(&state, &mut active_route).await {
+            Ok(readiness) => readiness,
             Err(error) => {
                 tracing::warn!(
                     %request_id,
@@ -367,12 +375,9 @@ pub(super) async fn proxy(
                     .await;
             }
         };
-        let Some((credential_generation, credential)) = current_credential else {
-            return finish_proxy_unavailable(&buffered_request, "upstream_credential_unavailable")
-                .await;
-        };
-        active_route.route.credential_generation = credential_generation;
-        active_route.route.credential = credential;
+        if readiness != PreparedRouteReadiness::Ready {
+            return finish_proxy_unavailable(&buffered_request, readiness.error_code()).await;
+        }
         return execute_component_provider(
             buffered_request,
             &active_route.route.driver,
@@ -385,15 +390,8 @@ pub(super) async fn proxy(
         .await;
     }
     let (upstream, upstream_activity, mut codex_retry, mut upstream_attempt) = loop {
-        let current_credential = match state
-            .db
-            .reload_current_upstream_credential(
-                active_route.route.account_id,
-                state.config.key_pepper.as_bytes(),
-            )
-            .await
-        {
-            Ok(current) => current,
+        let readiness = match refresh_prepared_route_snapshot(&state, &mut active_route).await {
+            Ok(readiness) => readiness,
             Err(error) => {
                 tracing::warn!(
                     %request_id,
@@ -405,17 +403,13 @@ pub(super) async fn proxy(
                     .await;
             }
         };
-        let Some((credential_generation, credential)) = current_credential else {
+        if readiness != PreparedRouteReadiness::Ready {
             state.metrics.observe_upstream_health(
                 UpstreamHealthEvent::Skipped,
                 UpstreamHealthReason::Unavailable,
             );
             let Some(next_route) = route_attempts.next() else {
-                return finish_proxy_unavailable(
-                    &buffered_request,
-                    "upstream_credential_unavailable",
-                )
-                .await;
+                return finish_proxy_unavailable(&buffered_request, readiness.error_code()).await;
             };
             if state
                 .db
@@ -437,9 +431,7 @@ pub(super) async fn proxy(
             );
             active_route = next_route;
             continue;
-        };
-        active_route.route.credential_generation = credential_generation;
-        active_route.route.credential = credential;
+        }
         let admission = state
             .db
             .claim_upstream_account_attempt(
@@ -497,9 +489,9 @@ pub(super) async fn proxy(
                 UpstreamFailureKind::InvalidResponse,
                 UpstreamHealthReason::InvalidResponse,
             )),
-            // The one same-account replay is exhausted. A second complete,
-            // definite transient 400 was received before downstream delivery,
-            // so the normal authorized-candidate failover remains safe.
+            // Same-account retry is exhausted. The complete 400 is evidence
+            // of an upstream response, so the account is marked unavailable
+            // but the request is never replayed to a different account.
             Err(ProxySendError::RetryableCodexBadRequest) => Some((
                 UpstreamFailureKind::Unavailable,
                 UpstreamHealthReason::Unavailable,
@@ -516,17 +508,41 @@ pub(super) async fn proxy(
             Err(
                 ProxySendError::CodexBadRequest
                 | ProxySendError::NonRetryableTransport
+                | ProxySendError::CredentialUnavailable
                 | ProxySendError::Credential,
             ) => None,
         };
+        let credential_unavailable = matches!(&result, Err(ProxySendError::CredentialUnavailable));
+        if credential_unavailable {
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .await;
+            state.metrics.observe_upstream_health(
+                UpstreamHealthEvent::Skipped,
+                UpstreamHealthReason::Unavailable,
+            );
+        }
         if let Some((kind, reason)) = failure {
             upstream_attempt
                 .complete(UpstreamAttemptTerminal::Failed { kind, reason })
                 .await;
         }
-        let can_failover = !matches!(&result, Err(ProxySendError::AmbiguousResponse(_)));
-        if can_failover
-            && let Some((_, reason)) = failure
+        let failover_reason = match &result {
+            Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => {
+                failure.map(|(_, reason)| reason)
+            }
+            Err(ProxySendError::CredentialUnavailable) => Some(UpstreamHealthReason::Unavailable),
+            Ok(_)
+            | Err(
+                ProxySendError::RetryableCodexBadRequest
+                | ProxySendError::CodexBadRequest
+                | ProxySendError::InvalidResponse(_)
+                | ProxySendError::AmbiguousResponse(_)
+                | ProxySendError::NonRetryableTransport
+                | ProxySendError::Credential,
+            ) => None,
+        };
+        if let Some(reason) = failover_reason
             && let Some(next_route) = route_attempts.next()
         {
             if let Ok(result) = result {
@@ -573,6 +589,13 @@ pub(super) async fn proxy(
                     .complete(UpstreamAttemptTerminal::invalid_response())
                     .await;
                 return finish_proxy_failure(&buffered_request, "provider_credential").await;
+            }
+            Err(ProxySendError::CredentialUnavailable) => {
+                return finish_proxy_unavailable(
+                    &buffered_request,
+                    "upstream_credential_unavailable",
+                )
+                .await;
             }
             Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => {
                 return finish_proxy_unavailable(&buffered_request, "upstream_connection").await;

@@ -137,13 +137,15 @@ async fn send_codex_attempt(
             wreq::Proxy::all(proxy_url).map_err(|_| ProxySendError::CandidateUnavailable)?;
         request = request.proxy(proxy);
     }
+    let credential_now = unix_millis();
     let request = codex_transport::apply_wreq_wire_headers(
         request,
         headers,
         &route.route.credential,
         session_id,
+        credential_now,
     )
-    .map_err(|_| ProxySendError::Credential)?;
+    .map_err(|_| credential_application_error(&route.route.credential, credential_now))?;
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
     let upstream_result = request.send().await;

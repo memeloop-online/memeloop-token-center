@@ -113,3 +113,131 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
     assert_eq!(prepared.len(), 1);
     assert_eq!(prepared[0].route.account_id, standby);
 }
+
+#[tokio::test]
+async fn local_codex_protocol_mismatch_skips_to_compatible_candidate() {
+    let fixture = codex_route_fixture("local-protocol-mismatch").await;
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let mut candidates = fixture
+        .state
+        .db
+        .resolve_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            key.tenant_id,
+            &fixture.model,
+            Protocol::OpenAiChat.name(),
+            RouteSelectionOptions {
+                upstream_account_hint: None,
+                selection_seed: request_id,
+            },
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    let mut compatible = candidates[0].clone();
+    compatible.route_id = Uuid::now_v7();
+    compatible.account_id = Uuid::now_v7();
+    compatible.driver = "http-json".to_owned();
+    compatible.base_url = "https://example.com".to_owned();
+    compatible.config = json!({"base_url": compatible.base_url.clone(), "network_scope": "public"});
+    compatible.credential = UpstreamCredential::None;
+    candidates.push(compatible.clone());
+
+    let prepared = prepare_authorized_proxy_routes(
+        &fixture.state,
+        &key,
+        &fixture.model,
+        Protocol::OpenAiChat,
+        request_id,
+        &json!({
+            "model": fixture.model,
+            "messages": [{"role": "user", "content": "local mismatch"}],
+            "stream": false
+        }),
+        candidates,
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].route.account_id, compatible.account_id);
+}
+
+#[tokio::test]
+async fn changed_transport_revision_invalidates_the_prepared_snapshot() {
+    let fixture = codex_route_fixture("transport-snapshot-fence").await;
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let candidates = fixture
+        .state
+        .db
+        .resolve_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            key.tenant_id,
+            &fixture.model,
+            Protocol::OpenAiResponses.name(),
+            RouteSelectionOptions {
+                upstream_account_hint: None,
+                selection_seed: request_id,
+            },
+            fixture.state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut prepared = prepare_authorized_proxy_routes(
+        &fixture.state,
+        &key,
+        &fixture.model,
+        Protocol::OpenAiResponses,
+        request_id,
+        &json!({"model": fixture.model, "input": "snapshot fence", "stream": false}),
+        candidates,
+    )
+    .await
+    .unwrap()
+    .remove(0);
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE upstream_accounts SET updated_at = updated_at + 1 WHERE id = $1")
+        .bind(fixture.upstream_account_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    assert_eq!(
+        refresh_prepared_route_snapshot(&fixture.state, &mut prepared)
+            .await
+            .unwrap(),
+        PreparedRouteReadiness::Unavailable
+    );
+}
+
+#[test]
+fn credential_expiring_at_header_application_is_typed_unavailable() {
+    let now = crate::db::unix_millis();
+    let credential = UpstreamCredential::OAuth {
+        access_token: "expired".to_owned(),
+        refresh_token: None,
+        expires_at: Some(now),
+        header: "authorization".to_owned(),
+        prefix: "Bearer ".to_owned(),
+        adapter_state: None,
+        proxy_url: None,
+        proxy_network_scope: None,
+    };
+    assert!(matches!(
+        credential_application_error(&credential, now),
+        ProxySendError::CredentialUnavailable
+    ));
+}

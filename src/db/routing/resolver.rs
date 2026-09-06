@@ -5,41 +5,56 @@ use sqlx::{Row, any::AnyRow};
 use uuid::Uuid;
 
 use super::super::{AppError, Database, parse_uuid, unix_millis};
-use crate::provider::{ResolvedUpstream, open_credential, validate_config};
+use crate::provider::{
+    PROXY_ROUTING_POLICY, ResolvedUpstream, UpstreamTransportSnapshot, open_credential,
+    validate_config,
+};
 
 use super::types::{GrantedModelCapabilitySource, RouteSelectionOptions};
 
-const MAX_RESOLVED_UPSTREAM_CANDIDATES: usize = 3;
-
 impl Database {
-    /// Reloads the current generation immediately before an outbound attempt.
-    /// `None` is a normal readiness transition (inactive, revoked, or expired);
-    /// malformed encrypted/configured material remains an explicit error and
-    /// must not be hidden by cross-provider failover.
-    pub(crate) async fn reload_current_upstream_credential(
+    /// Reloads one coherent account/config/credential snapshot immediately
+    /// before an outbound attempt. The expected revision and generation bind
+    /// this read to the tuple used during request preparation.
+    ///
+    /// `None` is a normal readiness transition (rotation, reconfiguration,
+    /// inactive, revoked, or expired); malformed encrypted/configured material
+    /// remains an explicit error and must not be hidden by failover.
+    pub(crate) async fn reload_prepared_upstream_snapshot(
         &self,
         upstream_account_id: Uuid,
+        expected_transport_revision: i64,
+        expected_credential_generation: i64,
         key_material: &[u8],
-    ) -> Result<Option<(i64, crate::provider::UpstreamCredential)>, AppError> {
+    ) -> Result<Option<UpstreamTransportSnapshot>, AppError> {
         let now = unix_millis();
         let row = sqlx::query(
-            "SELECT account.credential_generation, credential.credential_ciphertext
+            "SELECT account.updated_at AS transport_revision,
+                    account.credential_generation, account.driver,
+                    account.config_json, credential.credential_ciphertext
              FROM upstream_accounts account
              JOIN upstream_credentials credential
                ON credential.upstream_account_id = account.id
               AND credential.generation = account.credential_generation
               AND credential.revoked_at IS NULL
-              AND (credential.expires_at IS NULL OR credential.expires_at > $2)
-             WHERE account.id = $1 AND account.status = 'active'",
+              AND (credential.expires_at IS NULL OR credential.expires_at > $4)
+             WHERE account.id = $1 AND account.status = 'active'
+               AND account.updated_at = $2
+               AND account.credential_generation = $3",
         )
         .bind(upstream_account_id.to_string())
+        .bind(expected_transport_revision)
+        .bind(expected_credential_generation)
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let generation: i64 = row.try_get("credential_generation")?;
+        let config_json: String = row.try_get("config_json")?;
+        let config: serde_json::Value =
+            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+        let base_url = validate_config(&config)?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         if credential
@@ -49,7 +64,14 @@ impl Database {
             return Ok(None);
         }
         credential.validate(now)?;
-        Ok(Some((generation, credential)))
+        Ok(Some(UpstreamTransportSnapshot {
+            transport_revision: row.try_get("transport_revision")?,
+            credential_generation: row.try_get("credential_generation")?,
+            driver: row.try_get("driver")?,
+            base_url,
+            config,
+            credential,
+        }))
     }
 
     pub async fn reload_persisted_generation_upstream(
@@ -60,7 +82,9 @@ impl Database {
         key_material: &[u8],
     ) -> Result<Option<ResolvedUpstream>, AppError> {
         let row = sqlx::query(
-            "SELECT r.id AS route_id, candidate.upstream_model, a.id AS account_id, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext
+            "SELECT r.id AS route_id, candidate.upstream_model, a.id AS account_id,
+                    a.updated_at AS transport_revision, a.credential_generation,
+                    a.driver, a.config_json, c.credential_ciphertext
              FROM model_routes r
              JOIN model_route_eligible_upstream_accounts candidate
                ON candidate.tenant_id = r.tenant_id AND candidate.model_route_id = r.id
@@ -87,6 +111,7 @@ impl Database {
         Ok(Some(ResolvedUpstream {
             route_id: parse_uuid(row.try_get("route_id")?)?,
             account_id: parse_uuid(row.try_get("account_id")?)?,
+            transport_revision: row.try_get("transport_revision")?,
             credential_generation: row.try_get("credential_generation")?,
             driver: row.try_get("driver")?,
             base_url,
@@ -139,7 +164,10 @@ impl Database {
             selection_seed,
         } = selection;
         let rows = sqlx::query(
-             "SELECT r.id AS route_id, r.priority, candidates.upstream_model, candidates.scheduling_weight, a.id AS account_id, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext
+             "SELECT r.id AS route_id, r.priority, candidates.upstream_model,
+                     candidates.scheduling_weight, a.id AS account_id,
+                     a.updated_at AS transport_revision, a.credential_generation,
+                     a.driver, a.config_json, c.credential_ciphertext
              FROM model_routes r
              JOIN model_route_eligible_upstream_accounts candidates
                ON candidates.tenant_id = r.tenant_id AND candidates.model_route_id = r.id
@@ -159,7 +187,7 @@ impl Database {
                  )
                )
              ORDER BY r.priority ASC, r.id ASC, a.id ASC
-             LIMIT 1001",
+             LIMIT $7",
         )
         .bind(tenant_id.to_string())
         .bind(public_model)
@@ -171,9 +199,10 @@ impl Database {
         )
         .bind(key_id.to_string())
         .bind(unix_millis())
+        .bind(PROXY_ROUTING_POLICY.candidate_query_limit())
         .fetch_all(&self.pool)
         .await?;
-        if rows.len() > 1000 {
+        if rows.len() > PROXY_ROUTING_POLICY.max_resolved_candidates() {
             return Err(AppError::BadRequest(
                 "authorized routing candidate set exceeds the safety limit".into(),
             ));
@@ -200,31 +229,41 @@ impl Database {
                 .then_with(|| left.route_id.cmp(&right.route_id))
                 .then_with(|| left.account_id.cmp(&right.account_id))
         });
-        let mut resolved =
-            Vec::with_capacity(candidates.len().min(MAX_RESOLVED_UPSTREAM_CANDIDATES));
-        for candidate in candidates
-            .into_iter()
-            .take(MAX_RESOLVED_UPSTREAM_CANDIDATES)
-        {
-            let prepared: Result<ResolvedUpstream, AppError> = (|| {
-                let config: serde_json::Value =
-                    serde_json::from_str(&candidate.config_json).map_err(|_| AppError::Internal)?;
-                let base_url = validate_config(&config)?;
-                Ok(ResolvedUpstream {
-                    route_id: candidate.route_id,
-                    account_id: candidate.account_id,
-                    credential_generation: candidate.credential_generation,
-                    driver: candidate.driver,
-                    base_url,
-                    config,
-                    upstream_model: candidate.upstream_model,
-                    credential: open_credential(&candidate.credential_ciphertext, key_material)?,
-                })
-            })();
+        let mut resolved = Vec::with_capacity(
+            candidates
+                .len()
+                .min(PROXY_ROUTING_POLICY.max_resolved_candidates()),
+        );
+        for candidate in candidates {
+            let config: serde_json::Value =
+                serde_json::from_str(&candidate.config_json).map_err(|_| AppError::Internal)?;
+            let base_url = validate_config(&config)?;
+            let credential = open_credential(&candidate.credential_ciphertext, key_material)?;
+            let now = unix_millis();
+            if credential
+                .expires_at()
+                .is_some_and(|expires_at| expires_at <= now)
+            {
+                continue;
+            }
+            credential.validate(now)?;
             // Corrupt encrypted material or route configuration is not a
             // normal health/readiness transition. Do not silently change
             // providers when an authorized candidate is malformed.
-            resolved.push(prepared?);
+            resolved.push(ResolvedUpstream {
+                route_id: candidate.route_id,
+                account_id: candidate.account_id,
+                transport_revision: candidate.transport_revision,
+                credential_generation: candidate.credential_generation,
+                driver: candidate.driver,
+                base_url,
+                config,
+                upstream_model: candidate.upstream_model,
+                credential,
+            });
+            if resolved.len() == PROXY_ROUTING_POLICY.max_resolved_candidates() {
+                break;
+            }
         }
         Ok(resolved)
     }
@@ -362,6 +401,7 @@ impl Database {
 struct RoutingCandidate {
     route_id: Uuid,
     account_id: Uuid,
+    transport_revision: i64,
     credential_generation: i64,
     priority: i64,
     scheduling_weight: i64,
@@ -380,6 +420,7 @@ impl RoutingCandidate {
         Ok(Self {
             route_id: parse_uuid(row.try_get("route_id")?)?,
             account_id: parse_uuid(row.try_get("account_id")?)?,
+            transport_revision: row.try_get("transport_revision")?,
             credential_generation: row.try_get("credential_generation")?,
             priority: row.try_get("priority")?,
             scheduling_weight,

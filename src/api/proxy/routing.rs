@@ -2,11 +2,15 @@ use super::*;
 
 mod codex;
 mod probe;
+mod readiness;
 
+pub(super) use crate::provider::PROXY_ROUTING_POLICY;
 pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard};
 pub(super) use probe::{UpstreamAttemptGuard, UpstreamAttemptTerminal};
-
-pub(super) const MAX_UPSTREAM_ATTEMPTS: usize = 3;
+pub(super) use readiness::{
+    CandidateCompatibility, PreparedRouteReadiness, candidate_compatibility,
+    credential_application_error, refresh_prepared_route_snapshot,
+};
 
 pub(super) struct PreparedProxyRoute {
     pub(super) route: ResolvedUpstream,
@@ -49,6 +53,7 @@ pub(super) async fn prepare_proxy_route(
     request_id: Uuid,
     request_json: &Value,
     route: ResolvedUpstream,
+    preparation_now: i64,
 ) -> Result<PreparedProxyRoute, AppError> {
     if !state.providers.contains(&route.driver) {
         return Err(AppError::Upstream(format!(
@@ -56,7 +61,7 @@ pub(super) async fn prepare_proxy_route(
             route.driver
         )));
     }
-    route.credential.validate(unix_millis())?;
+    route.credential.validate(preparation_now)?;
     let is_codex = codex_transport::is_driver(&route.driver);
     if is_codex {
         codex_transport::validate_protocol(protocol)?;
@@ -145,6 +150,7 @@ pub(super) enum ProxySendError {
     InvalidResponse(&'static str),
     AmbiguousResponse(&'static str),
     NonRetryableTransport,
+    CredentialUnavailable,
     Credential,
 }
 
@@ -196,11 +202,12 @@ async fn send_reqwest_proxy_route(
                 .cloned()
                 .unwrap_or(HeaderValue::from_static("application/json")),
         );
+    let credential_now = unix_millis();
     request = route
         .route
         .credential
-        .apply(request, unix_millis())
-        .map_err(|_| ProxySendError::Credential)?;
+        .apply(request, credential_now)
+        .map_err(|_| credential_application_error(&route.route.credential, credential_now))?;
     if route.route.driver == crate::oauth::copilot::PROVIDER_DRIVER {
         let product = format!("memeloop-token-center/{}", env!("CARGO_PKG_VERSION"));
         request = request

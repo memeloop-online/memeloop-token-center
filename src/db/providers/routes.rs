@@ -430,9 +430,9 @@ impl Database {
         key_material: &[u8],
     ) -> Result<Option<ResolvedUpstream>, AppError> {
         let sql = if upstream_account_id.is_some() {
-            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $5) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND a.id = $4 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.updated_at AS transport_revision, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $5) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND a.id = $4 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
         } else {
-            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $4) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
+            "SELECT r.id AS route_id, r.upstream_model, a.id AS account_id, a.updated_at AS transport_revision, a.credential_generation, a.driver, a.config_json, c.credential_ciphertext FROM model_routes r JOIN upstream_accounts a ON a.id = r.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $4) WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3 AND r.enabled = 1 AND a.status = 'active' ORDER BY r.priority ASC, r.id ASC LIMIT 1"
         };
         let query = sqlx::query(sql)
             .bind(tenant_id.to_string())
@@ -455,6 +455,7 @@ impl Database {
         Ok(Some(ResolvedUpstream {
             route_id: parse_uuid(row.try_get("route_id")?)?,
             account_id: parse_uuid(row.try_get("account_id")?)?,
+            transport_revision: row.try_get("transport_revision")?,
             credential_generation: row.try_get("credential_generation")?,
             driver: row.try_get("driver")?,
             base_url,
