@@ -326,7 +326,7 @@ fn values_placeholders(width: usize, rows: usize, literal_position: Option<usize
         .join(", ")
 }
 
-pub(super) async fn ensure_route_has_eligible_candidate(
+pub(in crate::db) async fn ensure_route_has_eligible_candidate(
     tx: &mut Transaction<'_, Any>,
     backend: DatabaseBackend,
     tenant_id: &str,

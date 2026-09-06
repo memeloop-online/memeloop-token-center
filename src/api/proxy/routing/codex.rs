@@ -5,7 +5,7 @@ use crate::metrics::CodexBadRequestRetry;
 mod retry;
 
 use retry::{AttemptControl, CodexRetryState, observe_bad_request_disposition};
-pub(super) use retry::{CodexRetryTerminal, CodexRetryTerminalGuard};
+pub(in crate::api::proxy) use retry::{CodexRetryTerminal, CodexRetryTerminalGuard};
 
 pub(super) async fn send_proxy_route(
     state: &AppState,

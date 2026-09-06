@@ -3679,7 +3679,7 @@ components:
       description: API contract version selected for this response.
       schema: { const: v1 }
     RouteCreateCreatedDisposition:
-      description: `created` is a new route; `equivalent_unowned` preserves header-less equality behaviour and cannot prove ownership.
+      description: '`created` is a new route; `equivalent_unowned` preserves header-less equality behaviour and cannot prove ownership.'
       schema:
         type: string
         enum: [created, equivalent_unowned]

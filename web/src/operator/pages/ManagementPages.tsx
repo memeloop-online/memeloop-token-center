@@ -569,8 +569,8 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
   const scopeGeneration = useRef(0);
   const keyRequestGeneration = useRef(0);
   const routeRequestGeneration = useRef(0);
-  const keyRequest = useRef<{ identity: KeyListRequestIdentity; controller: AbortController }>();
-  const routeRequest = useRef<{ generation: number; scopeGeneration: number; controller: AbortController }>();
+  const keyRequest = useRef<{ identity: KeyListRequestIdentity; controller: AbortController } | undefined>(undefined);
+  const routeRequest = useRef<{ generation: number; scopeGeneration: number; controller: AbortController } | undefined>(undefined);
   const scopeRef = useRef({ token, tenant });
   scopeRef.current = { token, tenant };
   const credentialGroups = useGroups('credential', token, tenant);

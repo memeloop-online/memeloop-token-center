@@ -17,7 +17,7 @@ pub use types::{
     UpdateRoutedModelRouteInput,
 };
 
-pub(crate) use associations::{
+pub(in crate::db) use associations::{
     bump_model_route_relation_timestamps, bump_route_group_relation_timestamps,
     ensure_route_has_eligible_candidate,
 };

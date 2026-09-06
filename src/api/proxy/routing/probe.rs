@@ -2,7 +2,7 @@ use super::*;
 use crate::metrics::{UpstreamHealthEvent, UpstreamHealthReason};
 
 #[derive(Clone, Copy)]
-pub(super) enum UpstreamAttemptTerminal {
+pub(in crate::api::proxy) enum UpstreamAttemptTerminal {
     Succeeded,
     Inconclusive,
     Failed {
@@ -12,7 +12,7 @@ pub(super) enum UpstreamAttemptTerminal {
 }
 
 impl UpstreamAttemptTerminal {
-    pub(super) const fn invalid_response() -> Self {
+    pub(in crate::api::proxy) const fn invalid_response() -> Self {
         Self::Failed {
             kind: UpstreamFailureKind::InvalidResponse,
             reason: UpstreamHealthReason::InvalidResponse,
@@ -24,7 +24,7 @@ impl UpstreamAttemptTerminal {
 /// been admitted. A 2xx header is not recovery: only the buffered or streaming
 /// terminal path can confirm protocol validity and durable settlement.
 #[must_use]
-pub(super) struct UpstreamAttemptGuard {
+pub(in crate::api::proxy) struct UpstreamAttemptGuard {
     state: Option<AppState>,
     request_id: Uuid,
     upstream_account_id: Uuid,
@@ -34,7 +34,7 @@ pub(super) struct UpstreamAttemptGuard {
 }
 
 impl UpstreamAttemptGuard {
-    pub(super) fn new(
+    pub(in crate::api::proxy) fn new(
         state: &AppState,
         request_id: Uuid,
         upstream_account_id: Uuid,
@@ -90,7 +90,7 @@ impl UpstreamAttemptGuard {
         }
     }
 
-    pub(super) async fn complete(&mut self, terminal: UpstreamAttemptTerminal) {
+    pub(in crate::api::proxy) async fn complete(&mut self, terminal: UpstreamAttemptTerminal) {
         self.stop_heartbeat();
         let Some(state) = self.state.take() else {
             return;

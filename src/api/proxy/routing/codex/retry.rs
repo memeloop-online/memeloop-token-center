@@ -12,7 +12,7 @@ pub(super) enum CodexRetryState {
     Retried,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(super) enum AttemptControl {
     RetrySameAccount,
     Return(ProxySendError),
@@ -171,36 +171,36 @@ mod tests {
     #[test]
     fn definite_rejections_have_one_same_account_transition() {
         let mut retry = CodexRetryState::new(true);
-        assert_eq!(
+        assert!(matches!(
             retry.after_bad_request(codex_transport::BadRequestDisposition::DefiniteTransient),
             AttemptControl::RetrySameAccount
-        );
+        ));
         assert_eq!(retry.outcome(), CodexRetryOutcome::Retried);
-        assert_eq!(
+        assert!(matches!(
             retry.after_bad_request(codex_transport::BadRequestDisposition::DefiniteOrdinary),
             AttemptControl::Return(ProxySendError::CodexBadRequest)
-        );
+        ));
     }
 
     #[test]
     fn unclassifiable_400_never_enters_replay() {
         let mut retry = CodexRetryState::new(true);
-        assert_eq!(
+        assert!(matches!(
             retry.after_bad_request(codex_transport::BadRequestDisposition::Unclassifiable(
                 codex_transport::BadRequestUnclassifiableReason::InvalidJson,
             )),
             AttemptControl::Return(ProxySendError::CodexBadRequest)
-        );
+        ));
         assert_eq!(retry.outcome(), CodexRetryOutcome::NotRetried);
     }
 
     #[test]
     fn disabled_store_contract_disables_replay() {
         let mut retry = CodexRetryState::new(false);
-        assert_eq!(
+        assert!(matches!(
             retry.after_bad_request(codex_transport::BadRequestDisposition::DefiniteTransient),
             AttemptControl::Return(ProxySendError::RetryableCodexBadRequest)
-        );
+        ));
         assert_eq!(retry.outcome(), CodexRetryOutcome::NotRetried);
     }
 
