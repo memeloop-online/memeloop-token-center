@@ -1624,7 +1624,7 @@ impl ResponsesSseCapture {
         for event in batch.events {
             if self.saw_done {
                 if event.is_line_ending_continuation {
-                    let bytes = Self::delivery_event_bytes(&event);
+                    let bytes = self.delivery_event_bytes(&event);
                     self.finish_delivery_event(bytes, ChatSseDeliveryClass::Control);
                 }
                 continue;
@@ -1656,12 +1656,12 @@ impl ResponsesSseCapture {
                 {
                     continue;
                 }
-                let bytes = Self::delivery_event_bytes(&event);
+                let bytes = self.delivery_event_bytes(&event);
                 self.finish_delivery_event(bytes, ChatSseDeliveryClass::Control);
                 continue;
             }
             let class = self.dispatch_event(&event);
-            let bytes = Self::delivery_event_bytes(&event);
+            let bytes = self.delivery_event_bytes(&event);
             self.finish_delivery_event(bytes, class);
         }
         Ok(())
@@ -1684,7 +1684,9 @@ impl ResponsesSseCapture {
         }
         if let Some(chat_usage) = self.chat_usage.as_ref() {
             self.usage = chat_usage.usage();
-            self.usage_invalid |= chat_usage.usage_invalid();
+            let usage_invalid = chat_usage.usage_invalid();
+            self.usage_invalid |= usage_invalid;
+            self.invalid |= usage_invalid;
         }
         let outcome = if self.terminal_failure {
             ResponsesSseOutcome::Failed
@@ -1739,8 +1741,10 @@ impl ResponsesSseCapture {
         }
     }
 
-    fn delivery_event_bytes(event: &super::sse::BoundedSseEvent) -> Bytes {
-        let metadata_policy = if Self::event_name_matches_payload(event) {
+    fn delivery_event_bytes(&self, event: &super::sse::BoundedSseEvent) -> Bytes {
+        let metadata_policy = if Self::event_name_matches_payload(event)
+            || (self.chat_usage.is_some() && Self::strict_chat_safe_event_name(event).is_some())
+        {
             super::sse::SseEventMetadataPolicy::ValidatedEventNames
         } else {
             super::sse::SseEventMetadataPolicy::DataOnly
@@ -1749,16 +1753,25 @@ impl ResponsesSseCapture {
     }
 
     fn strict_chat_named_control_bytes(event: &super::sse::BoundedSseEvent) -> Bytes {
-        let Ok((Some(event_name), None)) = super::sse::parse_sse_event(event) else {
+        let Ok((_, None)) = super::sse::parse_sse_event(event) else {
             return Bytes::new();
         };
-        let safe_name = match event_name.as_str() {
-            "message" => "message",
-            "error" => "error",
-            "response.failed" => "response.failed",
-            _ => return Bytes::new(),
+        let Some(safe_name) = Self::strict_chat_safe_event_name(event) else {
+            return Bytes::new();
         };
         Bytes::from(format!("event: {safe_name}\n\n"))
+    }
+
+    fn strict_chat_safe_event_name(event: &super::sse::BoundedSseEvent) -> Option<&'static str> {
+        let (Some(event_name), _) = super::sse::parse_sse_event(event).ok()? else {
+            return None;
+        };
+        match event_name.as_str() {
+            "message" => Some("message"),
+            "error" => Some("error"),
+            "response.failed" => Some("response.failed"),
+            _ => None,
+        }
     }
 
     fn event_name_matches_payload(event: &super::sse::BoundedSseEvent) -> bool {
@@ -1819,6 +1832,11 @@ impl ResponsesSseCapture {
             }
             return ChatSseDeliveryClass::Control;
         };
+        if self.chat_usage.is_some() && trim_ascii_whitespace(&data).is_empty() {
+            self.usage_invalid = true;
+            self.invalid = true;
+            return ChatSseDeliveryClass::Control;
+        }
         if data == b"[DONE]" {
             self.saw_done = true;
             if let Some(chat_usage) = self.chat_usage.as_mut() {
