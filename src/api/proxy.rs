@@ -150,14 +150,10 @@ async fn prepare_authorized_proxy_routes(
         original_body_length,
         resolved_routes,
     } = input;
-    let ProxyRequestContext {
-        state,
-        key,
-        model,
-        protocol,
-        request_id,
-        request_json,
-    } = request;
+    let state = request.state;
+    let protocol = request.protocol;
+    let request_id = request.request_id;
+    let request_json = request.request_json;
     let openai_chat_choice_count = matches!(protocol, Protocol::OpenAiChat)
         .then(|| openai_chat_choice_count(request_json))
         .transpose()?;
@@ -302,14 +298,9 @@ async fn next_sendable_proxy_route(
         candidates,
         mut failover_reason,
     } = input;
-    let ProxyRequestContext {
-        state,
-        key,
-        model,
-        protocol,
-        request_id,
-        request_json,
-    } = request;
+    let state = request.state;
+    let key = request.key;
+    let request_id = request.request_id;
     for mut route in candidates.by_ref() {
         if refresh_route_snapshot(state, &mut route).await? != PreparedRouteReadiness::Ready {
             state.metrics.observe_upstream_health(
@@ -407,8 +398,8 @@ async fn next_sendable_proxy_route(
     Ok(None)
 }
 
-async fn finish_non_sse_proxy_response(
-    buffered_request: &BufferedRequest<'_>,
+struct NonSseProxyResponseInput<'buffered, 'state, 'attempt> {
+    buffered_request: &'buffered BufferedRequest<'state>,
     upstream: UpstreamResponse,
     status: StatusCode,
     content_type: Option<HeaderValue>,
@@ -416,8 +407,23 @@ async fn finish_non_sse_proxy_response(
     capture_json_usage: bool,
     input_token_ceiling: i64,
     output_token_ceiling: i64,
-    upstream_attempt: &mut UpstreamAttemptGuard,
+    upstream_attempt: &'attempt mut UpstreamAttemptGuard,
+}
+
+async fn finish_non_sse_proxy_response(
+    input: NonSseProxyResponseInput<'_, '_, '_>,
 ) -> Result<Response, AppError> {
+    let NonSseProxyResponseInput {
+        buffered_request,
+        upstream,
+        status,
+        content_type,
+        protocol,
+        capture_json_usage,
+        input_token_ceiling,
+        output_token_ceiling,
+        upstream_attempt,
+    } = input;
     let response_content_type = content_type
         .as_ref()
         .and_then(|value| value.to_str().ok())
@@ -967,8 +973,8 @@ pub(super) async fn proxy(
     }
     let capture_json_usage = should_capture_buffered_usage(is_sse, content_type.as_ref());
     if !is_sse {
-        return finish_non_sse_proxy_response(
-            &buffered_request,
+        return finish_non_sse_proxy_response(NonSseProxyResponseInput {
+            buffered_request: &buffered_request,
             upstream,
             status,
             content_type,
@@ -976,8 +982,8 @@ pub(super) async fn proxy(
             capture_json_usage,
             input_token_ceiling,
             output_token_ceiling,
-            &mut upstream_attempt,
-        )
+            upstream_attempt: &mut upstream_attempt,
+        })
         .await;
     }
     streaming::stream_response(streaming::StreamingResponse {
