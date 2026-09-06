@@ -141,7 +141,7 @@ async fn codex_crlf_terminal_releases_at_eof_and_archives_only_safe_comments() {
     let sse = concat!(
         "event: response.completed\r\n",
         ": Authorization: provider-comment-secret\r\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-crlf\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\r\n\r\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-crlf\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\r\n\r\n",
         "data: [DONE]\r\n\r\n"
     );
     Mock::given(method("POST"))
