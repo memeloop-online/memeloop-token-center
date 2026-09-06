@@ -76,10 +76,53 @@ async function streamBytes(response: ServerResponse, state: MockState, total: nu
   } finally { state.end(); }
 }
 
+function chatSseFrame(choices: unknown[], usage?: Obj): Buffer {
+  return Buffer.from(`data: ${JSON.stringify({ id: "chatcmpl-memory-stream", object: "chat.completion.chunk", model: "benchmark-text", choices, ...(usage ? { usage } : {}) })}\n\n`);
+}
+
+async function writeStreamChunk(response: ServerResponse, chunk: Buffer): Promise<boolean> {
+  if (response.destroyed) return false;
+  if (response.write(chunk)) return true;
+  await new Promise<void>((done) => {
+    const drained = (): void => { response.off("close", closed); done(); };
+    const closed = (): void => { response.off("drain", drained); done(); };
+    response.once("drain", drained);
+    response.once("close", closed);
+  });
+  return !response.destroyed;
+}
+
+async function streamChatSse(response: ServerResponse, state: MockState, total: number, maximumFrameBytes: number, delayMs: number): Promise<void> {
+  const finish = chatSseFrame([{ index: 0, delta: {}, finish_reason: "stop" }]);
+  const usage = chatSseFrame([], { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 });
+  const done = Buffer.from("data: [DONE]\n\n");
+  const tailBytes = finish.length + usage.length + done.length;
+  const emptyContentFrameBytes = chatSseFrame([{ index: 0, delta: { content: "" }, finish_reason: null }]).length;
+  const contentBytes = total - tailBytes;
+  const frameCount = Math.ceil(contentBytes / maximumFrameBytes);
+  if (frameCount < 1 || contentBytes < frameCount * emptyContentFrameBytes) throw new HarnessFailure("stream byte target is too small for a valid Chat SSE response");
+  const payloadBytes = contentBytes - frameCount * emptyContentFrameBytes;
+  const basePayloadBytes = Math.floor(payloadBytes / frameCount);
+  const extraPayloadFrames = payloadBytes % frameCount;
+
+  state.begin();
+  try {
+    response.writeHead(200, { "content-type": "text/event-stream", "content-length": total });
+    for (let index = 0; index < frameCount; index += 1) {
+      const payloadLength = basePayloadBytes + (index < extraPayloadFrames ? 1 : 0);
+      const frame = chatSseFrame([{ index: 0, delta: { content: "x".repeat(payloadLength) }, finish_reason: null }]);
+      if (!await writeStreamChunk(response, frame)) return;
+      if (delayMs) await delay(delayMs);
+    }
+    for (const frame of [finish, usage, done]) if (!await writeStreamChunk(response, frame)) return;
+    response.end();
+  } finally { state.end(); }
+}
+
 export function createMockServer(state = new MockState()): Server {
   return createServer(async (request, response) => { try {
     const path = request.url ?? "/";
-    if (request.method === "POST" && path === "/v1/chat/completions") { const body = await requestJson(request); const benchmark = body.benchmark; if (benchmark?.mode === "stream" || benchmark?.mode === "oversize") { await streamBytes(response, state, Number(benchmark.bytes), Math.max(4096, Math.min(Number(benchmark.chunk_bytes ?? 262144), MIB)), Number(benchmark.delay_ms ?? 0), "text/event-stream"); return; } jsonResponse(response, 200, { id: "chatcmpl-memory-benchmark", object: "chat.completion", model: body.model ?? "benchmark-text", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 } }); return; }
+    if (request.method === "POST" && path === "/v1/chat/completions") { const body = await requestJson(request); const benchmark = body.benchmark; if (benchmark?.mode === "stream" || benchmark?.mode === "oversize") { await streamChatSse(response, state, Number(benchmark.bytes), Math.max(4096, Math.min(Number(benchmark.chunk_bytes ?? 262144), MIB)), Number(benchmark.delay_ms ?? 0)); return; } jsonResponse(response, 200, { id: "chatcmpl-memory-benchmark", object: "chat.completion", model: body.model ?? "benchmark-text", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 } }); return; }
     if (request.method === "POST" && path === "/api/v3/contents/generations/tasks") { const body = await requestJson(request); const assetMib = Number(body.benchmark_asset_mib ?? 100); const id = `bench-${assetMib}-${randomUUID().slice(0, 12)}`; state.assets.set(id, assetMib * MIB); jsonResponse(response, 200, { id }); return; }
     if (request.method === "POST" && path === "/v1/images/generations") { const body = await requestJson(request); if (body.n !== state.imageItemCount) { jsonResponse(response, 400, { error: "unexpected image result count" }); return; } state.standardImageRequests += 1; const base = Math.floor(state.imageRawBytes / state.imageItemCount); const remainder = state.imageRawBytes % state.imageItemCount; const data = Array.from({ length: state.imageItemCount }, (_, index) => ({ b64_json: Buffer.alloc(base + (index < remainder ? 1 : 0), "x").toString("base64"), revised_prompt: `memory benchmark image ${index}` })); jsonResponse(response, 200, { created: 1_700_000_000, data, usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 }, provider_secret: "must-not-reach-the-client" }); return; }
     if (request.method === "POST" && path === "/v1/responses") { const body = await requestJson(request); if (body.stream !== false || body.tools?.[0]?.type !== "image_generation") { jsonResponse(response, 400, { error: "unexpected Responses image request" }); return; } state.responsesToolImageRequests += 1; jsonResponse(response, 200, { id: "resp_memory_image", output: [{ type: "image_generation_call", id: "ig_memory_image", result: Buffer.alloc(state.imageRawBytes, "x").toString("base64"), provider_secret: "must-not-reach-the-client" }], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } }); return; }
