@@ -129,7 +129,7 @@ fn failed_terminal_drops_a_bare_secret_event_before_done() {
 #[test]
 fn sanitizer_preserves_bare_cr_and_cross_chunk_crlf_boundaries() {
     let created =
-        b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-boundary\"}}\r";
+        b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-boundary\"}}\r\r";
 
     let mut bare_cr = ResponsesStreamingSanitizer::default();
     assert_eq!(bare_cr.push(created).unwrap().as_ref(), created);
