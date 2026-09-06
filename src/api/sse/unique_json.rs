@@ -87,7 +87,7 @@ impl<'de> Visitor<'de> for UniqueJsonVisitor {
     }
 }
 
-pub(super) fn parse(data: &[u8]) -> Result<Value, &'static str> {
+pub(in crate::api) fn parse_unique_json(data: &[u8]) -> Result<Value, &'static str> {
     let mut deserializer = serde_json::Deserializer::from_slice(data);
     let value = UniqueJsonSeed
         .deserialize(&mut deserializer)

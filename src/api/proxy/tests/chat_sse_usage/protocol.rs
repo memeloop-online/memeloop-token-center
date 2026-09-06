@@ -2,20 +2,94 @@ use super::support::*;
 use super::*;
 
 #[test]
-fn stateful_sse_delivery_framer_keeps_split_comments_and_done_nonbillable() {
+fn stateful_sse_delivery_framer_redacts_split_comments_and_keeps_done_nonbillable() {
     let mut capture = ResponsesSseCapture::for_openai_chat_usage();
-    assert!(capture.push_delivery_frames(b": pi").is_empty());
-    assert!(capture.push_delivery_frames(b"ng\r\n").is_empty());
-    let frames = capture.push_delivery_frames(b"\r\n: two\n\n");
-    assert_eq!(frames.len(), 2);
+    assert!(capture.push_delivery_frames(b": pi").unwrap().is_empty());
+    let frames = capture.push_delivery_frames(b"ng\r\n").unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].bytes, Bytes::from_static(b": heartbeat\r\n"));
+    assert!(!frames[0].billable);
+    let frames = capture.push_delivery_frames(b"\r\n: two\n\n").unwrap();
+    assert_eq!(frames.len(), 3);
     assert!(frames.iter().all(|frame| !frame.billable));
-    assert_eq!(frames[0].bytes, Bytes::from_static(b": ping\r\n\r\n"));
-    assert_eq!(frames[1].bytes, Bytes::from_static(b": two\n\n"));
-    let frames = capture.push_delivery_frames(done().as_bytes());
+    assert_eq!(frames[0].bytes, Bytes::from_static(b"\r\n"));
+    assert_eq!(frames[1].bytes, Bytes::from_static(b": heartbeat\n"));
+    assert_eq!(frames[2].bytes, Bytes::from_static(b"\n"));
+    let frames = capture.push_delivery_frames(done().as_bytes()).unwrap();
     assert_eq!(frames.len(), 1);
     assert!(!frames[0].billable);
-    let frames = capture.push_delivery_frames(&[]);
+    let frames = capture.push_delivery_frames(&[]).unwrap();
     assert!(frames.is_empty());
+}
+
+#[test]
+fn strict_done_waits_for_and_delivers_a_split_crlf_suffix() {
+    let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+    let before_lf = capture.push_delivery_frames(b"data: [DONE]\r\n\r").unwrap();
+    assert_eq!(before_lf.len(), 1);
+    assert_eq!(
+        before_lf[0].bytes,
+        Bytes::from_static(b"data: [DONE]\r\n\r")
+    );
+    assert!(capture.saw_done());
+    assert!(capture.has_pending_crlf_continuation());
+    assert!(!capture.strict_chat_terminal_ready());
+
+    let suffix = capture.push_delivery_frames(b"\n").unwrap();
+    assert_eq!(suffix.len(), 1);
+    assert_eq!(suffix[0].bytes, Bytes::from_static(b"\n"));
+    assert!(!capture.has_pending_crlf_continuation());
+    assert!(capture.strict_chat_terminal_ready());
+}
+
+#[test]
+fn strict_chat_done_requires_the_exact_sse_data_value() {
+    for wire in [
+        b"data:  [DONE]\n\n".as_slice(),
+        b"data:\ndata: [DONE]\n\n".as_slice(),
+    ] {
+        let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+        let frames = capture.push_delivery_frames(wire).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(!capture.saw_done());
+        assert!(!capture.strict_chat_terminal_ready());
+        let summary = capture.finish_summary();
+        assert_eq!(summary.outcome, ResponsesSseOutcome::Incomplete);
+        assert!(summary.usage_invalid);
+    }
+}
+
+#[test]
+fn shared_delivery_framer_handles_all_line_endings_without_eof_dispatch() {
+    for (heartbeat, safe) in [
+        (b": lf\n\n".as_slice(), b": heartbeat\n\n".as_slice()),
+        (b": cr\r\r".as_slice(), b": heartbeat\r\r".as_slice()),
+        (
+            b": crlf\r\n\r\n".as_slice(),
+            b": heartbeat\r\n\r\n".as_slice(),
+        ),
+    ] {
+        let mut capture = ResponsesSseCapture::for_delivery();
+        let frames = capture.push_delivery_frames(heartbeat).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|frame| !frame.billable));
+        let actual = frames
+            .iter()
+            .flat_map(|frame| frame.bytes.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(actual.as_slice(), safe);
+    }
+
+    let mut truncated = ResponsesSseCapture::for_responses();
+    assert!(
+        truncated
+            .push_delivery_frames(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-eof\"}}",
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(truncated.finish(), ResponsesSseOutcome::Incomplete);
 }
 
 #[test]
@@ -49,7 +123,7 @@ fn responses_queued_events_are_control_frames() {
     let mut capture = ResponsesSseCapture::for_responses();
     let frames = capture.push_delivery_frames(
         b"event: response.queued\ndata: {\"type\":\"response.queued\",\"response\":{\"id\":\"resp-queued\"}}\n\n",
-    );
+    ).unwrap();
     assert_eq!(frames.len(), 1);
     assert!(!frames[0].billable);
 }
@@ -74,7 +148,7 @@ fn responses_completed_frames_are_billable_only_with_output_or_usage() {
         ),
     ] {
         let mut capture = ResponsesSseCapture::for_responses();
-        let frames = capture.push_delivery_frames(data);
+        let frames = capture.push_delivery_frames(data).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].billable, billable);
     }
@@ -87,7 +161,7 @@ fn responses_safe_failures_are_billable_only_for_compatible_routes() {
         (ResponsesSseCapture::for_responses(), true),
         (ResponsesSseCapture::for_codex_responses(), false),
     ] {
-        let frames = capture.push_delivery_frames(event);
+        let frames = capture.push_delivery_frames(event).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].billable, billable);
     }
@@ -131,18 +205,20 @@ fn typed_chat_dto_accepts_standard_metadata_keys() {
 fn chat_no_op_preambles_are_control_frames() {
     for delta in [json!({}), json!({"role": "assistant", "content": ""})] {
         let mut capture = ResponsesSseCapture::for_openai_chat_usage();
-        let frames = capture.push_delivery_frames(
-            chat_chunk(
-                "chatcmpl-control-preamble",
-                json!([{
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": null,
-                }]),
-                None,
+        let frames = capture
+            .push_delivery_frames(
+                chat_chunk(
+                    "chatcmpl-control-preamble",
+                    json!([{
+                        "index": 0,
+                        "delta": delta,
+                        "finish_reason": null,
+                    }]),
+                    None,
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        );
+            .unwrap();
         assert_eq!(frames.len(), 1);
         assert!(!frames[0].billable);
     }

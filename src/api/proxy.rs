@@ -15,6 +15,7 @@ use crate::{
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},
 };
 use chat_sse_usage::{ChatSseDeliveryClass, ChatSseUsageContract, ChatSseUsageState};
+pub(in crate::api) use conversation_hints::safe_conversation_hint as safe_response_id;
 use conversation_hints::{client_name, conversation_hints, safe_conversation_hint};
 use lifecycle::{
     AbortTaskOnDrop, begin_streaming_response_archive, finish_proxy_request_with_archive_fallback,
@@ -30,6 +31,9 @@ use upstream_response::UpstreamResponse;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod sse_delivery_tests;
 
 const PROXY_BODY_CHANNEL_CAPACITY: usize = 1;
 const MAX_INPUT_TOKEN_OVERHEAD_CEILING: i64 = 1_000_000;
@@ -1517,12 +1521,9 @@ impl ResponsesSseEventKind {
 
 #[derive(Default)]
 struct ResponsesSseCapture {
-    line: Vec<u8>,
-    data: Vec<u8>,
-    event_kind: Option<ResponsesSseEventKind>,
+    framer: super::sse::BoundedSseFramer,
+    framing_rejection: Option<super::sse::SseFramerRejection>,
     response_id: Option<String>,
-    discard_line: bool,
-    discard_event: bool,
     invalid: bool,
     terminal_success: bool,
     terminal_failure: bool,
@@ -1543,9 +1544,7 @@ enum ResponsesDeliveryContract {
 
 #[derive(Default)]
 struct SseDeliveryState {
-    event: Vec<u8>,
     frames: Vec<SseDeliveryFrame>,
-    discard_event: bool,
 }
 
 pub(super) struct SseDeliveryFrame {
@@ -1600,40 +1599,73 @@ impl ResponsesSseCapture {
         }
     }
 
+    #[cfg(test)]
     fn push(&mut self, chunk: &[u8]) {
-        for &byte in chunk {
-            if self.saw_done {
-                break;
-            }
-            self.push_delivery_byte(byte);
-            if byte == b'\n' {
-                self.finish_line();
-            } else if self.discard_line {
-                continue;
-            } else if self.line.len() >= MAX_RESPONSES_SSE_EVENT_BYTES {
-                self.line.clear();
-                self.discard_line = true;
-                self.discard_event = true;
-                self.invalid = true;
-            } else {
-                self.line.push(byte);
-            }
-        }
+        let _ = self.push_framed(chunk);
     }
 
-    pub(super) fn push_delivery_frames(&mut self, chunk: &[u8]) -> Vec<SseDeliveryFrame> {
-        self.push(chunk);
-        self.delivery
+    fn push_framed(&mut self, chunk: &[u8]) -> Result<(), super::sse::SseFramerRejection> {
+        if let Some(rejection) = self.framing_rejection {
+            return Err(rejection);
+        }
+        let batch = self.framer.push(chunk);
+        if let Some(rejection) = batch.rejection {
+            // Any framing limit invalidates the delivery capture permanently.
+            // A later blank line must not let an oversized event recover into
+            // a complete-looking terminal stream.
+            self.invalid = true;
+            self.framing_rejection = Some(rejection);
+            return Err(rejection);
+        }
+        for event in batch.events {
+            if self.saw_done {
+                if event.is_line_ending_continuation {
+                    let bytes = Self::delivery_event_bytes(&event);
+                    self.finish_delivery_event(bytes, ChatSseDeliveryClass::Control);
+                }
+                continue;
+            }
+            let has_data = event
+                .lines
+                .iter()
+                .any(|line| super::sse::is_sse_field_line(line.value.as_slice(), b"data"));
+            if !has_data {
+                if self.terminal_success || self.terminal_failure {
+                    continue;
+                }
+                // Only fixed, redacted heartbeats and field-less framing are
+                // safe to forward without a data envelope. Drop arbitrary
+                // event/id/retry metadata so it cannot carry provider secrets.
+                if event.idle_control != Some(super::sse::SseIdleControl::Comment)
+                    && !event.lines.is_empty()
+                {
+                    continue;
+                }
+                let bytes = Self::delivery_event_bytes(&event);
+                self.finish_delivery_event(bytes, ChatSseDeliveryClass::Control);
+                continue;
+            }
+            let class = self.dispatch_event(&event);
+            let bytes = Self::delivery_event_bytes(&event);
+            self.finish_delivery_event(bytes, class);
+        }
+        Ok(())
+    }
+
+    pub(super) fn push_delivery_frames(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<SseDeliveryFrame>, super::sse::SseFramerRejection> {
+        self.push_framed(chunk)?;
+        Ok(self
+            .delivery
             .as_mut()
-            .map_or_else(Vec::new, |delivery| std::mem::take(&mut delivery.frames))
+            .map_or_else(Vec::new, |delivery| std::mem::take(&mut delivery.frames)))
     }
 
     fn finish_summary(mut self) -> ResponsesSseSummary {
-        if !self.discard_line && !self.line.is_empty() {
-            self.finish_line();
-        }
-        if !self.data.is_empty() || self.discard_event || self.event_kind.is_some() {
-            let _ = self.dispatch_event();
+        if !self.framer.is_complete() {
+            self.invalid = true;
         }
         if let Some(chat_usage) = self.chat_usage.as_ref() {
             self.usage = chat_usage.usage();
@@ -1657,14 +1689,22 @@ impl ResponsesSseCapture {
         }
     }
 
-    fn chat_usage_done(&self) -> bool {
+    fn strict_chat_terminal_ready(&self) -> bool {
         self.chat_usage
             .as_ref()
             .is_some_and(ChatSseUsageState::is_done)
+            && self.saw_done
+            && !self.framer.has_pending_crlf_continuation()
     }
 
+    #[cfg(test)]
     fn saw_done(&self) -> bool {
         self.saw_done
+    }
+
+    #[cfg(test)]
+    fn has_pending_crlf_continuation(&self) -> bool {
+        self.framer.has_pending_crlf_continuation()
     }
 
     #[cfg(test)]
@@ -1672,113 +1712,82 @@ impl ResponsesSseCapture {
         self.finish_summary().outcome
     }
 
-    fn push_delivery_byte(&mut self, byte: u8) {
+    fn finish_delivery_event(&mut self, bytes: Bytes, class: ChatSseDeliveryClass) {
         let Some(delivery) = self.delivery.as_mut() else {
             return;
         };
-        if delivery.discard_event {
-            return;
-        }
-        if delivery.event.len() >= MAX_RESPONSES_SSE_EVENT_BYTES {
-            delivery.event.clear();
-            delivery.discard_event = true;
-            self.invalid = true;
-            return;
-        }
-        delivery.event.push(byte);
-    }
-
-    fn finish_delivery_event(&mut self, class: ChatSseDeliveryClass) {
-        let Some(delivery) = self.delivery.as_mut() else {
-            return;
-        };
-        if delivery.discard_event {
-            delivery.discard_event = false;
-            delivery.event.clear();
-            return;
-        }
-        let event = std::mem::take(&mut delivery.event);
-        if !event.is_empty() {
+        if !bytes.is_empty() {
             delivery.frames.push(SseDeliveryFrame {
-                bytes: Bytes::from(event),
+                bytes,
                 billable: matches!(class, ChatSseDeliveryClass::Billable),
             });
         }
     }
 
-    fn finish_line(&mut self) {
-        if self.discard_line {
-            self.discard_line = false;
-            self.line.clear();
-            return;
-        }
-        let mut line = std::mem::take(&mut self.line);
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        if line.is_empty() {
-            let class = self.dispatch_event();
-            self.finish_delivery_event(class);
-            return;
-        }
-        if self.discard_event {
-            return;
-        }
-        if line == b"data" || line.starts_with(b"data:") {
-            let value = if line == b"data" {
-                &[][..]
-            } else {
-                line[5..].strip_prefix(b" ").unwrap_or(&line[5..])
-            };
-            let separator = usize::from(!self.data.is_empty());
-            if self
-                .data
-                .len()
-                .saturating_add(separator)
-                .saturating_add(value.len())
-                > MAX_RESPONSES_SSE_EVENT_BYTES
-            {
-                self.data.clear();
-                self.discard_event = true;
-                self.invalid = true;
-                return;
-            }
-            if separator == 1 {
-                self.data.push(b'\n');
-            }
-            self.data.extend_from_slice(value);
-        } else if line == b"event" || line.starts_with(b"event:") {
-            let value = if line == b"event" {
-                &[][..]
-            } else {
-                line[6..].strip_prefix(b" ").unwrap_or(&line[6..])
-            };
-            self.event_kind = Some(ResponsesSseEventKind::from_name(value));
-        }
+    fn delivery_event_bytes(event: &super::sse::BoundedSseEvent) -> Bytes {
+        let metadata_policy = if Self::event_name_matches_payload(event) {
+            super::sse::SseEventMetadataPolicy::ValidatedEventNames
+        } else {
+            super::sse::SseEventMetadataPolicy::DataOnly
+        };
+        super::sse::redacted_sse_event_bytes(event, metadata_policy)
     }
 
-    fn dispatch_event(&mut self) -> ChatSseDeliveryClass {
-        let data = std::mem::take(&mut self.data);
-        let event_kind = self.event_kind.take();
-        let discard = std::mem::take(&mut self.discard_event);
-        // OpenAI Chat usage-only streams use anonymous `data:` events. A
-        // named event belongs to a different SSE dialect, so do not let a
-        // later syntactically valid Chat chunk turn this protocol violation
-        // into success. Named failures are terminal as well as invalid.
+    fn event_name_matches_payload(event: &super::sse::BoundedSseEvent) -> bool {
+        let Ok((Some(event_name), Some(data))) = super::sse::parse_sse_event(event) else {
+            return false;
+        };
+        serde_json::from_slice::<Value>(&data)
+            .ok()
+            .is_some_and(|value| {
+                value.get("type").and_then(Value::as_str) == Some(event_name.as_str())
+            })
+    }
+
+    fn dispatch_event(&mut self, event: &super::sse::BoundedSseEvent) -> ChatSseDeliveryClass {
+        let mut data = None::<Vec<u8>>;
+        let mut event_kind = None;
+        for line in &event.lines {
+            let line = line.value.as_slice();
+            if line == b"data" || line.starts_with(b"data:") {
+                let value = if line == b"data" {
+                    &[][..]
+                } else {
+                    line[5..].strip_prefix(b" ").unwrap_or(&line[5..])
+                };
+                let append_separator = data.is_some();
+                let data = data.get_or_insert_with(Vec::new);
+                if append_separator {
+                    data.push(b'\n');
+                }
+                data.extend_from_slice(value);
+            } else if line == b"event" || line.starts_with(b"event:") {
+                let value = if line == b"event" {
+                    &[][..]
+                } else {
+                    line[6..].strip_prefix(b" ").unwrap_or(&line[6..])
+                };
+                event_kind = Some(ResponsesSseEventKind::from_name(value));
+            }
+        }
+        // Strict OpenAI Chat usage streams use anonymous `data:` events. A
+        // named event belongs to another SSE dialect, so fail closed even if
+        // a later syntactically valid Chat chunk would otherwise complete the
+        // stream. Only actual non-empty model data confirms billable delivery.
         if self.chat_usage.is_some() && event_kind.is_some() {
             self.invalid = true;
             if matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
                 self.terminal_failure = true;
             }
-            // A lone event field does not carry model output. Preserve the
-            // fail-closed protocol result, but do not turn a control-only
-            // malformed frame into durable delivery and a ceiling charge.
-            let data = trim_ascii_whitespace(&data);
+            let data = data
+                .as_deref()
+                .map(trim_ascii_whitespace)
+                .unwrap_or_default();
             return (!data.is_empty() && data != b"[DONE]")
                 .then_some(ChatSseDeliveryClass::Billable)
                 .unwrap_or(ChatSseDeliveryClass::Control);
         }
-        if discard {
+        let Some(data) = data else {
             match event_kind {
                 Some(ResponsesSseEventKind::Completed) if self.require_explicit_completed => {
                     self.invalid = true;
@@ -1788,19 +1797,7 @@ impl ResponsesSseCapture {
                 Some(ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other) | None => {}
             }
             return ChatSseDeliveryClass::Control;
-        }
-        if data.is_empty() {
-            match event_kind {
-                Some(ResponsesSseEventKind::Completed) if self.require_explicit_completed => {
-                    self.invalid = true;
-                }
-                Some(ResponsesSseEventKind::Completed) => self.terminal_success = true,
-                Some(ResponsesSseEventKind::Failed) => self.terminal_failure = true,
-                Some(ResponsesSseEventKind::Lifecycle | ResponsesSseEventKind::Other) | None => {}
-            }
-            return ChatSseDeliveryClass::Control;
-        }
-        let data = trim_ascii_whitespace(&data);
+        };
         if data == b"[DONE]" {
             self.saw_done = true;
             if let Some(chat_usage) = self.chat_usage.as_mut() {
@@ -1817,9 +1814,9 @@ impl ResponsesSseCapture {
             return ChatSseDeliveryClass::Control;
         }
         if let Some(chat_usage) = self.chat_usage.as_mut() {
-            return chat_usage.observe_data(data);
+            return chat_usage.observe_data(&data);
         }
-        let Ok(value) = serde_json::from_slice::<Value>(data) else {
+        let Ok(value) = serde_json::from_slice::<Value>(&data) else {
             self.invalid = true;
             return ChatSseDeliveryClass::Billable;
         };
