@@ -77,7 +77,7 @@ async fn ordinary_client_error_does_not_cool_down_a_shared_account() {
 }
 
 #[tokio::test]
-async fn server_error_cools_the_account_and_fails_over_before_delivery() {
+async fn server_error_is_preserved_then_cools_the_account_for_the_next_request() {
     let unavailable = MockServer::start().await;
     let healthy = MockServer::start().await;
     Mock::given(method("POST"))
@@ -98,7 +98,17 @@ async fn server_error_cools_the_account_and_fails_over_before_delivery() {
     )
     .await;
 
-    let response = send_resilient_chat(&fixture, Some("server-error-failover"), false).await;
+    let response = send_resilient_chat(&fixture, Some("server-error-first"), false).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+
+    // Receiving a 5xx does not prove the provider did not accept the POST,
+    // therefore this request must not be replayed to another account. The
+    // recorded cooldown still makes the standby eligible for a later,
+    // independent request.
+    let response = send_resilient_chat(&fixture, Some("server-error-next"), false).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
@@ -107,13 +117,6 @@ async fn server_error_cools_the_account_and_fails_over_before_delivery() {
     healthy.verify().await;
 
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let actual: String = sqlx::query_scalar(
-        "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(fixture.key_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
     let health: (i64, String) = sqlx::query_as(
         "SELECT consecutive_failures, last_failure_kind FROM upstream_account_health
          WHERE upstream_account_id = $1",
@@ -123,7 +126,6 @@ async fn server_error_cools_the_account_and_fails_over_before_delivery() {
     .await
     .unwrap();
     pool.close().await;
-    assert_eq!(actual, fixture.accounts[1].to_string());
     assert_eq!(health, (1, "unavailable".to_owned()));
 }
 

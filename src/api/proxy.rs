@@ -794,23 +794,16 @@ pub(super) async fn proxy(
                 .await;
         }
         let failover_reason = match &result {
-            // Authentication rejection, capacity rejection, and a 5xx are
-            // complete upstream responses received before any downstream
-            // bytes. The account is cooled first and an already-authorized
-            // standby may be tried within the bounded request budget. No
-            // route is revisited, and streaming / admitted success responses
-            // never take this branch.
+            // A complete 429 is a definite capacity rejection before model
+            // execution, so moving to another authorized account cannot
+            // duplicate billable work. Other HTTP responses, including a
+            // 5xx, are preserved for the caller after recording health: the
+            // provider may already have accepted the POST despite its error.
             Ok(result)
-                if retryable_upstream_status(result.response.status())
+                if result.response.status() == StatusCode::TOO_MANY_REQUESTS
                     && !route_candidates.as_slice().is_empty() =>
             {
-                Some(
-                    if result.response.status() == StatusCode::TOO_MANY_REQUESTS {
-                        UpstreamHealthReason::RateLimited
-                    } else {
-                        UpstreamHealthReason::Unavailable
-                    },
-                )
+                Some(UpstreamHealthReason::RateLimited)
             }
             Err(ProxySendError::RetryableConnection) => failure.map(|(_, reason)| reason),
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable) => {
