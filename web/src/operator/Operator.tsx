@@ -111,7 +111,7 @@ export function Operator({ route, onRouteChange, embedded = false, showNavigatio
       <div className="credential operator-credential">
         {scope.tenants.length > 0 && <label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={scope.tenant} onChange={(event) => scope.setTenant(event.target.value)}><option value="">{t('operator.allTenants')}</option>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{value.external_id}</option>)}</select></label>}
         <input aria-label={t('operator.serviceCredential')} autoComplete="off" type="password" value={scope.credentialInput} onChange={(event) => scope.setCredentialInput(event.target.value)} placeholder={t('operator.tokenPlaceholder')} />
-        <button type="button" disabled={!scope.credentialInput.trim()} onClick={() => void scope.authenticate(scope.credentialInput, true)}>{t('common.connect')}</button>
+        <button type="button" disabled={!scope.credentialInput.trim()} onClick={() => void scope.authenticate(scope.credentialInput)}>{t('common.connect')}</button>
         {scope.credential && <button type="button" className="secondary clear-credential" onClick={scope.clearCredential}>{t('common.clearCredential')}</button>}
       </div>
     </header>

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { operatorRouteKeys } from '../src/operator/scope/operatorRoutes.js';
+import { tenantForCredential } from '../src/operator/hooks/useOperatorScope.js';
 
 const operator = readFileSync(new URL('../src/operator/Operator.tsx', import.meta.url), 'utf8');
 const scope = readFileSync(new URL('../src/operator/hooks/useOperatorScope.ts', import.meta.url), 'utf8');
@@ -29,6 +30,20 @@ test('sessions are a first-class operator route and all page keys are explicit',
 test('credential authentication discovers only tenants before a page mounts', () => {
   assert.match(scope, /api<TenantView\[]>\('\/internal\/v1\/tenants'/);
   assert.doesNotMatch(scope, /provider-types|plugins|upstreams|requests|schemas/);
+});
+
+test('operator restores an allowed tenant and otherwise opens the production default', () => {
+  const tenants = [{ external_id: 'archive' }, { external_id: 'default' }];
+  assert.equal(tenantForCredential(tenants, 'archive'), 'archive');
+  assert.equal(tenantForCredential(tenants, 'missing'), 'default');
+  assert.equal(tenantForCredential([{ external_id: 'only' }], ''), 'only');
+  assert.equal(tenantForCredential([{ external_id: 'one' }, { external_id: 'two' }], ''), '');
+});
+
+test('credential review defaults to active and all-tenant routes remain visible', () => {
+  assert.match(managementPages, /useState\('active'\)/);
+  assert.match(managementPages, /if \(!loadToken\) \{ setRoutes\(\[\]\); setCredentials\(\[\]\); return; \}/);
+  assert.doesNotMatch(managementPages, /if \(!loadToken \|\| !loadTenant\) \{ setRoutes\(\[\]\); setCredentials\(\[\]\); return; \}/);
 });
 
 test('request filters hide stale rows and cursors while a replacement query is pending or fails', () => {

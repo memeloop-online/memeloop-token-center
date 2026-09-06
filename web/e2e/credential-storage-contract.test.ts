@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { clearRememberedCredential, readRememberedCredential, rememberCredential } from '../src/credentialStorage.js';
+import {
+  clearRememberedCredential,
+  readRememberedCredential,
+  readRememberedOperatorTenant,
+  rememberCredential,
+  rememberOperatorTenant,
+} from '../src/credentialStorage.js';
 
 class MemoryStorage {
   private readonly values = new Map<string, string>();
@@ -26,6 +32,15 @@ test('operator and self-service credentials persist in isolated browser keys', (
   assert.equal(readRememberedCredential('self', storage), 'mtk_client');
 });
 
+test('operator tenant selection persists without coupling it to the credential value', () => {
+  const storage = new MemoryStorage() as Storage;
+  rememberOperatorTenant('  default  ', storage);
+  assert.equal(readRememberedOperatorTenant(storage), 'default');
+
+  rememberOperatorTenant('', storage);
+  assert.equal(readRememberedOperatorTenant(storage), '');
+});
+
 test('empty values and unavailable storage never break login state', () => {
   const storage = new MemoryStorage() as Storage;
   rememberCredential('operator', '   ', storage);
@@ -39,4 +54,6 @@ test('empty values and unavailable storage never break login state', () => {
   assert.equal(readRememberedCredential('self', blocked), '');
   assert.doesNotThrow(() => rememberCredential('self', 'mtk_client', blocked));
   assert.doesNotThrow(() => clearRememberedCredential('self', blocked));
+  assert.doesNotThrow(() => rememberOperatorTenant('default', blocked));
+  assert.equal(readRememberedOperatorTenant(blocked), '');
 });

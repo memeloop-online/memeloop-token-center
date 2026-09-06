@@ -1,6 +1,12 @@
 import { useEffect, useReducer, useRef } from 'react';
 import { api } from '../../api';
-import { clearRememberedCredential, readRememberedCredential, rememberCredential } from '../../credentialStorage';
+import {
+  clearRememberedCredential,
+  readRememberedCredential,
+  readRememberedOperatorTenant,
+  rememberCredential,
+  rememberOperatorTenant,
+} from '../../credentialStorage';
 import { useI18n } from '../../i18n';
 import type { TenantView } from '../../types';
 import { messageOf } from '../scope/operatorShared';
@@ -34,7 +40,7 @@ function initialState(): ScopeState {
     credential,
     validated: false,
     credentialInput: '',
-    tenant: '',
+    tenant: readRememberedOperatorTenant(),
     tenants: [],
     status: credential ? { kind: 'authenticating', candidate: credential } : { kind: 'disconnected' },
   };
@@ -66,10 +72,10 @@ function reducer(state: ScopeState, action: ScopeAction): ScopeState {
   }
 }
 
-function tenantForCredential(tenants: TenantView[], previousTenant: string, replacing: boolean) {
-  if (tenants.length === 1) return tenants[0].external_id;
-  if (replacing) return '';
-  return tenants.some((value) => value.external_id === previousTenant) ? previousTenant : '';
+export function tenantForCredential(tenants: TenantView[], previousTenant: string) {
+  if (tenants.some((value) => value.external_id === previousTenant)) return previousTenant;
+  if (tenants.some((value) => value.external_id === 'default')) return 'default';
+  return tenants.length === 1 ? tenants[0].external_id : '';
 }
 
 export function useOperatorScope() {
@@ -79,7 +85,7 @@ export function useOperatorScope() {
   const sequence = useRef(0);
   stateRef.current = state;
 
-  async function authenticate(rawCandidate: string, replacing = true) {
+  async function authenticate(rawCandidate: string) {
     const candidate = rawCandidate.trim();
     if (!candidate) return;
     const request = ++sequence.current;
@@ -92,8 +98,9 @@ export function useOperatorScope() {
       // never performs an accidental all-tenant query.
       const tenants = await api<TenantView[]>('/internal/v1/tenants', candidate);
       if (request !== sequence.current) return;
-      const tenant = tenantForCredential(tenants, before.tenant, replacing);
+      const tenant = tenantForCredential(tenants, before.tenant);
       rememberCredential('operator', candidate);
+      rememberOperatorTenant(tenant);
       dispatch({ type: 'authenticated', credential: candidate, tenants, tenant });
     } catch (reason) {
       if (request !== sequence.current) return;
@@ -108,7 +115,7 @@ export function useOperatorScope() {
 
   useEffect(() => {
     if (state.credential && state.status.kind === 'authenticating') {
-      void authenticate(state.credential, false);
+      void authenticate(state.credential);
     }
     // The remembered credential is intentionally attempted once on mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -130,7 +137,10 @@ export function useOperatorScope() {
     authenticating: state.status.kind === 'authenticating',
     error: state.status.kind === 'failed' ? state.status.message : '',
     setCredentialInput: (value: string) => dispatch({ type: 'credential-input', value }),
-    setTenant: (tenant: string) => dispatch({ type: 'select-tenant', tenant }),
+    setTenant: (tenant: string) => {
+      rememberOperatorTenant(tenant);
+      dispatch({ type: 'select-tenant', tenant });
+    },
     authenticate,
     clearCredential,
   };

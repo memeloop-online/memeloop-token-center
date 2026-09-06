@@ -4,6 +4,7 @@ const storageKeys: Record<RememberedCredentialKind, string> = {
   operator: 'mtc.operator.service-credential.v1',
   self: 'mtc.self.client-credential.v1',
 };
+const operatorTenantStorageKey = 'mtc.operator.tenant.v1';
 
 function browserStorage(): Storage | undefined {
   if (typeof window === 'undefined') return undefined;
@@ -43,3 +44,22 @@ export function clearRememberedCredential(kind: RememberedCredentialKind, storag
   }
 }
 
+export function readRememberedOperatorTenant(storage = browserStorage()): string {
+  if (!storage) return '';
+  try {
+    return storage.getItem(operatorTenantStorageKey)?.trim() ?? '';
+  } catch {
+    return '';
+  }
+}
+
+export function rememberOperatorTenant(tenant: string, storage = browserStorage()): void {
+  if (!storage) return;
+  try {
+    const value = tenant.trim();
+    if (value) storage.setItem(operatorTenantStorageKey, value);
+    else storage.removeItem(operatorTenantStorageKey);
+  } catch {
+    // Tenant selection is an ergonomic preference, never an auth dependency.
+  }
+}
