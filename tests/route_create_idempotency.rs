@@ -562,7 +562,7 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
         Some("route-create-owned-after-update")
     );
 
-    let legacy_upstream_id = updated_route.upstream_account_id;
+    let legacy_upstream_id = updated_route.0.upstream_account_id;
     let removable_upstream = fixture
         .state
         .db
@@ -615,7 +615,7 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
             owned_route_id,
             &fixture.tenant,
             false,
-            updated_route.updated_at,
+            updated_route.0.updated_at,
         )
         .await
         .expect("disable owned route");
