@@ -33,7 +33,7 @@ pub(super) struct ResponseArchiveBatch {
     pub(super) chunks: Vec<Bytes>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResponseArchiveBatchError {
     BatchLimit,
     Backpressure,
