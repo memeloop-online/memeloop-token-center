@@ -1,0 +1,227 @@
+use super::*;
+
+/// All data needed after downstream delivery has ended. The delivery pump owns
+/// the response body, while this typed boundary owns settlement and the two
+/// route health guards.
+pub(super) struct StreamingFinalizationInput<'a> {
+    pub(super) state: &'a AppState,
+    pub(super) status_code: i64,
+    pub(super) protocol: Protocol,
+    pub(super) is_codex_route: bool,
+    pub(super) codex_retry: CodexRetryTerminalGuard,
+    pub(super) upstream_attempt: UpstreamAttemptGuard,
+    pub(super) request_id: Uuid,
+    pub(super) reservation: crate::model::UsageReservation,
+    pub(super) started: Instant,
+    pub(super) input_token_ceiling: i64,
+    pub(super) output_token_ceiling: i64,
+    pub(super) requested_service_tier: Option<String>,
+    pub(super) conversation: Option<ProxyConversation>,
+    pub(super) tenant_id: Uuid,
+    pub(super) transport_error: Option<&'static str>,
+    pub(super) delivered_billable: bool,
+    pub(super) sse_summary: Option<ResponsesSseSummary>,
+    pub(super) usage_capture: Vec<u8>,
+    pub(super) response_archive_attempt: Option<crate::proxy_lifecycle::ProxyArchiveAttempt>,
+    pub(super) stored_response: String,
+    pub(super) gap_response: String,
+}
+
+pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInput<'_>) {
+    let StreamingFinalizationInput {
+        state,
+        status_code,
+        protocol,
+        is_codex_route,
+        mut codex_retry,
+        mut upstream_attempt,
+        request_id,
+        reservation,
+        started,
+        input_token_ceiling,
+        output_token_ceiling,
+        requested_service_tier,
+        conversation,
+        tenant_id,
+        transport_error,
+        delivered_billable,
+        sse_summary,
+        usage_capture,
+        response_archive_attempt,
+        stored_response,
+        gap_response,
+    } = input;
+    let protocol_error = match sse_summary.as_ref().map(|summary| &summary.outcome) {
+        Some(ResponsesSseOutcome::Failed) => Some("upstream_failed_response"),
+        Some(ResponsesSseOutcome::Incomplete) => Some("upstream_incomplete_response"),
+        Some(ResponsesSseOutcome::Completed { .. }) | None => None,
+    };
+    let mut terminal_status = status_code;
+    let mut error_code = transport_error.or(protocol_error);
+    if error_code.is_some() {
+        terminal_status = 502;
+    }
+    let full_contract_usage = || TokenUsage {
+        input_tokens: input_token_ceiling,
+        output_tokens: output_token_ceiling,
+        ..TokenUsage::default()
+    };
+    let mut charge_contract_ceiling = delivered_billable && error_code.is_some();
+    let mut usage = if error_code.is_some() {
+        if delivered_billable {
+            full_contract_usage()
+        } else {
+            TokenUsage::default()
+        }
+    } else {
+        let extracted_usage = match sse_summary.as_ref() {
+            Some(summary) if summary.usage_invalid => ExtractedUsage::Invalid,
+            Some(summary) => summary.usage.clone().map_or_else(
+                || {
+                    if is_codex_route {
+                        ExtractedUsage::Invalid
+                    } else {
+                        ExtractedUsage::Missing
+                    }
+                },
+                ExtractedUsage::Valid,
+            ),
+            None => extract_usage_checked(&usage_capture),
+        };
+        match extracted_usage {
+            ExtractedUsage::Valid(usage) => usage,
+            ExtractedUsage::Missing => {
+                charge_contract_ceiling = delivered_billable;
+                if delivered_billable {
+                    full_contract_usage()
+                } else {
+                    TokenUsage::default()
+                }
+            }
+            ExtractedUsage::Invalid => {
+                terminal_status = 502;
+                error_code = Some("upstream_invalid_usage");
+                charge_contract_ceiling = delivered_billable;
+                if delivered_billable {
+                    full_contract_usage()
+                } else {
+                    TokenUsage::default()
+                }
+            }
+        }
+    };
+    match crate::db::normalize_proxy_usage(
+        &usage,
+        input_token_ceiling,
+        output_token_ceiling,
+        requested_service_tier.as_deref(),
+    ) {
+        Ok(normalized) => usage = normalized,
+        Err(AppError::Upstream(_)) => {
+            terminal_status = 502;
+            error_code = Some("upstream_invalid_usage");
+            charge_contract_ceiling = delivered_billable;
+            usage = if delivered_billable {
+                full_contract_usage()
+            } else {
+                TokenUsage::default()
+            };
+        }
+        Err(_) => {
+            terminal_status = 502;
+            error_code = Some("upstream_invalid_usage");
+            charge_contract_ceiling = delivered_billable;
+            usage = if delivered_billable {
+                full_contract_usage()
+            } else {
+                TokenUsage::default()
+            };
+        }
+    }
+    let response_id =
+        if (200..400).contains(&terminal_status) && matches!(protocol, Protocol::OpenAiResponses) {
+            match sse_summary.as_ref().map(|summary| &summary.outcome) {
+                Some(ResponsesSseOutcome::Completed { response_id }) => response_id.clone(),
+                None => extract_response_id(&usage_capture),
+                Some(ResponsesSseOutcome::Failed | ResponsesSseOutcome::Incomplete) => None,
+            }
+        } else {
+            None
+        };
+    // A retry's success is a protocol-terminal property, not a 2xx header or
+    // SSE framing property. Direct Codex streams must have exactly one
+    // matching `response.completed` carrying a stable response id; capture
+    // marks duplicate/mismatched terminal events incomplete before this point.
+    let retry_terminal = if is_codex_route
+        && error_code.is_none()
+        && (200..400).contains(&terminal_status)
+        && matches!(
+            sse_summary.as_ref().map(|summary| &summary.outcome),
+            Some(ResponsesSseOutcome::Completed {
+                response_id: Some(_)
+            })
+        ) {
+        CodexRetryTerminal::Succeeded
+    } else if matches!(
+        transport_error,
+        Some("downstream_disconnected" | "downstream_backpressure")
+    ) {
+        CodexRetryTerminal::Cancelled
+    } else {
+        CodexRetryTerminal::Failed
+    };
+    let conversation_input = conversation
+        .as_ref()
+        .map(|conversation| ProxyConversationInput {
+            key: &conversation.key,
+            request_json: &conversation.request_json,
+            hints: &conversation.hints,
+            client_name: conversation.client_name.as_deref(),
+            upstream_response_id: response_id.as_deref(),
+        });
+    let terminal_result = finish_proxy_request_with_archive_fallback(
+        &state.db,
+        FinishProxyRequest {
+            request_id,
+            tenant_id,
+            reservation: &reservation,
+            input_token_ceiling,
+            output_token_ceiling,
+            requested_service_tier: requested_service_tier.as_deref(),
+            status_code: terminal_status,
+            duration_ms: started.elapsed().as_millis() as i64,
+            usage,
+            charge_contract_ceiling,
+            error_code,
+            response_object: &stored_response,
+            conversation: conversation_input,
+        },
+        response_archive_attempt.as_ref(),
+        &gap_response,
+    )
+    .await;
+    let terminal_result_failed = terminal_result.is_err();
+    if terminal_result_failed {
+        // The commit can be durable even when its acknowledgement is lost.
+        // Preserve this request-scoped archive until its database owner is
+        // known; deleting it here could leave a committed row dangling.
+        tracing::error!(%request_id, stage = "terminal_transaction", "proxy request finalization failed");
+    }
+    let attempt_terminal = if terminal_result_failed
+        || matches!(
+            transport_error,
+            Some("downstream_disconnected" | "downstream_backpressure" | "delivery_state")
+        ) {
+        UpstreamAttemptTerminal::Inconclusive
+    } else if error_code.is_some() {
+        UpstreamAttemptTerminal::invalid_response()
+    } else {
+        UpstreamAttemptTerminal::Succeeded
+    };
+    upstream_attempt.complete(attempt_terminal).await;
+    codex_retry.complete(if terminal_result_failed {
+        CodexRetryTerminal::Failed
+    } else {
+        retry_terminal
+    });
+}
