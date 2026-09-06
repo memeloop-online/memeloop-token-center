@@ -1026,7 +1026,10 @@ impl BufferedResponsesParser {
     }
 }
 
-fn canonical_responses_usage(response: &Value) -> Result<TokenUsage, ()> {
+/// Parse the one canonical Responses API usage shape shared by buffered and
+/// direct Codex delivery. Callers must pass the completed `response` object,
+/// never an outer SSE event envelope.
+pub(super) fn canonical_responses_usage(response: &Value) -> Result<TokenUsage, ()> {
     let usage = response.get("usage").and_then(Value::as_object).ok_or(())?;
     let required_integer = |field: &str| -> Result<i64, ()> {
         usage

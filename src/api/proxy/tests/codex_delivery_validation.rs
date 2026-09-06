@@ -223,6 +223,181 @@ async fn buffered_codex_cache_usage_is_settled_at_distinct_prices() {
 }
 
 #[tokio::test]
+async fn streaming_codex_cache_usage_is_settled_at_distinct_prices() {
+    let fixture = codex_route_fixture("streaming-cache-pricing").await;
+    fixture
+        .state
+        .db
+        .upsert_model_price_tier(
+            &fixture.model,
+            "USD",
+            "default",
+            Decimal::ONE,
+            Decimal::from(2),
+            Decimal::from(3),
+            Decimal::from(4),
+            false,
+        )
+        .await
+        .unwrap();
+    let upstream = MockServer::start().await;
+    let body = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stream-cache\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{",
+        "\"id\":\"resp-stream-cache\",\"output\":[],",
+        "\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":3,",
+        "\"cache_write_tokens\":2},\"output_tokens\":1,\"output_tokens_details\":null,",
+        "\"total_tokens\":11}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "stream price categories", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("resp-stream-cache"));
+    wait_for_request_settlement(&fixture, 1).await;
+
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].input_tokens, 5);
+    assert_eq!(rows[0].cached_input_tokens, 3);
+    assert_eq!(rows[0].cache_write_tokens, 2);
+    assert_eq!(rows[0].output_tokens, 1);
+    assert_eq!(rows[0].cost, "0.000021");
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let stored = sqlx::query(
+        "SELECT r.actual_micros, c.available_micros
+         FROM request_records q
+         JOIN usage_reservations r ON r.id = q.reservation_id
+         JOIN key_records k ON k.id = q.key_id
+         JOIN credit_accounts c ON c.id = k.account_id
+         WHERE q.id = $1",
+    )
+    .bind(rows[0].request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.get::<i64, _>("actual_micros"), 21);
+    assert_eq!(stored.get::<i64, _>("available_micros"), 999_979);
+    pool.close().await;
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-stream-cache")).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn streaming_codex_accepts_nullable_usage_details() {
+    let fixture = codex_route_fixture("streaming-null-usage-details").await;
+    let upstream = MockServer::start().await;
+    let body = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-null-details\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{",
+        "\"id\":\"resp-null-details\",\"output\":[],",
+        "\"usage\":{\"input_tokens\":4,\"input_tokens_details\":null,",
+        "\"output_tokens\":1,\"output_tokens_details\":null,\"total_tokens\":5}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "nullable details", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].input_tokens, 4);
+    assert_eq!(rows[0].cached_input_tokens, 0);
+    assert_eq!(rows[0].cache_write_tokens, 0);
+    assert_eq!(rows[0].output_tokens, 1);
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-null-details")).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn streaming_codex_rejects_usage_without_canonical_total_after_delivery() {
+    let fixture = codex_route_fixture("streaming-missing-usage-total").await;
+    let upstream = MockServer::start().await;
+    let body = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-missing-total\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{",
+        "\"id\":\"resp-missing-total\",\"output\":[],",
+        "\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "missing total", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_invalid_usage")
+    );
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn streaming_codex_rejects_output_items_before_response_identity() {
     let fixture = codex_route_fixture("streaming-item-before-id").await;
     let upstream = MockServer::start().await;

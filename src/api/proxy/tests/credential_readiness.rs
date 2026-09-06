@@ -106,12 +106,13 @@ async fn credential_expiring_after_resolution_skips_to_prepared_standby() {
         Protocol::OpenAiResponses,
         request_id,
         &request,
+        serde_json::to_vec(&request).unwrap().len(),
         candidates,
     )
     .await
     .unwrap();
-    assert_eq!(prepared.len(), 1);
-    assert_eq!(prepared[0].route.account_id, standby);
+    assert_eq!(prepared.direct_candidates.len(), 1);
+    assert_eq!(prepared.direct_candidates[0].account_id, standby);
 }
 
 #[tokio::test]
@@ -150,23 +151,28 @@ async fn local_codex_protocol_mismatch_skips_to_compatible_candidate() {
     compatible.credential = UpstreamCredential::None;
     candidates.push(compatible.clone());
 
+    let request = json!({
+        "model": fixture.model,
+        "messages": [{"role": "user", "content": "local mismatch"}],
+        "stream": false
+    });
     let prepared = prepare_authorized_proxy_routes(
         &fixture.state,
         &key,
         &fixture.model,
         Protocol::OpenAiChat,
         request_id,
-        &json!({
-            "model": fixture.model,
-            "messages": [{"role": "user", "content": "local mismatch"}],
-            "stream": false
-        }),
+        &request,
+        serde_json::to_vec(&request).unwrap().len(),
         candidates,
     )
     .await
     .unwrap();
-    assert_eq!(prepared.len(), 1);
-    assert_eq!(prepared[0].route.account_id, compatible.account_id);
+    assert_eq!(prepared.direct_candidates.len(), 1);
+    assert_eq!(
+        prepared.direct_candidates[0].account_id,
+        compatible.account_id
+    );
 }
 
 #[tokio::test]
@@ -179,7 +185,7 @@ async fn changed_transport_revision_invalidates_the_prepared_snapshot() {
         .await
         .unwrap();
     let request_id = Uuid::now_v7();
-    let candidates = fixture
+    let mut candidate = fixture
         .state
         .db
         .resolve_authorized_upstream_candidates_with_hint(
@@ -194,19 +200,8 @@ async fn changed_transport_revision_invalidates_the_prepared_snapshot() {
             fixture.state.config.key_pepper.as_bytes(),
         )
         .await
-        .unwrap();
-    let mut prepared = prepare_authorized_proxy_routes(
-        &fixture.state,
-        &key,
-        &fixture.model,
-        Protocol::OpenAiResponses,
-        request_id,
-        &json!({"model": fixture.model, "input": "snapshot fence", "stream": false}),
-        candidates,
-    )
-    .await
-    .unwrap()
-    .remove(0);
+        .unwrap()
+        .remove(0);
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("UPDATE upstream_accounts SET updated_at = updated_at + 1 WHERE id = $1")
         .bind(fixture.upstream_account_id.to_string())
@@ -216,7 +211,7 @@ async fn changed_transport_revision_invalidates_the_prepared_snapshot() {
     pool.close().await;
 
     assert_eq!(
-        refresh_prepared_route_snapshot(&fixture.state, &mut prepared)
+        refresh_route_snapshot(&fixture.state, &mut candidate)
             .await
             .unwrap(),
         PreparedRouteReadiness::Unavailable
@@ -240,4 +235,125 @@ fn credential_expiring_at_header_application_is_typed_unavailable() {
         credential_application_error(&credential, now),
         ProxySendError::CredentialUnavailable
     ));
+}
+
+#[tokio::test]
+async fn cooldown_candidates_do_not_consume_the_three_outbound_attempts() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    let third = MockServer::start().await;
+    let fourth = MockServer::start().await;
+    for upstream in [&first, &second, &third] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(upstream)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_chat_response())
+        .expect(1)
+        .mount(&fourth)
+        .await;
+    let fixture = resilient_route_fixture(
+        "three-cooldowns-fourth-healthy",
+        &[
+            (first.uri(), 0),
+            (second.uri(), 10),
+            (third.uri(), 20),
+            (fourth.uri(), 30),
+        ],
+    )
+    .await;
+    for account_id in fixture.accounts.iter().take(3) {
+        assert!(
+            fixture
+                .state
+                .db
+                .record_upstream_account_failure(*account_id, 1, UpstreamFailureKind::Connection)
+                .await
+                .unwrap()
+        );
+    }
+
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    for upstream in [&first, &second, &third, &fourth] {
+        upstream.verify().await;
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let actual: String = sqlx::query_scalar(
+        "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(fixture.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(actual, fixture.accounts[3].to_string());
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn header_application_expiry_skips_to_standby_without_breaker_failure() {
+    let fixture = codex_route_fixture("header-expiry-standby").await;
+    let standby =
+        add_codex_standby_route(&fixture, "codex-route-header-expiry-standby", "account-456").await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-123"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-456"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("standby after header expiry"),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = routing::with_test_credential_application_now_once(
+        i64::MAX,
+        send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({"model": fixture.model, "input": "header expiry", "stream": false}),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    upstream.verify().await;
+
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let actual: String = sqlx::query_scalar(
+        "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(fixture.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let primary_failure_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(actual, standby.to_string());
+    assert_eq!(primary_failure_count, 0);
+    pool.close().await;
 }

@@ -1,5 +1,28 @@
 use super::*;
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_CREDENTIAL_APPLICATION_NOW: std::cell::Cell<Option<i64>>;
+}
+
+pub(super) fn credential_application_now() -> i64 {
+    #[cfg(test)]
+    if let Ok(Some(now)) = TEST_CREDENTIAL_APPLICATION_NOW.try_with(|clock| clock.take()) {
+        return now;
+    }
+    unix_millis()
+}
+
+#[cfg(test)]
+pub(super) async fn with_test_credential_application_now_once<F>(now: i64, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TEST_CREDENTIAL_APPLICATION_NOW
+        .scope(std::cell::Cell::new(Some(now)), future)
+        .await
+}
+
 mod codex;
 mod probe;
 mod readiness;
@@ -9,30 +32,47 @@ pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard};
 pub(super) use probe::{UpstreamAttemptGuard, UpstreamAttemptTerminal};
 pub(super) use readiness::{
     CandidateCompatibility, PreparedRouteReadiness, candidate_compatibility,
-    credential_application_error, refresh_prepared_route_snapshot,
+    credential_application_error, refresh_route_snapshot,
 };
 
 pub(super) struct PreparedProxyRoute {
     pub(super) route: ResolvedUpstream,
     forwarded_body: Vec<u8>,
-    pub(super) output_token_ceiling: i64,
     pub(super) codex_downstream_stream: bool,
     pub(super) codex_store_disabled: bool,
     codex_session_id: Option<String>,
     pub(super) component_request: Option<(PreparedProviderRequest, RequestContext)>,
 }
 
+pub(super) struct PlannedProxyRoute {
+    pub(super) route: ResolvedUpstream,
+    forwarded_json: Value,
+    pub(super) output_token_ceiling: i64,
+    codex_downstream_stream: bool,
+    codex_store_disabled: bool,
+    codex_session_id: Option<String>,
+    component_context: Option<RequestContext>,
+}
+
+impl PlannedProxyRoute {
+    pub(super) fn is_component(&self) -> bool {
+        self.component_context.is_some()
+    }
+
+    pub(super) fn request_body_ceiling(
+        &self,
+        original_body_length: usize,
+    ) -> Result<usize, AppError> {
+        let forwarded_length = serde_json::to_vec(&self.forwarded_json)
+            .map_err(|_| AppError::Internal)?
+            .len();
+        Ok(original_body_length.max(forwarded_length))
+    }
+}
+
 impl PreparedProxyRoute {
     pub(super) fn is_codex(&self) -> bool {
         codex_transport::is_driver(&self.route.driver)
-    }
-
-    pub(super) fn is_component(&self, state: &AppState) -> bool {
-        state
-            .providers
-            .get(&self.route.driver)
-            .and_then(|provider| provider.component_adapter.as_ref())
-            .is_some()
     }
 
     pub(super) fn request_body_ceiling(&self, original_body_length: usize) -> usize {
@@ -45,7 +85,7 @@ impl PreparedProxyRoute {
     }
 }
 
-pub(super) async fn prepare_proxy_route(
+pub(super) fn plan_proxy_route(
     state: &AppState,
     key: &AuthenticatedKey,
     model: &str,
@@ -54,7 +94,7 @@ pub(super) async fn prepare_proxy_route(
     request_json: &Value,
     route: ResolvedUpstream,
     preparation_now: i64,
-) -> Result<PreparedProxyRoute, AppError> {
+) -> Result<PlannedProxyRoute, AppError> {
     if !state.providers.contains(&route.driver) {
         return Err(AppError::Upstream(format!(
             "provider driver {} is not loaded",
@@ -95,7 +135,7 @@ pub(super) async fn prepare_proxy_route(
         .providers
         .get(&route.driver)
         .and_then(|provider| provider.component_adapter.as_ref());
-    let component_request = if component_adapter.is_some() {
+    let component_context = if component_adapter.is_some() {
         match forwarded_json.get("stream") {
             Some(Value::Bool(false)) | None => {}
             Some(Value::Bool(true)) => {
@@ -114,29 +154,52 @@ pub(super) async fn prepare_proxy_route(
             model: model.to_owned(),
             config_json: serde_json::to_string(&route.config).map_err(|_| AppError::Internal)?,
         };
+        Some(context)
+    } else {
+        None
+    };
+    let codex_downstream_stream = codex_plan
+        .as_ref()
+        .is_some_and(|plan| plan.downstream_stream);
+    let codex_store_disabled =
+        codex_plan.is_some() && forwarded_json.get("store").and_then(Value::as_bool) == Some(false);
+    let codex_session_id = codex_plan.map(|plan| plan.session_id);
+    Ok(PlannedProxyRoute {
+        route,
+        forwarded_json,
+        output_token_ceiling,
+        codex_downstream_stream,
+        codex_store_disabled,
+        codex_session_id,
+        component_context,
+    })
+}
+
+pub(super) async fn materialize_proxy_route(
+    state: &AppState,
+    planned: PlannedProxyRoute,
+) -> Result<PreparedProxyRoute, AppError> {
+    let component_request = if let Some(context) = planned.component_context {
         let prepared = prepare_component_provider(
             state,
-            &route.driver,
+            &planned.route.driver,
             context.clone(),
-            route.config.clone(),
-            forwarded_json.clone(),
+            planned.route.config.clone(),
+            planned.forwarded_json.clone(),
         )
         .await?;
         Some((prepared, context))
     } else {
         None
     };
-    let forwarded_body = serde_json::to_vec(&forwarded_json).map_err(|_| AppError::Internal)?;
+    let forwarded_body =
+        serde_json::to_vec(&planned.forwarded_json).map_err(|_| AppError::Internal)?;
     Ok(PreparedProxyRoute {
-        route,
+        route: planned.route,
         forwarded_body,
-        output_token_ceiling,
-        codex_downstream_stream: codex_plan
-            .as_ref()
-            .is_some_and(|plan| plan.downstream_stream),
-        codex_store_disabled: codex_plan.is_some()
-            && forwarded_json.get("store").and_then(Value::as_bool) == Some(false),
-        codex_session_id: codex_plan.map(|plan| plan.session_id),
+        codex_downstream_stream: planned.codex_downstream_stream,
+        codex_store_disabled: planned.codex_store_disabled,
+        codex_session_id: planned.codex_session_id,
         component_request,
     })
 }
@@ -202,7 +265,7 @@ async fn send_reqwest_proxy_route(
                 .cloned()
                 .unwrap_or(HeaderValue::from_static("application/json")),
         );
-    let credential_now = unix_millis();
+    let credential_now = credential_application_now();
     request = route
         .route
         .credential

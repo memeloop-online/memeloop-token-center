@@ -10,14 +10,12 @@ pub(super) enum CandidateCompatibility {
 pub(super) enum PreparedRouteReadiness {
     Ready,
     Unavailable,
-    StaleTransport,
 }
 
 impl PreparedRouteReadiness {
     pub(super) const fn error_code(self) -> &'static str {
         match self {
             Self::Ready | Self::Unavailable => "upstream_credential_unavailable",
-            Self::StaleTransport => "upstream_transport_changed",
         }
     }
 }
@@ -41,16 +39,16 @@ pub(super) fn candidate_compatibility(
 /// request preparation, then replace every transport field from one atomic DB
 /// snapshot. A rotation or reconfiguration is a normal readiness transition;
 /// the caller may safely try another already-prepared candidate.
-pub(super) async fn refresh_prepared_route_snapshot(
+pub(super) async fn refresh_route_snapshot(
     state: &AppState,
-    route: &mut PreparedProxyRoute,
+    route: &mut ResolvedUpstream,
 ) -> Result<PreparedRouteReadiness, AppError> {
-    let expected_revision = route.route.transport_revision;
-    let expected_generation = route.route.credential_generation;
+    let expected_revision = route.transport_revision;
+    let expected_generation = route.credential_generation;
     let Some(snapshot) = state
         .db
         .reload_prepared_upstream_snapshot(
-            route.route.account_id,
+            route.account_id,
             expected_revision,
             expected_generation,
             state.config.key_pepper.as_bytes(),
@@ -61,18 +59,18 @@ pub(super) async fn refresh_prepared_route_snapshot(
     };
     if snapshot.transport_revision != expected_revision
         || snapshot.credential_generation != expected_generation
-        || snapshot.driver != route.route.driver
-        || snapshot.base_url != route.route.base_url
-        || snapshot.config != route.route.config
+        || snapshot.driver != route.driver
+        || snapshot.base_url != route.base_url
+        || snapshot.config != route.config
     {
-        return Ok(PreparedRouteReadiness::StaleTransport);
+        return Ok(PreparedRouteReadiness::Unavailable);
     }
-    route.route.transport_revision = snapshot.transport_revision;
-    route.route.credential_generation = snapshot.credential_generation;
-    route.route.driver = snapshot.driver;
-    route.route.base_url = snapshot.base_url;
-    route.route.config = snapshot.config;
-    route.route.credential = snapshot.credential;
+    route.transport_revision = snapshot.transport_revision;
+    route.credential_generation = snapshot.credential_generation;
+    route.driver = snapshot.driver;
+    route.base_url = snapshot.base_url;
+    route.config = snapshot.config;
+    route.credential = snapshot.credential;
     Ok(PreparedRouteReadiness::Ready)
 }
 

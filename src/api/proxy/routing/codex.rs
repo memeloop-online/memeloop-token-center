@@ -137,7 +137,7 @@ async fn send_codex_attempt(
             wreq::Proxy::all(proxy_url).map_err(|_| ProxySendError::CandidateUnavailable)?;
         request = request.proxy(proxy);
     }
-    let credential_now = unix_millis();
+    let credential_now = credential_application_now();
     let request = codex_transport::apply_wreq_wire_headers(
         request,
         headers,
