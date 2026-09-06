@@ -65,6 +65,26 @@ fn unique(label: &str) -> String {
     format!("{label}-{}", Uuid::now_v7())
 }
 
+async fn ensure_active_tenant(world: &TokenCenterWorld, external_id: &str) {
+    let state = world.state.as_ref().expect("logical-session state");
+    if let Some(tenant) = state
+        .db
+        .list_tenant_management()
+        .await
+        .expect("list logical-session tenants")
+        .into_iter()
+        .find(|tenant| tenant.external_id == external_id)
+    {
+        assert_eq!(tenant.status, "active", "logical-session tenant is active");
+        return;
+    }
+    state
+        .db
+        .create_tenant(external_id, None)
+        .await
+        .expect("create active logical-session tenant");
+}
+
 async fn issue_key(
     world: &TokenCenterWorld,
     tenant: &str,
@@ -72,6 +92,7 @@ async fn issue_key(
     alias: &str,
     currency: &str,
 ) -> (IssuedKey, AuthenticatedKey) {
+    ensure_active_tenant(world, tenant).await;
     let state = world.state.as_ref().expect("logical-session state");
     let issued = state
         .db

@@ -103,6 +103,17 @@ async fn issue_service_token(world: &TokenCenterWorld, name: &str, scopes: &[&st
         .to_owned()
 }
 
+async fn create_active_tenant(world: &TokenCenterWorld, external_id: &str) {
+    world
+        .state
+        .as_ref()
+        .expect("security acceptance application state")
+        .db
+        .create_tenant(external_id, None)
+        .await
+        .expect("create active tenant before issuing scoped service credential");
+}
+
 async fn create_key(
     world: &TokenCenterWorld,
     tenant: &str,
@@ -325,6 +336,7 @@ async fn service_status_lifecycle_and_global_only(world: &mut TokenCenterWorld) 
         .expect("managed service credential JSON");
     let target_token = target["token"].as_str().expect("managed service token");
     let service_id = target["service_id"].as_str().expect("managed service id");
+    create_active_tenant(world, "status-tenant").await;
     let scoped_response = world
         .client
         .post(format!("{}/internal/v1/service-tokens", world.service_url))
@@ -760,6 +772,7 @@ async fn every_service_scope_is_exact(world: &mut TokenCenterWorld) {
     "tenant scoped OAuth cannot target private or metadata endpoints while a global private connection is allowed"
 )]
 async fn oauth_start_enforces_network_boundary(world: &mut TokenCenterWorld) {
+    create_active_tenant(world, "oauth-boundary-tenant").await;
     let scoped_response = world
         .client
         .post(format!("{}/internal/v1/service-tokens", world.service_url))

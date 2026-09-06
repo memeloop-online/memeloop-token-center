@@ -4407,6 +4407,14 @@ async fn matrix_request_id(world: &TokenCenterWorld, tenant: &str) -> Uuid {
 
 #[when("the service prepares two tenants and credentials for the authorization matrix")]
 async fn prepare_authorization_matrix(world: &mut TokenCenterWorld) {
+    let state = world.state.as_ref().expect("test application state");
+    for tenant in ["matrix-first", "matrix-second"] {
+        state
+            .db
+            .create_tenant(tenant, None)
+            .await
+            .expect("create active authorization-matrix tenant");
+    }
     let price = world
         .client
         .post(format!(
