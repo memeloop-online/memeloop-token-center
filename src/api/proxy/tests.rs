@@ -809,8 +809,11 @@ async fn codex_retry_then_http_response_is_not_replayed_across_accounts() {
             .expect(0)
             .mount(&upstream)
             .await;
-        let standby_route_name = format!("codex-route-retry-then-{label}-no-replay");
-        let _standby = add_codex_standby_route(&fixture, &standby_route_name, "account-456").await;
+        // The grant must remain in the key's tenant. The route label is only
+        // descriptive; using it as a distinct tenant now correctly trips the
+        // tenant-scoped routing-grant foreign key.
+        let standby_tenant = format!("codex-route-{fixture_name}");
+        let _standby = add_codex_standby_route(&fixture, &standby_tenant, "account-456").await;
 
         let response = send_codex_route(
             &fixture,
@@ -2435,6 +2438,54 @@ async fn codex_streaming_route_accepts_valid_sse_without_content_type() {
 }
 
 #[tokio::test]
+async fn codex_streaming_route_accepts_headerless_bare_cr_sse_without_byte_drift() {
+    let fixture = codex_route_fixture("streaming-headerless-bare-cr").await;
+    let upstream = MockServer::start().await;
+    let sse = completed_codex_sse("streamed bare CR answer")
+        .replace("\r\n", "\r")
+        .replace('\n', "\r");
+    assert!(!sse.contains('\n'));
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(sse.clone().into_bytes()))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({
+            "model": fixture.model,
+            "input": "stream a headerless bare CR SSE response",
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), sse.as_bytes());
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn streaming_text_delivery_does_not_wait_for_a_timed_out_archive() {
     let fixture = codex_route_fixture_with_archive_directory(
         "streaming-archive-timeout",
@@ -3177,7 +3228,9 @@ fn responses_sse_capture_bounds_and_skips_an_oversized_single_event() {
     );
     failed.push(&oversized_event);
     failed.push(b"\n\ndata: [DONE]\n\n");
-    assert_eq!(failed.finish(), ResponsesSseOutcome::Failed);
+    // An oversized event is discarded before its unclosed event metadata can
+    // be trusted. It must not recover into a terminal classification.
+    assert_eq!(failed.finish(), ResponsesSseOutcome::Incomplete);
 }
 
 #[test]

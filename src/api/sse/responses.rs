@@ -114,6 +114,7 @@ pub(in crate::api) struct ResponsesStreamingSanitizer {
     framer: BoundedSseFramer,
     terminal: Option<StreamTerminal>,
     saw_protocol_event: bool,
+    forward_crlf_continuation: bool,
     identity: ResponseIdentityGate,
     terminal_hold: ResponseTerminalHold,
 }
@@ -154,6 +155,21 @@ impl ResponsesStreamingSanitizer {
         event: BoundedSseEvent,
         output: &mut Vec<u8>,
     ) -> Result<(), &'static str> {
+        if event.is_line_ending_continuation {
+            if self.forward_crlf_continuation {
+                // The framer emitted the preceding CR-terminated event at a
+                // network boundary. This LF contains no provider payload,
+                // but it must follow that forwarded CR exactly so headerless
+                // admission can retain a bare-CR prefix without swallowing a
+                // later CRLF pair.
+                self.append_output(output, &event.bytes)?;
+            }
+            self.forward_crlf_continuation = false;
+            return Ok(());
+        }
+        // A non-continuation event proves that a preceding CR was a complete
+        // bare-CR separator. No later LF may be attached to it.
+        self.forward_crlf_continuation = false;
         let (event_name, data) = parse_sse_event(&event)?;
         if data.is_none()
             && event_name
@@ -171,12 +187,19 @@ impl ResponsesStreamingSanitizer {
             // Keep a standard DONE event's original CR/LF spelling. A named
             // provider event is normalized so its untrusted event name never
             // escapes the sanitizer.
-            let done = if event_name.is_none() {
-                safe_sse_fields(&event)
+            if event_name.is_none() {
+                self.append_safe_sse_fields(&event, output)?;
             } else {
-                b"data: [DONE]\n\n".to_vec()
-            };
-            self.append_output(output, &done)?;
+                self.append_output(output, b"data: [DONE]\n\n")?;
+            }
+            return Ok(());
+        }
+        if self.terminal == Some(StreamTerminal::Failed) {
+            // Once a framed failure terminal is delivered, all later
+            // provider data is untrusted diagnostic tail. Drop it before
+            // JSON parsing or identity checks so a secret-bearing or forged
+            // post-terminal event cannot turn a safe failure into a second
+            // downstream error.
             return Ok(());
         }
         let Some(data) = data else {
@@ -239,7 +262,9 @@ impl ResponsesStreamingSanitizer {
         event: &BoundedSseEvent,
         output: &mut Vec<u8>,
     ) -> Result<(), &'static str> {
-        self.append_output(output, &safe_sse_fields(event))
+        self.append_output(output, &safe_sse_fields(event))?;
+        self.forward_crlf_continuation = event.bytes.last() == Some(&b'\r');
+        Ok(())
     }
 
     fn append_output(&mut self, output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), &'static str> {

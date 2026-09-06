@@ -2,6 +2,7 @@ use super::*;
 
 use crate::api::limits::{
     MAX_RESPONSES_SSE_EVENT_BYTES, MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES, MAX_SSE_FIELDS_PER_EVENT,
+    MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK, MAX_SSE_FRAMES_PER_NETWORK_CHUNK,
 };
 
 fn event_with_field_count(fields: usize) -> Vec<u8> {
@@ -126,11 +127,40 @@ fn failed_terminal_drops_a_bare_secret_event_before_done() {
 }
 
 #[test]
+fn sanitizer_preserves_bare_cr_and_cross_chunk_crlf_boundaries() {
+    let created =
+        b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-boundary\"}}\r";
+
+    let mut bare_cr = ResponsesStreamingSanitizer::default();
+    assert_eq!(bare_cr.push(created).unwrap().as_ref(), created);
+    assert!(bare_cr.saw_protocol_event());
+    assert!(bare_cr.is_complete());
+
+    let mut split_crlf = ResponsesStreamingSanitizer::default();
+    let mut output = split_crlf.push(created).unwrap().to_vec();
+    assert!(split_crlf.saw_protocol_event());
+    output.extend_from_slice(&split_crlf.push(b"\n").unwrap());
+    let mut expected = created.to_vec();
+    expected.push(b'\n');
+    assert_eq!(output, expected);
+    assert!(split_crlf.is_complete());
+}
+
+#[test]
 fn sanitizer_bounds_each_event_not_the_network_chunk() {
-    let event = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"}}\n\n";
-    let repeats = MAX_RESPONSES_SSE_EVENT_BYTES / event.len() + 2;
+    // Keep the complete batch within the independent decoder-product caps.
+    // The property under test is that an otherwise bounded network chunk may
+    // exceed the per-event cap, not that it may bypass the batch cap.
+    let mut event =
+        b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\"},\"padding\":\""
+            .to_vec();
+    event.extend_from_slice(&[b'x'; 512]);
+    event.extend_from_slice(b"\"}\n\n");
+    let repeats = MAX_RESPONSES_SSE_EVENT_BYTES / event.len() + 1;
     let network_chunk = event.repeat(repeats);
     assert!(network_chunk.len() > MAX_RESPONSES_SSE_EVENT_BYTES);
+    assert!(network_chunk.len() <= MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK);
+    assert!(repeats <= MAX_SSE_FRAMES_PER_NETWORK_CHUNK);
     let mut sanitizer = ResponsesStreamingSanitizer::default();
     let output = sanitizer.push(&network_chunk).unwrap();
     assert_eq!(output.as_ref(), network_chunk);
