@@ -1,6 +1,184 @@
 use super::super::*;
 
 #[tokio::test]
+async fn sqlite_v66_preserves_existing_upstream_cooldown_and_probe_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("upstream-health-v66.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 1, 65)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let account_id = Uuid::now_v7();
+    let tenant_id = Uuid::now_v7();
+    let now = unix_millis();
+    let cooldown_until = now + 60_000;
+    let probe_lease_until = now + 30_000;
+    sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, $3)")
+        .bind(tenant_id.to_string())
+        .bind(format!("health-upgrade-{tenant_id}"))
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_accounts (
+             id, tenant_id, name, driver, auth_kind, config_json, status,
+             credential_generation, created_at, updated_at
+         ) VALUES ($1, $2, 'health-upgrade', 'http-json', 'none', '{}', 'active', 7, $3, $3)",
+    )
+    .bind(account_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(now)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_account_health (
+             upstream_account_id, consecutive_failures, cooldown_until,
+             probe_lease_until, last_failure_kind, updated_at
+         ) VALUES ($1, 4, $2, $3, 'connection', $4)",
+    )
+    .bind(account_id.to_string())
+    .bind(cooldown_until)
+    .bind(probe_lease_until)
+    .bind(now)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+
+    let mut transaction = database.pool.begin().await.unwrap();
+    apply_migration_range(&mut transaction, SQLITE_MIGRATIONS, 66, 66)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let health = sqlx::query(
+        "SELECT consecutive_failures, cooldown_until, probe_lease_until,
+                probe_lease_token, credential_generation, last_failure_kind, updated_at
+         FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(account_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(health.get::<i64, _>("consecutive_failures"), 4);
+    assert_eq!(health.get::<i64, _>("cooldown_until"), cooldown_until);
+    assert_eq!(health.get::<i64, _>("probe_lease_until"), probe_lease_until);
+    assert_eq!(health.get::<String, _>("probe_lease_token"), "");
+    assert_eq!(health.get::<i64, _>("credential_generation"), 7);
+    assert_eq!(health.get::<String, _>("last_failure_kind"), "connection");
+    assert_eq!(health.get::<i64, _>("updated_at"), now);
+    sqlx::query(
+        "UPDATE upstream_account_health SET cooldown_until = 0
+         WHERE upstream_account_id = $1",
+    )
+    .bind(account_id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        database
+            .claim_upstream_account_attempt(account_id, 7)
+            .await
+            .unwrap(),
+        UpstreamAttemptAdmission::Unavailable,
+        "the legacy probe lease remains exclusive after cooldown"
+    );
+}
+
+#[tokio::test]
+async fn postgres_v66_preserves_existing_upstream_cooldown_and_probe_lease() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    sqlx::any::install_default_drivers();
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
+    let mut transaction = pool.begin().await.unwrap();
+    let schema = format!("upstream_health_v66_{}", Uuid::now_v7().simple());
+    // Test-only identifier: a fixed literal prefix and a library-generated UUID.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL search_path = {schema}"
+    )))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    for statement in [
+        "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+        "CREATE TABLE tenants (id TEXT PRIMARY KEY)",
+        "CREATE TABLE upstream_accounts (id TEXT PRIMARY KEY, credential_generation BIGINT NOT NULL)",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    apply_migration_range(&mut transaction, POSTGRES_MIGRATIONS, 64, 65)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO tenants (id) VALUES ('health-upgrade-tenant')")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_accounts (id, credential_generation)
+         VALUES ('health-upgrade-account', 9)",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_account_health (
+             upstream_account_id, consecutive_failures, cooldown_until,
+             probe_lease_until, last_failure_kind, updated_at
+         ) VALUES ('health-upgrade-account', 5, 80000, 70000, 'unavailable', 60000)",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+
+    apply_migration_range(&mut transaction, POSTGRES_MIGRATIONS, 66, 66)
+        .await
+        .unwrap();
+
+    let health = sqlx::query(
+        "SELECT consecutive_failures, cooldown_until, probe_lease_until,
+                probe_lease_token, credential_generation, last_failure_kind, updated_at
+         FROM upstream_account_health WHERE upstream_account_id = 'health-upgrade-account'",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(health.get::<i64, _>("consecutive_failures"), 5);
+    assert_eq!(health.get::<i64, _>("cooldown_until"), 80_000);
+    assert_eq!(health.get::<i64, _>("probe_lease_until"), 70_000);
+    assert_eq!(health.get::<String, _>("probe_lease_token"), "");
+    assert_eq!(health.get::<i64, _>("credential_generation"), 9);
+    assert_eq!(health.get::<String, _>("last_failure_kind"), "unavailable");
+    assert_eq!(health.get::<i64, _>("updated_at"), 60_000);
+    transaction.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn sqlite_v60_normalizes_matching_coexisting_credentials_without_legacy_runtime() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

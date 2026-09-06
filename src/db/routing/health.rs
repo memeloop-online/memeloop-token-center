@@ -3,7 +3,10 @@ use uuid::Uuid;
 
 use super::super::{AppError, Database, unix_millis};
 
-const PROBE_LEASE_MILLIS: i64 = 30_000;
+mod policy;
+
+use policy::UPSTREAM_HEALTH_POLICY;
+pub(crate) use policy::upstream_probe_heartbeat_interval;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UpstreamFailureKind {
@@ -16,7 +19,7 @@ pub(crate) enum UpstreamFailureKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UpstreamAttemptAdmission {
     Healthy,
-    Probe,
+    Probe { lease_token: Uuid },
     Unavailable,
 }
 
@@ -31,12 +34,7 @@ impl UpstreamFailureKind {
     }
 
     fn base_cooldown_millis(self) -> i64 {
-        match self {
-            Self::RateLimited => 30_000,
-            Self::Unavailable => 15_000,
-            Self::InvalidResponse => 15_000,
-            Self::Connection => 5_000,
-        }
+        UPSTREAM_HEALTH_POLICY.base_cooldown_millis(self)
     }
 }
 
@@ -47,19 +45,29 @@ impl Database {
     pub(crate) async fn claim_upstream_account_attempt(
         &self,
         upstream_account_id: Uuid,
+        credential_generation: i64,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
         let now = unix_millis();
         let row = sqlx::query(
-            "SELECT consecutive_failures, cooldown_until, probe_lease_until
-             FROM upstream_account_health WHERE upstream_account_id = $1",
+            "SELECT health.consecutive_failures, health.cooldown_until, health.probe_lease_until
+             FROM upstream_accounts account
+             LEFT JOIN upstream_account_health health
+               ON health.upstream_account_id = account.id
+              AND health.credential_generation = $2
+             WHERE account.id = $1 AND account.status = 'active'
+               AND account.credential_generation = $2",
         )
         .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else {
+            return Ok(UpstreamAttemptAdmission::Unavailable);
+        };
+        let Some(consecutive_failures) = row.try_get::<Option<i64>, _>("consecutive_failures")?
+        else {
             return Ok(UpstreamAttemptAdmission::Healthy);
         };
-        let consecutive_failures: i64 = row.try_get("consecutive_failures")?;
         if consecutive_failures == 0 {
             return Ok(UpstreamAttemptAdmission::Healthy);
         }
@@ -68,21 +76,31 @@ impl Database {
         if cooldown_until > now || probe_lease_until > now {
             return Ok(UpstreamAttemptAdmission::Unavailable);
         }
+        let lease_token = Uuid::now_v7();
         let result = sqlx::query(
             "UPDATE upstream_account_health
-             SET probe_lease_until = $1, updated_at = $2
-             WHERE upstream_account_id = $3
+             SET probe_lease_until = $1, probe_lease_token = $2, updated_at = $3
+             WHERE upstream_account_id = $4
                AND consecutive_failures > 0
-               AND cooldown_until <= $2
-               AND probe_lease_until <= $2",
+               AND credential_generation = $5
+               AND cooldown_until <= $3
+               AND probe_lease_until <= $3
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_health.upstream_account_id
+                   AND account.status = 'active'
+                   AND account.credential_generation = $5
+               )",
         )
-        .bind(now.saturating_add(PROBE_LEASE_MILLIS))
+        .bind(now.saturating_add(UPSTREAM_HEALTH_POLICY.probe_lease_millis()))
+        .bind(lease_token.to_string())
         .bind(now)
         .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
         .execute(&self.pool)
         .await?;
         Ok(if result.rows_affected() == 1 {
-            UpstreamAttemptAdmission::Probe
+            UpstreamAttemptAdmission::Probe { lease_token }
         } else {
             UpstreamAttemptAdmission::Unavailable
         })
@@ -91,56 +109,203 @@ impl Database {
     pub(crate) async fn record_upstream_account_failure(
         &self,
         upstream_account_id: Uuid,
+        credential_generation: i64,
         kind: UpstreamFailureKind,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let now = unix_millis();
         let base = kind.base_cooldown_millis();
-        sqlx::query(
+        // The conflict predicate is shared by PostgreSQL and SQLite. It keeps
+        // a statement that observed an old account generation from replacing
+        // newer health, and lets the current half-open probe remain the sole
+        // authority while its lease is active.
+        let result = sqlx::query(
             "INSERT INTO upstream_account_health (
                  upstream_account_id, consecutive_failures, cooldown_until,
-                 probe_lease_until, last_failure_kind, updated_at
-             ) VALUES ($1, 1, $2, 0, $3, $4)
+                 probe_lease_until, probe_lease_token, credential_generation,
+                 last_failure_kind, updated_at
+             ) SELECT $1, 1, $3, 0, '', $2, $4, $5
+               FROM upstream_accounts account
+              WHERE account.id = $1 AND account.status = 'active'
+                AND account.credential_generation = $2
              ON CONFLICT (upstream_account_id) DO UPDATE SET
-                 consecutive_failures = upstream_account_health.consecutive_failures + 1,
+                 consecutive_failures = CASE
+                     WHEN upstream_account_health.credential_generation = excluded.credential_generation
+                         THEN upstream_account_health.consecutive_failures + 1
+                     ELSE 1
+                 END,
                  cooldown_until = CASE
-                     WHEN upstream_account_health.cooldown_until > excluded.updated_at
+                     WHEN upstream_account_health.credential_generation = excluded.credential_generation
+                          AND upstream_account_health.cooldown_until > excluded.updated_at
                          THEN upstream_account_health.cooldown_until
                      ELSE excluded.updated_at + CASE
-                         WHEN upstream_account_health.consecutive_failures >= 6 THEN $5 * 64
-                         WHEN upstream_account_health.consecutive_failures = 5 THEN $5 * 32
-                         WHEN upstream_account_health.consecutive_failures = 4 THEN $5 * 16
-                         WHEN upstream_account_health.consecutive_failures = 3 THEN $5 * 8
-                         WHEN upstream_account_health.consecutive_failures = 2 THEN $5 * 4
-                         WHEN upstream_account_health.consecutive_failures = 1 THEN $5 * 2
-                         ELSE $5
+                         WHEN upstream_account_health.credential_generation <> excluded.credential_generation THEN $6
+                         WHEN upstream_account_health.consecutive_failures >= 6 THEN $6 * 64
+                         WHEN upstream_account_health.consecutive_failures = 5 THEN $6 * 32
+                         WHEN upstream_account_health.consecutive_failures = 4 THEN $6 * 16
+                         WHEN upstream_account_health.consecutive_failures = 3 THEN $6 * 8
+                         WHEN upstream_account_health.consecutive_failures = 2 THEN $6 * 4
+                         WHEN upstream_account_health.consecutive_failures = 1 THEN $6 * 2
+                         ELSE $6
                      END
                  END,
                  probe_lease_until = 0,
+                 probe_lease_token = '',
+                 credential_generation = excluded.credential_generation,
                  last_failure_kind = excluded.last_failure_kind,
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at
+             WHERE EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_health.upstream_account_id
+                   AND account.status = 'active'
+                   AND account.credential_generation = excluded.credential_generation
+             )
+               AND (
+                 upstream_account_health.credential_generation < excluded.credential_generation
+                 OR (
+                   upstream_account_health.credential_generation = excluded.credential_generation
+                   AND upstream_account_health.probe_lease_until <= excluded.updated_at
+                 )
+               )",
         )
         .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
         .bind(now.saturating_add(base))
         .bind(kind.as_str())
         .bind(now)
         .bind(base)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn record_upstream_account_success(
+    pub(crate) async fn record_upstream_account_probe_failure(
         &self,
         upstream_account_id: Uuid,
+        credential_generation: i64,
+        lease_token: Uuid,
+        kind: UpstreamFailureKind,
     ) -> Result<bool, AppError> {
-        let result =
-            sqlx::query("DELETE FROM upstream_account_health WHERE upstream_account_id = $1")
-                .bind(upstream_account_id.to_string())
-                .execute(&self.pool)
-                .await?;
+        let now = unix_millis();
+        let base = kind.base_cooldown_millis();
+        let result = sqlx::query(
+            "UPDATE upstream_account_health SET
+                 consecutive_failures = consecutive_failures + 1,
+                 cooldown_until = $1 + CASE
+                     WHEN consecutive_failures >= 6 THEN $2 * 64
+                     WHEN consecutive_failures = 5 THEN $2 * 32
+                     WHEN consecutive_failures = 4 THEN $2 * 16
+                     WHEN consecutive_failures = 3 THEN $2 * 8
+                     WHEN consecutive_failures = 2 THEN $2 * 4
+                     WHEN consecutive_failures = 1 THEN $2 * 2
+                     ELSE $2
+                 END,
+                 probe_lease_until = 0,
+                 probe_lease_token = '',
+                 last_failure_kind = $3,
+                 updated_at = $1
+             WHERE upstream_account_id = $4 AND credential_generation = $5
+               AND probe_lease_token = $6
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_health.upstream_account_id
+                   AND account.status = 'active'
+                   AND account.credential_generation = $5
+               )",
+        )
+        .bind(now)
+        .bind(base)
+        .bind(kind.as_str())
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(lease_token.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn record_upstream_account_probe_success(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        lease_token: Uuid,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            "DELETE FROM upstream_account_health
+             WHERE upstream_account_id = $1 AND credential_generation = $2
+               AND probe_lease_token = $3
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_health.upstream_account_id
+                   AND account.status = 'active'
+                   AND account.credential_generation = $2
+               )",
+        )
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(lease_token.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn release_upstream_account_probe(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        lease_token: Uuid,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            "UPDATE upstream_account_health
+             SET probe_lease_until = 0, probe_lease_token = '', updated_at = $1
+             WHERE upstream_account_id = $2 AND credential_generation = $3
+               AND probe_lease_token = $4
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_health.upstream_account_id
+                   AND account.status = 'active'
+                   AND account.credential_generation = $3
+               )",
+        )
+        .bind(unix_millis())
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(lease_token.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn renew_upstream_account_probe(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        lease_token: Uuid,
+    ) -> Result<bool, AppError> {
+        let now = unix_millis();
+        let result = sqlx::query(
+            "UPDATE upstream_account_health SET probe_lease_until = $1, updated_at = $2
+             WHERE upstream_account_id = $3 AND credential_generation = $4
+               AND probe_lease_token = $5
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_health.upstream_account_id
+                   AND account.status = 'active'
+                   AND account.credential_generation = $4
+               )",
+        )
+        .bind(now.saturating_add(UPSTREAM_HEALTH_POLICY.probe_lease_millis()))
+        .bind(now)
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(lease_token.to_string())
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() == 1)
     }
 }
+
+#[cfg(test)]
+mod postgres_tests;
 
 #[cfg(test)]
 mod tests {
@@ -176,18 +341,18 @@ mod tests {
         let (_directory, database, account_id) = fixture().await;
         assert_eq!(
             database
-                .claim_upstream_account_attempt(account_id)
+                .claim_upstream_account_attempt(account_id, 1)
                 .await
                 .unwrap(),
             UpstreamAttemptAdmission::Healthy
         );
         database
-            .record_upstream_account_failure(account_id, UpstreamFailureKind::RateLimited)
+            .record_upstream_account_failure(account_id, 1, UpstreamFailureKind::RateLimited)
             .await
             .unwrap();
         assert_eq!(
             database
-                .claim_upstream_account_attempt(account_id)
+                .claim_upstream_account_attempt(account_id, 1)
                 .await
                 .unwrap(),
             UpstreamAttemptAdmission::Unavailable
@@ -202,34 +367,257 @@ mod tests {
         .unwrap();
 
         let (left, right) = tokio::join!(
-            database.claim_upstream_account_attempt(account_id),
-            database.claim_upstream_account_attempt(account_id),
+            database.claim_upstream_account_attempt(account_id, 1),
+            database.claim_upstream_account_attempt(account_id, 1),
         );
-        let mut admissions = [left.unwrap(), right.unwrap()];
-        admissions.sort_by_key(|admission| match admission {
-            UpstreamAttemptAdmission::Healthy => 0,
-            UpstreamAttemptAdmission::Probe => 1,
-            UpstreamAttemptAdmission::Unavailable => 2,
-        });
+        let admissions = [left.unwrap(), right.unwrap()];
+        let lease_token = admissions
+            .iter()
+            .find_map(|admission| match admission {
+                UpstreamAttemptAdmission::Probe { lease_token } => Some(*lease_token),
+                UpstreamAttemptAdmission::Healthy | UpstreamAttemptAdmission::Unavailable => None,
+            })
+            .expect("one caller owns the probe lease");
         assert_eq!(
-            admissions,
-            [
-                UpstreamAttemptAdmission::Probe,
-                UpstreamAttemptAdmission::Unavailable
-            ]
+            admissions
+                .iter()
+                .filter(|admission| **admission == UpstreamAttemptAdmission::Unavailable)
+                .count(),
+            1
         );
         assert!(
             database
-                .record_upstream_account_success(account_id)
+                .record_upstream_account_probe_success(account_id, 1, lease_token)
                 .await
                 .unwrap()
         );
         assert_eq!(
             database
-                .claim_upstream_account_attempt(account_id)
+                .claim_upstream_account_attempt(account_id, 1)
                 .await
                 .unwrap(),
             UpstreamAttemptAdmission::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_probe_terminal_cannot_overwrite_a_renewed_or_reassigned_lease() {
+        let (_directory, database, account_id) = fixture().await;
+        database
+            .record_upstream_account_failure(account_id, 1, UpstreamFailureKind::Connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE upstream_account_health SET cooldown_until = 0, probe_lease_until = 0
+             WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let UpstreamAttemptAdmission::Probe {
+            lease_token: stale_token,
+        } = database
+            .claim_upstream_account_attempt(account_id, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("first probe lease");
+        };
+        assert!(
+            database
+                .renew_upstream_account_probe(account_id, 1, stale_token)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            database
+                .claim_upstream_account_attempt(account_id, 1)
+                .await
+                .unwrap(),
+            UpstreamAttemptAdmission::Unavailable,
+            "a renewed long-running lease remains exclusive"
+        );
+
+        sqlx::query(
+            "UPDATE upstream_account_health SET cooldown_until = 0, probe_lease_until = 0
+             WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let UpstreamAttemptAdmission::Probe {
+            lease_token: current_token,
+        } = database
+            .claim_upstream_account_attempt(account_id, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("replacement probe lease");
+        };
+        assert_ne!(stale_token, current_token);
+        assert!(
+            !database
+                .record_upstream_account_probe_success(account_id, 1, stale_token)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !database
+                .record_upstream_account_probe_failure(
+                    account_id,
+                    1,
+                    stale_token,
+                    UpstreamFailureKind::InvalidResponse,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            database
+                .record_upstream_account_probe_success(account_id, 1, current_token)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_credential_generation_cannot_poison_rotated_account_health() {
+        let (_directory, database, account_id) = fixture().await;
+        assert!(
+            database
+                .record_upstream_account_failure(account_id, 1, UpstreamFailureKind::Connection)
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE upstream_accounts SET credential_generation = 2 WHERE id = $1")
+            .bind(account_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            database
+                .claim_upstream_account_attempt(account_id, 2)
+                .await
+                .unwrap(),
+            UpstreamAttemptAdmission::Healthy,
+            "the old generation cooldown is not inherited"
+        );
+        let (stale_failure, current_failure) = tokio::join!(
+            database.record_upstream_account_failure(
+                account_id,
+                1,
+                UpstreamFailureKind::InvalidResponse,
+            ),
+            database.record_upstream_account_failure(
+                account_id,
+                2,
+                UpstreamFailureKind::Unavailable,
+            ),
+        );
+        assert!(!stale_failure.unwrap());
+        assert!(current_failure.unwrap());
+        let row = sqlx::query(
+            "SELECT credential_generation, consecutive_failures, last_failure_kind
+             FROM upstream_account_health WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.try_get::<i64, _>("credential_generation").unwrap(), 2);
+        assert_eq!(row.try_get::<i64, _>("consecutive_failures").unwrap(), 1);
+        assert_eq!(
+            row.try_get::<String, _>("last_failure_kind").unwrap(),
+            "unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_upsert_cannot_downgrade_newer_conflicting_health() {
+        let (_directory, database, account_id) = fixture().await;
+        assert!(
+            database
+                .record_upstream_account_failure(account_id, 1, UpstreamFailureKind::Connection)
+                .await
+                .unwrap()
+        );
+        // Model the conflict target observed after a stale statement took its
+        // account-generation snapshot. PostgreSQL can reach this state while
+        // the UPSERT waits on the row writer; this deterministic SQLite case
+        // exercises the same shared conflict predicate.
+        sqlx::query(
+            "UPDATE upstream_account_health SET credential_generation = 2
+             WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        assert!(
+            !database
+                .record_upstream_account_failure(
+                    account_id,
+                    1,
+                    UpstreamFailureKind::InvalidResponse,
+                )
+                .await
+                .unwrap()
+        );
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT credential_generation FROM upstream_account_health
+             WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(generation, 2);
+    }
+
+    #[tokio::test]
+    async fn ordinary_failure_cannot_displace_an_active_probe() {
+        let (_directory, database, account_id) = fixture().await;
+        assert!(
+            database
+                .record_upstream_account_failure(account_id, 1, UpstreamFailureKind::Connection)
+                .await
+                .unwrap()
+        );
+        sqlx::query(
+            "UPDATE upstream_account_health SET cooldown_until = 0, probe_lease_until = 0
+             WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let UpstreamAttemptAdmission::Probe { lease_token } = database
+            .claim_upstream_account_attempt(account_id, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("half-open probe lease");
+        };
+
+        let (ordinary_failure, probe_renewal) = tokio::join!(
+            database.record_upstream_account_failure(
+                account_id,
+                1,
+                UpstreamFailureKind::InvalidResponse,
+            ),
+            database.renew_upstream_account_probe(account_id, 1, lease_token),
+        );
+        assert!(
+            !ordinary_failure.unwrap(),
+            "a pre-probe ordinary attempt must not replace the probe owner"
+        );
+        assert!(
+            probe_renewal.unwrap(),
+            "the current probe token remains authoritative"
         );
     }
 }

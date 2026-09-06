@@ -98,7 +98,10 @@ pub(super) async fn send_proxy_route(
                     stage = error_code,
                     "Codex upstream response failed framing admission"
                 );
-                return Err(ProxySendError::InvalidResponse(error_code));
+                // A successful HTTP response means the POST may already have
+                // executed and become billable. Framing invalidity is safe to
+                // reject, but never safe to replay on another account.
+                return Err(ProxySendError::AmbiguousResponse(error_code));
             }
             Err(codex_transport::ResponseAdmissionError::Ambiguous(error_code)) => {
                 retry
@@ -134,13 +137,15 @@ async fn send_codex_attempt(
             wreq::Proxy::all(proxy_url).map_err(|_| ProxySendError::CandidateUnavailable)?;
         request = request.proxy(proxy);
     }
+    let credential_now = credential_application_now();
     let request = codex_transport::apply_wreq_wire_headers(
         request,
         headers,
         &route.route.credential,
         session_id,
+        credential_now,
     )
-    .map_err(|_| ProxySendError::Credential)?;
+    .map_err(|_| credential_application_error(&route.route.credential, credential_now))?;
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
     let upstream_result = request.send().await;

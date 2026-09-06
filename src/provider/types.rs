@@ -1,8 +1,67 @@
+use std::num::NonZeroUsize;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use super::UpstreamCredential;
+
+/// One validated policy owns both the request attempt budget and the bounded
+/// resolver look-ahead. Keeping these values together prevents the database
+/// and HTTP layers from silently applying different routing limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RoutingAttemptPolicy {
+    max_attempts: NonZeroUsize,
+    max_resolved_candidates: NonZeroUsize,
+}
+
+impl RoutingAttemptPolicy {
+    const fn new(max_attempts: usize, max_resolved_candidates: usize) -> Self {
+        assert!(max_resolved_candidates > max_attempts);
+        assert!(max_resolved_candidates < i64::MAX as usize);
+        let Some(max_attempts) = NonZeroUsize::new(max_attempts) else {
+            panic!("routing must allow at least one upstream attempt");
+        };
+        let Some(max_resolved_candidates) = NonZeroUsize::new(max_resolved_candidates) else {
+            panic!("routing must resolve at least one upstream candidate");
+        };
+        Self {
+            max_attempts,
+            max_resolved_candidates,
+        }
+    }
+
+    pub(crate) const fn max_attempts(self) -> usize {
+        self.max_attempts.get()
+    }
+
+    pub(crate) const fn max_resolved_candidates(self) -> usize {
+        self.max_resolved_candidates.get()
+    }
+
+    pub(crate) const fn candidate_query_limit(self) -> i64 {
+        self.max_resolved_candidates.get() as i64 + 1
+    }
+}
+
+/// The database may inspect a larger defensive set, while component hooks and
+/// outbound sends remain bounded by the much smaller attempt budget. Only
+/// validated, sendable candidates count against the resolver side of this
+/// policy; request-local compatibility filters run before attempt accounting.
+pub(crate) const PROXY_ROUTING_POLICY: RoutingAttemptPolicy = RoutingAttemptPolicy::new(3, 1_000);
+
+/// Account and credential fields read by one send-time database statement.
+/// Route-specific fields are intentionally absent because they were already
+/// authorized and prepared; a revision mismatch makes that preparation stale.
+#[derive(Clone, Debug)]
+pub(crate) struct UpstreamTransportSnapshot {
+    pub(crate) transport_revision: i64,
+    pub(crate) credential_generation: i64,
+    pub(crate) driver: String,
+    pub(crate) base_url: String,
+    pub(crate) config: Value,
+    pub(crate) credential: UpstreamCredential,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UpstreamAccountView {
@@ -50,6 +109,12 @@ pub struct ModelRouteView {
 pub struct ResolvedUpstream {
     pub route_id: Uuid,
     pub account_id: Uuid,
+    /// Revision of the account transport tuple used to prepare this route.
+    /// A send-time reload must match it before attaching credential material.
+    pub transport_revision: i64,
+    /// Generation of the encrypted credential selected with this attempt.
+    /// Breaker and send transitions use it as a fence across OAuth rotation.
+    pub credential_generation: i64,
     pub driver: String,
     pub base_url: String,
     pub config: Value,

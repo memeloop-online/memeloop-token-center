@@ -21,8 +21,10 @@ use lifecycle::{
     run_bounded_proxy_lifecycle, run_bounded_text_archive,
 };
 use routing::{
-    CodexRetryTerminal, CodexRetryTerminalGuard, MAX_UPSTREAM_ATTEMPTS, ProxySendError,
-    prepare_proxy_route, retryable_upstream_status, send_proxy_route,
+    CandidateCompatibility, CodexRetryTerminal, CodexRetryTerminalGuard, PROXY_ROUTING_POLICY,
+    PreparedProxyRoute, PreparedRouteReadiness, ProxySendError, UpstreamAttemptGuard,
+    UpstreamAttemptTerminal, candidate_compatibility, materialize_proxy_route, plan_proxy_route,
+    refresh_route_snapshot, retryable_upstream_status, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -77,6 +79,301 @@ fn requires_strict_openai_chat_usage(
             == Some(true)
 }
 
+struct AuthorizedProxyRoutes {
+    component_primary: Option<PreparedProxyRoute>,
+    direct_candidates: Vec<ResolvedUpstream>,
+    input_token_ceiling: i64,
+    output_token_ceiling: i64,
+}
+
+impl AuthorizedProxyRoutes {
+    fn primary_route(&self) -> Option<&ResolvedUpstream> {
+        self.component_primary
+            .as_ref()
+            .map(|prepared| &prepared.route)
+            .or_else(|| self.direct_candidates.first())
+    }
+}
+
+fn extend_reservation_bounds(
+    input_token_ceiling: &mut i64,
+    output_token_ceiling: &mut i64,
+    route: &ResolvedUpstream,
+    request_body_ceiling: usize,
+    candidate_output_token_ceiling: i64,
+) -> Result<(), AppError> {
+    let body_ceiling = i64::try_from(request_body_ceiling).unwrap_or(i64::MAX);
+    let candidate_ceiling = body_ceiling
+        .checked_add(trusted_input_token_overhead_ceiling(
+            Some(&route.driver),
+            Some(&route.config),
+        )?)
+        .filter(|ceiling| *ceiling <= MAX_REPORTED_TOKENS)
+        .ok_or_else(|| {
+            AppError::Upstream(
+                "upstream input token reservation is outside the supported range".into(),
+            )
+        })?;
+    *input_token_ceiling = (*input_token_ceiling).max(candidate_ceiling);
+    *output_token_ceiling = (*output_token_ceiling).max(candidate_output_token_ceiling);
+    Ok(())
+}
+
+async fn prepare_authorized_proxy_routes(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    model: &str,
+    protocol: Protocol,
+    request_id: Uuid,
+    request_json: &Value,
+    original_body_length: usize,
+    resolved_routes: Vec<ResolvedUpstream>,
+) -> Result<AuthorizedProxyRoutes, AppError> {
+    let openai_chat_choice_count = matches!(protocol, Protocol::OpenAiChat)
+        .then(|| openai_chat_choice_count(request_json))
+        .transpose()?;
+    let output_choice_count = openai_chat_choice_count.unwrap_or(1);
+    let strict_choice_count_is_incompatible =
+        openai_chat_choice_count.is_some_and(|count| count != 1);
+    let mut skipped_incompatible_strict_route = false;
+    let mut skipped_local_protocol_mismatch = false;
+    let mut component_primary = None;
+    let mut direct_candidates = Vec::new();
+    let mut input_token_ceiling = 0;
+    let mut output_token_ceiling = 0;
+    for route in resolved_routes {
+        if candidate_compatibility(protocol, &route) == CandidateCompatibility::ProtocolMismatch {
+            skipped_local_protocol_mismatch = true;
+            continue;
+        }
+        if strict_choice_count_is_incompatible
+            && requires_strict_openai_chat_usage(
+                protocol,
+                &route.driver,
+                &route.config,
+                request_json,
+            )
+        {
+            skipped_incompatible_strict_route = true;
+            continue;
+        }
+        let preparation_now = unix_millis();
+        if route
+            .credential
+            .expires_at()
+            .is_some_and(|expires_at| expires_at <= preparation_now)
+        {
+            continue;
+        }
+        let route_id = route.route_id;
+        let account_id = route.account_id;
+        match plan_proxy_route(
+            state,
+            key,
+            model,
+            protocol,
+            request_id,
+            request_json,
+            route.clone(),
+            preparation_now,
+        ) {
+            Ok(planned) => {
+                if planned.is_component() {
+                    if !direct_candidates.is_empty() {
+                        // A standby component hook may have external effects;
+                        // never invoke it after a direct route was selected.
+                        continue;
+                    }
+                    let candidate_output_token_ceiling = planned
+                        .output_token_ceiling
+                        .checked_mul(output_choice_count)
+                        .filter(|ceiling| (0..=MAX_REPORTED_TOKENS).contains(ceiling))
+                        .ok_or_else(|| {
+                            AppError::BadRequest(
+                                "aggregate OpenAI Chat output token reservation is outside the supported range"
+                                    .into(),
+                            )
+                        })?;
+                    let prepared = materialize_proxy_route(state, planned).await?;
+                    extend_reservation_bounds(
+                        &mut input_token_ceiling,
+                        &mut output_token_ceiling,
+                        &prepared.route,
+                        prepared.request_body_ceiling(original_body_length),
+                        candidate_output_token_ceiling,
+                    )?;
+                    component_primary = Some(prepared);
+                    break;
+                }
+                let candidate_output_token_ceiling = planned
+                    .output_token_ceiling
+                    .checked_mul(output_choice_count)
+                    .filter(|ceiling| (0..=MAX_REPORTED_TOKENS).contains(ceiling))
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "aggregate OpenAI Chat output token reservation is outside the supported range"
+                                .into(),
+                        )
+                    })?;
+                extend_reservation_bounds(
+                    &mut input_token_ceiling,
+                    &mut output_token_ceiling,
+                    &planned.route,
+                    planned.request_body_ceiling(original_body_length)?,
+                    candidate_output_token_ceiling,
+                )?;
+                direct_candidates.push(route);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %request_id,
+                    %route_id,
+                    upstream_account_id = %account_id,
+                    stage = "candidate_prepare",
+                    "authorized proxy candidate is unusable"
+                );
+                // The primary prepare path may invoke a component hook with
+                // external effects. Its failure is therefore ambiguous and
+                // must never be hidden by preparing another provider.
+                if direct_candidates.is_empty() && component_primary.is_none() {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    if direct_candidates.is_empty() && component_primary.is_none() {
+        // Normalized grants are the sole downstream authorization source. A
+        // missing route must never fall back to unscoped process secrets.
+        if skipped_local_protocol_mismatch {
+            codex_transport::validate_protocol(protocol)?;
+        }
+        if skipped_incompatible_strict_route {
+            validate_openai_chat_choice_count(request_json)?;
+        }
+        return Err(AppError::Overloaded);
+    }
+    Ok(AuthorizedProxyRoutes {
+        component_primary,
+        direct_candidates,
+        input_token_ceiling,
+        output_token_ceiling,
+    })
+}
+
+async fn next_sendable_proxy_route(
+    state: &AppState,
+    key: &AuthenticatedKey,
+    model: &str,
+    protocol: Protocol,
+    request_id: Uuid,
+    request_json: &Value,
+    reservation_id: Uuid,
+    assigned_route: &mut (Uuid, Uuid),
+    candidates: &mut std::vec::IntoIter<ResolvedUpstream>,
+    mut failover_reason: Option<UpstreamHealthReason>,
+) -> Result<Option<(PreparedProxyRoute, UpstreamAttemptGuard)>, AppError> {
+    for mut route in candidates {
+        if refresh_route_snapshot(state, &mut route).await? != PreparedRouteReadiness::Ready {
+            state.metrics.observe_upstream_health(
+                UpstreamHealthEvent::Skipped,
+                UpstreamHealthReason::Unavailable,
+            );
+            failover_reason = Some(UpstreamHealthReason::Unavailable);
+            continue;
+        }
+        let preparation_now = unix_millis();
+        if route
+            .credential
+            .expires_at()
+            .is_some_and(|expires_at| expires_at <= preparation_now)
+        {
+            state.metrics.observe_upstream_health(
+                UpstreamHealthEvent::Skipped,
+                UpstreamHealthReason::Unavailable,
+            );
+            failover_reason = Some(UpstreamHealthReason::Unavailable);
+            continue;
+        }
+        let planned = plan_proxy_route(
+            state,
+            key,
+            model,
+            protocol,
+            request_id,
+            request_json,
+            route,
+            preparation_now,
+        )?;
+        if planned.is_component() {
+            return Err(AppError::Internal);
+        }
+        let admission = state
+            .db
+            .claim_upstream_account_attempt(
+                planned.route.account_id,
+                planned.route.credential_generation,
+            )
+            .await?;
+        if admission == UpstreamAttemptAdmission::Unavailable {
+            state.metrics.observe_upstream_health(
+                UpstreamHealthEvent::Skipped,
+                UpstreamHealthReason::Cooldown,
+            );
+            failover_reason = Some(UpstreamHealthReason::Cooldown);
+            continue;
+        }
+        let mut upstream_attempt = UpstreamAttemptGuard::new(
+            state,
+            request_id,
+            planned.route.account_id,
+            planned.route.credential_generation,
+            admission,
+        );
+        let next_assignment = (planned.route.account_id, planned.route.route_id);
+        if *assigned_route != next_assignment {
+            if let Err(error) = state
+                .db
+                .reassign_pending_proxy_upstream(
+                    request_id,
+                    key.tenant_id,
+                    reservation_id,
+                    *assigned_route,
+                    next_assignment,
+                )
+                .await
+            {
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::Inconclusive)
+                    .await;
+                return Err(error);
+            }
+            tracing::warn!(
+                %request_id,
+                failed_upstream_account_id = %assigned_route.0,
+                next_upstream_account_id = %next_assignment.0,
+                stage = "upstream_failover",
+                "proxy is switching to the next authorized upstream before downstream delivery"
+            );
+            state.metrics.observe_upstream_health(
+                UpstreamHealthEvent::Failover,
+                failover_reason.unwrap_or(UpstreamHealthReason::Unavailable),
+            );
+            *assigned_route = next_assignment;
+        }
+        let prepared = match materialize_proxy_route(state, planned).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::Inconclusive)
+                    .await;
+                return Err(error);
+            }
+        };
+        return Ok(Some((prepared, upstream_attempt)));
+    }
+    Ok(None)
+}
+
 pub(super) async fn proxy(
     state: AppState,
     headers: HeaderMap,
@@ -120,125 +417,23 @@ pub(super) async fn proxy(
             state.config.key_pepper.as_bytes(),
         )
         .await?;
-    let openai_chat_choice_count = matches!(protocol, Protocol::OpenAiChat)
-        .then(|| openai_chat_choice_count(&request_json))
-        .transpose()?;
-    let strict_choice_count_is_incompatible =
-        openai_chat_choice_count.is_some_and(|count| count != 1);
-    let mut resolved_routes = resolved_routes.into_iter();
-    let mut skipped_incompatible_strict_route = false;
-    let primary_route = loop {
-        let Some(route) = resolved_routes.next() else {
-            // Normalized grants are the sole downstream authorization source.
-            // A missing route must never fall back to process-wide legacy secrets.
-            if skipped_incompatible_strict_route {
-                validate_openai_chat_choice_count(&request_json)?;
-            }
-            return Err(AppError::Forbidden);
-        };
-        if strict_choice_count_is_incompatible
-            && requires_strict_openai_chat_usage(
-                protocol,
-                &route.driver,
-                &route.config,
-                &request_json,
-            )
-        {
-            skipped_incompatible_strict_route = true;
-            continue;
-        }
-        break route;
-    };
-    let primary = prepare_proxy_route(
+    let mut route_plan = prepare_authorized_proxy_routes(
         &state,
         &key,
         &model,
         protocol,
         request_id,
         &request_json,
-        primary_route,
+        body.len(),
+        resolved_routes,
     )
     .await?;
-    let primary_is_component = primary.is_component(&state);
-    let mut prepared_routes = vec![primary];
-    if !primary_is_component {
-        for route in resolved_routes {
-            if strict_choice_count_is_incompatible
-                && requires_strict_openai_chat_usage(
-                    protocol,
-                    &route.driver,
-                    &route.config,
-                    &request_json,
-                )
-            {
-                continue;
-            }
-            if prepared_routes.len() == MAX_UPSTREAM_ATTEMPTS {
-                break;
-            }
-            if state
-                .providers
-                .get(&route.driver)
-                .and_then(|provider| provider.component_adapter.as_ref())
-                .is_some()
-            {
-                // Plugin prepare may perform HTTP/KV side effects and component
-                // requests may use arbitrary methods. A standby component route
-                // must be rejected before its prepare hook sees the request.
-                continue;
-            }
-            match prepare_proxy_route(
-                &state,
-                &key,
-                &model,
-                protocol,
-                request_id,
-                &request_json,
-                route,
-            )
-            .await
-            {
-                Ok(prepared) => prepared_routes.push(prepared),
-                Err(error) => {
-                    tracing::warn!(%request_id, error = %error, stage = "candidate_prepare", "proxy failover candidate is unusable");
-                }
-            }
-        }
-    }
-    let primary = prepared_routes.first().ok_or(AppError::Internal)?;
-    let upstream_account_id = Some(primary.route.account_id);
-    let model_route_id = Some(primary.route.route_id);
+    let primary = route_plan.primary_route().ok_or(AppError::Internal)?;
+    let upstream_account_id = Some(primary.account_id);
+    let model_route_id = Some(primary.route_id);
     let price = state.db.model_price(&model, &key.currency).await?;
-    let output_choice_count = openai_chat_choice_count.unwrap_or(1);
-    let mut input_token_ceiling = 0_i64;
-    let mut output_token_ceiling = 0_i64;
-    for route in &prepared_routes {
-        let body_ceiling =
-            i64::try_from(route.request_body_ceiling(body.len())).unwrap_or(i64::MAX);
-        let candidate_ceiling = body_ceiling
-            .checked_add(trusted_input_token_overhead_ceiling(
-                Some(&route.route.driver),
-                Some(&route.route.config),
-            )?)
-            .filter(|ceiling| *ceiling <= MAX_REPORTED_TOKENS)
-            .ok_or_else(|| {
-                AppError::Upstream(
-                    "upstream input token reservation is outside the supported range".into(),
-                )
-            })?;
-        input_token_ceiling = input_token_ceiling.max(candidate_ceiling);
-        let candidate_output_ceiling = route
-            .output_token_ceiling
-            .checked_mul(output_choice_count)
-            .filter(|ceiling| (0..=MAX_REPORTED_TOKENS).contains(ceiling))
-            .ok_or_else(|| {
-                AppError::BadRequest(
-                    "aggregate OpenAI Chat output token reservation is outside the supported range"
-                        .into(),
-                )
-            })?;
-        output_token_ceiling = output_token_ceiling.max(candidate_output_ceiling);
-    }
+    let input_token_ceiling = route_plan.input_token_ceiling;
+    let output_token_ceiling = route_plan.output_token_ceiling;
     let requested_service_tier = match request_json.get("service_tier") {
         None => None,
         Some(Value::String(tier)) if is_supported_service_tier(tier) => Some(tier.clone()),
@@ -358,9 +553,25 @@ pub(super) async fn proxy(
             }
         }
     }
-    let mut route_attempts = prepared_routes.into_iter();
-    let mut active_route = route_attempts.next().ok_or(AppError::Internal)?;
-    if let Some((prepared, component_context)) = active_route.component_request.take() {
+    if let Some(mut active_route) = route_plan.component_primary.take()
+        && let Some((prepared, component_context)) = active_route.component_request.take()
+    {
+        let readiness = match refresh_route_snapshot(&state, &mut active_route.route).await {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %active_route.route.account_id,
+                    error = %error,
+                    "current upstream credential is invalid"
+                );
+                return finish_proxy_failure(&buffered_request, "upstream_credential_invalid")
+                    .await;
+            }
+        };
+        if readiness != PreparedRouteReadiness::Ready {
+            return finish_proxy_unavailable(&buffered_request, readiness.error_code()).await;
+        }
         return execute_component_provider(
             buffered_request,
             &active_route.route.driver,
@@ -372,41 +583,53 @@ pub(super) async fn proxy(
         )
         .await;
     }
-    let (upstream, upstream_activity, mut codex_retry) = loop {
-        let admission = state
-            .db
-            .claim_upstream_account_attempt(active_route.route.account_id)
-            .await?;
-        if admission == UpstreamAttemptAdmission::Unavailable {
-            state.metrics.observe_upstream_health(
-                UpstreamHealthEvent::Skipped,
-                UpstreamHealthReason::Cooldown,
-            );
-            let Some(next_route) = route_attempts.next() else {
-                return finish_proxy_unavailable(&buffered_request, "upstream_cooldown").await;
-            };
-            if state
-                .db
-                .reassign_pending_proxy_upstream(
-                    request_id,
-                    key.tenant_id,
-                    buffered_request.reservation.id,
-                    (active_route.route.account_id, active_route.route.route_id),
-                    (next_route.route.account_id, next_route.route.route_id),
-                )
-                .await
-                .is_err()
-            {
-                return finish_proxy_failure(&buffered_request, "upstream_failover_state").await;
-            }
-            state.metrics.observe_upstream_health(
-                UpstreamHealthEvent::Failover,
-                UpstreamHealthReason::Cooldown,
-            );
-            active_route = next_route;
-            continue;
+    let mut route_candidates = std::mem::take(&mut route_plan.direct_candidates).into_iter();
+    let mut assigned_route = (
+        upstream_account_id.ok_or(AppError::Internal)?,
+        model_route_id.ok_or(AppError::Internal)?,
+    );
+    let mut outbound_attempts = 0_usize;
+    let mut next_failover_reason = None;
+    let (active_route, upstream, upstream_activity, mut codex_retry, mut upstream_attempt) = loop {
+        if outbound_attempts == PROXY_ROUTING_POLICY.max_attempts() {
+            return finish_proxy_unavailable(&buffered_request, "upstream_attempts_exhausted")
+                .await;
         }
+        let selected = match next_sendable_proxy_route(
+            &state,
+            &key,
+            &model,
+            protocol,
+            request_id,
+            &request_json,
+            buffered_request.reservation.id,
+            &mut assigned_route,
+            &mut route_candidates,
+            next_failover_reason.take(),
+        )
+        .await
+        {
+            Ok(selected) => selected,
+            Err(error) => {
+                tracing::warn!(
+                    %request_id,
+                    error = %error,
+                    "proxy candidate selection failed"
+                );
+                return finish_proxy_failure(&buffered_request, "upstream_candidate_invalid").await;
+            }
+        };
+        let Some((active_route, mut upstream_attempt)) = selected else {
+            return finish_proxy_unavailable(&buffered_request, "upstream_unavailable").await;
+        };
         let result = send_proxy_route(&state, &headers, protocol, request_id, &active_route).await;
+        let consumed_outbound_attempt = !matches!(
+            &result,
+            Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable)
+        );
+        if consumed_outbound_attempt {
+            outbound_attempts += 1;
+        }
         let failure = match &result {
             Ok(result) if result.response.status() == StatusCode::TOO_MANY_REQUESTS => Some((
                 UpstreamFailureKind::RateLimited,
@@ -420,112 +643,90 @@ pub(super) async fn proxy(
                 UpstreamFailureKind::InvalidResponse,
                 UpstreamHealthReason::InvalidResponse,
             )),
-            // The one same-account replay is exhausted. A second complete,
-            // definite transient 400 was received before downstream delivery,
-            // so the normal authorized-candidate failover remains safe.
+            // Same-account retry is exhausted. The complete 400 is evidence
+            // of an upstream response, so the account is marked unavailable
+            // but the request is never replayed to a different account.
             Err(ProxySendError::RetryableCodexBadRequest) => Some((
                 UpstreamFailureKind::Unavailable,
                 UpstreamHealthReason::Unavailable,
             )),
-            Err(
-                ProxySendError::RetryableConnection
-                | ProxySendError::CandidateUnavailable
-                | ProxySendError::AmbiguousResponse(_),
-            ) => Some((
-                UpstreamFailureKind::Connection,
-                UpstreamHealthReason::Connection,
-            )),
+            Err(ProxySendError::RetryableConnection | ProxySendError::AmbiguousResponse(_)) => {
+                Some((
+                    UpstreamFailureKind::Connection,
+                    UpstreamHealthReason::Connection,
+                ))
+            }
             Ok(_) => None,
             Err(
                 ProxySendError::CodexBadRequest
+                | ProxySendError::CandidateUnavailable
+                | ProxySendError::NonRetryableTransport
+                | ProxySendError::CredentialUnavailable
+                | ProxySendError::Credential,
+            ) => None,
+        };
+        let candidate_unavailable = matches!(
+            &result,
+            Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable)
+        );
+        if candidate_unavailable {
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .await;
+            state.metrics.observe_upstream_health(
+                UpstreamHealthEvent::Skipped,
+                UpstreamHealthReason::Unavailable,
+            );
+        }
+        if let Some((kind, reason)) = failure {
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::Failed { kind, reason })
+                .await;
+        }
+        let failover_reason = match &result {
+            Err(ProxySendError::RetryableConnection) => failure.map(|(_, reason)| reason),
+            Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable) => {
+                Some(UpstreamHealthReason::Unavailable)
+            }
+            Ok(_)
+            | Err(
+                ProxySendError::RetryableCodexBadRequest
+                | ProxySendError::CodexBadRequest
+                | ProxySendError::InvalidResponse(_)
+                | ProxySendError::AmbiguousResponse(_)
                 | ProxySendError::NonRetryableTransport
                 | ProxySendError::Credential,
             ) => None,
         };
-        if let Some((kind, reason)) = failure {
-            if let Err(error) = state
-                .db
-                .record_upstream_account_failure(active_route.route.account_id, kind)
-                .await
-            {
-                tracing::warn!(
-                    %request_id,
-                    upstream_account_id = %active_route.route.account_id,
-                    error = %error,
-                    "failed to persist upstream account cooldown"
-                );
-            }
-            state
-                .metrics
-                .observe_upstream_health(UpstreamHealthEvent::Failure, reason);
-        }
-        let can_failover = !matches!(&result, Err(ProxySendError::AmbiguousResponse(_)));
-        if can_failover
-            && let Some((_, reason)) = failure
-            && let Some(next_route) = route_attempts.next()
+        if let Some(reason) = failover_reason
+            && (!consumed_outbound_attempt
+                || outbound_attempts < PROXY_ROUTING_POLICY.max_attempts())
         {
-            if let Ok(result) = result {
-                drop(result);
-            }
-            if state
-                .db
-                .reassign_pending_proxy_upstream(
-                    request_id,
-                    key.tenant_id,
-                    buffered_request.reservation.id,
-                    (active_route.route.account_id, active_route.route.route_id),
-                    (next_route.route.account_id, next_route.route.route_id),
-                )
-                .await
-                .is_err()
-            {
-                return finish_proxy_failure(&buffered_request, "upstream_failover_state").await;
-            }
-            tracing::warn!(
-                %request_id,
-                failed_upstream_account_id = %active_route.route.account_id,
-                next_upstream_account_id = %next_route.route.account_id,
-                stage = "upstream_failover",
-                "proxy is switching to the next authorized upstream before downstream delivery"
-            );
-            state
-                .metrics
-                .observe_upstream_health(UpstreamHealthEvent::Failover, reason);
-            active_route = next_route;
+            next_failover_reason = Some(reason);
             continue;
         }
         match result {
             Ok(result) => {
-                if admission == UpstreamAttemptAdmission::Probe
-                    && failure.is_none()
-                    && result.response.status().is_success()
-                {
-                    match state
-                        .db
-                        .record_upstream_account_success(active_route.route.account_id)
-                        .await
-                    {
-                        Ok(true) => state.metrics.observe_upstream_health(
-                            UpstreamHealthEvent::Recovered,
-                            UpstreamHealthReason::Success,
-                        ),
-                        Ok(false) => {}
-                        Err(error) => tracing::warn!(
-                            %request_id,
-                            upstream_account_id = %active_route.route.account_id,
-                            error = %error,
-                            "failed to clear upstream account cooldown"
-                        ),
-                    }
-                }
                 break (
+                    active_route,
                     result.response,
                     result.upstream_activity,
                     result.codex_retry,
+                    upstream_attempt,
                 );
             }
             Err(ProxySendError::Credential) => {
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .await;
                 return finish_proxy_failure(&buffered_request, "provider_credential").await;
+            }
+            Err(ProxySendError::CredentialUnavailable) => {
+                return finish_proxy_unavailable(
+                    &buffered_request,
+                    "upstream_credential_unavailable",
+                )
+                .await;
             }
             Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => {
                 return finish_proxy_unavailable(&buffered_request, "upstream_connection").await;
@@ -534,6 +735,9 @@ pub(super) async fn proxy(
                 return finish_proxy_unavailable(&buffered_request, "upstream_rejected").await;
             }
             Err(ProxySendError::CodexBadRequest) => {
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::Inconclusive)
+                    .await;
                 return finish_buffered_request(
                     &buffered_request,
                     StatusCode::BAD_REQUEST,
@@ -553,6 +757,12 @@ pub(super) async fn proxy(
                 return finish_proxy_failure(&buffered_request, error_code).await;
             }
             Err(ProxySendError::NonRetryableTransport) => {
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::Failed {
+                        kind: UpstreamFailureKind::Connection,
+                        reason: UpstreamHealthReason::Connection,
+                    })
+                    .await;
                 return finish_proxy_failure(&buffered_request, "upstream_transport").await;
             }
         }
@@ -582,6 +792,16 @@ pub(super) async fn proxy(
             Some(format!("http_{}", status.as_u16())),
         )
         .await;
+        upstream_attempt
+            .complete(if status.is_client_error() {
+                // Ordinary caller-dependent 4xx responses are not evidence
+                // that a shared upstream account is unhealthy. Typed auth,
+                // rate-limit, and transient statuses were handled above.
+                UpstreamAttemptTerminal::Inconclusive
+            } else {
+                UpstreamAttemptTerminal::invalid_response()
+            })
+            .await;
         codex_retry.complete(CodexRetryTerminal::Failed);
         return result;
     }
@@ -592,6 +812,9 @@ pub(super) async fn proxy(
             Err(error_code) => {
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
                 let result = finish_proxy_failure(&buffered_request, error_code).await;
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .await;
                 codex_retry.complete(CodexRetryTerminal::Failed);
                 return result;
             }
@@ -605,16 +828,20 @@ pub(super) async fn proxy(
             None,
         )
         .await;
-        codex_retry.complete(
-            if result
-                .as_ref()
-                .is_ok_and(|response| response.status().is_success())
-            {
-                CodexRetryTerminal::Succeeded
-            } else {
-                CodexRetryTerminal::Failed
-            },
-        );
+        let succeeded = result
+            .as_ref()
+            .is_ok_and(|response| response.status().is_success());
+        let attempt_terminal = match result.as_ref() {
+            Ok(response) if response.status().is_success() => UpstreamAttemptTerminal::Succeeded,
+            Ok(_) => UpstreamAttemptTerminal::invalid_response(),
+            Err(_) => UpstreamAttemptTerminal::Inconclusive,
+        };
+        upstream_attempt.complete(attempt_terminal).await;
+        codex_retry.complete(if succeeded {
+            CodexRetryTerminal::Succeeded
+        } else {
+            CodexRetryTerminal::Failed
+        });
         return result;
     }
     let is_sse = content_type
@@ -645,13 +872,21 @@ pub(super) async fn proxy(
         let response_body = match read_bounded_upstream(upstream, MAX_PROXY_RESPONSE_BODY).await {
             Ok(body) => Bytes::from(body),
             Err(error) => {
-                return finish_proxy_failure(&buffered_request, error.code()).await;
+                let result = finish_proxy_failure(&buffered_request, error.code()).await;
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::invalid_response())
+                    .await;
+                return result;
             }
         };
         if matches!(protocol, Protocol::OpenAiResponses)
             && let Err(error_code) = validate_buffered_responses_success(&response_body)
         {
-            return finish_proxy_failure(&buffered_request, error_code).await;
+            let result = finish_proxy_failure(&buffered_request, error_code).await;
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::invalid_response())
+                .await;
+            return result;
         }
         let usage = if capture_json_usage {
             match extract_usage_checked(&response_body) {
@@ -662,7 +897,12 @@ pub(super) async fn proxy(
                     ..TokenUsage::default()
                 },
                 ExtractedUsage::Invalid => {
-                    return finish_proxy_failure(&buffered_request, "upstream_invalid_usage").await;
+                    let result =
+                        finish_proxy_failure(&buffered_request, "upstream_invalid_usage").await;
+                    upstream_attempt
+                        .complete(UpstreamAttemptTerminal::invalid_response())
+                        .await;
+                    return result;
                 }
             }
         } else {
@@ -672,7 +912,7 @@ pub(super) async fn proxy(
                 ..TokenUsage::default()
             }
         };
-        return finish_buffered_request(
+        let result = finish_buffered_request(
             &buffered_request,
             status,
             response_body,
@@ -681,6 +921,13 @@ pub(super) async fn proxy(
             None,
         )
         .await;
+        let attempt_terminal = match result.as_ref() {
+            Ok(response) if response.status().is_success() => UpstreamAttemptTerminal::Succeeded,
+            Ok(_) => UpstreamAttemptTerminal::invalid_response(),
+            Err(_) => UpstreamAttemptTerminal::Inconclusive,
+        };
+        upstream_attempt.complete(attempt_terminal).await;
+        return result;
     }
     streaming::stream_response(streaming::StreamingResponse {
         state: &state,
@@ -693,6 +940,7 @@ pub(super) async fn proxy(
         is_codex_route,
         codex_retry,
         strict_openai_chat_usage,
+        upstream_attempt,
         upstream_activity,
         request_id,
         buffered_request,
@@ -1575,7 +1823,25 @@ impl ResponsesSseCapture {
             self.invalid = true;
             return ChatSseDeliveryClass::Billable;
         };
-        match usage_from_value_checked(&value) {
+        let payload_kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|name| ResponsesSseEventKind::from_name(name.as_bytes()));
+        let usage = if self.responses_delivery == Some(ResponsesDeliveryContract::Codex) {
+            if payload_kind == Some(ResponsesSseEventKind::Completed) {
+                value
+                    .get("response")
+                    .filter(|response| response.is_object())
+                    .ok_or(())
+                    .and_then(codex_transport::canonical_responses_usage)
+                    .map(Some)
+            } else {
+                Ok(None)
+            }
+        } else {
+            usage_from_value_checked(&value)
+        };
+        match usage {
             Err(()) => self.usage_invalid = true,
             Ok(None) => {}
             Ok(Some(next)) => {
@@ -1592,10 +1858,6 @@ impl ResponsesSseCapture {
         {
             self.terminal_failure = true;
         }
-        let payload_kind = value
-            .get("type")
-            .and_then(Value::as_str)
-            .map(|name| ResponsesSseEventKind::from_name(name.as_bytes()));
         if self.require_explicit_completed
             && let (Some(event_kind), Some(payload_kind)) = (event_kind, payload_kind)
             && event_kind != payload_kind

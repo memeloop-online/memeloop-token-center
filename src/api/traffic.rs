@@ -263,7 +263,7 @@ async fn authorize_traffic_model(
 ) -> Result<(), AppError> {
     if state
         .db
-        .credential_has_available_route(key.key_id, key.tenant_id, model, routing_protocol)
+        .credential_has_authorized_route(key.key_id, key.tenant_id, model, routing_protocol)
         .await?
     {
         Ok(())

@@ -191,6 +191,10 @@ async fn add_codex_standby_route(
     standby.id
 }
 
+mod breaker_validation;
+mod codex_delivery_validation;
+mod credential_readiness;
+
 async fn assert_response_archives_omit(fixture: &CodexRouteFixture, sensitive: &str) {
     for row in fixture
         .state
@@ -656,7 +660,7 @@ async fn stable_session_keeps_the_same_candidate_when_the_set_is_unchanged() {
 }
 
 #[tokio::test]
-async fn rate_limit_response_fails_over_and_records_the_actual_upstream() {
+async fn rate_limit_response_is_not_replayed_and_the_next_request_uses_standby() {
     let unavailable = MockServer::start().await;
     let healthy = MockServer::start().await;
     Mock::given(method("POST"))
@@ -668,13 +672,13 @@ async fn rate_limit_response_fails_over_and_records_the_actual_upstream() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(successful_chat_response())
-        .expect(2)
+        .expect(1)
         .mount(&healthy)
         .await;
     let fixture =
         resilient_route_fixture("failover", &[(unavailable.uri(), 0), (healthy.uri(), 10)]).await;
     let response = send_resilient_chat(&fixture, Some("failover-session"), false).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let response = send_resilient_chat(&fixture, Some("failover-session-2"), false).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -694,157 +698,7 @@ async fn rate_limit_response_fails_over_and_records_the_actual_upstream() {
 }
 
 #[tokio::test]
-async fn codex_missing_content_type_json_fails_over_before_downstream_delivery() {
-    let fixture = codex_route_fixture("high-demand-failover").await;
-    let upstream = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(codex_transport::RESPONSES_PATH))
-        .and(header_matcher("chatgpt-account-id", "account-123"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_bytes(
-                serde_json::to_vec(&json!({
-                    "error": {"message": "temporary high demand secret"}
-                }))
-                .unwrap(),
-            ),
-        )
-        .expect(1)
-        .mount(&upstream)
-        .await;
-    let sse = completed_codex_sse("standby answer");
-    Mock::given(method("POST"))
-        .and(path(codex_transport::RESPONSES_PATH))
-        .and(header_matcher("chatgpt-account-id", "account-456"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream"),
-        )
-        .expect(2)
-        .mount(&upstream)
-        .await;
-
-    let tenant = "codex-route-high-demand-failover";
-    let standby = fixture
-        .state
-        .db
-        .create_upstream_account(
-            CreateUpstreamAccountInput {
-                tenant_external_id: tenant.to_owned(),
-                name: "codex-high-demand-standby".to_owned(),
-                driver: codex_transport::DRIVER.to_owned(),
-                config: json!({
-                    "base_url": codex_transport::BASE_URL,
-                    "network_scope": "public",
-                    "reservation_token_bounds": {fixture.upstream_model.clone(): 64}
-                }),
-                credential: UpstreamCredential::OAuth {
-                    access_token: "standby-access-secret".to_owned(),
-                    refresh_token: Some("standby-refresh-secret".to_owned()),
-                    expires_at: Some(i64::MAX),
-                    header: "authorization".to_owned(),
-                    prefix: "Bearer ".to_owned(),
-                    adapter_state: Some(json!({
-                        "schema": "openai-codex-oauth-v1",
-                        "account_id": "account-456"
-                    })),
-                    proxy_url: None,
-                    proxy_network_scope: None,
-                },
-                oauth_session_id: None,
-                oauth_driver: Some(codex_transport::DRIVER.to_owned()),
-                oauth_refresh_url: Some(crate::oauth::managed::codex::TOKEN_ENDPOINT.to_owned()),
-            },
-            fixture.state.config.key_pepper.as_bytes(),
-        )
-        .await
-        .unwrap();
-    let standby_route = fixture
-        .state
-        .db
-        .create_model_route(CreateModelRouteInput {
-            tenant_external_id: tenant.to_owned(),
-            public_model: fixture.model.clone(),
-            upstream_account_id: standby.id,
-            upstream_model: fixture.upstream_model.clone(),
-            protocol: "openai".to_owned(),
-            priority: 10,
-        })
-        .await
-        .unwrap();
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let tenant_id: String = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1")
-        .bind(fixture.key_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO routing_grants (tenant_id, key_id, model_route_id, route_group_id, created_at)
-         VALUES ($1, $2, $3, NULL, $4)",
-    )
-    .bind(&tenant_id)
-    .bind(fixture.key_id.to_string())
-    .bind(standby_route.id.to_string())
-    .bind(crate::db::unix_millis())
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    for input in ["first", "second"] {
-        let response = send_codex_route(
-            &fixture,
-            &upstream,
-            "/v1/responses",
-            json!({"model": fixture.model, "input": input, "stream": false}),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-            .await
-            .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("standby answer"));
-    }
-    let actual: String = sqlx::query_scalar(
-        "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(fixture.key_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(actual, standby.id.to_string());
-    let failure_kind: String = sqlx::query_scalar(
-        "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
-    )
-    .bind(fixture.upstream_account_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(failure_kind, "invalid_response");
-    for row in fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap()
-    {
-        let refs = fixture
-            .state
-            .db
-            .request_archive_refs(fixture.key_id, row.request_id)
-            .await
-            .unwrap();
-        let archived = fixture
-            .state
-            .archive
-            .get(refs.response_object.as_deref().unwrap())
-            .await
-            .unwrap();
-        assert!(!String::from_utf8_lossy(&archived).contains("high demand secret"));
-    }
-    pool.close().await;
-    upstream.verify().await;
-}
-
-#[tokio::test]
-async fn codex_transient_400_fails_over_before_downstream_delivery() {
+async fn codex_transient_400_is_not_replayed_across_accounts() {
     let fixture = codex_route_fixture("transient-400-failover").await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
@@ -866,10 +720,10 @@ async fn codex_transient_400_fails_over_before_downstream_delivery() {
             completed_codex_sse("standby after transient rejection").into_bytes(),
             "text/event-stream",
         ))
-        .expect(1)
+        .expect(0)
         .mount(&upstream)
         .await;
-    let standby = add_codex_standby_route(
+    let _standby = add_codex_standby_route(
         &fixture,
         "codex-route-transient-400-failover",
         "account-456",
@@ -883,12 +737,12 @@ async fn codex_transient_400_fails_over_before_downstream_delivery() {
         json!({"model": fixture.model, "input": "retry safely", "stream": true}),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("standby after transient rejection"));
+    assert!(!body.contains("standby after transient rejection"));
     assert!(!body.contains("transient upstream detail must stay private"));
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let failure_kind: String = sqlx::query_scalar(
@@ -906,14 +760,14 @@ async fn codex_transient_400_fails_over_before_downstream_delivery() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(actual, standby.to_string());
+    assert_eq!(actual, fixture.upstream_account_id.to_string());
     pool.close().await;
     assert_response_archives_omit(&fixture, "transient upstream detail must stay private").await;
     upstream.verify().await;
 }
 
 #[tokio::test]
-async fn codex_retry_then_retryable_http_response_fails_over_and_finishes_retry_once() {
+async fn codex_retry_then_http_response_is_not_replayed_across_accounts() {
     for (label, second_status, failure_kind) in [
         ("429", StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         ("5xx", StatusCode::BAD_GATEWAY, "unavailable"),
@@ -935,7 +789,10 @@ async fn codex_retry_then_retryable_http_response_fails_over_and_finishes_retry_
                         }
                     }))
                 } else {
-                    ResponseTemplate::new(second_status.as_u16())
+                    ResponseTemplate::new(second_status.as_u16()).set_body_raw(
+                        format!("private {label} response must not trigger account replay"),
+                        "text/html",
+                    )
                 }
             })
             .expect(2)
@@ -948,11 +805,11 @@ async fn codex_retry_then_retryable_http_response_fails_over_and_finishes_retry_
                 completed_codex_sse("standby after retryable status").into_bytes(),
                 "text/event-stream",
             ))
-            .expect(1)
+            .expect(0)
             .mount(&upstream)
             .await;
-        let standby_route_name = format!("codex-route-retry-then-{label}-failover");
-        let standby = add_codex_standby_route(&fixture, &standby_route_name, "account-456").await;
+        let standby_route_name = format!("codex-route-retry-then-{label}-no-replay");
+        let _standby = add_codex_standby_route(&fixture, &standby_route_name, "account-456").await;
 
         let response = send_codex_route(
             &fixture,
@@ -961,12 +818,16 @@ async fn codex_retry_then_retryable_http_response_fails_over_and_finishes_retry_
             json!({"model": fixture.model, "input": "retry then status", "stream": true}),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK, "{label}");
+        assert_eq!(response.status(), second_status, "{label}");
         let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
         assert!(
-            String::from_utf8_lossy(&body).contains("standby after retryable status"),
+            !String::from_utf8_lossy(&body).contains("standby after retryable status"),
+            "{label}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains("must not trigger account replay"),
             "{label}"
         );
         wait_for_request_settlement(&fixture, 1).await;
@@ -976,8 +837,12 @@ async fn codex_retry_then_retryable_http_response_fails_over_and_finishes_retry_
             .list_requests(fixture.key_id, 10)
             .await
             .unwrap();
-        assert_eq!(rows[0].status_code, Some(200), "{label}");
-        assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+        assert_eq!(
+            rows[0].status_code,
+            Some(i64::from(second_status.as_u16())),
+            "{label}"
+        );
+        assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let actual: String = sqlx::query_scalar(
             "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -986,7 +851,7 @@ async fn codex_retry_then_retryable_http_response_fails_over_and_finishes_retry_
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(actual, standby.to_string(), "{label}");
+        assert_eq!(actual, fixture.upstream_account_id.to_string(), "{label}");
         let actual_failure: String = sqlx::query_scalar(
             "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
         )
@@ -1205,19 +1070,19 @@ async fn codex_retry_buffered_incomplete_sse_records_failed_terminal() {
 async fn codex_retry_buffered_completion_requires_a_single_matching_response_id() {
     let matching = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-buffered\"}}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
     );
     let missing = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-buffered\"}}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
     );
     let mismatched = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-buffered\"}}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-other\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-other\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
     );
     let duplicate = concat!(
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-buffered\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
     );
     for (label, body, success) in [
         ("matching", matching, true),
@@ -1645,16 +1510,12 @@ async fn server_errors_are_not_replayed_to_a_standby() {
 
 #[tokio::test]
 async fn secondary_component_does_not_consume_the_healthy_standby_budget() {
-    let primary = MockServer::start().await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let primary_uri = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
     let component_a = MockServer::start().await;
     let component_b = MockServer::start().await;
     let healthy = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(429))
-        .expect(1)
-        .mount(&primary)
-        .await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500))
         .expect(0)
@@ -1692,7 +1553,7 @@ async fn secondary_component_does_not_consume_the_healthy_standby_budget() {
                 tenant_external_id: tenant.to_owned(),
                 name: "primary-http-json".to_owned(),
                 driver: "http-json".to_owned(),
-                config: json!({"base_url": primary.uri(), "network_scope": "public"}),
+                config: json!({"base_url": primary_uri, "network_scope": "public"}),
                 credential: UpstreamCredential::None,
                 oauth_session_id: None,
                 oauth_driver: None,
@@ -1825,7 +1686,6 @@ async fn secondary_component_does_not_consume_the_healthy_standby_budget() {
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
-    primary.verify().await;
     component_a.verify().await;
     component_b.verify().await;
     healthy.verify().await;
@@ -2031,10 +1891,12 @@ async fn assert_exactly_once_side_effects(
 fn completed_codex_sse(output: &str) -> String {
     format!(
         concat!(
+            "event: response.queued\r\n",
+            "data: {{\"type\":\"response.queued\",\"response\":{{\"id\":\"resp-codex\"}}}}\r\n\r\n",
             "event: response.output_item.done\r\n",
             "data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"item-codex\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{output}\"}}]}}}}\r\n\r\n",
             "event: response.completed\n",
-            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-codex\",\"object\":\"response\",\"output\":[{{\"id\":\"item-codex\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{output}\"}}]}}],\"usage\":{{\"input_tokens\":3,\"output_tokens\":2}}}}}}\n\n",
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-codex\",\"object\":\"response\",\"output\":[{{\"id\":\"item-codex\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{output}\"}}]}}],\"usage\":{{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}}}}\n\n",
             "data: [DONE]\n\n"
         ),
         output = output

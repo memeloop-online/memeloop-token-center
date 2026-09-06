@@ -14,6 +14,7 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) protocol: Protocol,
     pub(super) is_codex_route: bool,
     pub(super) codex_retry: CodexRetryTerminalGuard,
+    pub(super) upstream_attempt: UpstreamAttemptGuard,
     pub(super) strict_openai_chat_usage: bool,
     pub(super) upstream_activity: crate::metrics::ActivityGuard,
     pub(super) request_id: Uuid,
@@ -32,6 +33,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         protocol,
         is_codex_route,
         mut codex_retry,
+        mut upstream_attempt,
         strict_openai_chat_usage,
         upstream_activity,
         request_id,
@@ -107,9 +109,14 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 Protocol::OpenAiResponses => ResponsesSseCapture::for_responses(),
                 _ => ResponsesSseCapture::for_delivery(),
             });
-            let mut responses_streaming_sanitizer = (is_sse
-                && matches!(protocol, Protocol::OpenAiResponses))
-            .then(codex_transport::ResponsesStreamingSanitizer::default);
+            let mut responses_streaming_sanitizer =
+                (is_sse && matches!(protocol, Protocol::OpenAiResponses)).then(|| {
+                    if is_codex_route {
+                        codex_transport::ResponsesStreamingSanitizer::for_codex()
+                    } else {
+                        codex_transport::ResponsesStreamingSanitizer::default()
+                    }
+                });
             let mut transport_error: Option<&'static str> = None;
             let mut response_bytes = 0_usize;
             let mut delivery_confirmed = false;
@@ -492,6 +499,18 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 // known; deleting it here could leave a committed row dangling.
                 tracing::error!(%request_id, stage = "terminal_transaction", "proxy request finalization failed");
             }
+            let attempt_terminal = if terminal_result_failed
+                || matches!(
+                    transport_error,
+                    Some("downstream_disconnected" | "downstream_backpressure" | "delivery_state")
+                ) {
+                UpstreamAttemptTerminal::Inconclusive
+            } else if error_code.is_some() {
+                UpstreamAttemptTerminal::invalid_response()
+            } else {
+                UpstreamAttemptTerminal::Succeeded
+            };
+            upstream_attempt.complete(attempt_terminal).await;
             codex_retry.complete(if terminal_result_failed {
                 CodexRetryTerminal::Failed
             } else {

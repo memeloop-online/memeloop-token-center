@@ -13,6 +13,7 @@ pub use credential::{
 };
 pub(crate) use credential::{open_private_json, seal_private_json};
 pub use types::{ModelRouteView, ResolvedUpstream, UpstreamAccountView};
+pub(crate) use types::{PROXY_ROUTING_POLICY, UpstreamTransportSnapshot};
 
 #[cfg(test)]
 mod tests;
