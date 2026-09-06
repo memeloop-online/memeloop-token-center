@@ -813,6 +813,12 @@ pub(super) fn canonical_responses_usage(response: &Value) -> Result<TokenUsage, 
         }
         Some(_) => return Err(()),
     };
+    if !matches!(
+        cached_input_tokens.checked_add(cache_write_tokens),
+        Some(total) if total <= reported_input
+    ) {
+        return Err(());
+    }
     if usage
         .get("output_tokens_details")
         .is_some_and(|details| !details.is_null() && !details.is_object())

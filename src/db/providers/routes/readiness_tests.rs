@@ -269,7 +269,11 @@ async fn postgres_activation_is_fenced_against_credential_expiry_when_configured
         "UPDATE upstream_credentials SET expires_at = $1
          WHERE upstream_account_id = $2 AND revoked_at IS NULL",
     )
-    .bind(unix_millis())
+    // The activation query binds its eligibility timestamp before waiting on
+    // this row lock. Use an unambiguously past value so the post-lock
+    // re-evaluation cannot treat the just-written expiry as future relative
+    // to that already-bound timestamp.
+    .bind(0_i64)
     .bind(account.id.to_string())
     .execute(&mut *rotation)
     .await
