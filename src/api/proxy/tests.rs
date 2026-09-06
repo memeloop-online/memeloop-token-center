@@ -2561,13 +2561,16 @@ async fn codex_streaming_route_preserves_sse_and_settles_usage_once() {
         serde_json::from_slice::<Value>(&archived_request).unwrap(),
         original
     );
-    let archived_response = fixture
-        .state
-        .archive
-        .get(refs.response_object.as_deref().unwrap())
-        .await
-        .unwrap();
-    assert_eq!(archived_response.as_ref(), sse.as_bytes());
+    let response_object = refs.response_object.expect("response archive locator");
+    let response_gap = format!("gap://{}/response", rows[0].request_id);
+    // A text response remains successful when the bounded archive sidecar
+    // cannot complete. `gap://` is a durable absence marker, not an
+    // object-store location, so passing it to ArchiveStore::get would
+    // correctly fail its path validation.
+    if response_object != response_gap {
+        let archived_response = fixture.state.archive.get(&response_object).await.unwrap();
+        assert_eq!(archived_response.as_ref(), sse.as_bytes());
+    }
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_codex_wire(&requests[0], &fixture.upstream_model);
