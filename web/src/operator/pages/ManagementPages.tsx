@@ -458,7 +458,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const searchCredential = (query: string) => {
     credentialSearchAbort.current?.abort();
     const keyId = query.trim();
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(keyId) || !token || !writeTenant) return;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(keyId) || !token || !writeTenant) return;
     const controller = new AbortController();
     credentialSearchAbort.current = controller;
     const searchToken = token; const searchTenant = tenant; const searchWriteTenant = writeTenant;

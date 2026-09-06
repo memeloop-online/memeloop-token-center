@@ -80,7 +80,11 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
       await route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
       return;
     }
-    const body = url.pathname === '/internal/v1/schemas' ? '{}' : '[]';
+    const body = url.pathname === '/internal/v1/schemas'
+      ? '{}'
+      : url.pathname === '/internal/v1/requests'
+        ? JSON.stringify({ requests: [], next_cursor: null })
+        : '[]';
     await route.fulfill({ status: 200, contentType: 'application/json', body });
   });
 

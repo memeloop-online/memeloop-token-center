@@ -81,7 +81,7 @@ export async function connectOperator(
     const scopedReload = page.waitForResponse((response) => {
       const url = new URL(response.url());
       return response.request().method() === 'GET'
-        && url.pathname === '/internal/v1/upstreams'
+        && url.pathname === '/internal/v1/requests'
         && url.searchParams.get('tenant_external_id') === tenant;
     });
     await tenantPicker.selectOption(tenant);

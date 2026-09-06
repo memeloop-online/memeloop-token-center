@@ -17,10 +17,10 @@ When('管理员和下游用户验证凭据记忆与手动清空', async function
   const seed = runtime.requireSeed();
   await connectOperator(this, 'dark');
   await assertValue(page.locator('.operator-credential input[type="password"]'), '');
-  await assertContains(page.locator('.console-context'), '已连接');
+  await assertVisible(page.getByRole('button', { name: '清空凭据', exact: true }));
   await page.reload();
   await assertValue(page.locator('.operator-credential input[type="password"]'), '');
-  await assertContains(page.locator('.console-context'), '已连接');
+  await assertVisible(page.getByRole('button', { name: '清空凭据', exact: true }));
   await assertOperatorTenantScope(page, tenant, 'hidden');
 
   await this.open('/portal', { theme: 'light', locale: 'zh-CN', viewport: { width: 375, height: 812 } });
