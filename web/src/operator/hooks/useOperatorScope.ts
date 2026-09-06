@@ -6,6 +6,7 @@ import {
   readRememberedOperatorTenant,
   rememberCredential,
   rememberOperatorTenant,
+  tenantForCredential,
 } from '../../credentialStorage';
 import { useI18n } from '../../i18n';
 import type { TenantView } from '../../types';
@@ -70,12 +71,6 @@ function reducer(state: ScopeState, action: ScopeAction): ScopeState {
     case 'clear':
       return { credential: '', validated: false, credentialInput: '', tenant: '', tenants: [], status: { kind: 'disconnected' } };
   }
-}
-
-export function tenantForCredential(tenants: TenantView[], previousTenant: string) {
-  if (tenants.some((value) => value.external_id === previousTenant)) return previousTenant;
-  if (tenants.some((value) => value.external_id === 'default')) return 'default';
-  return tenants.length === 1 ? tenants[0].external_id : '';
 }
 
 export function useOperatorScope() {

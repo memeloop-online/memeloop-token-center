@@ -63,3 +63,12 @@ export function rememberOperatorTenant(tenant: string, storage = browserStorage(
     // Tenant selection is an ergonomic preference, never an auth dependency.
   }
 }
+
+export function tenantForCredential(
+  tenants: ReadonlyArray<{ external_id: string }>,
+  previousTenant: string,
+): string {
+  if (tenants.some((value) => value.external_id === previousTenant)) return previousTenant;
+  if (tenants.some((value) => value.external_id === 'default')) return 'default';
+  return tenants.length === 1 ? tenants[0]!.external_id : '';
+}

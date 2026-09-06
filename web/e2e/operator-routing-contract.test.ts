@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { tenantForCredential } from '../src/credentialStorage.js';
 import { operatorRouteKeys } from '../src/operator/scope/operatorRoutes.js';
-import { tenantForCredential } from '../src/operator/hooks/useOperatorScope.js';
 
 const operator = readFileSync(new URL('../src/operator/Operator.tsx', import.meta.url), 'utf8');
 const scope = readFileSync(new URL('../src/operator/hooks/useOperatorScope.ts', import.meta.url), 'utf8');
