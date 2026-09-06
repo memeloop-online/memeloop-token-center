@@ -429,6 +429,7 @@ mod tests {
         );
         let database = Database::connect(&database_url).await.unwrap();
         database.migrate().await.unwrap();
+        database.create_tenant("memeloop", None).await.unwrap();
         let pepper = b"a service credential pepper longer than thirty-two bytes";
         let first = database
             .create_service_token(
