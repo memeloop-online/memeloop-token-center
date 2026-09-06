@@ -32,15 +32,13 @@ use routing::{
 };
 use upstream_response::UpstreamResponse;
 
-pub(super) use response_metadata::{
+use response_metadata::{
     ExtractedUsage, append_bounded, extract_response_id, extract_usage_checked,
     is_supported_service_tier, should_capture_buffered_usage,
 };
 #[cfg(test)]
-pub(super) use response_metadata::{
-    completed_response_id, usage_from_value, usage_from_value_checked,
-};
-pub(super) use sse_capture::{
+use response_metadata::{completed_response_id, usage_from_value, usage_from_value_checked};
+use sse_capture::{
     ResponsesSseCapture, ResponsesSseOutcome, ResponsesSseSummary, SseDeliveryFrame,
 };
 
