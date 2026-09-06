@@ -864,7 +864,11 @@ pub(super) async fn proxy(
     // forwarded or settled as a compatible buffered response.
     if strict_openai_chat_usage && !is_sse {
         drop(upstream);
-        return finish_proxy_failure(&buffered_request, "upstream_invalid_response").await;
+        let result = finish_proxy_failure(&buffered_request, "upstream_invalid_response").await;
+        upstream_attempt
+            .complete(UpstreamAttemptTerminal::invalid_response())
+            .await;
+        return result;
     }
     let capture_json_usage = should_capture_buffered_usage(is_sse, content_type.as_ref());
     if !is_sse {
@@ -1633,6 +1637,17 @@ impl ResponsesSseCapture {
                 if self.terminal_success || self.terminal_failure {
                     continue;
                 }
+                if self.chat_usage.is_some()
+                    && event
+                        .lines
+                        .iter()
+                        .any(|line| super::sse::is_sse_field_line(line.value.as_slice(), b"event"))
+                {
+                    let class = self.dispatch_event(&event);
+                    let bytes = Self::strict_chat_named_control_bytes(&event);
+                    self.finish_delivery_event(bytes, class);
+                    continue;
+                }
                 // Only fixed, redacted heartbeats and field-less framing are
                 // safe to forward without a data envelope. Drop arbitrary
                 // event/id/retry metadata so it cannot carry provider secrets.
@@ -1733,6 +1748,19 @@ impl ResponsesSseCapture {
         super::sse::redacted_sse_event_bytes(event, metadata_policy)
     }
 
+    fn strict_chat_named_control_bytes(event: &super::sse::BoundedSseEvent) -> Bytes {
+        let Ok((Some(event_name), None)) = super::sse::parse_sse_event(event) else {
+            return Bytes::new();
+        };
+        let safe_name = match event_name.as_str() {
+            "message" => "message",
+            "error" => "error",
+            "response.failed" => "response.failed",
+            _ => return Bytes::new(),
+        };
+        Bytes::from(format!("event: {safe_name}\n\n"))
+    }
+
     fn event_name_matches_payload(event: &super::sse::BoundedSseEvent) -> bool {
         let Ok((Some(event_name), Some(data))) = super::sse::parse_sse_event(event) else {
             return false;
@@ -1770,24 +1798,17 @@ impl ResponsesSseCapture {
                 event_kind = Some(ResponsesSseEventKind::from_name(value));
             }
         }
-        // Strict OpenAI Chat usage streams use anonymous `data:` events. A
-        // named event belongs to another SSE dialect, so fail closed even if
-        // a later syntactically valid Chat chunk would otherwise complete the
-        // stream. Only actual non-empty model data confirms billable delivery.
-        if self.chat_usage.is_some() && event_kind.is_some() {
+        // Explicit failure names remain authoritative, while unrelated event
+        // metadata is redacted and the typed Chat payload is still validated.
+        // This prevents provider metadata from changing settlement semantics.
+        if self.chat_usage.is_some() && matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
             self.invalid = true;
-            if matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
-                self.terminal_failure = true;
-            }
-            let data = data
-                .as_deref()
-                .map(trim_ascii_whitespace)
-                .unwrap_or_default();
-            return (!data.is_empty() && data != b"[DONE]")
-                .then_some(ChatSseDeliveryClass::Billable)
-                .unwrap_or(ChatSseDeliveryClass::Control);
+            self.terminal_failure = true;
         }
         let Some(data) = data else {
+            if self.chat_usage.is_some() && event_kind.is_some() {
+                self.usage_invalid = true;
+            }
             match event_kind {
                 Some(ResponsesSseEventKind::Completed) if self.require_explicit_completed => {
                     self.invalid = true;

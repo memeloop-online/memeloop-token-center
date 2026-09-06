@@ -228,19 +228,21 @@ fn chat_no_op_preambles_are_control_frames() {
 fn chat_empty_logprobs_remain_control_preambles() {
     for logprobs in [json!({}), json!({"content": []})] {
         let mut capture = ResponsesSseCapture::for_openai_chat_usage();
-        let frames = capture.push_delivery_frames(
-            chat_chunk(
-                "chatcmpl-empty-logprobs",
-                json!([{
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": null},
-                    "finish_reason": null,
-                    "logprobs": logprobs,
-                }]),
-                None,
+        let frames = capture
+            .push_delivery_frames(
+                chat_chunk(
+                    "chatcmpl-empty-logprobs",
+                    json!([{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": null},
+                        "finish_reason": null,
+                        "logprobs": logprobs,
+                    }]),
+                    None,
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        );
+            .unwrap();
         assert_eq!(frames.len(), 1);
         assert!(!frames[0].billable);
     }
@@ -278,7 +280,8 @@ fn chat_output_logprobs_or_unknown_choice_fields_are_never_control_frames() {
     for choices in cases {
         let mut capture = ResponsesSseCapture::for_openai_chat_usage();
         let frames = capture
-            .push_delivery_frames(chat_chunk("chatcmpl-choice-schema", choices, None).as_bytes());
+            .push_delivery_frames(chat_chunk("chatcmpl-choice-schema", choices, None).as_bytes())
+            .unwrap();
         assert_eq!(frames.len(), 1);
         assert!(frames[0].billable);
         assert!(capture.finish_summary().usage_invalid);
@@ -297,7 +300,7 @@ fn strict_chat_rejects_named_events_before_they_can_complete() {
         wire.extend_from_slice(event);
         wire.extend_from_slice(b"\ndata: {\"error\":{\"message\":\"failure\"}}\n\n");
         wire.extend_from_slice(done().as_bytes());
-        let frames = capture.push_delivery_frames(&wire);
+        let frames = capture.push_delivery_frames(&wire).unwrap();
         assert_eq!(frames.len(), 2);
         assert!(frames[0].billable);
         assert!(!frames[1].billable);
@@ -321,7 +324,7 @@ fn strict_chat_empty_named_events_fail_without_starting_delivery() {
         let mut wire = Vec::from(b"event: ".as_slice());
         wire.extend_from_slice(event);
         wire.extend_from_slice(b"\n\n");
-        let frames = capture.push_delivery_frames(&wire);
+        let frames = capture.push_delivery_frames(&wire).unwrap();
         assert_eq!(frames.len(), 1);
         assert!(!frames[0].billable);
         let summary = capture.finish_summary();
@@ -330,7 +333,9 @@ fn strict_chat_empty_named_events_fail_without_starting_delivery() {
     }
 
     let mut capture = ResponsesSseCapture::for_openai_chat_usage();
-    let frames = capture.push_delivery_frames(b"event: message\ndata:   \n\n");
+    let frames = capture
+        .push_delivery_frames(b"event: message\ndata:   \n\n")
+        .unwrap();
     assert_eq!(frames.len(), 1);
     assert!(!frames[0].billable);
     assert_eq!(
