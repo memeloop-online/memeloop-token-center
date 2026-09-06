@@ -22,8 +22,10 @@ RUN npm run build:importer-scripts
 
 FROM ${RUNTIME_IMAGE}
 USER root
-RUN apk upgrade --no-cache libcrypto3 libssl3 \
-    && apk add --no-cache ca-certificates minio-client nodejs postgresql-client sqlite util-linux \
+ARG ALPINE_SECURITY_REFRESH=2026-09-06
+RUN test -n "${ALPINE_SECURITY_REFRESH}" \
+    && apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates minio-client nodejs postgresql-client sqlite 'util-linux>=2.41.6-r1' \
     && ln -s /usr/bin/mcli /usr/local/bin/mc \
     && adduser -S -D -u 10001 importer
 COPY --from=scripts /source/dist/operator-scripts/migrate-cpamp.mjs /usr/local/bin/migrate-cpamp

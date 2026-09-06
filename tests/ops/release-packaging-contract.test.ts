@@ -43,14 +43,15 @@ test('release workflow and Docker packaging remain immutable and attested', () =
   assert.ok(dockerfile.includes('ARG NPM_REGISTRY=https://registry.npmjs.org'));
   assert.ok(importer.includes('ARG NPM_REGISTRY=https://registry.npmjs.org'));
   assert.ok(importer.includes('ARG RUNTIME_IMAGE=alpine:3.23.5'));
+  assert.ok(importer.includes('ARG ALPINE_SECURITY_REFRESH=2026-09-06'));
   for (const needle of [
     'COPY ops/migrate-cpamp.ts ops/audit-cpa-migration.ts ops/import-cpa-session-archive.ts ./ops/',
     'COPY --from=scripts /source/dist/operator-scripts/migrate-cpamp.mjs /usr/local/bin/migrate-cpamp',
     'COPY --from=scripts /source/dist/operator-scripts/audit-cpa-migration.mjs /usr/local/bin/audit-cpa-migration',
     'COPY --from=scripts /source/dist/operator-scripts/sql /usr/local/bin/sql',
     'COPY --from=scripts /source/dist/operator-scripts/export-cpa-session-archive-delta.mjs /usr/local/bin/export-cpa-session-archive-delta',
-    'apk upgrade --no-cache libcrypto3 libssl3',
-    'apk add --no-cache ca-certificates minio-client nodejs postgresql-client sqlite util-linux',
+    'apk upgrade --no-cache',
+    "apk add --no-cache ca-certificates minio-client nodejs postgresql-client sqlite 'util-linux>=2.41.6-r1'",
     'ln -s /usr/bin/mcli /usr/local/bin/mc',
   ]) assert.ok(importer.includes(needle), `Dockerfile.importer lacks ${needle}`);
   assert.ok(!importer.includes('apt-get'));
