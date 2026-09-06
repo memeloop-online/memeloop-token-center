@@ -236,11 +236,23 @@ async fn postgres_activation_is_fenced_against_credential_expiry_when_configured
     let route_id = route.id;
 
     let mut rotation = database.begin_write_transaction().await.unwrap();
-    sqlx::query("SELECT id FROM upstream_accounts WHERE id = $1 FOR UPDATE")
-        .bind(account.id.to_string())
-        .fetch_one(&mut *rotation)
-        .await
-        .unwrap();
+    // Hold the exact current credential row that activation locks while it
+    // validates eligibility. Locking only the account lets PostgreSQL retain
+    // an already-selected credential version in this join, which turns this
+    // expiry fence into a scheduler-dependent test rather than a concurrent
+    // credential-write test.
+    sqlx::query(
+        "SELECT credential.id FROM upstream_credentials credential \
+         JOIN upstream_accounts account ON account.id = credential.upstream_account_id \
+         WHERE account.id = $1 \
+           AND credential.generation = account.credential_generation \
+           AND credential.revoked_at IS NULL \
+         FOR UPDATE OF credential",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&mut *rotation)
+    .await
+    .unwrap();
     let activation_database = database.clone();
     let activation_tenant = tenant.clone();
     let activation = tokio::spawn(async move {
