@@ -696,6 +696,23 @@ async fn rate_limit_response_fails_over_to_standby_in_the_same_request() {
 }
 
 #[tokio::test]
+async fn rate_limit_response_is_preserved_without_a_standby() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture =
+        resilient_route_fixture("rate-limit-without-standby", &[(upstream.uri(), 0)]).await;
+    let response = send_resilient_chat(&fixture, Some("rate-limit-without-standby"), false).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn codex_transient_400_is_not_replayed_across_accounts() {
     let fixture = codex_route_fixture("transient-400-failover").await;
     let upstream = MockServer::start().await;
@@ -1991,7 +2008,11 @@ fn assert_codex_wire(request: &wiremock::Request, upstream_model: &str) {
     assert_eq!(body["model"], upstream_model);
     assert_eq!(body["stream"], true);
     assert_eq!(body["store"], false);
-    assert!(body.get("parallel_tool_calls").is_none());
+    assert_eq!(body["parallel_tool_calls"], true);
+    assert_eq!(
+        body["tools"],
+        json!([{"type": "image_generation", "output_format": "png"}])
+    );
     assert_eq!(body["instructions"], "");
     assert_eq!(
         body["prompt_cache_key"],
