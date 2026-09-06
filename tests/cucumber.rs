@@ -4906,6 +4906,77 @@ async fn grant_fixture_model(
     grant_fixture_routes(world, tenant_external_id, key_id, &[route_id]).await;
 }
 
+async fn add_fixture_standby_account(
+    world: &TokenCenterWorld,
+    tenant_external_id: &str,
+    public_model: &str,
+    protocol: &str,
+) {
+    let route = world
+        .state
+        .as_ref()
+        .expect("state")
+        .db
+        .list_model_routes(Some(tenant_external_id))
+        .await
+        .expect("list fixture routes")
+        .into_iter()
+        .find(|route| route.public_model == public_model && route.protocol == protocol)
+        .expect("fixture route");
+    let mock_url = world.mock.as_ref().expect("mock server").uri();
+    let (status, account) = control_json(
+        world,
+        Method::POST,
+        "/internal/v1/upstreams",
+        json!({
+            "tenant_external_id": tenant_external_id,
+            "name": format!("fixture-standby-{public_model}-{}", Uuid::now_v7()),
+            "driver": "http-json",
+            "config": {"base_url": mock_url},
+            "credential": {"type": "none"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{account}");
+
+    let routing_path = format!(
+        "/internal/v1/model-routes/{}/routing?tenant_external_id={tenant_external_id}",
+        route.id
+    );
+    let (status, routing) = control_json(world, Method::GET, &routing_path, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{routing}");
+    let mut upstream_account_ids = routing["upstream_account_ids"]
+        .as_array()
+        .expect("fixture upstream account ids")
+        .clone();
+    upstream_account_ids.push(account["id"].clone());
+    let (status, updated) = control_json(
+        world,
+        Method::PUT,
+        &format!("/internal/v1/model-routes/{}/routing", route.id),
+        json!({
+            "tenant_external_id": tenant_external_id,
+            "upstream_account_ids": upstream_account_ids,
+            "included_provider_group_ids": routing["included_provider_group_ids"],
+            "excluded_provider_group_ids": routing["excluded_provider_group_ids"],
+            "route_group_ids": routing["route_group_ids"],
+            "granted_credential_ids": routing["granted_credential_ids"],
+            "expected_updated_at": routing["updated_at"],
+            "expected_grant_revision": routing["grant_revision"],
+            "custom_model_confirmed": routing["custom_model_confirmed"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(
+        updated["candidate_upstream_account_ids"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "{updated}"
+    );
+}
+
 #[when("the service creates a key allowing both routed models")]
 async fn create_key_for_routed_models(world: &mut TokenCenterWorld) {
     for model in ["api-public", "oauth-public"] {
@@ -7156,6 +7227,7 @@ async fn send_failed_streaming_responses_parent_and_child(
     world: &mut TokenCenterWorld,
     model: String,
 ) {
+    add_fixture_standby_account(world, "default", &model, "openai").await;
     assert_eq!(
         send_responses_turn(world, &model, "failed streaming parent", None, true).await,
         StatusCode::OK
