@@ -11,6 +11,7 @@ import { GenerationsPage, OverviewPage, PluginsPage, UsagePage } from './pages/O
 import { RequestsPage } from './pages/RequestsPage';
 import { SessionsPage } from './pages/SessionsPage';
 import { operatorRouteKeys, type OperatorRouteKey } from './scope/operatorRoutes';
+import { TenantManager } from './TenantManager';
 
 export interface OperatorProps {
   route?: OperatorRouteKey;
@@ -89,7 +90,7 @@ export function Operator({ route, onRouteChange, embedded = false, showNavigatio
 
   let page: ReactNode = null;
   if (scope.activeCredential) {
-    const pageProps = { token: scope.activeCredential, tenant: scope.tenant };
+    const pageProps = { token: scope.activeCredential, tenant: scope.tenant, writeTenant: scope.writeTenant };
     switch (activeRoute) {
       case 'overview': page = <OverviewPage {...pageProps} onNavigate={navigate} onOpenUsageSession={openSession} onOpenSession={openSessionById} />; break;
       case 'requests': page = <RequestsPage {...pageProps} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} />; break;
@@ -109,14 +110,15 @@ export function Operator({ route, onRouteChange, embedded = false, showNavigatio
     <header className="hero compact">
       <div><span className="eyebrow">{t('operator.eyebrow')}</span><h1>Token Center</h1><p>{t('operator.subtitle')}</p><a className="button secondary portal-link" href="/portal">{t('operator.openPortal')}</a></div>
       <div className="credential operator-credential">
-        {scope.tenants.length > 0 && <label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={scope.tenant} onChange={(event) => scope.setTenant(event.target.value)}><option value="">{t('operator.allTenants')}</option>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{value.external_id}</option>)}</select></label>}
+        {scope.tenants.length > 1 && <label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={scope.tenant} onChange={(event) => scope.setTenant(event.target.value)}><option value="">{t('operator.allTenants')}</option>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{value.external_id}</option>)}</select></label>}
         <input aria-label={t('operator.serviceCredential')} autoComplete="off" type="password" value={scope.credentialInput} onChange={(event) => scope.setCredentialInput(event.target.value)} placeholder={t('operator.tokenPlaceholder')} />
         <button type="button" disabled={!scope.credentialInput.trim()} onClick={() => void scope.authenticate(scope.credentialInput)}>{t('common.connect')}</button>
         {scope.credential && <button type="button" className="secondary clear-credential" onClick={scope.clearCredential}>{t('common.clearCredential')}</button>}
       </div>
     </header>
     {scope.authenticating && <div className="console-context"><div><b>{t('common.loading')}</b></div></div>}
-    {scope.activeCredential && <div className="console-context"><div><b>{scope.tenant || t('operator.allTenants')}</b><span>{t('common.savedCredentialInUse')}</span></div>{(scope.tenants.length === 0 || !scope.tenant) && <small>{t(scope.tenants.length === 0 ? 'operator.noTenants' : 'operator.selectTenantToWrite')}</small>}</div>}
+    {scope.activeCredential && <div className="console-context"><div><b>{scope.tenant || t('operator.allTenants')}</b></div>{scope.tenants.length === 0 && <small>{t('operator.noTenants')}</small>}{scope.isAggregate && scope.writeTenant && <small>{t('operator.aggregateWritesToDefault', { tenant: scope.writeTenant })}</small>}</div>}
+    {scope.activeCredential && <TenantManager token={scope.activeCredential} onChanged={scope.refreshTenants} />}
     {showNavigation && <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{navigation.map((item) => <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={activeRoute === item.route} aria-controls={`operator-panel-${item.domId}`} tabIndex={activeRoute === item.route ? 0 : -1} key={item.route} className={activeRoute === item.route ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{t(item.label)}</button>)}</nav>}
     {scope.error && <div className="notice error" role="alert">{scope.error}</div>}
     <section id={`operator-panel-${pageId(activeRoute)}`} role="tabpanel" aria-labelledby={showNavigation ? `operator-tab-${pageId(activeRoute)}` : undefined} tabIndex={0}>

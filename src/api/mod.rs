@@ -52,6 +52,7 @@ mod self_service;
 mod sessions;
 mod sse;
 mod traffic;
+mod tenants;
 mod upstreams;
 mod usage_analysis;
 mod web;
@@ -108,6 +109,7 @@ use traffic::{
     proxy_anthropic_count_tokens, proxy_openai_chat, proxy_openai_embeddings,
     proxy_openai_responses,
 };
+use tenants::{archive_tenant, create_tenant, delete_tenant, list_tenant_management, rename_tenant, restore_tenant};
 use upstreams::*;
 use web::{operator_index, portal_index, web_asset};
 

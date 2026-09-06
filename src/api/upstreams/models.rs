@@ -255,7 +255,7 @@ async fn discover_models(
     if account.driver == "openai-codex" {
         return discover_codex_models(state, account, credential).await;
     }
-    if account.driver != "http-json" {
+    if !crate::provider::is_openai_compatible_http_driver(&account.driver) {
         return Err("unsupported");
     }
     credential

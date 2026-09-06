@@ -58,6 +58,37 @@
   text-transform: uppercase;
 }
 
+.tenant-manager {
+  margin: 14px 0;
+}
+
+.tenant-manager > summary {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  gap: 20px;
+  justify-content: space-between;
+  list-style: none;
+  padding: 14px 18px;
+}
+
+.tenant-manager > summary::-webkit-details-marker { display: none; }
+.tenant-manager > summary b,
+.tenant-manager > summary small { display: block; }
+.tenant-manager > summary small { color: #6f8289; font-size: 11px; margin-top: 4px; }
+.tenant-manager > summary > span:last-child { color: #5fd4c3; font-size: 22px; transition: transform .16s ease; }
+.tenant-manager[open] > summary > span:last-child { transform: rotate(45deg); }
+
+.tenant-create-row {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.tenant-create-row label { flex: 1 1 260px; }
+.tenant-list { margin-top: 16px; }
+
 .provider-layout {
   align-items: start;
   display: grid;
@@ -1182,6 +1213,8 @@
   .tenant-picker {
     width: 100%;
   }
+
+  .tenant-create-row { align-items: stretch; flex-direction: column; }
 
   .operator-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));

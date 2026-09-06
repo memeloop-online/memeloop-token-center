@@ -6,7 +6,7 @@ fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> St
         "openai-codex" => {
             format!("{base}/models?client_version={}", env!("CARGO_PKG_VERSION"))
         }
-        "http-json" => {
+        driver if crate::provider::is_openai_compatible_http_driver(driver) => {
             if base.ends_with("/v1") {
                 format!("{base}/models")
             } else {
@@ -172,6 +172,18 @@ mod tests {
                 "https://chatgpt.com/backend-api/codex/models?client_version={}",
                 env!("CARGO_PKG_VERSION")
             )
+        );
+    }
+
+    #[test]
+    fn cbcnx_health_uses_the_bounded_openai_model_catalog_endpoint() {
+        assert_eq!(
+            upstream_health_probe_url(
+                crate::provider::CBCNX_PROVIDER_DRIVER,
+                &json!({}),
+                "https://cbcnx.example.test/v1/",
+            ),
+            "https://cbcnx.example.test/v1/models",
         );
     }
 }

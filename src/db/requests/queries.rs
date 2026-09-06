@@ -45,6 +45,10 @@ impl PortableRequestListQuery {
 #[derive(Clone, Debug, Default)]
 pub struct RequestListFilter {
     pub limit: i64,
+    /// Internal-only request for one bounded lookahead row. This keeps the
+    /// public page-size ceiling intact while allowing the control API to emit
+    /// a definitive next cursor.
+    pub lookahead: bool,
     pub from_created_at: Option<i64>,
     pub to_created_at: Option<i64>,
     pub before_created_at: Option<i64>,
@@ -435,7 +439,7 @@ fn build_operator_request_list_query(
     tenant_external_id: Option<&str>,
     filter: &RequestListFilter,
 ) -> PortableRequestListQuery {
-    let page_limit = filter.limit.clamp(1, 500);
+    let page_limit = filter.limit.clamp(1, 500) + i64::from(filter.lookahead);
     let mut query = PortableRequestListQuery::new(
         "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost_micros, error_code, session_id, session_association, session_name, task_kind, agent_id, semantics_source FROM (SELECT * FROM (SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.error_code, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source FROM request_records r",
     );
@@ -925,12 +929,31 @@ mod query_shape_tests {
     }
 
     #[test]
+    fn operator_request_page_lookahead_is_one_bounded_extra_row() {
+        let query = build_operator_request_list_query(
+            Some("tenant-a"),
+            &RequestListFilter {
+                limit: 100,
+                lookahead: true,
+                ..RequestListFilter::default()
+            },
+        );
+
+        assert_eq!(
+            query.binds.last(),
+            Some(&RequestListBind::I64(101)),
+            "the control envelope proves another page without unbounded counting"
+        );
+    }
+
+    #[test]
     fn operator_request_list_emits_only_concrete_active_filters() {
         let key_id = Uuid::now_v7();
         let upstream_account_id = Uuid::now_v7();
         let before_id = Uuid::now_v7();
         let filter = RequestListFilter {
             limit: 17,
+            lookahead: false,
             from_created_at: Some(10),
             to_created_at: Some(90),
             before_created_at: Some(80),

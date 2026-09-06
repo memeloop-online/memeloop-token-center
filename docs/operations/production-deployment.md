@@ -87,7 +87,7 @@ new database and switching endpoints.
 Request and request-event partition maintenance creates partitions ahead of
 current traffic. Alert on blocked partition maintenance and use the documented
 backfill procedure for the affected day; the worker does not move or delete
-blocked rows automatically. After a legacy import or repair, reconcile compact
+blocked rows automatically. After a data repair, reconcile compact
 request facts and aggregates for the affected interval and run `ANALYZE`.
 Pruning raw history is a separate, explicit retention operation.
 
@@ -150,7 +150,7 @@ multipart sessions. Do not apply an ordinary object-expiration TTL to active
 archive prefixes: successfully bound request, response, result and asset
 objects remain there for their full retention period.
 
-See [backup and restore](backup-and-restore.md) and
+See [disaster recovery](disaster-recovery.md) and
 [secret management](secret-management.md) for the remaining operational gates.
 
 ## Observability and release evidence
@@ -197,7 +197,7 @@ At minimum, collect and alert on:
 - database pool use, wait duration and acquisition failures;
 - archive writes, gaps, latency and size;
 - generation queue depth, oldest age, retries and lease recovery;
-- quota reservation recovery and incremental-import lag; and
+- quota reservation recovery and background-work lag; and
 - process RSS, CPU and restart count.
 
 ### Controlled runtime diagnostics
@@ -208,6 +208,11 @@ register the following routes. They are not registered on gateway/worker roles
 and every request still requires a service credential with `metrics:read`.
 Keep them off public ingress; no NodePort, hostPort or alternate public listener
 is required or supported.
+
+For chart-managed deployments, set
+`config.runtimeProfiling.enabled=true` for a time-bounded incident. The chart
+renders this environment variable only for `control` or `all`; it cannot enable
+diagnostics on `gateway` or `worker`.
 
 | Route | Output and bounds |
 | --- | --- |

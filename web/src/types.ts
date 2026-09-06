@@ -6,11 +6,28 @@ export interface RequestView {
   status_code: number | null;
   duration_ms: number | null;
   input_tokens: number;
+  // Older retained history and stream events did not include cache split
+  // fields. The operator table treats their absence as zero while new API
+  // responses always provide both values.
+  cached_input_tokens?: number;
+  cache_write_tokens?: number;
   output_tokens: number;
   cost: string;
   currency?: string | null;
   error_code: string | null;
   session_context?: RequestSessionContext | null;
+}
+
+/** Exclusive descending keyset cursor returned by the operator request API. */
+export interface RequestListCursor {
+  before_created_at: number;
+  before_id: string;
+}
+
+/** Opt-in page envelope for large operator request histories. */
+export interface RequestListResponse {
+  requests: RequestView[];
+  next_cursor: RequestListCursor | null;
 }
 
 export interface RequestSessionContext {
@@ -174,6 +191,12 @@ export interface SelfUsageAnalysis {
 }
 
 export interface TenantView { external_id: string }
+
+export interface TenantManagementView extends TenantView {
+  status: 'active' | 'archived';
+  created_at: number;
+  updated_at: number;
+}
 
 export interface ModelPriceView {
   model: string;

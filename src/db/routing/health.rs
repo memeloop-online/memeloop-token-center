@@ -2,11 +2,13 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use super::super::{AppError, Database, unix_millis};
+use crate::config::UpstreamHealthConfig;
 
-mod policy;
-
-use policy::UPSTREAM_HEALTH_POLICY;
-pub(crate) use policy::upstream_probe_heartbeat_interval;
+pub(crate) fn upstream_probe_heartbeat_interval(
+    health: UpstreamHealthConfig,
+) -> std::time::Duration {
+    std::time::Duration::from_millis(health.probe_heartbeat_millis.unsigned_abs())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UpstreamFailureKind {
@@ -33,8 +35,13 @@ impl UpstreamFailureKind {
         }
     }
 
-    fn base_cooldown_millis(self) -> i64 {
-        UPSTREAM_HEALTH_POLICY.base_cooldown_millis(self)
+    fn base_cooldown_millis(self, health: UpstreamHealthConfig) -> i64 {
+        match self {
+            Self::RateLimited => health.rate_limited_cooldown_millis,
+            Self::Unavailable => health.unavailable_cooldown_millis,
+            Self::InvalidResponse => health.invalid_response_cooldown_millis,
+            Self::Connection => health.connection_cooldown_millis,
+        }
     }
 }
 
@@ -42,10 +49,28 @@ impl Database {
     /// Returns true for healthy accounts. An account recovering from cooldown
     /// is admitted only when this caller atomically owns its short half-open
     /// probe lease, preventing a concurrent request wave from stampeding it.
+    /// Test-only default-policy entry point. Runtime callers must supply the
+    /// configured policy so a deployment can tune recovery pressure without
+    /// changing account state.
+    #[cfg(test)]
     pub(crate) async fn claim_upstream_account_attempt(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
+    ) -> Result<UpstreamAttemptAdmission, AppError> {
+        self.claim_upstream_account_attempt_with_health_config(
+            upstream_account_id,
+            credential_generation,
+            UpstreamHealthConfig::DEFAULT,
+        )
+        .await
+    }
+
+    pub(crate) async fn claim_upstream_account_attempt_with_health_config(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        health: UpstreamHealthConfig,
     ) -> Result<UpstreamAttemptAdmission, AppError> {
         let now = unix_millis();
         let row = sqlx::query(
@@ -92,7 +117,7 @@ impl Database {
                    AND account.credential_generation = $5
                )",
         )
-        .bind(now.saturating_add(UPSTREAM_HEALTH_POLICY.probe_lease_millis()))
+        .bind(now.saturating_add(health.probe_lease_millis))
         .bind(lease_token.to_string())
         .bind(now)
         .bind(upstream_account_id.to_string())
@@ -106,14 +131,31 @@ impl Database {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_upstream_account_failure(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
         kind: UpstreamFailureKind,
     ) -> Result<bool, AppError> {
+        self.record_upstream_account_failure_with_health_config(
+            upstream_account_id,
+            credential_generation,
+            kind,
+            UpstreamHealthConfig::DEFAULT,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_upstream_account_failure_with_health_config(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        kind: UpstreamFailureKind,
+        health: UpstreamHealthConfig,
+    ) -> Result<bool, AppError> {
         let now = unix_millis();
-        let base = kind.base_cooldown_millis();
+        let base = kind.base_cooldown_millis(health);
         // The conflict predicate is shared by PostgreSQL and SQLite. It keeps
         // a statement that observed an old account generation from replacing
         // newer health, and lets the current half-open probe remain the sole
@@ -178,6 +220,7 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_upstream_account_probe_failure(
         &self,
         upstream_account_id: Uuid,
@@ -185,8 +228,26 @@ impl Database {
         lease_token: Uuid,
         kind: UpstreamFailureKind,
     ) -> Result<bool, AppError> {
+        self.record_upstream_account_probe_failure_with_health_config(
+            upstream_account_id,
+            credential_generation,
+            lease_token,
+            kind,
+            UpstreamHealthConfig::DEFAULT,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_upstream_account_probe_failure_with_health_config(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        lease_token: Uuid,
+        kind: UpstreamFailureKind,
+        health: UpstreamHealthConfig,
+    ) -> Result<bool, AppError> {
         let now = unix_millis();
-        let base = kind.base_cooldown_millis();
+        let base = kind.base_cooldown_millis(health);
         let result = sqlx::query(
             "UPDATE upstream_account_health SET
                  consecutive_failures = consecutive_failures + 1,
@@ -275,11 +336,28 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    #[cfg(test)]
     pub(crate) async fn renew_upstream_account_probe(
         &self,
         upstream_account_id: Uuid,
         credential_generation: i64,
         lease_token: Uuid,
+    ) -> Result<bool, AppError> {
+        self.renew_upstream_account_probe_with_health_config(
+            upstream_account_id,
+            credential_generation,
+            lease_token,
+            UpstreamHealthConfig::DEFAULT,
+        )
+        .await
+    }
+
+    pub(crate) async fn renew_upstream_account_probe_with_health_config(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        lease_token: Uuid,
+        health: UpstreamHealthConfig,
     ) -> Result<bool, AppError> {
         let now = unix_millis();
         let result = sqlx::query(
@@ -293,7 +371,7 @@ impl Database {
                    AND account.credential_generation = $4
                )",
         )
-        .bind(now.saturating_add(UPSTREAM_HEALTH_POLICY.probe_lease_millis()))
+        .bind(now.saturating_add(health.probe_lease_millis))
         .bind(now)
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
@@ -398,6 +476,61 @@ mod tests {
                 .unwrap(),
             UpstreamAttemptAdmission::Healthy
         );
+    }
+
+    #[tokio::test]
+    async fn configured_health_durations_drive_cooldown_and_half_open_lease() {
+        let (_directory, database, account_id) = fixture().await;
+        let health = UpstreamHealthConfig {
+            connection_cooldown_millis: 321,
+            probe_lease_millis: 12_345,
+            ..UpstreamHealthConfig::DEFAULT
+        };
+        assert!(
+            database
+                .record_upstream_account_failure_with_health_config(
+                    account_id,
+                    1,
+                    UpstreamFailureKind::Connection,
+                    health,
+                )
+                .await
+                .unwrap()
+        );
+        let cooldown: i64 = sqlx::query_scalar(
+            "SELECT cooldown_until - updated_at FROM upstream_account_health
+             WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(cooldown, health.connection_cooldown_millis);
+
+        sqlx::query(
+            "UPDATE upstream_account_health SET cooldown_until = 0, probe_lease_until = 0
+             WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let UpstreamAttemptAdmission::Probe { .. } = database
+            .claim_upstream_account_attempt_with_health_config(account_id, 1, health)
+            .await
+            .unwrap()
+        else {
+            panic!("configured half-open probe lease");
+        };
+        let lease: i64 = sqlx::query_scalar(
+            "SELECT probe_lease_until - updated_at FROM upstream_account_health
+             WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(lease, health.probe_lease_millis);
     }
 
     #[tokio::test]

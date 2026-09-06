@@ -8,6 +8,11 @@ pub(in crate::api) struct RequestsQuery {
     #[serde(default = "default_limit")]
     pub(in crate::api) limit: i64,
     pub(in crate::api) tenant_external_id: Option<String>,
+    /// Opt in to the object response that carries an authoritative cursor.
+    /// The default keeps the established array response stable for existing
+    /// API consumers.
+    #[serde(default)]
+    paged: bool,
     from_created_at: Option<i64>,
     to_created_at: Option<i64>,
     before_created_at: Option<i64>,
@@ -31,6 +36,7 @@ impl RequestsQuery {
     pub(in crate::api) fn to_filter(&self, operator: bool) -> Result<RequestListFilter, AppError> {
         Ok(RequestListFilter {
             limit: self.limit,
+            lookahead: false,
             from_created_at: self.from_created_at,
             to_created_at: self.to_created_at,
             before_created_at: self.before_created_at,
@@ -57,6 +63,10 @@ impl RequestsQuery {
             key_alias: operator.then(|| self.key_alias.clone()).flatten(),
             principal: operator.then(|| self.principal.clone()).flatten(),
         })
+    }
+
+    pub(in crate::api) fn requests_page_requested(&self) -> bool {
+        self.paged
     }
 }
 

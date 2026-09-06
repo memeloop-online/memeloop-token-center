@@ -355,6 +355,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "fenced upstream account health probes",
         sql: include_str!("../../../migrations/common/0066_upstream_probe_lease_fence.sql"),
     },
+    Migration {
+        version: 67,
+        name: "explicit tenant lifecycle and audit",
+        sql: include_str!("../../../migrations/common/0067_tenant_lifecycle.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -695,6 +700,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 66,
         name: "fenced upstream account health probes",
         sql: include_str!("../../../migrations/common/0066_upstream_probe_lease_fence.sql"),
+    },
+    Migration {
+        version: 67,
+        name: "explicit tenant lifecycle and audit",
+        sql: include_str!("../../../migrations/common/0067_tenant_lifecycle.sql"),
     },
 ];
 

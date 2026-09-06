@@ -87,7 +87,7 @@ fn requires_strict_openai_chat_usage(
     request: &Value,
 ) -> bool {
     matches!(protocol, Protocol::OpenAiChat)
-        && route_driver == "http-json"
+        && crate::provider::is_openai_compatible_http_driver(route_driver)
         && ChatSseUsageContract::from_route_config(route_config).requires_terminal_usage()
         && request.get("stream").and_then(Value::as_bool) == Some(true)
         && request
@@ -333,9 +333,10 @@ async fn next_sendable_proxy_route(
         }
         let admission = state
             .db
-            .claim_upstream_account_attempt(
+            .claim_upstream_account_attempt_with_health_config(
                 planned.route.account_id,
                 planned.route.credential_generation,
+                state.config.upstream_health,
             )
             .await?;
         if admission == UpstreamAttemptAdmission::Unavailable {
@@ -793,13 +794,21 @@ pub(super) async fn proxy(
                 .await;
         }
         let failover_reason = match &result {
-            // A 429 rejects the attempt before model execution, so moving to
-            // another healthy account cannot duplicate billable work.
+            // Authentication rejection, capacity rejection, and a 5xx are
+            // complete upstream responses received before any downstream
+            // bytes. The account is cooled first and an already-authorized
+            // standby may be tried within the bounded request budget. No
+            // route is revisited, and streaming / admitted success responses
+            // never take this branch.
             Ok(result)
-                if result.response.status() == StatusCode::TOO_MANY_REQUESTS
+                if retryable_upstream_status(result.response.status())
                     && !route_candidates.as_slice().is_empty() =>
             {
-                Some(UpstreamHealthReason::RateLimited)
+                Some(if result.response.status() == StatusCode::TOO_MANY_REQUESTS {
+                    UpstreamHealthReason::RateLimited
+                } else {
+                    UpstreamHealthReason::Unavailable
+                })
             }
             Err(ProxySendError::RetryableConnection) => failure.map(|(_, reason)| reason),
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable) => {
@@ -1018,7 +1027,7 @@ fn trusted_input_token_overhead_ceiling(
     route_driver: Option<&str>,
     route_config: Option<&Value>,
 ) -> Result<i64, AppError> {
-    if route_driver != Some("http-json") {
+    if !route_driver.is_some_and(crate::provider::is_openai_compatible_http_driver) {
         return Ok(0);
     }
     let Some(value) = route_config.and_then(|config| config.get("input_token_overhead_ceiling"))
@@ -1029,7 +1038,9 @@ fn trusted_input_token_overhead_ceiling(
         .as_i64()
         .filter(|ceiling| (0..=MAX_INPUT_TOKEN_OVERHEAD_CEILING).contains(ceiling))
         .ok_or_else(|| {
-            AppError::Upstream("HTTP JSON upstream input token overhead ceiling is invalid".into())
+            AppError::Upstream(
+                "OpenAI-compatible upstream input token overhead ceiling is invalid".into(),
+            )
         })
 }
 

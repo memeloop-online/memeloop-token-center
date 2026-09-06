@@ -15,7 +15,6 @@ const evidence = requireCanonicalDirectory(evidenceValue, SCOPE, 'release eviden
 if (output === '') fail(SCOPE, 'release manifest output is required');
 const expected: Record<string, string> = {
   'service-image-digest.json': `ghcr.io/${owner}/memeloop-token-center`,
-  'importer-image-digest.json': `ghcr.io/${owner}/memeloop-token-center-importer`,
   'plugin-installer-image-digest.json': `ghcr.io/${owner}/memeloop-token-center-plugin-installer`,
 };
 const names = readdirSync(evidence).filter((name) => name.endsWith('-image-digest.json')).sort();

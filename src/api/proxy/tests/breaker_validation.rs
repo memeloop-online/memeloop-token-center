@@ -77,6 +77,57 @@ async fn ordinary_client_error_does_not_cool_down_a_shared_account() {
 }
 
 #[tokio::test]
+async fn server_error_cools_the_account_and_fails_over_before_delivery() {
+    let unavailable = MockServer::start().await;
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&unavailable)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_chat_response())
+        .expect(1)
+        .mount(&healthy)
+        .await;
+    let fixture = resilient_route_fixture(
+        "server-error-failover",
+        &[(unavailable.uri(), 0), (healthy.uri(), 10)],
+    )
+    .await;
+
+    let response = send_resilient_chat(&fixture, Some("server-error-failover"), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    unavailable.verify().await;
+    healthy.verify().await;
+
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let actual: String = sqlx::query_scalar(
+        "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(fixture.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let health: (i64, String) = sqlx::query_as(
+        "SELECT consecutive_failures, last_failure_kind FROM upstream_account_health
+         WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.accounts[0].to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert_eq!(actual, fixture.accounts[1].to_string());
+    assert_eq!(health, (1, "unavailable".to_owned()));
+}
+
+#[tokio::test]
 async fn incomplete_sse_probe_stays_unhealthy_and_next_request_fails_over() {
     let fixture = codex_route_fixture("probe-incomplete-sse").await;
     let upstream = MockServer::start().await;

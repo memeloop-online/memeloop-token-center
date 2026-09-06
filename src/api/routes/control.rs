@@ -26,6 +26,22 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route("/internal/v1/provider-types", get(provider_types))
         .route("/internal/v1/tenants", get(list_tenants))
+        .route(
+            "/internal/v1/tenant-management",
+            get(list_tenant_management).post(create_tenant),
+        )
+        .route(
+            "/internal/v1/tenant-management/{external_id}",
+            patch(rename_tenant).delete(delete_tenant),
+        )
+        .route(
+            "/internal/v1/tenant-management/{external_id}/archive",
+            post(archive_tenant),
+        )
+        .route(
+            "/internal/v1/tenant-management/{external_id}/restore",
+            post(restore_tenant),
+        )
         .route("/internal/v1/plugins", get(plugin_manifests))
         .route(
             "/internal/v1/plugins/{plugin_id}/configuration",

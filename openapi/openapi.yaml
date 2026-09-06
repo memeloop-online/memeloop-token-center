@@ -579,6 +579,109 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/tenant-management:
+    get:
+      tags: [System]
+      operationId: listTenantManagement
+      summary: List tenant lifecycle metadata for a global operator
+      security: [{ serviceBearer: [] }]
+      x-required-scope: tenants:read
+      responses:
+        '200':
+          description: Active and archived tenant metadata. No tenant-owned data is returned.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                items: { $ref: '#/components/schemas/TenantManagement' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [System]
+      operationId: createTenant
+      summary: Create an empty active tenant
+      description: Creating a tenant does not create a client credential, principal, balance, route, or service credential.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: tenants:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TenantIdentifierRequest' }
+      responses:
+        '201':
+          description: The created tenant.
+          content: { application/json: { schema: { $ref: '#/components/schemas/TenantManagement' } } }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/tenant-management/{external_id}:
+    patch:
+      tags: [System]
+      operationId: renameTenant
+      summary: Rename a non-default tenant while preserving its UUID and history
+      description: The immutable tenant UUID and all tenant-owned relations remain unchanged. The service-credential and pending OAuth external-ID references are updated atomically.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: tenants:write
+      parameters: [{ $ref: '#/components/parameters/TenantExternalId' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TenantIdentifierRequest' } } }
+      responses:
+        '200': { description: Renamed tenant., content: { application/json: { schema: { $ref: '#/components/schemas/TenantManagement' } } } }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [System]
+      operationId: deleteArchivedTenant
+      summary: Delete an archived non-default tenant with no dependent data
+      security: [{ serviceBearer: [] }]
+      x-required-scope: tenants:write
+      parameters: [{ $ref: '#/components/parameters/TenantExternalId' }]
+      responses:
+        '204': { description: Tenant deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/tenant-management/{external_id}/archive:
+    post:
+      tags: [System]
+      operationId: archiveTenant
+      summary: Archive a non-default tenant while preserving its history
+      description: Archived tenants are omitted from normal tenant selection and their client and tenant-scoped service credentials are rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: tenants:write
+      parameters: [{ $ref: '#/components/parameters/TenantExternalId' }]
+      responses:
+        '200': { description: Archived tenant., content: { application/json: { schema: { $ref: '#/components/schemas/TenantManagement' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /internal/v1/tenant-management/{external_id}/restore:
+    post:
+      tags: [System]
+      operationId: restoreTenant
+      summary: Restore an archived non-default tenant
+      security: [{ serviceBearer: [] }]
+      x-required-scope: tenants:write
+      parameters: [{ $ref: '#/components/parameters/TenantExternalId' }]
+      responses:
+        '200': { description: Restored tenant., content: { application/json: { schema: { $ref: '#/components/schemas/TenantManagement' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /internal/v1/diagnostics/runtime:
     get:
       tags: [System]
@@ -2582,14 +2685,17 @@ paths:
         - $ref: '#/components/parameters/MaxCostFilter'
         - $ref: '#/components/parameters/KeyAliasFilter'
         - $ref: '#/components/parameters/PrincipalFilter'
+        - $ref: '#/components/parameters/RequestPageEnvelope'
       responses:
         '200':
-          description: Recent request summaries.
+          description: Recent request summaries. Set `paged=true` to receive the authoritative next cursor envelope; the default array response remains for existing clients.
           content:
             application/json:
               schema:
-                type: array
-                items: { $ref: '#/components/schemas/RequestSummary' }
+                oneOf:
+                  - type: array
+                    items: { $ref: '#/components/schemas/RequestSummary' }
+                  - $ref: '#/components/schemas/RequestListResponse'
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
@@ -3696,6 +3802,11 @@ components:
       required: false
       description: Global service credentials may select a tenant or omit it for all tenants. Scoped credentials may omit it or repeat only their bound tenant.
       schema: { type: string, maxLength: 200 }
+    TenantExternalId:
+      name: external_id
+      in: path
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 200 }
     KeyId:
       name: key_id
       in: path
@@ -3784,6 +3895,12 @@ components:
       required: false
       description: Stable row UUID from the last row of the prior page. Use together with `before_created_at`; the concrete response documents whether this is a key, ledger-entry, request, or generation ID.
       schema: { type: string, format: uuid }
+    RequestPageEnvelope:
+      name: paged
+      in: query
+      required: false
+      description: When true, return a cursor envelope instead of the compatibility array response. The page size remains limited by `limit`.
+      schema: { type: boolean, default: false }
     QuarantineId:
       name: quarantine_id
       in: path
@@ -4331,6 +4448,21 @@ components:
         daily_budget: { $ref: '#/components/schemas/ClientCredentialBudgetSnapshot' }
         weekly_budget: { $ref: '#/components/schemas/ClientCredentialBudgetSnapshot' }
         lifetime_budget: { $ref: '#/components/schemas/ClientCredentialBudgetSnapshot' }
+    TenantIdentifierRequest:
+      type: object
+      additionalProperties: false
+      required: [external_id]
+      properties:
+        external_id: { type: string, minLength: 1, maxLength: 200 }
+    TenantManagement:
+      type: object
+      additionalProperties: false
+      required: [external_id, status, created_at, updated_at]
+      properties:
+        external_id: { type: string, minLength: 1, maxLength: 200 }
+        status: { type: string, enum: [active, archived] }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
     StatusRequest:
       type: object
       additionalProperties: false
@@ -4362,6 +4494,8 @@ components:
         - prices:write
         - service_tokens:read
         - service_tokens:write
+        - tenants:read
+        - tenants:write
         - schemas:read
         - metrics:read
     CreateServiceCredentialRequest:
@@ -5741,7 +5875,7 @@ components:
           items: { $ref: '#/components/schemas/MemeLoopCloudSubscriptionEvent' }
     RequestSummary:
       type: object
-      required: [request_id, created_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost, error_code, session_context]
+      required: [request_id, created_at, protocol, model, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost, error_code, session_context]
       properties:
         request_id: { type: string, format: uuid }
         created_at: { type: integer, format: int64 }
@@ -5750,6 +5884,16 @@ components:
         status_code: { type: [integer, 'null'], format: int64 }
         duration_ms: { type: [integer, 'null'], format: int64 }
         input_tokens: { type: integer, format: int64 }
+        cached_input_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Input tokens served from the upstream cache tier.
+        cache_write_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Input tokens written to the upstream cache tier.
         output_tokens: { type: integer, format: int64 }
         cost: { $ref: '#/components/schemas/Money' }
         error_code: { type: [string, 'null'] }
@@ -5761,6 +5905,31 @@ components:
             edges never appear as confirmed, and generation jobs return null.
           oneOf:
             - $ref: '#/components/schemas/RequestSessionContext'
+            - type: 'null'
+    RequestListCursor:
+      type: object
+      additionalProperties: false
+      required: [before_created_at, before_id]
+      properties:
+        before_created_at:
+          type: integer
+          format: int64
+          description: Creation timestamp of the last visible row.
+        before_id:
+          type: string
+          format: uuid
+          description: Stable request or generation ID of the last visible row.
+    RequestListResponse:
+      type: object
+      additionalProperties: false
+      required: [requests, next_cursor]
+      properties:
+        requests:
+          type: array
+          items: { $ref: '#/components/schemas/RequestSummary' }
+        next_cursor:
+          oneOf:
+            - $ref: '#/components/schemas/RequestListCursor'
             - type: 'null'
     RequestSessionContext:
       type: object

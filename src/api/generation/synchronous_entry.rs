@@ -110,7 +110,7 @@ async fn proxy_openai_image_generation(
             )
             .await?
             .ok_or_else(|| AppError::Upstream("image generation route is not configured".into()))?;
-        if route.driver != "http-json" {
+        if !crate::provider::is_openai_compatible_http_driver(&route.driver) {
             return Err(AppError::Upstream(format!(
                 "generation driver {} does not implement the OpenAI Images API",
                 route.driver

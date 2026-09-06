@@ -450,3 +450,59 @@ fn weighted_rendezvous_score(
     let uniform = (hash as f64 + 1.0) / (u64::MAX as f64 + 2.0);
     -uniform.ln() / candidate.scheduling_weight as f64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(account_id: Uuid) -> RoutingCandidate {
+        RoutingCandidate {
+            route_id: Uuid::from_u128(1),
+            account_id,
+            transport_revision: 1,
+            credential_generation: 1,
+            priority: 0,
+            scheduling_weight: 100,
+            upstream_model: "same-model".to_owned(),
+            driver: "http-json".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ciphertext: "unused".to_owned(),
+        }
+    }
+
+    #[test]
+    fn one_key_thousands_of_distinct_requests_are_evenly_dispatched() {
+        let key_id = Uuid::from_u128(10);
+        let candidates = [
+            candidate(Uuid::from_u128(101)),
+            candidate(Uuid::from_u128(102)),
+            candidate(Uuid::from_u128(103)),
+            candidate(Uuid::from_u128(104)),
+        ];
+        let mut selections = [0_usize; 4];
+
+        // Each request has a new request UUID. The same downstream key must
+        // therefore not pin an entire concurrent wave to one account; stable
+        // session affinity is handled by passing a stable seed instead.
+        for ordinal in 0..4_096_u128 {
+            let seed = Uuid::from_u128(1_000 + ordinal);
+            let selected = candidates
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| {
+                    weighted_rendezvous_score(key_id, seed, left)
+                        .total_cmp(&weighted_rendezvous_score(key_id, seed, right))
+                })
+                .map(|(index, _)| index)
+                .expect("candidate pool is non-empty");
+            selections[selected] += 1;
+        }
+
+        // The expected share is 1,024 each. Wide bounds deliberately avoid a
+        // brittle statistical fixture while still catching a one-account
+        // sticky key or deterministic first-row selection.
+        for selection in &selections {
+            assert!((700..=1_350).contains(selection), "{selections:?}");
+        }
+    }
+}

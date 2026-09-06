@@ -432,6 +432,24 @@ pub struct RequestView {
     pub session_context: Option<RequestSessionContext>,
 }
 
+/// Exclusive keyset cursor for the operator request history.  A timestamp is
+/// not unique at production write rates, so the stable request id is part of
+/// the cursor and callers must pass both fields together.
+#[derive(Clone, Debug, Serialize)]
+pub struct RequestListCursor {
+    pub before_created_at: i64,
+    pub before_id: Uuid,
+}
+
+/// Optional envelope for operator request history.  The original array
+/// response remains supported for API clients which have not opted into this
+/// cursor contract.
+#[derive(Clone, Debug, Serialize)]
+pub struct RequestListResponse {
+    pub requests: Vec<RequestView>,
+    pub next_cursor: Option<RequestListCursor>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestSessionAssociation {
@@ -803,6 +821,14 @@ impl From<UsageAnalysisResponse> for SelfUsageAnalysisResponse {
 #[derive(Clone, Debug, Serialize)]
 pub struct TenantView {
     pub external_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TenantManagementView {
+    pub external_id: String,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

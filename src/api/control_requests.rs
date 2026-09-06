@@ -16,7 +16,12 @@ use super::{
     RequestsQuery, StatsQuery, generation_asset_response, management_tenant,
     request_detail_response, require_service,
 };
-use crate::{AppState, db::unix_millis, error::AppError};
+use crate::{
+    AppState,
+    db::unix_millis,
+    error::AppError,
+    model::{RequestListCursor, RequestListResponse},
+};
 
 pub(super) async fn provider_types(
     State(state): State<AppState>,
@@ -102,11 +107,41 @@ pub(super) async fn internal_requests(
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
     let filter = query.to_filter(true)?;
+    let limit = filter.limit.clamp(1, 500) as usize;
+    let paged = query.requests_page_requested();
+    // The database fetches one bounded extra row only for clients that opted
+    // into the envelope. Existing clients retain their exact requested array
+    // length and wire format.
+    let mut query_filter = filter;
+    query_filter.lookahead = paged;
     let values = match tenant {
-        Some(tenant) => state.db.list_all_requests_filtered(&tenant, filter).await?,
-        None => state.db.list_global_requests_filtered(filter).await?,
+        Some(tenant) => state
+            .db
+            .list_all_requests_filtered(&tenant, query_filter)
+            .await?,
+        None => state.db.list_global_requests_filtered(query_filter).await?,
     };
-    Ok(Json(values))
+    if !paged {
+        return Ok(Json(serde_json::json!(values)));
+    }
+    let has_more = values.len() > limit;
+    let mut requests = values;
+    if has_more {
+        requests.truncate(limit);
+    }
+    let next_cursor = has_more.then(|| {
+        let last = requests
+            .last()
+            .expect("a page with another request has a visible last request");
+        RequestListCursor {
+            before_created_at: last.created_at,
+            before_id: last.request_id,
+        }
+    });
+    Ok(Json(serde_json::json!(RequestListResponse {
+        requests,
+        next_cursor,
+    })))
 }
 
 pub(super) async fn internal_request_detail(

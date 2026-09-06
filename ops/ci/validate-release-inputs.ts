@@ -23,7 +23,7 @@ const git = (args: string[]): string => {
 const resolved = git(['rev-parse', 'HEAD']);
 if (resolved !== revision) fail(`checkout is ${resolved}, expected ${revision}`);
 if (git(['status', '--porcelain=v1', '--untracked-files=all']) !== '') fail('release checkout contains tracked or untracked changes');
-for (const path of ['Dockerfile', 'Dockerfile.importer', 'Dockerfile.plugin-installer']) {
+for (const path of ['Dockerfile', 'Dockerfile.plugin-installer']) {
   if (!existsSync(resolve(repository, path))) fail(`${path} is missing`);
 }
 // Force a directory read so a concurrently removed checkout fails before any output is trusted.
@@ -31,6 +31,5 @@ readdirSync(repository);
 const tag = tagStyle === 'exact' ? revision : `sha-${revision}`;
 for (const [kind, dockerfile, name] of [
   ['service', 'Dockerfile', 'memeloop-token-center'],
-  ['importer', 'Dockerfile.importer', 'memeloop-token-center-importer'],
   ['plugin-installer', 'Dockerfile.plugin-installer', 'memeloop-token-center-plugin-installer'],
 ]) console.log(`${kind}|${dockerfile}|${name}|${registry}/${name}:${tag}`);

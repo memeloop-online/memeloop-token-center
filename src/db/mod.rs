@@ -26,7 +26,7 @@ use crate::{
         ModelPriceTierView, ModelPriceView, OperatorGenerationJobView, OperatorStats,
         RequestArchiveRefs, RequestEventView, RequestProvenanceView, RequestSessionAssociation,
         RequestSessionContext, RequestView, SelfStats, ServiceTokenView, StatsBucket, StatsSummary,
-        TenantView, TokenUsage, UsageReservation, micros_to_decimal_string, priced_tokens,
+        TenantManagementView, TenantView, TokenUsage, UsageReservation, micros_to_decimal_string, priced_tokens,
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
@@ -52,6 +52,7 @@ mod rows;
 mod session_analytics;
 mod session_projection;
 mod time;
+mod tenants;
 mod usage_analysis;
 mod validation;
 
@@ -185,7 +186,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<TenantView>, AppError> {
         let rows = sqlx::query(
-            "SELECT external_id FROM tenants WHERE external_id > $1 ORDER BY external_id ASC LIMIT $2",
+            "SELECT external_id FROM tenants WHERE status = 'active' AND external_id > $1 ORDER BY external_id ASC LIMIT $2",
         )
         .bind(after_external_id.unwrap_or_default())
         .bind(limit.clamp(1, 100))

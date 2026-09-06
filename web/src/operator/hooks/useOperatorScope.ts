@@ -2,6 +2,7 @@ import { useEffect, useReducer, useRef } from 'react';
 import { api } from '../../api';
 import {
   clearRememberedCredential,
+  defaultTenantForCredential,
   readRememberedCredential,
   readRememberedOperatorTenant,
   rememberCredential,
@@ -31,6 +32,7 @@ type ScopeAction =
   | { type: 'credential-input'; value: string }
   | { type: 'authenticate'; candidate: string }
   | { type: 'authenticated'; credential: string; tenants: TenantView[]; tenant: string }
+  | { type: 'tenants-refreshed'; tenants: TenantView[]; tenant: string }
   | { type: 'authentication-failed'; message: string; preserve: boolean }
   | { type: 'select-tenant'; tenant: string }
   | { type: 'clear' };
@@ -62,6 +64,8 @@ function reducer(state: ScopeState, action: ScopeAction): ScopeState {
         tenant: action.tenant,
         status: { kind: 'ready' },
       };
+    case 'tenants-refreshed':
+      return { ...state, tenants: action.tenants, tenant: action.tenant };
     case 'authentication-failed':
       return action.preserve
         ? { ...state, status: { kind: 'failed', message: action.message } }
@@ -122,13 +126,27 @@ export function useOperatorScope() {
     dispatch({ type: 'clear' });
   }
 
+  async function refreshTenants() {
+    const credential = stateRef.current.credential;
+    if (!credential || !stateRef.current.validated) return;
+    const request = ++sequence.current;
+    const tenants = await api<TenantView[]>('/internal/v1/tenants', credential);
+    if (request !== sequence.current || stateRef.current.credential !== credential) return;
+    const tenant = tenantForCredential(tenants, stateRef.current.tenant);
+    rememberOperatorTenant(tenant);
+    dispatch({ type: 'tenants-refreshed', tenants, tenant });
+  }
+
   const activeCredential = state.status.kind === 'ready' || state.status.kind === 'failed'
     ? state.credential
     : '';
+  const writeTenant = state.tenant || defaultTenantForCredential(state.tenants);
 
   return {
     ...state,
     activeCredential,
+    writeTenant,
+    isAggregate: state.tenants.length > 1 && !state.tenant,
     authenticating: state.status.kind === 'authenticating',
     error: state.status.kind === 'failed' ? state.status.message : '',
     setCredentialInput: (value: string) => dispatch({ type: 'credential-input', value }),
@@ -138,5 +156,6 @@ export function useOperatorScope() {
     },
     authenticate,
     clearCredential,
+    refreshTenants,
   };
 }

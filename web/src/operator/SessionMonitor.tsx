@@ -53,7 +53,8 @@ export class LatestRequestGate {
 const emptySessionFilters: SessionFilters = { q: '', keyId: '', model: '', state: '' };
 
 function sessionsPath(tenant: string, filters: SessionFilters, before?: LogicalSessionCursor) {
-  const params = new URLSearchParams({ tenant_external_id: tenant, limit: '50' });
+  const params = new URLSearchParams({ limit: '50' });
+  if (tenant) params.set('tenant_external_id', tenant);
   if (filters.q.trim()) params.set('q', filters.q.trim());
   if (filters.keyId.trim()) params.set('key_id', filters.keyId.trim());
   if (filters.model.trim()) params.set('model', filters.model.trim());
@@ -66,7 +67,8 @@ function sessionsPath(tenant: string, filters: SessionFilters, before?: LogicalS
 }
 
 function detailPath(tenant: string, session: LogicalSessionSummary, cursor?: LogicalSessionDetail['next_cursor']) {
-  const params = new URLSearchParams({ tenant_external_id: tenant, key_id: session.key_id, limit: '100' });
+  const params = new URLSearchParams({ key_id: session.key_id, limit: '100' });
+  if (tenant) params.set('tenant_external_id', tenant);
   if (cursor) {
     params.set('before_created_at', String(cursor.before_created_at));
     params.set('before_request_id', cursor.before_request_id);
@@ -122,7 +124,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     const sequence = ++listSequence.current;
     const requestScope = scopeKey;
     const credential = token.trim();
-    if (!credential || !tenant) {
+    if (!credential) {
       setSessions([]); setNextCursor(null); setGeneratedAt(0);
       return;
     }
@@ -309,7 +311,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
     handledFocus.current = 0;
     setSessions([]); setListScope(''); setDetail(undefined); setDetailScope(''); setSelected(undefined); setNextCursor(null); setGeneratedAt(0);
     setLoading(false); setRefreshing(false); setError(''); setErrorScope('');
-    if (!token.trim() || !tenant) {
+    if (!token.trim()) {
       setDraft(emptySessionFilters);
       setFilters(emptySessionFilters);
     }
@@ -327,19 +329,18 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   }, [token, tenant, filters]);
 
   useEffect(() => {
-    if (!token.trim() || !tenant || revision === 0) return;
+    if (!token.trim() || revision === 0) return;
     for (const keyId of drainSessionEventKeys(eventKeyIds.current)) dirtyKeyIds.current.add(keyId);
     refreshDirty.current = true;
     scheduleRefresh();
   }, [revision, eventKeyIds]);
 
-  const hasScope = Boolean(token.trim() && tenant);
+  const hasScope = Boolean(token.trim());
   const status = !hasScope ? 'idle' : refreshing ? 'refreshing' : streamState;
   const visibleSessions = listScope === scopeKey ? sessions : [];
   const visibleDetail = detailScope === scopeKey ? detail : undefined;
   const visibleError = errorScope === scopeKey ? error : '';
   return <>
-    {!tenant && <div className="notice warning" role="status">{t('sessions.selectTenant')}</div>}
     {visibleError && <div className="notice error" role="alert">{visibleError}</div>}
     <div className={`session-live-state ${status}`} role="status">{t(`sessions.live.${status}`)}</div>
     <form className="session-controls" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }); }}>
@@ -347,7 +348,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       <label>{t('traffic.keyId')}<input value={draft.keyId} onChange={(event) => setDraft({ ...draft, keyId: event.target.value })} placeholder="019f…" /></label>
       <label>{t('request.model')}<input value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} /></label>
       <label>{t('sessions.state')}<select value={draft.state} onChange={(event) => setDraft({ ...draft, state: event.target.value as SessionFilters['state'] })}><option value="">{t('common.all')}</option><option value="active">{t('sessions.filter.active')}</option><option value="has_errors">{t('sessions.filter.hasErrors')}</option></select></label>
-      <div className="filter-actions"><button type="submit" disabled={loading || !tenant}>{t('traffic.applyFilters')}</button><button type="button" className="secondary" disabled={loading || !Object.values(filters).some(Boolean)} onClick={() => { setDraft(emptySessionFilters); setFilters(emptySessionFilters); }}>{t('traffic.clearFilters')}</button></div>
+      <div className="filter-actions"><button type="submit" disabled={loading}>{t('traffic.applyFilters')}</button><button type="button" className="secondary" disabled={loading || !Object.values(filters).some(Boolean)} onClick={() => { setDraft(emptySessionFilters); setFilters(emptySessionFilters); }}>{t('traffic.clearFilters')}</button></div>
     </form>
     <p className="muted session-result-count">{t('sessions.serverFiltered', { count: visibleSessions.length })}{listScope === scopeKey && generatedAt > 0 && <> · {t('sessions.generatedAt', { time: new Date(generatedAt).toLocaleString(locale) })}</>}</p>
     <SessionList values={visibleSessions} loading={loading} showCredential onSelect={(session) => void selectSession(session)} />

@@ -70,7 +70,7 @@
       ],
       "properties": {
         "enabled": { "type": "boolean" },
-        "schemaVersion": { "type": "integer", "const": 66 },
+        "schemaVersion": { "type": "integer", "const": 67 },
         "backoffLimit": { "type": "integer", "minimum": 0, "maximum": 20 },
         "activeDeadlineSeconds": { "type": "integer", "minimum": 30 },
         "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
@@ -128,6 +128,8 @@
         "gatewayBodyReadConcurrency",
         "responsesBodyMaxBytes",
         "responsesBodyReadConcurrency",
+        "upstreamHealth",
+        "runtimeProfiling",
         "databaseUrlSecret",
         "keyPepperSecret",
         "serviceTokenSecret",
@@ -143,6 +145,36 @@
         "gatewayBodyReadConcurrency": { "type": "integer", "minimum": 1, "maximum": 8192 },
         "responsesBodyMaxBytes": { "type": "integer", "minimum": 4194304, "maximum": 67108864 },
         "responsesBodyReadConcurrency": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "upstreamHealth": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "probeLeaseMillis",
+            "probeHeartbeatMillis",
+            "rateLimitedCooldownMillis",
+            "unavailableCooldownMillis",
+            "invalidResponseCooldownMillis",
+            "connectionCooldownMillis"
+          ],
+          "properties": {
+            "probeLeaseMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 },
+            "probeHeartbeatMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 },
+            "rateLimitedCooldownMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 },
+            "unavailableCooldownMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 },
+            "invalidResponseCooldownMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 },
+            "connectionCooldownMillis": { "type": "integer", "minimum": 100, "maximum": 86400000 }
+          },
+          "description": "Shared upstream account circuit-breaker cooldowns and exclusive half-open probe timing in milliseconds. The application rejects a heartbeat that is not shorter than the lease."
+        },
+        "runtimeProfiling": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {
+            "enabled": { "type": "boolean" }
+          },
+          "description": "Registers bounded authenticated diagnostic handlers only for the control or all role. Keep disabled outside a time-bounded internal incident investigation."
+        },
         "databaseUrlSecret": { "$ref": "#/definitions/secretKeyRef" },
         "keyPepperSecret": { "$ref": "#/definitions/secretKeyRef" },
         "serviceTokenSecret": { "$ref": "#/definitions/secretKeyRef" },

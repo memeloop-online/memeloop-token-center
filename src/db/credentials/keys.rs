@@ -646,7 +646,7 @@ impl Database {
         }
         let (secret_hash, _) = crypto::hash_credential(value, pepper);
         let row = sqlx::query(
-            "SELECT k.id AS key_id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_credentials c JOIN key_records k ON k.id = c.key_id AND k.credential_generation = c.generation WHERE c.secret_hash = $1 AND c.revoked_at IS NULL",
+            "SELECT k.id AS key_id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_credentials c JOIN key_records k ON k.id = c.key_id AND k.credential_generation = c.generation JOIN tenants t ON t.id = k.tenant_id AND t.status = 'active' WHERE c.secret_hash = $1 AND c.revoked_at IS NULL",
         )
         .bind(secret_hash)
         .fetch_optional(&self.pool)

@@ -277,6 +277,46 @@ fn http_json_provider_schema_accepts_exact_generation_result_origins() {
 }
 
 #[test]
+fn builtin_cbcnx_exposes_only_verified_openai_text_embedding_and_image_contracts() {
+    let catalog = ProviderCatalog::builtins();
+    let cbcnx = catalog
+        .get(CBCNX_PROVIDER_DRIVER)
+        .expect("CBCNX is a built-in provider");
+    assert_eq!(cbcnx.display_name, "广电（CBCNX）");
+    assert_eq!(cbcnx.protocols, vec!["openai", "generation"]);
+    assert_eq!(cbcnx.modalities, vec!["text", "embedding", "image"]);
+    assert!(!cbcnx.modalities.iter().any(|modality| modality == "video"));
+    assert!(catalog.supports_direct_credential(CBCNX_PROVIDER_DRIVER, "api_key"));
+    crate::schema::validate_instance(
+        &cbcnx.config_schema,
+        &json!({
+            "base_url": "https://cbcnx.example.test/v1",
+            "stream_usage_contract": "openai-chat-usage-only",
+            "input_token_overhead_ceiling": 512,
+            "result_origins": ["https://assets.cbcnx.example.test"]
+        }),
+    )
+    .expect("verified CBCNX text and image configuration");
+    for invalid in [
+        json!({"base_url": "https://cbcnx.example.test/v1"}),
+        json!({
+            "base_url": "https://cbcnx.example.test/v1",
+            "stream_usage_contract": "none"
+        }),
+        json!({
+            "base_url": "https://cbcnx.example.test/v1",
+            "stream_usage_contract": "openai-chat-usage-only",
+            "video_models": ["unverified-video-model"]
+        }),
+    ] {
+        assert!(
+            crate::schema::validate_instance(&cbcnx.config_schema, &invalid).is_err(),
+            "CBCNX must reject unverified configuration: {invalid}"
+        );
+    }
+}
+
+#[test]
 fn managed_oauth_source_types_are_extensible_but_unique_and_controlled() {
     let mut catalog = ProviderCatalog::builtins();
     catalog

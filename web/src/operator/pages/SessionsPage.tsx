@@ -36,7 +36,7 @@ export function SessionsPage({ token, tenant, focus, revision, eventKeyIds, stre
 
   async function selectRequest(request: RequestView) {
     const credential = token.trim();
-    if (!credential || !tenant) {
+    if (!credential) {
       detailRequests.current.invalidate();
       setDetail(undefined);
       setDetailScope('');

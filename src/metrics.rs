@@ -1037,6 +1037,7 @@ fn bounded_route(route: &str) -> String {
 fn bounded_provider(provider: &str) -> &'static str {
     match provider {
         "http-json" => "http-json",
+        "cbcnx" => "cbcnx",
         "comfyui" => "comfyui",
         "volcengine-seedance" => "volcengine-seedance",
         "legacy" => "legacy",

@@ -114,6 +114,8 @@ spec:
               value: "false"
             {{- include "memeloop-token-center.proxyEnv" $ | nindent 12 }}
             {{- if or (eq $role "control") (eq $role "all") }}
+            - name: MTC_RUNTIME_PROFILING_ENABLED
+              value: {{ $.Values.config.runtimeProfiling.enabled | quote }}
             - name: MTC_SERVICE_TOKEN
               valueFrom:
                 secretKeyRef:

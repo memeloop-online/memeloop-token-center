@@ -15,15 +15,16 @@ function queryForTenant(tenant: string) {
   return encoded ? `?${encoded}` : '';
 }
 
-export function Plugins({ token, tenant, values }: { token: string; tenant: string; values: PluginManifest[] }) {
+/** `tenant` scopes reads; plugin configuration writes use `writeTenant`. */
+export function Plugins({ token, tenant, writeTenant = tenant, values }: { token: string; tenant: string; writeTenant?: string; values: PluginManifest[] }) {
   const { locale, t } = useI18n();
   const [configurations, setConfigurations] = useState<Record<string, PluginConfiguration>>({});
   const [saving, setSaving] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const loadSequence = useRef(0);
-  const scope = useRef({ token, tenant });
-  scope.current = { token, tenant };
+  const scope = useRef({ token, tenant, writeTenant });
+  scope.current = { token, tenant, writeTenant };
 
   const load = async () => {
     const sequence = ++loadSequence.current;
@@ -49,7 +50,7 @@ export function Plugins({ token, tenant, values }: { token: string; tenant: stri
     loadSequence.current += 1;
     setConfigurations({}); setSaving(''); setMessage(''); setError('');
     void load();
-  }, [token, tenant, values]);
+  }, [token, tenant, writeTenant, values]);
 
   return <article className="panel">
     <div className="panel-title"><div><h2>{t('plugins.title')}</h2><p className="muted">{t('plugins.configurationDescription')}</p></div><span>{t('plugins.runtime')}</span></div>
@@ -65,7 +66,7 @@ export function Plugins({ token, tenant, values }: { token: string; tenant: stri
           {contribution && configuration && <div className="inline-editor form-panel">
             <p className="muted">{t('plugins.configurationScope', { source: t(`plugins.source.${configuration.source}`), version: formatNumber(configuration.scope_version, locale) })}</p>
             <RjsfForm
-              key={`${plugin.id}-${tenant}-${configuration.scope_version}-${locale}`}
+              key={`${plugin.id}-${tenant}-${writeTenant}-${configuration.scope_version}-${locale}`}
               schema={localizeSchema(contribution.schema as RJSFSchema, locale)}
               formData={configuration.value}
               validator={validator}
@@ -73,24 +74,24 @@ export function Plugins({ token, tenant, values }: { token: string; tenant: stri
               noHtml5Validate
               onError={() => { /* RJSF renders bounded validation errors inline. */ }}
               onSubmit={async ({ formData }) => {
-                if (!tenant) return;
-                const saveToken = token; const saveTenant = tenant;
+                if (!writeTenant) return;
+                const saveToken = token; const saveTenant = tenant; const saveWriteTenant = writeTenant;
                 setSaving(plugin.id); setMessage(''); setError('');
                 try {
                   await api<PluginConfiguration>(`/internal/v1/plugins/${plugin.id}/configuration`, saveToken, {
                     method: 'PUT',
                     headers: { 'Idempotency-Key': crypto.randomUUID() },
-                    body: JSON.stringify({ tenant_external_id: saveTenant || null, expected_version: configuration.scope_version, value: formData }),
+                    body: JSON.stringify({ tenant_external_id: saveWriteTenant, expected_version: configuration.scope_version, value: formData }),
                   });
-                  if (scope.current.token !== saveToken || scope.current.tenant !== saveTenant) return;
+                  if (scope.current.token !== saveToken || scope.current.tenant !== saveTenant || scope.current.writeTenant !== saveWriteTenant) return;
                   setMessage(t('plugins.configurationSaved', { plugin: plugin.id }));
                   await load();
                 } catch (reason) {
-                  if (scope.current.token !== saveToken || scope.current.tenant !== saveTenant) return;
+                  if (scope.current.token !== saveToken || scope.current.tenant !== saveTenant || scope.current.writeTenant !== saveWriteTenant) return;
                   setError(reason instanceof Error ? reason.message : t('common.requestFailed'));
-                } finally { if (scope.current.token === saveToken && scope.current.tenant === saveTenant) setSaving(''); }
+                } finally { if (scope.current.token === saveToken && scope.current.tenant === saveTenant && scope.current.writeTenant === saveWriteTenant) setSaving(''); }
               }}
-            ><button type="submit" disabled={!tenant || saving === plugin.id}>{saving === plugin.id ? t('common.loading') : t('common.save')}</button></RjsfForm>
+            ><button type="submit" disabled={!writeTenant || saving === plugin.id}>{saving === plugin.id ? t('common.loading') : t('common.save')}</button></RjsfForm>
           </div>}
         </div>;
       })}

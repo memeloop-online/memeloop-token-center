@@ -1,4 +1,4 @@
-import type { RequestEvent, RequestView } from '../../types';
+import type { RequestEvent, RequestListCursor, RequestView } from '../../types';
 
 export interface RequestFilters {
   from: string;
@@ -23,8 +23,8 @@ export const emptyRequestFilters: RequestFilters = {
   routeId: '', minDurationMs: '', maxDurationMs: '', minCost: '', maxCost: '', keyAlias: '', principal: '',
 };
 
-export function requestQuery(tenant: string, filters: RequestFilters, before?: RequestView) {
-  const params = new URLSearchParams({ limit: '100' });
+export function requestQuery(tenant: string, filters: RequestFilters, before?: RequestListCursor) {
+  const params = new URLSearchParams({ limit: '100', paged: 'true' });
   if (tenant) params.set('tenant_external_id', tenant);
   const from = filters.from ? Date.parse(filters.from) : Number.NaN;
   const to = filters.to ? Date.parse(filters.to) : Number.NaN;
@@ -44,8 +44,8 @@ export function requestQuery(tenant: string, filters: RequestFilters, before?: R
   if (filters.keyAlias.trim()) params.set('key_alias', filters.keyAlias.trim());
   if (filters.principal.trim()) params.set('principal', filters.principal.trim());
   if (before) {
-    params.set('before_created_at', String(before.created_at));
-    params.set('before_id', before.request_id);
+    params.set('before_created_at', String(before.before_created_at));
+    params.set('before_id', before.before_id);
   }
   return `?${params}`;
 }
@@ -63,6 +63,8 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     status_code: event.status_code,
     duration_ms: event.duration_ms,
     input_tokens: event.input_tokens,
+    cached_input_tokens: previous?.cached_input_tokens ?? 0,
+    cache_write_tokens: previous?.cache_write_tokens ?? 0,
     output_tokens: event.output_tokens,
     cost: event.cost,
     error_code: event.error_code,
@@ -70,12 +72,28 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
   };
 }
 
-export function mergeLiveRequestEvents(snapshot: RequestView[], liveEvents: Map<string, RequestEvent>) {
+export function mergeLiveRequestEvents(
+  snapshot: RequestView[],
+  liveEvents: Map<string, RequestEvent>,
+  preserveAll = false,
+) {
   const merged = new Map(snapshot.map((request) => [request.request_id, request]));
   for (const event of liveEvents.values()) {
     merged.set(event.request_id, requestViewFromEvent(event, merged.get(event.request_id)));
   }
+  // Keep any history page the operator deliberately loaded. The original
+  // first page remains bounded at 100 when another server page exists, while
+  // live events can displace only its oldest visible row; callers then advance
+  // their keyset cursor from that actual visible tail. When the server says
+  // this is the final page, retain every row so an incoming event cannot hide
+  // the old final record behind a disabled Load older action.
+  const visibleLimit = preserveAll ? merged.size : Math.max(100, snapshot.length);
   return [...merged.values()]
-    .sort((left, right) => right.created_at - left.created_at)
-    .slice(0, 100);
+    // Match the database's complete descending keyset order. Millisecond
+    // timestamps collide under concurrent traffic, so falling back to map
+    // insertion order here could advance the next page cursor past a row the
+    // UI never displayed.
+    .sort((left, right) => right.created_at - left.created_at
+      || right.request_id.localeCompare(left.request_id))
+    .slice(0, visibleLimit);
 }

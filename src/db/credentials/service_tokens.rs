@@ -32,6 +32,8 @@ const SUPPORTED_SERVICE_SCOPES: &[&str] = &[
     "schemas:read",
     "service_tokens:read",
     "service_tokens:write",
+    "tenants:read",
+    "tenants:write",
 ];
 
 #[derive(Serialize, Deserialize)]
@@ -315,7 +317,7 @@ impl Database {
     ) -> Result<AuthenticatedService, AppError> {
         let parsed = crypto::parse_service_credential(value).ok_or(AppError::Unauthorized)?;
         let row = sqlx::query(
-            "SELECT p.status, c.secret_hash, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL WHERE p.id = $1",
+            "SELECT p.status, c.secret_hash, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation AND c.revoked_at IS NULL LEFT JOIN tenants t ON t.external_id = c.tenant_external_id WHERE p.id = $1 AND (c.tenant_external_id IS NULL OR t.status = 'active')",
         )
         .bind(parsed.key_id.to_string())
         .fetch_optional(&self.pool)

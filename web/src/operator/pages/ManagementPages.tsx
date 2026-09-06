@@ -34,7 +34,7 @@ function isPositiveDecimal(value: string) {
   return /^(?:\d+(?:\.\d+)?|\.\d+)$/.test(normalized) && /[1-9]/.test(normalized);
 }
 
-function UpstreamProviders({ token, tenant, providers, values, onChanged }: { token: string; tenant: string; providers: ProviderType[]; values: UpstreamAccount[]; onChanged: () => Promise<void> }) {
+function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, onChanged }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; onChanged: () => Promise<void> }) {
   const { locale, t } = useI18n();
   const [method, setMethod] = useState<'direct' | 'authorization'>('direct');
   const [driver, setDriver] = useState('');
@@ -46,7 +46,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [showDisabled, setShowDisabled] = useState(false);
-  const providerGroups = useGroups('provider', token, tenant);
+  const providerGroups = useGroups('provider', token, writeTenant);
   const directProviders = providers.filter(supportsDirectConnection);
   const provider = directProviders.find((value) => value.id === driver) ?? directProviders[0];
   const schema = useMemo<RJSFSchema | undefined>(() => {
@@ -98,13 +98,13 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
   useEffect(() => {
     setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined);
     setBusy(''); setHealth({}); setMessage(''); setError(''); setShowDisabled(false);
-  }, [token, tenant]);
+  }, [token, tenant, writeTenant]);
 
   const activeValues = values.filter((value) => value.status === 'active');
   const disabledValues = values.filter((value) => value.status !== 'active');
   const visibleValues = showDisabled ? [...activeValues, ...disabledValues] : activeValues;
 
-  const canManage = (value: UpstreamAccount) => Boolean(tenant) && (!value.tenant_external_id || value.tenant_external_id === tenant);
+  const canManage = (value: UpstreamAccount) => Boolean(writeTenant) && (!value.tenant_external_id || value.tenant_external_id === writeTenant);
 
   async function refreshOAuth(value: UpstreamAccount) {
     if (!canManage(value)) return;
@@ -125,7 +125,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
     try {
       await api(`/internal/v1/upstreams/${value.id}/oauth/disconnect`, token, {
         method: 'POST',
-        body: JSON.stringify({ tenant_external_id: tenant, expected_updated_at: value.updated_at }),
+        body: JSON.stringify({ tenant_external_id: writeTenant, expected_updated_at: value.updated_at }),
       });
       setMessage(t('providers.disconnected', { name: value.name }));
       await onChanged();
@@ -137,7 +137,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
     if (!canManage(value)) return;
     setBusy(`status-${value.id}`); setError(''); setMessage('');
     try {
-      await api(`/internal/v1/upstreams/${value.id}`, token, { method: 'PATCH', body: JSON.stringify({ tenant_external_id: tenant, status, expected_updated_at: value.updated_at }) });
+      await api(`/internal/v1/upstreams/${value.id}`, token, { method: 'PATCH', body: JSON.stringify({ tenant_external_id: writeTenant, status, expected_updated_at: value.updated_at }) });
       if (status === 'disabled') setShowDisabled(true);
       setHealth((current) => { const next = { ...current }; delete next[value.id]; return next; });
       setMessage(t(status === 'active' ? 'providers.enabled' : 'providers.disabled', { name: value.name }));
@@ -151,7 +151,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
     if (!canManage(value)) return;
     setBusy(`health-${value.id}`); setError('');
     try {
-      const result = await api<UpstreamHealth>(`/internal/v1/upstreams/${value.id}/health${queryForTenant(tenant)}`, token, { method: 'POST' });
+      const result = await api<UpstreamHealth>(`/internal/v1/upstreams/${value.id}/health${queryForTenant(writeTenant)}`, token, { method: 'POST' });
       setHealth((current) => ({ ...current, [value.id]: result }));
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
@@ -161,7 +161,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
     if (!canManage(value) || value.status !== 'disabled' || !window.confirm(t('providers.confirmDelete', { name: value.name }))) return;
     setBusy(`delete-${value.id}`); setError(''); setMessage('');
     try {
-      const query = new URLSearchParams({ tenant_external_id: tenant, expected_updated_at: String(value.updated_at) });
+      const query = new URLSearchParams({ tenant_external_id: writeTenant, expected_updated_at: String(value.updated_at) });
       await api(`/internal/v1/upstreams/${value.id}?${query}`, token, { method: 'DELETE' });
       setMessage(t('providers.deleted', { name: value.name }));
       await onChanged();
@@ -169,7 +169,7 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
     finally { setBusy(''); }
   }
 
-  return <><WriteScopeNotice tenant={tenant} /><section className="provider-layout">
+  return <><WriteScopeNotice tenant={writeTenant} /><section className="provider-layout">
     <article className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><div className="provider-list-actions"><span>{t('providers.activeCount', { active: formatNumber(activeValues.length, locale), total: formatNumber(values.length, locale) })}</span>{disabledValues.length > 0 && <button type="button" className="secondary" aria-expanded={showDisabled} onClick={() => setShowDisabled((current) => !current)}>{showDisabled ? t('providers.hideDisabled') : t('providers.showDisabled', { count: formatNumber(disabledValues.length, locale) })}</button>}</div></div>
       {error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}
       <div className="account-list">{visibleValues.length === 0 && <div className="empty">{values.length === 0 ? t('providers.empty') : t('providers.noActive')}</div>}{visibleValues.map((value) => {
@@ -178,18 +178,18 @@ function UpstreamProviders({ token, tenant, providers, values, onChanged }: { to
         const memberships = providerGroups.groups.filter((group) => group.member_ids.includes(value.id));
         return <div className="account provider-account" key={value.id}><div className="account-main"><b>{value.name}</b><span>{value.driver} · {t('providers.method')}: {enumLabel(t, 'auth', value.connection_method)}{value.tenant_external_id ? ` · ${value.tenant_external_id}` : ''}</span>{memberships.length > 0 && <div className="table-chip-list provider-group-summary" aria-label={t('groups.provider.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}<small>{value.id}</small>{value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}{currentHealth && <small className={`status ${currentHealth.status === 'healthy' ? 'ok' : 'pending'}`}>{currentHealth.status === 'healthy' ? t('providers.healthy') : t('providers.unhealthy')}{currentHealth.upstream_status ? ` · HTTP ${formatNumber(currentHealth.upstream_status, locale)}` : ''}{currentHealth.latency_ms !== undefined ? ` · ${formatNumber(currentHealth.latency_ms, locale, 2)} ms` : ''}</small>}</div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span><span className="pill">{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span><div className="row-actions"><button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setEditing(value)}>{t('providers.edit')}</button><button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.health')}</button>{value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}{value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}{value.auth_kind === 'oauth' && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</button>}{value.can_rotate && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setRotating(value)}>{t('providers.rotateCredential')}</button>}<button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void setStatus(value, value.status === 'active' ? 'disabled' : 'active')}>{value.status === 'active' ? t('providers.disable') : t('providers.enable')}</button><button type="button" className="danger" title={value.status !== 'disabled' ? t('providers.disableBeforeDelete') : value.route_count > 0 ? t('providers.removeRoutesFirst') : undefined} disabled={!manageable || Boolean(busy) || value.status !== 'disabled' || value.route_count > 0} onClick={() => void remove(value)}>{t('common.remove')}</button></div></div></div>;
       })}</div>
-      {editing && editSchema && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.editFor', { name: editing.name })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><Form key={`${editing.id}-${locale}`} schema={editSchema} uiSchema={{ config: { oauth: { 'ui:disabled': true } } }} formData={{ name: editing.name, config: editing.config }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!formData) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: tenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(editing) || Boolean(busy)}>{t('common.save')}</button></Form></div>}
+      {editing && editSchema && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.editFor', { name: editing.name })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><Form key={`${editing.id}-${locale}`} schema={editSchema} uiSchema={{ config: { oauth: { 'ui:disabled': true } } }} formData={{ name: editing.name, config: editing.config }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!formData) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(editing) || Boolean(busy)}>{t('common.save')}</button></Form></div>}
       {rotating && rotateProvider && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.rotateFor', { name: rotating.name })}</h3><button type="button" className="secondary" onClick={() => setRotating(undefined)}>{t('common.cancel')}</button></div><Form key={`${rotating.id}-${locale}`} schema={localizeSchema(rotateProvider.credential_schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { setBusy(`rotate-${rotating.id}`); try { await api(`/internal/v1/upstreams/${rotating.id}/credential`, token, { method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ credential: formData }) }); setRotating(undefined); setMessage(t('providers.rotated', { name: rotating.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(rotating) || Boolean(busy)}>{t('providers.confirmRotate')}</button></Form></div>}
     </article>
     <details key={reauthorizing?.id ?? 'provider-create'} className="panel create-resource provider-onboarding" open={reauthorizing ? true : undefined}><summary><span><b>{reauthorizing ? t('providers.reauthorizeFor', { name: reauthorizing.name }) : t('providers.add')}</b><small>{t('providers.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{reauthorizing ? <>
       <div className="panel-title"><h2>{t('providers.reauthorizeFor', { name: reauthorizing.name })}</h2><button type="button" className="secondary" onClick={() => setReauthorizing(undefined)}>{t('common.cancel')}</button></div>
-      <AuthorizationConnection key={`reauthorize-${reauthorizing.id}`} token={token} tenant={tenant} providers={providers} existing={reauthorizing} onChanged={async () => { setReauthorizing(undefined); setMessage(t('providers.reauthorized', { name: reauthorizing.name })); await onChanged(); }} />
+      <AuthorizationConnection key={`reauthorize-${reauthorizing.id}`} token={token} tenant={writeTenant} providers={providers} existing={reauthorizing} onChanged={async () => { setReauthorizing(undefined); setMessage(t('providers.reauthorized', { name: reauthorizing.name })); await onChanged(); }} />
     </> : <>
       <div className="segmented" role="group" aria-label={t('providers.method')}><button type="button" aria-pressed={method === 'direct'} className={method === 'direct' ? 'active' : ''} onClick={() => setMethod('direct')}>{t('providers.direct')}</button><button type="button" aria-pressed={method === 'authorization'} className={method === 'authorization' ? 'active' : ''} onClick={() => setMethod('authorization')}>{t('providers.oauth')}</button></div>
       {method === 'direct' ? <>
         <label>{t('providers.provider')}<select value={provider?.id ?? ''} onChange={(event) => setDriver(event.target.value)}>{directProviders.map((value) => <option key={value.id} value={value.id}>{value.display_name} · {value.source}</option>)}</select></label>
-        {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant }) }); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
-      </> : <AuthorizationConnection token={token} tenant={tenant} providers={providers} onChanged={onChanged} />}</>}</div>
+        {schema ? <Form key={`${provider.id}-${locale}`} schema={schema} uiSchema={uiSchema} fields={schemaFormFields} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { setError(''); await api('/internal/v1/upstreams', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setMessage(t('providers.created')); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !token}>{t('providers.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+      </> : <AuthorizationConnection token={token} tenant={writeTenant} providers={providers} onChanged={onChanged} />}</>}</div>
     </details>
   </section></>;
 }
@@ -262,7 +262,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   </div>;
 }
 
-function Pricing({ token, tenant, schemas }: { token: string; tenant: string; schemas?: ConfigurationSchemas }) {
+function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: string; tenant: string; writeTenant?: string; schemas?: ConfigurationSchemas }) {
   const { locale, t } = useI18n();
   const [prices, setPrices] = useState<ModelPriceView[]>([]);
   const [generationPrices, setGenerationPrices] = useState<GenerationPriceView[]>([]);
@@ -279,8 +279,8 @@ function Pricing({ token, tenant, schemas }: { token: string; tenant: string; sc
   const [message, setMessage] = useState('');
   const loadSequence = useRef(0);
   const syncSequence = useRef(0);
-  const scopeRef = useRef({ token, tenant, displayCurrency });
-  scopeRef.current = { token, tenant, displayCurrency };
+  const scopeRef = useRef({ token, tenant, writeTenant, displayCurrency });
+  scopeRef.current = { token, tenant, writeTenant, displayCurrency };
   const load = async (requestedCurrency = displayCurrency) => {
     const sequence = ++loadSequence.current;
     const loadToken = token; const loadTenant = tenant;
@@ -306,8 +306,8 @@ function Pricing({ token, tenant, schemas }: { token: string; tenant: string; sc
     syncSequence.current += 1;
     setPrices([]); setGenerationPrices([]); setUsage({ models: [] }); setSyncResult(undefined); setLoadedCurrency('');
     setPricingLoading(false); setSyncing(false); setError(''); setMessage(''); setKind('token'); setModel('');
-  }, [token, tenant]);
-  useEffect(() => { void load(displayCurrency); }, [token, tenant, displayCurrency]);
+  }, [token, tenant, writeTenant]);
+  useEffect(() => { void load(displayCurrency); }, [token, tenant, writeTenant, displayCurrency]);
   const usageByModel = new Map(usage.models.map((value) => [value.model, value]));
   const renderCurrency = loadedCurrency || displayCurrency;
   const rows = Array.from(new Set([...usage.models.map((value) => value.model), ...prices.map((value) => value.model)])).sort().flatMap((name) => {
@@ -317,19 +317,19 @@ function Pricing({ token, tenant, schemas }: { token: string; tenant: string; sc
   });
   const schema = kind === 'generation' ? schemas?.generation_price : schemas?.model_price;
   const sync = async () => {
-    if (!tenant) return;
-    const syncToken = token; const syncTenant = tenant; const syncCurrency = displayCurrency;
+    if (!writeTenant) return;
+    const syncToken = token; const syncTenant = tenant; const syncWriteTenant = writeTenant; const syncCurrency = displayCurrency;
     const sequence = ++syncSequence.current;
     setSyncing(true); setError(''); setMessage('');
     try {
-      const result = await api<ModelPriceSyncResult>('/internal/v1/model-prices/sync', syncToken, { method: 'POST', body: JSON.stringify({ models: usage.models.map((value) => value.model), currency: displayCurrency, tenant_external_id: syncTenant }) });
-      if (sequence !== syncSequence.current || scopeRef.current.token !== syncToken || scopeRef.current.tenant !== syncTenant || scopeRef.current.displayCurrency !== syncCurrency) return;
+      const result = await api<ModelPriceSyncResult>('/internal/v1/model-prices/sync', syncToken, { method: 'POST', body: JSON.stringify({ models: usage.models.map((value) => value.model), currency: displayCurrency, tenant_external_id: syncWriteTenant }) });
+      if (sequence !== syncSequence.current || scopeRef.current.token !== syncToken || scopeRef.current.tenant !== syncTenant || scopeRef.current.writeTenant !== syncWriteTenant || scopeRef.current.displayCurrency !== syncCurrency) return;
       setSyncResult(result); setPrices(result.prices); setLoadedCurrency(syncCurrency); setMessage(t('pricing.synced', { count: formatNumber(result.imported, locale) }));
-    } catch (reason) { if (sequence === syncSequence.current && scopeRef.current.token === syncToken && scopeRef.current.tenant === syncTenant && scopeRef.current.displayCurrency === syncCurrency) setError(messageOf(reason, t('common.requestFailed'))); }
-    finally { if (sequence === syncSequence.current && scopeRef.current.token === syncToken && scopeRef.current.tenant === syncTenant && scopeRef.current.displayCurrency === syncCurrency) setSyncing(false); }
+    } catch (reason) { if (sequence === syncSequence.current && scopeRef.current.token === syncToken && scopeRef.current.tenant === syncTenant && scopeRef.current.writeTenant === syncWriteTenant && scopeRef.current.displayCurrency === syncCurrency) setError(messageOf(reason, t('common.requestFailed'))); }
+    finally { if (sequence === syncSequence.current && scopeRef.current.token === syncToken && scopeRef.current.tenant === syncTenant && scopeRef.current.writeTenant === syncWriteTenant && scopeRef.current.displayCurrency === syncCurrency) setSyncing(false); }
   };
-  return <div className="pricing-page"><WriteScopeNotice tenant={tenant} />
-    <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><div className="pricing-heading-actions"><label>{t('pricing.viewCurrency')}<select aria-label={t('pricing.viewCurrency')} value={displayCurrency} onChange={(event) => { const next = event.target.value; syncSequence.current += 1; setSyncing(false); setSyncResult(undefined); setMessage(''); setDisplayCurrency(next); setCurrency(next); }}><option value="USD">USD</option><option value="CNY">CNY</option></select></label><div className="disabled-action"><button type="button" onClick={() => void sync()} disabled={!tenant || syncing} title={!tenant ? t('pricing.syncNeedsTenant') : undefined}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</button>{!tenant && <small>{t('pricing.syncNeedsTenant')}</small>}</div></div></div>
+  return <div className="pricing-page"><WriteScopeNotice tenant={writeTenant} />
+    <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><div className="pricing-heading-actions"><label>{t('pricing.viewCurrency')}<select aria-label={t('pricing.viewCurrency')} value={displayCurrency} onChange={(event) => { const next = event.target.value; syncSequence.current += 1; setSyncing(false); setSyncResult(undefined); setMessage(''); setDisplayCurrency(next); setCurrency(next); }}><option value="USD">USD</option><option value="CNY">CNY</option></select></label><div className="disabled-action"><button type="button" onClick={() => void sync()} disabled={!writeTenant || syncing}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</button></div></div></div>
       <div className="pricing-summary"><span>{t('pricing.usedModels', { count: formatNumber(usage.models.length, locale) })}</span><span>{t('pricing.saved', { count: formatNumber(prices.length, locale) })}</span><span>{t('pricing.sourceOrder')}: models.dev → LiteLLM → OpenRouter</span></div>
       {error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}
       {syncResult && <><div className="source-status">{syncResult.sourceResults.map((source) => <div className={`source-card ${source.error ? 'failed' : 'healthy'}`} key={source.source}><b>{source.source}</b><span>{source.error ? t('pricing.sourceFailed') : t('pricing.sourceHealthy', { count: formatNumber(source.models, locale) })}</span>{source.error && <small>{source.error}</small>}</div>)}</div><div className="notice success"><b>{t('pricing.result')}</b> · {t('pricing.imported', { count: formatNumber(syncResult.imported, locale) })} · {t('pricing.candidates', { count: formatNumber(syncResult.candidates.length, locale) })} · {t('pricing.unmatched', { count: formatNumber(syncResult.unmatched.length, locale) })} · {t('pricing.preserved', { count: formatNumber(syncResult.preserved.length, locale) })}</div>
@@ -338,7 +338,7 @@ function Pricing({ token, tenant, schemas }: { token: string; tenant: string; sc
       <div className="table-scroll"><table><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.calls')}</th><th>{t('pricing.serviceTier')}</th><th>{t('pricing.input')}</th><th>{t('pricing.cachedInput')}</th><th>{t('pricing.cacheWrite')}</th><th>{t('pricing.output')}</th><th>{t('pricing.source')}</th><th>{t('pricing.updated')}</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.model}-${row.tier?.service_tier ?? 'missing'}`}><td><code>{row.model}</code></td><td>{row.usage ? formatNumber(row.usage.calls, locale) : ''}</td><td>{row.tier?.service_tier ?? '—'}</td><td>{row.tier ? formatCurrency(row.tier.input_per_million, renderCurrency, locale) : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cached_input_per_million, renderCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? <>{formatCurrency(row.tier.cache_write_per_million, renderCurrency, locale)}{row.tier.cache_price_estimated && <small className="muted"> {t('pricing.estimated')}</small>}</> : '—'}</td><td>{row.tier ? formatCurrency(row.tier.output_per_million, renderCurrency, locale) : '—'}</td><td>{row.tier ? <span className={`pill source-${row.tier.source.replace('.', '-')}`}>{row.tier.source}</span> : <span className="status pending">{t('pricing.missing')}</span>}</td><td>{row.tier ? new Date(row.tier.updated_at).toLocaleString(locale) : '—'}</td></tr>)}</tbody></table>{rows.length === 0 && <div className="empty">{pricingLoading ? t('common.loading') : t('pricing.noPricesForCurrency', { currency: renderCurrency })}</div>}</div>
     </article>
     <article className="panel"><div className="panel-title"><h2>{t('pricing.generationPrices')}</h2><span>{formatNumber(generationPrices.length, locale)}</span></div><div className="table-scroll"><table><thead><tr><th>{t('pricing.model')}</th><th>{t('pricing.currency')}</th><th>{t('self.units')}</th><th>{t('pricing.unitPrice')}</th></tr></thead><tbody>{generationPrices.map((price) => <tr key={`${price.currency}-${price.model}`}><td><code>{price.model}</code></td><td>{price.currency}</td><td>{enumLabel(t, 'billingUnit', price.billing_unit)}</td><td>{formatCurrency(price.price_per_unit, price.currency, locale)}</td></tr>)}</tbody></table>{generationPrices.length === 0 && <div className="empty">{t('pricing.noGenerationPrices')}</div>}</div></article>
-    <details className="panel manual-pricing"><summary><span><b>{t('pricing.manual')}</b><small>{t('pricing.manualHint')}</small></span><span>＋</span></summary><div className="manual-pricing-body form-panel"><label>{t('pricing.type')}<select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}><option value="token">{t('pricing.tokenModel')}</option><option value="generation">{t('pricing.generationModel')}</option></select></label><label>{t('pricing.model')}<input value={model} onChange={(event) => setModel(event.target.value)} /></label><label>{t('pricing.currency')}<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option value="USD">USD</option><option value="CNY">CNY</option></select></label>{schema ? <Form key={`${kind}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { const prefix = kind === 'generation' ? 'generation-prices' : 'prices'; await api(`/internal/v1/${prefix}/${encodeURIComponent(currency)}/${encodeURIComponent(model)}`, token, { method: 'POST', body: JSON.stringify(formData) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setMessage(t('pricing.savedMessage')); if (currency === displayCurrency) await load(currency); else setDisplayCurrency(currency); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant || !model.trim()}>{t('pricing.save')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
+    <details className="panel manual-pricing"><summary><span><b>{t('pricing.manual')}</b><small>{t('pricing.manualHint')}</small></span><span>＋</span></summary><div className="manual-pricing-body form-panel"><label>{t('pricing.type')}<select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}><option value="token">{t('pricing.tokenModel')}</option><option value="generation">{t('pricing.generationModel')}</option></select></label><label>{t('pricing.model')}<input value={model} onChange={(event) => setModel(event.target.value)} /></label><label>{t('pricing.currency')}<select value={currency} onChange={(event) => setCurrency(event.target.value)}><option value="USD">USD</option><option value="CNY">CNY</option></select></label>{schema ? <Form key={`${kind}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { const prefix = kind === 'generation' ? 'generation-prices' : 'prices'; await api(`/internal/v1/${prefix}/${encodeURIComponent(currency)}/${encodeURIComponent(model)}`, token, { method: 'POST', body: JSON.stringify(formData) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t('pricing.savedMessage')); if (currency === displayCurrency) await load(currency); else setDisplayCurrency(currency); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant || !model.trim()}>{t('pricing.save')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
   </div>;
 }
 
@@ -419,12 +419,12 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
   </>;
 }
 
-function RouteWorkspace({ token, tenant, upstreams, providers }: { token: string; tenant: string; upstreams: UpstreamAccount[]; providers: ProviderType[] }) {
+function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, providers }: { token: string; tenant: string; writeTenant?: string; upstreams: UpstreamAccount[]; providers: ProviderType[] }) {
   const { locale, t } = useI18n();
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
   const [credentials, setCredentials] = useState<KeyView[]>([]);
-  const providerGroups = useGroups('provider', token, tenant);
-  const routeGroups = useGroups('route', token, tenant);
+  const providerGroups = useGroups('provider', token, writeTenant);
+  const routeGroups = useGroups('route', token, writeTenant);
   const [form, setForm] = useState<RouteDraft>(emptyRouteDraft);
   const [formCatalog, setFormCatalog] = useState({ valid: false, allowCustom: false });
   const [editing, setEditing] = useState<ModelRouteView>();
@@ -436,8 +436,8 @@ function RouteWorkspace({ token, tenant, upstreams, providers }: { token: string
   const loadSequence = useRef(0);
   const loadAbort = useRef<AbortController | undefined>(undefined);
   const credentialSearchAbort = useRef<AbortController | undefined>(undefined);
-  const scopeRef = useRef({ token, tenant });
-  scopeRef.current = { token, tenant };
+  const scopeRef = useRef({ token, tenant, writeTenant });
+  scopeRef.current = { token, tenant, writeTenant };
   const load = async () => {
     loadAbort.current?.abort();
     const controller = new AbortController();
@@ -458,17 +458,17 @@ function RouteWorkspace({ token, tenant, upstreams, providers }: { token: string
   const searchCredential = (query: string) => {
     credentialSearchAbort.current?.abort();
     const keyId = query.trim();
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(keyId) || !token || !tenant) return;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(keyId) || !token || !writeTenant) return;
     const controller = new AbortController();
     credentialSearchAbort.current = controller;
-    const searchToken = token; const searchTenant = tenant;
-    const queryParameters = new URLSearchParams({ tenant_external_id: searchTenant, key_id: keyId, limit: '1' });
+    const searchToken = token; const searchTenant = tenant; const searchWriteTenant = writeTenant;
+    const queryParameters = new URLSearchParams({ tenant_external_id: searchWriteTenant, key_id: keyId, limit: '1' });
     void apiRead<KeyView[]>(`/internal/v1/keys?${queryParameters}`, searchToken, { signal: controller.signal }).then((matches) => {
-      if (controller.signal.aborted || scopeRef.current.token !== searchToken || scopeRef.current.tenant !== searchTenant) return;
+      if (controller.signal.aborted || scopeRef.current.token !== searchToken || scopeRef.current.tenant !== searchTenant || scopeRef.current.writeTenant !== searchWriteTenant) return;
       setCredentials((current) => [...matches, ...current.filter((value) => !matches.some((match) => match.key_id === value.key_id))]);
       setError('');
     }).catch((reason) => {
-      if (!controller.signal.aborted && scopeRef.current.token === searchToken && scopeRef.current.tenant === searchTenant) setError(messageOf(reason, t('common.requestFailed')));
+      if (!controller.signal.aborted && scopeRef.current.token === searchToken && scopeRef.current.tenant === searchTenant && scopeRef.current.writeTenant === searchWriteTenant) setError(messageOf(reason, t('common.requestFailed')));
     });
   };
   useEffect(() => {
@@ -476,9 +476,10 @@ function RouteWorkspace({ token, tenant, upstreams, providers }: { token: string
     setEditing(undefined); setEditForm(emptyRouteDraft); setEditCatalog({ valid: false, allowCustom: false });
     setBusy(''); setMessage(''); setError(''); void load();
     return () => { loadAbort.current?.abort(); credentialSearchAbort.current?.abort(); };
-  }, [token, tenant]);
-  const scopedUpstreams = upstreams.filter((value) => !tenant || !value.tenant_external_id || value.tenant_external_id === tenant);
-  const canSubmit = (draft: RouteDraft, catalogValid: boolean) => Boolean(tenant && catalogValid && draft.public_model.trim() && draft.upstream_model.trim()
+  }, [token, tenant, writeTenant]);
+  const scopedUpstreams = upstreams.filter((value) => !value.tenant_external_id || value.tenant_external_id === writeTenant);
+  const canManage = (route: ModelRouteView) => Boolean(writeTenant) && route.tenant_external_id === writeTenant;
+  const canSubmit = (draft: RouteDraft, catalogValid: boolean) => Boolean(writeTenant && catalogValid && draft.public_model.trim() && draft.upstream_model.trim()
     && (draft.upstream_account_ids.length > 0 || draft.included_provider_group_ids.length > 0));
   const beginEdit = (route: ModelRouteView) => {
     setEditing(route);
@@ -503,7 +504,7 @@ function RouteWorkspace({ token, tenant, upstreams, providers }: { token: string
     if (!editing || !canSubmit(editForm, editCatalog.valid)) return;
     setBusy(editing.id); setMessage(''); setError('');
     try {
-      await api(`/internal/v1/model-routes/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...routeRequest(editForm, editCatalog.allowCustom), tenant_external_id: tenant, expected_updated_at: editing.updated_at, expected_grant_revision: editing.grant_revision }) });
+      await api(`/internal/v1/model-routes/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...routeRequest(editForm, editCatalog.allowCustom), tenant_external_id: writeTenant, expected_updated_at: editing.updated_at, expected_grant_revision: editing.grant_revision }) });
       setEditing(undefined); setMessage(t('routes.updated')); await Promise.all([load(), routeGroups.load]);
     } catch (reason) {
       if (reason instanceof ApiError && reason.status === 409) {
@@ -515,14 +516,14 @@ function RouteWorkspace({ token, tenant, upstreams, providers }: { token: string
   const setEnabled = async (route: ModelRouteView, enabled: boolean) => {
     setBusy(route.id); setMessage(''); setError('');
     try {
-      await api(`/internal/v1/model-routes/${route.id}`, token, { method: 'PATCH', body: JSON.stringify({ tenant_external_id: tenant, enabled, expected_updated_at: route.updated_at }) });
+      await api(`/internal/v1/model-routes/${route.id}`, token, { method: 'PATCH', body: JSON.stringify({ tenant_external_id: writeTenant, enabled, expected_updated_at: route.updated_at }) });
       setEditing(undefined); setMessage(t(enabled ? 'routes.enabled' : 'routes.disabled')); await load();
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
   };
   const remove = async (route: ModelRouteView) => {
     if (route.enabled || !window.confirm(t('routes.confirmDelete', { model: route.public_model }))) return;
-    const query = new URLSearchParams({ tenant_external_id: tenant, expected_updated_at: String(route.updated_at) });
+    const query = new URLSearchParams({ tenant_external_id: writeTenant, expected_updated_at: String(route.updated_at) });
     setBusy(route.id); setMessage(''); setError('');
     try {
       await api(`/internal/v1/model-routes/${route.id}?${query}`, token, { method: 'DELETE' });
@@ -530,18 +531,18 @@ function RouteWorkspace({ token, tenant, upstreams, providers }: { token: string
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
   };
-  return <><WriteScopeNotice tenant={tenant} /><section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><span>{formatNumber(routes.length, locale)}</span></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="table-scroll"><table><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{routes.map((route) => <tr key={route.id}>{!tenant && <td><code>{route.tenant_external_id ?? '—'}</code></td>}<td><code>{route.public_model}</code></td><td><div className="table-chip-list">{(route.upstream_account_ids ?? (route.upstream_account_id ? [route.upstream_account_id] : [])).map((id) => <span key={id}>{scopedUpstreams.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code>{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !tenant} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !tenant} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !tenant || route.enabled} onClick={() => void remove(route)}>{t('common.remove')}</button></div></td></tr>)}</tbody></table>{routes.length === 0 && <div className="empty">{t('routes.empty')}</div>}</div>
-      {editing && <div className="inline-editor form-panel"><div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><RouteFields token={token} tenant={tenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === editing.id || !canSubmit(editForm, editCatalog.valid)} onClick={() => void saveEdit()}>{t('common.save')}</button></div>}
+  return <><WriteScopeNotice tenant={writeTenant} /><section className="management-layout">
+    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><span>{formatNumber(routes.length, locale)}</span></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="table-scroll"><table><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{routes.map((route) => <tr key={route.id}>{!tenant && <td><code>{route.tenant_external_id ?? '—'}</code></td>}<td><code>{route.public_model}</code></td><td><div className="table-chip-list">{(route.upstream_account_ids ?? (route.upstream_account_id ? [route.upstream_account_id] : [])).map((id) => <span key={id}>{upstreams.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code>{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('common.remove')}</button></div></td></tr>)}</tbody></table>{routes.length === 0 && <div className="empty">{t('routes.empty')}</div>}</div>
+      {editing && <div className="inline-editor form-panel"><div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === editing.id || !canSubmit(editForm, editCatalog.valid)} onClick={() => void saveEdit()}>{t('common.save')}</button></div>}
     </article>
-    <details className="panel create-resource"><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel"><RouteFields token={token} tenant={tenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: tenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></div></details>
+    <details className="panel create-resource"><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel"><RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: writeTenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></div></details>
   </section><section className="routing-group-managers">
-    <GroupManager kind="provider" token={token} tenant={tenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
-    <GroupManager kind="route" token={token} tenant={tenant} groups={routeGroups.groups} resources={routes.map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }))} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
+    <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
+    <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={routes.filter(canManage).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }))} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
   </section></>;
 }
 
-function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { token: string; tenant: string; createSchema?: Record<string, unknown>; policySchema?: Record<string, unknown> }) {
+function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema, policySchema }: { token: string; tenant: string; writeTenant?: string; createSchema?: Record<string, unknown>; policySchema?: Record<string, unknown> }) {
   const { locale, t } = useI18n();
   const [values, setValues] = useState<KeyView[]>([]);
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
@@ -571,10 +572,10 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
   const routeRequestGeneration = useRef(0);
   const keyRequest = useRef<{ identity: KeyListRequestIdentity; controller: AbortController } | undefined>(undefined);
   const routeRequest = useRef<{ generation: number; scopeGeneration: number; controller: AbortController } | undefined>(undefined);
-  const scopeRef = useRef({ token, tenant });
-  scopeRef.current = { token, tenant };
-  const credentialGroups = useGroups('credential', token, tenant);
-  const routeGroups = useGroups('route', token, tenant);
+  const scopeRef = useRef({ token, tenant, writeTenant });
+  scopeRef.current = { token, tenant, writeTenant };
+  const credentialGroups = useGroups('credential', token, writeTenant);
+  const routeGroups = useGroups('route', token, writeTenant);
   const createFormSchema = createSchema;
   const policyFormSchema = policySchema;
   const ownsKeyRequest = (request: { identity: KeyListRequestIdentity; controller: AbortController }) => ownsKeyListRequest(keyRequest.current?.identity, request.identity)
@@ -647,7 +648,7 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
     setRenaming(undefined); setAliasDraft(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
     setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setStatusFilter('active'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(''); setMessage(''); setError(''); void load();
     return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); };
-  }, [token, tenant]);
+  }, [token, tenant, writeTenant]);
   const loadMore = async () => {
     if (!canLoadMoreKeys(keyListState, Boolean(nextCursor), Boolean(keyRequest.current)) || !nextCursor || !token) return;
     const loadToken = token; const loadTenant = tenant; const cursor = nextCursor;
@@ -672,7 +673,7 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
   const filteredValues = values.filter((value) => {
     if (!matchesCredentialStatus(value, statusFilter)) return false;
     if (!matchesCredentialSearch(value, search, locale)) return false;
-    if (groupFilter === 'all' || !tenant) return true;
+    if (groupFilter === 'all' || !writeTenant) return true;
     const memberships = credentialGroups.groups.filter((group) => group.member_ids.includes(value.key_id));
     return groupFilter === 'unassigned' ? memberships.length === 0 : memberships.some((group) => group.id === groupFilter);
   });
@@ -681,8 +682,9 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
   const canLoadMore = canLoadMoreKeys(keyListState, Boolean(nextCursor), Boolean(keyRequest.current));
   const listPresentation = credentialListPresentation(keyListState, filtersApplied);
   const canReadLimits = canReadCredentialLimits(token);
-  const canWrite = canWriteCredential(tenant);
-  const routeOptions = routes.map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }));
+  const canWrite = canWriteCredential(writeTenant);
+  const canManage = (value: KeyView) => canWrite && value.tenant_external_id === writeTenant;
+  const routeOptions = routes.filter((route) => route.tenant_external_id === writeTenant).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }));
   const routeGroupOptions = routeGroups.groups.map((group) => ({ value: group.id, label: group.name, description: t('groups.memberCount', { count: formatNumber(group.member_count, locale) }) }));
   const openRouting = async (value: KeyView) => {
     if (editingRouting === value.key_id) { setEditingRouting(undefined); setRoutingDraft(undefined); return; }
@@ -695,23 +697,23 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
     } catch (reason) { if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant) setError(messageOf(reason, t('common.requestFailed'))); }
   };
   const saveRouting = async (value: KeyView, draft: CredentialRoutingView) => {
-    const operationToken = token; const operationTenant = tenant;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant;
     try {
-      const saved = await api<CredentialRoutingView>(`/internal/v1/keys/${value.key_id}/routing`, operationToken, { method: 'PUT', body: JSON.stringify({ tenant_external_id: operationTenant, route_ids: draft.route_ids, route_group_ids: draft.route_group_ids, expected_grant_revision: draft.grant_revision }) });
-      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant) return;
+      const saved = await api<CredentialRoutingView>(`/internal/v1/keys/${value.key_id}/routing`, operationToken, { method: 'PUT', body: JSON.stringify({ tenant_external_id: operationWriteTenant, route_ids: draft.route_ids, route_group_ids: draft.route_group_ids, expected_grant_revision: draft.grant_revision }) });
+      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
       setRoutingDraft(saved); setMessage(t('credentials.routingSaved')); setError('');
     } catch (reason) {
-      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant) return;
+      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
       if (reason instanceof ApiError && reason.status === 409) {
         const current = await api<CredentialRoutingView>(`/internal/v1/keys/${value.key_id}/routing${queryForTenant(operationTenant)}`, operationToken);
-        if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant) return;
+        if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
         setRoutingDraft(current); setError(t('credentials.concurrentRoutingReloaded'));
       } else setError(messageOf(reason, t('common.requestFailed')));
     }
   };
-  return <><WriteScopeNotice tenant={tenant} />{secret && <OneTimeSecret value={secret} message={t('credentials.oneTimeSecret')} />}<section className="management-layout">
+  return <><WriteScopeNotice tenant={writeTenant} />{secret && <OneTimeSecret value={secret} message={t('credentials.oneTimeSecret')} />}<section className="management-layout">
     <article className="panel"><div className="panel-title"><div><h2>{t('credentials.title')}</h2><p className="muted">{t('credentials.description')}</p></div><span>{formatNumber(filteredValues.length, locale)}</span></div>
-      <div className="credential-list-controls"><label>{t('credentials.search')}<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label><label>{t('credentials.statusFilter')}<select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">{t('common.all')}</option>{credentialStatuses.map((status) => <option key={status} value={status}>{enumLabel(t, 'status', status)}</option>)}</select></label>{tenant && <label>{t('credentials.groupFilter')}<select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></label>}</div>
+      <div className="credential-list-controls"><label>{t('credentials.search')}<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label><label>{t('credentials.statusFilter')}<select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">{t('common.all')}</option>{credentialStatuses.map((status) => <option key={status} value={status}>{enumLabel(t, 'status', status)}</option>)}</select></label>{writeTenant && <label>{t('credentials.groupFilter')}<select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></label>}</div>
       <p className="credential-list-summary" role="status">{listPresentation === 'loading' ? t('credentials.loadingList') : listPresentation === 'loading-more' ? t('credentials.loadingMore', { count: formatNumber(values.length, locale) }) : listPresentation === 'failed' ? t('credentials.loadFailed', { count: formatNumber(values.length, locale) }) : listPresentation === 'filtered' ? t('credentials.filteredLoaded', { shown: formatNumber(filteredValues.length, locale), loaded: formatNumber(values.length, locale) }) : listPresentation === 'more' ? t('credentials.loadedMore', { count: formatNumber(values.length, locale) }) : t('credentials.loadedComplete', { count: formatNumber(values.length, locale) })}</p>
       {keyError && <div className="notice error" role="alert">{keyError}</div>}{routeError && <div className="notice error" role="alert">{routeError}</div>}{error && <div className="notice error" role="alert">{error}</div>}{credentialGroups.error && <div className="notice error" role="alert">{credentialGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}
       <div className="account-list">{filteredValues.length === 0 && <div className="empty">{loadingKeys ? t('common.loading') : keyListState === 'failed' ? t('credentials.loadFailed', { count: formatNumber(values.length, locale) }) : values.length === 0 ? t('credentials.empty') : filtersApplied ? t('credentials.noFilterResults') : t('credentials.noGroupResults')}</div>}{filteredValues.map((value) => {
@@ -734,16 +736,16 @@ function CredentialWorkspace({ token, tenant, createSchema, policySchema }: { to
     <details className="panel create-resource"><summary><span><b>{t('credentials.createTitle')}</b><small>{t('credentials.createRoutingHint')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">
       <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(newRouteIds, routeOptions)} onChange={(selected) => setNewRouteIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
       <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(newRouteGroupIds, routeGroupOptions)} onChange={(selected) => setNewRouteGroupIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
-      {createFormSchema ? <Form key={`${tenant}-${locale}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try {
-        const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }) });
-        if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return;
+      {createFormSchema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try {
+        const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }) });
+        if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return;
         setNewRouteIds([]); setNewRouteGroupIds([]); setSecret(created.key); setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
       } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!canWrite}>{t('credentials.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
     </div></details>
-  </section>{tenant && <GroupManager kind="credential" token={token} tenant={tenant} groups={credentialGroups.groups} resources={values.map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} />}</>;
+  </section>{writeTenant && <GroupManager kind="credential" token={token} tenant={writeTenant} groups={credentialGroups.groups} resources={values.filter(canManage).map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} />}</>;
 }
 
-function ServiceCredentialWorkspace({ token, tenant, schema }: { token: string; tenant: string; schema?: Record<string, unknown> }) {
+function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schema }: { token: string; tenant: string; writeTenant?: string; schema?: Record<string, unknown> }) {
   const { locale, t } = useI18n();
   const [values, setValues] = useState<ServiceTokenView[]>([]);
   const [secret, setSecret] = useState('');
@@ -751,8 +753,8 @@ function ServiceCredentialWorkspace({ token, tenant, schema }: { token: string; 
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const loadSequence = useRef(0);
-  const scopeRef = useRef({ token, tenant });
-  scopeRef.current = { token, tenant };
+  const scopeRef = useRef({ token, tenant, writeTenant });
+  scopeRef.current = { token, tenant, writeTenant };
   const load = async () => {
     const sequence = ++loadSequence.current;
     const loadToken = token; const loadTenant = tenant;
@@ -765,15 +767,22 @@ function ServiceCredentialWorkspace({ token, tenant, schema }: { token: string; 
   };
   useEffect(() => {
     loadSequence.current += 1; setValues([]); setSecret(''); setBusy(''); setMessage(''); setError(''); void load();
-  }, [token, tenant]);
-  return <>{!tenant && <div className="scope-context"><span aria-hidden="true">◎</span><p>{t('services.allTenantNotice')}</p></div>}{secret && <OneTimeSecret value={secret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><span>{formatNumber(values.length, locale)}</span></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{values.length === 0 && <div className="empty">{t('services.empty')}</div>}{values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={value.status === 'revoked' || Boolean(busy)} onClick={async () => { if (!window.confirm(`${t('services.rotate')} · ${value.name}\n${value.service_id}`)) return; setBusy(`rotate-${value.service_id}`); try { const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
-    <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!tenant) return; try { const created = await api<{ token: string }>('/internal/v1/service-tokens', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: tenant }) }); setSecret(created.token); setMessage(t('services.created')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!tenant}>{t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
+  }, [token, tenant, writeTenant]);
+  const canManage = (value: ServiceTokenView) => Boolean(writeTenant) && (!value.tenant_external_id || value.tenant_external_id === writeTenant);
+  return <>{secret && <OneTimeSecret value={secret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
+    <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><span>{formatNumber(values.length, locale)}</span></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{values.length === 0 && <div className="empty">{t('services.empty')}</div>}{values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy)} onClick={async () => { if (!window.confirm(`${t('services.rotate')} · ${value.name}\n${value.service_id}`)) return; setBusy(`rotate-${value.service_id}`); try { const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } }}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
+    <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { const created = await api<{ token: string }>('/internal/v1/service-tokens', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setSecret(created.token); setMessage(t('services.created')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant}>{t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
   </section></>;
 }
 
 
-interface OperatorPageProps { token: string; tenant: string }
+interface OperatorPageProps {
+  token: string;
+  /** Read scope; an empty value means the authorized aggregate view. */
+  tenant: string;
+  /** Explicit target for every create/update action. */
+  writeTenant?: string;
+}
 
 function ResourceBoundary<T>({ resource, scopeKey, children }: {
   resource: ResourceState<T>;
@@ -791,7 +800,7 @@ function ResourceBoundary<T>({ resource, scopeKey, children }: {
   return <>{resource.kind === 'ready' && resource.refreshError && <div className="notice error" role="alert">{resource.refreshError}</div>}{children(value)}</>;
 }
 
-export function ProvidersPage({ token, tenant }: OperatorPageProps) {
+export function ProvidersPage({ token, tenant, writeTenant }: OperatorPageProps) {
   const { t } = useI18n();
   const resource = useOperatorResource(
     Boolean(token), `${token}\0${tenant}`,
@@ -805,11 +814,11 @@ export function ProvidersPage({ token, tenant }: OperatorPageProps) {
     t('common.requestFailed'),
   );
   return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, values }) =>
-    <UpstreamProviders token={token} tenant={tenant} providers={providers} values={values} onChanged={resource.reload} />
+    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} onChanged={resource.reload} />
   }</ResourceBoundary>;
 }
 
-export function PricingPage({ token, tenant }: OperatorPageProps) {
+export function PricingPage({ token, tenant, writeTenant }: OperatorPageProps) {
   const { t } = useI18n();
   const resource = useOperatorResource(
     Boolean(token), token,
@@ -817,11 +826,11 @@ export function PricingPage({ token, tenant }: OperatorPageProps) {
     t('common.requestFailed'),
   );
   return <ResourceBoundary resource={resource.state} scopeKey={token}>{(schemas) =>
-    <Pricing token={token} tenant={tenant} schemas={schemas} />
+    <Pricing token={token} tenant={tenant} writeTenant={writeTenant} schemas={schemas} />
   }</ResourceBoundary>;
 }
 
-export function RoutesPage({ token, tenant }: OperatorPageProps) {
+export function RoutesPage({ token, tenant, writeTenant }: OperatorPageProps) {
   const { t } = useI18n();
   const resource = useOperatorResource(
     Boolean(token), `${token}\0${tenant}`,
@@ -835,11 +844,11 @@ export function RoutesPage({ token, tenant }: OperatorPageProps) {
     t('common.requestFailed'),
   );
   return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, upstreams }) =>
-    <RouteWorkspace token={token} tenant={tenant} providers={providers} upstreams={upstreams} />
+    <RouteWorkspace token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} upstreams={upstreams} />
   }</ResourceBoundary>;
 }
 
-export function CredentialsPage({ token, tenant }: OperatorPageProps) {
+export function CredentialsPage({ token, tenant, writeTenant }: OperatorPageProps) {
   const { t } = useI18n();
   const resource = useOperatorResource(
     Boolean(token), token,
@@ -847,11 +856,11 @@ export function CredentialsPage({ token, tenant }: OperatorPageProps) {
     t('common.requestFailed'),
   );
   return <ResourceBoundary resource={resource.state} scopeKey={token}>{(schemas) =>
-    <CredentialWorkspace token={token} tenant={tenant} createSchema={schemas.key_create} policySchema={schemas.key_policy} />
+    <CredentialWorkspace token={token} tenant={tenant} writeTenant={writeTenant} createSchema={schemas.key_create} policySchema={schemas.key_policy} />
   }</ResourceBoundary>;
 }
 
-export function ServiceCredentialsPage({ token, tenant }: OperatorPageProps) {
+export function ServiceCredentialsPage({ token, tenant, writeTenant }: OperatorPageProps) {
   const { t } = useI18n();
   const resource = useOperatorResource(
     Boolean(token), token,
@@ -859,6 +868,6 @@ export function ServiceCredentialsPage({ token, tenant }: OperatorPageProps) {
     t('common.requestFailed'),
   );
   return <ResourceBoundary resource={resource.state} scopeKey={token}>{(schemas) =>
-    <ServiceCredentialWorkspace token={token} tenant={tenant} schema={schemas.service_token} />
+    <ServiceCredentialWorkspace token={token} tenant={tenant} writeTenant={writeTenant} schema={schemas.service_token} />
   }</ResourceBoundary>;
 }

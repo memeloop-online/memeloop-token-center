@@ -86,12 +86,11 @@ function verifyPublisher(job) {
 
   const expectedImages = [
     'ghcr.io/${{ github.repository_owner }}/memeloop-token-center',
-    'ghcr.io/${{ github.repository_owner }}/memeloop-token-center-importer',
     'ghcr.io/${{ github.repository_owner }}/memeloop-token-center-plugin-installer',
   ].sort();
   const include = job.strategy?.matrix?.include;
   if (!Array.isArray(include) || include.length !== expectedImages.length) {
-    fail('publish-ghcr matrix must contain exactly three images');
+    fail('publish-ghcr matrix must contain exactly two images');
   }
   const actualImages = include.map((entry) => entry?.image).sort();
   if (JSON.stringify(actualImages) !== JSON.stringify(expectedImages)) {

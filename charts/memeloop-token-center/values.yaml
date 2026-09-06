@@ -15,7 +15,7 @@ migration:
   enabled: true
   # Must equal the greatest migration registered by the release binary.
   # The packaging contract rejects drift between this value and migrations/.
-  schemaVersion: 66
+  schemaVersion: 67
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4
@@ -125,6 +125,20 @@ config:
   # by default) so it cannot turn the 1024 general permits into 16 GiB.
   responsesBodyMaxBytes: 16777216
   responsesBodyReadConcurrency: 4
+  # Shared account-pool circuit breaker. A half-open lease permits exactly one
+  # recovery request per account; every duration is in milliseconds.
+  upstreamHealth:
+    probeLeaseMillis: 30000
+    probeHeartbeatMillis: 10000
+    rateLimitedCooldownMillis: 30000
+    unavailableCooldownMillis: 15000
+    invalidResponseCooldownMillis: 15000
+    connectionCooldownMillis: 5000
+  # Register CPU/heap diagnostic handlers only on an internal control/all
+  # deployment during an incident. They remain disabled by default and are
+  # never rendered for gateway or worker roles.
+  runtimeProfiling:
+    enabled: false
   databaseUrlSecret:
     name: memeloop-token-center-secrets
     key: database-url

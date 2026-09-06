@@ -1,7 +1,0 @@
-{
-  "type": "copilot",
-  "upstream": "copilot",
-  "handle": "FixtureCopilotHandle01",
-  "label": "Fixture GitHub Copilot",
-  "login": "copilot-user@example.test"
-}

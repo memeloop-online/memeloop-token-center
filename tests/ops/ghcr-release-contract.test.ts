@@ -10,11 +10,10 @@ const revision = '1'.repeat(40);
 const sha = (character: string): string => `sha256:${character.repeat(64)}`;
 const names = {
   service: 'memeloop-token-center',
-  importer: 'memeloop-token-center-importer',
   'plugin-installer': 'memeloop-token-center-plugin-installer',
 } as const;
 
-test('GHCR evidence binds each tag and OCI subject before sealing the three-image release', () => {
+test('GHCR evidence binds each tag and OCI subject before sealing the two-image release', () => {
   const temporary = mkdtempSync(join(tmpdir(), 'mtc-ghcr-release-'));
   try {
     const bin = join(temporary, 'bin'); const fixtures = join(temporary, 'fixtures'); const runner = join(temporary, 'runner');
@@ -90,10 +89,10 @@ test('GHCR evidence binds each tag and OCI subject before sealing the three-imag
     });
     assert.equal(complete.status, 0, complete.stderr);
     const manifest = JSON.parse(readFileSync(release, 'utf8')) as Array<Record<string, unknown>>;
-    assert.equal(manifest.length, 3);
+    assert.equal(manifest.length, 2);
     assert.deepEqual(manifest.map((entry) => entry.image), Object.values(names).map((name) => `ghcr.io/memeloop-online/${name}`).sort());
     const dockerCalls = readFileSync(dockerLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as string[]);
-    assert.equal(dockerCalls.filter((call) => !call.includes('--format')).length, 3, 'every immutable release digest must be inspected remotely');
+    assert.equal(dockerCalls.filter((call) => !call.includes('--format')).length, 2, 'every immutable release digest must be inspected remotely');
 
     const wrongLabelRunner = join(temporary, 'wrong-label-runner'); mkdirSync(wrongLabelRunner);
     const wrongLabel = spawnSync(process.execPath, [
@@ -109,10 +108,10 @@ test('GHCR evidence binds each tag and OCI subject before sealing the three-imag
     assert.notEqual(wrongDigest.status, 0);
     assert.match(wrongDigest.stderr, /tag does not resolve to the build digest/);
 
-    const importerEvidence = join(runner, 'importer-image-digest.json');
-    const tampered = JSON.parse(readFileSync(importerEvidence, 'utf8')) as Record<string, unknown>;
+    const pluginEvidence = join(runner, 'plugin-installer-image-digest.json');
+    const tampered = JSON.parse(readFileSync(pluginEvidence, 'utf8')) as Record<string, unknown>;
     tampered.revision = '2'.repeat(40);
-    writeFileSync(importerEvidence, JSON.stringify(tampered), { mode: 0o600 });
+    writeFileSync(pluginEvidence, JSON.stringify(tampered), { mode: 0o600 });
     const rejected = spawnSync(process.execPath, ['ops/ci/verify-ghcr-release.ts', runner, join(temporary, 'rejected.json')], {
       cwd: repository, encoding: 'utf8', env: environment, shell: false,
     });

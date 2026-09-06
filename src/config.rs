@@ -14,6 +14,77 @@ pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = 4;
 pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = 8;
 
+/// Per-account circuit-breaker timings. These values deliberately belong to
+/// process configuration rather than route or credential records: routing
+/// health is shared by every key that may use an account, and operators need
+/// to tune recovery pressure without rewriting account metadata.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpstreamHealthConfig {
+    pub probe_lease_millis: i64,
+    pub probe_heartbeat_millis: i64,
+    pub rate_limited_cooldown_millis: i64,
+    pub unavailable_cooldown_millis: i64,
+    pub invalid_response_cooldown_millis: i64,
+    pub connection_cooldown_millis: i64,
+}
+
+impl UpstreamHealthConfig {
+    pub const DEFAULT: Self = Self {
+        probe_lease_millis: 30_000,
+        probe_heartbeat_millis: 10_000,
+        rate_limited_cooldown_millis: 30_000,
+        unavailable_cooldown_millis: 15_000,
+        invalid_response_cooldown_millis: 15_000,
+        connection_cooldown_millis: 5_000,
+    };
+
+    fn from_env() -> Result<Self, ConfigError> {
+        let config = Self {
+            probe_lease_millis: health_millis(
+                "MTC_UPSTREAM_HEALTH_PROBE_LEASE_MILLIS",
+                Self::DEFAULT.probe_lease_millis,
+            )?,
+            probe_heartbeat_millis: health_millis(
+                "MTC_UPSTREAM_HEALTH_PROBE_HEARTBEAT_MILLIS",
+                Self::DEFAULT.probe_heartbeat_millis,
+            )?,
+            rate_limited_cooldown_millis: health_millis(
+                "MTC_UPSTREAM_HEALTH_RATE_LIMITED_COOLDOWN_MILLIS",
+                Self::DEFAULT.rate_limited_cooldown_millis,
+            )?,
+            unavailable_cooldown_millis: health_millis(
+                "MTC_UPSTREAM_HEALTH_UNAVAILABLE_COOLDOWN_MILLIS",
+                Self::DEFAULT.unavailable_cooldown_millis,
+            )?,
+            invalid_response_cooldown_millis: health_millis(
+                "MTC_UPSTREAM_HEALTH_INVALID_RESPONSE_COOLDOWN_MILLIS",
+                Self::DEFAULT.invalid_response_cooldown_millis,
+            )?,
+            connection_cooldown_millis: health_millis(
+                "MTC_UPSTREAM_HEALTH_CONNECTION_COOLDOWN_MILLIS",
+                Self::DEFAULT.connection_cooldown_millis,
+            )?,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(self) -> Result<(), ConfigError> {
+        if self.probe_heartbeat_millis >= self.probe_lease_millis {
+            return Err(ConfigError::InvalidUpstreamHealthConfig(
+                "probe heartbeat must be shorter than the probe lease",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for UpstreamHealthConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeRole {
@@ -55,6 +126,8 @@ pub struct Config {
     pub responses_body_max_bytes: u32,
     /// Maximum concurrent `/v1/responses` body reads per gateway process.
     pub responses_body_read_concurrency: u32,
+    /// Shared per-upstream-account circuit-breaker and half-open probe timings.
+    pub upstream_health: UpstreamHealthConfig,
     pub run_migrations_on_start: bool,
     pub key_pepper: String,
     pub service_token: String,
@@ -103,6 +176,7 @@ impl std::fmt::Debug for Config {
                 "responses_body_read_concurrency",
                 &self.responses_body_read_concurrency,
             )
+            .field("upstream_health", &self.upstream_health)
             .field("run_migrations_on_start", &self.run_migrations_on_start)
             .field("key_pepper", &"[redacted]")
             .field("service_token", &"[redacted]")
@@ -195,6 +269,7 @@ impl Config {
             env_string("MTC_PRICING_OPENROUTER_URL", DEFAULT_PRICING_OPENROUTER_URL),
             allow_oauth_loopback,
         )?;
+        let upstream_health = UpstreamHealthConfig::from_env()?;
 
         Ok(Self {
             listen: env_string("MTC_LISTEN", "0.0.0.0:8080"),
@@ -217,6 +292,7 @@ impl Config {
                 "MTC_RESPONSES_BODY_READ_CONCURRENCY",
                 DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
             )?),
+            upstream_health,
             run_migrations_on_start: env_bool("MTC_RUN_MIGRATIONS_ON_START", true),
             key_pepper,
             service_token,
@@ -257,6 +333,7 @@ impl Config {
             gateway_body_read_concurrency: 1,
             responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
             responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
+            upstream_health: UpstreamHealthConfig::DEFAULT,
             run_migrations_on_start: false,
             key_pepper: "unused-by-session-archive-importer".to_owned(),
             service_token: "unused-by-session-archive-importer".to_owned(),
@@ -291,6 +368,7 @@ impl Config {
             gateway_body_read_concurrency: DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
             responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
             responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
+            upstream_health: UpstreamHealthConfig::DEFAULT,
             run_migrations_on_start: true,
             key_pepper: "test-pepper-must-have-at-least-32-bytes".to_owned(),
             service_token: "test-service-token".to_owned(),
@@ -412,6 +490,23 @@ fn env_u32(name: &'static str, default: u32) -> Result<u32, ConfigError> {
     }
 }
 
+fn health_millis(name: &'static str, default: i64) -> Result<i64, ConfigError> {
+    const MINIMUM: i64 = 100;
+    const MAXIMUM: i64 = 86_400_000;
+    let value = match env::var(name) {
+        Ok(value) => value
+            .parse::<i64>()
+            .map_err(|_| ConfigError::InvalidInteger(name, value))?,
+        Err(_) => default,
+    };
+    if !(MINIMUM..=MAXIMUM).contains(&value) {
+        return Err(ConfigError::InvalidUpstreamHealthConfig(
+            "all upstream health durations must be between 100 ms and 24 hours",
+        ));
+    }
+    Ok(value)
+}
+
 fn gateway_body_read_concurrency(value: u32) -> u32 {
     value.clamp(1, MAX_GATEWAY_BODY_READ_CONCURRENCY)
 }
@@ -442,6 +537,8 @@ pub enum ConfigError {
     InvalidArchiveBackend(String),
     #[error("{0} must be an unsigned integer, received {1}")]
     InvalidInteger(&'static str, String),
+    #[error("invalid upstream health configuration: {0}")]
+    InvalidUpstreamHealthConfig(&'static str),
     #[error("{0} must be a credential-free public HTTPS URL")]
     InvalidPricingSourceUrl(&'static str),
 }
@@ -606,6 +703,23 @@ mod tests {
         assert_eq!(
             config.responses_body_read_concurrency,
             DEFAULT_RESPONSES_BODY_READ_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn upstream_health_configuration_requires_a_bounded_half_open_lease() {
+        assert!(UpstreamHealthConfig::DEFAULT.validate().is_ok());
+        let invalid = UpstreamHealthConfig {
+            probe_heartbeat_millis: UpstreamHealthConfig::DEFAULT.probe_lease_millis,
+            ..UpstreamHealthConfig::DEFAULT
+        };
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::InvalidUpstreamHealthConfig(_))
+        ));
+        assert_eq!(
+            Config::for_test("sqlite::memory:".to_owned()).upstream_health,
+            UpstreamHealthConfig::DEFAULT
         );
     }
 }

@@ -76,17 +76,18 @@ fn downstream_modalities<'a>(
     config_json: &str,
     provider_modalities: &'a [String],
 ) -> Vec<&'a str> {
+    let openai_compatible_http = crate::provider::is_openai_compatible_http_driver(driver);
     let siliconflow_video = driver == "http-json"
         && serde_json::from_str::<Value>(config_json)
             .ok()
             .is_some_and(|config| {
                 crate::generation::is_siliconflow_video_profile(&config, upstream_model)
             });
-    let builtin: &[&str] = match (protocol, driver) {
-        ("generation", "http-json") if siliconflow_video => &["image", "video"],
-        ("generation", "http-json") => &["image"],
-        ("generation", "volcengine-seedance") => &["video"],
-        ("generation", "comfyui") => &["image", "video"],
+    let builtin: &[&str] = match protocol {
+        "generation" if siliconflow_video => &["image", "video"],
+        "generation" if openai_compatible_http => &["image"],
+        "generation" if driver == "volcengine-seedance" => &["video"],
+        "generation" if driver == "comfyui" => &["image", "video"],
         _ => &[],
     };
     if !builtin.is_empty() {
@@ -222,6 +223,17 @@ mod tests {
         assert_eq!(
             downstream_modalities("openai", "http-json", "text-model", "{}", &advertised),
             vec!["text", "embedding"]
+        );
+        assert_eq!(
+            downstream_modalities(
+                "generation",
+                crate::provider::CBCNX_PROVIDER_DRIVER,
+                "candidate-video-model",
+                "{}",
+                &advertised,
+            ),
+            vec!["image"],
+            "CBCNX video candidates must not be advertised before a reviewed job adapter exists",
         );
     }
 }

@@ -44,7 +44,7 @@ fn buffered_usage_capture_only_accepts_plausible_json_content_types() {
 }
 
 #[test]
-fn trusted_input_overhead_is_http_json_only_and_defaults_to_zero() {
+fn trusted_input_overhead_is_limited_to_reviewed_openai_compatible_http_drivers() {
     assert_eq!(
         trusted_input_token_overhead_ceiling(
             Some("http-json"),
@@ -52,6 +52,15 @@ fn trusted_input_overhead_is_http_json_only_and_defaults_to_zero() {
         )
         .unwrap(),
         0
+    );
+    assert_eq!(
+        trusted_input_token_overhead_ceiling(
+            Some(crate::provider::CBCNX_PROVIDER_DRIVER),
+            Some(&json!({"input_token_overhead_ceiling": 512})),
+        )
+        .unwrap(),
+        512,
+        "CBCNX must reserve its reviewed upstream-only input allowance"
     );
     assert_eq!(
         trusted_input_token_overhead_ceiling(
@@ -69,6 +78,26 @@ fn trusted_input_overhead_is_http_json_only_and_defaults_to_zero() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn cbcnx_chat_usage_contract_is_held_to_the_same_terminal_usage_boundary() {
+    let request = json!({
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
+    assert!(requires_strict_openai_chat_usage(
+        Protocol::OpenAiChat,
+        crate::provider::CBCNX_PROVIDER_DRIVER,
+        &json!({"stream_usage_contract": "openai-chat-usage-only"}),
+        &request,
+    ));
+    assert!(!requires_strict_openai_chat_usage(
+        Protocol::OpenAiChat,
+        crate::provider::CBCNX_PROVIDER_DRIVER,
+        &json!({"stream_usage_contract": "openai-chat-usage-only"}),
+        &json!({"stream": true}),
+    ));
 }
 
 #[test]
@@ -380,6 +409,23 @@ async fn response_usage_fixture_with_uri_and_contract(
     input_token_overhead_ceiling: i64,
     stream_usage_contract: Option<&str>,
 ) -> CodexRouteFixture {
+    response_usage_fixture_with_uri_contract_and_driver(
+        label,
+        upstream_uri,
+        input_token_overhead_ceiling,
+        stream_usage_contract,
+        "http-json",
+    )
+    .await
+}
+
+async fn response_usage_fixture_with_uri_contract_and_driver(
+    label: &str,
+    upstream_uri: String,
+    input_token_overhead_ceiling: i64,
+    stream_usage_contract: Option<&str>,
+    driver: &str,
+) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("archive");
     let database_url = format!(
@@ -409,7 +455,7 @@ async fn response_usage_fixture_with_uri_and_contract(
             CreateUpstreamAccountInput {
                 tenant_external_id: tenant.clone(),
                 name: format!("compatibility-{label}"),
-                driver: "http-json".to_owned(),
+                driver: driver.to_owned(),
                 config: upstream_config,
                 credential: UpstreamCredential::ApiKey {
                     value: "compatibility-upstream-secret".to_owned(),
@@ -501,6 +547,69 @@ async fn send_chat_usage_request(fixture: &CodexRouteFixture, body: &Value) -> R
         )
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn unpriced_cbcnx_route_is_rejected_before_any_upstream_request() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let fixture = response_usage_fixture_with_uri_contract_and_driver(
+        "cbcnx-unpriced",
+        upstream.uri(),
+        0,
+        Some("openai-chat-usage-only"),
+        crate::provider::CBCNX_PROVIDER_DRIVER,
+    )
+    .await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("DELETE FROM model_price_tiers WHERE model = $1 AND currency = $2")
+        .bind(&fixture.model)
+        .bind("USD")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM model_prices WHERE model = $1 AND currency = $2")
+        .bind(&fixture.model)
+        .bind("USD")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let response = send_chat_usage_request(
+        &fixture,
+        &json!({
+            "model": fixture.model,
+            "messages": [{"role": "user", "content": "priced admission required"}],
+            "max_completion_tokens": 8
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
+        "unpriced_model"
+    );
+    assert!(
+        fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "price admission must precede persistent request creation"
+    );
+    upstream.verify().await;
 }
 
 struct ResilientRouteFixture {

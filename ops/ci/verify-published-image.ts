@@ -15,7 +15,6 @@ const server = process.env.GITHUB_SERVER_URL;
 if (server === undefined || !/^https:\/\/[^/]+$/.test(server)) fail(SCOPE, 'GitHub server URL is invalid');
 const expectedNames: Record<string, string> = {
   service: 'memeloop-token-center',
-  importer: 'memeloop-token-center-importer',
   'plugin-installer': 'memeloop-token-center-plugin-installer',
 };
 const name = expectedNames[cacheScope];

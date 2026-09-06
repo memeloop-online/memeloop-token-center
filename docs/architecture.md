@@ -24,7 +24,7 @@ AI clients / MemeLoop Web
 
 Token Center owns client authentication, tenant isolation, routing decisions,
 quota, billing facts and observable history. It does not delegate these to an
-ingress, provider plugin or legacy CPA process. Higress/Ingress owns generic edge
+ingress or provider plugin. Higress/Ingress owns generic edge
 bandwidth and connection controls; Kubernetes and backing-service operations are
 external operational responsibilities.
 
@@ -70,7 +70,7 @@ storage split, archive staging fences and SlateDB decision are documented in
 [Archive storage and SlateDB decision](architecture/archive-storage.md).
 
 Backups cover only these Token Center data planes and their recovery material;
-see [Backup and restore](operations/backup-and-restore.md).
+see [Disaster recovery](operations/disaster-recovery.md).
 
 ## Identity and authorization model
 
@@ -84,8 +84,7 @@ route trees. Service-token scopes are least privilege and may be tenant-bound.
 Client credentials can access only authorized public routes plus their own
 self-service projection.
 
-Model authorization is relational rather than embedded in a model-name hack or
-legacy `allowed_models` list:
+Model authorization is relational rather than embedded in a model-name list:
 
 ```text
 stable key
@@ -128,16 +127,15 @@ result-origin allowlist before streaming into the job-scoped CAS staging area.
 Ambiguous submission never causes a second POST; normal polling uses bounded
 backoff, and the short-lived provider URL is never stored in job metadata.
 
-CPA is only a migration source. Importable direct accounts and reviewed managed
-OAuth documents converge into the unified account model. Opaque Copilot/Cursor
-handles cannot become credentials and are reported for native reauthorization.
-Historical retired connection rows may remain readable for attribution, but are
-never routable or refreshable.
+Direct accounts and reviewed managed OAuth documents converge into the unified
+account model. Opaque authorization handles cannot become credentials and
+require native reauthorization. Historical inactive connection rows may remain
+readable for attribution, but are never routable or refreshable.
 
-Imported direct targets default to the public destination policy. Migration may
-select `network_scope: private` only through a separate versioned owner-only
-policy listing exact normalized base URLs. This decision is independent of
-whether proxy presence caused the classification, but every private target must
+Direct targets default to the public destination policy. Private scope is
+available only through a separate versioned owner-only policy listing exact
+normalized base URLs. This decision is independent of whether proxy presence
+caused the classification, but every private target must
 carry an approved private SOCKS5 proxy. The importer validates this
 before any target request; server global-authority and independent DNS/IP checks
 still apply. Stable source identity does not include scope, so changing an
@@ -210,10 +208,8 @@ from prompts. See
 
 Candidate evidence is visible for operator review but cannot silently merge
 identities. Conversation queries remain scoped by tenant, principal and stable
-key. Imported archive records with stable ownership but ambiguous request
-correlation become explicit unlinked observations outside normal billing facts.
-
-Detailed import semantics are in [Session archive import](session-archive-import.md).
+key. Archive records with stable ownership but ambiguous request correlation
+remain explicit unlinked observations outside normal billing facts.
 
 ## Plugin boundary
 
@@ -254,17 +250,11 @@ The migration Job is the only production schema migrator. Application roles do
 not migrate on startup. Non-backward-compatible write barriers require all old
 writers to drain before the new schema and binary start.
 
-The 2026-08-23 release-order override makes API3 the production target. The
-candidate's exact SHA and three immutable digests first run in the CPA/API2
-trial slot while the old CPA revision, backup and routing configuration remain
-ready for immediate rollback. The trial must pass cluster smoke, the full live
-browser matrix and real Codex CLI text/image requests. Only those same digests
-may then be promoted to API3, and only after the user explicitly declares a
-production window open. The 2026-08-23 state is outside that window, so API3 is
-an immutable boundary even if the reversible CPA/API2 trial passes. Formal
-migration barriers and destructive traffic movement still follow
-[CPA to Token Center cutover](operations/cutover-runbook.md) and require their
-own explicit maintenance approval.
+A release candidate uses the exact source SHA and two immutable image digests.
+It must pass cluster smoke, the live browser matrix and real CLI text/image
+requests before production traffic moves. Promotion uses those exact digests and
+an explicitly approved maintenance window. Reversible traffic changes, backups
+and destructive schema barriers require their own maintenance approval.
 
 All cluster, GitOps, migration execution, storage and rollout work belongs to the
 designated infrastructure task. Product work supplies immutable inputs and

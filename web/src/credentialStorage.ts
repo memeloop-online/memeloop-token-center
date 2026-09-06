@@ -72,3 +72,16 @@ export function tenantForCredential(
   if (tenants.some((value) => value.external_id === 'default')) return 'default';
   return tenants.length === 1 ? tenants[0]!.external_id : '';
 }
+
+/**
+ * Resolve the explicit tenant used for mutations. The aggregate view remains
+ * intentionally represented by an empty read scope, but it must never make a
+ * write action ambiguous: `default` wins, followed by the stable first active
+ * tenant for installations which predate that convention.
+ */
+export function defaultTenantForCredential(
+  tenants: ReadonlyArray<{ external_id: string }>,
+): string {
+  if (tenants.some((value) => value.external_id === 'default')) return 'default';
+  return tenants[0]?.external_id ?? '';
+}

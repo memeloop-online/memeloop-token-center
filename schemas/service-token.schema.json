@@ -38,6 +38,8 @@
           "prices:read",
           "service_tokens:write",
           "service_tokens:read",
+          "tenants:write",
+          "tenants:read",
           "schemas:read",
           "metrics:read",
           "entitlements:read",

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../../api';
 import { DrawerFrame, RequestTable } from '../../components';
 import { useI18n } from '../../i18n';
-import type { RequestDetail, RequestEvent, RequestView, UpstreamAccount } from '../../types';
+import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, UpstreamAccount } from '../../types';
 import type { SessionStreamState } from '../SessionMonitor';
 import { messageOf, queryForTenant } from '../scope/operatorShared';
 import {
@@ -36,29 +36,33 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   const upstreamSequence = useRef(0);
   const detailSequence = useRef(0);
   const detailAbort = useRef<AbortController | null>(null);
+  const hasOlderRef = useRef(hasOlder);
   const scope = useRef({ token, tenant, filters });
+  hasOlderRef.current = hasOlder;
   scope.current = { token, tenant, filters };
 
   async function load(nextFilters: RequestFilters, older = false) {
     if (!token) return;
     const request = ++sequence.current;
     const currentScope = { token, tenant, filters: nextFilters };
-    const before = older ? requests.at(-1) : undefined;
+    const last = requests.at(-1);
+    const before = last ? { before_created_at: last.created_at, before_id: last.request_id } : undefined;
+    if (older && (!hasOlder || !before)) return;
     if (!older) { setRequests([]); setHasOlder(false); setDetail(undefined); }
     setLoading(true);
     setError('');
     try {
-      const next = await api<RequestView[]>(
-        `/internal/v1/requests${requestQuery(tenant, nextFilters, before)}`,
+      const next = await api<RequestListResponse>(
+        `/internal/v1/requests${requestQuery(tenant, nextFilters, older ? before : undefined)}`,
         token,
       );
       const latest = scope.current;
       if (request !== sequence.current || latest.token !== currentScope.token
         || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
       setRequests((current) => older
-        ? [...current, ...next.filter((value) => !current.some((existing) => existing.request_id === value.request_id))]
-        : filtersActive(nextFilters) ? next : mergeLiveRequestEvents(next, new Map(liveEvents)));
-      setHasOlder(next.length === 100);
+        ? [...current, ...next.requests.filter((value) => !current.some((existing) => existing.request_id === value.request_id))]
+        : filtersActive(nextFilters) ? next.requests : mergeLiveRequestEvents(next.requests, new Map(liveEvents), next.next_cursor === null));
+      setHasOlder(next.next_cursor !== null);
     } catch (reason) {
       if (request === sequence.current) {
         if (!older) { setRequests([]); setHasOlder(false); }
@@ -103,7 +107,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     if (liveEvents.size === 0 || filtersActive(filters)) return;
     // React may batch several replay revisions into one render. Merge the
     // complete bounded event map so no intermediate SSE event disappears.
-    setRequests((current) => mergeLiveRequestEvents(current, new Map(liveEvents)));
+    setRequests((current) => mergeLiveRequestEvents(current, new Map(liveEvents), !hasOlderRef.current));
   }, [streamRevision]);
 
   async function selectRequest(request: RequestView) {

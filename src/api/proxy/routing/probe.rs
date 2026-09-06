@@ -49,16 +49,20 @@ impl UpstreamAttemptGuard {
         let heartbeat_stop = lease_token.map(|lease_token| {
             let (stop, mut stopped) = tokio::sync::oneshot::channel();
             let database = state.db.clone();
+            let upstream_health = state.config.upstream_health;
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         _ = &mut stopped => break,
-                        _ = tokio::time::sleep(crate::db::upstream_probe_heartbeat_interval()) => {
+                        _ = tokio::time::sleep(crate::db::upstream_probe_heartbeat_interval(
+                            upstream_health,
+                        )) => {
                             match database
-                                .renew_upstream_account_probe(
+                                .renew_upstream_account_probe_with_health_config(
                                     upstream_account_id,
                                     credential_generation,
                                     lease_token,
+                                    upstream_health,
                                 )
                                 .await
                             {
@@ -200,21 +204,23 @@ async fn record_terminal(
                 Some(lease_token) => {
                     state
                         .db
-                        .record_upstream_account_probe_failure(
+                        .record_upstream_account_probe_failure_with_health_config(
                             upstream_account_id,
                             credential_generation,
                             lease_token,
                             kind,
+                            state.config.upstream_health,
                         )
                         .await
                 }
                 None => {
                     state
                         .db
-                        .record_upstream_account_failure(
+                        .record_upstream_account_failure_with_health_config(
                             upstream_account_id,
                             credential_generation,
                             kind,
+                            state.config.upstream_health,
                         )
                         .await
                 }

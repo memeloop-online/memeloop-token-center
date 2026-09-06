@@ -74,7 +74,8 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   assert.equal(observed.find((value) => value.credential === 'singleton-credential')?.path, '/internal/v1/tenants');
   assert.equal(await page.locator('.console-context').textContent(), '载入中…');
   singletonTenants.resolve();
-  await eventually(async () => assert.equal(await page.locator('.tenant-picker select').inputValue(), 'singleton-tenant'));
+  await eventually(async () => assert.equal(await page.locator('.tenant-picker select').count(), 0));
+  assert.match(await page.locator('.console-context').textContent() ?? '', /singleton-tenant/);
   await eventually(() => assert.ok(observed.filter((value) => value.credential === 'singleton-credential'
     && ['/internal/v1/upstreams', '/internal/v1/requests'].includes(value.path)).length >= 2));
   const singletonResources = observed.filter((value) => value.credential === 'singleton-credential'

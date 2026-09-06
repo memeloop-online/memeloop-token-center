@@ -49,6 +49,18 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
   value: {{ printf "%d" (int64 .Values.config.responsesBodyMaxBytes) | quote }}
 - name: MTC_RESPONSES_BODY_READ_CONCURRENCY
   value: {{ .Values.config.responsesBodyReadConcurrency | quote }}
+- name: MTC_UPSTREAM_HEALTH_PROBE_LEASE_MILLIS
+  value: {{ .Values.config.upstreamHealth.probeLeaseMillis | quote }}
+- name: MTC_UPSTREAM_HEALTH_PROBE_HEARTBEAT_MILLIS
+  value: {{ .Values.config.upstreamHealth.probeHeartbeatMillis | quote }}
+- name: MTC_UPSTREAM_HEALTH_RATE_LIMITED_COOLDOWN_MILLIS
+  value: {{ .Values.config.upstreamHealth.rateLimitedCooldownMillis | quote }}
+- name: MTC_UPSTREAM_HEALTH_UNAVAILABLE_COOLDOWN_MILLIS
+  value: {{ .Values.config.upstreamHealth.unavailableCooldownMillis | quote }}
+- name: MTC_UPSTREAM_HEALTH_INVALID_RESPONSE_COOLDOWN_MILLIS
+  value: {{ .Values.config.upstreamHealth.invalidResponseCooldownMillis | quote }}
+- name: MTC_UPSTREAM_HEALTH_CONNECTION_COOLDOWN_MILLIS
+  value: {{ .Values.config.upstreamHealth.connectionCooldownMillis | quote }}
 - name: MTC_KEY_PEPPER
   valueFrom:
     secretKeyRef:
