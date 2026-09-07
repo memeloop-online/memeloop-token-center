@@ -22,6 +22,18 @@ enum StreamTerminal {
     Failed,
 }
 
+#[derive(Clone, Copy)]
+struct SanitizerRejection {
+    code: &'static str,
+    stage: &'static str,
+}
+
+impl SanitizerRejection {
+    const fn new(code: &'static str, stage: &'static str) -> Self {
+        Self { code, stage }
+    }
+}
+
 /// Binds every event in one successful Responses lifecycle to its first
 /// canonical response identifier. Output events are invalid until a lifecycle
 /// event establishes that identity.
@@ -124,6 +136,9 @@ pub(in crate::api) struct ResponsesStreamingSanitizer {
     forward_crlf_continuation: bool,
     identity: ResponseIdentityGate,
     terminal_hold: ResponseTerminalHold,
+    // A fixed, low-cardinality operator diagnosis. It is deliberately never
+    // derived from an upstream event, identifier, or payload.
+    last_rejection_stage: Option<&'static str>,
 }
 
 impl ResponsesStreamingSanitizer {
@@ -131,10 +146,14 @@ impl ResponsesStreamingSanitizer {
         let mut output = Vec::new();
         let batch = self.framer.push(chunk);
         if let Some(rejection) = batch.rejection {
+            self.last_rejection_stage = Some("framing");
             return Err(rejection.error_code());
         }
         for event in batch.events {
-            self.sanitize_event(event, &mut output)?;
+            if let Err(rejection) = self.sanitize_event(event, &mut output) {
+                self.last_rejection_stage = Some(rejection.stage);
+                return Err(rejection.code);
+            }
         }
         Ok(Bytes::from(output))
     }
@@ -148,6 +167,7 @@ impl ResponsesStreamingSanitizer {
     /// is no unterminated trailing data.
     pub(in crate::api) fn finish(&mut self) -> Result<Bytes, &'static str> {
         if !self.framer.is_complete() {
+            self.last_rejection_stage = Some("eof_incomplete");
             return Err("upstream_incomplete_response");
         }
         Ok(self.terminal_hold.release())
@@ -164,11 +184,17 @@ impl ResponsesStreamingSanitizer {
         self.terminal == Some(StreamTerminal::Failed)
     }
 
+    /// A static parser boundary suitable for operator logs and metric labels.
+    /// It never includes any upstream bytes, headers, identifiers, or errors.
+    pub(in crate::api) fn last_rejection_stage(&self) -> &'static str {
+        self.last_rejection_stage.unwrap_or("unknown")
+    }
+
     fn sanitize_event(
         &mut self,
         event: BoundedSseEvent,
         output: &mut Vec<u8>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), SanitizerRejection> {
         if event.is_line_ending_continuation {
             if self.forward_crlf_continuation {
                 // The framer emitted the preceding CR-terminated event at a
@@ -176,7 +202,8 @@ impl ResponsesStreamingSanitizer {
                 // but it must follow that forwarded CR exactly so headerless
                 // admission can retain a bare-CR prefix without swallowing a
                 // later CRLF pair.
-                self.append_output(output, &event.bytes)?;
+                self.append_output(output, &event.bytes)
+                    .map_err(|code| SanitizerRejection::new(code, "terminal_hold"))?;
             }
             self.forward_crlf_continuation = false;
             return Ok(());
@@ -184,7 +211,8 @@ impl ResponsesStreamingSanitizer {
         // A non-continuation event proves that a preceding CR was a complete
         // bare-CR separator. No later LF may be attached to it.
         self.forward_crlf_continuation = false;
-        let (event_name, data) = parse_sse_event(&event)?;
+        let (event_name, data) = parse_sse_event(&event)
+            .map_err(|code| SanitizerRejection::new(code, "sse_metadata"))?;
         if data.is_none()
             && event_name
                 .as_deref()
@@ -192,11 +220,17 @@ impl ResponsesStreamingSanitizer {
         {
             // A named lifecycle without a JSON envelope must never let the
             // downstream capture discover a forged terminal after emit.
-            return Err("upstream_invalid_response");
+            return Err(SanitizerRejection::new(
+                "upstream_invalid_response",
+                "lifecycle_missing_data",
+            ));
         }
         if data.as_deref() == Some(b"[DONE]") {
             if self.terminal.is_none() {
-                return Err("upstream_incomplete_response");
+                return Err(SanitizerRejection::new(
+                    "upstream_incomplete_response",
+                    "done_before_terminal",
+                ));
             }
             // Keep a standard DONE event's original CR/LF spelling. A named
             // provider event is normalized so its untrusted event name never
@@ -204,7 +238,8 @@ impl ResponsesStreamingSanitizer {
             if event_name.is_none() {
                 self.append_safe_sse_fields(&event, output)?;
             } else {
-                self.append_output(output, b"data: [DONE]\n\n")?;
+                self.append_output(output, b"data: [DONE]\n\n")
+                    .map_err(|code| SanitizerRejection::new(code, "terminal_hold"))?;
             }
             return Ok(());
         }
@@ -228,21 +263,30 @@ impl ResponsesStreamingSanitizer {
             }
             return Ok(());
         };
-        let value: Value = parse_unique_json(&data)?;
+        let value: Value =
+            parse_unique_json(&data).map_err(|code| SanitizerRejection::new(code, "json"))?;
         let payload_name = value
             .get("type")
             .and_then(Value::as_str)
-            .ok_or("upstream_invalid_response")?;
+            .ok_or_else(|| SanitizerRejection::new("upstream_invalid_response", "payload_type"))?;
         if payload_name != "error" && !payload_name.starts_with("response.") {
-            return Err("upstream_invalid_response");
+            return Err(SanitizerRejection::new(
+                "upstream_invalid_response",
+                "payload_type",
+            ));
         }
         if event_name
             .as_deref()
             .is_some_and(|event_name| event_name != payload_name)
         {
-            return Err("upstream_invalid_response");
+            return Err(SanitizerRejection::new(
+                "upstream_invalid_response",
+                "event_type_mismatch",
+            ));
         }
-        self.identity.observe(payload_name, &value)?;
+        self.identity
+            .observe(payload_name, &value)
+            .map_err(|code| SanitizerRejection::new(code, "response_identity"))?;
         self.saw_protocol_event = true;
         let failure = matches!(terminal_kind(payload_name), Some(StreamTerminal::Failed))
             || value.get("error").is_some_and(|error| !error.is_null())
@@ -256,7 +300,12 @@ impl ResponsesStreamingSanitizer {
         };
         match self.terminal {
             Some(StreamTerminal::Failed) => return Ok(()),
-            Some(StreamTerminal::Completed) => return Err("upstream_invalid_response"),
+            Some(StreamTerminal::Completed) => {
+                return Err(SanitizerRejection::new(
+                    "upstream_invalid_response",
+                    "post_terminal",
+                ));
+            }
             None => {}
         }
         self.terminal = terminal;
@@ -264,7 +313,8 @@ impl ResponsesStreamingSanitizer {
             self.terminal_hold.begin();
         }
         if failure {
-            self.append_output(output, SAFE_FAILURE_EVENT)?;
+            self.append_output(output, SAFE_FAILURE_EVENT)
+                .map_err(|code| SanitizerRejection::new(code, "terminal_hold"))?;
         } else {
             self.append_safe_sse_fields(&event, output)?;
         }
@@ -275,8 +325,9 @@ impl ResponsesStreamingSanitizer {
         &mut self,
         event: &BoundedSseEvent,
         output: &mut Vec<u8>,
-    ) -> Result<(), &'static str> {
-        self.append_output(output, &safe_sse_fields(event))?;
+    ) -> Result<(), SanitizerRejection> {
+        self.append_output(output, &safe_sse_fields(event))
+            .map_err(|code| SanitizerRejection::new(code, "terminal_hold"))?;
         self.forward_crlf_continuation = event.bytes.last() == Some(&b'\r');
         Ok(())
     }

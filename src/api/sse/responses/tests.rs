@@ -337,3 +337,44 @@ fn sanitizer_rejects_bad_ids_and_bare_lifecycle_events_before_terminal_delivery(
         Err("upstream_invalid_response")
     );
 }
+
+#[test]
+fn sanitizer_rejection_stages_are_static_and_content_free() {
+    let cases = [
+        (
+            b"data: {not-json}\n\n".as_slice(),
+            "upstream_invalid_response",
+            "json",
+        ),
+        (
+            b"data: {\"type\":\"not-responses\",\"provider_detail\":\"must-not-log\"}\n\n"
+                .as_slice(),
+            "upstream_invalid_response",
+            "payload_type",
+        ),
+        (
+            b"event: response.created\ndata: {\"type\":\"response.queued\",\"response\":{\"id\":\"resp-mismatch\"}}\n\n"
+                .as_slice(),
+            "upstream_invalid_response",
+            "event_type_mismatch",
+        ),
+        (
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"must-not-log\"}\n\n"
+                .as_slice(),
+            "upstream_invalid_response",
+            "response_identity",
+        ),
+    ];
+    for (stream, code, stage) in cases {
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
+        assert_eq!(sanitizer.push(stream), Err(code));
+        assert_eq!(sanitizer.last_rejection_stage(), stage);
+        assert!(!sanitizer.last_rejection_stage().contains("must-not-log"));
+    }
+
+    let mut eof = ResponsesStreamingSanitizer::default();
+    eof.push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-eof\"}}")
+        .unwrap();
+    assert_eq!(eof.finish(), Err("upstream_incomplete_response"));
+    assert_eq!(eof.last_rejection_stage(), "eof_incomplete");
+}

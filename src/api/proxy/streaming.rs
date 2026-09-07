@@ -179,6 +179,16 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         TerminalEof::Flush => continue,
                         TerminalEof::Complete => break,
                         TerminalEof::Error(error_code) => {
+                            let protocol_rejection_stage = responses_streaming_sanitizer
+                                .as_ref()
+                                .map_or("unknown", |sanitizer| sanitizer.last_rejection_stage());
+                            tracing::warn!(
+                                %request_id,
+                                %upstream_account_id,
+                                stage = error_code,
+                                protocol_rejection_stage,
+                                "Responses upstream stream rejected at EOF"
+                            );
                             transport_error = Some(error_code);
                             cancel_stream_archive(&archive_complete, &mut archive_sender);
                             let _ = tokio::time::timeout(
@@ -235,6 +245,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                             %request_id,
                                             %upstream_account_id,
                                             stage = error_code,
+                                            protocol_rejection_stage = sanitizer.last_rejection_stage(),
                                             "Responses upstream stream rejected by protocol sanitizer"
                                         );
                                         transport_error = Some(error_code);
