@@ -6982,9 +6982,8 @@ async fn invalid_stream_is_billed_failure(world: &mut TokenCenterWorld) {
 
 async fn wait_for_invalid_stream_terminal_request(world: &TokenCenterWorld) -> Value {
     let deadline = Instant::now() + Duration::from_secs(2);
-    let mut latest = Value::Null;
     loop {
-        latest = world
+        let latest = world
             .client
             .get(format!("{}/self/v1/requests", world.service_url))
             .bearer_auth(&world.current_key)
