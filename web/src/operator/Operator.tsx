@@ -11,6 +11,7 @@ import { CredentialsPage, PricingPage, ProvidersPage, RoutesPage, ServiceCredent
 import { GenerationsPage, OverviewPage, PluginsPage, UsagePage } from './pages/OperatorPages';
 import { RequestsPage } from './pages/RequestsPage';
 import { SessionsPage } from './pages/SessionsPage';
+import { SystemSettingsPage } from './pages/SystemSettingsPage';
 import { operatorRouteKeys, isOperatorRouteKey, type OperatorRouteKey } from './scope/operatorRoutes';
 import { TenantManager } from './TenantManager';
 import {
@@ -45,6 +46,7 @@ const navigation: Array<{ route: OperatorRouteKey; label: string; domId: string 
   { route: 'credentials', label: 'nav.credentials', domId: 'credentials' },
   { route: 'service-credentials', label: 'nav.services', domId: 'services' },
   { route: 'plugins', label: 'nav.plugins', domId: 'plugins' },
+  { route: 'settings', label: 'nav.settings', domId: 'settings' },
 ];
 
 function pageId(route: OperatorApplicationRoute) {
@@ -144,6 +146,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
         case 'credentials': page = <CredentialsPage {...pageProps} />; break;
         case 'service-credentials': page = <ServiceCredentialsPage {...pageProps} />; break;
         case 'plugins': page = <PluginsPage {...pageProps} />; break;
+        case 'settings': page = <SystemSettingsPage {...pageProps} />; break;
       }
     } else {
       const registered = pluginRegistry.pages.get(activeRoute);
