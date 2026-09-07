@@ -6,9 +6,12 @@ const builder = await readFile(new URL('../src/operator/TypedFilterBuilder.tsx',
 const requests = await readFile(new URL('../src/operator/pages/RequestsPage.tsx', import.meta.url), 'utf8');
 const settings = await readFile(new URL('../src/operator/pages/SystemSettingsPage.tsx', import.meta.url), 'utf8');
 
-test('professional request filters are schema-backed, previewed, and catalog-bound', () => {
+test('professional request filters are schema-backed, previewed, and bound to public model routes', () => {
   assert.match(builder, /role="dialog"/);
-  assert.match(builder, /\/internal\/v1\/upstream-models/);
+  assert.match(builder, /api<ModelRouteView\[\]>\(`\/internal\/v1\/model-routes\$\{query\}`/);
+  assert.match(builder, /route\.public_model\.trim\(\)/);
+  assert.match(builder, /protocols\.add\(route\.protocol\)/);
+  assert.doesNotMatch(builder, /\/internal\/v1\/upstream-models/);
   assert.match(builder, /setAssistantPlan/);
   assert.match(builder, /filter\.usePreview/);
   assert.match(requests, /\/internal\/v1\/requests\/query/);

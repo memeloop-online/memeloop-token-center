@@ -56,9 +56,11 @@ test('request filters hide stale rows and cursors while a replacement query is p
   assert.match(requestsPage, /if \(!older\) \{ setRequests\(\[\]\); setHasOlder\(false\); setDetail\(undefined\); \}/);
   assert.match(requestsPage, /setUpstreamError\(messageOf/);
   assert.match(requestsPage, /<TypedFilterBuilder ast=\{filters\} disabled=\{loading\} onApply=\{onApply\} onClear=\{onClear\} scope="requests" token=\{token\} tenant=\{tenant\} upstreams=\{upstreams\} \/>/);
-  assert.match(typedFilterBuilder, /const accountIds = useMemo\(\(\) => upstreams\.filter\(\(account\) => account\.status === 'active'\)\.map\(\(account\) => account\.id\)/);
-  assert.match(typedFilterBuilder, /const available = Boolean\(tenant && accountIds\.length\);/);
-  assert.match(typedFilterBuilder, /disabled=\{disabled \|\| !available\}/);
+  assert.match(typedFilterBuilder, /api<ModelRouteView\[\]>\(`\/internal\/v1\/model-routes\$\{query\}`/);
+  assert.match(typedFilterBuilder, /route\.public_model\.trim\(\)/);
+  assert.match(typedFilterBuilder, /protocols\.add\(route\.protocol\)/);
+  assert.doesNotMatch(typedFilterBuilder, /\/internal\/v1\/upstream-models/);
+  assert.match(typedFilterBuilder, /upstreams\.filter\(\(account\) => account\.status === 'active'\)\.map\(\(account\) => <option value=\{account\.id\}/);
 });
 
 test('pricing sync and resource refreshes retain only current operation results', () => {
