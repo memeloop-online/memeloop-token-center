@@ -31,9 +31,22 @@ pub(super) use bad_request::{
 pub(super) const DRIVER: &str = "openai-codex";
 pub(super) const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub(super) const RESPONSES_PATH: &str = "/responses";
-// Keep a fixed, audited Codex-compatible identity. It must not be supplied by
-// downstream callers or vary with arbitrary account configuration.
+// A conservative identity remains the fallback when a downstream caller is
+// not a recognized first-party Codex client. Native Codex may safely preserve
+// a narrowly-defined client identity below, but account configuration never
+// controls either header.
 pub(super) const USER_AGENT: &str = crate::oauth::managed::codex::USER_AGENT;
+const DEFAULT_ORIGINATOR: &str = "codex-tui";
+const MAX_CODEX_ORIGINATOR_BYTES: usize = 128;
+const MAX_CODEX_USER_AGENT_BYTES: usize = 512;
+const EXACT_CODEX_ORIGINATORS: &[&str] = &[
+    "codex_cli_rs",
+    "codex-tui",
+    "codex_vscode",
+    "codex_atlas",
+    "codex_chatgpt_desktop",
+    "codex-chrome-extension-sidepanel",
+];
 const MAX_OUTPUT_ITEMS: usize = 16_384;
 // A 400 is normally a client-side rejection and must not affect account
 // health. Keep the exceptional definite-rejection inspection deliberately
@@ -81,6 +94,95 @@ const PASSTHROUGH_HEADERS: &[&str] = &[
 ];
 const MAX_PASSTHROUGH_HEADER_BYTES: usize = 4 * 1024;
 const IMAGE_GENERATION_TOOL_TYPE: &str = "image_generation";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CodexClientIdentity<'a> {
+    originator: &'a str,
+    user_agent: &'a str,
+}
+
+/// Preserve only an auditable subset of the downstream Codex fingerprint.
+///
+/// These two fields are compatibility metadata for the fixed native Codex
+/// endpoint, not a general header-forwarding mechanism. In particular, no
+/// authentication, forwarding, browser, proxy, or response header can reach
+/// the upstream through this path.
+fn codex_client_identity(headers: &http::HeaderMap) -> CodexClientIdentity<'_> {
+    select_codex_client_identity(
+        single_visible_header(headers, "originator"),
+        single_visible_header(headers, header::USER_AGENT.as_str()),
+    )
+}
+
+fn select_codex_client_identity<'a>(
+    originator: Option<&'a str>,
+    user_agent: Option<&'a str>,
+) -> CodexClientIdentity<'a> {
+    match (originator, user_agent) {
+        (Some(originator), Some(user_agent))
+            if is_allowed_codex_originator(originator)
+                && is_matching_codex_user_agent(originator, user_agent) =>
+        {
+            CodexClientIdentity {
+                originator,
+                user_agent,
+            }
+        }
+        _ => CodexClientIdentity {
+            originator: DEFAULT_ORIGINATOR,
+            user_agent: USER_AGENT,
+        },
+    }
+}
+
+fn single_visible_header<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(value)
+}
+
+fn is_allowed_codex_originator(originator: &str) -> bool {
+    if !bounded_visible_ascii(originator, MAX_CODEX_ORIGINATOR_BYTES) {
+        return false;
+    }
+    EXACT_CODEX_ORIGINATORS.contains(&originator)
+        || originator
+            .strip_prefix("Codex ")
+            .is_some_and(is_bounded_codex_originator_suffix)
+}
+
+fn is_bounded_codex_originator_suffix(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && suffix.len() <= MAX_CODEX_ORIGINATOR_BYTES - "Codex ".len()
+        && suffix.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_' | b'.')
+        })
+}
+
+fn is_matching_codex_user_agent(originator: &str, user_agent: &str) -> bool {
+    if !bounded_visible_ascii(user_agent, MAX_CODEX_USER_AGENT_BYTES) {
+        return false;
+    }
+    let expected_prefix = match originator {
+        "codex_cli_rs" => "codex_cli_rs/",
+        "codex-tui" => "codex-tui/",
+        "codex_vscode" => "codex_vscode/",
+        "codex_atlas" => "codex_atlas/",
+        "codex_chatgpt_desktop" => "codex_chatgpt_desktop/",
+        "codex-chrome-extension-sidepanel" => "codex-chrome-extension-sidepanel/",
+        originator if originator.starts_with("Codex ") => "Codex ",
+        _ => return false,
+    };
+    user_agent.starts_with(expected_prefix)
+}
+
+fn bounded_visible_ascii(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b' '..=b'~'))
+}
 
 pub(super) struct PreparedCodexRequest {
     pub downstream_stream: bool,
@@ -432,6 +534,7 @@ pub(super) fn apply_wreq_wire_headers(
             "OpenAI Codex credential is missing authorization".into(),
         ));
     };
+    let client_identity = codex_client_identity(downstream_headers);
     let mut request = request.default_headers(false);
     for name in PASSTHROUGH_HEADERS {
         if let Some(value) = downstream_headers.get(*name) {
@@ -448,8 +551,8 @@ pub(super) fn apply_wreq_wire_headers(
         .header(header::ACCEPT, "text/event-stream")
         .header(header::ACCEPT_ENCODING, "identity")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("originator", "codex-tui")
-        .header(header::USER_AGENT, USER_AGENT)
+        .header("originator", client_identity.originator)
+        .header(header::USER_AGENT, client_identity.user_agent)
         .header("session-id", session_id)
         .header("chatgpt-account-id", account_id))
 }
@@ -905,6 +1008,41 @@ pub(super) fn parse_buffered_sse_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_codex_cli_identity_passes_through() {
+        let identity = select_codex_client_identity(
+            Some("codex_cli_rs"),
+            Some("codex_cli_rs/0.150.0 (Linux 6.8.0; x86_64) terminal/0.1"),
+        );
+        assert_eq!(identity.originator, "codex_cli_rs");
+        assert_eq!(
+            identity.user_agent,
+            "codex_cli_rs/0.150.0 (Linux 6.8.0; x86_64) terminal/0.1"
+        );
+    }
+
+    #[test]
+    fn unsafe_or_mismatched_client_identity_falls_back_to_the_conservative_default() {
+        let oversized_user_agent = format!("codex_cli_rs/{}", "x".repeat(512));
+        for (originator, user_agent) in [
+            ("codex-untrusted", "codex-untrusted/0.150.0"),
+            ("codex_cli_rs", "codex-tui/0.150.0"),
+            ("Codex \u{1f}Injected", "Codex client/0.150.0"),
+            ("codex_cli_rs", "codex_cli_rs/0.150.0\nInjected"),
+            ("codex_cli_rs", oversized_user_agent.as_str()),
+        ] {
+            let identity = select_codex_client_identity(Some(originator), Some(user_agent));
+            assert_eq!(
+                identity,
+                CodexClientIdentity {
+                    originator: DEFAULT_ORIGINATOR,
+                    user_agent: USER_AGENT,
+                },
+                "{originator:?} / {user_agent:?}"
+            );
+        }
+    }
 
     #[test]
     fn retryable_bad_request_classification_requires_known_transient_semantics() {
