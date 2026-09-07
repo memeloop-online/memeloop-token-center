@@ -350,7 +350,22 @@ fn sanitizer_rejection_stages_are_static_and_content_free() {
             b"data: {\"type\":\"not-responses\",\"provider_detail\":\"must-not-log\"}\n\n"
                 .as_slice(),
             "upstream_invalid_response",
-            "payload_type",
+            "payload_namespace",
+        ),
+        (
+            b"data: []\n\n".as_slice(),
+            "upstream_invalid_response",
+            "payload_shape",
+        ),
+        (
+            b"data: {}\n\n".as_slice(),
+            "upstream_invalid_response",
+            "payload_schema",
+        ),
+        (
+            b"data: {\"type\":false}\n\n".as_slice(),
+            "upstream_invalid_response",
+            "payload_schema",
         ),
         (
             b"event: response.created\ndata: {\"type\":\"response.queued\",\"response\":{\"id\":\"resp-mismatch\"}}\n\n"

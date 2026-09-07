@@ -265,14 +265,16 @@ impl ResponsesStreamingSanitizer {
         };
         let value: Value =
             parse_unique_json(&data).map_err(|code| SanitizerRejection::new(code, "json"))?;
-        let payload_name = value
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| SanitizerRejection::new("upstream_invalid_response", "payload_type"))?;
+        let payload = value
+            .as_object()
+            .ok_or_else(|| SanitizerRejection::new("upstream_invalid_response", "payload_shape"))?;
+        let payload_name = payload.get("type").and_then(Value::as_str).ok_or_else(|| {
+            SanitizerRejection::new("upstream_invalid_response", "payload_schema")
+        })?;
         if payload_name != "error" && !payload_name.starts_with("response.") {
             return Err(SanitizerRejection::new(
                 "upstream_invalid_response",
-                "payload_type",
+                "payload_namespace",
             ));
         }
         if event_name
