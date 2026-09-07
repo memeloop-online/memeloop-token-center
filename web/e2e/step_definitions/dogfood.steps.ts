@@ -231,7 +231,7 @@ Then('模型、客户端凭据、上游和状态过滤都作用于真实统计 A
   await clearUsageFilters(page);
   await applyUsageTypedFilter(page, 'key_id', async (row) => row.getByLabel('值', { exact: true }).fill(seed.clientKeyId), 'key_id', seed.clientKeyId, 51);
   await clearUsageFilters(page);
-  await applyUsageTypedFilter(page, 'upstream_account_id', async (row) => { await row.getByLabel('值', { exact: true }).selectOption(seed.upstreamId); }, 'upstream_account_id', seed.upstreamId, 51);
+  await applyUsageTypedFilter(page, 'upstream_account_id', async (row) => { await row.locator('[data-filter-field="upstream_account_id"] select').selectOption(seed.upstreamId); }, 'upstream_account_id', seed.upstreamId, 51);
   await clearUsageFilters(page);
   await applyUsageTypedFilter(page, 'status', async (row) => { await row.getByLabel('值', { exact: true }).selectOption('success'); }, 'status', 'success', 50);
   await clearUsageFilters(page);
