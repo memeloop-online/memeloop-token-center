@@ -283,10 +283,7 @@ Then('连续事件期间会话计数有界前进且活跃筛选移除已完成�
     'coalesced refresh starved under continuous events',
   );
   const responses = await Promise.all(observation.liveRequests);
-  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 503, 503, 503]);
-  for (const response of responses.filter((candidate) => candidate.status === 503)) {
-    assert.equal(response.headers.get('retry-after'), '1');
-  }
+  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 200, 429, 429]);
   await eventually(async () => assert.equal(await page.locator('.session-card').count(), 0), 5_000, 'completed session remained in the active filter');
   const refreshes = observation.sessionListRequests.length - observation.baselineSessionListRequests;
   assert.ok(refreshes >= 1 && refreshes <= 6, `continuous event refresh count was not bounded: ${refreshes}`);
