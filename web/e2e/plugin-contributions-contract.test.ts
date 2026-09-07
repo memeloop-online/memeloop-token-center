@@ -26,6 +26,7 @@ test('conflicting category labels fail closed instead of replacing registered na
   const registry = registerOperatorPluginContributions([...fixture.installed, fixture.conflicting_category]);
   const intelligence = registry.navigation.find((section) => section.id === 'intelligence');
   assert.equal(intelligence?.label, 'Intelligence');
+  assert.ok(registry.pages.has(pluginRouteKey('observability-suite', 'intelligence-signals')));
   assert.equal(registry.pages.has(pluginRouteKey('different-intelligence', 'conflicting-signals')), false);
 });
 

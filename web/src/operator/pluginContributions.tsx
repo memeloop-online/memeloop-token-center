@@ -78,22 +78,23 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
     }
   }
 
-  // Treat a stale or malicious manifest list exactly like the service does:
-  // do not let load order pick a winning route or new-category label.
+  // Keep the first validated category declaration as the owner of its label.
+  // A later conflicting declaration is rejected on its own; it must not erase
+  // the already-valid navigation section or replace its label.
   const routeCounts = new Map<string, number>();
   const categoryLabels = new Map<string, string>();
-  const conflictingCategories = new Set<string>();
+  const conflictingCategoryRoutes = new Set<PluginRouteKey>();
   for (const registered of sidebar) {
     const rawRoute = registered.contribution.route!;
     routeCounts.set(rawRoute, (routeCounts.get(rawRoute) ?? 0) + 1);
     if (coreCategories.has(registered.category.id)) continue;
     const label = registered.category.label!;
     const existing = categoryLabels.get(registered.category.id);
-    if (existing !== undefined && existing !== label) conflictingCategories.add(registered.category.id);
+    if (existing !== undefined && existing !== label) conflictingCategoryRoutes.add(registered.route);
     else categoryLabels.set(registered.category.id, label);
   }
   for (const registered of sidebar) {
-    if (routeCounts.get(registered.contribution.route!) !== 1 || conflictingCategories.has(registered.category.id) || pages.has(registered.route)) continue;
+    if (routeCounts.get(registered.contribution.route!) !== 1 || conflictingCategoryRoutes.has(registered.route) || pages.has(registered.route)) continue;
     pages.set(registered.route, registered);
     const existing = navigation.get(registered.category.id);
     if (existing) {
