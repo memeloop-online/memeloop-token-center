@@ -5,7 +5,7 @@ import type { Locator, Page } from 'playwright';
 import { baseURL, eventually, generationMockCounts, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
-import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertGenerationDownload, assertNoCount, assertNoHorizontalOverflow, assertValue, assertVisible, connectOperator, generationTableFor, metric, multimodalObservations, openTypedFilterDialog, operatorTrafficPanel, requestEventFixture, realtimeReconnectObservations, requireMultimodalObservation, sseRequestEvent, submitPortalGeneration, uuidPattern, waitForGenerationStatus } from './dogfood.support.js';
+import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertGenerationDownload, assertNoCount, assertNoHorizontalOverflow, assertValue, assertVisible, connectOperator, generationTableFor, metric, multimodalObservations, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, requestEventFixture, realtimeReconnectObservations, requireMultimodalObservation, sseRequestEvent, submitPortalGeneration, uuidPattern, waitForGenerationStatus } from './dogfood.support.js';
 
 const operatorGenerationCancellations = new WeakMap<DogfoodWorld, { status: number; body: { status: string } }>();
 
@@ -727,9 +727,8 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   const modelCondition = await addTypedFilterCondition(dialog, 'model');
   const routeCatalogResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/model-routes'
     && response.request().method() === 'GET');
-  await modelCondition.getByRole('button', { name: '选择模型', exact: true }).click();
+  const catalog = await openCatalogModelPicker(modelCondition);
   assert.equal((await routeCatalogResponse).status(), 200);
-  const catalog = modelCondition.getByRole('dialog', { name: '模型目录', exact: true });
   await catalog.getByLabel('搜索模型', { exact: true }).fill(model);
   await catalog.getByRole('option').filter({ hasText: model }).click();
   await dialog.getByRole('button', { name: '应用筛选', exact: true }).click();

@@ -246,7 +246,10 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
       {error && <div className="notice error" role="alert">{error}</div>}
       <div className="typed-filter-rows">{draft.conditions.map((condition, index) => {
         const field = fieldDefinition(condition.field); const operators = operatorsFor(field, scope);
-        return <div className="typed-filter-row" key={`${condition.field}-${index}`}>
+        // Field selection replaces only the value editor. Keeping the row
+        // mounted preserves the freshly selected field while React swaps that
+        // editor from a scalar input to the catalog picker.
+        return <div className="typed-filter-row" key={index}>
           <label><span>{t('filter.field')}</span><select value={condition.field} disabled={disabled} onChange={(event) => selectField(index, event.target.value as TypedFilterField)}>{visibleFields.map((option) => <option key={option.id} value={option.id}>{t(`filter.field.${option.id}`)}</option>)}</select></label>
           <label><span>{t('filter.operator')}</span><select value={condition.operator} disabled={disabled} onChange={(event) => { const operator = event.target.value as TypedFilterOperator; updateCondition(index, { operator, upper: operator === 'between' ? blankValue(field.type) : undefined }); }}>{operators.map((operator) => <option key={operator} value={operator}>{t(`filter.operator.${operator}`)}</option>)}</select></label>
           <label className="typed-filter-value"><span>{t('filter.value')}</span>{renderValue(condition, index, 'value')}</label>

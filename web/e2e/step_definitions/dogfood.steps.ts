@@ -6,7 +6,7 @@ import { baseURL, eventually, model, requestJson, runtime, tenant } from '../sup
 import type { DogfoodWorld } from '../support/world.js';
 
 import { appPreferenceControls, openAppRoute, openUsageDimension } from './app-route.support.js';
-import { addTypedFilterCondition, applyUsageTypedFilter, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertOperatorTenantScope, assertValue, assertVisible, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, openTypedFilterDialog, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, usageFilterBuilder, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
+import { addTypedFilterCondition, applyUsageTypedFilter, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertOperatorTenantScope, assertValue, assertVisible, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, openCatalogModelPicker, openTypedFilterDialog, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, usageFilterBuilder, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
 
 Given('dogfood 服务已有隔离租户、统一上游、请求记录和多模态价格', function () {
   runtime.requireSeed();
@@ -223,9 +223,8 @@ Then('模型、客户端凭据、上游和状态过滤都作用于真实统计 A
   await applyUsageTypedFilter(page, 'model', async (row) => {
     const routeCatalogResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/model-routes'
       && response.request().method() === 'GET');
-    await row.getByRole('button', { name: '选择模型', exact: true }).click();
+    const catalog = await openCatalogModelPicker(row);
     assert.equal((await routeCatalogResponse).status(), 200);
-    const catalog = row.getByRole('dialog', { name: '模型目录', exact: true });
     await catalog.getByLabel('搜索模型', { exact: true }).fill(model);
     await catalog.getByRole('option').filter({ hasText: model }).click();
   }, 'model', model, 51);
