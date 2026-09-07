@@ -2793,6 +2793,146 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/requests/query:
+    post:
+      tags: [Operator traffic]
+      operationId: queryOperatorRequestsWithTypedFilter
+      summary: Query bounded request history with a typed filter AST
+      description: |
+        The AST is an AND-only, allow-listed predicate tree. Field names and operators
+        are never used as SQL; the server maps them to indexed request columns and binds
+        all values. At most 12 predicates and 100 visible rows are accepted. This endpoint
+        cannot execute model-generated SQL or arbitrary query text.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TypedRequestQuery' }
+      responses:
+        '200':
+          description: Bounded request summaries, optionally with a keyset cursor envelope.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items: { $ref: '#/components/schemas/RequestSummary' }
+                  - $ref: '#/components/schemas/RequestListResponse'
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/filter-presets:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorFilterPresets
+      summary: Read named and recent typed filters for the authenticated operator identity
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters: [{ $ref: '#/components/parameters/TenantFilter' }]
+      responses:
+        '200':
+          description: Bounded per-operator saved filters. The service credential identity is the persistence principal.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FilterPresetState' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Operator traffic]
+      operationId: saveOperatorFilterPreset
+      summary: Save a named or recent typed filter for the authenticated operator identity
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PutFilterPresetRequest' }
+      responses:
+        '200':
+          description: Updated bounded preset state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FilterPresetState' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/filter-assistant/settings:
+    get:
+      tags: [Operator traffic]
+      operationId: getFilterAssistantSettings
+      summary: Read the tenant's filter-assistant model-route reference
+      description: The response contains only a stable model route UUID; it never returns an upstream or MTC credential secret.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters: [{ $ref: '#/components/parameters/TenantFilter' }]
+      responses:
+        '200':
+          description: Configured model route or null when the assistant is not configured.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/FilterAssistantSettings'
+                  - type: 'null'
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Operator traffic]
+      operationId: putFilterAssistantSettings
+      summary: Set the tenant's approved filter-assistant model route
+      description: Requires a global provider-write operator credential. The route must be enabled in the selected tenant and only its UUID is persisted.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PutFilterAssistantSettingsRequest' }
+      responses:
+        '200':
+          description: Stored secret-free setting.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FilterAssistantSettings' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/filter-assistant/plan:
+    post:
+      tags: [Operator traffic]
+      operationId: planFilterWithAssistant
+      summary: Turn natural-language filter intent into a reviewable typed AST
+      description: |
+        The assistant output is constrained to `TypedFilterAst` and is validated by the
+        same server-side allow-list as manual filters. It is a preview only: clients must
+        explicitly apply it through the typed request query endpoint. Raw SQL is neither
+        accepted nor returned.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FilterAssistantPlanRequest' }
+      responses:
+        '200':
+          description: Validated AST preview bound to the configured model route.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FilterAssistantPlan' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/sessions:
     get:
       tags: [Operator traffic]
@@ -6137,6 +6277,109 @@ components:
           oneOf:
             - $ref: '#/components/schemas/RequestListCursor'
             - type: 'null'
+    TypedFilterValue:
+      description: Tagged values prevent a filter field from receiving an implicit string or untyped JSON value.
+      oneOf:
+        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: text }, value: { type: string, minLength: 1, maxLength: 200 } } }
+        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: model }, value: { type: string, minLength: 1, maxLength: 200 } } }
+        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: protocol }, value: { type: string, enum: [openai, anthropic, openai-image, generation] } } }
+        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: status }, value: { type: string, enum: [success, error, pending] } } }
+        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: uuid }, value: { type: string, format: uuid } } }
+        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: integer }, value: { type: integer, format: int64 } } }
+        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: timestamp }, value: { type: integer, format: int64, minimum: 0 } } }
+        - { type: object, additionalProperties: false, required: [type, value], properties: { type: { const: money_micros }, value: { type: integer, format: int64 } } }
+    TypedFilterCondition:
+      type: object
+      additionalProperties: false
+      required: [field, operator, value]
+      properties:
+        field:
+          type: string
+          enum: [created_at, key_id, model, protocol, status, error_code, upstream_account_id, route_id, duration_ms, cost_micros, key_alias, principal]
+        operator:
+          type: string
+          enum: [equals, not_equals, contains, greater_than, greater_than_or_equal, less_than, less_than_or_equal, between]
+        value: { $ref: '#/components/schemas/TypedFilterValue' }
+        upper:
+          oneOf:
+            - $ref: '#/components/schemas/TypedFilterValue'
+            - type: 'null'
+      description: The server validates each field/value/operator combination; `upper` is accepted only for `between`.
+    TypedFilterAst:
+      type: object
+      additionalProperties: false
+      required: [logical_operator, conditions]
+      properties:
+        logical_operator: { type: string, const: and }
+        conditions:
+          type: array
+          maxItems: 12
+          items: { $ref: '#/components/schemas/TypedFilterCondition' }
+    TypedRequestQuery:
+      type: object
+      additionalProperties: false
+      required: [ast]
+      properties:
+        tenant_external_id: { type: [string, 'null'], maxLength: 200 }
+        limit: { type: integer, minimum: 1, maximum: 100, default: 100 }
+        paged: { type: boolean, default: true }
+        before_created_at: { type: [integer, 'null'], format: int64 }
+        before_id: { type: [string, 'null'], format: uuid }
+        ast: { $ref: '#/components/schemas/TypedFilterAst' }
+    NamedFilterPreset:
+      type: object
+      additionalProperties: false
+      required: [name, ast, updated_at]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        ast: { $ref: '#/components/schemas/TypedFilterAst' }
+        updated_at: { type: integer, format: int64 }
+    FilterPresetState:
+      type: object
+      additionalProperties: false
+      required: [named, recent]
+      properties:
+        named: { type: array, maxItems: 20, items: { $ref: '#/components/schemas/NamedFilterPreset' } }
+        recent: { type: array, maxItems: 8, items: { $ref: '#/components/schemas/TypedFilterAst' } }
+    PutFilterPresetRequest:
+      type: object
+      additionalProperties: false
+      required: [ast]
+      properties:
+        tenant_external_id: { type: [string, 'null'], maxLength: 200 }
+        name: { type: [string, 'null'], maxLength: 80 }
+        ast: { $ref: '#/components/schemas/TypedFilterAst' }
+    FilterAssistantSettings:
+      type: object
+      additionalProperties: false
+      required: [model_route_id, updated_at]
+      properties:
+        model_route_id:
+          type: string
+          format: uuid
+          description: Stable enabled MTC model-route reference; no credential material is returned.
+        updated_at: { type: integer, format: int64 }
+    PutFilterAssistantSettingsRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, model_route_id]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        model_route_id: { type: string, format: uuid }
+    FilterAssistantPlanRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, prompt]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        prompt: { type: string, minLength: 1, maxLength: 2000 }
+    FilterAssistantPlan:
+      type: object
+      additionalProperties: false
+      required: [model_route_id, ast]
+      properties:
+        model_route_id: { type: string, format: uuid }
+        ast: { $ref: '#/components/schemas/TypedFilterAst' }
     RequestSessionContext:
       type: object
       additionalProperties: false

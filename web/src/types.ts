@@ -30,6 +30,34 @@ export interface RequestListResponse {
   next_cursor: RequestListCursor | null;
 }
 
+export type TypedFilterField = 'created_at' | 'key_id' | 'model' | 'protocol' | 'status' | 'error_code'
+  | 'upstream_account_id' | 'route_id' | 'duration_ms' | 'cost_micros' | 'key_alias' | 'principal';
+export type TypedFilterOperator = 'equals' | 'not_equals' | 'contains' | 'greater_than'
+  | 'greater_than_or_equal' | 'less_than' | 'less_than_or_equal' | 'between';
+export type TypedFilterValue =
+  | { type: 'text'; value: string }
+  | { type: 'model'; value: string }
+  | { type: 'protocol'; value: 'openai' | 'anthropic' | 'openai-image' | 'generation' }
+  | { type: 'status'; value: 'success' | 'error' | 'pending' }
+  | { type: 'uuid'; value: string }
+  | { type: 'integer'; value: number }
+  | { type: 'timestamp'; value: number }
+  | { type: 'money_micros'; value: number };
+export interface TypedFilterCondition {
+  field: TypedFilterField;
+  operator: TypedFilterOperator;
+  value: TypedFilterValue;
+  upper?: TypedFilterValue;
+}
+export interface TypedFilterAst {
+  logical_operator: 'and';
+  conditions: TypedFilterCondition[];
+}
+export interface NamedFilterPreset { name: string; ast: TypedFilterAst; updated_at: number }
+export interface FilterPresetState { named: NamedFilterPreset[]; recent: TypedFilterAst[] }
+export interface FilterAssistantSettings { model_route_id: string; updated_at: number }
+export interface FilterAssistantPlan { model_route_id: string; ast: TypedFilterAst }
+
 export interface RequestSessionContext {
   session_id: string | null;
   association: 'confirmed' | 'unlinked';

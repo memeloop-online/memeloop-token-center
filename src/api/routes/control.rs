@@ -25,6 +25,19 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             patch(set_service_token_status),
         )
         .route("/internal/v1/provider-types", get(provider_types))
+        .route("/internal/v1/requests/query", post(typed_internal_requests))
+        .route(
+            "/internal/v1/filter-presets",
+            get(get_filter_presets).post(put_filter_preset),
+        )
+        .route(
+            "/internal/v1/filter-assistant/settings",
+            get(get_filter_assistant_settings).put(put_filter_assistant_settings),
+        )
+        .route(
+            "/internal/v1/filter-assistant/plan",
+            post(plan_filter_with_assistant),
+        )
         .route("/internal/v1/tenants", get(list_tenants))
         .route(
             "/internal/v1/tenant-management",

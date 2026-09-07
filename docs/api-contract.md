@@ -67,6 +67,20 @@ Request search accepts bounded time intervals, stable keyset cursors and exact
 filters for credential, model, protocol, status, error, account, route, duration
 and cost. Statistics use the same dimension rules and bounded intervals.
 
+### Typed operator filters
+
+`POST /internal/v1/requests/query` accepts a bounded, `and`-only typed-filter
+AST. Fields, operators, and tagged value kinds are allow-listed; the query
+adapter chooses fixed indexed columns and binds every value. It never accepts
+SQL, a column name, an expression, or a raw query fragment. The endpoint remains
+tenant/key scoped, limits pages to 100 rows, and uses a look-ahead keyset cursor.
+
+Saved and recent filters are per service identity and tenant. The filter assistant
+returns the same validated AST for an explicit browser preview; it cannot execute
+model-generated SQL. A tenant administrator selects an enabled MTC model-route
+reference at `/internal/v1/filter-assistant/settings`; only that UUID and update
+time are stored or returned, never a credential secret.
+
 Conversation APIs remain credential-scoped. They expose explicit session and
 execution declarations, structured parent relations, bounded inferred edges and
 confidence without inferring absent human or agent information. Archive detail may

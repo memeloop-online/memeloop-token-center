@@ -1,4 +1,8 @@
 use super::super::*;
+use crate::filter_ast::{
+    TypedFilterAst, TypedFilterField, TypedFilterOperator, TypedFilterValue, filter_integer,
+    filter_text, filter_uuid, search_contains,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RequestListBind {
@@ -68,6 +72,9 @@ pub struct RequestListFilter {
     pub key_alias: Option<String>,
     /// Operator-only, case-insensitive prefix search over the tenant principal identifier.
     pub principal: Option<String>,
+    /// Strict, schema-backed predicates submitted by the professional filter
+    /// builder.  They are adapted through a closed SQL-column allow-list.
+    pub typed_ast: Option<TypedFilterAst>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -474,14 +481,14 @@ fn push_operator_identity_joins(
     // Tenant isolation is enforced directly on the request/generation source below. These
     // relations only provide searchable identity metadata; joining them on the default path
     // prevents PostgreSQL from stopping after the first page in the ordered source index.
-    if filter.key_alias.is_some() || filter.principal.is_some() {
+    if filter_uses_key_alias(filter) || filter_uses_principal(filter) {
         query.push(" JOIN key_records k ON k.id = ");
         query.push(source_alias);
         query.push(".key_id AND k.tenant_id = ");
         query.push(source_alias);
         query.push(".tenant_id");
     }
-    if filter.principal.is_some() {
+    if filter_uses_principal(filter) {
         query.push(" JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id");
     }
 }
@@ -552,6 +559,7 @@ fn push_request_record_filters(
         query.bind_i64(max_cost_micros);
     }
     push_operator_identity_filters(query, filter);
+    push_typed_filters(query, "r", false, filter);
 }
 
 fn push_generation_job_filters(
@@ -612,6 +620,207 @@ fn push_generation_job_filters(
         query.bind_i64(max_cost_micros);
     }
     push_operator_identity_filters(query, filter);
+    push_typed_filters(query, "g", true, filter);
+}
+
+/// Adds only predicates whose column text is selected in this function.  All
+/// caller-originated values continue through `bind_*`; adding a typed field is
+/// therefore a deliberate query-plan review rather than a dynamic-SQL change.
+fn push_typed_filters(
+    query: &mut PortableRequestListQuery,
+    source_alias: &str,
+    generation: bool,
+    filter: &RequestListFilter,
+) {
+    let Some(ast) = filter.typed_ast.as_ref() else {
+        return;
+    };
+    for condition in &ast.conditions {
+        let column = match condition.field {
+            TypedFilterField::CreatedAt => format!("{source_alias}.created_at"),
+            TypedFilterField::KeyId => format!("{source_alias}.key_id"),
+            TypedFilterField::Model => {
+                if generation {
+                    format!("{source_alias}.public_model")
+                } else {
+                    format!("{source_alias}.model")
+                }
+            }
+            TypedFilterField::Protocol => {
+                if generation {
+                    "'generation'".to_owned()
+                } else {
+                    format!("{source_alias}.protocol")
+                }
+            }
+            TypedFilterField::Status => {
+                push_typed_status_filter(
+                    query,
+                    source_alias,
+                    generation,
+                    condition.operator,
+                    &condition.value,
+                );
+                continue;
+            }
+            TypedFilterField::ErrorCode => format!("{source_alias}.error_code"),
+            TypedFilterField::UpstreamAccountId => format!("{source_alias}.upstream_account_id"),
+            // Generation jobs never have a model-route record.  SQL NULL
+            // semantics for `!=` are easy to get subtly wrong, so any route
+            // predicate explicitly excludes this source branch.
+            TypedFilterField::RouteId if generation => {
+                query.push(" AND 1 = 0");
+                continue;
+            }
+            TypedFilterField::RouteId => format!("{source_alias}.model_route_id"),
+            TypedFilterField::DurationMs => {
+                if generation {
+                    format!("({source_alias}.completed_at - {source_alias}.created_at)")
+                } else {
+                    format!("{source_alias}.duration_ms")
+                }
+            }
+            TypedFilterField::CostMicros => format!("{source_alias}.cost_micros"),
+            TypedFilterField::KeyAlias => "k.alias".to_owned(),
+            TypedFilterField::Principal => "p.external_id".to_owned(),
+        };
+        push_typed_predicate(
+            query,
+            &column,
+            condition.operator,
+            &condition.value,
+            condition.upper.as_ref(),
+        );
+    }
+}
+
+fn push_typed_status_filter(
+    query: &mut PortableRequestListQuery,
+    source_alias: &str,
+    generation: bool,
+    operator: TypedFilterOperator,
+    value: &TypedFilterValue,
+) {
+    let status = filter_text(value);
+    let expression = if generation {
+        match (operator, status) {
+            (TypedFilterOperator::Equals, "success") => {
+                format!("{source_alias}.status = 'succeeded'")
+            }
+            (TypedFilterOperator::Equals, "error") => {
+                format!("{source_alias}.status IN ('failed', 'cancelled')")
+            }
+            (TypedFilterOperator::Equals, "pending") => {
+                format!("{source_alias}.status IN ('queued', 'running')")
+            }
+            (TypedFilterOperator::NotEquals, "success") => {
+                format!("{source_alias}.status <> 'succeeded'")
+            }
+            (TypedFilterOperator::NotEquals, "error") => {
+                format!("{source_alias}.status NOT IN ('failed', 'cancelled')")
+            }
+            (TypedFilterOperator::NotEquals, "pending") => {
+                format!("{source_alias}.status NOT IN ('queued', 'running')")
+            }
+            _ => unreachable!("the AST operator/value matrix is validated before SQL adaptation"),
+        }
+    } else {
+        match (operator, status) {
+            (TypedFilterOperator::Equals, "success") => {
+                format!("{source_alias}.status_code BETWEEN 200 AND 399")
+            }
+            (TypedFilterOperator::Equals, "error") => format!("{source_alias}.status_code >= 400"),
+            (TypedFilterOperator::Equals, "pending") => {
+                format!("{source_alias}.status_code IS NULL")
+            }
+            (TypedFilterOperator::NotEquals, "success") => format!(
+                "({source_alias}.status_code IS NULL OR {source_alias}.status_code NOT BETWEEN 200 AND 399)"
+            ),
+            (TypedFilterOperator::NotEquals, "error") => {
+                format!("({source_alias}.status_code IS NULL OR {source_alias}.status_code < 400)")
+            }
+            (TypedFilterOperator::NotEquals, "pending") => {
+                format!("{source_alias}.status_code IS NOT NULL")
+            }
+            _ => unreachable!("the AST operator/value matrix is validated before SQL adaptation"),
+        }
+    };
+    query.push(" AND ");
+    query.push(&expression);
+}
+
+fn push_typed_predicate(
+    query: &mut PortableRequestListQuery,
+    column: &str,
+    operator: TypedFilterOperator,
+    value: &TypedFilterValue,
+    upper: Option<&TypedFilterValue>,
+) {
+    query.push(" AND ");
+    match operator {
+        TypedFilterOperator::Equals => {
+            query.push(column);
+            query.push(" = ");
+            push_typed_value(query, value);
+        }
+        TypedFilterOperator::NotEquals => {
+            query.push(column);
+            query.push(" <> ");
+            push_typed_value(query, value);
+        }
+        TypedFilterOperator::Contains => {
+            query.push("LOWER(");
+            query.push(column);
+            query.push(") LIKE ");
+            query.bind_text(search_contains(filter_text(value)));
+            query.push(r" ESCAPE '\'");
+        }
+        TypedFilterOperator::GreaterThan => {
+            query.push(column);
+            query.push(" > ");
+            push_typed_value(query, value);
+        }
+        TypedFilterOperator::GreaterThanOrEqual => {
+            query.push(column);
+            query.push(" >= ");
+            push_typed_value(query, value);
+        }
+        TypedFilterOperator::LessThan => {
+            query.push(column);
+            query.push(" < ");
+            push_typed_value(query, value);
+        }
+        TypedFilterOperator::LessThanOrEqual => {
+            query.push(column);
+            query.push(" <= ");
+            push_typed_value(query, value);
+        }
+        TypedFilterOperator::Between => {
+            query.push(column);
+            query.push(" BETWEEN ");
+            push_typed_value(query, value);
+            query.push(" AND ");
+            push_typed_value(
+                query,
+                upper.expect("between values are validated before SQL adaptation"),
+            );
+        }
+    }
+}
+
+fn push_typed_value(query: &mut PortableRequestListQuery, value: &TypedFilterValue) {
+    match value {
+        TypedFilterValue::Text(_) | TypedFilterValue::Model(_) | TypedFilterValue::Protocol(_) => {
+            query.bind_text(filter_text(value));
+        }
+        TypedFilterValue::Uuid(_) => query.bind_text(filter_uuid(value).to_string()),
+        TypedFilterValue::Integer(_)
+        | TypedFilterValue::Timestamp(_)
+        | TypedFilterValue::MoneyMicros(_) => {
+            query.bind_i64(filter_integer(value));
+        }
+        TypedFilterValue::Status(_) => unreachable!("status predicates use a closed SQL mapping"),
+    }
 }
 
 fn push_keyset_cursor(
@@ -653,8 +862,28 @@ fn push_operator_identity_filters(
     }
 }
 
+fn filter_uses_key_alias(filter: &RequestListFilter) -> bool {
+    filter.key_alias.is_some()
+        || filter
+            .typed_ast
+            .as_ref()
+            .is_some_and(|ast| ast.uses_field(TypedFilterField::KeyAlias))
+}
+
+fn filter_uses_principal(filter: &RequestListFilter) -> bool {
+    filter.principal.is_some()
+        || filter
+            .typed_ast
+            .as_ref()
+            .is_some_and(|ast| ast.uses_field(TypedFilterField::Principal))
+}
+
 fn generation_branch_can_match(filter: &RequestListFilter) -> bool {
     filter.route_id.is_none()
+        && !filter
+            .typed_ast
+            .as_ref()
+            .is_some_and(|ast| ast.uses_field(TypedFilterField::RouteId))
         && filter
             .protocol
             .as_deref()
@@ -814,6 +1043,9 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
 }
 
 fn validate_request_filter(filter: &RequestListFilter) -> Result<(), AppError> {
+    if let Some(ast) = filter.typed_ast.as_ref() {
+        ast.validate()?;
+    }
     if filter
         .status
         .as_deref()

@@ -24,6 +24,30 @@ pub struct UpdateModelRouteInput {
 }
 
 impl Database {
+    /// Validate the stable route reference used by the filter assistant without
+    /// reading its upstream credential material.  This is intentionally a
+    /// narrow existence/authorization check: callers receive only the route
+    /// UUID they configured, never a secret or decrypted provider metadata.
+    pub async fn require_enabled_model_route(
+        &self,
+        tenant_external_id: &str,
+        route_id: Uuid,
+    ) -> Result<(), AppError> {
+        let present = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2 AND r.enabled = 1",
+        )
+        .bind(route_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some();
+        if present {
+            Ok(())
+        } else {
+            Err(AppError::NotFound)
+        }
+    }
+
     pub async fn list_model_routes(
         &self,
         tenant_external_id: Option<&str>,

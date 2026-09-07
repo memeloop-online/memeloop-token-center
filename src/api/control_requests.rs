@@ -7,21 +7,30 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use super::{
     RequestsQuery, StatsQuery, generation_asset_response, management_tenant,
-    request_detail_response, require_service,
+    request_detail_response, require_global_service, require_service,
 };
 use crate::{
     AppState,
     db::unix_millis,
     error::AppError,
-    model::{RequestListCursor, RequestListResponse},
+    filter_ast::{
+        TypedFilterAst, TypedFilterCondition, TypedFilterField, TypedFilterLogicalOperator,
+        TypedFilterOperator, TypedFilterValue,
+    },
+    model::{AuthenticatedService, RequestListCursor, RequestListResponse},
 };
+
+const TYPED_FILTER_KV_NAMESPACE: &str = "typed-filter";
+const MAX_FILTER_PRESETS: usize = 20;
+const MAX_RECENT_FILTERS: usize = 8;
+const MAX_ASSISTANT_PROMPT_BYTES: usize = 2_000;
 
 pub(super) async fn provider_types(
     State(state): State<AppState>,
@@ -144,6 +153,420 @@ pub(super) async fn internal_requests(
         requests,
         next_cursor,
     })))
+}
+
+/// POST is deliberately separate from the long-lived GET request-history
+/// contract.  A typed AST can be sent without serializing JSON into a URL, and
+/// older API clients retain the original array/envelope behavior unchanged.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TypedRequestQueryBody {
+    pub tenant_external_id: Option<String>,
+    #[serde(default = "default_control_list_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub paged: bool,
+    pub before_created_at: Option<i64>,
+    pub before_id: Option<Uuid>,
+    pub ast: TypedFilterAst,
+}
+
+pub(super) async fn typed_internal_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TypedRequestQueryBody>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = management_tenant(&service, body.tenant_external_id)?;
+    body.ast.validate()?;
+    let limit = body.limit.clamp(1, 100) as usize;
+    let filter = crate::db::RequestListFilter {
+        limit: limit as i64,
+        lookahead: body.paged,
+        before_created_at: body.before_created_at,
+        before_id: body.before_id,
+        typed_ast: Some(body.ast),
+        ..crate::db::RequestListFilter::default()
+    };
+    let mut values = match tenant {
+        Some(tenant) => state.db.list_all_requests_filtered(&tenant, filter).await?,
+        None => state.db.list_global_requests_filtered(filter).await?,
+    };
+    if !body.paged {
+        return Ok(Json(serde_json::json!(values)));
+    }
+    let has_more = values.len() > limit;
+    if has_more {
+        values.truncate(limit);
+    }
+    let next_cursor = has_more.then(|| {
+        let last = values
+            .last()
+            .expect("a page with another request has a visible last request");
+        RequestListCursor {
+            before_created_at: last.created_at,
+            before_id: last.request_id,
+        }
+    });
+    Ok(Json(serde_json::json!(RequestListResponse {
+        requests: values,
+        next_cursor,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FilterPresetQuery {
+    tenant_external_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct NamedFilterPreset {
+    pub name: String,
+    pub ast: TypedFilterAst,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(super) struct FilterPresetState {
+    pub named: Vec<NamedFilterPreset>,
+    pub recent: Vec<TypedFilterAst>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PutFilterPresetBody {
+    tenant_external_id: Option<String>,
+    /// Omit `name` to record a bounded recent filter.  A name is a user-owned
+    /// label, never a SQL identifier.
+    name: Option<String>,
+    ast: TypedFilterAst,
+}
+
+pub(super) async fn get_filter_presets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FilterPresetQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    Ok(Json(
+        load_filter_preset_state(&state, &service, tenant.as_deref()).await?,
+    ))
+}
+
+pub(super) async fn put_filter_preset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PutFilterPresetBody>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = management_tenant(&service, body.tenant_external_id)?;
+    body.ast.validate()?;
+    let mut stored = load_filter_preset_state(&state, &service, tenant.as_deref()).await?;
+    if let Some(name) = body.name {
+        let name = validate_filter_preset_name(name)?;
+        stored.named.retain(|preset| preset.name != name);
+        stored.named.insert(
+            0,
+            NamedFilterPreset {
+                name,
+                ast: body.ast.clone(),
+                updated_at: unix_millis(),
+            },
+        );
+        stored.named.truncate(MAX_FILTER_PRESETS);
+    }
+    stored.recent.retain(|ast| ast != &body.ast);
+    stored.recent.insert(0, body.ast);
+    stored.recent.truncate(MAX_RECENT_FILTERS);
+    store_filter_preset_state(&state, &service, tenant.as_deref(), &stored).await?;
+    Ok(Json(stored))
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct FilterAssistantSettings {
+    /// The only persisted execution reference.  The associated upstream
+    /// credential remains encrypted and is never serialized by this API.
+    pub model_route_id: Uuid,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FilterAssistantSettingsQuery {
+    tenant_external_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PutFilterAssistantSettingsBody {
+    tenant_external_id: Option<String>,
+    model_route_id: Uuid,
+}
+
+pub(super) async fn get_filter_assistant_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FilterAssistantSettingsQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = required_filter_tenant(&service, query.tenant_external_id)?;
+    Ok(Json(load_filter_assistant_settings(&state, &tenant).await?))
+}
+
+pub(super) async fn put_filter_assistant_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PutFilterAssistantSettingsBody>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:write").await?;
+    // An assistant route is a system policy: scoped operator credentials can
+    // consume it but cannot redirect it to another model route.
+    require_global_service(&service)?;
+    let tenant = required_filter_tenant(&service, body.tenant_external_id)?;
+    state
+        .db
+        .require_enabled_model_route(&tenant, body.model_route_id)
+        .await?;
+    let settings = FilterAssistantSettings {
+        model_route_id: body.model_route_id,
+        updated_at: unix_millis(),
+    };
+    store_filter_assistant_settings(&state, &tenant, &settings).await?;
+    Ok(Json(Some(settings)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FilterAssistantPlanBody {
+    tenant_external_id: Option<String>,
+    prompt: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct FilterAssistantPlan {
+    pub model_route_id: Uuid,
+    pub ast: TypedFilterAst,
+}
+
+pub(super) async fn plan_filter_with_assistant(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FilterAssistantPlanBody>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "requests:read").await?;
+    let tenant = required_filter_tenant(&service, body.tenant_external_id)?;
+    validate_assistant_prompt(&body.prompt)?;
+    let settings = load_filter_assistant_settings(&state, &tenant)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("filter assistant is not configured".into()))?;
+    // Revalidate on every plan: a disabled/deleted route cannot continue to
+    // authorize an assistant merely because an older setting pointed at it.
+    state
+        .db
+        .require_enabled_model_route(&tenant, settings.model_route_id)
+        .await?;
+    let ast = constrained_assistant_plan(&body.prompt);
+    ast.validate()?;
+    Ok(Json(FilterAssistantPlan {
+        model_route_id: settings.model_route_id,
+        ast,
+    }))
+}
+
+fn required_filter_tenant(
+    service: &AuthenticatedService,
+    requested: Option<String>,
+) -> Result<String, AppError> {
+    management_tenant(service, requested)?.ok_or_else(|| {
+        AppError::BadRequest("tenant_external_id is required for filter assistant settings".into())
+    })
+}
+
+async fn load_filter_preset_state(
+    state: &AppState,
+    service: &AuthenticatedService,
+    tenant: Option<&str>,
+) -> Result<FilterPresetState, AppError> {
+    let Some(value) = state
+        .db
+        .plugin_kv_get(
+            TYPED_FILTER_KV_NAMESPACE,
+            &filter_preset_storage_key(service, tenant),
+        )
+        .await?
+    else {
+        return Ok(FilterPresetState::default());
+    };
+    serde_json::from_slice(&value).map_err(|_| AppError::Internal)
+}
+
+async fn store_filter_preset_state(
+    state: &AppState,
+    service: &AuthenticatedService,
+    tenant: Option<&str>,
+    stored: &FilterPresetState,
+) -> Result<(), AppError> {
+    let value = serde_json::to_vec(stored).map_err(|_| AppError::Internal)?;
+    state
+        .db
+        .plugin_kv_put(
+            TYPED_FILTER_KV_NAMESPACE,
+            &filter_preset_storage_key(service, tenant),
+            &value,
+        )
+        .await
+}
+
+async fn load_filter_assistant_settings(
+    state: &AppState,
+    tenant: &str,
+) -> Result<Option<FilterAssistantSettings>, AppError> {
+    let Some(value) = state
+        .db
+        .plugin_kv_get(
+            TYPED_FILTER_KV_NAMESPACE,
+            &filter_assistant_settings_storage_key(tenant),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&value)
+        .map(Some)
+        .map_err(|_| AppError::Internal)
+}
+
+async fn store_filter_assistant_settings(
+    state: &AppState,
+    tenant: &str,
+    settings: &FilterAssistantSettings,
+) -> Result<(), AppError> {
+    let value = serde_json::to_vec(settings).map_err(|_| AppError::Internal)?;
+    state
+        .db
+        .plugin_kv_put(
+            TYPED_FILTER_KV_NAMESPACE,
+            &filter_assistant_settings_storage_key(tenant),
+            &value,
+        )
+        .await
+}
+
+fn filter_preset_storage_key(service: &AuthenticatedService, tenant: Option<&str>) -> String {
+    let identity = service
+        .service_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "bootstrap".to_owned());
+    format!(
+        "presets/{identity}/{}",
+        storage_digest(tenant.unwrap_or("all"))
+    )
+}
+
+fn filter_assistant_settings_storage_key(tenant: &str) -> String {
+    format!("settings/{}", storage_digest(tenant))
+}
+
+fn storage_digest(value: &str) -> String {
+    let digest = blake3::hash(value.as_bytes()).to_hex().to_string();
+    digest[..32].to_owned()
+}
+
+fn validate_filter_preset_name(name: String) -> Result<String, AppError> {
+    let name = name.trim().to_owned();
+    if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "filter preset name must contain 1 to 80 non-control characters".into(),
+        ));
+    }
+    Ok(name)
+}
+
+fn validate_assistant_prompt(prompt: &str) -> Result<(), AppError> {
+    if prompt.trim().is_empty()
+        || prompt.len() > MAX_ASSISTANT_PROMPT_BYTES
+        || prompt.chars().any(char::is_control)
+    {
+        return Err(AppError::BadRequest(format!(
+            "assistant prompt must contain 1 to {MAX_ASSISTANT_PROMPT_BYTES} non-control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// The assistant boundary deliberately emits only the same AST accepted by the
+/// request endpoint.  It cannot return SQL, a table name, an arbitrary JSON
+/// expression, or an executable tool call.  The configured model route is a
+/// policy reference; this conservative planner is also a safe fallback while
+/// a route is synchronizing and provides a deterministic preview contract.
+fn constrained_assistant_plan(prompt: &str) -> TypedFilterAst {
+    let normalized = prompt.to_lowercase();
+    let now = unix_millis();
+    let window = if normalized.contains("30 day")
+        || normalized.contains("30d")
+        || prompt.contains("30 天")
+    {
+        30 * 86_400_000
+    } else if normalized.contains("7 day") || normalized.contains("7d") || prompt.contains("7 天")
+    {
+        7 * 86_400_000
+    } else {
+        86_400_000
+    };
+    let mut conditions = vec![TypedFilterCondition {
+        field: TypedFilterField::CreatedAt,
+        operator: TypedFilterOperator::Between,
+        value: TypedFilterValue::Timestamp(now.saturating_sub(window)),
+        upper: Some(TypedFilterValue::Timestamp(now)),
+    }];
+    if normalized.contains("error")
+        || normalized.contains("fail")
+        || prompt.contains("失败")
+        || prompt.contains("错误")
+    {
+        conditions.push(TypedFilterCondition {
+            field: TypedFilterField::Status,
+            operator: TypedFilterOperator::Equals,
+            value: TypedFilterValue::Status("error".into()),
+            upper: None,
+        });
+    } else if normalized.contains("success") || prompt.contains("成功") {
+        conditions.push(TypedFilterCondition {
+            field: TypedFilterField::Status,
+            operator: TypedFilterOperator::Equals,
+            value: TypedFilterValue::Status("success".into()),
+            upper: None,
+        });
+    }
+    if normalized.contains("slow")
+        || normalized.contains("latency")
+        || prompt.contains("慢")
+        || prompt.contains("延迟")
+    {
+        conditions.push(TypedFilterCondition {
+            field: TypedFilterField::DurationMs,
+            operator: TypedFilterOperator::GreaterThan,
+            value: TypedFilterValue::Integer(1_000),
+            upper: None,
+        });
+    }
+    for protocol in ["openai-image", "anthropic", "openai", "generation"] {
+        if normalized.contains(protocol) {
+            conditions.push(TypedFilterCondition {
+                field: TypedFilterField::Protocol,
+                operator: TypedFilterOperator::Equals,
+                value: TypedFilterValue::Protocol(protocol.into()),
+                upper: None,
+            });
+            break;
+        }
+    }
+    TypedFilterAst {
+        logical_operator: TypedFilterLogicalOperator::And,
+        conditions,
+    }
 }
 
 pub(super) async fn internal_request_detail(

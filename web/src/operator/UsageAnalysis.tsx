@@ -8,8 +8,10 @@ import {
 import { Metric } from '../components';
 import { formatCurrency, formatMetricNumber, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import type { OperatorUsageAnalysis, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
+import type { OperatorUsageAnalysis, TypedFilterAst, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
 import './usage.css';
+import { TypedFilterBuilder } from './TypedFilterBuilder';
+import { emptyTypedFilterAst } from './traffic/requestTraffic';
 import { localDateTimeInput, nextUsageTab, statsQuery, usageTabs, type Granularity, type Preset, type UsageSelection, type UsageTab } from './usageState';
 
 const EChart = lazy(() => import('../charts/EChart').then((module) => ({ default: module.EChart })));
@@ -31,6 +33,22 @@ const localCopy = {
     tokens: 'Tokens', cost: 'Cost', failureRate: 'Failure rate', selectedCell: 'Selected', chartEmpty: 'No chartable data in this range', filtersActive: 'active filters', category: 'Category',
   },
 } as const;
+
+function selectionFromTypedFilter(current: UsageSelection, ast: TypedFilterAst): UsageSelection {
+  const filters = { ...emptyFilters };
+  let customFrom = current.customFrom; let customTo = current.customTo; let preset: Preset = current.preset;
+  for (const condition of ast.conditions) {
+    if (condition.field === 'created_at' && condition.operator === 'between' && condition.value.type === 'timestamp' && condition.upper?.type === 'timestamp') {
+      preset = 'custom'; customFrom = localDateTimeInput(condition.value.value); customTo = localDateTimeInput(condition.upper.value);
+    } else if (condition.operator === 'equals' && condition.field === 'model' && condition.value.type === 'model') filters.model = condition.value.value;
+    else if (condition.operator === 'equals' && condition.field === 'key_id' && condition.value.type === 'uuid') filters.keyId = condition.value.value;
+    else if (condition.operator === 'equals' && condition.field === 'upstream_account_id' && condition.value.type === 'uuid') filters.upstreamId = condition.value.value;
+    else if (condition.operator === 'equals' && condition.field === 'protocol' && condition.value.type === 'protocol') filters.protocol = condition.value.value;
+    else if (condition.operator === 'equals' && condition.field === 'status' && condition.value.type === 'status' && condition.value.value !== 'pending') filters.status = condition.value.value;
+    else if (condition.operator === 'equals' && condition.field === 'error_code' && condition.value.type === 'text') filters.errorCode = condition.value.value;
+  }
+  return { ...current, preset, customFrom, customTo, filters };
+}
 
 function NumericMetric({ label, value, tone }: { label: string; value?: number | null; tone?: string }) {
   const { locale } = useI18n(); const formatted = formatMetricNumber(value, locale);
@@ -76,6 +94,7 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
   const [tab, setTab] = useState<UsageTab>('overview'); const [dimension, setDimension] = useState<Dimension>('models');
   const [heatMetric, setHeatMetric] = useState<HeatmapMetric>('requests'); const [heatCurrency, setHeatCurrency] = useState(''); const [selectedHeatHour, setSelectedHeatHour] = useState<number>();
   const [selection, setSelection] = useState<UsageSelection>({ preset: '24h', granularity: 'auto', customFrom: localDateTimeInput(now - 86_400_000), customTo: localDateTimeInput(now), filters: emptyFilters });
+  const [typedFilters, setTypedFilters] = useState<TypedFilterAst>(emptyTypedFilterAst);
   const [applied, setApplied] = useState(selection); const [refresh, setRefresh] = useState(0); const scope = useMemo(() => ({}), [token, tenant, applied, refresh]);
   const [remote, setRemote] = useState<{ scope: object; status: 'loading' } | { scope: object; status: 'ready'; value: OperatorUsageAnalysis } | { scope: object; status: 'error'; message: string }>(); const requestSequence = useRef(0);
 
@@ -103,7 +122,7 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
   const currencies = stats ? costCurrencies(stats.heatmap) : []; const effectiveHeatCurrency = currencies.includes(heatCurrency) ? heatCurrency : (currencies[0] ?? 'USD');
   const weekdays = useMemo(() => Array.from({ length: 7 }, (_, day) => new Date(Date.UTC(2024, 0, 8 + day)).toLocaleDateString(locale === 'en' ? 'en-US' : 'zh-CN', { weekday: 'short', timeZone: stats?.time_zone ?? 'UTC' })), [locale, stats?.time_zone]);
   const heatmap = useMemo(() => heatmapOption(stats?.heatmap ?? [], heatMetric, effectiveHeatCurrency, weekdays, t('usage.heatmapLabel'), chartFormatters), [stats?.heatmap, heatMetric, effectiveHeatCurrency, weekdays, t, chartFormatters]);
-  const activeFilters = Object.values(applied.filters).filter(Boolean).length;
+  const activeFilters = Object.values(applied.filters).filter(Boolean).length + typedFilters.conditions.length;
   const heatMetricLabel = heatMetric === 'requests' ? copy.requests : heatMetric === 'tokens' ? copy.tokens : heatMetric === 'cost' ? copy.cost : copy.failureRate;
   const selectedHeatCell = stats?.heatmap.find((value) => value.hour_of_week === selectedHeatHour);
 
@@ -119,10 +138,11 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
   };
 
   return <div className="usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('usage.description')}</p>{stats && <span className="usage-time-zone">{stats.time_zone}</span>}</div><button type="button" className="secondary" disabled={loading || !token.trim()} onClick={() => setRefresh((value) => value + 1)}>{loading ? t('common.loading') : t('usage.refresh')}</button></div>
+    <TypedFilterBuilder ast={typedFilters} disabled={Boolean(loading) || !token.trim()} onApply={(ast) => { const next = selectionFromTypedFilter(selection, ast); setTypedFilters(ast); setSelection(next); setApplied(next); }} onClear={() => { const next = { ...selection, preset: '24h' as const, filters: emptyFilters }; setTypedFilters(emptyTypedFilterAst); setSelection(next); setApplied(next); }} scope="usage" token={token} tenant={tenant} upstreams={upstreams} />
     <details className="usage-filter-disclosure"><summary>{copy.filters}{activeFilters > 0 && <span className="usage-filter-count">{activeFilters} {copy.filtersActive}</span>}</summary><form className="usage-controls" onSubmit={(event) => { event.preventDefault(); setApplied({ ...selection }); }}>
       <fieldset><legend>{t('usage.timeRange')}</legend><div className="usage-presets">{presets.map((preset) => <button type="button" className={selection.preset === preset ? 'active' : 'secondary'} aria-pressed={selection.preset === preset} key={preset} onClick={() => { const next = { ...selection, preset }; setSelection(next); if (preset !== 'custom') setApplied(next); }}>{t(`usage.preset.${preset}`)}</button>)}</div></fieldset>
       {selection.preset === 'custom' && <div className="usage-custom-range"><label>{t('traffic.from')}<input type="datetime-local" step="0.001" value={selection.customFrom} onChange={(event) => setSelection({ ...selection, customFrom: event.target.value })} /></label><label>{t('traffic.to')}<input type="datetime-local" step="0.001" value={selection.customTo} onChange={(event) => setSelection({ ...selection, customTo: event.target.value })} /></label></div>}
-      <div className="usage-filter-grid"><label>{t('usage.granularity')}<select value={selection.granularity} onChange={(event) => setSelection({ ...selection, granularity: event.target.value as Granularity })}><option value="auto">{t('usage.granularity.auto')}</option><option value="hour">{t('usage.granularity.hour')}</option><option value="day">{t('usage.granularity.day')}</option></select></label><label>{t('request.model')}<input value={selection.filters.model} onChange={(event) => setSelection({ ...selection, filters: { ...selection.filters, model: event.target.value } })} /></label><label>{t('traffic.keyId')}<input value={selection.filters.keyId} onChange={(event) => setSelection({ ...selection, filters: { ...selection.filters, keyId: event.target.value } })} placeholder="019f…" /></label><label>{t('traffic.upstream')}<select value={selection.filters.upstreamId} onChange={(event) => setSelection({ ...selection, filters: { ...selection.filters, upstreamId: event.target.value } })}><option value="">{t('common.all')}</option><option value="unassigned">{t('usage.unassigned')}</option>{upstreams.map((value) => <option value={value.id} key={value.id}>{value.name}</option>)}</select></label><label>{t('request.protocol')}<select value={selection.filters.protocol} onChange={(event) => setSelection({ ...selection, filters: { ...selection.filters, protocol: event.target.value } })}><option value="">{t('common.all')}</option>{['openai', 'anthropic', 'openai-image', 'generation'].map((protocol) => <option value={protocol} key={protocol}>{t(`usage.protocol.${protocol}`)}</option>)}</select></label><label>{t('request.status')}<select value={selection.filters.status} onChange={(event) => setSelection({ ...selection, filters: { ...selection.filters, status: event.target.value } })}><option value="">{t('common.all')}</option><option value="success">{t('traffic.success')}</option><option value="error">{t('traffic.failure')}</option></select></label><label>{t('traffic.errorCode')}<input value={selection.filters.errorCode} onChange={(event) => setSelection({ ...selection, filters: { ...selection.filters, errorCode: event.target.value } })} /></label><div className="filter-actions"><button type="submit" disabled={loading || !token.trim()}>{t('usage.apply')}</button><button type="button" className="secondary" disabled={loading || !Object.values(selection.filters).some(Boolean)} onClick={() => { const next = { ...selection, filters: emptyFilters }; setSelection(next); setApplied(next); }}>{t('usage.clearFilters')}</button></div></div>
+      <div className="usage-filter-grid"><label>{t('usage.granularity')}<select value={selection.granularity} onChange={(event) => setSelection({ ...selection, granularity: event.target.value as Granularity })}><option value="auto">{t('usage.granularity.auto')}</option><option value="hour">{t('usage.granularity.hour')}</option><option value="day">{t('usage.granularity.day')}</option></select></label><div className="filter-actions"><button type="submit" disabled={loading || !token.trim()}>{t('usage.apply')}</button><button type="button" className="secondary" disabled={loading || (!Object.values(selection.filters).some(Boolean) && typedFilters.conditions.length === 0)} onClick={() => { const next = { ...selection, preset: '24h' as const, filters: emptyFilters }; setTypedFilters(emptyTypedFilterAst); setSelection(next); setApplied(next); }}>{t('usage.clearFilters')}</button></div></div>
     </form></details>
     {!token.trim() && <div className="notice warning" role="status">{t('usage.connectPrompt')}</div>}{loading && <div className="notice" role="status">{t('common.loading')}</div>}{error && <div className="notice error" role="alert">{error}</div>}
     <nav className="usage-tabs" role="tablist" aria-label={t('usage.sections')}>{usageTabs.map((id) => <button type="button" role="tab" id={`usage-tab-${id}`} aria-controls={`usage-panel-${id}`} aria-selected={tab === id} tabIndex={tab === id ? 0 : -1} className={tab === id ? 'active' : ''} key={id} onClick={() => setTab(id)} onKeyDown={(event) => { const next = nextUsageTab(id, event.key); if (!next) return; event.preventDefault(); setTab(next); requestAnimationFrame(() => document.getElementById(`usage-tab-${next}`)?.focus()); }}>{id === 'dimensions' ? copy.dimensions : t(`usage.tab.${id}`)}</button>)}</nav>

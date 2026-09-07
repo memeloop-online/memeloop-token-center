@@ -7,6 +7,7 @@ pub mod conversation;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod filter_ast;
 mod gateway_body;
 pub mod generation;
 #[cfg(not(target_env = "msvc"))]

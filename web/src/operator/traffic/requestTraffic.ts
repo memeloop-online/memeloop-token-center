@@ -1,4 +1,21 @@
-import type { RequestEvent, RequestListCursor, RequestView } from '../../types';
+import type { RequestEvent, RequestListCursor, RequestView, TypedFilterAst } from '../../types';
+
+export const emptyTypedFilterAst: TypedFilterAst = { logical_operator: 'and', conditions: [] };
+
+export function typedFiltersActive(ast: TypedFilterAst) {
+  return ast.conditions.length > 0;
+}
+
+export function typedRequestQueryBody(tenant: string, ast: TypedFilterAst, before?: RequestListCursor) {
+  return {
+    tenant_external_id: tenant || undefined,
+    limit: 100,
+    paged: true,
+    before_created_at: before?.before_created_at,
+    before_id: before?.before_id,
+    ast,
+  };
+}
 
 export interface RequestFilters {
   from: string;

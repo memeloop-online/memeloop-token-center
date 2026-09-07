@@ -72,10 +72,12 @@ use cloud_entitlements::{
     sync_memeloop_cloud_subscription,
 };
 use control_requests::{
-    ManagementTenantQuery, cancel_internal_generation, configuration_schemas, internal_generation,
+    ManagementTenantQuery, cancel_internal_generation, configuration_schemas,
+    get_filter_assistant_settings, get_filter_presets, internal_generation,
     internal_generation_asset, internal_generations, internal_request_asset,
     internal_request_detail, internal_request_events, internal_requests, internal_stats,
-    list_tenants, plugin_manifests, provider_types,
+    list_tenants, plan_filter_with_assistant, plugin_manifests, provider_types,
+    put_filter_assistant_settings, put_filter_preset, typed_internal_requests,
 };
 use credentials::*;
 #[cfg(target_os = "linux")]

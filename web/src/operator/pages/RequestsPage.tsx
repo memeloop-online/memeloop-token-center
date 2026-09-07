@@ -2,16 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../../api';
 import { DrawerFrame, RequestTable } from '../../components';
 import { useI18n } from '../../i18n';
-import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, UpstreamAccount } from '../../types';
+import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, TypedFilterAst, UpstreamAccount } from '../../types';
 import type { SessionStreamState } from '../SessionMonitor';
 import { messageOf, queryForTenant } from '../scope/operatorShared';
-import {
-  emptyRequestFilters,
-  filtersActive,
-  mergeLiveRequestEvents,
-  requestQuery,
-  type RequestFilters,
-} from '../traffic/requestTraffic';
+import { TypedFilterBuilder } from '../TypedFilterBuilder';
+import { emptyTypedFilterAst, mergeLiveRequestEvents, typedFiltersActive, typedRequestQueryBody } from '../traffic/requestTraffic';
 
 export function RequestsPage({ token, tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession }: {
   token: string;
@@ -26,7 +21,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   const { t } = useI18n();
   const [requests, setRequests] = useState<RequestView[]>([]);
   const [upstreams, setUpstreams] = useState<UpstreamAccount[]>([]);
-  const [filters, setFilters] = useState<RequestFilters>(emptyRequestFilters);
+  const [filters, setFilters] = useState<TypedFilterAst>(emptyTypedFilterAst);
   const [loading, setLoading] = useState(false);
   const [hasOlder, setHasOlder] = useState(false);
   const [detail, setDetail] = useState<RequestDetail>();
@@ -41,7 +36,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   hasOlderRef.current = hasOlder;
   scope.current = { token, tenant, filters };
 
-  async function load(nextFilters: RequestFilters, older = false) {
+  async function load(nextFilters: TypedFilterAst, older = false) {
     if (!token) return;
     const request = ++sequence.current;
     const currentScope = { token, tenant, filters: nextFilters };
@@ -49,19 +44,16 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     const before = last ? { before_created_at: last.created_at, before_id: last.request_id } : undefined;
     if (older && (!hasOlder || !before)) return;
     if (!older) { setRequests([]); setHasOlder(false); setDetail(undefined); }
-    setLoading(true);
-    setError('');
+    setLoading(true); setError('');
     try {
-      const next = await api<RequestListResponse>(
-        `/internal/v1/requests${requestQuery(tenant, nextFilters, older ? before : undefined)}`,
-        token,
-      );
+      const next = await api<RequestListResponse>('/internal/v1/requests/query', token, {
+        method: 'POST', body: JSON.stringify(typedRequestQueryBody(tenant, nextFilters, older ? before : undefined)),
+      });
       const latest = scope.current;
-      if (request !== sequence.current || latest.token !== currentScope.token
-        || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
+      if (request !== sequence.current || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
       setRequests((current) => older
         ? [...current, ...next.requests.filter((value) => !current.some((existing) => existing.request_id === value.request_id))]
-        : filtersActive(nextFilters) ? next.requests : mergeLiveRequestEvents(next.requests, new Map(liveEvents), next.next_cursor === null));
+        : typedFiltersActive(nextFilters) ? next.requests : mergeLiveRequestEvents(next.requests, new Map(liveEvents), next.next_cursor === null));
       setHasOlder(next.next_cursor !== null);
     } catch (reason) {
       if (request === sequence.current) {
@@ -74,96 +66,59 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   }
 
   useEffect(() => {
-    sequence.current += 1;
-    setFilters(emptyRequestFilters);
-    setRequests([]);
-    setDetail(undefined);
-    setHasOlder(false);
-    setError('');
-    setUpstreamError('');
-    if (!token) {
-      setUpstreams([]);
-      return;
-    }
+    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setError(''); setUpstreamError('');
+    if (!token) { setUpstreams([]); return; }
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
       .then((values) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams(values); setUpstreamError(''); } })
       .catch((reason) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams([]); setUpstreamError(messageOf(reason, t('common.requestFailed'))); } });
-    void load(emptyRequestFilters);
+    void load(emptyTypedFilterAst);
   }, [tenant, token]);
 
   useEffect(() => {
-    detailSequence.current += 1;
-    detailAbort.current?.abort();
-    detailAbort.current = null;
-    setDetail(undefined);
-    return () => {
-      detailSequence.current += 1;
-      detailAbort.current?.abort();
-    };
+    detailSequence.current += 1; detailAbort.current?.abort(); detailAbort.current = null; setDetail(undefined);
+    return () => { detailSequence.current += 1; detailAbort.current?.abort(); };
   }, [tenant, token]);
 
   useEffect(() => {
-    if (liveEvents.size === 0 || filtersActive(filters)) return;
-    // React may batch several replay revisions into one render. Merge the
-    // complete bounded event map so no intermediate SSE event disappears.
+    if (liveEvents.size === 0 || typedFiltersActive(filters)) return;
     setRequests((current) => mergeLiveRequestEvents(current, new Map(liveEvents), !hasOlderRef.current));
   }, [streamRevision]);
 
   async function selectRequest(request: RequestView) {
     const requestSequence = ++detailSequence.current;
-    detailAbort.current?.abort();
-    const controller = new AbortController();
-    detailAbort.current = controller;
+    detailAbort.current?.abort(); const controller = new AbortController(); detailAbort.current = controller;
     try {
       setError('');
-      const next = await api<RequestDetail>(
-        `/internal/v1/requests/${request.request_id}${queryForTenant(tenant)}`,
-        token,
-        { signal: controller.signal },
-      );
+      const next = await api<RequestDetail>(`/internal/v1/requests/${request.request_id}${queryForTenant(tenant)}`, token, { signal: controller.signal });
       if (requestSequence === detailSequence.current) setDetail(next);
     } catch (reason) {
-      if (requestSequence === detailSequence.current && !controller.signal.aborted) {
-        setError(messageOf(reason, t('traffic.detailFailed')));
-      }
-    } finally {
-      if (detailAbort.current === controller) detailAbort.current = null;
-    }
+      if (requestSequence === detailSequence.current && !controller.signal.aborted) setError(messageOf(reason, t('traffic.detailFailed')));
+    } finally { if (detailAbort.current === controller) detailAbort.current = null; }
   }
 
   return <>
     {error && <div className="notice error" role="alert">{error}</div>}
     {upstreamError && <div className="notice error" role="alert">{upstreamError}</div>}
     {streamError && <div className="notice error" role="alert">{streamError}</div>}
-    <RequestsPanel
-      requests={requests}
-      upstreams={upstreams}
-      upstreamsAvailable={!upstreamError}
-      filters={filters}
-      loading={loading}
-      hasOlder={hasOlder}
-      streamState={streamState}
+    <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
-      onClear={() => { setFilters(emptyRequestFilters); scope.current = { token, tenant, filters: emptyRequestFilters }; void load(emptyRequestFilters); }}
-      onLoadOlder={() => void load(filters, true)}
-      onSelect={selectRequest}
-      onOpenSessions={onOpenSessions}
-      onOpenSession={onOpenSession}
-    />
+      onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
+      onLoadOlder={() => void load(filters, true)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={onOpenSession} />
     {detail && <RequestDrawer detail={detail} onClose={() => setDetail(undefined)} />}
   </>;
 }
 
-function RequestsPanel({ requests, upstreams, upstreamsAvailable, filters, loading, hasOlder, streamState, onApply, onClear, onLoadOlder, onSelect, onOpenSessions, onOpenSession }: {
+function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, streamState, token, tenant, onApply, onClear, onLoadOlder, onSelect, onOpenSessions, onOpenSession }: {
   requests: RequestView[];
   upstreams: UpstreamAccount[];
-  upstreamsAvailable: boolean;
-  filters: RequestFilters;
+  filters: TypedFilterAst;
   loading: boolean;
   hasOlder: boolean;
   streamState: SessionStreamState;
-  onApply: (filters: RequestFilters) => void;
+  token: string;
+  tenant: string;
+  onApply: (filters: TypedFilterAst) => void;
   onClear: () => void;
   onLoadOlder: () => void;
   onSelect: (request: RequestView) => Promise<void>;
@@ -171,28 +126,8 @@ function RequestsPanel({ requests, upstreams, upstreamsAvailable, filters, loadi
   onOpenSession: (sessionId: string) => void;
 }) {
   const { t } = useI18n();
-  const [draft, setDraft] = useState(filters);
-  useEffect(() => setDraft(filters), [filters]);
-
-  return <article className="panel"><div className="panel-title traffic-heading"><div><h2>{filtersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{filtersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><button type="button" className="active" aria-pressed="true">{t('sessions.requestsMode')}</button><button type="button" aria-pressed="false" onClick={onOpenSessions}>{t('sessions.sessionsMode')}</button></div></div></div>
-    <form className="traffic-filters" onSubmit={(event) => { event.preventDefault(); onApply(draft); }}>
-      <label>{t('traffic.from')}<input type="datetime-local" value={draft.from} onChange={(event) => setDraft({ ...draft, from: event.target.value })} /></label>
-      <label>{t('traffic.to')}<input type="datetime-local" value={draft.to} onChange={(event) => setDraft({ ...draft, to: event.target.value })} /></label>
-      <label>{t('traffic.keyId')}<input value={draft.keyId} onChange={(event) => setDraft({ ...draft, keyId: event.target.value })} placeholder="019f…" /></label>
-      <label>{t('request.model')}<input value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} /></label>
-      <label>{t('request.protocol')}<select value={draft.protocol} onChange={(event) => setDraft({ ...draft, protocol: event.target.value })}><option value="">{t('common.all')}</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="openai-image">OpenAI Image</option><option value="generation">{t('routes.generation')}</option></select></label>
-      <label>{t('request.status')}<select value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value })}><option value="">{t('common.all')}</option><option value="success">{t('traffic.success')}</option><option value="error">{t('traffic.failure')}</option><option value="pending">{t('common.running')}</option></select></label>
-      <label>{t('traffic.errorCode')}<input value={draft.errorCode} onChange={(event) => setDraft({ ...draft, errorCode: event.target.value })} /></label>
-      <label>{t('traffic.upstream')}<select disabled={!upstreamsAvailable} value={draft.upstreamAccountId} onChange={(event) => setDraft({ ...draft, upstreamAccountId: event.target.value })}><option value="">{t('common.all')}</option>{upstreams.map((value) => <option value={value.id} key={value.id}>{value.name}</option>)}</select></label>
-      <label>{t('traffic.routeId')}<input value={draft.routeId} onChange={(event) => setDraft({ ...draft, routeId: event.target.value })} placeholder="019f…" /></label>
-      <label>{t('traffic.keyAlias')}<input value={draft.keyAlias} onChange={(event) => setDraft({ ...draft, keyAlias: event.target.value })} /></label>
-      <label>{t('traffic.principal')}<input value={draft.principal} onChange={(event) => setDraft({ ...draft, principal: event.target.value })} /></label>
-      <label>{t('traffic.minDuration')}<input type="number" min="0" value={draft.minDurationMs} onChange={(event) => setDraft({ ...draft, minDurationMs: event.target.value })} /></label>
-      <label>{t('traffic.maxDuration')}<input type="number" min="0" value={draft.maxDurationMs} onChange={(event) => setDraft({ ...draft, maxDurationMs: event.target.value })} /></label>
-      <label>{t('traffic.minCost')}<input inputMode="decimal" value={draft.minCost} onChange={(event) => setDraft({ ...draft, minCost: event.target.value })} /></label>
-      <label>{t('traffic.maxCost')}<input inputMode="decimal" value={draft.maxCost} onChange={(event) => setDraft({ ...draft, maxCost: event.target.value })} /></label>
-      <div className="filter-actions"><button type="submit" disabled={loading}>{loading ? t('common.loading') : t('traffic.applyFilters')}</button><button type="button" className="secondary" disabled={loading || (!filtersActive(filters) && !filtersActive(draft))} onClick={() => { setDraft(emptyRequestFilters); onClear(); }}>{t('traffic.clearFilters')}</button></div>
-    </form>
+  return <article className="panel"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><button type="button" className="active" aria-pressed="true">{t('sessions.requestsMode')}</button><button type="button" aria-pressed="false" onClick={onOpenSessions}>{t('sessions.sessionsMode')}</button></div></div></div>
+    <TypedFilterBuilder ast={filters} disabled={loading} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
     <RequestTable requests={requests} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />
     {hasOlder && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
   </article>;
@@ -200,5 +135,5 @@ function RequestsPanel({ requests, upstreams, upstreamsAvailable, filters, loadi
 
 function RequestDrawer({ detail, onClose }: { detail: RequestDetail; onClose: () => void }) {
   const { t } = useI18n();
-  return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}><p className="muted break-anywhere">{detail.request_id} · {detail.status_code ?? t('common.running')} · {detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</p><h3>{t('request.error')}</h3><pre>{detail.error_code ?? t('common.none')}</pre><h3>{t('request.request')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre><h3>{t('request.response')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre></DrawerFrame>;
+  return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}><p className="muted break-anywhere">{detail.request_id} · {detail.status_code ?? t('common.running')} · {detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</p><h3>{t('request.error')}</h3><pre>{detail.error_code ?? t('common.none')}</pre><details className="request-technical-details"><summary>{t('request.technicalDetails')}</summary><h3>{t('request.request')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre><h3>{t('request.response')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>{detail.provenance && <><h3>{t('request.provenance')}</h3><pre>{JSON.stringify(detail.provenance, null, 2)}</pre></>}</details></DrawerFrame>;
 }
