@@ -213,6 +213,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await assertContains(page.getByRole('status'), '路由已更新');
   await assertContains(routeRow, 'mock-provider-model-v2');
   await routeRow.getByRole('button', { name: '停用', exact: true }).click();
+  await page.locator('[data-resource-list-status-filter]').getByRole('button', { name: /显示非正常状态/ }).click();
   await assertContains(routeRow, '已停用');
   await routeRow.getByRole('button', { name: '启用', exact: true }).click();
   await assertContains(routeRow, '已启用');
@@ -438,6 +439,8 @@ When('管理员创建凭据组并按组筛选凭据', async function (this: Dogf
   await memberInput.fill(seed.clientKeyId);
   await memberInput.press('ArrowDown');
   await memberInput.press('Enter');
+  await memberInput.press('Escape');
+  await assertAttribute(memberInput, 'aria-expanded', 'false');
   const savedMembers = page.waitForResponse((response) => response.url().includes('/internal/v1/credential-groups/') && response.url().endsWith('/members') && response.request().method() === 'PUT');
   await credentialGroups.getByRole('button', { name: '保存成员', exact: true }).click();
   const credentialMembersResponse = await savedMembers;

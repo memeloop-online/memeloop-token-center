@@ -327,6 +327,7 @@ export async function clearUsageFilters(page: Page, expectedRequests = 51): Prom
   const response = await responsePromise;
   assert.equal(response.status(), 200);
   await assertExactText(metric(page, '请求数'), String(expectedRequests));
+  await assertNoCount(builder.getByRole('button', { name: '清除', exact: true }));
 }
 
 export function usageDimension(page: Page, heading: string) {
