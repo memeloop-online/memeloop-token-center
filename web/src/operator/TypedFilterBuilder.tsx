@@ -178,7 +178,12 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   const visibleFields = scope === 'usage' ? fields.filter((field) => field.usage) : fields;
   const hasActiveFilters = ast.conditions.length > 0 || externalChips.length > 0;
 
-  useEffect(() => { if (!open) setDraft(ast); }, [ast, open]);
+  // The editor is a draft.  Synchronizing it in a passive effect while it is
+  // closed races a clear followed immediately by opening and adding a row: a
+  // queued clear can erase that new row.  Initialize from the applied AST at
+  // the explicit open boundary instead, so recents and in-dialog edits remain
+  // local to the current editor session.
+  const openEditor = () => { setDraft(ast); setError(''); setOpen(true); };
   useEffect(() => {
     if (!open || !token) return;
     const query = tenant ? `?tenant_external_id=${encodeURIComponent(tenant)}` : '';
@@ -240,7 +245,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
       {externalChips.map((chip) => <span className="filter-chip" key={chip.id}>{chip.label}</span>)}
       {!hasActiveFilters && <span className="muted">{t('filter.noneApplied')}</span>}
     </div>
-    <div className="typed-filter-actions"><button type="button" className="secondary" disabled={disabled} onClick={() => { setDraft(ast); setError(''); setOpen(true); }}>{t('filter.open')}</button>{hasActiveFilters && <button type="button" className="secondary" disabled={disabled} onClick={onClear}>{t('filter.clear')}</button>}</div>
+    <div className="typed-filter-actions"><button type="button" className="secondary" disabled={disabled} onClick={openEditor}>{t('filter.open')}</button>{hasActiveFilters && <button type="button" className="secondary" disabled={disabled} onClick={onClear}>{t('filter.clear')}</button>}</div>
     {open && <div className="typed-filter-overlay" role="presentation"><section className="typed-filter-dialog" role="dialog" aria-modal="true" aria-label={t('filter.title')}>
       <div className="panel-title"><div><h2>{t('filter.title')}</h2><p className="muted">{t('filter.description')}</p></div><button type="button" className="secondary" onClick={() => setOpen(false)}>{t('common.close')}</button></div>
       {error && <div className="notice error" role="alert">{error}</div>}
