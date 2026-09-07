@@ -30,8 +30,7 @@ async function waitForConsoleContext(page: Page, expectedText: RegExp) {
 async function waitForSingleTenantScope(page: Page, expectedTenant: string) {
   await eventually(async () => {
     assert.equal(await page.locator('.tenant-picker select').count(), 0, 'a single-tenant credential must not render a tenant picker');
-    const contextText = (await page.locator('.console-context').allTextContents()).join(' ');
-    assert.ok(contextText.includes(expectedTenant), `operator context ${JSON.stringify(contextText)} does not identify ${expectedTenant}`);
+    assert.equal(await page.locator('.console-context').count(), 0, `single tenant ${expectedTenant} must not render a scope card`);
   });
 }
 
@@ -113,15 +112,15 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
     assert.equal(await credentialInput.inputValue(), 'multi-credential');
   });
   await eventually(async () => connect.click());
-  await waitForTenantPicker(page, '');
+  await waitForTenantPicker(page, 'tenant-a');
   const multiRequests = observed.filter((value) => value.credential === 'multi-credential');
   assert.equal(multiRequests[0]?.path, '/internal/v1/tenants');
   await eventually(() => assert.ok(observed.filter((value) => value.credential === 'multi-credential'
     && ['/internal/v1/upstreams', '/internal/v1/requests'].includes(value.path)).length >= 2));
   const multiResources = observed.filter((value) => value.credential === 'multi-credential'
     && ['/internal/v1/upstreams', '/internal/v1/requests'].includes(value.path));
-  assert.ok(multiResources.every((value) => value.tenant === null), JSON.stringify(multiResources));
-  assert.match(await page.locator('.console-context').textContent() ?? '', /全部租户/);
+  assert.ok(multiResources.every((value) => value.tenant === 'tenant-a'), JSON.stringify(multiResources));
+  assert.equal(await page.locator('.console-context').count(), 0);
 
   const failedRequestStart = observed.length;
   await eventually(async () => { await credentialInput.fill('failed-credential'); assert.equal(await credentialInput.inputValue(), 'failed-credential'); });
@@ -130,7 +129,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   const failedRequests = observed.slice(failedRequestStart).filter((value) => value.credential === 'failed-credential');
   assert.deepEqual(failedRequests.map((value) => value.path), ['/internal/v1/tenants']);
   assert.equal(await page.evaluate(() => localStorage.getItem('mtc.operator.service-credential.v1')), 'multi-credential');
-  await waitForTenantPicker(page, '');
+  await waitForTenantPicker(page, 'tenant-a');
 
   await eventually(async () => { await credentialInput.fill('slow-credential'); assert.equal(await credentialInput.inputValue(), 'slow-credential'); });
   await eventually(async () => connect.click());

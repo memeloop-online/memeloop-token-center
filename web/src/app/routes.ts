@@ -16,9 +16,11 @@ export const operatorRouteKeys = [
   'providers',
   'routes',
   'pricing',
+  'tenants',
   'credentials',
   'service-credentials',
   'plugins',
+  'settings',
 ] as const;
 
 export type PortalRouteKey = (typeof portalRouteKeys)[number];

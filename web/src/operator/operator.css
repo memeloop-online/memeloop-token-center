@@ -46,7 +46,7 @@
 }
 
 .tenant-picker {
-  min-width: 190px;
+  min-width: 176px;
 }
 
 .tenant-picker span {
@@ -58,26 +58,27 @@
   text-transform: uppercase;
 }
 
-.tenant-manager {
-  margin: 14px 0;
-}
-
-.tenant-manager > summary {
+.tenant-scope-switcher {
   align-items: center;
-  cursor: pointer;
   display: flex;
-  gap: 20px;
-  justify-content: space-between;
-  list-style: none;
-  padding: 14px 18px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin: 0 0 18px;
 }
 
-.tenant-manager > summary::-webkit-details-marker { display: none; }
-.tenant-manager > summary b,
-.tenant-manager > summary small { display: block; }
-.tenant-manager > summary small { color: #6f8289; font-size: 11px; margin-top: 4px; }
-.tenant-manager > summary > span:last-child { color: #5fd4c3; font-size: 22px; transition: transform .16s ease; }
-.tenant-manager[open] > summary > span:last-child { transform: rotate(45deg); }
+.tenant-manager {
+  margin: 0;
+}
+
+.tenant-manager-title { margin-bottom: 18px; }
+.tenant-manager-title h2 { margin: 0; }
+.tenant-manager-title .muted { margin: 5px 0 0; }
+.tenant-dialog-object { margin: 0 0 10px; }
+.tenant-dialog-object code { color: #8bd7cc; overflow-wrap: anywhere; }
+.tenant-dialog-impact { color: #9aafb5; line-height: 1.55; }
+.tenant-dialog-input { display: block; margin-top: 18px; color: #9aafb5; font-size: 12px; }
+.tenant-dialog-input input { margin-top: 6px; }
+.tenant-dialog-actions { margin-top: 22px; }
 
 .tenant-create-row {
   align-items: end;
@@ -1210,9 +1211,12 @@
   }
 
   .operator-credential input,
-  .tenant-picker {
+  .tenant-picker,
+  .tenant-scope-switcher {
     width: 100%;
   }
+
+  .tenant-scope-switcher { align-items: stretch; }
 
   .tenant-create-row { align-items: stretch; flex-direction: column; }
 

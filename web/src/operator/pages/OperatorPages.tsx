@@ -12,7 +12,7 @@ import { queryForTenant } from '../scope/operatorShared';
 
 interface OperatorPageProps {
   token: string;
-  /** Read scope; an empty value is the aggregate authorized view. */
+  /** Selected read scope; empty only when no tenant is available. */
   tenant: string;
   /** Explicit target for any mutation rendered by the page. */
   writeTenant?: string;

@@ -1,5 +1,6 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
+import { DrawerFrame } from '../components';
 import { useI18n } from '../i18n';
 import type { TenantManagementView } from '../types';
 import { messageOf } from './scope/operatorShared';
@@ -10,6 +11,11 @@ interface Props {
 }
 
 const managementPath = '/internal/v1/tenant-management';
+
+type TenantDialog = {
+  kind: 'rename' | 'archive' | 'restore' | 'delete';
+  tenant: TenantManagementView;
+};
 
 /**
  * Tenant lifecycle is intentionally separate from client-credential
@@ -24,6 +30,8 @@ export function TenantManager({ token, onChanged }: Props) {
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [dialog, setDialog] = useState<TenantDialog>();
+  const [renameDraft, setRenameDraft] = useState('');
   const loadedFor = useRef('');
   const loadSequence = useRef(0);
   const tokenRef = useRef(token);
@@ -71,8 +79,19 @@ export function TenantManager({ token, onChanged }: Props) {
     }
   }
 
-  async function rename(value: TenantManagementView) {
-    const externalId = window.prompt(t('tenants.renamePrompt'), value.external_id)?.trim();
+  function openDialog(kind: TenantDialog['kind'], tenant: TenantManagementView) {
+    setError('');
+    setMessage('');
+    if (kind === 'rename') setRenameDraft(tenant.external_id);
+    setDialog({ kind, tenant });
+  }
+
+  function closeDialog() {
+    if (!busy) setDialog(undefined);
+  }
+
+  async function rename(value: TenantManagementView, nextExternalId: string) {
+    const externalId = nextExternalId.trim();
     if (!externalId || externalId === value.external_id) return;
     setBusy(`rename-${value.external_id}`); setMessage(''); setError('');
     try {
@@ -81,6 +100,7 @@ export function TenantManager({ token, onChanged }: Props) {
       });
       setMessage(t('tenants.renamed', { tenant: updated.external_id }));
       await refresh();
+      setDialog(undefined);
     } catch (reason) {
       setError(messageOf(reason, t('common.requestFailed')));
     } finally {
@@ -90,15 +110,12 @@ export function TenantManager({ token, onChanged }: Props) {
 
   async function archive(value: TenantManagementView, status: 'active' | 'archived') {
     const action = status === 'archived' ? 'archive' : 'restore';
-    const confirmation = status === 'archived'
-      ? t('tenants.confirmArchive', { tenant: value.external_id })
-      : t('tenants.confirmRestore', { tenant: value.external_id });
-    if (!window.confirm(confirmation)) return;
     setBusy(`${action}-${value.external_id}`); setMessage(''); setError('');
     try {
       const updated = await api<TenantManagementView>(`${managementPath}/${encodeURIComponent(value.external_id)}/${action}`, token, { method: 'POST' });
       setMessage(t(status === 'archived' ? 'tenants.archivedMessage' : 'tenants.restored', { tenant: updated.external_id }));
       await refresh();
+      setDialog(undefined);
     } catch (reason) {
       setError(messageOf(reason, t('common.requestFailed')));
     } finally {
@@ -107,12 +124,12 @@ export function TenantManager({ token, onChanged }: Props) {
   }
 
   async function remove(value: TenantManagementView) {
-    if (!window.confirm(t('tenants.confirmDelete', { tenant: value.external_id }))) return;
     setBusy(`delete-${value.external_id}`); setMessage(''); setError('');
     try {
       await api<void>(`${managementPath}/${encodeURIComponent(value.external_id)}`, token, { method: 'DELETE' });
       setMessage(t('tenants.deleted', { tenant: value.external_id }));
       await refresh();
+      setDialog(undefined);
     } catch (reason) {
       setError(messageOf(reason, t('common.requestFailed')));
     } finally {
@@ -120,12 +137,42 @@ export function TenantManager({ token, onChanged }: Props) {
     }
   }
 
-  return <details className="panel tenant-manager" onToggle={(event) => {
-    if ((event.currentTarget as HTMLDetailsElement).open) void load();
-  }}>
-    <summary><span><b>{t('tenants.title')}</b><small>{t('tenants.description')}</small></span><span aria-hidden="true">＋</span></summary>
-    <div className="create-resource-body">
-      {error && <div className="notice error" role="alert">{error}</div>}
+  useEffect(() => { void load(); }, [token]);
+
+  function submitDialog() {
+    if (!dialog || busy) return;
+    if (dialog.kind === 'rename') { void rename(dialog.tenant, renameDraft); return; }
+    if (dialog.kind === 'archive') { void archive(dialog.tenant, 'archived'); return; }
+    if (dialog.kind === 'restore') { void archive(dialog.tenant, 'active'); return; }
+    void remove(dialog.tenant);
+  }
+
+  const dialogTitle = dialog?.kind === 'rename'
+    ? t('tenants.renameTitle')
+    : dialog?.kind === 'archive'
+      ? t('tenants.archiveTitle')
+      : dialog?.kind === 'restore'
+        ? t('tenants.restoreTitle')
+        : t('tenants.deleteTitle');
+  const dialogImpact = dialog?.kind === 'rename'
+    ? t('tenants.renameImpact')
+    : dialog?.kind === 'archive'
+      ? t('tenants.archiveImpact')
+      : dialog?.kind === 'restore'
+        ? t('tenants.restoreImpact')
+        : t('tenants.deleteImpact');
+  const dialogAction = dialog?.kind === 'rename'
+    ? t('tenants.rename')
+    : dialog?.kind === 'archive'
+      ? t('tenants.archive')
+      : dialog?.kind === 'restore'
+        ? t('tenants.restore')
+        : t('tenants.delete');
+
+  return <section className="panel tenant-manager">
+    <div className="panel-title tenant-manager-title"><div><h2>{t('tenants.title')}</h2><p className="muted">{t('tenants.description')}</p></div></div>
+    <div className="tenant-manager-body">
+      {!dialog && error && <div className="notice error" role="alert">{error}</div>}
       {message && <div className="notice success" role="status">{message}</div>}
       <div className="tenant-create-row">
         <label>{t('tenants.name')}<input value={name} maxLength={200} onChange={(event) => setName(event.target.value)} /></label>
@@ -137,17 +184,22 @@ export function TenantManager({ token, onChanged }: Props) {
           const isDefault = value.external_id === 'default';
           return <div className="managed-resource" key={value.external_id}>
             <div className="managed-resource-header"><div><b>{value.external_id}</b><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{t(`tenants.${value.status}`)}</span></div></div>
-            {isDefault
-              ? <small className="tenant-default-note">{t('tenants.default')}</small>
-              : <div className="row-actions">
-                <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void rename(value)}>{t('tenants.rename')}</button>
+            {!isDefault && <div className="row-actions">
+                <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => openDialog('rename', value)}>{t('tenants.rename')}</button>
                 {value.status === 'active'
-                  ? <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void archive(value, 'archived')}>{t('tenants.archive')}</button>
-                  : <><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void archive(value, 'active')}>{t('tenants.restore')}</button><button type="button" className="danger" disabled={Boolean(busy)} onClick={() => void remove(value)}>{t('tenants.delete')}</button></>}
+                  ? <button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => openDialog('archive', value)}>{t('tenants.archive')}</button>
+                  : <><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => openDialog('restore', value)}>{t('tenants.restore')}</button><button type="button" className="danger" disabled={Boolean(busy)} onClick={() => openDialog('delete', value)}>{t('tenants.delete')}</button></>}
               </div>}
           </div>;
         })}
       </div>}
     </div>
-  </details>;
+    {dialog && <DrawerFrame title={dialogTitle} eyebrow={t('tenants.title')} onClose={closeDialog}>
+      <p className="tenant-dialog-object"><code>{dialog.tenant.external_id}</code></p>
+      <p className="tenant-dialog-impact">{dialogImpact}</p>
+      {dialog.kind === 'rename' && <label className="tenant-dialog-input">{t('tenants.name')}<input autoFocus value={renameDraft} maxLength={200} onChange={(event) => setRenameDraft(event.target.value)} /></label>}
+      {error && <div className="notice error" role="alert">{error}</div>}
+      <div className="button-row tenant-dialog-actions"><button type="button" className="secondary" disabled={Boolean(busy)} onClick={closeDialog}>{t('common.cancel')}</button><button type="button" className={dialog.kind === 'delete' ? 'danger' : ''} disabled={Boolean(busy) || (dialog.kind === 'rename' && !renameDraft.trim())} onClick={submitDialog}>{busy ? t('common.loading') : dialogAction}</button></div>
+    </DrawerFrame>}
+  </section>;
 }

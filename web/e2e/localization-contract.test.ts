@@ -27,6 +27,22 @@ test('credential and empty-state copy does not infer bootstrap or candidate-envi
   }
 });
 
+test('tenant copy stays action-focused and its active locale keys are not orphaned', async () => {
+  const operator = await readFile(new URL('../src/operator/Operator.tsx', import.meta.url), 'utf8');
+  const manager = await readFile(new URL('../src/operator/TenantManager.tsx', import.meta.url), 'utf8');
+  const staleCopy = /创建客户端凭据不会创建租户|Creating a client credential never creates a tenant|aggregate view|未指定租户的写入|writes with no explicit tenant/i;
+  for (const [locale, catalog] of Object.entries(translationCatalogs)) {
+    assert.doesNotMatch(Object.values(catalog).join('\n'), staleCopy, `${locale} tenant copy must not expose product-design discussion`);
+  }
+  assert.match(operator, /t\('nav\.tenants'\)/);
+  for (const key of [
+    'tenants.title', 'tenants.description', 'tenants.create', 'tenants.name', 'tenants.rename', 'tenants.archive', 'tenants.restore', 'tenants.delete',
+    'tenants.renameTitle', 'tenants.archiveTitle', 'tenants.restoreTitle', 'tenants.deleteTitle',
+    'tenants.renameImpact', 'tenants.archiveImpact', 'tenants.restoreImpact', 'tenants.deleteImpact',
+  ]) assert.match(manager, new RegExp(`t\\('${key.replace('.', '\\.')}'\\)`));
+  assert.doesNotMatch(manager, /window\.(?:confirm|prompt)/);
+});
+
 test('Chinese copy does not leak English plural Tokens', () => {
   const exposed = Object.values(translationCatalogs['zh-CN']).filter((value) => /\bTokens\b/.test(value));
   assert.deepEqual(exposed, []);

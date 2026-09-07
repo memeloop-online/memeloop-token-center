@@ -21,9 +21,10 @@ test('operator exposes controlled AppShell routing without coupling credentials 
 test('sessions are a first-class operator route and all page keys are explicit', () => {
   assert.deepEqual(operatorRouteKeys, [
     'overview', 'requests', 'sessions', 'usage', 'generations', 'providers', 'routes',
-    'pricing', 'credentials', 'service-credentials', 'plugins',
+    'pricing', 'tenants', 'credentials', 'service-credentials', 'plugins', 'settings',
   ]);
   assert.match(operator, /case 'sessions': page = <SessionsPage/);
+  assert.match(operator, /case 'tenants': page = <TenantManager/);
   assert.doesNotMatch(operator, /trafficMode|onModeChange/);
 });
 
@@ -32,18 +33,18 @@ test('credential authentication discovers only tenants before a page mounts', ()
   assert.doesNotMatch(scope, /provider-types|plugins|upstreams|requests|schemas/);
 });
 
-test('operator restores an allowed tenant and otherwise opens the production default', () => {
+test('operator restores an allowed tenant and otherwise selects an explicit tenant', () => {
   const tenants = [{ external_id: 'archive' }, { external_id: 'default' }];
   assert.equal(tenantForCredential(tenants, 'archive'), 'archive');
   assert.equal(tenantForCredential(tenants, 'missing'), 'default');
   assert.equal(tenantForCredential([{ external_id: 'only' }], ''), 'only');
-  assert.equal(tenantForCredential([{ external_id: 'one' }, { external_id: 'two' }], ''), '');
+  assert.equal(tenantForCredential([{ external_id: 'one' }, { external_id: 'two' }], ''), 'one');
 });
 
-test('credential review defaults to active and all-tenant routes remain visible', () => {
+test('credential review defaults to active and mutation scopes remain explicit', () => {
   assert.match(managementPages, /useState\('active'\)/);
-  assert.match(managementPages, /if \(!loadToken\) \{ setRoutes\(\[\]\); setCredentials\(\[\]\); return; \}/);
-  assert.doesNotMatch(managementPages, /if \(!loadToken \|\| !loadTenant\) \{ setRoutes\(\[\]\); setCredentials\(\[\]\); return; \}/);
+  assert.match(scope, /const writeTenant = state\.tenant;/);
+  assert.doesNotMatch(operator, /<option value="">/);
 });
 
 test('request filters hide stale rows and cursors while a replacement query is pending or fails', () => {

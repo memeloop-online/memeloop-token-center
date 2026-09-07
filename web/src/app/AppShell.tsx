@@ -16,7 +16,7 @@ interface NavigationSection {
 }
 
 type IconName = 'overview' | 'requests' | 'sessions' | 'usage' | 'generations' | 'generate'
-  | 'providers' | 'routes' | 'pricing' | 'credentials' | 'service-credentials' | 'plugins';
+  | 'providers' | 'routes' | 'pricing' | 'tenants' | 'credentials' | 'service-credentials' | 'plugins' | 'settings';
 
 const labels = {
   'zh-CN': {
@@ -25,8 +25,8 @@ const labels = {
     errorEyebrow: '页面加载失败', errorTitle: '暂时无法显示此页面', errorDescription: '页面模块未能完成加载。你可以先重试；如果问题仍然存在，请刷新页面。', errorRetry: '重试', errorRefresh: '刷新页面',
     monitoring: '监控', traffic: '流量配置', identity: '身份与权限', system: '系统', creation: '多模态',
     overview: '总览', requests: '请求', sessions: '会话', usage: '用量分析', generations: '生成任务', generate: '创建任务',
-    providers: '上游服务', routes: '模型路由', pricing: '模型计费', credentials: '客户端凭据',
-    'service-credentials': '服务凭据', plugins: '插件',
+    providers: '上游服务', routes: '模型路由', pricing: '模型计费', tenants: '租户管理', credentials: '客户端凭据',
+    'service-credentials': '服务凭据', plugins: '插件', settings: '系统设置',
   },
   en: {
     portal: 'Portal', operator: 'Operator', skip: 'Skip to main content', menu: 'Open navigation', close: 'Close navigation',
@@ -34,8 +34,8 @@ const labels = {
     errorEyebrow: 'Page load failed', errorTitle: 'This page cannot be displayed', errorDescription: 'A page module did not finish loading. Try again, or refresh the page if the problem continues.', errorRetry: 'Try again', errorRefresh: 'Refresh page',
     monitoring: 'Monitoring', traffic: 'Traffic configuration', identity: 'Identity and access', system: 'System', creation: 'Multimodal',
     overview: 'Overview', requests: 'Requests', sessions: 'Sessions', usage: 'Usage', generations: 'Generation jobs', generate: 'Create task',
-    providers: 'Upstream services', routes: 'Model routes', pricing: 'Model pricing', credentials: 'Client credentials',
-    'service-credentials': 'Service credentials', plugins: 'Plugins',
+    providers: 'Upstream services', routes: 'Model routes', pricing: 'Model pricing', tenants: 'Tenant management', credentials: 'Client credentials',
+    'service-credentials': 'Service credentials', plugins: 'Plugins', settings: 'System settings',
   },
 } as const;
 
@@ -57,8 +57,8 @@ function navigation(surface: AppSurface, locale: Locale): NavigationSection[] {
   return [
     { label: label(locale, 'monitoring'), items: [item('overview'), item('requests'), item('sessions'), item('usage'), item('generations')] },
     { label: label(locale, 'traffic'), items: [item('providers'), item('routes'), item('pricing')] },
-    { label: label(locale, 'identity'), items: [item('credentials'), item('service-credentials')] },
-    { label: label(locale, 'system'), items: [item('plugins')] },
+    { label: label(locale, 'identity'), items: [item('tenants'), item('credentials'), item('service-credentials')] },
+    { label: label(locale, 'system'), items: [item('plugins'), item('settings')] },
   ];
 }
 
@@ -73,9 +73,11 @@ function NavIcon({ name }: { name: IconName }) {
     providers: <><path d="M12 2v7M12 15v7M4.2 6.5l6.1 3.5M13.7 14l6.1 3.5M19.8 6.5 13.7 10M10.3 14l-6.1 3.5" /><circle cx="12" cy="12" r="3" /></>,
     routes: <><path d="M4 5h7a4 4 0 0 1 4 4v10M20 5h-2a3 3 0 0 0-3 3" /><path d="m11 16 4 4 4-4" /></>,
     pricing: <><path d="M12 3v18M17 7.5C17 5.6 14.8 4 12 4S7 5.6 7 7.5 9.2 11 12 11s5 1.6 5 3.5S14.8 18 12 18s-5-1.6-5-3.5" /></>,
+    tenants: <><circle cx="12" cy="8" r="3" /><path d="M5 21v-2a7 7 0 0 1 14 0v2M4 13h4M16 13h4" /></>,
     credentials: <><circle cx="9" cy="8" r="4" /><path d="M3 21v-2a6 6 0 0 1 12 0v2M16 11h5M19 8v6" /></>,
     'service-credentials': <><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M7 10h5M7 14h8M17 9v6" /></>,
     plugins: <><path d="M8 3v5H3v8h5v5h8v-5h5V8h-5V3z" /></>,
+    settings: <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.7 2.7-.1-.1a1.7 1.7 0 0 0-1.9-.3l-.8.4a1.7 1.7 0 0 0-1 1.5v.2H9.5v-.2a1.7 1.7 0 0 0-1-1.5l-.8-.4a1.7 1.7 0 0 0-1.9.3l-.1.1L3 17l.1-.1a1.7 1.7 0 0 0 .3-1.9L3 14.2a1.7 1.7 0 0 0-1.5-1H1.4V9.5h.2a1.7 1.7 0 0 0 1.5-1l.4-.8a1.7 1.7 0 0 0-.3-1.9L3 5.7 5.7 3l.1.1a1.7 1.7 0 0 0 1.9.3l.8-.4a1.7 1.7 0 0 0 1-1.5v-.2h3.8v.2a1.7 1.7 0 0 0 1 1.5l.8.4a1.7 1.7 0 0 0 1.9-.3l.1-.1 2.7 2.7-.1.1a1.7 1.7 0 0 0-.3 1.9l.4.8a1.7 1.7 0 0 0 1.5 1h.2v3.8h-.2a1.7 1.7 0 0 0-1.5 1z" /></>,
   };
   return <svg aria-hidden="true" className="app-nav-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }

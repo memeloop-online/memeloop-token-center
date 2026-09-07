@@ -11,7 +11,7 @@ import {
 
 test('portal and operator expose the complete product route sets', () => {
   assert.deepEqual(portalRouteKeys, ['overview', 'requests', 'sessions', 'usage', 'generations', 'generate']);
-  assert.deepEqual(operatorRouteKeys, ['overview', 'requests', 'sessions', 'usage', 'generations', 'providers', 'routes', 'pricing', 'credentials', 'service-credentials', 'plugins']);
+  assert.deepEqual(operatorRouteKeys, ['overview', 'requests', 'sessions', 'usage', 'generations', 'providers', 'routes', 'pricing', 'tenants', 'credentials', 'service-credentials', 'plugins', 'settings']);
 });
 
 test('legacy entry URLs resolve to stable defaults and query routes survive refresh', () => {
@@ -19,12 +19,14 @@ test('legacy entry URLs resolve to stable defaults and query routes survive refr
   assert.deepEqual(readAppLocation(new URL('https://example.test/operator')), { surface: 'operator', route: 'overview' });
   assert.deepEqual(readAppLocation(new URL('https://example.test/portal?view=sessions')), { surface: 'portal', route: 'sessions' });
   assert.deepEqual(readAppLocation(new URL('https://example.test/operator?view=service-credentials')), { surface: 'operator', route: 'service-credentials' });
+  assert.deepEqual(readAppLocation(new URL('https://example.test/operator?view=tenants')), { surface: 'operator', route: 'tenants' });
   assert.deepEqual(readAppLocation(new URL('https://example.test/operator?view=unknown')), { surface: 'operator', route: 'overview' });
 });
 
 test('navigation URLs use exact server document paths and never contain credentials', () => {
   assert.equal(appHref('portal', 'generate'), '/portal?view=generate');
   assert.equal(appHref('operator', 'pricing'), '/operator?view=pricing');
+  assert.equal(appHref('operator', 'tenants'), '/operator?view=tenants');
   assert.throws(() => appHref('portal', 'providers'));
   for (const route of portalRouteKeys) assert.doesNotMatch(appHref('portal', route), /token|secret|credential=/i);
   for (const route of operatorRouteKeys) assert.doesNotMatch(appHref('operator', route), /token|secret|credential=/i);

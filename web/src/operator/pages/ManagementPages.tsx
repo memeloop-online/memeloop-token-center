@@ -778,7 +778,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
 
 interface OperatorPageProps {
   token: string;
-  /** Read scope; an empty value means the authorized aggregate view. */
+  /** Selected read scope; empty only when no tenant is available. */
   tenant: string;
   /** Explicit target for every create/update action. */
   writeTenant?: string;

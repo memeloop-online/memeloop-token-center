@@ -38,7 +38,7 @@ type TenantPickerExpectation = 'hidden' | 'visible';
 /**
  * A scoped single-tenant credential authenticates directly into its tenant and
  * deliberately has no selector. Multi-tenant credentials retain the selector
- * so the operator can select aggregate or tenant-specific read scope.
+ * so every read and write has an explicit tenant scope.
  */
 export async function assertOperatorTenantScope(
   page: Page,
@@ -46,7 +46,6 @@ export async function assertOperatorTenantScope(
   pickerExpectation: TenantPickerExpectation,
 ): Promise<Locator | undefined> {
   const tenantPicker = page.locator('.tenant-picker select');
-  const context = page.locator('.console-context');
   await eventually(async () => {
     const count = await tenantPicker.count();
     assert.equal(
@@ -59,8 +58,7 @@ export async function assertOperatorTenantScope(
       assert.ok(options.includes(expectedTenant), `tenant picker options ${JSON.stringify(options)} do not include ${expectedTenant}`);
       return;
     }
-    const contextText = (await context.allTextContents()).join(' ');
-    assert.ok(contextText.includes(expectedTenant), `operator context ${JSON.stringify(contextText)} does not identify ${expectedTenant}`);
+    assert.equal(await page.locator('.console-context').count(), 0, `single tenant ${expectedTenant} must not render a scope card`);
   });
   return pickerExpectation === 'visible' ? tenantPicker : undefined;
 }

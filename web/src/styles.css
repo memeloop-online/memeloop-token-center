@@ -514,7 +514,6 @@ button.bucket-heading:hover b {
   .console-context { align-items: flex-start; flex-direction: column; gap: 6px; margin-top: 0; }
   .console-context small { text-align: left; }
   .operator-credential { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; width: 100%; }
-  .operator-credential .tenant-picker { grid-column: 1 / -1; }
   .management-layout { grid-template-columns: minmax(0, 1fr); }
 }
 @media (width <= 560px) {

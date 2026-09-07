@@ -2,7 +2,6 @@ import { useEffect, useReducer, useRef } from 'react';
 import { api } from '../../api';
 import {
   clearRememberedCredential,
-  defaultTenantForCredential,
   readRememberedCredential,
   readRememberedOperatorTenant,
   rememberCredential,
@@ -140,13 +139,12 @@ export function useOperatorScope() {
   const activeCredential = state.status.kind === 'ready' || state.status.kind === 'failed'
     ? state.credential
     : '';
-  const writeTenant = state.tenant || defaultTenantForCredential(state.tenants);
+  const writeTenant = state.tenant;
 
   return {
     ...state,
     activeCredential,
     writeTenant,
-    isAggregate: state.tenants.length > 1 && !state.tenant,
     authenticating: state.status.kind === 'authenticating',
     error: state.status.kind === 'failed' ? state.status.message : '',
     setCredentialInput: (value: string) => dispatch({ type: 'credential-input', value }),

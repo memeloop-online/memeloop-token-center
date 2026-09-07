@@ -739,8 +739,9 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   assert.ok(Number.isSafeInteger(Number(afterFilterReset.searchParams.get('after_event_at'))));
 
   const tenantPicker = page.locator('.tenant-picker select');
-  await tenantPicker.selectOption('');
-  await assertValue(tenantPicker, '');
+  const alternateTenant = (await tenantPicker.locator('option').evaluateAll((options) => options.map((option) => option.getAttribute('value')).find((value) => value && value !== tenant)))!;
+  await tenantPicker.selectOption(alternateTenant);
+  await assertValue(tenantPicker, alternateTenant);
   const connectionsBeforeTenantReset = observation.connectionUrls.length;
   await tenantPicker.selectOption(tenant);
   await assertValue(tenantPicker, tenant);
