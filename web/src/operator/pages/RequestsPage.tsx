@@ -42,7 +42,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   scope.current = { token, tenant, filters };
 
   async function load(nextFilters: TypedFilterAst, older = false) {
-    if (!token) return;
+    if (!token || !tenant) return;
     const request = ++sequence.current;
     const currentScope = { token, tenant, filters: nextFilters };
     const last = requests.at(-1);
@@ -72,7 +72,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
 
   useEffect(() => {
     sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setError(''); setUpstreamError('');
-    if (!token) { setUpstreams([]); return; }
+    if (!token || !tenant) { setUpstreams([]); return; }
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
       .then((values) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams(values); setUpstreamError(''); } })

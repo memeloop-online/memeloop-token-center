@@ -71,7 +71,11 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
   const stream = useOperatorRequestStream({
     token: scope.activeCredential,
     tenant: scope.tenant,
-    enabled: Boolean(scope.activeCredential) && (activeRoute === 'requests' || activeRoute === 'sessions'),
+    // A credential is not a resolved resource scope. Do not open an
+    // all-tenant stream while tenant discovery or a scope replacement is in
+    // flight; the explicit tenant is part of the stream authorization.
+    enabled: Boolean(scope.activeCredential && scope.validated && scope.tenant)
+      && (activeRoute === 'requests' || activeRoute === 'sessions'),
     disconnectedMessage: t('traffic.streamDisconnected'),
   });
 
@@ -130,7 +134,10 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
   }
 
   let page: ReactNode = null;
-  if (scope.activeCredential) {
+  // Pages mount only after authentication and tenant discovery have produced
+  // an exact scope. This prevents a transient empty tenant from turning a
+  // tenant-scoped resource request into an accidental all-tenant read.
+  if (scope.activeCredential && scope.validated && scope.tenant) {
     const pageProps = { token: scope.activeCredential, tenant: scope.tenant, writeTenant: scope.writeTenant };
     if (isOperatorRouteKey(activeRoute)) {
       switch (activeRoute) {

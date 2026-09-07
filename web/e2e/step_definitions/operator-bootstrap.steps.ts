@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { Then, When } from '@cucumber/cucumber';
-import type { Page } from 'playwright';
+import type { Page, Request } from 'playwright';
 
 import { eventually } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
@@ -9,6 +9,18 @@ interface ObservedRequest {
   credential: string;
   path: string;
   tenant: string | null;
+}
+
+function requestTenant(request: Request, url: URL): string | null {
+  const queryTenant = url.searchParams.get('tenant_external_id');
+  if (queryTenant) return queryTenant;
+  if (request.method() !== 'POST') return null;
+  try {
+    const body = request.postDataJSON() as { tenant_external_id?: unknown } | null;
+    return typeof body?.tenant_external_id === 'string' ? body.tenant_external_id : null;
+  } catch {
+    return null;
+  }
 }
 
 const observations = new WeakMap<DogfoodWorld, ObservedRequest[]>();
@@ -51,7 +63,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
     const request = route.request();
     const url = new URL(request.url());
     const credential = (await request.allHeaders()).authorization?.replace(/^Bearer /, '') ?? '';
-    observed.push({ credential, path: url.pathname, tenant: url.searchParams.get('tenant_external_id') });
+    observed.push({ credential, path: url.pathname, tenant: requestTenant(request, url) });
 
     if (url.pathname === '/internal/v1/tenants') {
       if (credential === 'singleton-credential') {
