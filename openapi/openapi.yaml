@@ -890,6 +890,32 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/upstreams/{account_id}/deletion-readiness:
+    get:
+      tags: [Upstream providers]
+      operationId: getUpstreamProviderDeletionReadiness
+      summary: Read the blockers before deleting an upstream provider
+      description: |
+        Returns the exact lifecycle, explicit-model-route, immutable-history, and
+        import-provenance constraints that DELETE checks. Explicit route counts
+        include every direct and multi-candidate reference, including disabled
+        routes retained for audit. This is a read-only preview; DELETE repeats
+        all checks transactionally.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '200':
+          description: Current deletion constraints for the stable upstream identity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamDeletionReadiness' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/upstreams/{account_id}:
     put:
       tags: [Upstream providers]
@@ -953,10 +979,11 @@ paths:
       operationId: deleteUpstreamProvider
       summary: Delete a disabled, unreferenced unified upstream
       description: |
-        The account must be disabled, have no model routes, and have no text or
-        generation request history. Otherwise it must remain disabled for audit and
-        the operation returns 409. A missing account, including a repeated successful
-        delete, returns 204.
+        The account must be disabled, have no direct or multi-candidate model-route
+        references, no text or generation request history, and no retained import
+        provenance. Otherwise it must remain disabled for audit and the operation
+        returns 409. A missing account, including a repeated successful delete,
+        returns 204.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:write
       parameters:
@@ -4703,6 +4730,17 @@ components:
         route_count: { type: integer, format: int64, minimum: 0, description: Includes disabled routes retained for audit. }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
+    UpstreamDeletionReadiness:
+      type: object
+      additionalProperties: false
+      required: [requires_disabled, model_route_count, request_history_count, generation_history_count, imported_for_audit, can_delete]
+      properties:
+        requires_disabled: { type: boolean, description: The stable upstream must first transition to disabled. }
+        model_route_count: { type: integer, format: int64, minimum: 0, description: Distinct direct or multi-candidate model routes, including disabled routes. }
+        request_history_count: { type: integer, format: int64, minimum: 0, description: Immutable request-history rows attributed to this upstream. }
+        generation_history_count: { type: integer, format: int64, minimum: 0, description: Immutable generation-history rows attributed to this upstream. }
+        imported_for_audit: { type: boolean, description: Immutable import provenance retains the upstream for audit. }
+        can_delete: { type: boolean, description: All deletion blockers were absent when this read completed; DELETE verifies them again transactionally. }
     DisconnectUpstreamOAuthRequest:
       type: object
       additionalProperties: false

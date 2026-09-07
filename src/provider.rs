@@ -14,7 +14,9 @@ pub use credential::{
     UpstreamCredential, open_credential, seal_credential, validate_adapter_state, validate_config,
 };
 pub(crate) use credential::{open_private_json, seal_private_json};
-pub use types::{ModelRouteView, ResolvedUpstream, UpstreamAccountView};
+pub use types::{
+    ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamDeletionReadiness,
+};
 pub(crate) use types::{PROXY_ROUTING_POLICY, UpstreamTransportSnapshot};
 
 #[cfg(test)]

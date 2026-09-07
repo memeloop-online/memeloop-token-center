@@ -1,5 +1,6 @@
 use super::super::*;
 use super::*;
+use sqlx::{Any, Executor};
 
 pub struct CreateUpstreamAccountInput {
     pub tenant_external_id: String,
@@ -58,7 +59,7 @@ impl Database {
             .try_get("id")?;
         if let Some(session_id) = input.oauth_session_id {
             let existing = sqlx::query(
-                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.oauth_session_id = $1",
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.oauth_session_id = $1",
             )
             .bind(session_id.to_string())
             .fetch_optional(&mut *tx)
@@ -136,7 +137,7 @@ impl Database {
         key_material: &[u8],
     ) -> Result<(UpstreamAccountView, UpstreamCredential), AppError> {
         let row = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1",
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1",
         )
         .bind(account_id.to_string())
         .fetch_optional(&self.pool)
@@ -176,7 +177,7 @@ impl Database {
         let config_json = serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
         let mut tx = self.pool.begin().await?;
         let current = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
         )
         .bind(account_id.to_string())
         .bind(tenant_external_id)
@@ -246,7 +247,7 @@ impl Database {
         }
         let mut tx = self.pool.begin().await?;
         let current = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
         )
         .bind(account_id.to_string())
         .bind(tenant_external_id)
@@ -284,6 +285,43 @@ impl Database {
         view.updated_at = updated_at;
         Ok(view)
     }
+
+    /// Read the actual deletion constraints for one upstream identity. This is
+    /// deliberately a read-only preview: DELETE repeats these checks in its
+    /// transaction so a concurrent relation or history write cannot turn this
+    /// result into permission to remove the account.
+    pub async fn upstream_deletion_readiness(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+    ) -> Result<UpstreamDeletionReadiness, AppError> {
+        let account = sqlx::query(
+            "SELECT a.tenant_id, a.status FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2",
+        )
+        .bind(account_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        let tenant_id: String = account.try_get("tenant_id")?;
+        let (model_route_count, request_history_count, generation_history_count, imported_for_audit) =
+            upstream_deletion_dependency_counts(&self.pool, &tenant_id, account_id).await?;
+        let requires_disabled = account.try_get::<String, _>("status")? != "disabled";
+        let can_delete = !requires_disabled
+            && model_route_count == 0
+            && request_history_count == 0
+            && generation_history_count == 0
+            && !imported_for_audit;
+        Ok(UpstreamDeletionReadiness {
+            requires_disabled,
+            model_route_count,
+            request_history_count,
+            generation_history_count,
+            imported_for_audit,
+            can_delete,
+        })
+    }
+
     pub async fn delete_upstream_account(
         &self,
         account_id: Uuid,
@@ -312,42 +350,20 @@ impl Database {
                 "reload the upstream provider before deleting it".into(),
             ));
         }
-        let imported = sqlx::query(
-            "SELECT upstream_account_id FROM upstream_account_imports WHERE upstream_account_id = $1 LIMIT 1",
-        )
-        .bind(account_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?
-        .is_some();
-        if imported {
+        let tenant_id: String = account.try_get("tenant_id")?;
+        let (model_route_count, request_history_count, generation_history_count, imported_for_audit) =
+            upstream_deletion_dependency_counts(&mut *tx, &tenant_id, account_id).await?;
+        if imported_for_audit {
             return Err(AppError::Conflict(
                 "imported upstream providers are retained for audit and cannot be deleted".into(),
             ));
         }
-        let has_routes =
-            sqlx::query("SELECT id FROM model_routes WHERE upstream_account_id = $1 LIMIT 1")
-                .bind(account_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_some();
-        if has_routes {
+        if model_route_count > 0 {
             return Err(AppError::Conflict(
                 "the upstream provider still has model routes and must be retained".into(),
             ));
         }
-        let has_request_history =
-            sqlx::query("SELECT id FROM request_records WHERE upstream_account_id = $1 LIMIT 1")
-                .bind(account_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_some();
-        let has_generation_history =
-            sqlx::query("SELECT id FROM generation_jobs WHERE upstream_account_id = $1 LIMIT 1")
-                .bind(account_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_some();
-        if has_request_history || has_generation_history {
+        if request_history_count > 0 || generation_history_count > 0 {
             return Err(AppError::Conflict(
                 "the upstream provider has request history and must be retained for audit".into(),
             ));
@@ -365,10 +381,10 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let deleted = sqlx::query(
-            "DELETE FROM upstream_accounts WHERE id = $1 AND tenant_id = $2 AND status = 'disabled' AND updated_at = $3",
+            "DELETE FROM upstream_accounts WHERE id = $1 AND tenant_id = $2 AND status = 'disabled' AND updated_at = $3 AND NOT EXISTS (SELECT 1 FROM model_routes r WHERE r.tenant_id = $2 AND (r.upstream_account_id = $1 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $1))) AND NOT EXISTS (SELECT 1 FROM request_records history WHERE history.tenant_id = $2 AND history.upstream_account_id = $1) AND NOT EXISTS (SELECT 1 FROM generation_jobs history WHERE history.tenant_id = $2 AND history.upstream_account_id = $1) AND NOT EXISTS (SELECT 1 FROM upstream_account_imports imported WHERE imported.tenant_id = $2 AND imported.upstream_account_id = $1)",
         )
         .bind(account_id.to_string())
-        .bind(account.try_get::<String, _>("tenant_id")?)
+        .bind(tenant_id)
         .bind(expected_updated_at)
         .execute(&mut *tx)
         .await?;
@@ -400,7 +416,7 @@ impl Database {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned());
         let rows = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE ($1 = '' OR t.external_id = $1) AND (a.created_at < $2 OR (a.created_at = $2 AND a.id < $3)) ORDER BY a.created_at DESC, a.id DESC LIMIT $4",
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE ($1 = '' OR t.external_id = $1) AND (a.created_at < $2 OR (a.created_at = $2 AND a.id < $3)) ORDER BY a.created_at DESC, a.id DESC LIMIT $4",
         )
         .bind(tenant_external_id.unwrap_or_default())
         .bind(before_created_at)
@@ -438,7 +454,7 @@ impl Database {
         tenant_external_id: &str,
     ) -> Result<UpstreamAccountView, AppError> {
         let row = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2",
         )
         .bind(account_id.to_string())
         .bind(tenant_external_id)
@@ -456,6 +472,29 @@ impl Database {
             .try_get("driver")
             .map_err(AppError::from)
     }
+}
+
+async fn upstream_deletion_dependency_counts<'e, E>(
+    executor: E,
+    tenant_id: &str,
+    account_id: Uuid,
+) -> Result<(i64, i64, i64, bool), AppError>
+where
+    E: Executor<'e, Database = Any>,
+{
+    let row = sqlx::query(
+        "SELECT (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = $1 AND (r.upstream_account_id = $2 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $2))) AS model_route_count, (SELECT COUNT(*) FROM request_records history WHERE history.tenant_id = $1 AND history.upstream_account_id = $2) AS request_history_count, (SELECT COUNT(*) FROM generation_jobs history WHERE history.tenant_id = $1 AND history.upstream_account_id = $2) AS generation_history_count, (SELECT COUNT(*) FROM upstream_account_imports imported WHERE imported.tenant_id = $1 AND imported.upstream_account_id = $2) AS import_count",
+    )
+    .bind(tenant_id)
+    .bind(account_id.to_string())
+    .fetch_one(executor)
+    .await?;
+    Ok((
+        row.try_get("model_route_count")?,
+        row.try_get("request_history_count")?,
+        row.try_get("generation_history_count")?,
+        row.try_get::<i64, _>("import_count")? > 0,
+    ))
 }
 
 pub(super) fn upstream_account_view(

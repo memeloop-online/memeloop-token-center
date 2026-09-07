@@ -10,7 +10,7 @@ import { safeValidator as validator } from '../../safeValidator';
 import type {
   ConfigurationSchemas, CredentialRoutingView, GenerationPriceView, GroupView, KeyLimitSnapshot, KeyListCursor, KeyView,
   ModelPriceSyncResult, ModelPriceUsageSummary, ModelPriceView, ModelRouteView, ProviderType,
-  ServiceTokenView, UpstreamAccount, UpstreamHealth,
+  ServiceTokenView, UpstreamAccount, UpstreamDeletionReadiness, UpstreamHealth,
 } from '../../types';
 import { GroupManager, useGroups } from '../GroupManager';
 import { MultiCombobox, type ComboboxOption } from '../MultiCombobox';
@@ -44,6 +44,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [reauthorizing, setReauthorizing] = useState<UpstreamAccount>();
   const [busy, setBusy] = useState('');
   const [health, setHealth] = useState<Record<string, UpstreamHealth>>({});
+  const [deletionReadiness, setDeletionReadiness] = useState<Record<string, UpstreamDeletionReadiness>>({});
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const providerGroups = useGroups('provider', token, writeTenant);
@@ -97,7 +98,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   };
   useEffect(() => {
     setMethod('direct'); setDriver(''); setRotating(undefined); setEditing(undefined); setReauthorizing(undefined);
-    setBusy(''); setHealth({}); setMessage(''); setError('');
+    setBusy(''); setHealth({}); setDeletionReadiness({}); setMessage(''); setError('');
   }, [token, tenant, writeTenant]);
 
   const statusFilter = useResourceListStatusFilter('upstreams', tenant, values, (value) => value.status === 'active');
@@ -137,6 +138,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     try {
       await api(`/internal/v1/upstreams/${value.id}`, token, { method: 'PATCH', body: JSON.stringify({ tenant_external_id: writeTenant, status, expected_updated_at: value.updated_at }) });
       setHealth((current) => { const next = { ...current }; delete next[value.id]; return next; });
+      setDeletionReadiness((current) => { const next = { ...current }; delete next[value.id]; return next; });
       setMessage(t(status === 'active' ? 'providers.enabled' : 'providers.disabled', { name: value.name }));
       await onChanged();
       setHealth((current) => { const next = { ...current }; delete next[value.id]; return next; });
@@ -154,10 +156,28 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     finally { setBusy(''); }
   }
 
+  function deletionMessages(readiness: UpstreamDeletionReadiness) {
+    const messages: string[] = [];
+    if (readiness.requires_disabled) messages.push(t('providers.deleteRequiresDisabled'));
+    if (readiness.model_route_count > 0) messages.push(t('providers.deleteBlockedRoutes', { count: formatNumber(readiness.model_route_count, locale) }));
+    if (readiness.request_history_count > 0) messages.push(t('providers.deleteBlockedRequestHistory', { count: formatNumber(readiness.request_history_count, locale) }));
+    if (readiness.generation_history_count > 0) messages.push(t('providers.deleteBlockedGenerationHistory', { count: formatNumber(readiness.generation_history_count, locale) }));
+    if (readiness.imported_for_audit) messages.push(t('providers.deleteBlockedImport'));
+    if (readiness.can_delete) messages.push(t('providers.deleteReady'));
+    return messages;
+  }
+
   async function remove(value: UpstreamAccount) {
-    if (!canManage(value) || value.status !== 'disabled' || !window.confirm(t('providers.confirmDelete', { name: value.name }))) return;
+    if (!canManage(value)) return;
     setBusy(`delete-${value.id}`); setError(''); setMessage('');
     try {
+      const readiness = await api<UpstreamDeletionReadiness>(`/internal/v1/upstreams/${value.id}/deletion-readiness${queryForTenant(writeTenant)}`, token);
+      setDeletionReadiness((current) => ({ ...current, [value.id]: readiness }));
+      if (!readiness.can_delete) {
+        setError(deletionMessages(readiness).join(' '));
+        return;
+      }
+      if (!window.confirm(t('providers.confirmDelete', { name: value.name }))) return;
       const query = new URLSearchParams({ tenant_external_id: writeTenant, expected_updated_at: String(value.updated_at) });
       await api(`/internal/v1/upstreams/${value.id}?${query}`, token, { method: 'DELETE' });
       setMessage(t('providers.deleted', { name: value.name }));
@@ -170,10 +190,41 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     <article className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
       {error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}
       <div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('providers.empty')} />}{statusFilter.values.map((value) => {
-        const currentHealth = value.status === 'active' ? health[value.id] : undefined;
+        const providerAvailable = providers.some((provider) => provider.id === value.driver);
+        const currentHealth = value.status === 'active' && providerAvailable ? health[value.id] : undefined;
         const manageable = canManage(value);
         const memberships = providerGroups.groups.filter((group) => group.member_ids.includes(value.id));
-        return <div className="account provider-account" key={value.id}><div className="account-main"><b>{value.name}</b><span>{value.driver} · {t('providers.method')}: {enumLabel(t, 'auth', value.connection_method)}{value.tenant_external_id ? ` · ${value.tenant_external_id}` : ''}</span>{memberships.length > 0 && <div className="table-chip-list provider-group-summary" aria-label={t('groups.provider.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}<small>{value.id}</small>{value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}{currentHealth && <small className={`status ${currentHealth.status === 'healthy' ? 'ok' : 'pending'}`}>{currentHealth.status === 'healthy' ? t('providers.healthy') : t('providers.unhealthy')}{currentHealth.upstream_status ? ` · HTTP ${formatNumber(currentHealth.upstream_status, locale)}` : ''}{currentHealth.latency_ms !== undefined ? ` · ${formatNumber(currentHealth.latency_ms, locale, 2)} ms` : ''}</small>}</div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span><span className="pill">{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span><div className="row-actions"><button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setEditing(value)}>{t('providers.edit')}</button><button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.health')}</button>{value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}{value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}{value.auth_kind === 'oauth' && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</button>}{value.can_rotate && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setRotating(value)}>{t('providers.rotateCredential')}</button>}<button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void setStatus(value, value.status === 'active' ? 'disabled' : 'active')}>{value.status === 'active' ? t('providers.disable') : t('providers.enable')}</button><button type="button" className="danger" title={value.status !== 'disabled' ? t('providers.disableBeforeDelete') : value.route_count > 0 ? t('providers.removeRoutesFirst') : undefined} disabled={!manageable || Boolean(busy) || value.status !== 'disabled' || value.route_count > 0} onClick={() => void remove(value)}>{t('common.remove')}</button></div></div></div>;
+        const currentReadiness = deletionReadiness[value.id];
+        const deletionBlockers = currentReadiness ? deletionMessages(currentReadiness) : [];
+        return <div className="account provider-account" key={value.id}>
+          <div className="account-main">
+            <b>{value.name}</b>
+            <span>{value.driver} · {t('providers.method')}: {enumLabel(t, 'auth', value.connection_method)}{value.tenant_external_id ? ` · ${value.tenant_external_id}` : ''}</span>
+            {memberships.length > 0 && <div className="table-chip-list provider-group-summary" aria-label={t('groups.provider.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
+            {!providerAvailable && <span className="pill">{t('providers.retired')}</span>}
+            <small>{value.id}</small>
+            {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
+            {currentHealth && <small className={`status ${currentHealth.status === 'healthy' ? 'ok' : 'pending'}`}>{currentHealth.status === 'healthy' ? t('providers.healthy') : t('providers.unhealthy')}{currentHealth.upstream_status ? ` · HTTP ${formatNumber(currentHealth.upstream_status, locale)}` : ''}{currentHealth.latency_ms !== undefined ? ` · ${formatNumber(currentHealth.latency_ms, locale, 2)} ms` : ''}</small>}
+            {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
+          </div>
+          <div className="account-meta">
+            <span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span>
+            <span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span>
+            <span className="pill">{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span>
+            <div className="row-actions">
+              {providerAvailable && <>
+                <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setEditing(value)}>{t('providers.edit')}</button>
+                <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.health')}</button>
+                {value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}
+                {value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}
+                {value.auth_kind === 'oauth' && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</button>}
+                {value.can_rotate && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setRotating(value)}>{t('providers.rotateCredential')}</button>}
+              </>}
+              {(value.status === 'active' || providerAvailable) && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void setStatus(value, value.status === 'active' ? 'disabled' : 'active')}>{value.status === 'active' ? t('providers.disable') : t('providers.enable')}</button>}
+              <button type="button" className="danger" title={deletionBlockers.length > 0 ? deletionBlockers.join(' ') : undefined} disabled={!manageable || Boolean(busy)} onClick={() => void remove(value)}>{t('common.remove')}</button>
+            </div>
+          </div>
+        </div>;
       })}</div>
       {editing && editSchema && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.editFor', { name: editing.name })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><Form key={`${editing.id}-${locale}`} schema={editSchema} uiSchema={{ config: { oauth: { 'ui:disabled': true } } }} formData={{ name: editing.name, config: editing.config }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!formData) return; setBusy(`edit-${editing.id}`); try { await api(`/internal/v1/upstreams/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, expected_updated_at: editing.updated_at }) }); setEditing(undefined); setMessage(t('providers.updated', { name: editing.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(editing) || Boolean(busy)}>{t('common.save')}</button></Form></div>}
       {rotating && rotateProvider && <div className="inline-editor"><div className="panel-title"><h3>{t('providers.rotateFor', { name: rotating.name })}</h3><button type="button" className="secondary" onClick={() => setRotating(undefined)}>{t('common.cancel')}</button></div><Form key={`${rotating.id}-${locale}`} schema={localizeSchema(rotateProvider.credential_schema as RJSFSchema, locale)} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { setBusy(`rotate-${rotating.id}`); try { await api(`/internal/v1/upstreams/${rotating.id}/credential`, token, { method: 'PUT', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ credential: formData }) }); setRotating(undefined); setMessage(t('providers.rotated', { name: rotating.name })); await onChanged(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}><button type="submit" disabled={!canManage(rotating) || Boolean(busy)}>{t('providers.confirmRotate')}</button></Form></div>}

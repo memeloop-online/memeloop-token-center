@@ -8,8 +8,8 @@ mod oauth_claude;
 mod oauth_copilot;
 
 pub(in crate::api) use accounts::{
-    create_upstream, delete_upstream, list_upstreams, rotate_upstream_credential,
-    set_upstream_status, update_upstream,
+    create_upstream, delete_upstream, get_upstream_deletion_readiness, list_upstreams,
+    rotate_upstream_credential, set_upstream_status, update_upstream,
 };
 pub(in crate::api) use health::probe_upstream_health;
 pub(in crate::api) use managed_import::{

@@ -275,6 +275,31 @@ pub(in crate::api) async fn list_upstreams(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct UpstreamDeletionReadinessQuery {
+    tenant_external_id: String,
+}
+
+/// Shows the lifecycle and immutable-data constraints that DELETE will check.
+/// This endpoint is intentionally read-only: the delete operation repeats the
+/// same checks inside its own transaction.
+pub(in crate::api) async fn get_upstream_deletion_readiness(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<UpstreamDeletionReadinessQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:read").await?;
+    require_service_tenant(&service, &query.tenant_external_id)?;
+    Ok(Json(
+        state
+            .db
+            .upstream_deletion_readiness(account_id, &query.tenant_external_id)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
 pub(in crate::api) struct UpstreamListQuery {
     tenant_external_id: Option<String>,
     before_created_at: Option<i64>,

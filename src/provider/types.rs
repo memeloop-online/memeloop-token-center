@@ -90,6 +90,32 @@ pub struct UpstreamAccountView {
     pub updated_at: i64,
 }
 
+/// Read-only deletion preflight for one stable upstream identity.
+///
+/// Counts include disabled routes and immutable request/generation history so
+/// an operator can distinguish an actionable route cleanup from an audit
+/// retention boundary before attempting a destructive mutation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UpstreamDeletionReadiness {
+    /// The only mutable lifecycle prerequisite: disable this exact upstream
+    /// identity before it can be physically removed.
+    pub requires_disabled: bool,
+    /// Distinct model routes that explicitly name this upstream, including a
+    /// multi-candidate association and disabled routes retained for audit.
+    pub model_route_count: i64,
+    /// Immutable text/request archive rows attributed to this upstream.
+    pub request_history_count: i64,
+    /// Immutable asynchronous generation rows attributed to this upstream.
+    pub generation_history_count: i64,
+    /// Imported accounts retain immutable source provenance and are never
+    /// physically deleted through the upstream lifecycle API.
+    pub imported_for_audit: bool,
+    /// True only when DELETE may proceed at the instant this read completed.
+    /// DELETE repeats every check transactionally; this is guidance, not an
+    /// authorization grant.
+    pub can_delete: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ModelRouteView {
     pub id: Uuid,

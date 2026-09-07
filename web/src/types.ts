@@ -585,6 +585,15 @@ export interface UpstreamAccount {
   updated_at: number;
 }
 
+export interface UpstreamDeletionReadiness {
+  requires_disabled: boolean;
+  model_route_count: number;
+  request_history_count: number;
+  generation_history_count: number;
+  imported_for_audit: boolean;
+  can_delete: boolean;
+}
+
 export interface UpstreamHealth {
   account_id: string;
   status: 'healthy' | 'unhealthy';

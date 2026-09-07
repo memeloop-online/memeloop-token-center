@@ -37,6 +37,13 @@ authorization or no credential. Its authentication method is metadata, not a
 separate resource type. Inactive records remain readable for audit but cannot be
 reactivated or routed without an explicit supported configuration.
 
+`GET /internal/v1/upstreams/{account_id}/deletion-readiness` reports the exact
+lifecycle, direct-or-multi-candidate route, immutable history, and import
+provenance blockers without mutating data. `DELETE` requires a disabled account
+with none of those retained dependencies and repeats the check transactionally,
+so a stale readiness read cannot delete a newly referenced upstream. Otherwise
+the upstream remains disabled for audit and DELETE returns 409.
+
 Model routes are tenant-scoped, versioned and optimistic-concurrency protected.
 Route selection honors enabled state, grants, priority, health and bounded
 round-robin behavior. A client may access only visible models. Historical request

@@ -6,7 +6,8 @@ use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
     db::{
-        CreateModelRouteInput, CreateServiceTokenInput, CreateUpstreamAccountInput,
+        CreateModelRouteInput, CreateRoutedModelRouteInput, CreateServiceTokenInput,
+        CreateUpstreamAccountInput,
         ReauthorizeUpstreamAccountInput,
     },
     provider::{UpstreamAccountView, UpstreamCredential},
@@ -1137,6 +1138,203 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(body, Value::Null);
+}
+
+#[tokio::test]
+async fn upstream_deletion_readiness_keeps_multi_candidate_routes_and_history_visible() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("upstream-deletion-readiness.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let primary = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "deletion-readiness".into(),
+                name: "current-upstream".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url": "https://api.example.test"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    // This persists a historical account directly; it does not recreate a
+    // legacy driver in the public provider catalog or routing runtime.
+    let retired = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "deletion-readiness".into(),
+                name: "retired-upstream".into(),
+                driver: "cpa-gemini-oauth-legacy".into(),
+                config: json!({"base_url": "https://cloudcode-pa.googleapis.com"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let (route, _) = state
+        .db
+        .create_routed_model_route(CreateRoutedModelRouteInput {
+            tenant_external_id: "deletion-readiness".into(),
+            public_model: "deletion-ready-model".into(),
+            upstream_model: "provider-model".into(),
+            protocol: "openai".into(),
+            priority: 0,
+            enabled: true,
+            upstream_account_ids: vec![primary.id, retired.id],
+            included_provider_group_ids: Vec::new(),
+            excluded_provider_group_ids: Vec::new(),
+            route_group_ids: Vec::new(),
+            route_group_names: Vec::new(),
+            granted_credential_ids: Vec::new(),
+            custom_model_confirmed: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(route.upstream_account_id, primary.id);
+    let service = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "deletion-readiness-manager".into(),
+                scopes: vec!["providers:read".into(), "providers:write".into()],
+                tenant_external_id: Some("deletion-readiness".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let readiness_path = format!(
+        "/internal/v1/upstreams/{}/deletion-readiness?tenant_external_id=deletion-readiness",
+        retired.id
+    );
+    let (status, readiness) = json_request(
+        &state,
+        "GET",
+        &readiness_path,
+        &service.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(readiness["requires_disabled"], true);
+    assert_eq!(readiness["model_route_count"], 1);
+    assert_eq!(readiness["request_history_count"], 0);
+    assert_eq!(readiness["generation_history_count"], 0);
+    assert_eq!(readiness["imported_for_audit"], false);
+    assert_eq!(readiness["can_delete"], false);
+
+    let (status, disabled) = json_request(
+        &state,
+        "PATCH",
+        &format!("/internal/v1/upstreams/{}", retired.id),
+        &service.token,
+        None,
+        Some(json!({
+            "tenant_external_id": "deletion-readiness",
+            "status": "disabled",
+            "expected_updated_at": retired.updated_at
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let disabled = account(disabled);
+    let (status, _) = json_request(
+        &state,
+        "PATCH",
+        &format!("/internal/v1/upstreams/{}", retired.id),
+        &service.token,
+        None,
+        Some(json!({
+            "tenant_external_id": "deletion-readiness",
+            "status": "active",
+            "expected_updated_at": disabled.updated_at
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = json_request(
+        &state,
+        "DELETE",
+        &format!(
+            "/internal/v1/upstreams/{}?tenant_external_id=deletion-readiness&expected_updated_at={}",
+            retired.id, disabled.updated_at
+        ),
+        &service.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    sqlx::query(
+        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id, upstream_account_id, model_route_id) VALUES ($1, $2, $3, 1, 'openai', 'deletion-ready-model', 0, 0, 0, '{}', $4, $5, $6)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(retired.tenant_id.to_string())
+    .bind(Uuid::now_v7().to_string())
+    .bind(Uuid::now_v7().to_string())
+    .bind(retired.id.to_string())
+    .bind(route.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO generation_jobs (id, tenant_id, key_id, upstream_account_id, reservation_id, public_model, upstream_model, driver, status, request_object, estimated_units, next_attempt_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 'deletion-ready-model', 'provider-model', 'cpa-gemini-oauth-legacy', 'failed', '{}', 1, 1, 1, 1)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(retired.tenant_id.to_string())
+    .bind(Uuid::now_v7().to_string())
+    .bind(retired.id.to_string())
+    .bind(Uuid::now_v7().to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstream_account_imports (tenant_id, import_kind, source_key, contract_version, payload_digest, upstream_account_id, created_at) VALUES ($1, 'cpa_managed_oauth', $2, 1, $3, $4, 1)",
+    )
+    .bind(retired.tenant_id.to_string())
+    .bind("a".repeat(64))
+    .bind("b".repeat(64))
+    .bind(retired.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, readiness) = json_request(
+        &state,
+        "GET",
+        &readiness_path,
+        &service.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(readiness["requires_disabled"], false);
+    assert_eq!(readiness["model_route_count"], 1);
+    assert_eq!(readiness["request_history_count"], 1);
+    assert_eq!(readiness["generation_history_count"], 1);
+    assert_eq!(readiness["imported_for_audit"], true);
+    assert_eq!(readiness["can_delete"], false);
 }
 
 #[tokio::test]
