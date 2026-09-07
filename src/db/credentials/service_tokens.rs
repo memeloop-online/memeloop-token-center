@@ -96,8 +96,13 @@ impl Database {
         let before_id = before_id
             .map(|value| value.to_string())
             .unwrap_or_else(|| "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned());
+        // Materialize the keyset page before joining credential payloads.  In
+        // particular, this keeps a high-cardinality credential table from
+        // becoming the driving relation for the ordered list query: control
+        // reads stay bounded by the public page limit even while a pool is
+        // serving concurrent list requests.
         let rows = sqlx::query(
-            "SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at, c.fingerprint, c.scopes_json, c.tenant_external_id FROM service_principals p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation WHERE p.created_at < $1 OR (p.created_at = $1 AND p.id < $2) ORDER BY p.created_at DESC, p.id DESC LIMIT $3",
+            "WITH page AS MATERIALIZED (SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at FROM service_principals p WHERE (p.created_at < $1 OR (p.created_at = $1 AND p.id < $2)) AND EXISTS (SELECT 1 FROM service_credentials c WHERE c.service_principal_id = p.id AND c.generation = p.credential_generation) ORDER BY p.created_at DESC, p.id DESC LIMIT $3) SELECT p.id, p.name, p.status, p.credential_generation, p.created_at, p.updated_at, c.fingerprint, c.scopes_json, c.tenant_external_id FROM page p JOIN service_credentials c ON c.service_principal_id = p.id AND c.generation = p.credential_generation ORDER BY p.created_at DESC, p.id DESC",
         )
         .bind(before_created_at)
         .bind(before_id)
@@ -589,6 +594,63 @@ mod tests {
             second
                 .iter()
                 .all(|right| left.service_id != right.service_id)
+        }));
+    }
+
+    #[tokio::test]
+    async fn service_token_page_is_bounded_under_concurrent_credential_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("service-token-concurrency.db")
+                .display()
+        );
+        // The memory acceptance fixture deliberately uses a two-connection
+        // SQLite pool. Keep this small regression fixture on that same pool
+        // shape so a credential-table join cannot turn concurrent control
+        // reads into an internal error.
+        let database = Database::connect_with_max(&database_url, 2).await.unwrap();
+        database.migrate().await.unwrap();
+        let mut transaction = database.pool.begin().await.unwrap();
+        for index in 1..=256_u128 {
+            let principal_id = Uuid::from_u128(index);
+            let credential_id = Uuid::from_u128((1_u128 << 64) | index);
+            let created_at = index as i64;
+            sqlx::query(
+                "INSERT INTO service_principals (id, name, status, credential_generation, created_at, updated_at) VALUES ($1, $2, 'active', 1, $3, $3)",
+            )
+            .bind(principal_id.to_string())
+            .bind(format!("concurrent-page-{index:03}"))
+            .bind(created_at)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO service_credentials (id, service_principal_id, generation, secret_hash, fingerprint, scopes_json, tenant_external_id, created_at) VALUES ($1, $2, 1, $3, $4, '[\"requests:read\"]', NULL, $5)",
+            )
+            .bind(credential_id.to_string())
+            .bind(principal_id.to_string())
+            .bind(vec![0_u8])
+            .bind(format!("concurrent-fingerprint-{index:03}"))
+            .bind(created_at)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        }
+        transaction.commit().await.unwrap();
+
+        let pages = futures_util::future::try_join_all(
+            (0..16).map(|_| database.list_service_tokens_page(None, None, 1_000_000)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pages.len(), 16);
+        assert!(pages.iter().all(|page| page.len() == 100));
+        assert!(pages.iter().all(|page| {
+            page.iter()
+                .all(|service| service.name.starts_with("concurrent-page-"))
         }));
     }
 }
