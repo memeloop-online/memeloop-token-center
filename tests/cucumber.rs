@@ -1,4 +1,8 @@
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use cucumber::{World, given, then, when};
 use futures_util::StreamExt;
@@ -6945,16 +6949,7 @@ async fn failed_responses_id_is_not_a_parent(world: &mut TokenCenterWorld) {
 #[then("the delivered invalid stream is a fully billed failure without response lineage")]
 async fn invalid_stream_is_billed_failure(world: &mut TokenCenterWorld) {
     assert_eq!(world.status, Some(StatusCode::OK));
-    let requests = world
-        .client
-        .get(format!("{}/self/v1/requests", world.service_url))
-        .bearer_auth(&world.current_key)
-        .send()
-        .await
-        .expect("invalid stream request history")
-        .json::<Value>()
-        .await
-        .expect("invalid stream request history JSON");
+    let requests = wait_for_invalid_stream_terminal_request(world).await;
     assert_eq!(requests.as_array().map(Vec::len), Some(1), "{requests}");
     assert_eq!(requests[0]["status_code"], 502, "{requests}");
     assert_eq!(
@@ -6983,6 +6978,34 @@ async fn invalid_stream_is_billed_failure(world: &mut TokenCenterWorld) {
         .expect("invalid stream stats JSON");
     assert_eq!(stats["summary"]["failed_requests"], 1, "{stats}");
     assert_eq!(stats["summary"]["output_tokens"], 2, "{stats}");
+}
+
+async fn wait_for_invalid_stream_terminal_request(world: &TokenCenterWorld) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut latest = Value::Null;
+    loop {
+        latest = world
+            .client
+            .get(format!("{}/self/v1/requests", world.service_url))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("invalid stream request history")
+            .json::<Value>()
+            .await
+            .expect("invalid stream request history JSON");
+        if latest.as_array().is_some_and(|requests| {
+            requests.len() == 1
+                && requests[0]["status_code"] == 502
+                && requests[0]["error_code"] == "upstream_invalid_usage"
+        }) {
+            return latest;
+        }
+        if Instant::now() >= deadline {
+            panic!("invalid stream did not reach its terminal row: {latest}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[when(
