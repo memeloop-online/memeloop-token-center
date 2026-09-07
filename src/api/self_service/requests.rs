@@ -62,6 +62,7 @@ impl RequestsQuery {
                 .transpose()?,
             key_alias: operator.then(|| self.key_alias.clone()).flatten(),
             principal: operator.then(|| self.principal.clone()).flatten(),
+            typed_ast: None,
         })
     }
 

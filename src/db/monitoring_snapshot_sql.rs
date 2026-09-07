@@ -12,7 +12,7 @@ pub(super) fn monitoring_snapshot_sql(
     scope: &MonitoringScope,
     granularity: MonitoringGranularity,
 ) -> String {
-    let (table, bucket_column, bucket_millis) = match granularity {
+    let (table, bucket_column, _bucket_millis) = match granularity {
         MonitoringGranularity::Hour => ("usage_analysis_hourly", "hour_bucket", 3_600_000),
         MonitoringGranularity::Day => ("usage_analysis_daily", "day_bucket", 86_400_000),
     };

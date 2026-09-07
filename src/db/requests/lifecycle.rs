@@ -435,7 +435,11 @@ impl Database {
         .await?;
         let delivery_started = pending
             .as_ref()
-            .and_then(|row| row.try_get::<Option<String>, _>("error_code").ok())
+            .and_then(|row| {
+                row.try_get::<Option<String>, _>("error_code")
+                    .ok()
+                    .flatten()
+            })
             .as_deref()
             == Some("delivery_started");
         let input_token_ceiling = if delivery_started {

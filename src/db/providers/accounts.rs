@@ -1,5 +1,6 @@
 use super::super::*;
 use super::*;
+use crate::provider::UpstreamDeletionReadiness;
 use sqlx::{Any, Executor};
 
 pub struct CreateUpstreamAccountInput {
@@ -304,8 +305,12 @@ impl Database {
         .await?
         .ok_or(AppError::NotFound)?;
         let tenant_id: String = account.try_get("tenant_id")?;
-        let (model_route_count, request_history_count, generation_history_count, imported_for_audit) =
-            upstream_deletion_dependency_counts(&self.pool, &tenant_id, account_id).await?;
+        let (
+            model_route_count,
+            request_history_count,
+            generation_history_count,
+            imported_for_audit,
+        ) = upstream_deletion_dependency_counts(&self.pool, &tenant_id, account_id).await?;
         let requires_disabled = account.try_get::<String, _>("status")? != "disabled";
         let can_delete = !requires_disabled
             && model_route_count == 0
@@ -351,8 +356,12 @@ impl Database {
             ));
         }
         let tenant_id: String = account.try_get("tenant_id")?;
-        let (model_route_count, request_history_count, generation_history_count, imported_for_audit) =
-            upstream_deletion_dependency_counts(&mut *tx, &tenant_id, account_id).await?;
+        let (
+            model_route_count,
+            request_history_count,
+            generation_history_count,
+            imported_for_audit,
+        ) = upstream_deletion_dependency_counts(&mut *tx, &tenant_id, account_id).await?;
         if imported_for_audit {
             return Err(AppError::Conflict(
                 "imported upstream providers are retained for audit and cannot be deleted".into(),
