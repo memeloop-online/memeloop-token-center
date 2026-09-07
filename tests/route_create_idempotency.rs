@@ -562,7 +562,7 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
         Some("route-create-owned-after-update")
     );
 
-    let legacy_upstream_id = updated_route.0.upstream_account_id;
+    let primary_upstream_id = updated_route.0.upstream_account_id;
     let removable_upstream = fixture
         .state
         .db
@@ -571,11 +571,25 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
         .expect("list owned route upstreams")
         .into_iter()
         .find(|upstream| {
-            upstream.id != legacy_upstream_id
+            upstream.id != primary_upstream_id
                 && (upstream.id == fixture.upstream_id
                     || upstream.id == fixture.secondary_upstream_id)
         })
         .expect("non-compatibility owned route upstream");
+
+    // Multi-candidate routes retain every associated upstream.  This exact
+    // route must therefore block deletion until the candidate association is
+    // explicitly removed; DELETE must never rely on a foreign-key cascade to
+    // erase a still-routable association.
+    let readiness = fixture
+        .state
+        .db
+        .upstream_deletion_readiness(removable_upstream.id, &fixture.tenant)
+        .await
+        .expect("read removable owned route upstream readiness");
+    assert!(readiness.requires_disabled);
+    assert_eq!(readiness.model_route_count, 1);
+    assert!(!readiness.can_delete);
     let disabled_upstream = fixture
         .state
         .db
@@ -587,6 +601,52 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
         )
         .await
         .expect("disable removable owned route upstream");
+    let readiness = fixture
+        .state
+        .db
+        .upstream_deletion_readiness(removable_upstream.id, &fixture.tenant)
+        .await
+        .expect("read disabled removable owned route upstream readiness");
+    assert!(!readiness.requires_disabled);
+    assert_eq!(readiness.model_route_count, 1);
+    assert!(!readiness.can_delete);
+
+    let cleaned_route = fixture
+        .state
+        .db
+        .update_routed_model_route(
+            owned_route_id,
+            UpdateRoutedModelRouteInput {
+                tenant_external_id: fixture.tenant.clone(),
+                public_model: "route-create-owned-after-update".to_owned(),
+                upstream_model: "unlisted-route-create-idempotency-model".to_owned(),
+                protocol: "openai".to_owned(),
+                priority: 1,
+                upstream_account_ids: vec![primary_upstream_id],
+                included_provider_group_ids: Vec::new(),
+                excluded_provider_group_ids: Vec::new(),
+                route_group_ids: vec![owned_group_id],
+                route_group_names: Vec::new(),
+                granted_credential_ids: Vec::new(),
+                expected_updated_at: updated_route.0.updated_at,
+                expected_grant_revision: updated_route.0.grant_revision,
+                custom_model_confirmed: true,
+            },
+        )
+        .await
+        .expect("remove removable upstream candidate from owned route");
+    let readiness = fixture
+        .state
+        .db
+        .upstream_deletion_readiness(removable_upstream.id, &fixture.tenant)
+        .await
+        .expect("read cleaned removable owned route upstream readiness");
+    assert!(!readiness.requires_disabled);
+    assert_eq!(readiness.model_route_count, 0);
+    assert_eq!(readiness.request_history_count, 0);
+    assert_eq!(readiness.generation_history_count, 0);
+    assert!(!readiness.imported_for_audit);
+    assert!(readiness.can_delete);
     fixture
         .state
         .db
@@ -615,7 +675,7 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
             owned_route_id,
             &fixture.tenant,
             false,
-            updated_route.0.updated_at,
+            cleaned_route.0.updated_at,
         )
         .await
         .expect("disable owned route");
