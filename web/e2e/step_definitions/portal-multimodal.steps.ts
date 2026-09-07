@@ -325,7 +325,16 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await routeForm.getByRole('option', { name: /Browser UI ComfyUI/ }).click();
   await assertVisible(routeForm.locator('.selection-chip').filter({ hasText: 'Browser UI ComfyUI' }));
   await routeForm.getByLabel('协议').selectOption('generation');
+  const imageCatalogResponsePromise = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'GET'
+      && url.pathname === '/internal/v1/upstream-models'
+      && url.searchParams.get('account_ids') === comfyUpstream.id
+      && url.searchParams.get('q') === 'browser-workflow-v1';
+  }, { timeout: 10_000 });
   await routeForm.getByLabel('上游模型').fill('browser-workflow-v1');
+  const imageCatalogResponse = await imageCatalogResponsePromise;
+  assert.equal(imageCatalogResponse.status(), 200, await imageCatalogResponse.text());
   const imageCustomModelConfirmation = routeForm.getByLabel(/未验证的自定义模型/);
   const imagePartialCoverageConfirmation = routeForm.getByLabel(/候选支持此模型/);
   const createImageRouteButton = routeForm.getByRole('button', { name: '创建路由', exact: true });
@@ -355,7 +364,16 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await routeForm.getByRole('option', { name: /Browser UI Seedance/ }).click();
   await assertVisible(routeForm.locator('.selection-chip').filter({ hasText: 'Browser UI Seedance' }));
   await routeForm.getByLabel('协议').selectOption('generation');
+  const videoCatalogResponsePromise = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'GET'
+      && url.pathname === '/internal/v1/upstream-models'
+      && url.searchParams.get('account_ids') === seedanceUpstream.id
+      && url.searchParams.get('q') === 'seedance-browser-v1';
+  }, { timeout: 10_000 });
   await routeForm.getByLabel('上游模型').fill('seedance-browser-v1');
+  const videoCatalogResponse = await videoCatalogResponsePromise;
+  assert.equal(videoCatalogResponse.status(), 200, await videoCatalogResponse.text());
   const customModelConfirmation = routeForm.getByLabel(/未验证的自定义模型/);
   const partialCoverageConfirmation = routeForm.getByLabel(/候选支持此模型/);
   const createVideoRouteButton = routeForm.getByRole('button', { name: '创建路由', exact: true });
