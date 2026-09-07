@@ -441,7 +441,7 @@ Then('趋势下钻使用 UTC 毫秒完整闭区间', async function (this: Dogfo
   assert.equal(to - from, 3_600_000 - 1, 'hour drilldown must include the complete final millisecond');
 
   const resetResponse = page.waitForResponse((candidate) => candidate.url().includes('/internal/v1/usage-analysis?') && !candidate.url().includes('from_created_at=' + from));
-  await page.getByRole('button', { name: '最近 24 小时', exact: true }).click();
+  await page.getByRole('button', { name: '最近 7 天', exact: true }).click();
   await resetResponse;
   await page.getByRole('tab', { name: '总览', exact: true }).click();
 });
