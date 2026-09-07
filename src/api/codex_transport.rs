@@ -408,6 +408,9 @@ pub(super) fn apply_reqwest_wire_headers(
     let request = credential.apply(request, crate::db::unix_millis())?;
     Ok(request
         .header(header::ACCEPT, "text/event-stream")
+        // The native Responses parser consumes SSE framing directly. Do not
+        // negotiate a content coding that this transport does not decode.
+        .header(header::ACCEPT_ENCODING, "identity")
         .header(header::CONTENT_TYPE, "application/json")
         .header("originator", "codex-tui")
         .header(header::USER_AGENT, USER_AGENT)
@@ -443,6 +446,7 @@ pub(super) fn apply_wreq_wire_headers(
     Ok(request
         .header(credential_header, credential_value)
         .header(header::ACCEPT, "text/event-stream")
+        .header(header::ACCEPT_ENCODING, "identity")
         .header(header::CONTENT_TYPE, "application/json")
         .header("originator", "codex-tui")
         .header(header::USER_AGENT, USER_AGENT)
@@ -1379,6 +1383,7 @@ mod tests {
             format!("{BASE_URL}{RESPONSES_PATH}")
         );
         assert_eq!(request.headers()[header::ACCEPT], "text/event-stream");
+        assert_eq!(request.headers()[header::ACCEPT_ENCODING], "identity");
         assert_eq!(request.headers()[header::CONTENT_TYPE], "application/json");
         assert!(request.headers().get(header::CONNECTION).is_none());
         assert_eq!(request.headers()[header::USER_AGENT], USER_AGENT);
