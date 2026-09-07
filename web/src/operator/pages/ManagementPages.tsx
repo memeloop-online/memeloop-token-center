@@ -196,7 +196,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
         const memberships = providerGroups.groups.filter((group) => group.member_ids.includes(value.id));
         const currentReadiness = deletionReadiness[value.id];
         const deletionBlockers = currentReadiness ? deletionMessages(currentReadiness) : [];
-        return <div className="account provider-account" key={value.id}>
+        return <div className="account provider-account" data-upstream-id={value.id} key={value.id}>
           <div className="account-main">
             <b>{value.name}</b>
             <span>{value.driver} · {t('providers.method')}: {enumLabel(t, 'auth', value.connection_method)}{value.tenant_external_id ? ` · ${value.tenant_external_id}` : ''}</span>
