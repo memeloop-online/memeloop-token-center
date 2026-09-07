@@ -289,6 +289,10 @@ export async function openCatalogModelPicker(row: Locator): Promise<Locator> {
   return catalog;
 }
 
+export function catalogModelSearch(catalog: Locator): Locator {
+  return catalog.getByRole('textbox');
+}
+
 export async function applyUsageTypedFilter(
   page: Page,
   field: string,

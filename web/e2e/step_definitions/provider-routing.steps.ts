@@ -6,7 +6,7 @@ import { baseURL, eventually, model, requestJson, runtime, tenant } from '../sup
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
 
-import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertVisible, connectOperator, credentialGroupObservations, groupedModel, metric, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, uuidPattern } from './dogfood.support.js';
+import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertVisible, catalogModelSearch, connectOperator, credentialGroupObservations, groupedModel, metric, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, uuidPattern } from './dogfood.support.js';
 When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且仅显示产品接入方式', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.route('**/internal/v1/provider-types', async (route) => {
@@ -90,7 +90,7 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
     && response.request().method() === 'GET');
   const catalog = await openCatalogModelPicker(modelCondition);
   assert.equal((await routeCatalogResponse).status(), 200);
-  await catalog.getByLabel('搜索模型', { exact: true }).fill(model);
+  await catalogModelSearch(catalog).fill(model);
   await catalog.getByRole('option').filter({ hasText: model }).click();
 
   const keyAlias = await addTypedFilterCondition(dialog, 'key_alias');
