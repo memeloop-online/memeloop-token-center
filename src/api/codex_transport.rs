@@ -154,9 +154,9 @@ fn is_allowed_codex_originator(originator: &str) -> bool {
 fn is_bounded_codex_originator_suffix(suffix: &str) -> bool {
     !suffix.is_empty()
         && suffix.len() <= MAX_CODEX_ORIGINATOR_BYTES - "Codex ".len()
-        && suffix.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_' | b'.')
-        })
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_' | b'.'))
 }
 
 fn is_matching_codex_user_agent(originator: &str, user_agent: &str) -> bool {
@@ -179,9 +179,7 @@ fn is_matching_codex_user_agent(originator: &str, user_agent: &str) -> bool {
 fn bounded_visible_ascii(value: &str, max_bytes: usize) -> bool {
     !value.is_empty()
         && value.len() <= max_bytes
-        && value
-            .bytes()
-            .all(|byte| matches!(byte, b' '..=b'~'))
+        && value.bytes().all(|byte| matches!(byte, b' '..=b'~'))
 }
 
 pub(super) struct PreparedCodexRequest {
