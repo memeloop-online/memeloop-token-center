@@ -339,6 +339,47 @@ fn sanitizer_rejects_bad_ids_and_bare_lifecycle_events_before_terminal_delivery(
 }
 
 #[test]
+fn sanitizer_drops_only_exact_codex_metadata_events_before_response_lifecycle() {
+    for metadata_type in ["codex.response.metadata", "responsesapi.websocket_timing"] {
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
+        let metadata = format!(
+            "event: {metadata_type}\ndata: {{\"type\":\"{metadata_type}\",\"provider_secret\":\"must-not-forward\"}}\n\n"
+        );
+        assert!(sanitizer.push(metadata.as_bytes()).unwrap().is_empty());
+        assert!(!sanitizer.saw_protocol_event());
+
+        let mut output = sanitizer
+            .push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-metadata\"}}\n\n")
+            .unwrap()
+            .to_vec();
+        assert!(sanitizer.saw_protocol_event());
+        assert!(sanitizer
+            .push(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-metadata\"}}\n\ndata: [DONE]\n\n")
+            .unwrap()
+            .is_empty());
+        output.extend_from_slice(&sanitizer.finish().unwrap());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("response.created"));
+        assert!(output.contains("response.completed"));
+        assert!(output.contains("data: [DONE]"));
+        assert!(!output.contains("must-not-forward"));
+    }
+
+    for metadata_type in [
+        "codex.response.metadata.extra",
+        "responsesapi.websocket_timing.extra",
+    ] {
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
+        let metadata = format!("data: {{\"type\":\"{metadata_type}\"}}\n\n");
+        assert_eq!(
+            sanitizer.push(metadata.as_bytes()),
+            Err("upstream_invalid_response")
+        );
+        assert_eq!(sanitizer.last_rejection_stage(), "payload_namespace");
+    }
+}
+
+#[test]
 fn sanitizer_rejection_stages_are_static_and_content_free() {
     let cases = [
         (
