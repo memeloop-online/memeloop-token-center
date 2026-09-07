@@ -58,7 +58,7 @@ export function registerOperatorPluginContributions(manifests: PluginManifest[])
   const navigation = new Map<string, PluginNavigationSection>();
   const pages = new Map<PluginRouteKey, RegisteredPluginContribution>();
   const overviewCards: RegisteredPluginContribution[] = [];
-  const sidebar: Array<RegisteredPluginContribution & { category: NonNullable<PluginOperatorUiContribution['category']> }> = [];
+  const sidebar: Array<RegisteredPluginContribution & { route: PluginRouteKey; category: NonNullable<PluginOperatorUiContribution['category']> }> = [];
   for (const manifest of manifests) {
     if (!token.test(manifest.id)) continue;
     const endpoints = new Set((manifest.contributions.service_data ?? []).map((endpoint) => endpoint.id).filter((id) => token.test(id)));
