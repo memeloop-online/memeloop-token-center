@@ -6,7 +6,7 @@ import { baseURL, eventually, model, requestJson, runtime, tenant } from '../sup
 import type { DogfoodWorld } from '../support/world.js';
 
 import { appPreferenceControls, openAppRoute, openUsageDimension } from './app-route.support.js';
-import { addTypedFilterCondition, applyUsageTypedFilter, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertOperatorTenantScope, assertVisible, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, openTypedFilterDialog, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, usageFilterBuilder, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
+import { addTypedFilterCondition, applyUsageTypedFilter, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertOperatorTenantScope, assertValue, assertVisible, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, openTypedFilterDialog, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, usageFilterBuilder, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
 
 Given('dogfood 服务已有隔离租户、统一上游、请求记录和多模态价格', function () {
   runtime.requireSeed();
@@ -229,11 +229,11 @@ Then('模型、客户端凭据、上游和状态过滤都作用于真实统计 A
   await clearUsageFilters(page);
   await applyUsageTypedFilter(page, 'key_id', async (row) => row.getByLabel('值', { exact: true }).fill(seed.clientKeyId), 'key_id', seed.clientKeyId, 51);
   await clearUsageFilters(page);
-  await applyUsageTypedFilter(page, 'upstream_account_id', async (row) => row.getByLabel('值', { exact: true }).selectOption(seed.upstreamId), 'upstream_account_id', seed.upstreamId, 51);
+  await applyUsageTypedFilter(page, 'upstream_account_id', async (row) => { await row.getByLabel('值', { exact: true }).selectOption(seed.upstreamId); }, 'upstream_account_id', seed.upstreamId, 51);
   await clearUsageFilters(page);
-  await applyUsageTypedFilter(page, 'status', async (row) => row.getByLabel('值', { exact: true }).selectOption('success'), 'status', 'success', 50);
+  await applyUsageTypedFilter(page, 'status', async (row) => { await row.getByLabel('值', { exact: true }).selectOption('success'); }, 'status', 'success', 50);
   await clearUsageFilters(page);
-  await applyUsageTypedFilter(page, 'status', async (row) => row.getByLabel('值', { exact: true }).selectOption('error'), 'status', 'error', 1);
+  await applyUsageTypedFilter(page, 'status', async (row) => { await row.getByLabel('值', { exact: true }).selectOption('error'); }, 'status', 'error', 1);
   await clearUsageFilters(page);
 });
 
