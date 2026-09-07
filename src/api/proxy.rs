@@ -1012,6 +1012,7 @@ pub(super) async fn proxy(
         upstream_attempt,
         upstream_activity,
         request_id,
+        upstream_account_id: active_route.route.account_id,
         buffered_request,
         proxy_lifecycle_permit,
     })

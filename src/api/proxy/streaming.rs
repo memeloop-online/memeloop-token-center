@@ -29,6 +29,11 @@ pub(super) struct StreamingResponse<'a> {
     pub(super) strict_openai_chat_usage: bool,
     pub(super) upstream_activity: crate::metrics::ActivityGuard,
     pub(super) request_id: Uuid,
+    /// Stable operator-only correlation metadata. This is intentionally an
+    /// account UUID rather than any provider response field so protocol
+    /// rejections can be diagnosed without retaining or logging upstream
+    /// content.
+    pub(super) upstream_account_id: Uuid,
     pub(super) buffered_request: BufferedRequest<'a>,
     pub(super) proxy_lifecycle_permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -48,6 +53,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         strict_openai_chat_usage,
         upstream_activity,
         request_id,
+        upstream_account_id,
         buffered_request,
         proxy_lifecycle_permit,
     } = input;
@@ -218,6 +224,19 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 match sanitizer.push(&raw_chunk) {
                                     Ok(chunk) => chunk,
                                     Err(error_code) => {
+                                        // `error_code` is a fixed parser
+                                        // classification, never an upstream
+                                        // string or payload. Keep this at the
+                                        // rejection boundary: once the safe
+                                        // terminal frame is emitted, archive
+                                        // backpressure may legitimately leave
+                                        // no raw response to inspect.
+                                        tracing::warn!(
+                                            %request_id,
+                                            %upstream_account_id,
+                                            stage = error_code,
+                                            "Responses upstream stream rejected by protocol sanitizer"
+                                        );
                                         transport_error = Some(error_code);
                                         cancel_stream_archive(
                                             &archive_complete,
