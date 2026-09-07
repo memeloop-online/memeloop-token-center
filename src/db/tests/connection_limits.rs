@@ -203,7 +203,16 @@ async fn two_connection_pool_keeps_all_control_pages_bounded_under_concurrent_re
                     upstreams
                         .list_upstream_accounts_page(None, None, None, 1_000_000)
                         .await
-                        .map(|page| page.len())
+                        .map(|page| {
+                            // Every seeded route names the account both as its
+                            // direct target and as an eligible association.
+                            // Listing must count that route exactly once.
+                            if page.iter().all(|account| account.route_count == 1) {
+                                page.len()
+                            } else {
+                                0
+                            }
+                        })
                 }),
                 tokio::spawn(async move {
                     routes
