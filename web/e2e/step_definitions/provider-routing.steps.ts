@@ -177,7 +177,13 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await assertContains(page.getByRole('status'), '已更新 Browser mock upstream');
   await assertContains(providerAccount, 'Browser mock upstream edited');
   seed.upstreamName = 'Browser mock upstream edited';
+  const disabledProvider = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'PATCH'
+      && url.pathname === `/internal/v1/upstreams/${seed.upstreamId}`;
+  });
   await providerAccount.getByRole('button', { name: '停用', exact: true }).click();
+  assert.equal((await disabledProvider).status(), 200);
   await page.locator('[data-resource-list-status-filter]').getByRole('button', { name: /显示非正常状态/ }).click();
   await assertContains(providerAccount, '已停用');
   await assertNotContains(providerAccount, '连接正常');

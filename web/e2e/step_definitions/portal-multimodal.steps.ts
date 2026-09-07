@@ -320,11 +320,19 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const routeForm = page.locator('details.create-resource').filter({ hasText: '创建模型路由' });
   await routeForm.locator('summary').click();
   await routeForm.getByLabel('公开模型').fill(imageModel);
+  await routeForm.getByLabel('协议').selectOption('generation');
   const imageUpstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
   await imageUpstreamPicker.fill('Browser UI ComfyUI');
+  const imageScopeCatalog = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'GET'
+      && url.pathname === '/internal/v1/upstream-models'
+      && url.searchParams.get('account_ids') === comfyUpstream.id
+      && !url.searchParams.has('q');
+  });
   await routeForm.getByRole('option', { name: /Browser UI ComfyUI/ }).click();
+  assert.equal((await imageScopeCatalog).status(), 200);
   await assertVisible(routeForm.locator('.selection-chip').filter({ hasText: 'Browser UI ComfyUI' }));
-  await routeForm.getByLabel('协议').selectOption('generation');
   const imageCatalogResponsePromise = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return response.request().method() === 'GET'
@@ -359,11 +367,19 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await assertContains(page.getByRole('status'), '路由已创建');
 
   await routeForm.getByLabel('公开模型').fill(videoModel);
+  await routeForm.getByLabel('协议').selectOption('generation');
   const upstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
   await upstreamPicker.fill('Browser UI Seedance');
+  const videoScopeCatalog = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'GET'
+      && url.pathname === '/internal/v1/upstream-models'
+      && url.searchParams.get('account_ids') === seedanceUpstream.id
+      && !url.searchParams.has('q');
+  });
   await routeForm.getByRole('option', { name: /Browser UI Seedance/ }).click();
+  assert.equal((await videoScopeCatalog).status(), 200);
   await assertVisible(routeForm.locator('.selection-chip').filter({ hasText: 'Browser UI Seedance' }));
-  await routeForm.getByLabel('协议').selectOption('generation');
   const videoCatalogResponsePromise = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return response.request().method() === 'GET'
