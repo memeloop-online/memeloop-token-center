@@ -40,6 +40,33 @@ let stopPromise;
 let comfySequence = 0;
 let seedanceCreateCount = 0;
 let blockerActive = false;
+const pendingSessionResponses = new Set();
+let sessionFixtureReleased = false;
+
+function sendSessionResponse(response, fail, body) {
+  response.writeHead(fail ? 429 : 200, { 'content-type': 'application/json' });
+  response.end(JSON.stringify(fail ? {
+    error: { type: 'rate_limit_error', message: 'mock gated session rate limit' },
+  } : {
+    id: 'chatcmpl-browser-session-live',
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: body.model,
+    choices: [{ index: 0, message: { role: 'assistant', content: 'browser gated session response' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+  }));
+}
+
+function releasePendingSessionResponses() {
+  const pending = [...pendingSessionResponses];
+  pendingSessionResponses.clear();
+  sessionFixtureReleased = true;
+  for (const { response, fail, body } of pending) {
+    if (response.destroyed || response.writableEnded) continue;
+    sendSessionResponse(response, fail, body);
+  }
+  return pending.length;
+}
 
 function directoryContains(root, needle) {
   try {
@@ -80,6 +107,11 @@ const upstream = createServer((request, response) => {
     if (request.method === 'GET' && requestUrl.pathname === '/__e2e/generation-counts') {
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
       response.end(JSON.stringify({ image: comfySequence, video: seedanceCreateCount }));
+      return;
+    }
+    if (request.method === 'POST' && requestUrl.pathname === '/__e2e/session-fixture/release') {
+      response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      response.end(JSON.stringify({ released: releasePendingSessionResponses() }));
       return;
     }
     if (request.method === 'GET' && requestUrl.pathname === '/__e2e/never-persist-state') {
@@ -181,19 +213,13 @@ const upstream = createServer((request, response) => {
       : '';
     if (prompt.includes('force session active success') || prompt.includes('force session active error')) {
       const fail = prompt.includes('force session active error');
-      setTimeout(() => {
-        response.writeHead(fail ? 429 : 200, { 'content-type': 'application/json' });
-        response.end(JSON.stringify(fail ? {
-          error: { type: 'rate_limit_error', message: 'mock delayed session rate limit' },
-        } : {
-          id: 'chatcmpl-browser-session-live',
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: body.model,
-          choices: [{ index: 0, message: { role: 'assistant', content: 'browser delayed session response' }, finish_reason: 'stop' }],
-          usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
-        }));
-      }, 1_500);
+      if (sessionFixtureReleased) {
+        sendSessionResponse(response, fail, body);
+        return;
+      }
+      const pending = { response, fail, body };
+      pendingSessionResponses.add(pending);
+      response.once('close', () => pendingSessionResponses.delete(pending));
       return;
     }
     if (prompt.includes('force observable error')) {

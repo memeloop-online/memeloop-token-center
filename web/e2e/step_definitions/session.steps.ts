@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
-import { eventually, model, requestJson, runtime, tenant } from '../support/runtime.js';
+import { eventually, model, releaseSessionFixture, requestJson, runtime, sessionModel, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
 
@@ -212,7 +212,7 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
   const sendCall = (index: number) => fetch(new URL('/v1/chat/completions', page.url()), {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${seed.clientCredential}`,
+      Authorization: `Bearer ${seed.sessionClientCredential}`,
       'Content-Type': 'application/json',
       'X-Codex-Session-Id': 'browser-codex-semantic-session',
       'X-MTC-Turn-Id': `browser-turn-${index}`,
@@ -225,7 +225,7 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
       traceparent: `00-4bf92f3577b34da6a3ce929d0e0e4736-${String(index + 1).padStart(16, '0')}-01`,
     },
     body: JSON.stringify({
-      model,
+      model: sessionModel,
       messages: [{ role: 'user', content: `force session active ${index % 2 ? 'error' : 'success'} ${index}` }],
       max_tokens: 32,
     }),
@@ -239,10 +239,17 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
     return sendCall(index);
   })];
   observation.liveRequests = calls;
-  await eventually(async () => {
-    await visible(page.locator('.session-card').first());
-    assert.match(await page.locator('.session-card').first().textContent() ?? '', /活跃/);
-  }, 5_000, 'active session was not visible');
+  let activeSessionConfirmed = false;
+  try {
+    await eventually(async () => {
+      await visible(page.locator('.session-card').first());
+      assert.match(await page.locator('.session-card').first().textContent() ?? '', /活跃/);
+    }, 5_000, 'active session was not visible');
+    activeSessionConfirmed = true;
+  } finally {
+    const released = await releaseSessionFixture();
+    if (activeSessionConfirmed) assert.equal(released, 1, 'exactly one live session request must be released after it is visible');
+  }
 });
 
 Then('Codex 上报的会话名称、代理层级和任务分类进入真实语义视图', async function (this: DogfoodWorld) {

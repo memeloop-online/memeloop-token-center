@@ -11,6 +11,7 @@ const mockPort = Number(process.env.MTC_E2E_MOCK_PORT ?? 41740);
 export const baseURL = new URL(process.env.MTC_E2E_BASE_URL ?? 'http://127.0.0.1:41739');
 export const tenant = 'browser-e2e-tenant';
 export const model = 'browser-e2e-model';
+export const sessionModel = 'browser-e2e-session-model';
 
 export interface GenerationMockCounts {
   image: number;
@@ -25,9 +26,22 @@ export async function generationMockCounts(): Promise<GenerationMockCounts> {
   return await response.json() as GenerationMockCounts;
 }
 
+export async function releaseSessionFixture(): Promise<number> {
+  const response = await fetch(`http://127.0.0.1:${mockPort}/__e2e/session-fixture/release`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(2_000),
+  });
+  assert.equal(response.status, 200, 'session fixture release endpoint must be available');
+  const { released } = await response.json() as { released: number };
+  assert.ok(Number.isInteger(released) && released >= 0, 'session fixture release count must be a non-negative integer');
+  return released;
+}
+
 export interface SeedState {
   clientCredential: string;
   clientKeyId: string;
+  sessionClientCredential: string;
+  sessionClientKeyId: string;
   otherClientCredential: string;
   otherClientKeyId: string;
   globalServiceCredential: string;
@@ -235,7 +249,22 @@ async function seedThroughHttp(): Promise<SeedState> {
       priority: 0,
     },
   });
+  const sessionRoute = await requestJson<{ id: string }>('/internal/v1/model-routes', {
+    method: 'POST', credential: bootstrapToken,
+    body: {
+      tenant_external_id: tenant,
+      public_model: sessionModel,
+      upstream_account_id: otherUpstream.id,
+      upstream_model: 'mock-provider-model',
+      protocol: 'openai',
+      priority: 0,
+    },
+  });
   await requestJson(`/internal/v1/prices/USD/${model}`, {
+    method: 'POST', credential: bootstrapToken,
+    body: { input_per_million: '1', output_per_million: '2' },
+  });
+  await requestJson(`/internal/v1/prices/USD/${sessionModel}`, {
     method: 'POST', credential: bootstrapToken,
     body: { input_per_million: '1', output_per_million: '2' },
   });
@@ -267,6 +296,26 @@ async function seedThroughHttp(): Promise<SeedState> {
         lifetime_budget: '1000',
       },
       route_ids: [route.id],
+      route_group_ids: [],
+    },
+  });
+  const sessionClient = await requestJson<{ key: string; key_id: string }>('/internal/v1/keys', {
+    method: 'POST', credential: bootstrapToken,
+    body: {
+      tenant_external_id: tenant,
+      principal_external_id: 'browser-e2e-session-user',
+      alias: 'Browser session lifecycle credential',
+      currency: 'USD',
+      initial_balance: '1000',
+      policy: {
+        requests_per_minute: 1000,
+        tokens_per_minute: 200000000,
+        max_concurrency: 4,
+        daily_budget: null,
+        weekly_budget: null,
+        lifetime_budget: '1000',
+      },
+      route_ids: [sessionRoute.id],
       route_group_ids: [],
     },
   });
@@ -372,6 +421,8 @@ async function seedThroughHttp(): Promise<SeedState> {
   return {
     clientCredential: client.key,
     clientKeyId: client.key_id,
+    sessionClientCredential: sessionClient.key,
+    sessionClientKeyId: sessionClient.key_id,
     otherClientCredential: otherClient.key,
     globalServiceCredential: globalService.token,
     otherClientKeyId: otherClient.key_id,
