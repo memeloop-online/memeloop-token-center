@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
-import { ApiError, api } from '../api';
-import { pluginRouteKey, type PluginRouteKey } from '../app/routes';
+import { ApiError, api } from '../api.js';
+import { pluginRouteKey, type PluginRouteKey } from '../app/routes.js';
 import type {
   PluginManifest,
   PluginOperatorUiContribution,
   PluginServiceDataResponse,
-} from '../types';
+} from '../types.js';
 
 /**
  * Browser-side policy boundary for operator plugins.

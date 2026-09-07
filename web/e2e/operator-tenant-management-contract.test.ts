@@ -8,6 +8,12 @@ import test from 'node:test';
 import { chromium, type Page } from 'playwright';
 import { createServer } from 'vite';
 
+declare global {
+  interface Window {
+    tenantFixture: { calls: string[] };
+  }
+}
+
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const screenshotWidths = [320, 390, 768, 1024, 1440, 1920, 2560] as const;
 

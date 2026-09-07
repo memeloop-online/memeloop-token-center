@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useI18n } from '../i18n';
+import { useI18n } from '../i18n.js';
 
 export type ResourceListStatusSelection = 'normal' | 'all';
 
