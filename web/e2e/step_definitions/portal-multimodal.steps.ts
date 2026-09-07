@@ -5,7 +5,7 @@ import type { Locator, Page } from 'playwright';
 import { baseURL, eventually, generationMockCounts, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
-import { assertAttribute, assertContains, assertCount, assertExactText, assertGenerationDownload, assertNoCount, assertNoHorizontalOverflow, assertValue, assertVisible, connectOperator, generationTableFor, metric, multimodalObservations, operatorTrafficPanel, requestEventFixture, realtimeReconnectObservations, requireMultimodalObservation, sseRequestEvent, submitPortalGeneration, uuidPattern, waitForGenerationStatus } from './dogfood.support.js';
+import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertGenerationDownload, assertNoCount, assertNoHorizontalOverflow, assertValue, assertVisible, connectOperator, generationTableFor, metric, multimodalObservations, openTypedFilterDialog, operatorTrafficPanel, requestEventFixture, realtimeReconnectObservations, requireMultimodalObservation, sseRequestEvent, submitPortalGeneration, uuidPattern, waitForGenerationStatus } from './dogfood.support.js';
 
 const operatorGenerationCancellations = new WeakMap<DogfoodWorld, { status: number; body: { status: string } }>();
 
@@ -721,12 +721,21 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   await assertNoCount(page.locator('.notice.error'));
   await assertCount(operatorTrafficPanel(page).locator('tbody tr'), observation.finalRowCount);
 
-  const filters = page.locator('.traffic-filters');
-  await filters.getByLabel('模型').fill(model);
-  await filters.getByRole('button', { name: '应用筛选', exact: true }).click();
+  const requestPanel = operatorTrafficPanel(page);
+  const builder = requestPanel.locator('.typed-filter-builder');
+  const dialog = await openTypedFilterDialog(builder);
+  const modelCondition = await addTypedFilterCondition(dialog, 'model');
+  const routeCatalogResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/model-routes'
+    && response.request().method() === 'GET');
+  await modelCondition.getByRole('button', { name: '选择模型', exact: true }).click();
+  assert.equal((await routeCatalogResponse).status(), 200);
+  const catalog = modelCondition.getByRole('dialog', { name: '模型目录', exact: true });
+  await catalog.getByLabel('搜索模型', { exact: true }).fill(model);
+  await catalog.getByRole('option').filter({ hasText: model }).click();
+  await dialog.getByRole('button', { name: '应用筛选', exact: true }).click();
   await assertVisible(page.getByRole('heading', { name: '筛选结果', exact: true }));
   const connectionsBeforeFilterReset = observation.connectionUrls.length;
-  await filters.getByRole('button', { name: '清除筛选', exact: true }).click();
+  await builder.getByRole('button', { name: '清除', exact: true }).click();
   await eventually(
     () => assert.ok(observation.connectionUrls.length > connectionsBeforeFilterReset),
     10_000,

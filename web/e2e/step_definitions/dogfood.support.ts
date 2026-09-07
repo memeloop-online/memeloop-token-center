@@ -267,6 +267,9 @@ export async function addTypedFilterCondition(dialog: Locator, field: string): P
   await dialog.getByRole('button', { name: '添加条件', exact: true }).click();
   const row = rows.nth(index);
   await row.getByLabel('字段').selectOption(field);
+  // Selecting a field replaces the row's value control.  Confirm the React
+  // update before callers address a model catalog button rendered by it.
+  await assertValue(row.getByLabel('字段'), field);
   return row;
 }
 

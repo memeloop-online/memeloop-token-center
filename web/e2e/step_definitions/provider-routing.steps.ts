@@ -86,10 +86,13 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   await protocol.getByLabel('值').selectOption('openai');
 
   const modelCondition = await addTypedFilterCondition(dialog, 'model');
+  const routeCatalogResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/model-routes'
+    && response.request().method() === 'GET');
   await modelCondition.getByRole('button', { name: '选择模型', exact: true }).click();
+  assert.equal((await routeCatalogResponse).status(), 200);
   const catalog = modelCondition.getByRole('dialog', { name: '模型目录', exact: true });
   await catalog.getByLabel('搜索模型', { exact: true }).fill(model);
-  await catalog.getByRole('option', { name: new RegExp(model) }).click();
+  await catalog.getByRole('option').filter({ hasText: model }).click();
 
   const keyAlias = await addTypedFilterCondition(dialog, 'key_alias');
   await keyAlias.getByLabel('操作符').selectOption('contains');
