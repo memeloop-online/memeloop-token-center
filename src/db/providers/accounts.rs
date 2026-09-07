@@ -424,8 +424,15 @@ impl Database {
         let before_id = before_id
             .map(|value| value.to_string())
             .unwrap_or_else(|| "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned());
+        // Select the keyset page before attaching credential state and route
+        // counts.  Both are high-cardinality relations in a production
+        // control plane; allowing either to drive the global list can turn a
+        // 100-row public page into an unbounded join under concurrent reads.
+        // The scoped tenant scalar keeps the tenant-created cursor index
+        // usable, and the final tenant join preserves the visible-tenant
+        // semantics of the previous query.
         let rows = sqlx::query(
-            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE ($1 = '' OR t.external_id = $1) AND (a.created_at < $2 OR (a.created_at = $2 AND a.id < $3)) ORDER BY a.created_at DESC, a.id DESC LIMIT $4",
+            "WITH page AS MATERIALIZED (SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at FROM upstream_accounts a WHERE EXISTS (SELECT 1 FROM tenants visible_tenant WHERE visible_tenant.id = a.tenant_id) AND ($1 = '' OR a.tenant_id = (SELECT scoped_tenant.id FROM tenants scoped_tenant WHERE scoped_tenant.external_id = $1)) AND (a.created_at < $2 OR (a.created_at = $2 AND a.id < $3)) ORDER BY a.created_at DESC, a.id DESC LIMIT $4) SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM page a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL ORDER BY a.created_at DESC, a.id DESC",
         )
         .bind(tenant_external_id.unwrap_or_default())
         .bind(before_created_at)

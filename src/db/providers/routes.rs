@@ -67,8 +67,15 @@ impl Database {
         let before_id = before_id
             .map(|value| value.to_string())
             .unwrap_or_else(|| "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned());
+        // Keep the cursor page as the driving relation.  The enriched
+        // operator view fans each selected route out into several association
+        // tables, so joining tenants before this bound makes the global list
+        // susceptible to unrelated control-plane cardinality.  The scalar
+        // tenant lookup preserves the tenant-created cursor index for scoped
+        // reads while the final join retains the historical authorization and
+        // projection semantics.
         let rows = sqlx::query(
-            "SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE ($1 = '' OR t.external_id = $1) AND (r.created_at < $2 OR (r.created_at = $2 AND r.id < $3)) ORDER BY r.created_at DESC, r.id DESC LIMIT $4",
+            "WITH page AS MATERIALIZED (SELECT r.id, r.tenant_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM model_routes r WHERE EXISTS (SELECT 1 FROM tenants visible_tenant WHERE visible_tenant.id = r.tenant_id) AND ($1 = '' OR r.tenant_id = (SELECT scoped_tenant.id FROM tenants scoped_tenant WHERE scoped_tenant.external_id = $1)) AND (r.created_at < $2 OR (r.created_at = $2 AND r.id < $3)) ORDER BY r.created_at DESC, r.id DESC LIMIT $4) SELECT r.id, r.tenant_id, t.external_id AS tenant_external_id, r.public_model, r.upstream_account_id, r.upstream_model, r.protocol, r.priority, r.enabled, r.created_at, r.updated_at FROM page r JOIN tenants t ON t.id = r.tenant_id ORDER BY r.created_at DESC, r.id DESC",
         )
         .bind(tenant_external_id.unwrap_or_default())
         .bind(before_created_at)

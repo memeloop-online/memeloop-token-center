@@ -13,7 +13,7 @@ const MAX_ROUTE_PAGE: usize = 100;
 // not rewrite SQLite `?` placeholders for PostgreSQL. A fixed-size CTE keeps
 // association loading to one query without constructing backend-specific SQL.
 const ROUTE_ASSOCIATIONS_SQL: &str = r#"
-WITH selected_routes(route_id) AS (
+WITH selected_routes(route_id) AS MATERIALIZED (
     VALUES
         ($1), ($2), ($3), ($4), ($5), ($6), ($7), ($8), ($9), ($10),
         ($11), ($12), ($13), ($14), ($15), ($16), ($17), ($18), ($19), ($20),
