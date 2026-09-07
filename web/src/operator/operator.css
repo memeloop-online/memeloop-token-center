@@ -1326,3 +1326,6 @@
     width: 100%;
   }
 }
+
+.operator-overview-plugin-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.plugin-typed-data { max-block-size: 28rem; margin: 0; padding: 12px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid #27373c; border-radius: 10px; background: #071014; color: inherit; font: 0.8rem/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }

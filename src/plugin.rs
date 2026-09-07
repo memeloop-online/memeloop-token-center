@@ -44,7 +44,43 @@ const PLUGIN_EPOCH_TICK: Duration = Duration::from_millis(10);
 const PLUGIN_CONFIGURATION_CACHE_TTL: Duration = Duration::from_secs(5);
 const PLUGIN_CONFIGURATION_CACHE_ENTRIES: usize = 64;
 const PLUGIN_CONFIGURATION_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const PLUGIN_SERVICE_DATA_CACHE_ENTRIES: usize = 128;
+const PLUGIN_SERVICE_DATA_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PLUGIN_SERVICE_DATA_TIMEOUT_MILLIS: u64 = 10_000;
+const MAX_PLUGIN_SERVICE_DATA_BODY_BYTES: usize = 1024 * 1024;
 const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.2.0, <0.3.0";
+const CORE_OPERATOR_ROUTES: &[&str] = &[
+    "overview",
+    "requests",
+    "sessions",
+    "usage",
+    "generations",
+    "providers",
+    "routes",
+    "pricing",
+    "credentials",
+    "service-credentials",
+    "plugins",
+    // Reserved for the core system-settings surface even when that page is
+    // not enabled in a particular deployment/build.
+    "settings",
+    "system-settings",
+];
+const CORE_OPERATOR_CATEGORIES: &[&str] = &["monitoring", "traffic", "identity", "system"];
+const PLUGIN_DATA_SCOPES: &[&str] = &[
+    "credits:read",
+    "entitlements:read",
+    "keys:read",
+    "metrics:read",
+    "plugins:read",
+    "prices:read",
+    "providers:read",
+    "requests:read",
+    "routes:read",
+    "schemas:read",
+    "service_tokens:read",
+    "tenants:read",
+];
 
 wasmtime::component::bindgen!({
     world: "plugin",
@@ -81,6 +117,101 @@ pub struct PluginContributions {
     pub configuration: Option<PluginConfigurationContribution>,
     #[serde(default)]
     pub providers: Vec<ProviderType>,
+    /// Declarative operator contributions.  These are deliberately data-only:
+    /// the browser maps them to core-owned renderers and never loads a plugin
+    /// script, document, stylesheet, or iframe.
+    #[serde(default)]
+    pub operator_ui: Vec<PluginOperatorUiContribution>,
+    /// Named, server-side JSON feeds used by `operator_ui`. The browser can
+    /// only call the core proxy route for one of these manifest entries.
+    #[serde(default)]
+    pub service_data: Vec<PluginServiceDataEndpoint>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginOperatorUiSlot {
+    #[serde(rename = "operator.sidebar.tab")]
+    SidebarTab,
+    #[serde(rename = "operator.overview.card")]
+    OverviewCard,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginOperatorUiCategory {
+    pub id: String,
+    /// Required for a category that is not owned by the core. Core categories
+    /// use their localized product labels instead of plugin-supplied strings.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginOperatorUiContribution {
+    pub id: String,
+    pub slot: PluginOperatorUiSlot,
+    #[serde(default)]
+    pub category: Option<PluginOperatorUiCategory>,
+    #[serde(default)]
+    pub route: Option<String>,
+    pub label: String,
+    pub icon: String,
+    /// Only `typed_data_v1` is accepted. It selects a core-owned React
+    /// renderer; it is not a filename, URL, HTML fragment, or JavaScript ABI.
+    pub renderer: String,
+    pub data_endpoint: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceDataEndpoint {
+    pub id: String,
+    /// A complete, manifest-audited HTTPS URL. Requests are GET-only, carry
+    /// no caller credentials, and are DNS-pinned by `network::client_for_url`.
+    pub url: String,
+    pub required_scope: String,
+    pub response_schema: Value,
+    #[serde(default = "empty_json_object")]
+    pub fallback: Value,
+    #[serde(default = "default_plugin_data_cache_ttl_seconds")]
+    pub cache_ttl_seconds: u64,
+    #[serde(default = "default_plugin_data_timeout_millis")]
+    pub timeout_millis: u64,
+    #[serde(default = "default_plugin_data_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PluginServiceDataView {
+    pub data: Value,
+    /// `true` means a stale cached result or manifest fallback was returned
+    /// after a bounded upstream failure. The endpoint remains a valid typed
+    /// JSON response so local renderers can degrade without unsafe content.
+    pub partial: bool,
+    pub provenance: PluginServiceDataProvenance,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PluginServiceDataProvenance {
+    pub plugin_id: String,
+    pub endpoint_id: String,
+    pub origin: String,
+    pub fetched_at: i64,
+    pub source: String,
+}
+
+fn default_plugin_data_cache_ttl_seconds() -> u64 {
+    30
+}
+
+fn default_plugin_data_timeout_millis() -> u64 {
+    2_000
+}
+
+fn default_plugin_data_max_body_bytes() -> usize {
+    64 * 1024
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -146,6 +277,14 @@ struct LoadedPlugin {
 struct CachedPluginConfigurations {
     loaded_at: Instant,
     values: BTreeMap<String, Value>,
+    estimated_bytes: usize,
+}
+
+#[derive(Clone)]
+struct CachedPluginServiceData {
+    loaded_at: Instant,
+    fetched_at: i64,
+    data: Value,
     estimated_bytes: usize,
 }
 
@@ -253,6 +392,7 @@ pub struct PluginRuntime {
     plugins: Arc<Vec<LoadedPlugin>>,
     providers: Arc<Vec<ProviderType>>,
     configuration_cache: Arc<tokio::sync::RwLock<BTreeMap<Uuid, CachedPluginConfigurations>>>,
+    service_data_cache: Arc<tokio::sync::RwLock<BTreeMap<String, CachedPluginServiceData>>>,
     execution_timeout: Duration,
     fuel: u64,
 }
@@ -302,6 +442,10 @@ impl PluginRuntime {
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
+            // The service-data and guest HTTP paths use DNS-pinned clients for
+            // hostnames. Keep the shared literal-IP fallback equally isolated
+            // from inherited proxy configuration.
+            .no_proxy()
             .build()
             .map_err(|_| plugin_runtime_failure("http_initialization"))?;
         let canonical_root =
@@ -358,6 +502,7 @@ impl PluginRuntime {
                 configuration_validator,
             });
         }
+        validate_loaded_operator_ui_contributions(&plugins)?;
 
         Ok(Self {
             engine: Some(engine),
@@ -367,6 +512,7 @@ impl PluginRuntime {
             plugins: Arc::new(plugins),
             providers: Arc::new(providers),
             configuration_cache: Arc::default(),
+            service_data_cache: Arc::default(),
             execution_timeout: PLUGIN_EXECUTION_TIMEOUT,
             fuel: PLUGIN_FUEL,
         })
@@ -386,13 +532,21 @@ impl PluginRuntime {
     /// A bounded, aggregate-only snapshot for operational metrics. Tenant and
     /// plugin identifiers never leave the cache through this interface.
     pub async fn runtime_metrics(&self) -> PluginRuntimeMetrics {
-        let cache = self.configuration_cache.read().await;
+        let configuration_cache = self.configuration_cache.read().await;
+        let service_data_cache = self.service_data_cache.read().await;
         PluginRuntimeMetrics {
             loaded_plugins: self.plugins.len(),
-            cache_entries: cache.len(),
-            cache_bytes: cache.values().fold(0usize, |total, entry| {
-                total.saturating_add(entry.estimated_bytes)
-            }),
+            cache_entries: configuration_cache
+                .len()
+                .saturating_add(service_data_cache.len()),
+            cache_bytes: configuration_cache
+                .values()
+                .fold(0usize, |total, entry| {
+                    total.saturating_add(entry.estimated_bytes)
+                })
+                .saturating_add(service_data_cache.values().fold(0usize, |total, entry| {
+                    total.saturating_add(entry.estimated_bytes)
+                })),
         }
     }
 
@@ -404,6 +558,192 @@ impl PluginRuntime {
             .iter()
             .find(|plugin| plugin.manifest.id == plugin_id)
             .and_then(|plugin| plugin.manifest.contributions.configuration.clone())
+    }
+
+    pub fn service_data_endpoint(
+        &self,
+        plugin_id: &str,
+        endpoint_id: &str,
+    ) -> Option<PluginServiceDataEndpoint> {
+        self.plugins
+            .iter()
+            .find(|plugin| plugin.manifest.id == plugin_id)
+            .and_then(|plugin| {
+                plugin
+                    .manifest
+                    .contributions
+                    .service_data
+                    .iter()
+                    .find(|endpoint| endpoint.id == endpoint_id)
+            })
+            .cloned()
+    }
+
+    /// Fetch one declared typed-data feed through the core. The caller has
+    /// already authenticated and authorized the selected manifest endpoint;
+    /// this method never receives or forwards a browser/service credential.
+    pub async fn service_data(
+        &self,
+        plugin_id: &str,
+        endpoint_id: &str,
+        tenant_external_id: Option<&str>,
+    ) -> Result<PluginServiceDataView, AppError> {
+        let endpoint = self
+            .service_data_endpoint(plugin_id, endpoint_id)
+            .ok_or(AppError::NotFound)?;
+        let cache_key = service_data_cache_key(plugin_id, endpoint_id, tenant_external_id);
+        let origin = plugin_service_data_origin(&endpoint.url)?;
+        if let Some(cached) = self
+            .service_data_cache
+            .read()
+            .await
+            .get(&cache_key)
+            .filter(|cached| {
+                cached.loaded_at.elapsed() < Duration::from_secs(endpoint.cache_ttl_seconds)
+            })
+            .cloned()
+        {
+            return Ok(service_data_view(
+                plugin_id,
+                endpoint_id,
+                origin,
+                cached.data,
+                false,
+                cached.fetched_at,
+                "cache",
+            ));
+        }
+
+        let result = self.fetch_service_data(&endpoint).await;
+        match result {
+            Ok(data) => {
+                let fetched_at = crate::db::unix_millis();
+                self.cache_service_data(
+                    cache_key,
+                    CachedPluginServiceData {
+                        loaded_at: Instant::now(),
+                        fetched_at,
+                        estimated_bytes: estimated_json_bytes(&data),
+                        data: data.clone(),
+                    },
+                )
+                .await;
+                Ok(service_data_view(
+                    plugin_id,
+                    endpoint_id,
+                    origin,
+                    data,
+                    false,
+                    fetched_at,
+                    "network",
+                ))
+            }
+            Err(_) => {
+                if let Some(cached) = self
+                    .service_data_cache
+                    .read()
+                    .await
+                    .get(&cache_key)
+                    .cloned()
+                {
+                    return Ok(service_data_view(
+                        plugin_id,
+                        endpoint_id,
+                        origin,
+                        cached.data,
+                        true,
+                        cached.fetched_at,
+                        "stale_cache",
+                    ));
+                }
+                Ok(service_data_view(
+                    plugin_id,
+                    endpoint_id,
+                    origin,
+                    endpoint.fallback,
+                    true,
+                    crate::db::unix_millis(),
+                    "fallback",
+                ))
+            }
+        }
+    }
+
+    async fn fetch_service_data(
+        &self,
+        endpoint: &PluginServiceDataEndpoint,
+    ) -> Result<Value, AppError> {
+        let http = self.http.as_ref().ok_or(AppError::Internal)?;
+        let timeout = Duration::from_millis(endpoint.timeout_millis);
+        let request = async {
+            let client =
+                network::client_for_url(http, &endpoint.url, OutboundScope::Public, false).await?;
+            let response = client
+                .get(&endpoint.url)
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(|_| AppError::Upstream("plugin service data is unavailable".into()))?;
+            if !response.status().is_success() {
+                return Err(AppError::Upstream(
+                    "plugin service data is unavailable".into(),
+                ));
+            }
+            let json_content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    let media_type = value.split(';').next().unwrap_or_default().trim();
+                    media_type == "application/json" || media_type.ends_with("+json")
+                });
+            if !json_content_type {
+                return Err(AppError::Upstream(
+                    "plugin service data is unavailable".into(),
+                ));
+            }
+            let mut body = Vec::new();
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk
+                    .map_err(|_| AppError::Upstream("plugin service data is unavailable".into()))?;
+                if body.len().saturating_add(chunk.len()) > endpoint.max_body_bytes {
+                    return Err(AppError::Upstream(
+                        "plugin service data is unavailable".into(),
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let data: Value = serde_json::from_slice(&body)
+                .map_err(|_| AppError::Upstream("plugin service data is unavailable".into()))?;
+            crate::schema::validate_instance(&endpoint.response_schema, &data)?;
+            Ok(data)
+        };
+        tokio::time::timeout(timeout, request)
+            .await
+            .map_err(|_| AppError::Upstream("plugin service data is unavailable".into()))?
+    }
+
+    async fn cache_service_data(&self, key: String, entry: CachedPluginServiceData) {
+        if entry.estimated_bytes > PLUGIN_SERVICE_DATA_CACHE_BYTES {
+            return;
+        }
+        let mut cache = self.service_data_cache.write().await;
+        cache.insert(key, entry);
+        while cache.len() > PLUGIN_SERVICE_DATA_CACHE_ENTRIES
+            || cache.values().fold(0usize, |total, value| {
+                total.saturating_add(value.estimated_bytes)
+            }) > PLUGIN_SERVICE_DATA_CACHE_BYTES
+        {
+            let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.loaded_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
     }
 
     pub async fn resolved_traffic_configurations(
@@ -1551,7 +1891,257 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
     for provider in &manifest.contributions.providers {
         validate_provider_contribution(&manifest.id, provider)?;
     }
+    validate_operator_ui_contributions(manifest)?;
+    validate_service_data_contributions(manifest)?;
     Ok(())
+}
+
+fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), AppError> {
+    let contributions = &manifest.contributions.operator_ui;
+    let endpoints = &manifest.contributions.service_data;
+    let mut ids = BTreeSet::new();
+    let mut routes = BTreeSet::new();
+    for contribution in contributions {
+        if !safe_plugin_token(&contribution.id, 64) || !ids.insert(&contribution.id) {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} has an invalid or duplicate operator UI contribution id",
+                manifest.id
+            )));
+        }
+        if !safe_plugin_label(&contribution.label) || contribution.renderer != "typed_data_v1" {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} operator UI contribution is not a supported typed-data renderer",
+                manifest.id
+            )));
+        }
+        if !matches!(
+            contribution.icon.as_str(),
+            "activity" | "chart" | "database" | "heart" | "plug" | "shield"
+        ) {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} operator UI contribution has an unsupported icon token",
+                manifest.id
+            )));
+        }
+        if !endpoints
+            .iter()
+            .any(|endpoint| endpoint.id == contribution.data_endpoint)
+        {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} operator UI contribution references an unknown data endpoint",
+                manifest.id
+            )));
+        }
+        match contribution.slot {
+            PluginOperatorUiSlot::SidebarTab => {
+                let route = contribution.route.as_deref().ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "plugin {} sidebar contribution needs a route",
+                        manifest.id
+                    ))
+                })?;
+                if !safe_plugin_token(route, 64)
+                    || CORE_OPERATOR_ROUTES.contains(&route)
+                    || !routes.insert(route)
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "plugin {} sidebar contribution has a reserved or duplicate route",
+                        manifest.id
+                    )));
+                }
+                validate_operator_category(&manifest.id, contribution.category.as_ref())?;
+            }
+            PluginOperatorUiSlot::OverviewCard => {
+                if contribution.route.is_some() || contribution.category.is_some() {
+                    return Err(AppError::BadRequest(format!(
+                        "plugin {} overview-card contribution cannot declare a route or category",
+                        manifest.id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_service_data_contributions(manifest: &PluginManifest) -> Result<(), AppError> {
+    let mut ids = BTreeSet::new();
+    for endpoint in &manifest.contributions.service_data {
+        if !safe_plugin_token(&endpoint.id, 64) || !ids.insert(&endpoint.id) {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} has an invalid or duplicate service data endpoint id",
+                manifest.id
+            )));
+        }
+        if !PLUGIN_DATA_SCOPES.contains(&endpoint.required_scope.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} service data endpoint requires an unsupported read scope",
+                manifest.id
+            )));
+        }
+        let parsed = url::Url::parse(&endpoint.url).map_err(|_| {
+            AppError::BadRequest(format!(
+                "plugin {} service data endpoint has an invalid URL",
+                manifest.id
+            ))
+        })?;
+        if endpoint.url.len() > 2_048
+            || parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || parsed.query().is_some()
+            || parsed.port() == Some(0)
+        {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} service data endpoint must use a bounded HTTPS URL",
+                manifest.id
+            )));
+        }
+        let origin = parsed.origin().ascii_serialization();
+        let origin_allowed = manifest.capabilities.iter().any(|capability| {
+            matches!(capability, PluginCapability::Http { allowed_origins } if allowed_origins.contains(&origin))
+        });
+        if !origin_allowed {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} service data endpoint origin is not declared by the HTTP capability",
+                manifest.id
+            )));
+        }
+        if endpoint.cache_ttl_seconds == 0
+            || endpoint.cache_ttl_seconds > 3_600
+            || endpoint.timeout_millis == 0
+            || endpoint.timeout_millis > MAX_PLUGIN_SERVICE_DATA_TIMEOUT_MILLIS
+            || endpoint.max_body_bytes == 0
+            || endpoint.max_body_bytes > MAX_PLUGIN_SERVICE_DATA_BODY_BYTES
+        {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} service data endpoint exceeds core fetch limits",
+                manifest.id
+            )));
+        }
+        if endpoint.response_schema.get("type").and_then(Value::as_str) != Some("object")
+            || schema_contains_write_only(&endpoint.response_schema)
+        {
+            return Err(AppError::BadRequest(format!(
+                "plugin {} service data endpoint needs a non-secret object response schema",
+                manifest.id
+            )));
+        }
+        crate::schema::validate_definition(&endpoint.response_schema)?;
+        crate::schema::validate_instance(&endpoint.response_schema, &endpoint.fallback)?;
+    }
+    Ok(())
+}
+
+fn validate_operator_category(
+    plugin_id: &str,
+    category: Option<&PluginOperatorUiCategory>,
+) -> Result<(), AppError> {
+    let category = category.ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "plugin {plugin_id} sidebar contribution needs a category"
+        ))
+    })?;
+    if !safe_plugin_token(&category.id, 64) {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} sidebar contribution has an invalid category"
+        )));
+    }
+    if CORE_OPERATOR_CATEGORIES.contains(&category.id.as_str()) {
+        if category.label.is_some() {
+            return Err(AppError::BadRequest(format!(
+                "plugin {plugin_id} cannot override a core operator category label"
+            )));
+        }
+    } else if !category.label.as_deref().is_some_and(safe_plugin_label) {
+        return Err(AppError::BadRequest(format!(
+            "plugin {plugin_id} new operator category needs a safe label"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_loaded_operator_ui_contributions(plugins: &[LoadedPlugin]) -> Result<(), AppError> {
+    let mut categories: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut routes = BTreeSet::new();
+    for plugin in plugins {
+        for contribution in &plugin.manifest.contributions.operator_ui {
+            if let Some(route) = contribution.route.as_deref()
+                && !routes.insert(route)
+            {
+                return Err(AppError::BadRequest(
+                    "duplicate plugin operator route across installed plugins".into(),
+                ));
+            }
+            let Some(category) = contribution.category.as_ref() else {
+                continue;
+            };
+            if CORE_OPERATOR_CATEGORIES.contains(&category.id.as_str()) {
+                continue;
+            }
+            let label = category
+                .label
+                .as_deref()
+                .expect("validated new category label");
+            if let Some(existing_label) = categories.get(category.id.as_str())
+                && *existing_label != label
+            {
+                return Err(AppError::BadRequest(
+                    "conflicting plugin operator category across installed plugins".into(),
+                ));
+            }
+            categories.insert(category.id.as_str(), label);
+        }
+    }
+    Ok(())
+}
+
+fn safe_plugin_token(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn safe_plugin_label(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 120
+        && !value.chars().any(char::is_control)
+        && !value.contains(['<', '>'])
+}
+
+fn service_data_cache_key(plugin_id: &str, endpoint_id: &str, tenant: Option<&str>) -> String {
+    format!("{plugin_id}\0{endpoint_id}\0{}", tenant.unwrap_or("global"))
+}
+
+fn plugin_service_data_origin(url: &str) -> Result<String, AppError> {
+    let url = url::Url::parse(url).map_err(|_| AppError::Internal)?;
+    Ok(url.origin().ascii_serialization())
+}
+
+fn service_data_view(
+    plugin_id: &str,
+    endpoint_id: &str,
+    origin: String,
+    data: Value,
+    partial: bool,
+    fetched_at: i64,
+    source: &str,
+) -> PluginServiceDataView {
+    PluginServiceDataView {
+        data,
+        partial,
+        provenance: PluginServiceDataProvenance {
+            plugin_id: plugin_id.to_owned(),
+            endpoint_id: endpoint_id.to_owned(),
+            origin,
+            fetched_at,
+            source: source.to_owned(),
+        },
+    }
 }
 
 pub fn plugin_configuration_schema_digest(schema: &Value) -> Result<String, AppError> {

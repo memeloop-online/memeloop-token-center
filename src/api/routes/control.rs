@@ -47,6 +47,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             "/internal/v1/plugins/{plugin_id}/configuration",
             get(get_plugin_configuration).put(put_plugin_configuration),
         )
+        .route(
+            "/internal/v1/plugins/{plugin_id}/data/{endpoint_id}",
+            get(get_plugin_service_data),
+        )
         .route("/internal/v1/schemas", get(configuration_schemas))
         .route("/internal/v1/oauth/cursor/start", post(start_cursor_oauth))
         .route("/internal/v1/oauth/cursor/poll", post(poll_cursor_oauth))

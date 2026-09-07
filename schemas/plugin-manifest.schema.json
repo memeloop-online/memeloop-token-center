@@ -71,7 +71,7 @@
           "description": "Contributes bounded post-auth model, route, or canonical request rewriting through the WIT traffic-policy hook."
         },
         "configuration": {
-          "type": "object",
+          "type": ["object", "null"],
           "additionalProperties": false,
           "required": ["schema"],
           "properties": {
@@ -177,6 +177,52 @@
                 }
               },
               "source": { "type": "string", "readOnly": true }
+            }
+          }
+        },
+        "operator_ui": {
+          "type": "array",
+          "description": "Declarative operator navigation and fixed-slot cards. Core renders typed_data_v1 locally; plugin JavaScript, remote HTML, stylesheets, and iframes are not supported.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "slot", "label", "icon", "renderer", "data_endpoint"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
+              "slot": { "enum": ["operator.sidebar.tab", "operator.overview.card"] },
+              "category": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id"],
+                "properties": {
+                  "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
+                  "label": { "type": "string", "minLength": 1, "maxLength": 120, "pattern": "^[^<>\\u0000-\\u001F\\u007F]+$" }
+                }
+              },
+              "route": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
+              "label": { "type": "string", "minLength": 1, "maxLength": 120, "pattern": "^[^<>\\u0000-\\u001F\\u007F]+$" },
+              "icon": { "enum": ["activity", "chart", "database", "heart", "plug", "shield"] },
+              "renderer": { "const": "typed_data_v1" },
+              "data_endpoint": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" }
+            }
+          }
+        },
+        "service_data": {
+          "type": "array",
+          "description": "Server-only GET feeds. Each URL must be an HTTPS origin declared by the plugin HTTP capability; browser credentials are never forwarded.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "url", "required_scope", "response_schema"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
+              "url": { "type": "string", "format": "uri", "maxLength": 2048 },
+              "required_scope": { "enum": ["credits:read", "entitlements:read", "keys:read", "metrics:read", "plugins:read", "prices:read", "providers:read", "requests:read", "routes:read", "schemas:read", "service_tokens:read", "tenants:read"] },
+              "response_schema": { "type": "object", "description": "Non-secret JSON Schema with an object root. writeOnly fields are forbidden." },
+              "fallback": { "default": {}, "description": "Schema-valid data returned on an upstream failure when no stale cache entry is available." },
+              "cache_ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 30 },
+              "timeout_millis": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 2000 },
+              "max_body_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536 }
             }
           }
         }

@@ -51,6 +51,19 @@ test("lifetime apostrophe is not parsed as a character literal", () => assert.eq
 test("unknown merged router fails closed", () => assert.throws(() => sourceRoutes(sourceWith(".merge(helper_router())")), /unparsed Router/u));
 
 test("asset and image semantics are complete", () => validateProductContracts(cloneDocument()));
+test("plugin operator data is a scoped typed-JSON proxy contract", () => {
+  const document = cloneDocument(); const operation = document.paths["/internal/v1/plugins/{plugin_id}/data/{endpoint_id}"].get;
+  assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
+  assert.equal(operation["x-required-scope"], "plugins:read");
+  assert.equal(operation["x-manifest-required-scope"], true);
+  assert.deepEqual(operation["x-outbound-contract"].methods, ["GET"]);
+  assert.equal(operation["x-outbound-contract"].transport, "HTTPS-only-DNS-pinned-no-redirect");
+  assert.equal(operation.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/PluginServiceDataResponse");
+  const contribution = document.components.schemas.PluginOperatorUiContribution;
+  assert.deepEqual(contribution.properties.slot.enum, ["operator.sidebar.tab", "operator.overview.card"]);
+  assert.equal(contribution.properties.renderer.const, "typed_data_v1");
+  assert.ok(document.components.schemas.PluginServiceDataEndpoint.properties.required_scope.enum.includes("metrics:read"));
+});
 test("Responses WebSocket negotiation remains an authenticated temporary fallback", () => {
   const document = cloneDocument(); const operation = document.paths["/v1/responses"].get; assert.deepEqual(operation.security, [{ clientBearer: [] }]); assert.deepEqual(operation.responses["426"], { $ref: "#/components/responses/ResponsesWebSocketUpgradeRequired" }); assert.equal(operation["x-transport-negotiation"]["native-websocket-planned"], true); validateProductContracts(document);
   delete operation["x-transport-negotiation"]["native-websocket-planned"]; assert.throws(() => validateProductContracts(document), /native WebSocket direction/u);

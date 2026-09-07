@@ -826,6 +826,53 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/plugins/{plugin_id}/data/{endpoint_id}:
+    parameters:
+      - name: plugin_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+      - name: endpoint_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+    get:
+      tags: [System]
+      operationId: getPluginServiceData
+      summary: Read one manifest-declared typed plugin data feed through the core proxy
+      description: |
+        The caller must hold `plugins:read` and the endpoint's manifest-declared
+        `required_scope`; a tenant-scoped service credential remains bound to its own
+        tenant. The core performs a GET-only, DNS-pinned HTTPS request to the declared
+        capability allowlist origin with no browser/service credential, headers, or
+        tenant value forwarded. The response is body-capped, schema-validated typed JSON.
+        On bounded upstream failure it returns a stale cache entry or schema-valid manifest
+        fallback with `partial=true`; remote HTML, scripts, and iframes are never returned.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:read
+      x-manifest-required-scope: true
+      x-outbound-contract:
+        methods: [GET]
+        allowed-origins: manifest-http-capability
+        transport: HTTPS-only-DNS-pinned-no-redirect
+        browser-credentials-forwarded: false
+        response: schema-validated-typed-json
+      parameters:
+        - name: tenant_external_id
+          in: query
+          required: false
+          description: Omit for the aggregate/global view. A tenant-scoped service credential cannot select another tenant.
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        '200':
+          description: Fresh, cached, stale, or fallback typed data. `partial` distinguishes degradation without changing the JSON shape.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PluginServiceDataResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/schemas:
     get:
       tags: [System]
@@ -5077,7 +5124,7 @@ components:
           items: { type: object, additionalProperties: true }
         contributions:
           type: object
-          required: [traffic_policy, request_rewrite, configuration, providers]
+          required: [traffic_policy, request_rewrite, configuration, providers, operator_ui, service_data]
           properties:
             traffic_policy: { type: boolean }
             request_rewrite: { type: boolean }
@@ -5093,6 +5140,67 @@ components:
             providers:
               type: array
               items: { $ref: '#/components/schemas/ProviderType' }
+            operator_ui:
+              type: array
+              description: Data-only contributions rendered by core-owned local components. Remote scripts, HTML, stylesheets, and iframes are unsupported.
+              items: { $ref: '#/components/schemas/PluginOperatorUiContribution' }
+            service_data:
+              type: array
+              description: Server-side typed JSON feeds; URLs are capability-audited and never called directly by the browser.
+              items: { $ref: '#/components/schemas/PluginServiceDataEndpoint' }
+    PluginOperatorUiContribution:
+      type: object
+      additionalProperties: false
+      required: [id, slot, label, icon, renderer, data_endpoint]
+      properties:
+        id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+        slot: { type: string, enum: [operator.sidebar.tab, operator.overview.card] }
+        category:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [id]
+          properties:
+            id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+            label: { type: [string, 'null'], minLength: 1, maxLength: 120 }
+        route: { type: [string, 'null'], pattern: '^[a-z0-9-]{1,64}$' }
+        label: { type: string, minLength: 1, maxLength: 120 }
+        icon: { type: string, enum: [activity, chart, database, heart, plug, shield] }
+        renderer:
+          type: string
+          const: typed_data_v1
+          description: Selects a core-owned local React renderer; it is not a URL or executable asset.
+        data_endpoint: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+    PluginServiceDataEndpoint:
+      type: object
+      additionalProperties: false
+      required: [id, url, required_scope, response_schema, fallback, cache_ttl_seconds, timeout_millis, max_body_bytes]
+      properties:
+        id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+        url: { type: string, format: uri, description: HTTPS URL declared by the plugin HTTP capability; credentials, fragments, and query strings are rejected. }
+        required_scope: { type: string, enum: [credits:read, entitlements:read, keys:read, metrics:read, plugins:read, prices:read, providers:read, requests:read, routes:read, schemas:read, service_tokens:read, tenants:read] }
+        response_schema: { type: object, additionalProperties: true, description: Object-root JSON Schema for response data. writeOnly fields are rejected. }
+        fallback: { type: object, additionalProperties: true, description: Schema-valid fallback typed data. }
+        cache_ttl_seconds: { type: integer, minimum: 1, maximum: 3600 }
+        timeout_millis: { type: integer, minimum: 1, maximum: 10000 }
+        max_body_bytes: { type: integer, minimum: 1, maximum: 1048576 }
+    PluginServiceDataResponse:
+      type: object
+      additionalProperties: false
+      required: [data, partial, provenance]
+      properties:
+        data: { type: object, additionalProperties: true, description: Manifest-schema-validated typed JSON only. }
+        partial: { type: boolean, description: True when a stale cache entry or manifest fallback replaced a failed upstream fetch. }
+        provenance: { $ref: '#/components/schemas/PluginServiceDataProvenance' }
+    PluginServiceDataProvenance:
+      type: object
+      additionalProperties: false
+      required: [plugin_id, endpoint_id, origin, fetched_at, source]
+      properties:
+        plugin_id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+        endpoint_id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+        origin: { type: string, format: uri, description: Audited upstream origin only; no request path or credentials are exposed. }
+        fetched_at: { type: integer, format: int64, description: Unix epoch milliseconds. }
+        source: { type: string, enum: [network, cache, stale_cache, fallback] }
     PluginConfiguration:
       type: object
       additionalProperties: false

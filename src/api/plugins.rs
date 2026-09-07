@@ -31,6 +31,37 @@ pub(in crate::api) struct PutPluginConfigurationRequest {
     value: Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct PluginServiceDataQuery {
+    tenant_external_id: Option<String>,
+}
+
+/// Serve a manifest-declared, schema-checked plugin data feed.  The service
+/// credential is checked by the core and is deliberately never sent upstream.
+pub(in crate::api) async fn get_plugin_service_data(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((plugin_id, endpoint_id)): Path<(String, String)>,
+    Query(query): Query<PluginServiceDataQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "plugins:read").await?;
+    let endpoint = state
+        .plugins
+        .service_data_endpoint(&plugin_id, &endpoint_id)
+        .ok_or(AppError::NotFound)?;
+    if !service.allows(&endpoint.required_scope) {
+        return Err(AppError::Forbidden);
+    }
+    let tenant_external_id = management_tenant(&service, query.tenant_external_id)?;
+    Ok(Json(
+        state
+            .plugins
+            .service_data(&plugin_id, &endpoint_id, tenant_external_id.as_deref())
+            .await?,
+    ))
+}
+
 pub(in crate::api) async fn get_plugin_configuration(
     State(state): State<AppState>,
     headers: HeaderMap,

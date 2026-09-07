@@ -552,6 +552,46 @@ export interface PluginManifest {
       default: unknown;
     } | null;
     providers?: ProviderType[];
+    operator_ui?: PluginOperatorUiContribution[];
+    service_data?: PluginServiceDataEndpoint[];
+  };
+}
+
+export type PluginOperatorUiSlot = 'operator.sidebar.tab' | 'operator.overview.card';
+export type PluginOperatorUiIcon = 'activity' | 'chart' | 'database' | 'heart' | 'plug' | 'shield';
+
+export interface PluginOperatorUiContribution {
+  id: string;
+  slot: PluginOperatorUiSlot;
+  category?: { id: string; label?: string | null } | null;
+  route?: string | null;
+  label: string;
+  icon: PluginOperatorUiIcon;
+  /** Always selects a core-owned renderer; this is never executable plugin code. */
+  renderer: 'typed_data_v1';
+  data_endpoint: string;
+}
+
+export interface PluginServiceDataEndpoint {
+  id: string;
+  url: string;
+  required_scope: string;
+  response_schema: Record<string, unknown>;
+  fallback: Record<string, unknown>;
+  cache_ttl_seconds: number;
+  timeout_millis: number;
+  max_body_bytes: number;
+}
+
+export interface PluginServiceDataResponse {
+  data: Record<string, unknown>;
+  partial: boolean;
+  provenance: {
+    plugin_id: string;
+    endpoint_id: string;
+    origin: string;
+    fetched_at: number;
+    source: 'network' | 'cache' | 'stale_cache' | 'fallback';
   };
 }
 

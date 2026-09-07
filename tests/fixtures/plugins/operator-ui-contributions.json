@@ -1,0 +1,116 @@
+{
+  "installed": [
+    {
+      "id": "observability-suite",
+      "version": "1.0.0",
+      "wit_version": "0.2.0",
+      "wasm": null,
+      "capabilities": [{ "kind": "http", "allowed_origins": ["https://radar.example"] }],
+      "contributions": {
+        "traffic_policy": false,
+        "request_rewrite": false,
+        "configuration": null,
+        "providers": [],
+        "service_data": [
+          {
+            "id": "health",
+            "url": "https://radar.example/v1/health",
+            "required_scope": "metrics:read",
+            "response_schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "checks"],
+              "properties": {
+                "status": { "type": "string", "enum": ["healthy", "degraded", "offline"] },
+                "checks": { "type": "array", "items": { "type": "string" }, "maxItems": 20 }
+              }
+            },
+            "fallback": { "status": "offline", "checks": [] },
+            "cache_ttl_seconds": 30,
+            "timeout_millis": 2000,
+            "max_body_bytes": 65536
+          },
+          {
+            "id": "intelligence",
+            "url": "https://radar.example/v1/intelligence",
+            "required_scope": "requests:read",
+            "response_schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["signals"],
+              "properties": { "signals": { "type": "array", "items": { "type": "string" }, "maxItems": 20 } }
+            },
+            "fallback": { "signals": [] },
+            "cache_ttl_seconds": 30,
+            "timeout_millis": 2000,
+            "max_body_bytes": 65536
+          }
+        ],
+        "operator_ui": [
+          {
+            "id": "health-and-intelligence",
+            "slot": "operator.sidebar.tab",
+            "category": { "id": "monitoring" },
+            "route": "health-intelligence",
+            "label": "Health and intelligence",
+            "icon": "heart",
+            "renderer": "typed_data_v1",
+            "data_endpoint": "health"
+          },
+          {
+            "id": "intelligence-signals",
+            "slot": "operator.sidebar.tab",
+            "category": { "id": "intelligence", "label": "Intelligence" },
+            "route": "intelligence-signals",
+            "label": "Signals",
+            "icon": "chart",
+            "renderer": "typed_data_v1",
+            "data_endpoint": "intelligence"
+          },
+          {
+            "id": "health-summary-card",
+            "slot": "operator.overview.card",
+            "label": "Health summary",
+            "icon": "activity",
+            "renderer": "typed_data_v1",
+            "data_endpoint": "health"
+          }
+        ]
+      }
+    }
+  ],
+  "conflicting_category": {
+    "id": "different-intelligence",
+    "version": "1.0.0",
+    "wit_version": "0.2.0",
+    "wasm": null,
+    "capabilities": [{ "kind": "http", "allowed_origins": ["https://radar.example"] }],
+    "contributions": {
+      "traffic_policy": false,
+      "request_rewrite": false,
+      "configuration": null,
+      "providers": [],
+      "service_data": [{
+        "id": "signals",
+        "url": "https://radar.example/v1/conflicting-signals",
+        "required_scope": "requests:read",
+        "response_schema": { "type": "object", "additionalProperties": false, "properties": {} },
+        "fallback": {},
+        "cache_ttl_seconds": 30,
+        "timeout_millis": 2000,
+        "max_body_bytes": 65536
+      }],
+      "operator_ui": [{
+        "id": "conflicting-category",
+        "slot": "operator.sidebar.tab",
+        "category": { "id": "intelligence", "label": "Different intelligence" },
+        "route": "conflicting-signals",
+        "label": "Conflicting signals",
+        "icon": "chart",
+        "renderer": "typed_data_v1",
+        "data_endpoint": "signals"
+      }]
+    }
+  },
+  "uninstalled": []
+}

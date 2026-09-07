@@ -1,7 +1,8 @@
-import { Fragment, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
+import { Fragment, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { Shell } from '../components';
 import { useI18n } from '../i18n';
-import type { UsageAnalysisSessionBucket } from '../types';
+import type { PluginManifest, UsageAnalysisSessionBucket } from '../types';
+import { api } from '../api';
 import './operator.css';
 import type { SessionFocus } from './SessionMonitor';
 import { useOperatorScope } from './hooks/useOperatorScope';
@@ -10,12 +11,23 @@ import { CredentialsPage, PricingPage, ProvidersPage, RoutesPage, ServiceCredent
 import { GenerationsPage, OverviewPage, PluginsPage, UsagePage } from './pages/OperatorPages';
 import { RequestsPage } from './pages/RequestsPage';
 import { SessionsPage } from './pages/SessionsPage';
-import { operatorRouteKeys, type OperatorRouteKey } from './scope/operatorRoutes';
+import { operatorRouteKeys, isOperatorRouteKey, type OperatorRouteKey } from './scope/operatorRoutes';
 import { TenantManager } from './TenantManager';
+import {
+  PluginContributionPage,
+  PluginOverviewCards,
+  registerOperatorPluginContributions,
+  type OperatorPluginRegistry,
+  type PluginNavigationSection,
+} from './pluginContributions';
+import type { PluginRouteKey } from '../app/routes';
+
+type OperatorApplicationRoute = OperatorRouteKey | PluginRouteKey;
 
 export interface OperatorProps {
-  route?: OperatorRouteKey;
-  onRouteChange?: (route: OperatorRouteKey) => void;
+  route?: OperatorApplicationRoute;
+  onRouteChange?: (route: OperatorApplicationRoute) => void;
+  onPluginNavigation?: (navigation: PluginNavigationSection[]) => void;
   embedded?: boolean;
   showNavigation?: boolean;
 }
@@ -35,15 +47,16 @@ const navigation: Array<{ route: OperatorRouteKey; label: string; domId: string 
   { route: 'plugins', label: 'nav.plugins', domId: 'plugins' },
 ];
 
-function pageId(route: OperatorRouteKey) {
+function pageId(route: OperatorApplicationRoute) {
   return navigation.find((item) => item.route === route)?.domId ?? route;
 }
 
-export function Operator({ route, onRouteChange, embedded = false, showNavigation = true }: OperatorProps = {}) {
+export function Operator({ route, onRouteChange, onPluginNavigation, embedded = false, showNavigation = true }: OperatorProps = {}) {
   const { t } = useI18n();
   const scope = useOperatorScope();
   const [internalRoute, setInternalRoute] = useState<OperatorRouteKey>('requests');
   const [sessionFocus, setSessionFocus] = useState<SessionFocus>();
+  const [pluginRegistry, setPluginRegistry] = useState<OperatorPluginRegistry>(() => registerOperatorPluginContributions([]));
   const credentialScope = useRef({ credential: '', generation: 0 });
   if (credentialScope.current.credential !== scope.activeCredential) {
     credentialScope.current = {
@@ -59,6 +72,31 @@ export function Operator({ route, onRouteChange, embedded = false, showNavigatio
     enabled: Boolean(scope.activeCredential) && (activeRoute === 'requests' || activeRoute === 'sessions'),
     disconnectedMessage: t('traffic.streamDisconnected'),
   });
+
+  useEffect(() => {
+    let active = true;
+    const credential = scope.activeCredential;
+    if (!credential) {
+      const empty = registerOperatorPluginContributions([]);
+      setPluginRegistry(empty);
+      onPluginNavigation?.(empty.navigation);
+      return () => { active = false; };
+    }
+    void api<PluginManifest[]>('/internal/v1/plugins', credential)
+      .then((manifests) => {
+        if (!active) return;
+        const next = registerOperatorPluginContributions(manifests);
+        setPluginRegistry(next);
+        onPluginNavigation?.(next.navigation);
+      })
+      .catch(() => {
+        if (!active) return;
+        const empty = registerOperatorPluginContributions([]);
+        setPluginRegistry(empty);
+        onPluginNavigation?.(empty.navigation);
+      });
+    return () => { active = false; };
+  }, [onPluginNavigation, scope.activeCredential]);
 
   function navigate(next: OperatorRouteKey) {
     if (route === undefined) setInternalRoute(next);
@@ -92,19 +130,26 @@ export function Operator({ route, onRouteChange, embedded = false, showNavigatio
   let page: ReactNode = null;
   if (scope.activeCredential) {
     const pageProps = { token: scope.activeCredential, tenant: scope.tenant, writeTenant: scope.writeTenant };
-    switch (activeRoute) {
-      case 'overview': page = <OverviewPage {...pageProps} onNavigate={navigate} onOpenUsageSession={openSession} onOpenSession={openSessionById} />; break;
-      case 'requests': page = <RequestsPage {...pageProps} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} />; break;
-      case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} revision={stream.revision} eventKeyIds={stream.sessionEventKeyIds} streamState={stream.state} streamError={stream.error} onOpenRequests={() => navigate('requests')} />; break;
-      case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
-      case 'generations': page = <GenerationsPage {...pageProps} />; break;
-      case 'providers': page = <ProvidersPage {...pageProps} />; break;
-      case 'routes': page = <RoutesPage {...pageProps} />; break;
-      case 'pricing': page = <PricingPage {...pageProps} />; break;
-      case 'tenants': page = <TenantManager token={scope.activeCredential} onChanged={scope.refreshTenants} />; break;
-      case 'credentials': page = <CredentialsPage {...pageProps} />; break;
-      case 'service-credentials': page = <ServiceCredentialsPage {...pageProps} />; break;
-      case 'plugins': page = <PluginsPage {...pageProps} />; break;
+    if (isOperatorRouteKey(activeRoute)) {
+      switch (activeRoute) {
+        case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onOpenUsageSession={openSession} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} /></>; break;
+        case 'requests': page = <RequestsPage {...pageProps} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} />; break;
+        case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} revision={stream.revision} eventKeyIds={stream.sessionEventKeyIds} streamState={stream.state} streamError={stream.error} onOpenRequests={() => navigate('requests')} />; break;
+        case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
+        case 'generations': page = <GenerationsPage {...pageProps} />; break;
+        case 'providers': page = <ProvidersPage {...pageProps} />; break;
+        case 'routes': page = <RoutesPage {...pageProps} />; break;
+        case 'pricing': page = <PricingPage {...pageProps} />; break;
+        case 'tenants': page = <TenantManager token={scope.activeCredential} onChanged={scope.refreshTenants} />; break;
+        case 'credentials': page = <CredentialsPage {...pageProps} />; break;
+        case 'service-credentials': page = <ServiceCredentialsPage {...pageProps} />; break;
+        case 'plugins': page = <PluginsPage {...pageProps} />; break;
+      }
+    } else {
+      const registered = pluginRegistry.pages.get(activeRoute);
+      page = registered
+        ? <PluginContributionPage registered={registered} token={scope.activeCredential} tenant={scope.tenant} />
+        : <div className="notice error" role="alert">This plugin page is no longer installed or available.</div>;
     }
   }
 

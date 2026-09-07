@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 
 import { useI18n, type Locale } from '../i18n';
 import { appHref, type AppRouteKey, type AppSurface } from './routes';
 import { RouteErrorBoundary, type RouteErrorCopy } from './RouteErrorBoundary';
+import type { PluginNavigationSection } from '../operator/pluginContributions';
 
 interface NavigationItem {
   route: AppRouteKey;
@@ -11,12 +12,14 @@ interface NavigationItem {
 }
 
 interface NavigationSection {
+  id: string;
   label: string;
   items: NavigationItem[];
 }
 
 type IconName = 'overview' | 'requests' | 'sessions' | 'usage' | 'generations' | 'generate'
-  | 'providers' | 'routes' | 'pricing' | 'tenants' | 'credentials' | 'service-credentials' | 'plugins' | 'settings';
+  | 'providers' | 'routes' | 'pricing' | 'tenants' | 'credentials' | 'service-credentials' | 'plugins' | 'settings'
+  | 'activity' | 'chart' | 'database' | 'heart' | 'plug' | 'shield';
 
 const labels = {
   'zh-CN': {
@@ -43,7 +46,7 @@ function label(locale: Locale, key: keyof typeof labels.en) {
   return labels[locale][key];
 }
 
-function navigation(surface: AppSurface, locale: Locale): NavigationSection[] {
+function navigation(surface: AppSurface, locale: Locale, pluginNavigation: PluginNavigationSection[]): NavigationSection[] {
   const item = (route: AppRouteKey, icon: IconName = route as IconName, primary = false): NavigationItem => ({
     route,
     icon,
@@ -51,15 +54,22 @@ function navigation(surface: AppSurface, locale: Locale): NavigationSection[] {
     label: label(locale, route as keyof typeof labels.en),
   });
   if (surface === 'portal') return [
-    { label: label(locale, 'workspace'), items: [item('overview'), item('requests'), item('sessions'), item('usage')] },
-    { label: label(locale, 'creation'), items: [item('generations'), item('generate', 'generate', true)] },
+    { id: 'workspace', label: label(locale, 'workspace'), items: [item('overview'), item('requests'), item('sessions'), item('usage')] },
+    { id: 'creation', label: label(locale, 'creation'), items: [item('generations'), item('generate', 'generate', true)] },
   ];
-  return [
-    { label: label(locale, 'monitoring'), items: [item('overview'), item('requests'), item('sessions'), item('usage'), item('generations')] },
-    { label: label(locale, 'traffic'), items: [item('providers'), item('routes'), item('pricing')] },
-    { label: label(locale, 'identity'), items: [item('tenants'), item('credentials'), item('service-credentials')] },
-    { label: label(locale, 'system'), items: [item('plugins'), item('settings')] },
+  const sections: NavigationSection[] = [
+    { id: 'monitoring', label: label(locale, 'monitoring'), items: [item('overview'), item('requests'), item('sessions'), item('usage'), item('generations')] },
+    { id: 'traffic', label: label(locale, 'traffic'), items: [item('providers'), item('routes'), item('pricing')] },
+    { id: 'identity', label: label(locale, 'identity'), items: [item('tenants'), item('credentials'), item('service-credentials')] },
+    { id: 'system', label: label(locale, 'system'), items: [item('plugins'), item('settings')] },
   ];
+  for (const pluginSection of pluginNavigation) {
+    const pluginItems = pluginSection.items.map((entry) => ({ route: entry.route as AppRouteKey, label: entry.label, icon: entry.icon as IconName }));
+    const existing = sections.find((section) => section.id === pluginSection.id);
+    if (existing) existing.items.push(...pluginItems);
+    else sections.push({ id: pluginSection.id, label: pluginSection.label, items: pluginItems });
+  }
+  return sections;
 }
 
 function NavIcon({ name }: { name: IconName }) {
@@ -78,21 +88,28 @@ function NavIcon({ name }: { name: IconName }) {
     'service-credentials': <><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M7 10h5M7 14h8M17 9v6" /></>,
     plugins: <><path d="M8 3v5H3v8h5v5h8v-5h5V8h-5V3z" /></>,
     settings: <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.7 2.7-.1-.1a1.7 1.7 0 0 0-1.9-.3l-.8.4a1.7 1.7 0 0 0-1 1.5v.2H9.5v-.2a1.7 1.7 0 0 0-1-1.5l-.8-.4a1.7 1.7 0 0 0-1.9.3l-.1.1L3 17l.1-.1a1.7 1.7 0 0 0 .3-1.9L3 14.2a1.7 1.7 0 0 0-1.5-1H1.4V9.5h.2a1.7 1.7 0 0 0 1.5-1l.4-.8a1.7 1.7 0 0 0-.3-1.9L3 5.7 5.7 3l.1.1a1.7 1.7 0 0 0 1.9.3l.8-.4a1.7 1.7 0 0 0 1-1.5v-.2h3.8v.2a1.7 1.7 0 0 0 1 1.5l.8.4a1.7 1.7 0 0 0 1.9-.3l.1-.1 2.7 2.7-.1.1a1.7 1.7 0 0 0-.3 1.9l.4.8a1.7 1.7 0 0 0 1.5 1h.2v3.8h-.2a1.7 1.7 0 0 0-1.5 1z" /></>,
+    activity: <><path d="M3 12h4l2-6 4 12 2-6h6" /></>,
+    chart: <><path d="M4 19V5M4 19h17" /><path d="m7 15 4-4 3 2 5-7" /></>,
+    database: <><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7" /></>,
+    heart: <><path d="M20.8 8.2c0 6-8.8 11.8-8.8 11.8S3.2 14.2 3.2 8.2A4.3 4.3 0 0 1 12 6.7a4.3 4.3 0 0 1 8.8 1.5Z" /></>,
+    plug: <><path d="M8 3v6M16 3v6M6 9h12v3a6 6 0 0 1-12 0V9ZM12 18v3" /></>,
+    shield: <><path d="M12 3 20 6v5c0 5-3.4 8.2-8 10-4.6-1.8-8-5-8-10V6l8-3Z" /><path d="m8.5 12 2.2 2.2 4.8-4.8" /></>,
   };
   return <svg aria-hidden="true" className="app-nav-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
-export function AppShell({ surface, route, onNavigate, children }: {
+export function AppShell({ surface, route, onNavigate, children, pluginNavigation = [] }: {
   surface: AppSurface;
   route: AppRouteKey;
   onNavigate: (route: AppRouteKey) => void;
   children: ReactNode;
+  pluginNavigation?: PluginNavigationSection[];
 }) {
   const { locale, setLocale, t } = useI18n();
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem('mtc-sidebar-collapsed') === 'true');
   const [mobileOpen, setMobileOpen] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>(() => document.documentElement.dataset.theme === 'light' ? 'light' : 'dark');
-  const navigationSections = navigation(surface, locale);
+  const navigationSections = navigation(surface, locale, pluginNavigation);
   const navigationItems = navigationSections.flatMap((section) => section.items);
   const navRefs = useRef<Array<HTMLAnchorElement | null>>([]);
   const sidebarRef = useRef<HTMLElement>(null);

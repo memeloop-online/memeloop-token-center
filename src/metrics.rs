@@ -910,7 +910,7 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
         }
     }
     output.push_str(
-        "# HELP memeloop_token_center_plugin_cache_entries Resolved plugin configuration cache entries.\n",
+        "# HELP memeloop_token_center_plugin_cache_entries Resolved plugin configuration and service-data cache entries.\n",
     );
     output.push_str("# TYPE memeloop_token_center_plugin_cache_entries gauge\n");
     let _ = writeln!(
@@ -919,7 +919,7 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
         runtime.plugin_cache_entries
     );
     output.push_str(
-        "# HELP memeloop_token_center_plugin_cache_bytes Estimated bytes retained by the resolved plugin configuration cache.\n",
+        "# HELP memeloop_token_center_plugin_cache_bytes Estimated bytes retained by plugin configuration and service-data caches.\n",
     );
     output.push_str("# TYPE memeloop_token_center_plugin_cache_bytes gauge\n");
     let _ = writeln!(

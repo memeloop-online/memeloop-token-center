@@ -1,10 +1,11 @@
-import { lazy, StrictMode, Suspense } from 'react';
+import { lazy, StrictMode, Suspense, useCallback, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { AppShell } from './app/AppShell';
 import { useAppLocation } from './app/useAppLocation';
 import { SelfPortal, type SelfPortalRoute } from './self/SelfPortal';
 import type { OperatorRouteKey } from './operator/scope/operatorRoutes';
 import { I18nProvider, useI18n } from './i18n';
+import type { PluginNavigationSection } from './operator/pluginContributions';
 import './styles.css';
 import './theme.css';
 import './app-shell.css';
@@ -20,9 +21,11 @@ function Loading() {
 
 function Application() {
   const { surface, route, navigate } = useAppLocation();
-  return <AppShell surface={surface} route={route} onNavigate={navigate}>
+  const [pluginNavigation, setPluginNavigation] = useState<PluginNavigationSection[]>([]);
+  const updatePluginNavigation = useCallback((next: PluginNavigationSection[]) => setPluginNavigation(next), []);
+  return <AppShell surface={surface} route={route} onNavigate={navigate} pluginNavigation={surface === 'operator' ? pluginNavigation : []}>
     {surface === 'operator'
-      ? <Suspense fallback={<Loading />}><Operator route={route as OperatorRouteKey} onRouteChange={navigate} embedded showNavigation={false} /></Suspense>
+      ? <Suspense fallback={<Loading />}><Operator route={route as OperatorRouteKey} onRouteChange={navigate} onPluginNavigation={updatePluginNavigation} embedded showNavigation={false} /></Suspense>
       : <SelfPortal route={route as SelfPortalRoute} onRouteChange={navigate} embedded showNavigation={false} />}
   </AppShell>;
 }
