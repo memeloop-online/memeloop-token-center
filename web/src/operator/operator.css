@@ -109,6 +109,18 @@
   padding: 7px 10px;
 }
 
+.resource-list-status-filter {
+  align-items: flex-end;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.resource-list-status-filter button {
+  font-size: 11px;
+  padding: 7px 10px;
+}
+
 @media (width >= 1400px) {
   .provider-list .account-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
@@ -1222,6 +1234,10 @@
 
   .operator-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .resource-list-status-filter {
+    align-items: flex-start;
   }
 
   .traffic-heading {
