@@ -9,10 +9,13 @@ const scope = readFileSync(new URL('../src/operator/hooks/useOperatorScope.ts', 
 const requestsPage = readFileSync(new URL('../src/operator/pages/RequestsPage.tsx', import.meta.url), 'utf8');
 const managementPages = readFileSync(new URL('../src/operator/pages/ManagementPages.tsx', import.meta.url), 'utf8');
 const resourceHook = readFileSync(new URL('../src/operator/hooks/useOperatorResource.ts', import.meta.url), 'utf8');
+const resourceListStatusFilter = readFileSync(new URL('../src/operator/ResourceListStatusFilter.tsx', import.meta.url), 'utf8');
+const typedFilterBuilder = readFileSync(new URL('../src/operator/TypedFilterBuilder.tsx', import.meta.url), 'utf8');
 
-test('operator exposes controlled AppShell routing without coupling credentials to the URL', () => {
-  assert.match(operator, /route\?: OperatorRouteKey/);
-  assert.match(operator, /onRouteChange\?: \(route: OperatorRouteKey\)/);
+test('operator exposes controlled built-in and plugin routing without coupling credentials to the URL', () => {
+  assert.match(operator, /type OperatorApplicationRoute = OperatorRouteKey \| PluginRouteKey/);
+  assert.match(operator, /route\?: OperatorApplicationRoute/);
+  assert.match(operator, /onRouteChange\?: \(route: OperatorApplicationRoute\)/);
   assert.match(operator, /embedded\?: boolean/);
   assert.match(operator, /showNavigation\?: boolean/);
   assert.doesNotMatch(operator, /URLSearchParams|location\.|history\./);
@@ -42,7 +45,9 @@ test('operator restores an allowed tenant and otherwise selects an explicit tena
 });
 
 test('credential review defaults to active and mutation scopes remain explicit', () => {
-  assert.match(managementPages, /useState\('active'\)/);
+  assert.match(managementPages, /useResourceListStatusFilter\('credentials', tenant, nonStatusFilteredValues, \(value\) => \(value\.status \?\? 'active'\) === 'active'\)/);
+  assert.match(resourceListStatusFilter, /return window\.localStorage\.getItem\(key\) === 'all' \? 'all' : 'normal';/);
+  assert.match(resourceListStatusFilter, /useState<ResourceListStatusSelection>\(\(\) => readSelection\(storageKey\)\)/);
   assert.match(scope, /const writeTenant = state\.tenant;/);
   assert.doesNotMatch(operator, /<option value="">/);
 });
@@ -50,7 +55,10 @@ test('credential review defaults to active and mutation scopes remain explicit',
 test('request filters hide stale rows and cursors while a replacement query is pending or fails', () => {
   assert.match(requestsPage, /if \(!older\) \{ setRequests\(\[\]\); setHasOlder\(false\); setDetail\(undefined\); \}/);
   assert.match(requestsPage, /setUpstreamError\(messageOf/);
-  assert.match(requestsPage, /select disabled=\{!upstreamsAvailable\}/);
+  assert.match(requestsPage, /<TypedFilterBuilder ast=\{filters\} disabled=\{loading\} onApply=\{onApply\} onClear=\{onClear\} scope="requests" token=\{token\} tenant=\{tenant\} upstreams=\{upstreams\} \/>/);
+  assert.match(typedFilterBuilder, /const accountIds = useMemo\(\(\) => upstreams\.filter\(\(account\) => account\.status === 'active'\)\.map\(\(account\) => account\.id\)/);
+  assert.match(typedFilterBuilder, /const available = Boolean\(tenant && accountIds\.length\);/);
+  assert.match(typedFilterBuilder, /disabled=\{disabled \|\| !available\}/);
 });
 
 test('pricing sync and resource refreshes retain only current operation results', () => {

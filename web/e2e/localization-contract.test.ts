@@ -34,7 +34,8 @@ test('tenant copy stays action-focused and its active locale keys are not orphan
   for (const [locale, catalog] of Object.entries(translationCatalogs)) {
     assert.doesNotMatch(Object.values(catalog).join('\n'), staleCopy, `${locale} tenant copy must not expose product-design discussion`);
   }
-  assert.match(operator, /t\('nav\.tenants'\)/);
+  assert.match(operator, /\{ route: 'tenants', label: 'nav\.tenants', domId: 'tenants' \}/);
+  assert.match(operator, /navigation\.map\(\(item\).*t\(item\.label\)/s);
   for (const key of [
     'tenants.title', 'tenants.description', 'tenants.create', 'tenants.name', 'tenants.rename', 'tenants.archive', 'tenants.restore', 'tenants.delete',
     'tenants.renameTitle', 'tenants.archiveTitle', 'tenants.restoreTitle', 'tenants.deleteTitle',

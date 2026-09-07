@@ -38,6 +38,12 @@ async function fixtureCalls(page: Page) {
   return page.evaluate(() => window.tenantFixture.calls);
 }
 
+function tenantRow(page: Page, tenantId: string) {
+  return page.locator('.tenant-manager .managed-resource').filter({
+    has: page.locator('.managed-resource-header b', { hasText: new RegExp(`^${tenantId}$`) }),
+  });
+}
+
 test('tenant management has one sidebar route and single-default scope stays implicit through refresh and history', { timeout: 30_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) return test.skip('a local Chromium runtime is required for tenant navigation assertions');
@@ -91,15 +97,15 @@ test('multi-tenant scope exposes tenant CRUD, dependency refusal, authorization 
 
     await page.getByLabel('Tenant ID', { exact: true }).fill('west');
     await page.getByRole('button', { name: 'Add tenant', exact: true }).click();
-    await page.getByText('west', { exact: true }).waitFor();
+    await tenantRow(page, 'west').waitFor();
 
-    let north = page.locator('.managed-resource').filter({ has: page.getByText('north', { exact: true }) });
+    let north = tenantRow(page, 'north');
     await north.getByRole('button', { name: 'Rename', exact: true }).click();
     const renameDialog = page.getByRole('dialog', { name: 'Rename tenant', exact: true });
     await renameDialog.getByLabel('Tenant ID', { exact: true }).fill('north-renamed');
     await renameDialog.getByRole('button', { name: 'Rename', exact: true }).click();
-    await page.getByText('north-renamed', { exact: true }).waitFor();
-    north = page.locator('.managed-resource').filter({ has: page.getByText('north-renamed', { exact: true }) });
+    await tenantRow(page, 'north-renamed').waitFor();
+    north = tenantRow(page, 'north-renamed');
 
     await north.getByRole('button', { name: 'Archive', exact: true }).click();
     const archiveDialog = page.getByRole('dialog', { name: 'Archive tenant', exact: true });
