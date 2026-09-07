@@ -81,7 +81,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
     }
     const body = url.pathname === '/internal/v1/schemas'
       ? '{}'
-      : url.pathname === '/internal/v1/requests'
+      : url.pathname === '/internal/v1/requests' || url.pathname === '/internal/v1/requests/query'
         ? JSON.stringify({ requests: [], next_cursor: null })
         : '[]';
     await route.fulfill({ status: 200, contentType: 'application/json', body });
@@ -101,10 +101,11 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   await waitForConsoleContext(page, /^载入中…$/);
   singletonTenants.resolve();
   await waitForSingleTenantScope(page, 'singleton-tenant');
+  const resourcePaths = ['/internal/v1/upstreams', '/internal/v1/requests', '/internal/v1/requests/query'];
   await eventually(() => assert.ok(observed.filter((value) => value.credential === 'singleton-credential'
-    && ['/internal/v1/upstreams', '/internal/v1/requests'].includes(value.path)).length >= 2));
+    && resourcePaths.includes(value.path)).length >= 2));
   const singletonResources = observed.filter((value) => value.credential === 'singleton-credential'
-    && ['/internal/v1/upstreams', '/internal/v1/requests'].includes(value.path));
+    && resourcePaths.includes(value.path));
   assert.ok(singletonResources.every((value) => value.tenant === 'singleton-tenant'), JSON.stringify(singletonResources));
 
   await eventually(async () => {
@@ -116,9 +117,9 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   const multiRequests = observed.filter((value) => value.credential === 'multi-credential');
   assert.equal(multiRequests[0]?.path, '/internal/v1/tenants');
   await eventually(() => assert.ok(observed.filter((value) => value.credential === 'multi-credential'
-    && ['/internal/v1/upstreams', '/internal/v1/requests'].includes(value.path)).length >= 2));
+    && resourcePaths.includes(value.path)).length >= 2));
   const multiResources = observed.filter((value) => value.credential === 'multi-credential'
-    && ['/internal/v1/upstreams', '/internal/v1/requests'].includes(value.path));
+    && resourcePaths.includes(value.path));
   assert.ok(multiResources.every((value) => value.tenant === 'tenant-a'), JSON.stringify(multiResources));
   assert.equal(await page.locator('.console-context').count(), 0);
 
@@ -143,9 +144,9 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   assert.equal(await page.evaluate(() => localStorage.getItem('mtc.operator.service-credential.v1')), 'fast-credential');
   assert.deepEqual(observed.filter((value) => value.credential === 'slow-credential').map((value) => value.path), ['/internal/v1/tenants']);
   await eventually(() => assert.ok(observed.filter((value) => value.credential === 'fast-credential'
-    && ['/internal/v1/upstreams', '/internal/v1/requests'].includes(value.path)).length >= 2));
+    && resourcePaths.includes(value.path)).length >= 2));
   const fastResources = observed.filter((value) => value.credential === 'fast-credential'
-    && ['/internal/v1/upstreams', '/internal/v1/requests'].includes(value.path));
+    && resourcePaths.includes(value.path));
   assert.ok(fastResources.every((value) => value.tenant === 'fast-tenant'), JSON.stringify(fastResources));
 });
 

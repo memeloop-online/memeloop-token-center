@@ -31,6 +31,11 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   const upstreamSequence = useRef(0);
   const detailSequence = useRef(0);
   const detailAbort = useRef<AbortController | null>(null);
+  // The initial snapshot and the live stream resolve independently. Keep the
+  // latest event map available to an in-flight snapshot so an event received
+  // before the snapshot completes cannot be overwritten by that stale result.
+  const liveEventsRef = useRef(liveEvents);
+  liveEventsRef.current = liveEvents;
   const hasOlderRef = useRef(hasOlder);
   const scope = useRef({ token, tenant, filters });
   hasOlderRef.current = hasOlder;
@@ -53,7 +58,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
       if (request !== sequence.current || latest.token !== currentScope.token || latest.tenant !== currentScope.tenant || latest.filters !== currentScope.filters) return;
       setRequests((current) => older
         ? [...current, ...next.requests.filter((value) => !current.some((existing) => existing.request_id === value.request_id))]
-        : typedFiltersActive(nextFilters) ? next.requests : mergeLiveRequestEvents(next.requests, new Map(liveEvents), next.next_cursor === null));
+        : typedFiltersActive(nextFilters) ? next.requests : mergeLiveRequestEvents(next.requests, new Map(liveEventsRef.current), next.next_cursor === null));
       setHasOlder(next.next_cursor !== null);
     } catch (reason) {
       if (request === sequence.current) {
@@ -82,7 +87,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
 
   useEffect(() => {
     if (liveEvents.size === 0 || typedFiltersActive(filters)) return;
-    setRequests((current) => mergeLiveRequestEvents(current, new Map(liveEvents), !hasOlderRef.current));
+    setRequests((current) => mergeLiveRequestEvents(current, new Map(liveEventsRef.current), !hasOlderRef.current));
   }, [streamRevision]);
 
   async function selectRequest(request: RequestView) {
