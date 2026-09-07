@@ -410,6 +410,92 @@ impl Database {
         Ok(())
     }
 
+    /// Converges an admitted stream after its in-process lifecycle deadline.
+    ///
+    /// The durable delivery marker, rather than the cancelled task's local
+    /// state, decides whether the reserved contract was delivered and must be
+    /// charged. The terminal write below is still the normal request-owner
+    /// CAS, so a late normal finalizer is returned as `AlreadyFinished` and an
+    /// unavailable database leaves the record pending for the orphan reaper.
+    pub async fn expire_proxy_lifecycle_deadline(
+        &self,
+        request_id: Uuid,
+        tenant_id: Uuid,
+        reservation: &UsageReservation,
+        duration_ms: i64,
+    ) -> Result<FinishProxyRequestResult, AppError> {
+        let pending = sqlx::query(
+            "SELECT error_code, input_tokens, output_tokens, service_tier FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4 AND completed_at IS NULL",
+        )
+        .bind(request_id.to_string())
+        .bind(tenant_id.to_string())
+        .bind(reservation.key_id.to_string())
+        .bind(reservation.id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let delivery_started = pending
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<String>, _>("error_code").ok())
+            .as_deref()
+            == Some("delivery_started");
+        let input_token_ceiling = if delivery_started {
+            pending
+                .as_ref()
+                .ok_or(AppError::Internal)?
+                .try_get::<i64, _>("input_tokens")?
+        } else {
+            reservation.reserved_tokens
+        };
+        let output_token_ceiling = if delivery_started {
+            pending
+                .as_ref()
+                .ok_or(AppError::Internal)?
+                .try_get::<i64, _>("output_tokens")?
+        } else {
+            0
+        };
+        if input_token_ceiling.checked_add(output_token_ceiling)
+            != Some(reservation.reserved_tokens)
+        {
+            return Err(AppError::Conflict(
+                "persisted proxy delivery ceiling does not match its reservation".into(),
+            ));
+        }
+        let requested_service_tier = if delivery_started {
+            pending
+                .as_ref()
+                .ok_or(AppError::Internal)?
+                .try_get::<Option<String>, _>("service_tier")?
+        } else {
+            None
+        };
+        let response_object = format!("gap://{request_id}/response");
+        self.finish_proxy_request(FinishProxyRequest {
+            request_id,
+            tenant_id,
+            reservation,
+            input_token_ceiling,
+            output_token_ceiling,
+            requested_service_tier: requested_service_tier.as_deref(),
+            status_code: 504,
+            duration_ms: duration_ms.max(0),
+            usage: if delivery_started {
+                TokenUsage {
+                    input_tokens: input_token_ceiling,
+                    output_tokens: output_token_ceiling,
+                    ..TokenUsage::default()
+                }
+            } else {
+                TokenUsage::default()
+            },
+            charge_contract_ceiling: delivery_started,
+            error_code: Some("request_lifecycle_timeout"),
+            response_object: &response_object,
+            conversation: None,
+        })
+        .await
+    }
+
     pub async fn finish_proxy_request(
         &self,
         input: FinishProxyRequest<'_>,

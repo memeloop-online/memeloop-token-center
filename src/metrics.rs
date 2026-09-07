@@ -40,6 +40,7 @@ struct MetricsInner {
     http: Mutex<BTreeMap<HttpLabels, RequestSeries>>,
     upstream: Mutex<BTreeMap<UpstreamLabels, RequestSeries>>,
     upstream_health: Mutex<BTreeMap<UpstreamHealthLabels, u64>>,
+    proxy_lifecycle_deadlines: [AtomicU64; ProxyLifecycleDeadlineOutcome::COUNT],
     codex_bad_request_classifications: Mutex<BTreeMap<CodexBadRequestClassification, u64>>,
     codex_bad_request_retries: Mutex<BTreeMap<CodexBadRequestRetry, u64>>,
     active_http_requests: AtomicI64,
@@ -61,6 +62,7 @@ impl Default for MetricsInner {
             http: Mutex::default(),
             upstream: Mutex::default(),
             upstream_health: Mutex::default(),
+            proxy_lifecycle_deadlines: std::array::from_fn(|_| AtomicU64::new(0)),
             codex_bad_request_classifications: Mutex::default(),
             codex_bad_request_retries: Mutex::default(),
             active_http_requests: AtomicI64::new(0),
@@ -149,6 +151,29 @@ impl UpstreamHealthReason {
             Self::Connection => "connection",
             Self::Cooldown => "cooldown",
             Self::Success => "success",
+        }
+    }
+}
+
+/// Fixed outcomes for the absolute request-lifecycle deadline. This avoids
+/// labels derived from request, tenant, or upstream identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProxyLifecycleDeadlineOutcome {
+    Converged,
+    ReconcileFailed,
+}
+
+impl ProxyLifecycleDeadlineOutcome {
+    const COUNT: usize = 2;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Converged => "converged",
+            Self::ReconcileFailed => "reconcile_failed",
         }
     }
 }
@@ -408,6 +433,10 @@ impl Metrics {
         *value = value.saturating_add(1);
     }
 
+    pub fn observe_proxy_lifecycle_deadline(&self, outcome: ProxyLifecycleDeadlineOutcome) {
+        self.inner.proxy_lifecycle_deadlines[outcome.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_dependency_ready(&self, dependency: &'static str, ready: bool) {
         let value = i64::from(ready);
         match dependency {
@@ -515,6 +544,7 @@ impl Metrics {
         render_http(&mut output, &http);
         render_upstream(&mut output, &upstream);
         render_upstream_health(&mut output, &upstream_health);
+        render_proxy_lifecycle_deadlines(&mut output, &self.inner);
         codex::render_bad_requests(
             &mut output,
             &codex_bad_request_classifications,
@@ -538,6 +568,22 @@ fn render_upstream_health(output: &mut String, values: &BTreeMap<UpstreamHealthL
             output,
             "memeloop_token_center_upstream_candidate_health_events_total{{event=\"{}\",reason=\"{}\"}} {value}",
             labels.event, labels.reason
+        );
+    }
+}
+
+fn render_proxy_lifecycle_deadlines(output: &mut String, inner: &MetricsInner) {
+    output.push_str("# HELP memeloop_token_center_proxy_lifecycle_deadline_events_total Absolute proxy lifecycle deadline outcomes with fixed low-cardinality labels.\n");
+    output.push_str("# TYPE memeloop_token_center_proxy_lifecycle_deadline_events_total counter\n");
+    for outcome in [
+        ProxyLifecycleDeadlineOutcome::Converged,
+        ProxyLifecycleDeadlineOutcome::ReconcileFailed,
+    ] {
+        let value = inner.proxy_lifecycle_deadlines[outcome.index()].load(Ordering::Relaxed);
+        let _ = writeln!(
+            output,
+            "memeloop_token_center_proxy_lifecycle_deadline_events_total{{outcome=\"{}\"}} {value}",
+            outcome.label(),
         );
     }
 }
@@ -1143,6 +1189,19 @@ mod tests {
         ));
         assert!(rendered.contains(
             "memeloop_token_center_upstream_candidate_health_events_total{event=\"failover\",reason=\"invalid_response\"} 1"
+        ));
+    }
+
+    #[test]
+    fn proxy_lifecycle_deadline_labels_are_fixed() {
+        let metrics = Metrics::default();
+        metrics.observe_proxy_lifecycle_deadline(ProxyLifecycleDeadlineOutcome::Converged);
+        let rendered = metrics.render(&RuntimeMetrics::default());
+        assert!(rendered.contains(
+            "memeloop_token_center_proxy_lifecycle_deadline_events_total{outcome=\"converged\"} 1"
+        ));
+        assert!(rendered.contains(
+            "memeloop_token_center_proxy_lifecycle_deadline_events_total{outcome=\"reconcile_failed\"} 0"
         ));
     }
 

@@ -1,6 +1,161 @@
 use super::super::*;
 
 #[tokio::test]
+async fn lifecycle_deadline_converges_pending_proxy_request_idempotently() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("proxy-lifecycle-deadline.db")
+            .display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    let pepper = b"proxy lifecycle deadline test pepper value";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "proxy-lifecycle-deadline".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "proxy-lifecycle-deadline".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(
+            "proxy-lifecycle-deadline",
+            "USD",
+            Decimal::ONE,
+            Decimal::ONE,
+        )
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    let reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 7,
+            output_token_ceiling: 11,
+            protocol: "openai",
+            model: "proxy-lifecycle-deadline",
+            request_object: "gap://proxy-lifecycle-deadline/request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        database
+            .expire_proxy_lifecycle_deadline(request_id, key.tenant_id, &reservation, 1_230)
+            .await
+            .unwrap(),
+        FinishProxyRequestResult::Finished {
+            usage_invalid: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        database
+            .expire_proxy_lifecycle_deadline(request_id, key.tenant_id, &reservation, 1_240)
+            .await
+            .unwrap(),
+        FinishProxyRequestResult::AlreadyFinished {
+            status_code: 504,
+            ..
+        }
+    ));
+    let terminal = sqlx::query(
+        "SELECT status_code, error_code, input_tokens, output_tokens FROM request_records WHERE id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(terminal.get::<i64, _>("status_code"), 504);
+    assert_eq!(
+        terminal.get::<String, _>("error_code"),
+        "request_lifecycle_timeout"
+    );
+    assert_eq!(terminal.get::<i64, _>("input_tokens"), 0);
+    assert_eq!(terminal.get::<i64, _>("output_tokens"), 0);
+
+    let delivered_request_id = Uuid::now_v7();
+    let delivered_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: delivered_request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 7,
+            output_token_ceiling: 11,
+            protocol: "openai",
+            model: "proxy-lifecycle-deadline",
+            request_object: "gap://proxy-lifecycle-deadline/delivered-request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    database
+        .prepare_proxy_delivery(
+            delivered_request_id,
+            key.tenant_id,
+            &delivered_reservation,
+            7,
+            11,
+            None,
+        )
+        .await
+        .unwrap();
+    database
+        .mark_proxy_delivery_started(delivered_request_id, key.tenant_id, &delivered_reservation)
+        .await
+        .unwrap();
+    assert!(matches!(
+        database
+            .expire_proxy_lifecycle_deadline(
+                delivered_request_id,
+                key.tenant_id,
+                &delivered_reservation,
+                1_230,
+            )
+            .await
+            .unwrap(),
+        FinishProxyRequestResult::Finished {
+            usage_invalid: false,
+            ..
+        }
+    ));
+    let delivered_terminal = sqlx::query(
+        "SELECT status_code, error_code, input_tokens, output_tokens FROM request_records WHERE id = $1",
+    )
+    .bind(delivered_request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(delivered_terminal.get::<i64, _>("status_code"), 504);
+    assert_eq!(
+        delivered_terminal.get::<String, _>("error_code"),
+        "request_lifecycle_timeout"
+    );
+    assert_eq!(delivered_terminal.get::<i64, _>("input_tokens"), 7);
+    assert_eq!(delivered_terminal.get::<i64, _>("output_tokens"), 11);
+}
+
+#[tokio::test]
 async fn concurrent_proxy_starts_serialize_in_sqlite() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

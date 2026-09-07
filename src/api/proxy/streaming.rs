@@ -186,6 +186,14 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let lifecycle_started = tokio::time::Instant::now();
         let stream_deadline = lifecycle_started + MAX_PROXY_STREAM_LIFETIME;
         let lifecycle_deadline = lifecycle_started + MAX_PROXY_LIFETIME;
+        // The bounded lifecycle below owns these values. Keep exact copies for
+        // the timeout convergence path, which must not infer delivery from a
+        // task that Tokio has just cancelled.
+        let deadline_database = background_state.db.clone();
+        let deadline_metrics = background_state.metrics.clone();
+        let deadline_reservation = reservation.clone();
+        let deadline_tenant_id = tenant_id;
+        let deadline_started = started;
         let lifecycle = async move {
             let mut upstream_stream = upstream.bytes_stream();
             let archive_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -557,6 +565,38 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 stage = "lifecycle_deadline",
                 "proxy request lifecycle exceeded its absolute deadline"
             );
+            match deadline_database
+                .expire_proxy_lifecycle_deadline(
+                    request_id,
+                    deadline_tenant_id,
+                    &deadline_reservation,
+                    deadline_started.elapsed().as_millis() as i64,
+                )
+                .await
+            {
+                Ok(FinishProxyRequestResult::Finished { .. }) => {
+                    deadline_metrics.observe_proxy_lifecycle_deadline(
+                        crate::metrics::ProxyLifecycleDeadlineOutcome::Converged,
+                    );
+                    tracing::warn!(
+                        %request_id,
+                        error_code = "request_lifecycle_timeout",
+                        "proxy lifecycle deadline converged a pending request"
+                    );
+                }
+                Ok(FinishProxyRequestResult::AlreadyFinished { .. }) => {}
+                Err(error) => {
+                    deadline_metrics.observe_proxy_lifecycle_deadline(
+                        crate::metrics::ProxyLifecycleDeadlineOutcome::ReconcileFailed,
+                    );
+                    tracing::error!(
+                        %request_id,
+                        error_code = "request_lifecycle_timeout_reconcile_failed",
+                        %error,
+                        "proxy lifecycle deadline could not converge a pending request"
+                    );
+                }
+            }
         }
     });
     let mut response = Response::builder()
