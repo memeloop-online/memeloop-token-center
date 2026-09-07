@@ -629,7 +629,12 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
                 route_group_names: Vec::new(),
                 granted_credential_ids: Vec::new(),
                 expected_updated_at: updated_route.0.updated_at,
-                expected_grant_revision: updated_route.0.grant_revision,
+                // Candidate membership is independent from credential grants,
+                // so the route's original grant revision remains the correct
+                // CAS precondition for this relation-only cleanup.
+                expected_grant_revision: owned_route["grant_revision"]
+                    .as_i64()
+                    .expect("owned route grant revision"),
                 custom_model_confirmed: true,
             },
         )
@@ -833,7 +838,7 @@ async fn exercise_route_create_idempotency(database_url: String, tenant: String)
     // in-window retry must resolve its owned route before that mutable check.
     sqlx::query("UPDATE upstream_accounts SET driver = $1 WHERE id = $2")
         .bind("route-create-idempotency-provider-removed")
-        .bind(legacy_upstream_id.to_string())
+        .bind(primary_upstream_id.to_string())
         .execute(&raw_pool)
         .await
         .expect("simulate removed provider driver");
