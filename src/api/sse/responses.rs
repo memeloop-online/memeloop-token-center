@@ -271,15 +271,6 @@ impl ResponsesStreamingSanitizer {
         let payload_name = payload.get("type").and_then(Value::as_str).ok_or_else(|| {
             SanitizerRejection::new("upstream_invalid_response", "payload_schema")
         })?;
-        if payload_name != "error"
-            && !payload_name.starts_with("response.")
-            && !is_opaque_metadata_event_name(payload_name)
-        {
-            return Err(SanitizerRejection::new(
-                "upstream_invalid_response",
-                "payload_namespace",
-            ));
-        }
         if event_name
             .as_deref()
             .is_some_and(|event_name| event_name != payload_name)
@@ -289,11 +280,10 @@ impl ResponsesStreamingSanitizer {
                 "event_type_mismatch",
             ));
         }
-        if is_opaque_metadata_event_name(payload_name) {
-            // These two non-Responses events are emitted by Codex transports.
-            // They are opaque provider metadata: do not let them establish
-            // identity, affect lifecycle/accounting state, or escape into the
-            // downstream/archive representation.
+        if payload_name != "error" && !payload_name.starts_with("response.") {
+            // Unknown provider events are opaque metadata. Do not let them
+            // establish identity, affect lifecycle/accounting state, or
+            // escape into the downstream/archive representation.
             return Ok(());
         }
         self.identity
@@ -382,13 +372,6 @@ fn is_response_lifecycle_event_name(name: &str) -> bool {
             | "response.incomplete"
             | "response.error"
             | "error"
-    )
-}
-
-fn is_opaque_metadata_event_name(name: &str) -> bool {
-    matches!(
-        name,
-        "codex.response.metadata" | "responsesapi.websocket_timing"
     )
 }
 

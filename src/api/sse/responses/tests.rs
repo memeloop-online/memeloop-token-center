@@ -54,13 +54,6 @@ fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
             .is_err()
     );
 
-    let mut unknown_type = ResponsesStreamingSanitizer::default();
-    assert!(
-        unknown_type
-            .push(b"data: {\"type\":\"not-responses\",\"secret\":\"hidden\"}\n\n")
-            .is_err()
-    );
-
     let mut unknown_field = ResponsesStreamingSanitizer::default();
     let mut output = unknown_field
         .push(
@@ -339,44 +332,52 @@ fn sanitizer_rejects_bad_ids_and_bare_lifecycle_events_before_terminal_delivery(
 }
 
 #[test]
-fn sanitizer_drops_only_exact_codex_metadata_events_before_response_lifecycle() {
-    for metadata_type in ["codex.response.metadata", "responsesapi.websocket_timing"] {
-        let mut sanitizer = ResponsesStreamingSanitizer::default();
-        let metadata = format!(
-            "event: {metadata_type}\ndata: {{\"type\":\"{metadata_type}\",\"provider_secret\":\"must-not-forward\"}}\n\n"
-        );
-        assert!(sanitizer.push(metadata.as_bytes()).unwrap().is_empty());
-        assert!(!sanitizer.saw_protocol_event());
+fn sanitizer_drops_opaque_metadata_before_response_lifecycle() {
+    for metadata_type in [
+        "codex.response.metadata",
+        "responsesapi.websocket_timing.extra",
+        "foreign.provider.metadata",
+    ] {
+        for include_matching_event_name in [true, false] {
+            let mut sanitizer = ResponsesStreamingSanitizer::default();
+            let metadata = if include_matching_event_name {
+                format!(
+                    "event: {metadata_type}\ndata: {{\"type\":\"{metadata_type}\",\"provider_secret\":\"must-not-forward\"}}\n\n"
+                )
+            } else {
+                format!(
+                    "data: {{\"type\":\"{metadata_type}\",\"provider_secret\":\"must-not-forward\"}}\n\n"
+                )
+            };
+            assert!(sanitizer.push(metadata.as_bytes()).unwrap().is_empty());
+            assert!(!sanitizer.saw_protocol_event());
 
-        let mut output = sanitizer
+            let mut output = sanitizer
             .push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-metadata\"}}\n\n")
             .unwrap()
             .to_vec();
-        assert!(sanitizer.saw_protocol_event());
-        assert!(sanitizer
+            assert!(sanitizer.saw_protocol_event());
+            assert!(sanitizer
             .push(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-metadata\"}}\n\ndata: [DONE]\n\n")
             .unwrap()
             .is_empty());
-        output.extend_from_slice(&sanitizer.finish().unwrap());
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("response.created"));
-        assert!(output.contains("response.completed"));
-        assert!(output.contains("data: [DONE]"));
-        assert!(!output.contains("must-not-forward"));
+            output.extend_from_slice(&sanitizer.finish().unwrap());
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("response.created"));
+            assert!(output.contains("response.completed"));
+            assert!(output.contains("data: [DONE]"));
+            assert!(!output.contains("must-not-forward"));
+        }
     }
 
-    for metadata_type in [
-        "codex.response.metadata.extra",
-        "responsesapi.websocket_timing.extra",
-    ] {
-        let mut sanitizer = ResponsesStreamingSanitizer::default();
-        let metadata = format!("data: {{\"type\":\"{metadata_type}\"}}\n\n");
-        assert_eq!(
-            sanitizer.push(metadata.as_bytes()),
-            Err("upstream_invalid_response")
-        );
-        assert_eq!(sanitizer.last_rejection_stage(), "payload_namespace");
-    }
+    let mut mismatched = ResponsesStreamingSanitizer::default();
+    assert_eq!(
+        mismatched.push(
+            b"event: other.provider.metadata\ndata: {\"type\":\"foreign.provider.metadata\",\"provider_secret\":\"must-not-forward\"}\n\n"
+        ),
+        Err("upstream_invalid_response")
+    );
+    assert_eq!(mismatched.last_rejection_stage(), "event_type_mismatch");
 }
 
 #[test]
@@ -386,12 +387,6 @@ fn sanitizer_rejection_stages_are_static_and_content_free() {
             b"data: {not-json}\n\n".as_slice(),
             "upstream_invalid_response",
             "json",
-        ),
-        (
-            b"data: {\"type\":\"not-responses\",\"provider_detail\":\"must-not-log\"}\n\n"
-                .as_slice(),
-            "upstream_invalid_response",
-            "payload_namespace",
         ),
         (
             b"data: []\n\n".as_slice(),
