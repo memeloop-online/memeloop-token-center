@@ -7,8 +7,7 @@ use memeloop_token_center::{
     config::{Config, RuntimeRole},
     db::{
         CreateModelRouteInput, CreateRoutedModelRouteInput, CreateServiceTokenInput,
-        CreateUpstreamAccountInput,
-        ReauthorizeUpstreamAccountInput,
+        CreateUpstreamAccountInput, ReauthorizeUpstreamAccountInput,
     },
     provider::{UpstreamAccountView, UpstreamCredential},
 };
@@ -1145,7 +1144,10 @@ async fn upstream_deletion_readiness_keeps_multi_candidate_routes_and_history_vi
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
-        directory.path().join("upstream-deletion-readiness.db").display()
+        directory
+            .path()
+            .join("upstream-deletion-readiness.db")
+            .display()
     );
     let state = AppState::initialize(Config::for_test(database_url.clone()))
         .await
@@ -1223,15 +1225,8 @@ async fn upstream_deletion_readiness_keeps_multi_candidate_routes_and_history_vi
         "/internal/v1/upstreams/{}/deletion-readiness?tenant_external_id=deletion-readiness",
         retired.id
     );
-    let (status, readiness) = json_request(
-        &state,
-        "GET",
-        &readiness_path,
-        &service.token,
-        None,
-        None,
-    )
-    .await;
+    let (status, readiness) =
+        json_request(&state, "GET", &readiness_path, &service.token, None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(readiness["requires_disabled"], true);
     assert_eq!(readiness["model_route_count"], 1);
@@ -1319,15 +1314,8 @@ async fn upstream_deletion_readiness_keeps_multi_candidate_routes_and_history_vi
     .await
     .unwrap();
 
-    let (status, readiness) = json_request(
-        &state,
-        "GET",
-        &readiness_path,
-        &service.token,
-        None,
-        None,
-    )
-    .await;
+    let (status, readiness) =
+        json_request(&state, "GET", &readiness_path, &service.token, None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(readiness["requires_disabled"], false);
     assert_eq!(readiness["model_route_count"], 1);
