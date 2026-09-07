@@ -165,7 +165,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await assertVisible(onboarding.getByRole('button', { name: 'API 凭据', exact: true }));
   await assertVisible(onboarding.getByRole('button', { name: '账户授权', exact: true }));
   await assertVisible(page.getByText('Browser mock upstream', { exact: true }));
-  const providerAccount = page.locator('.provider-account').filter({ hasText: seed.upstreamId });
+  const providerAccount = page.locator(`.provider-account[data-upstream-id="${seed.upstreamId}"]`);
   await assertContains(providerAccount, 'API 凭据');
   await assertContains(providerAccount, '1 条路由');
   await providerAccount.getByRole('button', { name: '健康检查' }).click();
