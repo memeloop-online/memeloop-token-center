@@ -127,6 +127,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route("/internal/v1/stats", get(internal_stats))
         .route(
+            "/internal/v1/monitoring-snapshot",
+            get(monitoring_snapshot::internal_monitoring_snapshot),
+        )
+        .route(
             "/internal/v1/usage-analysis",
             get(usage_analysis::internal_usage_analysis),
         )

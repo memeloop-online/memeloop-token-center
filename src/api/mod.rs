@@ -42,6 +42,7 @@ mod groups;
 mod health;
 mod limits;
 mod model_routes;
+mod monitoring_snapshot;
 mod plugins;
 mod proxy;
 mod request_detail;

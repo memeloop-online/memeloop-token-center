@@ -675,6 +675,91 @@ pub struct OperatorStats {
     pub errors: Vec<StatsBucket>,
 }
 
+/// A compact terminal-traffic projection for an operator-selected scope and
+/// exact inclusive time window. It is deliberately separate from the general
+/// usage-analysis response: callers get a bounded operational view rather
+/// than every analytics dimension.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MonitoringMetrics {
+    pub requests: i64,
+    pub successful_requests: i64,
+    pub failed_requests: i64,
+    pub avg_duration_ms: Option<f64>,
+    pub p95_duration_ms: Option<i64>,
+    /// Stable ascending currency order. Unlike currencies are never added.
+    pub costs: Vec<UsageAnalysisCost>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MonitoringFreshness {
+    /// The newest terminal fact's original request/job creation time in this
+    /// window. A fact is written only after its outcome is terminal.
+    pub latest_terminal_created_at: Option<i64>,
+    /// `generated_at - latest_terminal_created_at`, never negative. This is
+    /// absent when the window has no terminal traffic.
+    pub age_millis: Option<i64>,
+}
+
+/// Versioned interpretation of the durable upstream circuit-breaker state.
+/// `unknown` is intentional whenever the selected scope has no terminal
+/// traffic or its historical stable account no longer has a current row.
+#[derive(Clone, Debug, Serialize)]
+pub struct MonitoringHealth {
+    pub version: String,
+    pub status: String,
+    pub observed_at: Option<i64>,
+}
+
+/// One terminal fact from a bounded top upstream/model drilldown. `source`
+/// distinguishes synchronous request facts from terminal generation facts;
+/// started/in-flight rows never enter this type.
+#[derive(Clone, Debug, Serialize)]
+pub struct MonitoringTerminalOutcome {
+    pub id: String,
+    pub source: String,
+    pub created_at: i64,
+    pub status: String,
+    pub duration_ms: i64,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MonitoringUpstreamModel {
+    /// Stable account identity, retained across credential rotation.
+    pub upstream_account_id: String,
+    pub upstream_name: String,
+    pub model: String,
+    pub metrics: MonitoringMetrics,
+    pub health: MonitoringHealth,
+    /// At most five newest terminal outcomes for this exact stable
+    /// upstream/model pair and selected time window.
+    pub terminal_outcomes: Vec<MonitoringTerminalOutcome>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OperatorMonitoringSnapshot {
+    /// Additive payload evolution is keyed separately from the HTTP API
+    /// version so an operator can identify this health interpretation.
+    pub contract_version: String,
+    pub generated_at: i64,
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_external_id: Option<String>,
+    pub from_created_at: i64,
+    pub to_created_at: i64,
+    pub granularity: String,
+    pub latency_is_approximate: bool,
+    pub latency_method: String,
+    pub summary: MonitoringMetrics,
+    pub freshness: MonitoringFreshness,
+    /// Aggregate health is unknown when there was no terminal activity in the
+    /// selected window. It never guesses health from started request rows.
+    pub health: MonitoringHealth,
+    /// Top ten stable upstream/model pairs by terminal requests. Unassigned
+    /// traffic remains in the summary but has no stable upstream row.
+    pub top_upstream_models: Vec<MonitoringUpstreamModel>,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct UsageAnalysisCost {
     pub currency: String,

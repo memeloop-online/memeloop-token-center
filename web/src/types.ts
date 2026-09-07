@@ -150,6 +150,63 @@ export interface OperatorStats {
   errors: StatsBucket[];
 }
 
+export interface MonitoringMetrics {
+  requests: number;
+  successful_requests: number;
+  failed_requests: number;
+  avg_duration_ms: number | null;
+  p95_duration_ms: number | null;
+  /** Amounts are currency-separated and sorted by currency by the API. */
+  costs: UsageAnalysisCost[];
+}
+
+export interface MonitoringFreshness {
+  latest_terminal_created_at: number | null;
+  age_millis: number | null;
+}
+
+export interface MonitoringHealth {
+  version: 'upstream_breaker_v1';
+  status: 'healthy' | 'degraded' | 'unhealthy' | 'unknown';
+  observed_at: number | null;
+}
+
+export interface MonitoringTerminalOutcome {
+  id: string;
+  source: 'request' | 'generation';
+  created_at: number;
+  status: 'success' | 'failure';
+  duration_ms: number;
+  error_code: string | null;
+}
+
+export interface MonitoringUpstreamModel {
+  upstream_account_id: string;
+  upstream_name: string;
+  model: string;
+  metrics: MonitoringMetrics;
+  health: MonitoringHealth;
+  /** API cap: five terminal outcomes; started rows are never represented. */
+  terminal_outcomes: MonitoringTerminalOutcome[];
+}
+
+export interface OperatorMonitoringSnapshot {
+  contract_version: 'v1';
+  generated_at: number;
+  scope: 'tenant' | 'global';
+  tenant_external_id?: string;
+  from_created_at: number;
+  to_created_at: number;
+  granularity: 'hour' | 'day';
+  latency_is_approximate: true;
+  latency_method: 'fixed_histogram_upper_bound_capped_60000ms';
+  summary: MonitoringMetrics;
+  freshness: MonitoringFreshness;
+  health: MonitoringHealth;
+  /** API cap: ten stable upstream/model pairs by terminal requests. */
+  top_upstream_models: MonitoringUpstreamModel[];
+}
+
 export interface OperatorUsageAnalysis {
   from_created_at: number;
   to_created_at: number;

@@ -1,9 +1,9 @@
 import { api } from '../../api';
-import { Metric, RequestTable } from '../../components';
-import { formatCurrency, formatMetricNumber, formatNumber, formatPercent } from '../../format';
+import { RequestTable } from '../../components';
 import { useI18n } from '../../i18n';
-import type { OperatorStats, PluginManifest, RequestView, UpstreamAccount, UsageAnalysisSessionBucket } from '../../types';
+import type { OperatorMonitoringSnapshot, PluginManifest, RequestView, UpstreamAccount, UsageAnalysisSessionBucket } from '../../types';
 import { GenerationWorkspace } from '../GenerationWorkspace';
+import { MonitoringSnapshot } from '../MonitoringSnapshot';
 import { Plugins } from '../Plugins';
 import { UsageAnalysis } from '../UsageAnalysis';
 import { useOperatorResource } from '../hooks/useOperatorResource';
@@ -18,40 +18,14 @@ interface OperatorPageProps {
   writeTenant?: string;
 }
 
-function overviewStatsPath(tenant: string) {
+function monitoringSnapshotPath(tenant: string, now: number) {
   const query = new URLSearchParams({
-    from_created_at: String(Date.now() - 86_400_000),
-    to_created_at: String(Date.now()),
+    scope: tenant ? 'tenant' : 'global',
+    from_created_at: String(now - 86_400_000),
+    to_created_at: String(now),
   });
   if (tenant) query.set('tenant_external_id', tenant);
-  return `/internal/v1/stats?${query}`;
-}
-
-function OverviewCost({ costs }: { costs: OperatorStats['summary']['costs'] }) {
-  const { locale } = useI18n();
-  if (!costs.length) return <>—</>;
-  return <span className="usage-cost-lines">
-    {costs.map(({ currency, cost }) => <span key={currency} title={`${cost} ${currency}`}>
-      {formatCurrency(cost, currency, locale)}
-    </span>)}
-  </span>;
-}
-
-function OverviewMetrics({ stats }: { stats: OperatorStats }) {
-  const { locale, t } = useI18n();
-  const summary = stats.summary;
-  const requests = formatMetricNumber(summary.total_requests, locale);
-  const tokens = formatMetricNumber(summary.input_tokens + summary.output_tokens, locale);
-  const successRate = summary.total_requests > 0
-    ? summary.successful_requests / summary.total_requests
-    : undefined;
-  return <section className="metrics operator-overview-metrics" aria-label={t('usage.overview')}>
-    <Metric label={t('usage.requests')} value={<span title={requests.title}>{requests.text}</span>} />
-    <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
-    <Metric label={t('usage.failures')} value={formatNumber(summary.failed_requests, locale)} tone="negative" />
-    <Metric label={t('usage.totalTokens')} value={<span title={tokens.title}>{tokens.text}</span>} />
-    <Metric label={t('usage.cost')} value={<OverviewCost costs={summary.costs} />} />
-  </section>;
+  return `/internal/v1/monitoring-snapshot?${query}`;
 }
 
 export function OverviewPage({ token, tenant, onNavigate, onOpenSession }: OperatorPageProps & {
@@ -63,11 +37,12 @@ export function OverviewPage({ token, tenant, onNavigate, onOpenSession }: Opera
   const resource = useOperatorResource(
     Boolean(token), `${token}\0${tenant}`,
     async () => {
-      const [requests, stats] = await Promise.all([
+      const now = Date.now();
+      const [requests, monitoring] = await Promise.all([
         api<RequestView[]>(`/internal/v1/requests${queryForTenant(tenant, 'limit=5')}`, token),
-        api<OperatorStats>(overviewStatsPath(tenant), token),
+        api<OperatorMonitoringSnapshot>(monitoringSnapshotPath(tenant, now), token),
       ]);
-      return { requests, stats };
+      return { requests, monitoring };
     },
     t('common.requestFailed'),
   );
@@ -84,7 +59,7 @@ export function OverviewPage({ token, tenant, onNavigate, onOpenSession }: Opera
   return <div className="operator-overview-dashboard">
     {resource.state.refreshError && <div className="notice error" role="alert">{resource.state.refreshError}</div>}
     <article className="panel operator-overview-shortcuts"><div className="panel-title"><div><h2>{t('usage.overview')}</h2><p className="muted">{t('operator.subtitle')}</p></div></div><div className="row-actions">{destinations.map((item) => <button type="button" className="secondary" key={item.route} onClick={() => onNavigate(item.route)}>{item.label}</button>)}</div></article>
-    <OverviewMetrics stats={resource.state.value.stats} />
+    <MonitoringSnapshot snapshot={resource.state.value.monitoring} />
     <article className="panel operator-overview-recent"><div className="panel-title"><h2>{t('self.recent')}</h2><span>{t('sessions.requests')}</span></div><RequestTable requests={resource.state.value.requests} onOpenSession={onOpenSession} /></article>
   </div>;
 }

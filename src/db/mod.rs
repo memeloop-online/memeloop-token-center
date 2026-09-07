@@ -42,6 +42,7 @@ mod credentials;
 mod generation;
 mod groups;
 mod migrations;
+mod monitoring_snapshot;
 mod oauth_sessions;
 mod plugin_configurations;
 mod plugin_kv;
@@ -108,6 +109,7 @@ pub use migrations::{BlockedPartition, PartitionMaintenanceReport};
 pub(crate) use migrations::{POSTGRES_MIGRATIONS, SQLITE_MIGRATIONS};
 #[cfg(test)]
 use migrations::{apply_migration_range, maintain_postgres_partitions};
+pub use monitoring_snapshot::{MonitoringScope, MonitoringSnapshotFilter};
 pub use oauth_sessions::{BeginOAuthLoginSession, OAuthLoginClaim, OAuthLoginSessionReference};
 pub use providers::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, CreateModelRouteInput,

@@ -1,0 +1,87 @@
+import { Metric, NumberMetric } from '../components';
+import { formatCurrency, formatMilliseconds, formatNumber, formatPercent } from '../format';
+import { useI18n } from '../i18n';
+import type { MonitoringHealth, OperatorMonitoringSnapshot, UsageAnalysisCost } from '../types';
+
+function CostLines({ costs }: { costs: UsageAnalysisCost[] }) {
+  const { locale } = useI18n();
+  if (!costs.length) return <>—</>;
+  return <span className="monitoring-cost-lines">{costs.map(({ currency, cost }) => (
+    <span key={currency} title={`${cost} ${currency}`}>{formatCurrency(cost, currency, locale)}</span>
+  ))}</span>;
+}
+
+function healthClass(status: MonitoringHealth['status']) {
+  if (status === 'healthy') return 'ok';
+  if (status === 'unhealthy') return 'bad';
+  return 'pending';
+}
+
+function HealthBadge({ health }: { health: MonitoringHealth }) {
+  const { t } = useI18n();
+  return <span className={`status ${healthClass(health.status)}`} title={health.version}>{t(`monitoring.health.${health.status}`)}</span>;
+}
+
+function Freshness({ snapshot }: { snapshot: OperatorMonitoringSnapshot }) {
+  const { locale, t } = useI18n();
+  const freshness = snapshot.freshness;
+  if (freshness.latest_terminal_created_at === null) return <span>{t('monitoring.noTerminalTraffic')}</span>;
+  const occurred = new Date(freshness.latest_terminal_created_at).toLocaleString(locale);
+  const age = freshness.age_millis === null ? '—' : formatMilliseconds(freshness.age_millis, locale);
+  return <span title={occurred}>{t('monitoring.freshnessAge', { age })}</span>;
+}
+
+export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringSnapshot }) {
+  const { locale, t } = useI18n();
+  const summary = snapshot.summary;
+  const successRate = summary.requests > 0 ? summary.successful_requests / summary.requests : null;
+  const range = `${new Date(snapshot.from_created_at).toLocaleString(locale)} – ${new Date(snapshot.to_created_at).toLocaleString(locale)}`;
+  return <section className="operator-monitoring" aria-labelledby="monitoring-heading">
+    <article className="panel">
+      <div className="panel-title monitoring-heading">
+        <div><h2 id="monitoring-heading">{t('monitoring.title')}</h2><p className="muted">{range}</p></div>
+        <HealthBadge health={snapshot.health} />
+      </div>
+      <section className="metrics operator-monitoring-metrics" aria-label={t('monitoring.summary')}>
+        <NumberMetric label={t('usage.requests')} value={summary.requests} />
+        <NumberMetric label={t('traffic.success')} value={summary.successful_requests} tone="positive" />
+        <NumberMetric label={t('traffic.failure')} value={summary.failed_requests} tone="negative" />
+        <Metric label={t('usage.successRate')} value={formatPercent(successRate, locale)} tone="positive" />
+        <Metric label={t('usage.average')} value={formatMilliseconds(summary.avg_duration_ms, locale)} />
+        <Metric label={t('usage.p95Approx')} value={formatMilliseconds(summary.p95_duration_ms, locale)} />
+        <Metric label={t('traffic.cost')} value={<CostLines costs={summary.costs} />} />
+        <Metric label={t('monitoring.freshness')} value={<Freshness snapshot={snapshot} />} />
+      </section>
+    </article>
+    <article className="panel monitoring-top-panel">
+      <div className="panel-title"><h2>{t('monitoring.topUpstreams')}</h2><span>{t('monitoring.topLimit')}</span></div>
+      {!snapshot.top_upstream_models.length
+        ? <div className="empty">{t('monitoring.noStableUpstreamTraffic')}</div>
+        : <ol className="monitoring-top-list">{snapshot.top_upstream_models.map((value) => {
+          const metrics = value.metrics;
+          return <li key={`${value.upstream_account_id}\0${value.model}`}>
+            <div className="monitoring-top-heading">
+              <div><b>{value.upstream_name}</b><code>{value.model}</code></div>
+              <HealthBadge health={value.health} />
+            </div>
+            <div className="monitoring-top-metrics">
+              <span>{t('usage.requests')}: {formatNumber(metrics.requests, locale)}</span>
+              <span>{t('traffic.success')}: {formatNumber(metrics.successful_requests, locale)}</span>
+              <span>{t('traffic.failure')}: {formatNumber(metrics.failed_requests, locale)}</span>
+              <span>{t('usage.p95Approx')}: {formatMilliseconds(metrics.p95_duration_ms, locale)}</span>
+              <CostLines costs={metrics.costs} />
+            </div>
+            <ol className="monitoring-outcomes" aria-label={t('monitoring.terminalOutcomes')}>
+              {value.terminal_outcomes.slice(0, 5).map((outcome) => <li key={`${outcome.source}\0${outcome.id}`}>
+                <time dateTime={new Date(outcome.created_at).toISOString()}>{new Date(outcome.created_at).toLocaleString(locale)}</time>
+                <span className={`status ${outcome.status === 'success' ? 'ok' : 'bad'}`}>{t(`monitoring.outcome.${outcome.status}`)}</span>
+                <span>{t(`monitoring.source.${outcome.source}`)}</span>
+                <span>{formatMilliseconds(outcome.duration_ms, locale)}</span>
+                {outcome.error_code && <code>{outcome.error_code}</code>}
+              </li>)}
+            </ol>
+          </li>;
+        })}</ol>}
+    </article>
+  </section>;
+}

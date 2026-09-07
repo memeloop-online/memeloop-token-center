@@ -360,6 +360,13 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "explicit tenant lifecycle and audit",
         sql: include_str!("../../../migrations/common/0067_tenant_lifecycle.sql"),
     },
+    Migration {
+        version: 68,
+        name: "bounded monitoring snapshot outcome indexes",
+        sql: include_str!(
+            "../../../migrations/common/0068_monitoring_snapshot_outcome_indexes.sql"
+        ),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -705,6 +712,13 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 67,
         name: "explicit tenant lifecycle and audit",
         sql: include_str!("../../../migrations/common/0067_tenant_lifecycle.sql"),
+    },
+    Migration {
+        version: 68,
+        name: "bounded monitoring snapshot outcome indexes",
+        sql: include_str!(
+            "../../../migrations/common/0068_monitoring_snapshot_outcome_indexes.sql"
+        ),
     },
 ];
 

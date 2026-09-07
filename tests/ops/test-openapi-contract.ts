@@ -81,6 +81,21 @@ test("usage analysis contract is currency safe and canonical", () => {
   const metrics = document.components.schemas.UsageAnalysisMetrics; for (const field of ["requests", "success", "failed", "cached_input_tokens", "cache_write_tokens", "generation_units", "costs"]) assert.ok(metrics.required.includes(field)); assert.equal(metrics.properties.costs.type, "array"); assert.equal(metrics.properties.costs.items.$ref, "#/components/schemas/UsageAnalysisCost"); const hour = document.components.schemas.UsageAnalysisHeatmapBucket.allOf[0].properties.hour_of_week; assert.deepEqual([hour.minimum, hour.maximum], [0, 167]);
 });
 
+test("operator monitoring snapshot has explicit scope/window and bounded terminal drilldowns", () => {
+  const document = cloneDocument(); const operation = document.paths["/internal/v1/monitoring-snapshot"].get;
+  assert.equal(operation["x-required-scope"], "requests:read"); assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
+  const parameters = Object.fromEntries(operation.parameters.map((item: Obj) => [item.name, item]));
+  assert.equal(parameters.scope.required, true); assert.deepEqual(parameters.scope.schema.enum, ["tenant", "global"]);
+  assert.equal(parameters.from_created_at.required, true); assert.equal(parameters.to_created_at.required, true);
+  const snapshot = document.components.schemas.OperatorMonitoringSnapshot;
+  assert.equal(snapshot.properties.contract_version.const, "v1"); assert.equal(snapshot.properties.top_upstream_models.maxItems, 10);
+  const health = document.components.schemas.MonitoringHealth;
+  assert.deepEqual(health.properties.status.enum, ["healthy", "degraded", "unhealthy", "unknown"]);
+  assert.equal(health.properties.version.const, "upstream_breaker_v1");
+  assert.equal(document.components.schemas.MonitoringUpstreamModel.properties.terminal_outcomes.maxItems, 5);
+  assert.equal(operation["x-query-plan"]["raw-request-records"], "forbidden");
+});
+
 test("OAuth reauthorization reuses the unified upstream resource", () => {
   const document = cloneDocument(); for (const [segment, schema] of [["cursor", "StartCursorOAuthRequest"], ["provider-adapter", "StartProviderAdapterOAuthRequest"], ["codex", "StartCodexOAuthRequest"]] as const) { const start = document.paths[`/internal/v1/oauth/${segment}/start`].post; const poll = document.paths[`/internal/v1/oauth/${segment}/poll`].post; assert.equal(start["x-required-scope"], "oauth:write"); assert.equal(poll["x-required-scope"], "oauth:write"); const target = document.components.schemas[schema].properties.upstream_account_id; assert.deepEqual([target.type, target.format], ["string", "uuid"]); assert.equal(poll.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UpstreamProvider"); }
   for (const path of ["/internal/v1/oauth/subscription-bridge/start", "/internal/v1/oauth/subscription-bridge/poll", "/internal/v1/imports/cpa/subscription-accounts"]) assert.ok(!(path in document.paths)); for (const schema of ["StartSubscriptionBridgeRequest", "SubscriptionBridgeCredential"]) assert.ok(!(schema in document.components.schemas)); assert.equal(document.paths["/internal/v1/oauth/codex/start"].post.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/CodexDeviceLoginStart"); assert.equal(document.components.schemas.CodexDeviceLoginStart.properties.security_notice.const, "only_continue_if_you_started_this_login");

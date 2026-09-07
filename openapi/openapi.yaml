@@ -3042,6 +3042,66 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/monitoring-snapshot:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorMonitoringSnapshot
+      summary: Read a bounded terminal-traffic monitoring snapshot
+      description: |
+        Requires an explicit `scope` and inclusive time window. `scope=tenant`
+        requires `tenant_external_id`; `scope=global` requires a global service
+        credential and must omit that selector. The response identifies the
+        resolved scope and exact window. Windows are capped at 93 days; up to
+        31 days reads hourly rollups and longer windows read daily rollups.
+        Complete buckets use compact terminal rollups and only the two partial
+        edge buckets read terminal request/generation facts. It never scans
+        `request_records`, request bodies, started rows, or full raw history.
+        Costs remain separate by currency. The top list contains no more than
+        ten stable upstream-account/model pairs, and each row has no more than
+        five terminal outcomes. Health is versioned; a zero-traffic window is
+        `unknown`, never inferred as healthy.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      x-query-plan:
+        complete-buckets: usage_analysis_hourly-or-daily
+        edge-buckets: terminal-request-and-generation-facts-only
+        top-upstream-models: 10
+        terminal-outcomes-per-row: 5
+        raw-request-records: forbidden
+      parameters:
+        - name: scope
+          in: query
+          required: true
+          description: Explicit operator read scope. Global scope is unavailable to tenant-scoped service credentials.
+          schema: { type: string, enum: [tenant, global] }
+        - name: tenant_external_id
+          in: query
+          required: false
+          description: Required when `scope=tenant`; forbidden when `scope=global`.
+          schema: { type: string, minLength: 1, maxLength: 200 }
+        - name: from_created_at
+          in: query
+          required: true
+          description: Inclusive Unix epoch milliseconds start.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: to_created_at
+          in: query
+          required: true
+          description: Inclusive Unix epoch milliseconds end.
+          schema: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: Currency-safe terminal monitoring summary and bounded stable upstream/model drilldowns.
+          headers:
+            Cache-Control:
+              schema: { const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorMonitoringSnapshot' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/usage-analysis:
     get:
       tags: [Operator traffic]
@@ -6166,6 +6226,120 @@ components:
         errors:
           type: array
           items: { $ref: '#/components/schemas/StatisticsBucket' }
+    MonitoringMetrics:
+      type: object
+      additionalProperties: false
+      required: [requests, successful_requests, failed_requests, avg_duration_ms, p95_duration_ms, costs]
+      properties:
+        requests: { type: integer, format: int64, minimum: 0 }
+        successful_requests: { type: integer, format: int64, minimum: 0 }
+        failed_requests: { type: integer, format: int64, minimum: 0 }
+        avg_duration_ms: { type: [number, 'null'], format: double, minimum: 0 }
+        p95_duration_ms:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+          maximum: 60000
+          description: Fixed-histogram upper-bound approximation, capped at 60000 ms.
+        costs:
+          type: array
+          description: Stable ascending currency order; values from unlike currencies are never added.
+          items: { $ref: '#/components/schemas/UsageAnalysisCost' }
+    MonitoringFreshness:
+      type: object
+      additionalProperties: false
+      required: [latest_terminal_created_at, age_millis]
+      properties:
+        latest_terminal_created_at:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+          description: Original creation time of the newest terminal request/generation fact in the selected window.
+        age_millis:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+          description: Snapshot generation time minus latest_terminal_created_at; null with no terminal traffic.
+    MonitoringHealth:
+      type: object
+      additionalProperties: false
+      required: [version, status, observed_at]
+      properties:
+        version:
+          type: string
+          const: upstream_breaker_v1
+          description: Versioned interpretation of durable upstream breaker state.
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy, unknown]
+          description: Zero terminal traffic is unknown, not healthy.
+        observed_at:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+          description: Latest durable breaker observation used by this health interpretation, when present.
+    MonitoringTerminalOutcome:
+      type: object
+      additionalProperties: false
+      required: [id, source, created_at, status, duration_ms, error_code]
+      properties:
+        id: { type: string, minLength: 1 }
+        source: { type: string, enum: [request, generation] }
+        created_at:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Original request/job creation time retained by the terminal fact.
+        status: { type: string, enum: [success, failure] }
+        duration_ms: { type: integer, format: int64, minimum: 0 }
+        error_code: { type: [string, 'null'], maxLength: 200 }
+    MonitoringUpstreamModel:
+      type: object
+      additionalProperties: false
+      required: [upstream_account_id, upstream_name, model, metrics, health, terminal_outcomes]
+      properties:
+        upstream_account_id:
+          type: string
+          minLength: 1
+          description: Stable upstream account identity across credential rotation.
+        upstream_name: { type: string, minLength: 1 }
+        model: { type: string, minLength: 1 }
+        metrics: { $ref: '#/components/schemas/MonitoringMetrics' }
+        health: { $ref: '#/components/schemas/MonitoringHealth' }
+        terminal_outcomes:
+          type: array
+          maxItems: 5
+          description: Newest terminal facts only; started/in-flight traffic is excluded.
+          items: { $ref: '#/components/schemas/MonitoringTerminalOutcome' }
+    OperatorMonitoringSnapshot:
+      type: object
+      additionalProperties: false
+      required: [contract_version, generated_at, scope, from_created_at, to_created_at, granularity, latency_is_approximate, latency_method, summary, freshness, health, top_upstream_models]
+      properties:
+        contract_version: { type: string, const: v1 }
+        generated_at: { type: integer, format: int64, minimum: 0 }
+        scope: { type: string, enum: [tenant, global] }
+        tenant_external_id:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Present exactly for `scope=tenant`.
+        from_created_at: { type: integer, format: int64, minimum: 0 }
+        to_created_at: { type: integer, format: int64, minimum: 0 }
+        granularity:
+          type: string
+          enum: [hour, day]
+          description: Hour through 31 days; day over 31 days up to the 93-day maximum.
+        latency_is_approximate: { type: boolean, const: true }
+        latency_method: { type: string, const: fixed_histogram_upper_bound_capped_60000ms }
+        summary: { $ref: '#/components/schemas/MonitoringMetrics' }
+        freshness: { $ref: '#/components/schemas/MonitoringFreshness' }
+        health: { $ref: '#/components/schemas/MonitoringHealth' }
+        top_upstream_models:
+          type: array
+          maxItems: 10
+          description: Top stable upstream-account/model pairs by terminal requests. Unassigned traffic remains in summary only.
+          items: { $ref: '#/components/schemas/MonitoringUpstreamModel' }
     UsageAnalysisCost:
       type: object
       additionalProperties: false
