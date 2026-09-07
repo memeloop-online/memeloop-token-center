@@ -1203,6 +1203,7 @@ mod query_shape_tests {
             max_cost_micros: Some(200),
             key_alias: Some("Alias%".to_owned()),
             principal: Some("Principal_".to_owned()),
+            typed_ast: None,
         };
         let query = build_operator_request_list_query(None, &filter);
 

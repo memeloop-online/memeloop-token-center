@@ -12,16 +12,11 @@ use crate::error::AppError;
 pub const MAX_TYPED_FILTER_CONDITIONS: usize = 12;
 pub const MAX_TYPED_FILTER_TEXT_BYTES: usize = 200;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedFilterLogicalOperator {
+    #[default]
     And,
-}
-
-impl Default for TypedFilterLogicalOperator {
-    fn default() -> Self {
-        Self::And
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -224,15 +219,14 @@ fn validate_value(value: &TypedFilterValue) -> Result<(), AppError> {
         TypedFilterValue::Text(value)
         | TypedFilterValue::Model(value)
         | TypedFilterValue::Protocol(value)
-        | TypedFilterValue::Status(value) => {
+        | TypedFilterValue::Status(value)
             if value.is_empty()
                 || value.len() > MAX_TYPED_FILTER_TEXT_BYTES
-                || value.chars().any(char::is_control)
-            {
-                return Err(AppError::BadRequest(format!(
-                    "filter text must contain 1 to {MAX_TYPED_FILTER_TEXT_BYTES} non-control characters"
-                )));
-            }
+                || value.chars().any(char::is_control) =>
+        {
+            return Err(AppError::BadRequest(format!(
+                "filter text must contain 1 to {MAX_TYPED_FILTER_TEXT_BYTES} non-control characters"
+            )));
         }
         TypedFilterValue::Timestamp(value) if *value < 0 => {
             return Err(AppError::BadRequest(

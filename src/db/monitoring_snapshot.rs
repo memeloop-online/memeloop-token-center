@@ -311,7 +311,7 @@ impl Database {
         }
         let summary = summary.finish();
         let latest_terminal_created_at = latest_terminal_created_at(
-            &mut *snapshot,
+            &mut snapshot,
             &scope,
             &tenant_id,
             range.from_created_at,
@@ -327,9 +327,9 @@ impl Database {
         let mut top_upstream_models = Vec::with_capacity(top.len());
         for ((upstream_account_id, model), accumulator) in top {
             let (upstream_name, health) =
-                upstream_health(&mut *snapshot, &upstream_account_id, generated_at).await?;
+                upstream_health(&mut snapshot, &upstream_account_id, generated_at).await?;
             let terminal_outcomes = terminal_outcomes(
-                &mut *snapshot,
+                &mut snapshot,
                 &scope,
                 &tenant_id,
                 &upstream_account_id,
