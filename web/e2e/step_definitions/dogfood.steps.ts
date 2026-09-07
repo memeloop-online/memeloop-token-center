@@ -440,7 +440,6 @@ Then('趋势下钻使用 UTC 毫秒完整闭区间', async function (this: Dogfo
   assert.equal(from % 3_600_000, 0, 'hour drilldown must start on a UTC hour boundary');
   assert.equal(to - from, 3_600_000 - 1, 'hour drilldown must include the complete final millisecond');
 
-  await page.getByRole('button', { name: '最近 7 天', exact: true }).click();
   await page.getByRole('tab', { name: '总览', exact: true }).click();
 });
 
