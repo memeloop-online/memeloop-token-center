@@ -428,12 +428,15 @@ async fn streaming_codex_rejects_output_items_before_response_identity() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-            .await
-            .is_err(),
-        "the invalid output item must not become a downstream body"
-    );
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .expect("the invalid output item must be replaced by a safe SSE error");
+    let delivered = String::from_utf8(delivered.to_vec()).unwrap();
+    assert_eq!(delivered.matches("event: error").count(), 1);
+    assert_eq!(delivered.matches("upstream request failed").count(), 1);
+    assert!(!delivered.contains("must-not-deliver"));
+    assert!(!delivered.contains("item-private"));
+    assert!(!delivered.contains("response.completed"));
 
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture

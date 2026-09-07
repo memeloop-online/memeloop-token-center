@@ -33,20 +33,15 @@ async fn responses_done_then_trailing_partial_is_rejected_and_settled_once() {
     });
     let response = send_response_usage_request(&fixture, &request).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let mut body = response.into_body().into_data_stream();
-    let mut delivered = Vec::new();
-    let mut saw_error = false;
-    while let Some(next) = body.next().await {
-        match next {
-            Ok(bytes) => delivered.extend_from_slice(&bytes),
-            Err(_) => saw_error = true,
-        }
-    }
-    assert!(saw_error);
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .expect("a truncated Responses stream must end with a safe SSE error");
     let delivered = String::from_utf8_lossy(&delivered);
     assert!(delivered.contains("response.created"));
     assert!(!delivered.contains("response.completed"));
     assert!(!delivered.contains("[DONE]"));
+    assert_eq!(delivered.matches("event: error").count(), 1);
+    assert_eq!(delivered.matches("upstream request failed").count(), 1);
     upstream.await.unwrap();
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
