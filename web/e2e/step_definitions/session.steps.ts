@@ -230,10 +230,9 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
       max_tokens: 32,
     }),
   });
-  // Put successful work first in the reservation queue. The single effective
-  // upstream slot completes one request; the first queued rate-limit response
-  // cools the account before the remaining queued requests are admitted. Those
-  // failures collapse to the public 503/Retry-After contract.
+  // The dedicated session fixture gates all four concurrent upstream calls.
+  // Keep the full batch pending until the active projection is visible, then
+  // release it so the terminal-state assertions observe every lifecycle event.
   const calls = [sendCall(0), sendCall(2), ...[1, 3].map(async (index) => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     return sendCall(index);
@@ -248,7 +247,7 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
     activeSessionConfirmed = true;
   } finally {
     const released = await releaseSessionFixture();
-    if (activeSessionConfirmed) assert.equal(released, 1, 'exactly one live session request must be released after it is visible');
+    if (activeSessionConfirmed) assert.equal(released, 4, 'the four gated live session requests must be released after the active projection is visible');
   }
 });
 
