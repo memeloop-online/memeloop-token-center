@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../api';
 import { useI18n } from '../i18n';
 import type {
   FilterAssistantPlan, FilterAssistantSettings, FilterPresetState, RequestListCursor,
-  TypedFilterAst, TypedFilterCondition, TypedFilterField, TypedFilterOperator, TypedFilterValue,
+  ModelRouteView, TypedFilterAst, TypedFilterCondition, TypedFilterField, TypedFilterOperator, TypedFilterValue,
   UpstreamAccount,
 } from '../types';
 
@@ -97,48 +97,63 @@ function conditionLabel(condition: TypedFilterCondition, t: (key: string) => str
   return `${t(`filter.field.${condition.field}`)} ${t(`filter.operator.${condition.operator}`)} ${value}${upper === undefined ? '' : ` – ${upper}`}`;
 }
 
-interface ModelCatalog {
-  data: Array<{ id: string; protocol: string; complete_coverage: boolean }>;
+interface CatalogModel {
+  id: string;
+  protocols: string[];
 }
 
-function CatalogModelPicker({ accountIds, disabled, onSelect, tenant, token, value }: {
-  accountIds: string[]; disabled: boolean; onSelect: (model: string) => void; tenant: string; token: string; value: string;
+/**
+ * Request and usage filters operate on the public model name recorded in an
+ * activity fact, not the provider-native model name.  The route catalog is
+ * therefore the authoritative autocomplete source.  Reusing the upstream
+ * catalog here made a valid public model impossible to select whenever its
+ * provider used a different native name.
+ */
+function CatalogModelPicker({ disabled, onSelect, tenant, token, value }: {
+  disabled: boolean; onSelect: (model: string) => void; tenant: string; token: string; value: string;
 }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
-  const [models, setModels] = useState<ModelCatalog['data']>([]);
+  const [models, setModels] = useState<CatalogModel[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   useEffect(() => {
-    if (!open || !token || !tenant || accountIds.length === 0) return;
+    if (!open || !token) return;
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => {
-      const query = new URLSearchParams({ tenant_external_id: tenant, account_ids: accountIds.join(','), limit: '100' });
-      if (search.trim()) query.set('q', search.trim());
-      setLoading(true); setError('');
-      void api<ModelCatalog>(`/internal/v1/upstream-models?${query}`, token, { signal: controller.signal })
-        .then((catalog) => { if (!controller.signal.aborted) setModels(catalog.data); })
-        .catch((reason: unknown) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : t('filter.catalogUnavailable')); })
-        .finally(() => { if (!controller.signal.aborted) setLoading(false); });
-    }, 180);
-    return () => { window.clearTimeout(timeout); controller.abort(); };
-  }, [open, search, tenant, token, accountIds.join(',')]);
+    const query = tenant ? `?tenant_external_id=${encodeURIComponent(tenant)}` : '';
+    setLoading(true); setError('');
+    void api<ModelRouteView[]>(`/internal/v1/model-routes${query}`, token, { signal: controller.signal })
+      .then((routes) => {
+        if (controller.signal.aborted) return;
+        const byPublicModel = new Map<string, Set<string>>();
+        for (const route of routes) {
+          const name = route.public_model.trim();
+          if (!name) continue;
+          const protocols = byPublicModel.get(name) ?? new Set<string>();
+          protocols.add(route.protocol);
+          byPublicModel.set(name, protocols);
+        }
+        setModels([...byPublicModel].map(([id, protocols]) => ({ id, protocols: [...protocols].sort() })).sort((left, right) => left.id.localeCompare(right.id)));
+      })
+      .catch((reason: unknown) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : t('filter.catalogUnavailable')); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [open, tenant, token, t]);
 
-  const available = Boolean(tenant && accountIds.length);
+  const matchingModels = models.filter((model) => model.id.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()));
   return <div className="typed-filter-model-picker">
-    <button type="button" className="secondary" disabled={disabled || !available} aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen((value) => !value)}>{value || t('filter.selectCatalogModel')}</button>
-    {!available && <small>{t('filter.catalogTenantRequired')}</small>}
+    <button type="button" className="secondary" disabled={disabled || !token} aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen((value) => !value)}>{value || t('filter.selectCatalogModel')}</button>
     {open && <div className="typed-filter-catalog" role="dialog" aria-label={t('filter.catalogModels')}>
       <input autoFocus value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('filter.searchCatalog')} aria-label={t('filter.searchCatalog')} />
       {loading && <small>{t('common.loading')}</small>}{error && <small className="error-text">{error}</small>}
-      <div role="listbox">{models.map((model) => <button type="button" role="option" key={`${model.protocol}:${model.id}`} aria-selected={model.id === value} onClick={() => { onSelect(model.id); setOpen(false); setSearch(''); }}>{model.id}<small>{model.protocol}{model.complete_coverage ? '' : ` · ${t('filter.catalogPartial')}`}</small></button>)}</div>
-      {!loading && !error && models.length === 0 && <small>{t('filter.catalogEmpty')}</small>}
+      <div role="listbox">{matchingModels.map((model) => <button type="button" role="option" key={model.id} aria-selected={model.id === value} onClick={() => { onSelect(model.id); setOpen(false); setSearch(''); }}>{model.id}<small>{model.protocols.join(', ')}</small></button>)}</div>
+      {!loading && !error && matchingModels.length === 0 && <small>{t('filter.catalogEmpty')}</small>}
     </div>}
   </div>;
 }
 
-export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant, upstreams, disabled = false }: {
+export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant, upstreams, externalChips = [], disabled = false }: {
   ast: TypedFilterAst;
   onApply: (ast: TypedFilterAst) => void;
   onClear: () => void;
@@ -146,6 +161,8 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   token: string;
   tenant: string;
   upstreams: UpstreamAccount[];
+  /** Read-only API filters that cannot be represented by the UUID-only AST. */
+  externalChips?: Array<{ id: string; label: string }>;
   disabled?: boolean;
 }) {
   const { t } = useI18n();
@@ -158,8 +175,8 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   const [assistantSettings, setAssistantSettings] = useState<FilterAssistantSettings | null>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const accountIds = useMemo(() => upstreams.filter((account) => account.status === 'active').map((account) => account.id), [upstreams]);
   const visibleFields = scope === 'usage' ? fields.filter((field) => field.usage) : fields;
+  const hasActiveFilters = ast.conditions.length > 0 || externalChips.length > 0;
 
   useEffect(() => { if (!open) setDraft(ast); }, [ast, open]);
   useEffect(() => {
@@ -208,7 +225,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   const renderValue = (condition: TypedFilterCondition, index: number, side: 'value' | 'upper') => {
     const value = side === 'value' ? condition.value : condition.upper;
     if (!value) return null;
-    if (value.type === 'model') return <CatalogModelPicker accountIds={accountIds} disabled={disabled} onSelect={(model) => setValue(index, side, { type: 'model', value: model })} tenant={tenant} token={token} value={value.value} />;
+    if (value.type === 'model') return <CatalogModelPicker disabled={disabled} onSelect={(model) => setValue(index, side, { type: 'model', value: model })} tenant={tenant} token={token} value={value.value} />;
     if (value.type === 'protocol') return <select value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: 'protocol', value: event.target.value as 'openai' | 'anthropic' | 'openai-image' | 'generation' })}><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="openai-image">OpenAI Images</option><option value="generation">{t('routes.generation')}</option></select>;
     if (value.type === 'status') return <select value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: 'status', value: event.target.value as 'success' | 'error' | 'pending' })}><option value="success">{t('traffic.success')}</option><option value="error">{t('traffic.failure')}</option><option value="pending">{t('common.running')}</option></select>;
     if (condition.field === 'upstream_account_id') return <select value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: 'uuid', value: event.target.value })}><option value="">{t('common.select')}</option>{upstreams.filter((account) => account.status === 'active').map((account) => <option value={account.id} key={account.id}>{account.name}</option>)}</select>;
@@ -220,9 +237,10 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   return <div className="typed-filter-builder">
     <div className="typed-filter-chips" aria-label={t('filter.applied')}>
       {ast.conditions.map((condition, index) => <span className="filter-chip" key={`${condition.field}-${index}`}>{conditionLabel(condition, t)}</span>)}
-      {ast.conditions.length === 0 && <span className="muted">{t('filter.noneApplied')}</span>}
+      {externalChips.map((chip) => <span className="filter-chip" key={chip.id}>{chip.label}</span>)}
+      {!hasActiveFilters && <span className="muted">{t('filter.noneApplied')}</span>}
     </div>
-    <div className="typed-filter-actions"><button type="button" className="secondary" disabled={disabled} onClick={() => { setDraft(ast); setError(''); setOpen(true); }}>{t('filter.open')}</button>{ast.conditions.length > 0 && <button type="button" className="secondary" disabled={disabled} onClick={onClear}>{t('filter.clear')}</button>}</div>
+    <div className="typed-filter-actions"><button type="button" className="secondary" disabled={disabled} onClick={() => { setDraft(ast); setError(''); setOpen(true); }}>{t('filter.open')}</button>{hasActiveFilters && <button type="button" className="secondary" disabled={disabled} onClick={onClear}>{t('filter.clear')}</button>}</div>
     {open && <div className="typed-filter-overlay" role="presentation"><section className="typed-filter-dialog" role="dialog" aria-modal="true" aria-label={t('filter.title')}>
       <div className="panel-title"><div><h2>{t('filter.title')}</h2><p className="muted">{t('filter.description')}</p></div><button type="button" className="secondary" onClick={() => setOpen(false)}>{t('common.close')}</button></div>
       {error && <div className="notice error" role="alert">{error}</div>}

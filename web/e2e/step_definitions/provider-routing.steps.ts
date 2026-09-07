@@ -6,7 +6,7 @@ import { baseURL, eventually, model, requestJson, runtime, tenant } from '../sup
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
 
-import { assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertValue, assertVisible, applyUsageFilter, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, operatorTrafficPanel, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
+import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertVisible, connectOperator, credentialGroupObservations, groupedModel, metric, openTypedFilterDialog, operatorTrafficPanel, uuidPattern } from './dogfood.support.js';
 When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且仅显示产品接入方式', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.route('**/internal/v1/provider-types', async (route) => {
@@ -74,30 +74,68 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
 
   await openAppRoute(page, 'operator', 'requests');
   await assertVisible(page.getByRole('heading', { name: '实时请求', exact: true }));
-  await assertNoCount(operatorTrafficPanel(page).locator('.metric'));
-  const filters = page.locator('.traffic-filters');
-  const protocolValues = await filters.getByLabel('协议').locator('option').evaluateAll((options) =>
+  const requestPanel = operatorTrafficPanel(page);
+  await assertNoCount(requestPanel.locator('.metric'));
+  const builder = requestPanel.locator('.typed-filter-builder');
+  const dialog = await openTypedFilterDialog(builder);
+
+  const protocol = await addTypedFilterCondition(dialog, 'protocol');
+  const protocolValues = await protocol.getByLabel('值').locator('option').evaluateAll((options) =>
     options.map((option) => (option as HTMLOptionElement).value));
-  assert.deepEqual(protocolValues, ['', 'openai', 'anthropic', 'openai-image', 'generation']);
-  await filters.getByLabel('凭据别名').fill('Browser');
-  await filters.getByLabel('用户').fill('browser-e2e');
-  await filters.getByLabel('路由 ID').fill(seed.routeId);
-  await filters.getByLabel('上游提供商').selectOption(seed.upstreamId);
-  await filters.getByLabel('最低费用').fill('0');
-  await filters.getByLabel('最高费用').fill('1000');
-  await filters.getByRole('button', { name: '应用筛选' }).click();
-  await assertCount(operatorTrafficPanel(page).locator('tbody tr'), 51);
+  assert.deepEqual(protocolValues, ['openai', 'anthropic', 'openai-image', 'generation']);
+  await protocol.getByLabel('值').selectOption('openai');
 
-  await filters.getByLabel('状态').selectOption('error');
-  await filters.getByLabel('错误码').fill('http_429');
-  await filters.getByRole('button', { name: '应用筛选' }).click();
-  await assertValue(filters.getByLabel('状态'), 'error');
-  await assertValue(filters.getByLabel('错误码'), 'http_429');
-  await assertCount(operatorTrafficPanel(page).locator('tbody tr'), 1);
-  await assertContains(operatorTrafficPanel(page).locator('tbody'), 'http_429');
+  const modelCondition = await addTypedFilterCondition(dialog, 'model');
+  await modelCondition.getByRole('button', { name: '选择模型', exact: true }).click();
+  const catalog = modelCondition.getByRole('dialog', { name: '模型目录', exact: true });
+  await catalog.getByLabel('搜索模型', { exact: true }).fill(model);
+  await catalog.getByRole('option', { name: new RegExp(model) }).click();
 
-  await filters.getByRole('button', { name: '清除筛选' }).click();
-  await assertCount(operatorTrafficPanel(page).locator('tbody tr'), 51);
+  const keyAlias = await addTypedFilterCondition(dialog, 'key_alias');
+  await keyAlias.getByLabel('操作符').selectOption('contains');
+  await keyAlias.getByLabel('值').fill('Browser');
+  const principal = await addTypedFilterCondition(dialog, 'principal');
+  await principal.getByLabel('操作符').selectOption('contains');
+  await principal.getByLabel('值').fill('browser-e2e');
+  const route = await addTypedFilterCondition(dialog, 'route_id');
+  await route.getByLabel('值').fill(seed.routeId);
+  const upstream = await addTypedFilterCondition(dialog, 'upstream_account_id');
+  await upstream.getByLabel('值').selectOption(seed.upstreamId);
+  const minimumCost = await addTypedFilterCondition(dialog, 'cost_micros');
+  await minimumCost.getByLabel('操作符').selectOption('greater_than_or_equal');
+  await minimumCost.getByLabel('值').fill('0');
+  const maximumCost = await addTypedFilterCondition(dialog, 'cost_micros');
+  await maximumCost.getByLabel('操作符').selectOption('less_than_or_equal');
+  await maximumCost.getByLabel('值').fill('1000000000');
+
+  const firstFilterResponse = page.waitForResponse((response) => response.url().endsWith('/internal/v1/requests/query') && response.request().method() === 'POST');
+  await dialog.getByRole('button', { name: '应用筛选', exact: true }).click();
+  const firstFilter = await firstFilterResponse;
+  assert.equal(firstFilter.status(), 200, await firstFilter.text());
+  const firstAst = (firstFilter.request().postDataJSON() as { ast: { conditions: Array<{ field: string; operator: string; value: { value: string | number } }> } }).ast;
+  assert.deepEqual(firstAst.conditions.map((condition) => [condition.field, condition.operator, condition.value.value]), [
+    ['protocol', 'equals', 'openai'], ['model', 'equals', model], ['key_alias', 'contains', 'Browser'],
+    ['principal', 'contains', 'browser-e2e'], ['route_id', 'equals', seed.routeId], ['upstream_account_id', 'equals', seed.upstreamId],
+    ['cost_micros', 'greater_than_or_equal', 0], ['cost_micros', 'less_than_or_equal', 1_000_000_000],
+  ]);
+  await assertCount(requestPanel.locator('tbody tr'), 51);
+
+  const errorDialog = await openTypedFilterDialog(builder);
+  const status = await addTypedFilterCondition(errorDialog, 'status');
+  await status.getByLabel('值').selectOption('error');
+  const errorCode = await addTypedFilterCondition(errorDialog, 'error_code');
+  await errorCode.getByLabel('值').fill('http_429');
+  const errorFilterResponse = page.waitForResponse((response) => response.url().endsWith('/internal/v1/requests/query') && response.request().method() === 'POST');
+  await errorDialog.getByRole('button', { name: '应用筛选', exact: true }).click();
+  const errorFilter = await errorFilterResponse;
+  assert.equal(errorFilter.status(), 200, await errorFilter.text());
+  const errorAst = (errorFilter.request().postDataJSON() as { ast: { conditions: Array<{ field: string; value: { value: string } }> } }).ast;
+  assert.deepEqual(errorAst.conditions.slice(-2).map((condition) => [condition.field, condition.value.value]), [['status', 'error'], ['error_code', 'http_429']]);
+  await assertCount(requestPanel.locator('tbody tr'), 1);
+  await assertContains(requestPanel.locator('tbody'), 'http_429');
+
+  await builder.getByRole('button', { name: '清除', exact: true }).click();
+  await assertCount(requestPanel.locator('tbody tr'), 51);
 });
 
 Then('租户边界和未认证请求在解析正文前生效', async function () {

@@ -100,7 +100,7 @@ export function generationTableFor(page: Page): Locator {
 }
 
 export function operatorTrafficPanel(page: Page): Locator {
-  return page.locator('article.panel').filter({ has: page.locator('.traffic-filters') });
+  return page.locator('article.panel').filter({ has: page.locator('.typed-filter-builder') });
 }
 
 export async function submitPortalGeneration(
@@ -250,20 +250,42 @@ export async function assertAttribute(locator: Locator, name: string, expected: 
   await eventually(async () => assert.equal(await locator.first().getAttribute(name), expected));
 }
 
-export async function applyUsageFilter(
+export function usageFilterBuilder(page: Page): Locator {
+  return page.locator('.usage-page .typed-filter-builder');
+}
+
+export async function openTypedFilterDialog(builder: Locator): Promise<Locator> {
+  await builder.getByRole('button', { name: '筛选', exact: true }).click();
+  const dialog = builder.getByRole('dialog', { name: '筛选请求', exact: true });
+  await assertVisible(dialog);
+  return dialog;
+}
+
+export async function addTypedFilterCondition(dialog: Locator, field: string): Promise<Locator> {
+  const rows = dialog.locator('.typed-filter-row');
+  const index = await rows.count();
+  await dialog.getByRole('button', { name: '添加条件', exact: true }).click();
+  const row = rows.nth(index);
+  await row.getByLabel('字段').selectOption(field);
+  return row;
+}
+
+export async function applyUsageTypedFilter(
   page: Page,
-  change: () => Promise<void>,
+  field: string,
+  setValue: (row: Locator, dialog: Locator) => Promise<void>,
   parameter: string,
   expectedValue: string,
   expectedRequests: number,
 ): Promise<void> {
-  await openUsageFilters(page);
-  await change();
+  const dialog = await openTypedFilterDialog(usageFilterBuilder(page));
+  const row = await addTypedFilterCondition(dialog, field);
+  await setValue(row, dialog);
   const responsePromise = page.waitForResponse((response) => {
     if (!response.url().includes('/internal/v1/usage-analysis?')) return false;
     return new URL(response.url()).searchParams.get(parameter) === expectedValue;
   });
-  await page.locator('.usage-controls').getByRole('button', { name: '应用', exact: true }).click();
+  await dialog.getByRole('button', { name: '应用筛选', exact: true }).click();
   const response = await responsePromise;
   assert.equal(response.status(), 200);
   await page.getByRole('tab', { name: '总览', exact: true }).click();
@@ -271,13 +293,14 @@ export async function applyUsageFilter(
 }
 
 export async function clearUsageFilters(page: Page, expectedRequests = 51): Promise<void> {
-  await openUsageFilters(page);
+  const builder = usageFilterBuilder(page);
+  await assertVisible(builder.getByRole('button', { name: '清除', exact: true }));
   const responsePromise = page.waitForResponse((response) => {
     if (!response.url().includes('/internal/v1/usage-analysis?')) return false;
     const query = new URL(response.url()).searchParams;
     return !query.has('model') && !query.has('key_id') && !query.has('upstream_account_id') && !query.has('status');
   });
-  await page.locator('.usage-controls').getByRole('button', { name: '清除筛选', exact: true }).click();
+  await builder.getByRole('button', { name: '清除', exact: true }).click();
   const response = await responsePromise;
   assert.equal(response.status(), 200);
   await assertExactText(metric(page, '请求数'), String(expectedRequests));
@@ -304,10 +327,11 @@ export async function nextStrictUsageUrl(observation: StrictUsageObservation, pr
 
 export async function clearStrictUsageFilters(world: DogfoodWorld, expectedRequests: number) {
   const page = world.requirePage();
-  await openUsageFilters(page);
   const observation = requireStrictUsageObservation(world);
   const previousCount = observation.requestUrls.length;
-  await page.locator('.usage-controls').getByRole('button', { name: '清除筛选', exact: true }).click();
+  const builder = usageFilterBuilder(page);
+  await assertVisible(builder.getByRole('button', { name: '清除', exact: true }));
+  await builder.getByRole('button', { name: '清除', exact: true }).click();
   const requestUrl = await nextStrictUsageUrl(observation, previousCount);
   assert.equal(requestUrl.searchParams.has('status'), false);
   assert.equal(requestUrl.searchParams.has('upstream_account_id'), false);
@@ -317,12 +341,6 @@ export async function clearStrictUsageFilters(world: DogfoodWorld, expectedReque
   assert.equal(requestUrl.searchParams.has('error_code'), false);
   await page.getByRole('tab', { name: /^(总览|Overview)$/ }).click();
   await assertExactText(metric(page, '请求数'), String(expectedRequests));
-}
-
-export async function openUsageFilters(page: Page): Promise<void> {
-  const disclosure = page.locator('details.usage-filter-disclosure');
-  if (await disclosure.getAttribute('open') === null) await disclosure.locator('summary').click();
-  await eventually(async () => assert.notEqual(await disclosure.getAttribute('open'), null));
 }
 
 export function usageMetrics(overrides: Record<string, unknown> = {}) {

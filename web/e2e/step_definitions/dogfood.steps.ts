@@ -6,7 +6,7 @@ import { baseURL, eventually, model, requestJson, runtime, tenant } from '../sup
 import type { DogfoodWorld } from '../support/world.js';
 
 import { appPreferenceControls, openAppRoute, openUsageDimension } from './app-route.support.js';
-import { assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertOperatorTenantScope, assertValue, assertVisible, applyUsageFilter, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
+import { addTypedFilterCondition, applyUsageTypedFilter, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertOperatorTenantScope, assertVisible, clearStrictUsageFilters, clearUsageFilters, connectOperator, credentialGroupObservations, emptyUsageFixture, groupedModel, localizationUsageFixture, metric, nextStrictUsageUrl, openTypedFilterDialog, requireStrictUsageObservation, strictDimensionUsageFixture, strictUsageObservations, usageDimension, usageFilterBuilder, uuidPattern, type StrictUsageObservation } from './dogfood.support.js';
 
 Given('dogfood 服务已有隔离租户、统一上游、请求记录和多模态价格', function () {
   runtime.requireSeed();
@@ -175,8 +175,7 @@ Then('总览、趋势、模型、客户端凭据、会话、上游账户和热�
   const names = ['总览', '趋势分析', '维度分析', '用量热力图'];
   for (const name of names) await assertVisible(page.getByRole('tab', { name, exact: true }));
 
-  await assertContains(page.getByRole('tabpanel'), 'OpenAI');
-  await assertContains(page.getByRole('tabpanel'), '成功');
+  await assertContains(page.getByRole('tabpanel'), '成功率');
 
   await page.getByRole('tab', { name: '趋势分析', exact: true }).click();
   const throughputChart = page.locator('.usage-echart').filter({ has: page.locator('canvas') }).first();
@@ -198,6 +197,12 @@ Then('总览、趋势、模型、客户端凭据、会话、上游账户和热�
   await assertContains(page.getByRole('tabpanel'), 'Browser mock upstream');
   assert.ok(await usageDimension(page, '上游账户').locator('tbody tr').count() > 0, 'upstream dimension must contain data rows');
 
+  await openUsageDimension(page, '协议');
+  await assertContains(page.getByRole('tabpanel'), 'OpenAI');
+
+  await openUsageDimension(page, '状态');
+  await assertContains(page.getByRole('tabpanel'), '成功');
+
   await page.getByRole('tab', { name: '用量热力图', exact: true }).click();
   const heatmap = page.locator('.usage-echart-heatmap');
   await assertVisible(heatmap);
@@ -215,16 +220,20 @@ Then('总览、趋势、模型、客户端凭据、会话、上游账户和热�
 Then('模型、客户端凭据、上游和状态过滤都作用于真实统计 API', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
-  const controls = page.locator('.usage-controls');
-
-  await applyUsageFilter(page, async () => controls.getByLabel('模型').fill(model), 'model', model, 51);
+  await applyUsageTypedFilter(page, 'model', async (row) => {
+    await row.getByRole('button', { name: '选择模型', exact: true }).click();
+    const catalog = row.getByRole('dialog', { name: '模型目录', exact: true });
+    await catalog.getByLabel('搜索模型', { exact: true }).fill(model);
+    await catalog.getByRole('option', { name: model, exact: true }).click();
+  }, 'model', model, 51);
   await clearUsageFilters(page);
-  await applyUsageFilter(page, async () => controls.getByLabel('凭据 ID').fill(seed.clientKeyId), 'key_id', seed.clientKeyId, 51);
+  await applyUsageTypedFilter(page, 'key_id', async (row) => row.getByLabel('值', { exact: true }).fill(seed.clientKeyId), 'key_id', seed.clientKeyId, 51);
   await clearUsageFilters(page);
-  await applyUsageFilter(page, async () => { await controls.getByLabel('上游提供商').selectOption(seed.upstreamId); }, 'upstream_account_id', seed.upstreamId, 51);
+  await applyUsageTypedFilter(page, 'upstream_account_id', async (row) => row.getByLabel('值', { exact: true }).selectOption(seed.upstreamId), 'upstream_account_id', seed.upstreamId, 51);
   await clearUsageFilters(page);
-  await applyUsageFilter(page, async () => { await controls.getByLabel('状态').selectOption('success'); }, 'status', 'success', 50);
-  await applyUsageFilter(page, async () => { await controls.getByLabel('状态').selectOption('error'); }, 'status', 'error', 1);
+  await applyUsageTypedFilter(page, 'status', async (row) => row.getByLabel('值', { exact: true }).selectOption('success'), 'status', 'success', 50);
+  await clearUsageFilters(page);
+  await applyUsageTypedFilter(page, 'status', async (row) => row.getByLabel('值', { exact: true }).selectOption('error'), 'status', 'error', 1);
   await clearUsageFilters(page);
 });
 
@@ -273,7 +282,8 @@ Then('点击失败状态 bucket 使用 error 并仅显示失败结果', async fu
   const statusPanel = usageDimension(page, '状态');
   const failureBucket = statusPanel.locator('.usage-filter-link').filter({ hasText: '失败' });
   await failureBucket.click();
-  await assertValue(page.locator('.usage-controls').getByLabel('状态'), 'error');
+  await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), '状态');
+  await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), 'error');
   const requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
   assert.equal(requestUrl.searchParams.get('status'), 'error');
   assert.notEqual(requestUrl.searchParams.get('status'), 'failure');
@@ -294,7 +304,6 @@ Then('点击未分配上游使用 unassigned 并仅显示无上游结果', async
   await unassignedBucket.click();
   const requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
   assert.equal(requestUrl.searchParams.get('upstream_account_id'), 'unassigned');
-  await assertValue(page.locator('.usage-controls').getByLabel('上游提供商'), 'unassigned');
   await assertCount(upstreamPanel.locator('tbody tr'), 1);
   await assertExactText(upstreamPanel.locator('tbody tr td').nth(1), '6');
   await assertContains(upstreamPanel, '未分配上游');
@@ -305,7 +314,6 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   const page = this.requirePage();
   const seed = runtime.requireSeed();
   const observation = requireStrictUsageObservation(this);
-  const controls = page.locator('.usage-controls');
 
   await clearStrictUsageFilters(this, 17);
   await openUsageDimension(page, '模型');
@@ -313,7 +321,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   await usageDimension(page, '模型').locator('.usage-filter-link').filter({ hasText: model }).click();
   let requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
   assert.equal(requestUrl.searchParams.get('model'), model);
-  await assertValue(controls.getByLabel('模型'), model);
+  await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), model);
 
   await clearStrictUsageFilters(this, 17);
   await openUsageDimension(page, '客户端凭据');
@@ -324,7 +332,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
   assert.equal(requestUrl.searchParams.get('key_id'), seed.clientKeyId);
   assert.match(requestUrl.searchParams.get('key_id') ?? '', uuidPattern);
-  await assertValue(controls.getByLabel('凭据 ID'), seed.clientKeyId);
+  await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), seed.clientKeyId);
 
   await clearStrictUsageFilters(this, 17);
   await openUsageDimension(page, '协议');
@@ -332,7 +340,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   await usageDimension(page, '协议').locator('.usage-filter-link').filter({ hasText: 'OpenAI' }).click();
   requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
   assert.equal(requestUrl.searchParams.get('protocol'), 'openai');
-  await assertValue(controls.getByLabel('协议'), 'openai');
+  await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), 'openai');
 
   await clearStrictUsageFilters(this, 17);
   await openUsageDimension(page, '错误码');
@@ -342,7 +350,7 @@ Then('模型、凭据别名、协议和错误码 bucket 使用精确公开过滤
   await errorBucket.click();
   requestUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
   assert.equal(requestUrl.searchParams.get('error_code'), 'strict_fixture_error');
-  await assertValue(controls.getByLabel('错误码'), 'strict_fixture_error');
+  await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), 'strict_fixture_error');
   const errorPanel = usageDimension(page, '错误码');
   await assertCount(errorPanel.locator('tbody tr'), 1);
   await assertExactText(errorPanel.locator('tbody tr td').nth(1), '5');
@@ -361,7 +369,7 @@ Then('真实上游 UUID 和清除过滤保持可用且中英文亮暗主题无�
   const assignedUrl = await nextStrictUsageUrl(observation, requestsBeforeClick);
   assert.equal(assignedUrl.searchParams.get('upstream_account_id'), seed.upstreamId);
   assert.match(assignedUrl.searchParams.get('upstream_account_id') ?? '', uuidPattern);
-  await assertValue(page.locator('.usage-controls').getByLabel('上游提供商'), seed.upstreamId);
+  await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), seed.upstreamId);
   await assertCount(upstreamPanel.locator('tbody tr'), 1);
   await assertExactText(upstreamPanel.locator('tbody tr td').nth(1), '11');
   await assertContains(upstreamPanel, seed.upstreamName);
@@ -370,7 +378,7 @@ Then('真实上游 UUID 和清除过滤保持可用且中英文亮暗主题无�
   await clearStrictUsageFilters(this, 17);
   await openUsageDimension(page, '上游账户');
   upstreamPanel = usageDimension(page, '上游账户');
-  await assertValue(page.locator('.usage-controls').getByLabel('上游提供商'), '');
+  await assertContains(usageFilterBuilder(page).locator('.typed-filter-chips'), '未应用筛选条件');
   await assertCount(upstreamPanel.locator('tbody tr'), 2);
   await assertContains(upstreamPanel, seed.upstreamName);
   await assertContains(upstreamPanel, '未分配上游');
@@ -379,7 +387,6 @@ Then('真实上游 UUID 和清除过滤保持可用且中英文亮暗主题无�
   await assertAttribute(page.locator('html'), 'lang', 'en');
   await openUsageDimension(page, 'Upstream accounts');
   await assertVisible(page.locator('.usage-filter-link').filter({ hasText: 'Unassigned' }));
-  await assertContains(page.locator('.usage-controls').getByLabel('Upstream provider'), 'Unassigned');
   await assertAttribute(page.locator('html'), 'data-theme', 'dark');
   await appPreferenceControls(page).getByRole('button', { name: 'Switch to light theme' }).click();
   await assertAttribute(page.locator('html'), 'data-theme', 'light');

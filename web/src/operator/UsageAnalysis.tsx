@@ -8,7 +8,7 @@ import {
 import { Metric } from '../components';
 import { formatCurrency, formatMetricNumber, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import type { OperatorUsageAnalysis, TypedFilterAst, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
+import type { OperatorUsageAnalysis, TypedFilterAst, TypedFilterCondition, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
 import './usage.css';
 import { TypedFilterBuilder } from './TypedFilterBuilder';
 import { emptyTypedFilterAst } from './traffic/requestTraffic';
@@ -48,6 +48,29 @@ function selectionFromTypedFilter(current: UsageSelection, ast: TypedFilterAst):
     else if (condition.operator === 'equals' && condition.field === 'error_code' && condition.value.type === 'text') filters.errorCode = condition.value.value;
   }
   return { ...current, preset, customFrom, customTo, filters };
+}
+
+const typedFieldForUsageFilter: Record<keyof UsageFilters, TypedFilterCondition['field']> = {
+  model: 'model', keyId: 'key_id', upstreamId: 'upstream_account_id', protocol: 'protocol', status: 'status', errorCode: 'error_code',
+};
+
+function typedUsageCondition(filter: keyof UsageFilters, bucket: UsageAnalysisBucket): TypedFilterCondition | undefined {
+  if (filter === 'model') return { field: 'model', operator: 'equals', value: { type: 'model', value: bucket.id } };
+  if (filter === 'keyId') return { field: 'key_id', operator: 'equals', value: { type: 'uuid', value: bucket.id } };
+  // `unassigned` is a read-only analytics sentinel, not a UUID accepted by
+  // the reusable typed-filter AST.  Its drilldown still uses the documented
+  // usage API query parameter below.
+  if (filter === 'upstreamId') return bucket.id === 'unassigned' ? undefined : { field: 'upstream_account_id', operator: 'equals', value: { type: 'uuid', value: bucket.id } };
+  if (filter === 'protocol') return { field: 'protocol', operator: 'equals', value: { type: 'protocol', value: bucket.id as 'openai' | 'anthropic' | 'openai-image' | 'generation' } };
+  if (filter === 'status') return { field: 'status', operator: 'equals', value: { type: 'status', value: bucket.id as 'success' | 'error' | 'pending' } };
+  return { field: 'error_code', operator: 'equals', value: { type: 'text', value: bucket.id } };
+}
+
+function replaceTypedUsageCondition(ast: TypedFilterAst, filter: keyof UsageFilters, bucket: UsageAnalysisBucket): TypedFilterAst {
+  const field = typedFieldForUsageFilter[filter];
+  const conditions = ast.conditions.filter((condition) => condition.field !== field);
+  const condition = typedUsageCondition(filter, bucket);
+  return condition ? { ...ast, conditions: [...conditions, condition] } : { ...ast, conditions };
 }
 
 function NumericMetric({ label, value, tone }: { label: string; value?: number | null; tone?: string }) {
@@ -111,7 +134,11 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
   const loading = scopedRemote?.status === 'loading';
   const error = scopedRemote?.status === 'error' ? scopedRemote.message : '';
 
-  const applyDimension = (filter: keyof UsageFilters, bucket: UsageAnalysisBucket) => { const next = { ...selection, filters: { ...selection.filters, [filter]: bucket.id } }; setSelection(next); setApplied(next); };
+  const applyDimension = (filter: keyof UsageFilters, bucket: UsageAnalysisBucket) => {
+    const next = { ...selection, filters: { ...selection.filters, [filter]: bucket.id } };
+    setTypedFilters((current) => replaceTypedUsageCondition(current, filter, bucket));
+    setSelection(next); setApplied(next);
+  };
   const selectUtcBucket = (point: UsageAnalysisTimeBucket) => { const millis = stats?.granularity === 'hour' ? 3_600_000 : 86_400_000; const next = { ...selection, preset: 'custom' as const, customFrom: localDateTimeInput(point.bucket_start), customTo: localDateTimeInput(point.bucket_start + millis - 1) }; setSelection(next); setApplied(next); setTab('overview'); };
 
   const chartCopy: UsageChartCopy = useMemo(() => ({ requests: copy.requests, success: copy.success, failures: copy.failures, averageLatency: copy.averageLatency, p95Latency: copy.p95Latency, cost: copy.cost, noData: copy.chartEmpty }), [copy]);
@@ -122,7 +149,15 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
   const currencies = stats ? costCurrencies(stats.heatmap) : []; const effectiveHeatCurrency = currencies.includes(heatCurrency) ? heatCurrency : (currencies[0] ?? 'USD');
   const weekdays = useMemo(() => Array.from({ length: 7 }, (_, day) => new Date(Date.UTC(2024, 0, 8 + day)).toLocaleDateString(locale === 'en' ? 'en-US' : 'zh-CN', { weekday: 'short', timeZone: stats?.time_zone ?? 'UTC' })), [locale, stats?.time_zone]);
   const heatmap = useMemo(() => heatmapOption(stats?.heatmap ?? [], heatMetric, effectiveHeatCurrency, weekdays, t('usage.heatmapLabel'), chartFormatters), [stats?.heatmap, heatMetric, effectiveHeatCurrency, weekdays, t, chartFormatters]);
-  const activeFilters = Object.values(applied.filters).filter(Boolean).length + typedFilters.conditions.length;
+  const activeFilters = new Set([
+    ...typedFilters.conditions.map((condition) => condition.field),
+    ...(applied.filters.model ? ['model'] : []), ...(applied.filters.keyId ? ['key_id'] : []),
+    ...(applied.filters.upstreamId ? ['upstream_account_id'] : []), ...(applied.filters.protocol ? ['protocol'] : []),
+    ...(applied.filters.status ? ['status'] : []), ...(applied.filters.errorCode ? ['error_code'] : []),
+  ]).size;
+  const externalFilterChips = applied.filters.upstreamId === 'unassigned'
+    ? [{ id: 'usage-upstream-unassigned', label: `${t('filter.field.upstream_account_id')} ${t('filter.operator.equals')} ${t('usage.unassigned')}` }]
+    : [];
   const heatMetricLabel = heatMetric === 'requests' ? copy.requests : heatMetric === 'tokens' ? copy.tokens : heatMetric === 'cost' ? copy.cost : copy.failureRate;
   const selectedHeatCell = stats?.heatmap.find((value) => value.hour_of_week === selectedHeatHour);
 
@@ -138,7 +173,7 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
   };
 
   return <div className="usage-page"><div className="usage-heading"><div><h2>{t('usage.title')}</h2><p className="muted">{t('usage.description')}</p>{stats && <span className="usage-time-zone">{stats.time_zone}</span>}</div><button type="button" className="secondary" disabled={loading || !token.trim()} onClick={() => setRefresh((value) => value + 1)}>{loading ? t('common.loading') : t('usage.refresh')}</button></div>
-    <TypedFilterBuilder ast={typedFilters} disabled={Boolean(loading) || !token.trim()} onApply={(ast) => { const next = selectionFromTypedFilter(selection, ast); setTypedFilters(ast); setSelection(next); setApplied(next); }} onClear={() => { const next = { ...selection, preset: '24h' as const, filters: emptyFilters }; setTypedFilters(emptyTypedFilterAst); setSelection(next); setApplied(next); }} scope="usage" token={token} tenant={tenant} upstreams={upstreams} />
+    <TypedFilterBuilder ast={typedFilters} disabled={Boolean(loading) || !token.trim()} externalChips={externalFilterChips} onApply={(ast) => { const next = selectionFromTypedFilter(selection, ast); setTypedFilters(ast); setSelection(next); setApplied(next); }} onClear={() => { const next = { ...selection, preset: '24h' as const, filters: emptyFilters }; setTypedFilters(emptyTypedFilterAst); setSelection(next); setApplied(next); }} scope="usage" token={token} tenant={tenant} upstreams={upstreams} />
     <details className="usage-filter-disclosure"><summary>{copy.filters}{activeFilters > 0 && <span className="usage-filter-count">{activeFilters} {copy.filtersActive}</span>}</summary><form className="usage-controls" onSubmit={(event) => { event.preventDefault(); setApplied({ ...selection }); }}>
       <fieldset><legend>{t('usage.timeRange')}</legend><div className="usage-presets">{presets.map((preset) => <button type="button" className={selection.preset === preset ? 'active' : 'secondary'} aria-pressed={selection.preset === preset} key={preset} onClick={() => { const next = { ...selection, preset }; setSelection(next); if (preset !== 'custom') setApplied(next); }}>{t(`usage.preset.${preset}`)}</button>)}</div></fieldset>
       {selection.preset === 'custom' && <div className="usage-custom-range"><label>{t('traffic.from')}<input type="datetime-local" step="0.001" value={selection.customFrom} onChange={(event) => setSelection({ ...selection, customFrom: event.target.value })} /></label><label>{t('traffic.to')}<input type="datetime-local" step="0.001" value={selection.customTo} onChange={(event) => setSelection({ ...selection, customTo: event.target.value })} /></label></div>}
