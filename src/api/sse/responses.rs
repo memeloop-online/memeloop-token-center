@@ -9,6 +9,13 @@ use crate::api::{limits::MAX_RESPONSES_SSE_TERMINAL_HOLD_BYTES, proxy::safe_resp
 
 const SAFE_FAILURE_EVENT: &[u8] = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}\n\n";
 
+/// A fixed terminal error frame for a downstream Responses SSE stream.  It
+/// deliberately contains no provider detail and lets a stream that has
+/// already started end with a valid body instead of a transport decode error.
+pub(in crate::api) fn safe_failure_event() -> Bytes {
+    Bytes::from_static(SAFE_FAILURE_EVENT)
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum StreamTerminal {
     Completed,
@@ -148,6 +155,13 @@ impl ResponsesStreamingSanitizer {
 
     pub(in crate::api) fn saw_protocol_event(&self) -> bool {
         self.saw_protocol_event
+    }
+
+    /// A natural failure terminal was already emitted as the fixed safe error
+    /// frame. A later transport error must close the body without adding a
+    /// second terminal error.
+    pub(in crate::api) fn has_failed_terminal(&self) -> bool {
+        self.terminal == Some(StreamTerminal::Failed)
     }
 
     fn sanitize_event(

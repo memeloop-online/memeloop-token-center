@@ -1996,6 +1996,30 @@ async fn send_codex_route_to_endpoint(
     .unwrap()
 }
 
+async fn truncated_sse_upstream_endpoint(
+    body: &'static [u8],
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request_prefix = [0_u8; 4096];
+        assert!(stream.read(&mut request_prefix).await.unwrap() > 0);
+        // Advertise more bytes than we send so the native HTTP client reports
+        // a mid-body transport error after the stream was already admitted.
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len() + 1
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    (endpoint, accepted)
+}
+
 async fn wait_for_request_settlement(fixture: &CodexRouteFixture, expected: usize) {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -2574,6 +2598,108 @@ async fn codex_streaming_route_preserves_sse_and_settles_usage_once() {
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_codex_wire(&requests[0], &fixture.upstream_model);
+}
+
+#[tokio::test]
+async fn codex_streaming_truncated_upstream_ends_with_a_safe_sse_error_frame() {
+    let fixture = codex_route_fixture("streaming-truncated-upstream").await;
+    let created =
+        b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-truncated\"}}\n\n";
+    let (endpoint, accepted) = truncated_sse_upstream_endpoint(created).await;
+
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "truncated SSE", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .expect("a post-admission upstream failure must not reset the downstream body");
+    let rendered = String::from_utf8(body.to_vec()).unwrap();
+    assert!(rendered.contains("resp-truncated"));
+    assert!(rendered.contains("upstream request failed"));
+
+    accepted.await.unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(502));
+    assert!(matches!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_stream") | Some("upstream_incomplete_response")
+    ));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+#[tokio::test]
+async fn codex_streaming_natural_failure_then_truncation_emits_one_error_terminal() {
+    let fixture = codex_route_fixture("streaming-failure-then-truncation").await;
+    let failed = concat!(
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"provider-secret\"}}}\n\n"
+    )
+    .as_bytes();
+    let (endpoint, accepted) = truncated_sse_upstream_endpoint(failed).await;
+
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "natural failed terminal", "stream": true}),
+    )
+    .await;
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .expect("a post-terminal upstream error must still close the body cleanly");
+    let rendered = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(rendered.matches("event: error").count(), 1);
+    assert_eq!(rendered.matches("upstream request failed").count(), 1);
+    assert!(!rendered.contains("provider-secret"));
+
+    accepted.await.unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+}
+
+#[tokio::test]
+async fn codex_streaming_completed_then_truncation_replaces_held_success_with_error() {
+    let fixture = codex_route_fixture("streaming-completed-then-truncation").await;
+    let completed = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-held\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-held\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+    )
+    .as_bytes();
+    let (endpoint, accepted) = truncated_sse_upstream_endpoint(completed).await;
+
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "held completed terminal", "stream": true}),
+    )
+    .await;
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .expect("a held success terminal must not reset the downstream body");
+    let rendered = String::from_utf8(body.to_vec()).unwrap();
+    assert!(rendered.contains("resp-held"));
+    assert!(!rendered.contains("response.completed"));
+    assert_eq!(rendered.matches("event: error").count(), 1);
+    assert_eq!(rendered.matches("upstream request failed").count(), 1);
+
+    accepted.await.unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
 }
 
 #[tokio::test]

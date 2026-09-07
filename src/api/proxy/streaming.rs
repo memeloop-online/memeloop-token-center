@@ -44,6 +44,28 @@ struct CapturedSseDelivery {
     strict_chat_terminal_ready: bool,
 }
 
+fn downstream_stream_failure(
+    protocol: Protocol,
+    is_sse: bool,
+    sanitizer: Option<&crate::api::sse::ResponsesStreamingSanitizer>,
+    message: &'static str,
+) -> Result<Bytes, std::io::Error> {
+    // Once a Responses stream has been admitted, returning an error item from
+    // Body::from_stream resets the HTTP body. Responses clients surface that
+    // as a transport/body-decode failure instead of a terminal API error.
+    // Keep other streaming protocols' existing error behavior unchanged.
+    if is_sse && matches!(protocol, Protocol::OpenAiResponses) {
+        if sanitizer.is_some_and(crate::api::sse::ResponsesStreamingSanitizer::has_failed_terminal)
+        {
+            Ok(Bytes::new())
+        } else {
+            Ok(crate::api::sse::safe_failure_event())
+        }
+    } else {
+        Err(std::io::Error::other(message))
+    }
+}
+
 fn capture_sse_delivery(
     capture: Option<&mut ResponsesSseCapture>,
     chunk: Bytes,
@@ -223,8 +245,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             cancel_stream_archive(&archive_complete, &mut archive_sender);
                             let _ = tokio::time::timeout(
                                 MAX_DOWNSTREAM_SEND_WAIT,
-                                body_sender
-                                    .send(Err(std::io::Error::other("upstream stream timed out"))),
+                                body_sender.send(downstream_stream_failure(
+                                    protocol,
+                                    is_sse,
+                                    responses_streaming_sanitizer.as_ref(),
+                                    "upstream stream timed out",
+                                )),
                             )
                             .await;
                             break;
@@ -240,9 +266,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             cancel_stream_archive(&archive_complete, &mut archive_sender);
                             let _ = tokio::time::timeout(
                                 MAX_DOWNSTREAM_SEND_WAIT,
-                                body_sender.send(Err(std::io::Error::other(
+                                body_sender.send(downstream_stream_failure(
+                                    protocol,
+                                    is_sse,
+                                    responses_streaming_sanitizer.as_ref(),
                                     "upstream Responses stream ended with an incomplete frame",
-                                ))),
+                                )),
                             )
                             .await;
                         }
@@ -264,9 +293,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 cancel_stream_archive(&archive_complete, &mut archive_sender);
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
-                                    body_sender.send(Err(std::io::Error::other(
+                                    body_sender.send(downstream_stream_failure(
+                                        protocol,
+                                        is_sse,
+                                        responses_streaming_sanitizer.as_ref(),
                                         "upstream response exceeded the size limit",
-                                    ))),
+                                    )),
                                 )
                                 .await;
                                 break;
@@ -282,9 +314,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                         );
                                         let _ = tokio::time::timeout(
                                             MAX_DOWNSTREAM_SEND_WAIT,
-                                            body_sender.send(Err(std::io::Error::other(
+                                            body_sender.send(downstream_stream_failure(
+                                                protocol,
+                                                is_sse,
+                                                Some(&*sanitizer),
                                                 "upstream stream violated the Responses protocol",
-                                            ))),
+                                            )),
                                         )
                                         .await;
                                         break;
@@ -325,9 +360,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 cancel_stream_archive(&archive_complete, &mut archive_sender);
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
-                                    body_sender.send(Err(std::io::Error::other(
+                                    body_sender.send(downstream_stream_failure(
+                                        protocol,
+                                        is_sse,
+                                        responses_streaming_sanitizer.as_ref(),
                                         "upstream SSE stream exceeded framing limits",
-                                    ))),
+                                    )),
                                 )
                                 .await;
                                 break;
@@ -397,9 +435,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                             transport_error = Some("delivery_state");
                                             let _ = tokio::time::timeout(
                                                 MAX_DOWNSTREAM_SEND_WAIT,
-                                                body_sender.send(Err(std::io::Error::other(
+                                                body_sender.send(downstream_stream_failure(
+                                                    protocol,
+                                                    is_sse,
+                                                    responses_streaming_sanitizer.as_ref(),
                                                     "response delivery could not be recorded",
-                                                ))),
+                                                )),
                                             )
                                             .await;
                                         }
@@ -436,7 +477,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         cancel_stream_archive(&archive_complete, &mut archive_sender);
                         let _ = tokio::time::timeout(
                             MAX_DOWNSTREAM_SEND_WAIT,
-                            body_sender.send(Err(std::io::Error::other("upstream stream failed"))),
+                            body_sender.send(downstream_stream_failure(
+                                protocol,
+                                is_sse,
+                                responses_streaming_sanitizer.as_ref(),
+                                "upstream stream failed",
+                            )),
                         )
                         .await;
                         break;
