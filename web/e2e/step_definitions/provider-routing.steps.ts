@@ -311,8 +311,17 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   await routeEditor.getByLabel('公开模型').fill(groupedModel);
   const includeProviders = routeEditor.getByRole('combobox', { name: '包含提供商组', exact: true });
   await includeProviders.fill('主力');
+  const groupCatalog = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'GET'
+      && url.pathname === '/internal/v1/upstream-models'
+      && url.searchParams.get('include_provider_group_ids') === providerGroup.id
+      && !url.searchParams.has('q');
+  });
   await includeProviders.press('Enter');
   await assertContains(includeProviders.locator('..').locator('.selection-chip'), '主力提供商');
+  const groupCatalogResponse = await groupCatalog;
+  assert.equal(groupCatalogResponse.status(), 200);
   const groupedCatalog = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return url.pathname === '/internal/v1/upstream-models'
