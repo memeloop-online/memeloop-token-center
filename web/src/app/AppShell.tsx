@@ -229,8 +229,8 @@ export function AppShell({ surface, route, onNavigate, children, pluginNavigatio
         <button className="app-mobile-close" ref={mobileCloseRef} type="button" aria-label={label(locale, 'close')} onClick={() => setMobileOpen(false)}>×</button>
       </div>
       <nav className="app-navigation" aria-label={label(locale, surface)}>
-        {navigationSections.map((section) => <section className="app-nav-section" key={section.label}>
-          <h2>{section.label}</h2>
+        {navigationSections.map((section) => <section className="app-nav-section" key={section.id} aria-labelledby={`app-nav-section-${section.id}`}>
+          <h2 id={`app-nav-section-${section.id}`}>{section.label}</h2>
           {section.items.map((item) => {
             const index = itemIndex++;
             const selected = item.route === route;

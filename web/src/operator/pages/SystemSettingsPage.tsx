@@ -36,7 +36,6 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
     return () => { cancelled = true; };
   }, [tenant, token]);
 
-  const selected = routes.find((route) => route.id === selectedRouteId);
   const save = async () => {
     if (!tenant || !selectedRouteId) return;
     setSaving(true); setError(''); setMessage('');
@@ -49,15 +48,31 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
     finally { setSaving(false); }
   };
 
-  return <section className="system-settings"><article className="panel"><div className="panel-title"><div><h2>{t('settings.title')}</h2><p className="muted">{t('settings.description')}</p></div></div>
-    {!tenant ? <div className="empty">{t('settings.selectTenant')}</div> : <>
-      {error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}
-      {loading ? <div className="empty">{t('common.loading')}</div> : routes.length === 0 ? <div className="empty">{t('settings.noEnabledRoute')}</div> : <div className="system-settings-form"><label>{t('settings.filterAssistantRoute')}<select value={selectedRouteId} onChange={(event) => setSelectedRouteId(event.target.value)}><option value="">{t('common.select')}</option>{routes.map((route) => <option key={route.id} value={route.id}>{route.public_model} · {route.upstream_model} · {route.protocol}</option>)}</select></label>
-        {selected && <p className="muted">{t('settings.filterAssistantRouteHint')} <code>{selected.id}</code></p>}
-        <p className="muted">{t('settings.filterAssistantSecretFree')}</p>
-        <button type="button" disabled={saving || !selectedRouteId} onClick={() => void save()}>{saving ? t('common.loading') : t('common.save')}</button>
-      </div>}
-      {settings === null && <div className="notice warning" role="status">{t('settings.filterAssistantNotConfigured')}</div>}
+  return <section className="system-settings" aria-labelledby="system-settings-title">
+    <header className="settings-page-header">
+      <div>
+        <span className="eyebrow">{t('settings.eyebrow')}</span>
+        <h2 id="system-settings-title">{t('settings.title')}</h2>
+        <p className="muted">{t('settings.description')}</p>
+      </div>
+    </header>
+    {!tenant ? <article className="panel settings-card"><div className="empty">{t('settings.selectTenant')}</div></article> : <>
+      {error && <div className="notice error" role="alert">{error}</div>}
+      {message && <div className="notice success" role="status">{message}</div>}
+      <article className="panel settings-card" aria-busy={loading || saving}>
+        <div className="settings-card-heading">
+          <div>
+            <h3>{t('settings.filterAssistantTitle')}</h3>
+            <p className="muted">{t('settings.filterAssistantDescription')}</p>
+          </div>
+          {settings && <span className="status ok">{t('settings.configured')}</span>}
+        </div>
+        {loading ? <div className="empty">{t('common.loading')}</div> : routes.length === 0 ? <div className="settings-empty"><b>{t('settings.noEnabledRoute')}</b><span>{t('settings.noEnabledRouteHint')}</span></div> : <div className="system-settings-form">
+          <label htmlFor="filter-assistant-route">{t('settings.filterAssistantRoute')}<select id="filter-assistant-route" value={selectedRouteId} onChange={(event) => setSelectedRouteId(event.target.value)}><option value="">{t('common.select')}</option>{routes.map((route) => <option key={route.id} value={route.id}>{route.public_model} · {route.upstream_model} · {route.protocol}</option>)}</select><small>{t('settings.filterAssistantRouteHint')}</small></label>
+          <button type="button" disabled={saving || !selectedRouteId} onClick={() => void save()}>{saving ? t('common.loading') : t('common.save')}</button>
+        </div>}
+        {settings === null && <p className="settings-status-note">{t('settings.filterAssistantNotConfigured')}</p>}
+      </article>
     </>}
-  </article></section>;
+  </section>;
 }

@@ -23,7 +23,7 @@ export function enumLabel(t: Translate, prefix: string, value: string) {
 export function WriteScopeNotice({ tenant }: { tenant: string }) {
   const { t } = useI18n();
   if (tenant) return null;
-  return <div className="scope-context"><span aria-hidden="true">◎</span><p>{t('operator.selectTenantToWrite')}</p></div>;
+  return <div className="scope-context" role="status"><span aria-hidden="true">◎</span><p>{t('operator.selectTenantToWrite')}</p></div>;
 }
 
 export function OneTimeSecret({ value, message }: { value: string; message: string }) {
