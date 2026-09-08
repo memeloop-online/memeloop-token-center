@@ -48,10 +48,12 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     const historicalGapDiagnostics = historicalGap.locator('.request-diagnostics');
     await Promise.all([recordedDiagnostics.waitFor(), historicalGapDiagnostics.waitFor()]);
 
-    const tableId = page.locator('.request-id-control.compact code');
+    const recordedRow = page.locator('tbody tr').filter({ has: page.locator(`code[title="${requestId}"]`) });
+    assert.equal(await recordedRow.count(), 1);
+    const tableId = recordedRow.locator('.request-id-control.compact code');
     assert.equal(await tableId.getAttribute('title'), requestId);
     assert.equal(await tableId.textContent(), requestId);
-    assert.match(await page.locator('.request-token-cell small').textContent() ?? '', /Cache read 40.*Cache write 20/);
+    assert.match(await recordedRow.locator('.request-token-cell small').textContent() ?? '', /Cache read 40.*Cache write 20/);
     assert.match(await recorded.textContent() ?? '', /http_429/);
     assert.match(await recorded.textContent() ?? '', new RegExp(upstreamId));
     assert.match(await recorded.textContent() ?? '', new RegExp(routeId));
@@ -68,10 +70,10 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
         value: { writeText: (value: string) => { document.body.dataset.fixtureCopied = value; return Promise.resolve(); } },
       });
     });
-    await page.locator('.request-id-control.compact .copy-control button').click();
+    await recordedRow.locator('.request-id-control.compact .copy-control button').click();
     assert.equal(await page.locator('body').getAttribute('data-fixture-copied'), requestId);
 
-    await page.locator('.request-session-cell .table-link').click();
+    await recordedRow.locator('.request-session-cell .table-link').click();
     assert.equal(await page.locator('[data-fixture-session-opened]').textContent(), sessionId);
 
     for (const theme of ['dark', 'light'] as const) {

@@ -96,11 +96,13 @@ test('Overview keeps current sections visible through independent endpoint failu
         const layout = await page.evaluate(() => ({
           documentClientWidth: document.documentElement.clientWidth,
           documentScrollWidth: document.documentElement.scrollWidth,
+          metricColumns: getComputedStyle(document.querySelector('.monitoring-metrics-grid')!).gridTemplateColumns.split(' ').length,
           charts: [...document.querySelectorAll<HTMLElement>('.overview-trend-card .usage-echart')].map((element) => ({ clientWidth: element.clientWidth, scrollWidth: element.scrollWidth })),
           tables: [...document.querySelectorAll<HTMLElement>('.table-scroll')].map((element) => ({ clientWidth: element.clientWidth, scrollWidth: element.scrollWidth })),
         }));
         assert.equal(layout.charts.length, 2, `${theme} ${width}px retains both trend charts`);
         assert.ok(layout.documentScrollWidth <= layout.documentClientWidth, `${theme} ${width}px must not create page-level horizontal overflow`);
+        if (width >= 1440) assert.equal(layout.metricColumns, 4, 'eight summary metrics form two balanced rows on wide screens');
         for (const chart of layout.charts) assert.ok(chart.scrollWidth <= chart.clientWidth, `${theme} ${width}px charts must remain contained`);
         for (const table of layout.tables) assert.ok(table.scrollWidth >= table.clientWidth, `${theme} ${width}px tables retain their own scroll container`);
         if (width <= 768) assert.ok(layout.tables.some((table) => table.scrollWidth > table.clientWidth), `${theme} ${width}px wide request data must scroll within its table instead of overflowing the page`);
