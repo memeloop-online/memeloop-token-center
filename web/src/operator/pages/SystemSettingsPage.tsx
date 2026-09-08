@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../api';
-import { CopyButton } from '../../CopyButton';
+import { CopyButton } from '../../CopyButton.js';
 import { useI18n } from '../../i18n';
 import type { FilterAssistantSettings, ModelRouteView } from '../../types';
 import { messageOf, queryForTenant } from '../scope/operatorShared';

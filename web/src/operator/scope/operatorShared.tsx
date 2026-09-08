@@ -1,4 +1,4 @@
-import { CopyButton } from '../../CopyButton';
+import { CopyButton } from '../../CopyButton.js';
 import { useI18n } from '../../i18n';
 
 export type Translate = (key: string, variables?: Record<string, string | number>) => string;

@@ -449,7 +449,10 @@ async fn operator_and_self_observability_filters_are_bounded_scoped_and_keyset_p
         projected_request["session_context"]["session_name"],
         "Operator-visible session"
     );
-    assert_eq!(projected_request["upstream_account_id"], upstream.to_string());
+    assert_eq!(
+        projected_request["upstream_account_id"],
+        upstream.to_string()
+    );
     assert_eq!(projected_request["route_id"], alpha_route.to_string());
     assert!(projected_request["completed_at"].is_i64());
     assert_eq!(projected_request["currency"], "USD");

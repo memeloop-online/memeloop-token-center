@@ -1,5 +1,5 @@
 import { useId, useState } from 'react';
-import { useI18n } from './i18n';
+import { useI18n } from './i18n.js';
 
 /**
  * Copies a value already held by the current UI. Callers must not pass an ID,

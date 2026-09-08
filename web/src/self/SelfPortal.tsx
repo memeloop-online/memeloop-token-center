@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { api } from '../api';
-import { CopyButton } from '../CopyButton';
+import { CopyButton } from '../CopyButton.js';
 import { Shell } from '../components';
 import { clearRememberedCredential, readRememberedCredential, rememberCredential } from '../credentialStorage';
 import { useI18n } from '../i18n';
