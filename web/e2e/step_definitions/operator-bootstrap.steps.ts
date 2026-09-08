@@ -107,8 +107,12 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
     await credentialInput.fill('singleton-credential');
     assert.equal(await credentialInput.inputValue(), 'singleton-credential');
   });
+  const singletonDiscovery = page.waitForRequest((request) => new URL(request.url()).pathname === '/internal/v1/tenants'
+    && request.method() === 'GET'
+    && request.headers().authorization === 'Bearer singleton-credential');
   await eventually(async () => connect.click());
-  await eventually(() => assert.equal(observed.filter((value) => value.credential === 'singleton-credential').length, 1));
+  await singletonDiscovery;
+  assert.equal(observed.filter((value) => value.credential === 'singleton-credential').length, 1);
   assert.equal(observed.find((value) => value.credential === 'singleton-credential')?.path, '/internal/v1/tenants');
   await waitForConsoleContext(page, /^载入中…$/);
   singletonTenants.resolve();

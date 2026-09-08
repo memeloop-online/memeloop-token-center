@@ -71,15 +71,33 @@ export async function connectOperator(
 ): Promise<void> {
   const page = world.requirePage();
   const seed = runtime.requireSeed();
+  const expectedCredential = credential ?? seed.serviceCredential;
   await world.open('/operator?view=settings', { theme, locale: 'zh-CN' });
-  await page.locator('input[type="password"]').fill(credential ?? seed.serviceCredential);
-  await page.getByRole('button', { name: '连接', exact: true }).click();
+  // A page reload can restore a remembered credential, so the shell first
+  // performs tenant discovery and only then remounts this form as a
+  // replacement-credential form. Target the form instead of its translated
+  // submit label so both entry points exercise the same user flow.
+  const accessForm = page.locator('form.operator-credential');
+  const credentialInput = accessForm.locator('input[type="password"]');
+  await credentialInput.waitFor({ state: 'visible' });
+  await credentialInput.fill(expectedCredential);
+  await assertValue(credentialInput, expectedCredential);
+  const tenantDiscovery = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'GET'
+      && url.pathname === '/internal/v1/tenants'
+      && response.request().headers().authorization === `Bearer ${expectedCredential}`;
+  });
+  await accessForm.locator('button[type="submit"]').click();
+  assert.equal((await tenantDiscovery).status(), 200);
   const tenantPicker = await assertOperatorTenantScope(page, tenant, pickerExpectation);
   if (tenantPicker && await tenantPicker.inputValue() !== tenant) {
     const scopedReload = page.waitForResponse((response) => {
       const url = new URL(response.url());
       return response.request().method() === 'GET'
-        && url.pathname === '/internal/v1/requests'
+        // The helper opens the settings route, whose tenant-scoped resource
+        // load is model routes rather than the traffic page's request list.
+        && url.pathname === '/internal/v1/model-routes'
         && url.searchParams.get('tenant_external_id') === tenant;
     });
     await tenantPicker.selectOption(tenant);
