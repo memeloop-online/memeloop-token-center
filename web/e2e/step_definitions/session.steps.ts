@@ -160,7 +160,9 @@ Then('六类可靠关系、候选关系、未关联请求和语义执行图被�
     assert.match(text, new RegExp(sentence), `missing natural-language relationship: ${sentence}`);
   }
   const candidate = drawer.locator('.candidate-edges');
+  await drawer.locator('.session-relationships > summary').click();
   await candidate.locator('summary').click();
+  await visible(candidate.locator('.edge-list'));
   assert.match(await candidate.textContent() ?? '', /不计入会话统计/);
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
   await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
