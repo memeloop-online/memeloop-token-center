@@ -28,11 +28,15 @@ bounded cache/timeout/body limits. Its origin must exactly match an existing
 
 Every contribution must use `renderer: "typed_data_v1"`, one of the documented
 icon tokens (`activity`, `chart`, `database`, `heart`, `plug`, `shield`), and a
-same-plugin `data_endpoint`. Core routes, duplicate routes, conflicting new
-category labels, write-only response fields, arbitrary icon names, and unknown
-data endpoints are rejected at load time. `settings` and `system-settings` are
-also reserved for core system configuration, whether or not that screen is
-enabled by a given Token Center build.
+same-plugin `data_endpoint`. `presentation` is optional and closed: omitting
+it selects the generic typed-data view, while `health_intelligence_v1` selects
+the core's compact three-source health view after its exact bounded snapshot is
+validated. It never names plugin JavaScript or a browser URL. Core routes,
+duplicate routes, conflicting new category labels, write-only response fields,
+arbitrary icon names, and unknown data endpoints are rejected at load time.
+`settings` and `system-settings` are also reserved for core system
+configuration, whether or not that screen is enabled by a given Token Center
+build.
 
 Example fragment:
 
@@ -63,6 +67,7 @@ Example fragment:
       "label": "Health and intelligence",
       "icon": "heart",
       "renderer": "typed_data_v1",
+      "presentation": "health_intelligence_v1",
       "data_endpoint": "health"
     }]
   }

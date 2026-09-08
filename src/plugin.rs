@@ -137,6 +137,15 @@ pub enum PluginOperatorUiSlot {
     OverviewCard,
 }
 
+/// Closed, core-owned visual presentation choices for declarative operator
+/// contributions. A presentation selects only a renderer already compiled
+/// into Token Center; it is never a URL, a component name, or plugin code.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginOperatorUiPresentation {
+    HealthIntelligenceV1,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginOperatorUiCategory {
@@ -161,6 +170,10 @@ pub struct PluginOperatorUiContribution {
     /// Only `typed_data_v1` is accepted. It selects a core-owned React
     /// renderer; it is not a filename, URL, HTML fragment, or JavaScript ABI.
     pub renderer: String,
+    /// An optional closed presentation selected by the core. Omitting this
+    /// keeps the generic typed-data presentation for backwards compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<PluginOperatorUiPresentation>,
     pub data_endpoint: String,
 }
 

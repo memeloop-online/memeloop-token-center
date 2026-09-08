@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import type { PluginManifest } from '../src/types.js';
 import { pluginRouteKey } from '../src/app/routes.js';
-import { registerOperatorPluginContributions } from '../src/operator/pluginContributions.js';
+import { healthIntelligenceSnapshot, registerOperatorPluginContributions } from '../src/operator/pluginContributions.js';
 
 const fixture = JSON.parse(await readFile(new URL('../../tests/fixtures/plugins/operator-ui-contributions.json', import.meta.url), 'utf8')) as {
   installed: PluginManifest[];
@@ -42,7 +42,29 @@ test('uninstalling a manifest removes every plugin navigation, route, and card r
 test('render boundary remains core-owned typed JSON with no remote executable surface', async () => {
   const source = await readFile(new URL('../src/operator/pluginContributions.tsx', import.meta.url), 'utf8');
   assert.match(source, /renderer === 'typed_data_v1'/);
+  assert.match(source, /health_intelligence_v1/);
   assert.match(source, /\/internal\/v1\/plugins\//);
   assert.doesNotMatch(source, /dangerouslySetInnerHTML|<iframe|import\s*\(/u);
   assert.doesNotMatch(source, /contribution\.url|endpoint\.url/u);
+});
+
+test('the closed health-intelligence presentation only accepts its bounded three-source snapshot', () => {
+  const snapshot = healthIntelligenceSnapshot({
+    schemaVersion: 1,
+    generatedAt: '2026-09-08T00:00:00.000Z',
+    sources: [
+      { id: 'codexradar', label: 'Codex Radar', status: 'ok', rows: [{ model: 'model-a', effort: 'high', iq: 42.5, samples: 12 }] },
+      { id: 'deepswe', label: 'DeepSWE', status: 'stale', rows: [{ model: 'model-b', effort: 'medium', passRate: 0.75, agentSteps: 8 }] },
+      { id: 'aixhan', label: 'Model health', status: 'error', rows: [{ name: 'provider-a', status: 'degraded', model: 'model-c', latencyMs: 320 }] },
+    ],
+  });
+  assert.deepEqual(snapshot?.sources.map((source) => source.id), ['codexradar', 'deepswe', 'aixhan']);
+  assert.equal(snapshot?.sources[0]?.rows[0]?.title, 'model-a · high');
+  assert.equal(snapshot?.sources[2]?.rows[0]?.value, 'degraded');
+  assert.equal(healthIntelligenceSnapshot({ schemaVersion: 1, sources: [] }), null);
+  assert.equal(healthIntelligenceSnapshot({ schemaVersion: 1, sources: [
+    { id: 'codexradar', label: 'Codex Radar', status: 'ok', rows: [] },
+    { id: 'codexradar', label: 'Duplicate', status: 'ok', rows: [] },
+    { id: 'aixhan', label: 'Model health', status: 'ok', rows: [] },
+  ] }), null);
 });

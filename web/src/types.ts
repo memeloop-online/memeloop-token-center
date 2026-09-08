@@ -644,6 +644,8 @@ export interface PluginManifest {
 
 export type PluginOperatorUiSlot = 'operator.sidebar.tab' | 'operator.overview.card';
 export type PluginOperatorUiIcon = 'activity' | 'chart' | 'database' | 'heart' | 'plug' | 'shield';
+/** Closed core-owned data presentation; this is never a plugin browser-code entrypoint. */
+export type PluginOperatorUiPresentation = 'health_intelligence_v1';
 
 export interface PluginOperatorUiContribution {
   id: string;
@@ -654,6 +656,8 @@ export interface PluginOperatorUiContribution {
   icon: PluginOperatorUiIcon;
   /** Always selects a core-owned renderer; this is never executable plugin code. */
   renderer: 'typed_data_v1';
+  /** Optional closed core presentation for a matching validated data shape. */
+  presentation?: PluginOperatorUiPresentation | null;
   data_endpoint: string;
 }
 

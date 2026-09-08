@@ -41,6 +41,9 @@ export interface OperatorPluginRegistry {
 const token = /^[a-z0-9-]{1,64}$/;
 const coreCategories = new Set(['monitoring', 'traffic', 'identity', 'system']);
 const supportedIcons = new Set<PluginOperatorUiContribution['icon']>(['activity', 'chart', 'database', 'heart', 'plug', 'shield']);
+const supportedPresentations = new Set<NonNullable<PluginOperatorUiContribution['presentation']>>(['health_intelligence_v1']);
+const healthSourceIds = new Set(['codexradar', 'deepswe', 'aixhan']);
+const healthSourceStatuses = new Set(['ok', 'stale', 'error']);
 
 function safeLabel(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= 120 && !/[\u0000-\u001f\u007f<>]/u.test(value);
@@ -51,7 +54,8 @@ function validContribution(value: PluginOperatorUiContribution): boolean {
     && safeLabel(value.label)
     && token.test(value.data_endpoint)
     && value.renderer === 'typed_data_v1'
-    && supportedIcons.has(value.icon);
+    && supportedIcons.has(value.icon)
+    && (value.presentation == null || supportedPresentations.has(value.presentation));
 }
 
 export function registerOperatorPluginContributions(manifests: PluginManifest[]): OperatorPluginRegistry {
@@ -120,6 +124,125 @@ function renderJson(value: Record<string, unknown>, limit: number) {
   return encoded.length > limit ? `${encoded.slice(0, limit)}\n…` : encoded;
 }
 
+type HealthSourceId = 'codexradar' | 'deepswe' | 'aixhan';
+type HealthSourceStatus = 'ok' | 'stale' | 'error';
+
+export interface HealthIntelligenceRow {
+  title: string;
+  value: string;
+  detail: string | null;
+}
+
+export interface HealthIntelligenceSource {
+  id: HealthSourceId;
+  label: string;
+  status: HealthSourceStatus;
+  rows: HealthIntelligenceRow[];
+}
+
+export interface HealthIntelligenceSnapshot {
+  generatedAt: string;
+  sources: HealthIntelligenceSource[];
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function text(value: unknown, limit = 120): string | null {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= limit && !/[\u0000-\u001f\u007f]/u.test(value)
+    ? value : null;
+}
+
+function numeric(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function formatMetric(value: number, fractionDigits = 0): string {
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: fractionDigits }).format(value);
+}
+
+function sourceRows(id: HealthSourceId, value: unknown): HealthIntelligenceRow[] | null {
+  if (!Array.isArray(value) || value.length > 24) return null;
+  const rows: HealthIntelligenceRow[] = [];
+  for (const candidate of value.slice(0, 6)) {
+    const row = record(candidate);
+    if (!row) return null;
+    if (id === 'codexradar') {
+      const model = text(row.model);
+      const effort = text(row.effort, 48);
+      const iq = numeric(row.iq);
+      if (!model || !effort || iq == null) return null;
+      const samples = numeric(row.samples);
+      rows.push({ title: `${model} · ${effort}`, value: `IQ ${formatMetric(iq, 1)}`, detail: samples == null ? null : `${formatMetric(samples)} samples` });
+    } else if (id === 'deepswe') {
+      const model = text(row.model);
+      const effort = text(row.effort, 48);
+      const passRate = numeric(row.passRate);
+      if (!model || !effort || passRate == null || passRate < 0 || passRate > 1) return null;
+      const steps = numeric(row.agentSteps);
+      rows.push({ title: `${model} · ${effort}`, value: `${formatMetric(passRate * 100, 1)}%`, detail: steps == null ? null : `${formatMetric(steps)} steps` });
+    } else {
+      const name = text(row.name);
+      const status = text(row.status, 32);
+      if (!name || !status) return null;
+      const model = text(row.model);
+      const latency = numeric(row.latencyMs);
+      const detail = [model, latency == null ? null : `${formatMetric(latency)} ms`].filter((item): item is string => item != null).join(' · ');
+      rows.push({ title: name, value: status, detail: detail || null });
+    }
+  }
+  return rows;
+}
+
+/**
+ * Narrows the published health-intelligence snapshot into a small, core-owned
+ * view model. Any data that does not meet the exact bounded shape falls back
+ * to the generic typed-data renderer rather than being guessed or executed.
+ */
+export function healthIntelligenceSnapshot(value: Record<string, unknown>): HealthIntelligenceSnapshot | null {
+  if (value.schemaVersion !== 1 || !Array.isArray(value.sources) || value.sources.length !== 3) return null;
+  const generatedAt = text(value.generatedAt, 64);
+  if (!generatedAt) return null;
+  const seen = new Set<string>();
+  const sources: HealthIntelligenceSource[] = [];
+  for (const candidate of value.sources) {
+    const source = record(candidate);
+    if (!source) return null;
+    const id = text(source.id, 32);
+    const label = text(source.label);
+    const status = text(source.status, 16);
+    if (!id || !healthSourceIds.has(id) || seen.has(id) || !label || !status || !healthSourceStatuses.has(status)) return null;
+    const rows = sourceRows(id as HealthSourceId, source.rows);
+    if (!rows) return null;
+    seen.add(id);
+    sources.push({ id: id as HealthSourceId, label, status: status as HealthSourceStatus, rows });
+  }
+  return seen.size === healthSourceIds.size
+    ? { generatedAt, sources }
+    : null;
+}
+
+function HealthIntelligencePanel({ snapshot, compact }: { snapshot: HealthIntelligenceSnapshot; compact: boolean }) {
+  const rowLimit = compact ? 2 : 6;
+  return <section className="operator-overview-plugin-cards" aria-label="Health and intelligence">
+    {snapshot.sources.map((source) => <section className="managed-resource" key={source.id}>
+      <header className="managed-resource-header">
+        <h3>{source.label}</h3>
+        <span className={`status ${source.status === 'ok' ? 'ok' : source.status === 'stale' ? 'pending' : 'bad'}`}>{source.status}</span>
+      </header>
+      <div className="account-list">
+        {source.rows.length === 0 && <p className="muted">No current signals.</p>}
+        {source.rows.slice(0, rowLimit).map((row) => <div className="account" key={`${source.id}:${row.title}`}>
+          <div className="account-main"><b>{row.title}</b>{row.detail && <span>{row.detail}</span>}</div>
+          <span className="pill">{row.value}</span>
+        </div>)}
+      </div>
+    </section>)}
+    {!compact && <p className="muted">Snapshot generated {new Date(snapshot.generatedAt).toLocaleString()}.</p>}
+  </section>;
+}
+
 function TypedPluginData({ registered, token: credential, tenant, compact = false }: {
   registered: RegisteredPluginContribution;
   token: string;
@@ -146,9 +269,14 @@ function TypedPluginData({ registered, token: credential, tenant, compact = fals
 
   if (error) return <div className="notice error" role="alert">{error}</div>;
   if (!response) return <div className="empty">Loading plugin data…</div>;
+  const snapshot = registered.contribution.presentation === 'health_intelligence_v1'
+    ? healthIntelligenceSnapshot(response.data)
+    : null;
   return <>
     {response.partial && <div className="notice" role="status">Showing degraded plugin data ({response.provenance.source.replaceAll('_', ' ')}).</div>}
-    <pre className="plugin-typed-data" aria-label={`${registered.contribution.label} data`}>{renderJson(response.data, compact ? 1_500 : 12_000)}</pre>
+    {snapshot
+      ? <HealthIntelligencePanel snapshot={snapshot} compact={compact} />
+      : <pre className="plugin-typed-data" aria-label={`${registered.contribution.label} data`}>{renderJson(response.data, compact ? 1_500 : 12_000)}</pre>}
     {!compact && <p className="muted">Source: {response.provenance.origin} · {new Date(response.provenance.fetched_at).toLocaleString()}</p>}
   </>;
 }
@@ -159,7 +287,7 @@ export function PluginContributionPage({ registered, token, tenant }: {
   tenant: string;
 }) {
   return <article className="panel plugin-contribution-page">
-    <div className="panel-title"><div><h2>{registered.contribution.label}</h2><p className="muted">Plugin-provided typed data rendered by Token Center.</p></div></div>
+    <div className="panel-title"><div><h2>{registered.contribution.label}</h2><p className="muted">Data from the installed extension.</p></div></div>
     <TypedPluginData registered={registered} token={token} tenant={tenant} />
   </article>;
 }

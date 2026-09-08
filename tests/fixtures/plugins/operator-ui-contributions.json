@@ -55,6 +55,7 @@
             "label": "Health and intelligence",
             "icon": "heart",
             "renderer": "typed_data_v1",
+            "presentation": "health_intelligence_v1",
             "data_endpoint": "health"
           },
           {
