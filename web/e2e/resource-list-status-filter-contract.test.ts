@@ -38,6 +38,7 @@ test('the saved status choice is scoped by resource kind and tenant, never by a 
 
 test('every status-bearing operator resource list uses the shared filter rather than a page-local disabled toggle', async () => {
   const source = await readFile(new URL('../src/operator/pages/ManagementPages.tsx', import.meta.url), 'utf8');
+  const tenantSource = await readFile(new URL('../src/operator/TenantManager.tsx', import.meta.url), 'utf8');
 
   for (const resource of ['upstreams', 'model-routes', 'credentials', 'service-credentials']) {
     assert.match(source, new RegExp(`useResourceListStatusFilter\\('${resource}'`));
@@ -45,4 +46,7 @@ test('every status-bearing operator resource list uses the shared filter rather 
   assert.match(source, /<ResourceListStatusFilterControl filter=\{statusFilter\}/);
   assert.match(source, /<ResourceListStatusEmpty totalCount=\{statusFilter\.totalCount\}/);
   assert.doesNotMatch(source, /showDisabled|setShowDisabled/);
+  assert.match(tenantSource, /useResourceListStatusFilter\('tenants', '', values \?\? \[\], \(value\) => value\.status === 'active'\)/);
+  assert.match(tenantSource, /<ResourceListStatusFilterControl filter=\{statusFilter\} inactiveLabel=\{t\('tenants\.archived'\)\}/);
+  assert.match(tenantSource, /<ResourceListStatusEmpty totalCount=\{statusFilter\.totalCount\} normalLabel=\{t\('tenants\.active'\)\}/);
 });

@@ -75,7 +75,7 @@ function replaceTypedUsageCondition(ast: TypedFilterAst, filter: keyof UsageFilt
 
 function NumericMetric({ label, value, tone }: { label: string; value?: number | null; tone?: string }) {
   const { locale } = useI18n(); const formatted = formatMetricNumber(value, locale);
-  return <Metric label={label} tone={tone} value={<span title={formatted.title}>{formatted.text}</span>} />;
+  return <Metric label={label} tone={tone} value={<span className="metric-number"><span className="metric-exact" title={formatted.title}>{formatted.text}</span></span>} />;
 }
 function CostValue({ costs }: { costs: UsageAnalysisCost[] }) {
   const { locale } = useI18n(); if (!costs.length) return <span>—</span>;

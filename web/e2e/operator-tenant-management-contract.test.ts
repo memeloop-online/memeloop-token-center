@@ -114,6 +114,10 @@ test('multi-tenant scope exposes tenant CRUD, dependency refusal, authorization 
     assert.equal(await page.getByRole('dialog', { name: 'Archive tenant', exact: true }).count(), 0, 'Escape must dismiss the tenant action dialog');
     await north.getByRole('button', { name: 'Archive', exact: true }).click();
     await page.getByRole('dialog', { name: 'Archive tenant', exact: true }).getByRole('button', { name: 'Archive', exact: true }).click();
+    await page.getByRole('button', { name: 'Show Archived (1)', exact: true }).waitFor();
+    assert.equal(await tenantRow(page, 'north-renamed').count(), 0, 'archived tenants must be hidden by default');
+    await page.getByRole('button', { name: 'Show Archived (1)', exact: true }).click();
+    north = tenantRow(page, 'north-renamed');
     await north.getByRole('button', { name: 'Restore', exact: true }).waitFor();
     await north.getByRole('button', { name: 'Restore', exact: true }).click();
     await page.getByRole('dialog', { name: 'Restore tenant', exact: true }).getByRole('button', { name: 'Restore', exact: true }).click();

@@ -3,6 +3,7 @@ import { api } from '../api';
 import { DrawerFrame } from '../components';
 import { useI18n } from '../i18n';
 import type { TenantManagementView } from '../types';
+import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceListStatusFilter } from './ResourceListStatusFilter';
 import { messageOf } from './scope/operatorShared';
 
 interface Props {
@@ -139,6 +140,8 @@ export function TenantManager({ token, onChanged }: Props) {
 
   useEffect(() => { void load(); }, [token]);
 
+  const statusFilter = useResourceListStatusFilter('tenants', '', values ?? [], (value) => value.status === 'active');
+
   function submitDialog() {
     if (!dialog || busy) return;
     if (dialog.kind === 'rename') { void rename(dialog.tenant, renameDraft); return; }
@@ -170,7 +173,7 @@ export function TenantManager({ token, onChanged }: Props) {
         : t('tenants.delete');
 
   return <section className="panel tenant-manager">
-    <div className="panel-title tenant-manager-title"><div><h2>{t('tenants.title')}</h2><p className="muted">{t('tenants.description')}</p></div></div>
+    <div className="panel-title tenant-manager-title"><div><h2>{t('tenants.title')}</h2><p className="muted">{t('tenants.description')}</p></div>{values && <ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('tenants.archived')} />}</div>
     <div className="tenant-manager-body">
       {!dialog && error && <div className="notice error" role="alert">{error}</div>}
       {message && <div className="notice success" role="status">{message}</div>}
@@ -179,8 +182,8 @@ export function TenantManager({ token, onChanged }: Props) {
         <button type="button" disabled={busy === 'create' || !name.trim()} onClick={() => void create()}>{t('tenants.create')}</button>
       </div>
       {!values ? <div className="empty">{t('common.loading')}</div> : <div className="account-list tenant-list">
-        {values.length === 0 && <div className="empty">{t('tenants.empty')}</div>}
-        {values.map((value) => {
+        {statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('tenants.active')} empty={t('tenants.empty')} />}
+        {statusFilter.values.map((value) => {
           const isDefault = value.external_id === 'default';
           return <div className="managed-resource" key={value.external_id}>
             <div className="managed-resource-header"><div><b>{value.external_id}</b><span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{t(`tenants.${value.status}`)}</span></div></div>
