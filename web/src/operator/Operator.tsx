@@ -170,7 +170,10 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
         ? <PluginContributionPage registered={registered} token={scope.activeCredential} tenant={scope.tenant} />
         : <div className="notice error" role="alert">This plugin page is no longer installed or available.</div>;
     }
-  } else if (!scope.authenticating) page = accessSettings;
+  // A settings user may explicitly replace a credential while tenant
+  // discovery is still in flight. Keep only that access form mounted; all
+  // tenant-scoped pages remain withheld until discovery resolves.
+  } else if (!scope.authenticating || activeRoute === 'settings') page = accessSettings;
 
   const content = <>
     {scope.authenticating && <div className="console-context"><div><b>{t('common.loading')}</b></div></div>}
@@ -179,7 +182,9 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     {showNavigation && <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{navigation.map((item) => <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={activeRoute === item.route} aria-controls={`operator-panel-${item.domId}`} tabIndex={activeRoute === item.route ? 0 : -1} key={item.route} className={activeRoute === item.route ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{t(item.label)}</button>)}</nav>}
     {scope.error && <div className="notice error" role="alert">{scope.error}</div>}
     <section id={`operator-panel-${pageId(activeRoute)}`} role="tabpanel" aria-labelledby={showNavigation ? `operator-tab-${pageId(activeRoute)}` : undefined} tabIndex={0}>
-      {scope.authenticating ? <div className="empty">{t('common.loading')}</div> : <Fragment key={pageScopeKey}>{page}</Fragment>}
+      {scope.authenticating && activeRoute !== 'settings'
+        ? <div className="empty">{t('common.loading')}</div>
+        : <Fragment key={pageScopeKey}>{page}</Fragment>}
     </section>
   </>;
 

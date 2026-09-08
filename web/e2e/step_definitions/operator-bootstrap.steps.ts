@@ -157,7 +157,11 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
   await eventually(async () => { await credentialInput.fill('slow-credential'); assert.equal(await credentialInput.inputValue(), 'slow-credential'); });
   await eventually(async () => connect.click());
   await eventually(() => assert.ok(observed.some((value) => value.credential === 'slow-credential' && value.path === '/internal/v1/tenants')));
-  await eventually(async () => { await credentialInput.fill('fast-credential'); assert.equal(await credentialInput.inputValue(), 'fast-credential'); });
+  await eventually(async () => {
+    await credentialInput.fill('fast-credential');
+    assert.equal(await credentialInput.inputValue(), 'fast-credential');
+    assert.equal(await connect.isEnabled(), true, 'a pending tenant lookup must allow an explicit credential replacement');
+  });
   await eventually(async () => connect.click());
   await waitForSingleTenantScope(page, 'fast-tenant');
   slowTenants.resolve();
