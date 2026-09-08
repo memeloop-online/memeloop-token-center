@@ -99,7 +99,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
     await route.fulfill({ status: 200, contentType: 'application/json', body });
   });
 
-  await this.open('/operator?view=requests', { theme: 'dark', locale: 'zh-CN' });
+  await this.open('/operator?view=settings', { theme: 'dark', locale: 'zh-CN' });
   const credentialInput = page.locator('.operator-credential input[type="password"]');
   const connect = page.getByRole('button', { name: '连接', exact: true });
 

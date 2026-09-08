@@ -40,6 +40,15 @@
   font-weight: 400;
 }
 
+.session-list-sidebar .session-sidebar-card {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
 .session-sidebar-item:last-child { border-bottom: 0; }
 .session-sidebar-item:hover { background: #102126; }
 .session-sidebar-item.selected { box-shadow: inset 3px 0 #5ed8c6; background: #102a2d; }

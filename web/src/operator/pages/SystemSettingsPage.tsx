@@ -28,7 +28,7 @@ export function OperatorAccessSettings({ credentialInput, credential, authentica
       </div>
       {credential && <span className="status ok">{t('common.savedCredentialInUse')}</span>}
     </div>
-    <form className="system-settings-access" onSubmit={(event) => { event.preventDefault(); if (credentialInput.trim()) onConnect(credentialInput); }}>
+    <form className="system-settings-access operator-credential" onSubmit={(event) => { event.preventDefault(); if (credentialInput.trim()) onConnect(credentialInput); }}>
       <label htmlFor="operator-access-credential">{t('settings.accessCredential')}<input id="operator-access-credential" autoComplete="new-password" type="password" value={credentialInput} onChange={(event) => onCredentialInput(event.target.value)} placeholder={t('operator.tokenPlaceholder')} /></label>
       <div className="button-row"><button type="submit" disabled={authenticating || !credentialInput.trim()}>{authenticating ? t('common.loading') : credential ? t('settings.replaceCredential') : t('common.connect')}</button>{credential && <button type="button" className="secondary" onClick={onClear}>{t('common.clearCredential')}</button>}</div>
     </form>

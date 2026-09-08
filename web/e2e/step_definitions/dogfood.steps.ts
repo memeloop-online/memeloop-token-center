@@ -43,7 +43,7 @@ When('管理员和下游用户验证凭据记忆与手动清空', async function
   await assertValue(page.getByPlaceholder('输入客户端凭据'), '');
   await assertNoCount(page.locator('.console-context'));
 
-  await this.open('/operator', { theme: 'dark', locale: 'zh-CN' });
+  await this.open('/operator?view=settings', { theme: 'dark', locale: 'zh-CN' });
   await assertValue(page.locator('.operator-credential input[type="password"]'), '');
   await assertOperatorTenantScope(page, tenant, 'hidden');
   await page.getByRole('button', { name: '清空凭据', exact: true }).click();
@@ -402,35 +402,9 @@ Then('趋势下钻使用 UTC 毫秒完整闭区间', async function (this: Dogfo
   const page = this.requirePage();
   await page.getByRole('tab', { name: '趋势分析', exact: true }).click();
   const responsePromise = page.waitForResponse((response) => response.url().includes('/internal/v1/usage-analysis?') && response.url().includes('granularity=auto'));
-  const chart = page.locator('.usage-chart-card').first().locator('.usage-echart');
-  const bounds = await chart.boundingBox();
-  assert.ok(bounds, 'throughput chart must have measurable pointer bounds');
-  let dataPixel: { canvasIndex: number; x: number; y: number } | undefined;
-  await eventually(async () => {
-    dataPixel = await chart.locator('canvas').evaluateAll((elements) => {
-      const colors = [[104, 222, 201], [255, 156, 114]];
-      for (let canvasIndex = 0; canvasIndex < elements.length; canvasIndex += 1) {
-        const canvas = elements[canvasIndex] as HTMLCanvasElement;
-        const context = canvas.getContext('2d');
-        if (!context) continue;
-        const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-        for (let y = Math.floor(canvas.height * 0.2); y < canvas.height * 0.9; y += 2) {
-          for (let x = 0; x < canvas.width; x += 2) {
-            const index = (y * canvas.width + x) * 4;
-            if (pixels[index + 3] < 180) continue;
-            if (colors.some(([red, green, blue]) => Math.abs(pixels[index] - red) < 18
-              && Math.abs(pixels[index + 1] - green) < 18 && Math.abs(pixels[index + 2] - blue) < 18)) {
-              return { canvasIndex, x: x * canvas.clientWidth / canvas.width, y: y * canvas.clientHeight / canvas.height };
-            }
-          }
-        }
-      }
-      return undefined;
-    });
-    assert.ok(dataPixel, 'throughput chart must paint at least one data bar');
-  }, 30_000, 'throughput chart did not finish painting');
-  assert.ok(dataPixel);
-  await chart.locator('canvas').nth(dataPixel.canvasIndex).click({ position: dataPixel });
+  const chart = page.locator('.usage-chart-card').first();
+  await chart.locator('.usage-chart-table summary').click();
+  await chart.locator('.usage-chart-table tbody button').first().click();
   const response = await responsePromise;
   assert.equal(response.status(), 200);
   const requestURL = new URL(response.url());

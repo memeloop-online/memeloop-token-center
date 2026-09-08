@@ -71,7 +71,7 @@ export async function connectOperator(
 ): Promise<void> {
   const page = world.requirePage();
   const seed = runtime.requireSeed();
-  await world.open('/operator', { theme, locale: 'zh-CN' });
+  await world.open('/operator?view=settings', { theme, locale: 'zh-CN' });
   await page.locator('input[type="password"]').fill(credential ?? seed.serviceCredential);
   await page.getByRole('button', { name: '连接', exact: true }).click();
   const tenantPicker = await assertOperatorTenantScope(page, tenant, pickerExpectation);

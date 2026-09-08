@@ -75,7 +75,7 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   await openAppRoute(page, 'operator', 'requests');
   await assertVisible(page.getByRole('heading', { name: '实时请求', exact: true }));
   const requestPanel = operatorTrafficPanel(page);
-  await assertNoCount(requestPanel.locator('.metric'));
+  await assertCount(requestPanel.locator('.request-traffic-metrics .metric'), 6);
   const builder = requestPanel.locator('.typed-filter-builder');
   const dialog = await openTypedFilterDialog(builder);
 

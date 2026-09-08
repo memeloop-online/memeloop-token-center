@@ -159,11 +159,13 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
     {values.map((session) => {
       const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name || t('sessions.reportedNameMissing');
       const isSelected = selected?.session_id === session.session_id && selected?.key_id === session.key_id;
-      return <button type="button" className={`session-sidebar-item${isSelected ? ' selected' : ''}`} key={`${session.key_id}:${session.session_id}`} onClick={() => onSelect(session)} aria-pressed={isSelected}>
-        <span className="session-sidebar-title"><b>{title}</b><span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span>
-        <span className="session-sidebar-context">{showCredential && <span>{session.key_alias || t('common.none')}</span>}<span>{session.model || t('common.none')}</span></span>
-        <span className="session-sidebar-meta"><span>{new Date(session.last_activity_at).toLocaleString(locale)}</span><span>{formatMetricNumber(session.requests, locale).text}</span></span>
-      </button>;
+      return <article className="session-card session-sidebar-card" key={`${session.key_id}:${session.session_id}`}>
+        <button type="button" className={`session-sidebar-item${isSelected ? ' selected' : ''}`} onClick={() => onSelect(session)} aria-pressed={isSelected} aria-label={t('sessions.open', { name: title })}>
+          <span className="session-sidebar-title"><b>{title}</b><span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span>
+          <span className="session-sidebar-context">{showCredential && <span>{session.key_alias || t('common.none')}</span>}<span>{session.model || t('common.none')}</span></span>
+          <span className="session-sidebar-meta"><span>{new Date(session.last_activity_at).toLocaleString(locale)}</span><span>{formatMetricNumber(session.requests, locale).text}</span></span>
+        </button>
+      </article>;
     })}
   </div>;
   return <div className="session-list">{values.map((session) => {
@@ -286,7 +288,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
     const request = requestPositions.get(requestId);
     return request ? t('sessions.timelinePoint', { index: request.index, time: new Date(request.createdAt).toLocaleString(locale) }) : t('sessions.timelineRequest');
   };
-  return <section className="session-detail" aria-label={title}>
+  return <section className="session-detail" role="dialog" aria-label={title}>
     <header className="session-detail-heading"><div><span className="eyebrow">{t('sessions.logicalSession')}</span><h2>{title}</h2></div>{onClose && <button type="button" className="secondary" onClick={onClose} aria-label={t('common.close')}>×</button>}</header>
     {showDiagnosticIds && <details className="session-diagnostics"><summary>{t('sessions.diagnostics')}</summary><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /></>}</details>}
     {detail.unlinked && <div className="notice warning" role="status"><b>{t('sessions.unlinkedRequests')}</b><br />{t('sessions.unlinkedDetail')}</div>}

@@ -128,15 +128,15 @@ Then('同时间戳会话详情分页无重复遗漏且 USD 与 CNY 分行', asyn
   await firstCard.getByRole('button', { name: /^打开 / }).click();
   const drawer = page.getByRole('dialog');
   await visible(drawer);
-  await eventually(async () => assert.equal(await drawer.locator('tbody tr').count(), 7));
+  await eventually(async () => assert.equal(await drawer.locator('.session-event').count(), 7));
   assert.match(await drawer.textContent() ?? '', /US\$|\$/);
   assert.match(await drawer.textContent() ?? '', /CN¥|¥/);
   await drawer.getByRole('button', { name: '加载更早请求', exact: true }).click();
-  await eventually(async () => assert.equal(await drawer.locator('tbody tr').count(), 8));
+  await eventually(async () => assert.equal(await drawer.locator('.session-event').count(), 8));
   const cursorUrl = new URL(observations.get(this)!.detailRequests.at(-1)!);
   assert.equal(cursorUrl.searchParams.get('before_created_at'), String(sharedCreatedAt));
   assert.equal(cursorUrl.searchParams.get('before_request_id'), 'session-request-007');
-  const rows = await drawer.locator('tbody tr').allTextContents();
+  const rows = await drawer.locator('.session-event').allTextContents();
   assert.equal(new Set(rows).size, 8, 'same-timestamp cursor must not duplicate or omit requests');
 });
 
