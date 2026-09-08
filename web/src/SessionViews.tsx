@@ -237,11 +237,11 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
   return <div className="session-activity">
     <aside className="session-actor-outline" aria-label={t('sessions.semantic')}>
       <div className="session-outline-heading"><span className="eyebrow">{t('sessions.semantic')}</span><b>{actors.size}</b></div>
-      <div className="session-actor-list">{[...actors.values()].map((actor) => <span className="session-actor" key={actor.label} title={actor.label}><b>{actor.label}</b><small>{formatMetricNumber(actor.requestIds.length, locale)}</small></span>)}</div>
+      <div className="session-actor-list">{[...actors.values()].map((actor) => <span className="session-actor" key={actor.label} title={actor.label}><b>{actor.label}</b><small>{formatMetricNumber(actor.requestIds.length, locale).text}</small></span>)}</div>
       {semantic.labels.length > 0 && <div className="session-labels">{semantic.labels.map((label) => <span key={label.key} className={label.conflict ? 'status pending' : undefined}><small>{label.key}</small><b>{label.values.join(label.conflict ? ' ≠ ' : '')}</b></span>)}</div>}
     </aside>
     <section className="session-event-feed" aria-label={t('sessions.timeline')}>
-      <div className="session-feed-heading"><div><span className="eyebrow">{t('sessions.timeline')}</span><h3>{t('sessions.executionTimeline')}</h3></div><span>{formatMetricNumber(requests.length, locale)}</span></div>
+      <div className="session-feed-heading"><div><span className="eyebrow">{t('sessions.timeline')}</span><h3>{t('sessions.executionTimeline')}</h3></div><span>{formatMetricNumber(requests.length, locale).text}</span></div>
       <ol>{requests.map((request, index) => {
         const node = nodes.get(request.request_id);
         const relations = relationsByChild.get(request.request_id) ?? [];

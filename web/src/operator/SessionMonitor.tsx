@@ -163,7 +163,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
           : undefined;
         const currentlyVisible = selectedRef.current && page.some((session) => session.session_id === selectedRef.current?.session_id && session.key_id === selectedRef.current?.key_id);
         const target = focused ?? (!pendingFocus && !currentlyVisible ? page[0] : undefined);
-        if (focused) handledFocus.current = focus.revision;
+        if (focused && pendingFocus) handledFocus.current = pendingFocus.revision;
         if (target) void selectSession(target);
       }
     } catch (reason) {

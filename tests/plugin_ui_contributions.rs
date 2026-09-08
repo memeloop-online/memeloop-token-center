@@ -112,7 +112,10 @@ async fn arbitrary_operator_presentation_is_rejected_before_plugin_load() {
     write_package(&plugins, "unsupported-presentation", &manifest);
     let database_url = format!(
         "sqlite://{}?mode=rwc",
-        directory.path().join("unsupported-presentation.db").display()
+        directory
+            .path()
+            .join("unsupported-presentation.db")
+            .display()
     );
     let mut config = Config::for_test(database_url);
     config.plugin_dir = Some(plugins.display().to_string());
