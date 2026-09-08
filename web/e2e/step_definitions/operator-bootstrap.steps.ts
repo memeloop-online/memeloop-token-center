@@ -112,7 +112,7 @@ When('操作台依次验证单租户、多租户、租户发现失败和快速�
     && request.headers().authorization === 'Bearer singleton-credential');
   await eventually(async () => connect.click());
   await singletonDiscovery;
-  assert.equal(observed.filter((value) => value.credential === 'singleton-credential').length, 1);
+  await eventually(() => assert.equal(observed.filter((value) => value.credential === 'singleton-credential').length, 1));
   assert.equal(observed.find((value) => value.credential === 'singleton-credential')?.path, '/internal/v1/tenants');
   await waitForConsoleContext(page, /^载入中…$/);
   singletonTenants.resolve();
