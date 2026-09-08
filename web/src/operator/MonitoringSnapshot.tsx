@@ -31,6 +31,19 @@ function Freshness({ snapshot }: { snapshot: OperatorMonitoringSnapshot }) {
   return <span title={occurred}>{t('monitoring.freshnessAge', { age })}</span>;
 }
 
+function MonitoringMetricList({ metrics }: { metrics: OperatorMonitoringSnapshot['summary'] }) {
+  const { locale, t } = useI18n();
+  const terminal = metrics.successful_requests + metrics.failed_requests;
+  const successRate = terminal > 0 ? metrics.successful_requests / terminal : null;
+  return <dl className="monitoring-metric-list">
+    <div><dt>{t('usage.requests')}</dt><dd>{formatNumber(metrics.requests, locale)}</dd></div>
+    <div><dt>{t('usage.successRate')}</dt><dd>{formatPercent(successRate, locale)}</dd></div>
+    <div><dt>{t('usage.average')}</dt><dd>{formatMilliseconds(metrics.avg_duration_ms, locale)}</dd></div>
+    <div><dt>{t('usage.p95Approx')}</dt><dd>{formatMilliseconds(metrics.p95_duration_ms, locale)}</dd></div>
+    <div><dt>{t('traffic.cost')}</dt><dd><CostLines costs={metrics.costs} /></dd></div>
+  </dl>;
+}
+
 export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringSnapshot }) {
   const { locale, t } = useI18n();
   const summary = snapshot.summary;
@@ -42,7 +55,7 @@ export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringS
         <div><h2 id="monitoring-heading">{t('monitoring.title')}</h2><p className="muted">{range}</p></div>
         <HealthBadge health={snapshot.health} />
       </div>
-      <section className="metrics operator-monitoring-metrics" aria-label={t('monitoring.summary')}>
+      <section className="metrics operator-monitoring-metrics monitoring-metrics-grid" aria-label={t('monitoring.summary')}>
         <NumberMetric label={t('usage.requests')} value={summary.requests} />
         <NumberMetric label={t('traffic.success')} value={summary.successful_requests} tone="positive" />
         <NumberMetric label={t('traffic.failure')} value={summary.failed_requests} tone="negative" />
@@ -64,13 +77,7 @@ export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringS
               <div><b>{value.upstream_name}</b><code>{value.model}</code></div>
               <HealthBadge health={value.health} />
             </div>
-            <div className="monitoring-top-metrics">
-              <span>{t('usage.requests')}: {formatNumber(metrics.requests, locale)}</span>
-              <span>{t('traffic.success')}: {formatNumber(metrics.successful_requests, locale)}</span>
-              <span>{t('traffic.failure')}: {formatNumber(metrics.failed_requests, locale)}</span>
-              <span>{t('usage.p95Approx')}: {formatMilliseconds(metrics.p95_duration_ms, locale)}</span>
-              <CostLines costs={metrics.costs} />
-            </div>
+            <MonitoringMetricList metrics={metrics} />
             <ol className="monitoring-outcomes" aria-label={t('monitoring.terminalOutcomes')}>
               {value.terminal_outcomes.slice(0, 5).map((outcome) => <li key={`${outcome.source}\0${outcome.id}`}>
                 <time dateTime={new Date(outcome.created_at).toISOString()}>{new Date(outcome.created_at).toLocaleString(locale)}</time>

@@ -24,6 +24,22 @@
   color: var(--muted, #82979e);
 }
 
+.request-traffic-metrics {
+  margin-top: 2px;
+}
+
+.request-traffic-metrics .metric-value {
+  white-space: nowrap;
+}
+
+.table-scroll table {
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+.table-scroll td:first-child {
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
 @media (max-width: 599px) {
   .request-session-cell {
     min-width: 8.5rem;

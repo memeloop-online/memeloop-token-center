@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../../api';
-import { DrawerFrame, RequestTable } from '../../components';
+import { DrawerFrame, Metric, NumberMetric, RequestTable } from '../../components';
+import { formatMilliseconds, formatPercent } from '../../format';
 import { useI18n } from '../../i18n';
 import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, TypedFilterAst, UpstreamAccount } from '../../types';
 import type { SessionStreamState } from '../SessionMonitor';
 import { messageOf, queryForTenant } from '../scope/operatorShared';
 import { TypedFilterBuilder } from '../TypedFilterBuilder';
-import { emptyTypedFilterAst, mergeLiveRequestEvents, typedFiltersActive, typedRequestQueryBody } from '../traffic/requestTraffic';
+import { emptyTypedFilterAst, mergeLiveRequestEvents, summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody } from '../traffic/requestTraffic';
 
 export function RequestsPage({ token, tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession }: {
   token: string;
@@ -130,9 +131,18 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   onOpenSessions: () => void;
   onOpenSession: (sessionId: string) => void;
 }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
+  const summary = summarizeVisibleRequests(requests);
   return <article className="panel"><div className="panel-title traffic-heading"><div><h2>{typedFiltersActive(filters) ? t('traffic.filtered') : t('traffic.live')}</h2><span>{typedFiltersActive(filters) ? t('traffic.filteredHint') : t('traffic.liveHint')}</span></div><div className="traffic-heading-actions"><div className={`request-live-state session-live-state ${streamState}`} role="status">{t(`sessions.live.${streamState}`)}</div><div className="segmented" role="group" aria-label={t('sessions.monitorMode')}><button type="button" className="active" aria-pressed="true">{t('sessions.requestsMode')}</button><button type="button" aria-pressed="false" onClick={onOpenSessions}>{t('sessions.sessionsMode')}</button></div></div></div>
     <TypedFilterBuilder ast={filters} disabled={loading} onApply={onApply} onClear={onClear} scope="requests" token={token} tenant={tenant} upstreams={upstreams} />
+    {requests.length > 0 && <section className="metrics request-traffic-metrics" aria-label={t('monitoring.summary')}>
+      <NumberMetric label={t('usage.requests')} value={summary.requests} />
+      <NumberMetric label={t('traffic.success')} value={summary.successful} tone="positive" />
+      <NumberMetric label={t('traffic.failure')} value={summary.failed} tone="negative" />
+      <NumberMetric label={t('common.running')} value={summary.running} tone={summary.running > 0 ? 'pending' : undefined} />
+      <Metric label={t('usage.successRate')} value={formatPercent(summary.successRate, locale)} tone="positive" />
+      <Metric label={t('usage.average')} value={formatMilliseconds(summary.averageDurationMs, locale)} />
+    </section>}
     <RequestTable requests={requests} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />
     {hasOlder && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
   </article>;

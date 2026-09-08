@@ -60,6 +60,67 @@
   white-space: nowrap;
 }
 
+/* Operator monitoring and traffic summaries use the same metric primitive as
+   the rest of the product, while reserving enough inline width for precise
+   locale-formatted numbers. */
+.metrics.monitoring-metrics-grid,
+.metrics.request-traffic-metrics {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12.5rem), 1fr));
+}
+
+.monitoring-top-list {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 25rem), 1fr));
+}
+
+.operator-monitoring .monitoring-top-list > li {
+  background: color-mix(in srgb, #102127 72%, transparent);
+  border: 1px solid #254148;
+  border-radius: 8px;
+  min-width: 0;
+  padding: 16px;
+}
+
+.operator-monitoring .monitoring-top-list > li:first-child {
+  border-top: 1px solid #254148;
+  padding-top: 16px;
+}
+
+.monitoring-metric-list {
+  display: grid;
+  gap: 8px 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 14px 0 0;
+}
+
+.monitoring-metric-list > div {
+  min-width: 0;
+}
+
+.monitoring-metric-list dt {
+  color: #70858d;
+  font-size: 0.69rem;
+  font-variant-numeric: lining-nums tabular-nums;
+  letter-spacing: 0.065em;
+  line-height: 1.35;
+  text-transform: uppercase;
+}
+
+.monitoring-metric-list dd {
+  font-size: 0.94rem;
+  font-variant-numeric: lining-nums tabular-nums;
+  font-weight: 650;
+  line-height: 1.35;
+  margin: 3px 0 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.monitoring-metric-list .monitoring-cost-lines {
+  align-items: baseline;
+}
+
 :root[data-theme='light'] .metric > .metric-label,
 :root[data-theme='light'] .metric-compact {
   color: #566d73;
@@ -70,4 +131,8 @@
   .usage-metrics .metric > .metric-value {
     font-size: 1.5rem;
   }
+}
+
+@media (width <= 540px) {
+  .monitoring-metric-list { grid-template-columns: minmax(0, 1fr); }
 }

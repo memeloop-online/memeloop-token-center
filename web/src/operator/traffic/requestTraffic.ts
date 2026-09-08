@@ -6,6 +6,54 @@ export function typedFiltersActive(ast: TypedFilterAst) {
   return ast.conditions.length > 0;
 }
 
+/**
+ * A summary of the records currently visible in the operator traffic view.
+ *
+ * This deliberately stays a view summary: pagination and live events can
+ * mean it represents fewer records than the full query result.  Terminal
+ * status is the same status predicate used by the shared request table, so
+ * success-rate and latency never treat an in-flight request as a failure.
+ */
+export interface VisibleRequestTrafficSummary {
+  requests: number;
+  successful: number;
+  failed: number;
+  running: number;
+  successRate: number | null;
+  averageDurationMs: number | null;
+}
+
+export function summarizeVisibleRequests(requests: readonly RequestView[]): VisibleRequestTrafficSummary {
+  let successful = 0;
+  let failed = 0;
+  let running = 0;
+  let durationTotal = 0;
+  let durationCount = 0;
+
+  for (const request of requests) {
+    if (request.status_code === null) {
+      running += 1;
+      continue;
+    }
+    if (request.status_code < 400) successful += 1;
+    else failed += 1;
+    if (request.duration_ms !== null && Number.isFinite(request.duration_ms)) {
+      durationTotal += request.duration_ms;
+      durationCount += 1;
+    }
+  }
+
+  const terminal = successful + failed;
+  return {
+    requests: requests.length,
+    successful,
+    failed,
+    running,
+    successRate: terminal > 0 ? successful / terminal : null,
+    averageDurationMs: durationCount > 0 ? durationTotal / durationCount : null,
+  };
+}
+
 export function typedRequestQueryBody(tenant: string, ast: TypedFilterAst, before?: RequestListCursor) {
   return {
     tenant_external_id: tenant || undefined,
