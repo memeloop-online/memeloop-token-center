@@ -42,6 +42,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     const page = await browser.newPage();
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-diagnostics.html`);
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `http://127.0.0.1:${address.port}` });
     const recorded = page.locator('[data-fixture-request="recorded"]');
     const historicalGap = page.locator('[data-fixture-request="historical-gap"]');
     const recordedDiagnostics = recorded.locator('.request-diagnostics');
@@ -64,14 +65,9 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.doesNotMatch(historicalGapText, /Cache read|Cache write/, 'missing historical cache fields must remain absent rather than becoming zero-valued rows');
     assert.equal((await page.locator('tbody tr').nth(1).locator('td').nth(7).textContent())?.trim(), '—', 'an explicit historical null currency must not inherit the current credential currency');
 
-    await page.evaluate(() => {
-      Object.defineProperty(navigator, 'clipboard', {
-        configurable: true,
-        value: { writeText: (value: string) => { document.body.dataset.fixtureCopied = value; return Promise.resolve(); } },
-      });
-    });
     await recordedRow.locator('.request-id-control.compact .copy-control button').click();
-    assert.equal(await page.locator('body').getAttribute('data-fixture-copied'), requestId);
+    await recordedRow.getByRole('button', { name: 'Copied', exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), requestId);
 
     await recordedRow.locator('.request-session-cell .table-link').click();
     assert.equal(await page.locator('[data-fixture-session-opened]').textContent(), sessionId);
