@@ -4,6 +4,37 @@ import { useI18n } from '../../i18n';
 import type { FilterAssistantSettings, ModelRouteView } from '../../types';
 import { messageOf, queryForTenant } from '../scope/operatorShared';
 
+export interface OperatorAccessSettingsProps {
+  credentialInput: string;
+  credential: string;
+  authenticating?: boolean;
+  onCredentialInput: (value: string) => void;
+  onConnect: (value: string) => void;
+  onClear: () => void;
+}
+
+/**
+ * The operator access form belongs to System settings. Keeping it as a
+ * small controlled component lets the application shell keep authentication
+ * state while avoiding a credential editor on every management page.
+ */
+export function OperatorAccessSettings({ credentialInput, credential, authenticating = false, onCredentialInput, onConnect, onClear }: OperatorAccessSettingsProps) {
+  const { t } = useI18n();
+  return <article className="panel settings-card settings-access-card">
+    <div className="settings-card-heading">
+      <div>
+        <h3>{t('settings.accessTitle')}</h3>
+        <p className="muted">{t('settings.accessDescription')}</p>
+      </div>
+      {credential && <span className="status ok">{t('common.savedCredentialInUse')}</span>}
+    </div>
+    <form className="system-settings-access" onSubmit={(event) => { event.preventDefault(); if (credentialInput.trim()) onConnect(credentialInput); }}>
+      <label htmlFor="operator-access-credential">{t('settings.accessCredential')}<input id="operator-access-credential" autoComplete="new-password" type="password" value={credentialInput} onChange={(event) => onCredentialInput(event.target.value)} placeholder={t('operator.tokenPlaceholder')} /></label>
+      <div className="button-row"><button type="submit" disabled={authenticating || !credentialInput.trim()}>{authenticating ? t('common.loading') : credential ? t('settings.replaceCredential') : t('common.connect')}</button>{credential && <button type="button" className="secondary" onClick={onClear}>{t('common.clearCredential')}</button>}</div>
+    </form>
+  </article>;
+}
+
 /**
  * Tenant-scoped system policy for the natural-language filter assistant.
  * The API intentionally stores only a stable model-route UUID; it neither

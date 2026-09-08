@@ -254,6 +254,9 @@
 .system-settings-form select { min-height: 44px; }
 .system-settings-form small { display: block; }
 .settings-status-note { border-left: 2px solid #b99142; margin: 18px 0 0; padding-left: 10px; }
+.system-settings-access { display: grid; gap: 14px; margin-top: 20px; max-width: 680px; }
+.system-settings-access label { color: #91aab0; display: grid; font-size: 12px; gap: 7px; }
+.system-settings-access input { min-height: 44px; }
 :root[data-theme='light'] .settings-empty { border-color: #a9c9c3; }
 :root[data-theme='light'] .settings-empty b { color: #24444a; }
 
