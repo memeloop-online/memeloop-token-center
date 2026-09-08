@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
-import { SessionDrawer, SessionList } from '../SessionViews';
+import { SessionDetailSurface, SessionList } from '../SessionViews';
 import type { KeyView, LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, RequestView } from '../types';
 import { selfErrorMessage } from './errors';
 import { sessionDetailPath, sessionsPath } from './requestPaths';
@@ -47,6 +47,8 @@ export function SessionsPage({ credential, credentialView, focusSessionId, onErr
         const focused = response.sessions.find((session) => session.session_id === focusSessionId);
         if (focused) void selectSession(focused);
         else onError(t('self.resourceMissing'));
+      } else if (!before && response.sessions[0]) {
+        void selectSession(response.sessions[0]);
       }
     } catch (reason) {
       if (sequence === listSequence.current && !controller.signal.aborted) onError(selfErrorMessage(reason, t, t('common.requestFailed')));
@@ -125,9 +127,15 @@ export function SessionsPage({ credential, credentialView, focusSessionId, onErr
   return <div className="self-page self-sessions-page" data-self-page="sessions">
     <article className="panel self-sessions">
       <div className="panel-title"><div><h2>{t('sessions.selfTitle')}</h2></div><span>{t('sessions.loaded', { count: formatNumber(sessions.length, locale) })}{generatedAt > 0 && ` · ${t('sessions.generatedAt', { time: new Date(generatedAt).toLocaleString(locale) })}`}</span></div>
-      <SessionList values={sessions} loading={loading} showCredential={false} onSelect={(session) => void selectSession(session)} />
-      {nextCursor && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void fetchSessions(nextCursor)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
+      <div className="session-workspace self-session-workspace">
+        <section className="session-browser" aria-label={t('sessions.recent')}>
+          <SessionList values={sessions} loading={loading} showCredential={false} selected={selected} layout="sidebar" onSelect={(session) => void selectSession(session)} />
+          {nextCursor && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void fetchSessions(nextCursor)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
+        </section>
+        <div className="session-detail-region">
+          {detail && <SessionDetailSurface detail={detail} summary={selected} currency={credentialView.currency} loading={loading} onLoadOlder={() => void fetchEarlierDetail()} onSelect={(request) => { setDetail(undefined); setSelected(undefined); onOpenRequest(request); }} onClose={() => { setDetail(undefined); setSelected(undefined); }} />}
+        </div>
+      </div>
     </article>
-    {detail && <SessionDrawer detail={detail} summary={selected} currency={credentialView.currency} loading={loading} onLoadOlder={() => void fetchEarlierDetail()} onSelect={(request) => { setDetail(undefined); setSelected(undefined); onOpenRequest(request); }} onClose={() => { setDetail(undefined); setSelected(undefined); }} />}
   </div>;
 }

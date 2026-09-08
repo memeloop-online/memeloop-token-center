@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type RefObject } from 'react';
 import { api } from '../api.js';
 import { useI18n } from '../i18n.js';
-import { SessionDrawer, SessionList } from '../SessionViews.js';
+import { SessionDetailSurface, SessionList } from '../SessionViews.js';
 import { drainSessionEventKeys, mergeSessionPage } from './sessionRefresh.js';
 import type {
   LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, RequestView,
@@ -156,12 +156,15 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       setListScope(requestScope);
       if (!background || !loadedOlderList.current || resetActiveTail) setNextCursor(response.next_cursor);
       setGeneratedAt(response.generated_at);
-      if (!older && focus && handledFocus.current !== focus.revision) {
-        const focused = page.find((session) => session.session_id === focus.sessionId && (!focus.keyId || session.key_id === focus.keyId));
-        if (focused) {
-          handledFocus.current = focus.revision;
-          void selectSession(focused);
-        }
+      if (!older && !background) {
+        const pendingFocus = focus && handledFocus.current !== focus.revision ? focus : undefined;
+        const focused = pendingFocus
+          ? page.find((session) => session.session_id === pendingFocus.sessionId && (!pendingFocus.keyId || session.key_id === pendingFocus.keyId))
+          : undefined;
+        const currentlyVisible = selectedRef.current && page.some((session) => session.session_id === selectedRef.current?.session_id && session.key_id === selectedRef.current?.key_id);
+        const target = focused ?? (!pendingFocus && !currentlyVisible ? page[0] : undefined);
+        if (focused) handledFocus.current = focus.revision;
+        if (target) void selectSession(target);
       }
     } catch (reason) {
       if (sequence !== listSequence.current) return;
@@ -351,8 +354,14 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       <div className="filter-actions"><button type="submit" disabled={loading}>{t('traffic.applyFilters')}</button><button type="button" className="secondary" disabled={loading || !Object.values(filters).some(Boolean)} onClick={() => { setDraft(emptySessionFilters); setFilters(emptySessionFilters); }}>{t('traffic.clearFilters')}</button></div>
     </form>
     <p className="muted session-result-count">{t('sessions.serverFiltered', { count: visibleSessions.length })}{listScope === scopeKey && generatedAt > 0 && <> · {t('sessions.generatedAt', { time: new Date(generatedAt).toLocaleString(locale) })}</>}</p>
-    <SessionList values={visibleSessions} loading={loading} showCredential onSelect={(session) => void selectSession(session)} />
-    {listScope === scopeKey && nextCursor && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(true, filters)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
-    {visibleDetail && <SessionDrawer detail={visibleDetail} summary={selected} showDiagnosticIds loading={loading} onLoadOlder={() => void loadEarlier()} onSelect={(request) => { setDetail(undefined); setDetailScope(''); setSelected(undefined); void onSelectRequest(request); }} onClose={() => { setDetail(undefined); setDetailScope(''); setSelected(undefined); }} />}
+    <div className="session-workspace">
+      <section className="session-browser" aria-label={t('sessions.recent')}>
+        <SessionList values={visibleSessions} loading={loading} showCredential selected={selected} layout="sidebar" onSelect={(session) => void selectSession(session)} />
+        {listScope === scopeKey && nextCursor && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(true, filters)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
+      </section>
+      <div className="session-detail-region">
+        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={loading} onLoadOlder={() => void loadEarlier()} onSelect={(request) => { setDetail(undefined); setDetailScope(''); setSelected(undefined); void onSelectRequest(request); }} onClose={() => { setDetail(undefined); setDetailScope(''); setSelected(undefined); }} />}
+      </div>
+    </div>
   </>;
 }

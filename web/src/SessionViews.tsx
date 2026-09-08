@@ -1,9 +1,10 @@
-import { DrawerFrame, RequestTable } from './components.js';
+import { DrawerFrame } from './components.js';
 import type { CSSProperties } from 'react';
 import { formatCurrency, formatMetricNumber, formatMilliseconds, formatPercent } from './format.js';
 import { useI18n } from './i18n.js';
 import { deriveSemanticExecution } from './sessionSemantics.js';
-import type { LogicalSessionDetail, LogicalSessionSummary, RequestView, UsageAnalysisCost } from './types.js';
+import type { ConversationRequest, LogicalSessionDetail, LogicalSessionSummary, RequestView, UsageAnalysisCost } from './types.js';
+import './sessionViews.css';
 
 const semanticPalette = ['#6859d9', '#18a999', '#e68a2e', '#d74f70', '#4078c0', '#8a63b8'];
 
@@ -145,14 +146,27 @@ function SessionMetricNumber({ value }: { value: number }) {
   return <span title={formatted.title}>{formatted.text}</span>;
 }
 
-export function SessionList({ values, loading, showCredential, onSelect }: {
+export function SessionList({ values, loading, showCredential, onSelect, selected, layout = 'cards' }: {
   values: LogicalSessionSummary[];
   loading: boolean;
   showCredential: boolean;
   onSelect: (session: LogicalSessionSummary) => void;
+  selected?: Pick<LogicalSessionSummary, 'key_id' | 'session_id'>;
+  layout?: 'cards' | 'sidebar';
 }) {
   const { locale, t } = useI18n();
   if (!values.length) return <div className="empty">{loading ? t('common.loading') : t('sessions.empty')}</div>;
+  if (layout === 'sidebar') return <div className="session-list session-list-sidebar" aria-label={t('sessions.recent')}>
+    {values.map((session) => {
+      const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name || t('sessions.reportedNameMissing');
+      const isSelected = selected?.session_id === session.session_id && selected?.key_id === session.key_id;
+      return <button type="button" className={`session-sidebar-item${isSelected ? ' selected' : ''}`} key={`${session.key_id}:${session.session_id}`} onClick={() => onSelect(session)} aria-pressed={isSelected}>
+        <span className="session-sidebar-title"><b>{title}</b><span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span>
+        <span className="session-sidebar-context">{showCredential && <span>{session.key_alias || t('common.none')}</span>}<span>{session.model || t('common.none')}</span></span>
+        <span className="session-sidebar-meta"><span>{new Date(session.last_activity_at).toLocaleString(locale)}</span><span>{formatMetricNumber(session.requests, locale).text}</span></span>
+      </button>;
+    })}
+  </div>;
   return <div className="session-list">{values.map((session) => {
     const title = session.unlinked
       ? t('sessions.unlinkedRequests')
@@ -180,6 +194,116 @@ export function SessionList({ values, loading, showCredential, onSelect }: {
   })}</div>;
 }
 
+function SessionActivity({ detail, summary, currency, loading, onSelect }: {
+  detail: LogicalSessionDetail;
+  summary?: LogicalSessionSummary;
+  currency?: string;
+  loading: boolean;
+  onSelect: (request: RequestView) => void;
+}) {
+  const { locale, t } = useI18n();
+  const requests = [...detail.requests].sort((left, right) => left.created_at - right.created_at || left.request_id.localeCompare(right.request_id));
+  const semantic = deriveSemanticExecution(detail);
+  const nodes = new Map(semantic.nodes.map((node) => [node.requestId, node]));
+  const byId = new Map(requests.map((request, index) => [request.request_id, { request, index }]));
+  const relationsByChild = new Map<string, LogicalSessionDetail['edges']>();
+  for (const edge of detail.edges) {
+    if (edge.relation === 'candidate') continue;
+    relationsByChild.set(edge.to_request_id, [...(relationsByChild.get(edge.to_request_id) ?? []), edge]);
+  }
+  const actors = new Map<string, { label: string; requestIds: string[] }>();
+  const actorFor = (request: ConversationRequest, index: number) => request.execution?.agent_id
+    || request.structure?.client_name
+    || t('sessions.executionNode', { index: index + 1 });
+  for (const [index, request] of requests.entries()) {
+    const label = actorFor(request, index);
+    const actor = actors.get(label) ?? { label, requestIds: [] };
+    actor.requestIds.push(request.request_id);
+    actors.set(label, actor);
+  }
+  const summaryCurrency = summary?.costs.length === 1 ? summary.costs[0].currency : undefined;
+  const eventMetrics = (request: ConversationRequest) => [
+    `${formatMetricNumber(request.input_tokens + request.output_tokens, locale).text} ${t('request.tokenUnit')}`,
+    request.duration_ms === null ? '—' : formatMilliseconds(request.duration_ms, locale),
+    request.currency || currency || summaryCurrency ? formatCurrency(request.cost, request.currency ?? currency ?? summaryCurrency ?? '', locale) : '—',
+  ];
+  const parentLabel = (request: ConversationRequest) => {
+    const node = nodes.get(request.request_id);
+    if (!node?.parentRequestId) return undefined;
+    const parent = byId.get(node.parentRequestId);
+    return parent ? actorFor(parent.request, parent.index) : t('sessions.timelineRequest');
+  };
+
+  return <div className="session-activity">
+    <aside className="session-actor-outline" aria-label={t('sessions.semantic')}>
+      <div className="session-outline-heading"><span className="eyebrow">{t('sessions.semantic')}</span><b>{actors.size}</b></div>
+      <div className="session-actor-list">{[...actors.values()].map((actor) => <span className="session-actor" key={actor.label} title={actor.label}><b>{actor.label}</b><small>{formatMetricNumber(actor.requestIds.length, locale)}</small></span>)}</div>
+      {semantic.labels.length > 0 && <div className="session-labels">{semantic.labels.map((label) => <span key={label.key} className={label.conflict ? 'status pending' : undefined}><small>{label.key}</small><b>{label.values.join(label.conflict ? ' ≠ ' : '')}</b></span>)}</div>}
+    </aside>
+    <section className="session-event-feed" aria-label={t('sessions.timeline')}>
+      <div className="session-feed-heading"><div><span className="eyebrow">{t('sessions.timeline')}</span><h3>{t('sessions.executionTimeline')}</h3></div><span>{formatMetricNumber(requests.length, locale)}</span></div>
+      <ol>{requests.map((request, index) => {
+        const node = nodes.get(request.request_id);
+        const relations = relationsByChild.get(request.request_id) ?? [];
+        const parent = parentLabel(request);
+        const actor = actorFor(request, index);
+        const status = request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending';
+        const task = request.execution?.task_kind;
+        return <li className={`session-event${request.unlinked ? ' inferred' : ''}`} key={request.request_id} style={{ '--session-depth': node?.depth ?? 0 } as CSSProperties}>
+          <span className="session-event-rail" aria-hidden="true"><i /></span>
+          <article>
+            <header><div><b>{actor}</b>{task && <span className="pill">{task}</span>}{relations.map((relation) => <span className="session-relation" key={`${relation.from_request_id ?? 'root'}-${relation.relation}`}>{t(`conversationRelation.${relation.relation}`)}</span>)}</div><time dateTime={new Date(request.created_at).toISOString()}>{new Date(request.created_at).toLocaleString(locale)}</time></header>
+            <div className="session-event-request"><code>{request.model}</code><span>{request.protocol}</span><span className={`status ${status}`}>{request.status_code ?? t('common.running')}</span></div>
+            {parent && <p className="session-event-parent">← {parent}</p>}
+            <footer><span>{eventMetrics(request).join(' · ')}</span>{request.error_code && <code className="error-code">{request.error_code}</code>}<button type="button" className="secondary session-event-open" disabled={loading} onClick={() => onSelect(request)}>{t('request.inspect')}</button></footer>
+          </article>
+        </li>;
+      })}</ol>
+    </section>
+  </div>;
+}
+
+export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose }: {
+  detail: LogicalSessionDetail;
+  summary?: LogicalSessionSummary;
+  currency?: string;
+  showDiagnosticIds?: boolean;
+  loading: boolean;
+  onLoadOlder: () => void;
+  onSelect: (request: RequestView) => void;
+  onClose?: () => void;
+}) {
+  const { locale, t } = useI18n();
+  const declaredSessionName = [...detail.requests].reverse().find((request) => request.execution?.session_name)?.execution?.session_name;
+  const reportedSessionId = [...detail.requests].reverse().find((request) => request.structure?.session_id)?.structure?.session_id;
+  const title = detail.unlinked
+    ? t('sessions.unlinkedRequests')
+    : declaredSessionName || summary?.session_name || t('sessions.reportedNameMissing');
+  const confirmedEdges = detail.edges.filter((edge) => edge.relation !== 'candidate');
+  const candidateEdges = detail.edges.filter((edge) => edge.relation === 'candidate');
+  const requestPositions = new Map(detail.requests.map((request, index) => [request.request_id, { index: index + 1, createdAt: request.created_at }]));
+  const requestLabel = (requestId: string | null) => {
+    if (!requestId) return t('sessions.root');
+    const request = requestPositions.get(requestId);
+    return request ? t('sessions.timelinePoint', { index: request.index, time: new Date(request.createdAt).toLocaleString(locale) }) : t('sessions.timelineRequest');
+  };
+  return <section className="session-detail" aria-label={title}>
+    <header className="session-detail-heading"><div><span className="eyebrow">{t('sessions.logicalSession')}</span><h2>{title}</h2></div>{onClose && <button type="button" className="secondary" onClick={onClose} aria-label={t('common.close')}>×</button>}</header>
+    {showDiagnosticIds && <details className="session-diagnostics"><summary>{t('sessions.diagnostics')}</summary><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /></>}</details>}
+    {detail.unlinked && <div className="notice warning" role="status"><b>{t('sessions.unlinkedRequests')}</b><br />{t('sessions.unlinkedDetail')}</div>}
+    <SessionActivity detail={detail} summary={summary} currency={currency} loading={loading} onSelect={onSelect} />
+    {detail.has_more && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('sessions.loadEarlier')}</button></div>}
+    {!detail.unlinked && <details className="session-analysis" open><summary>{t('sessions.semantic')}</summary><SemanticExecutionPanel detail={detail} /></details>}
+    <details className="session-relationships"><summary>{t('sessions.relationships')}</summary>{detail.edges_truncated && <div className="notice warning">{t('sessions.edgesTruncated')}</div>}<div className="edge-list">{confirmedEdges.map((edge) => <div className="edge" key={`${edge.from_request_id ?? 'root'}-${edge.to_request_id}-${edge.relation}`}>
+      <span className="status ok">{t(`conversationRelation.${edge.relation}`)}</span>
+      <span>{t(`sessions.relationship.${edge.relation}`, { from: requestLabel(edge.from_request_id), to: requestLabel(edge.to_request_id) })}</span>
+      <small className="muted">{t('sessions.confidence', { value: formatPercent(edge.confidence, locale) })}</small>
+    </div>)}{confirmedEdges.length === 0 && <div className="empty">{detail.unlinked ? t('sessions.noGuessedEdges') : t('sessions.singleObservation')}</div>}</div>
+    {candidateEdges.length > 0 && <details className="candidate-edges"><summary>{t('sessions.candidateRelationships', { count: candidateEdges.length })}</summary><p className="muted">{t('sessions.candidateHint')}</p><div className="edge-list">{candidateEdges.map((edge) => <div className="edge" key={`candidate-${edge.from_request_id ?? 'root'}-${edge.to_request_id}`}><span className="status pending">{t('conversationRelation.candidate')}</span><span>{t('sessions.relationshipSentence', { from: requestLabel(edge.from_request_id), to: requestLabel(edge.to_request_id) })}</span><small className="muted">{t('sessions.confidence', { value: formatPercent(edge.confidence, locale) })}</small></div>)}</div></details>}
+    </details>
+  </section>;
+}
+
 export function SessionDrawer({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose }: {
   detail: LogicalSessionDetail;
   summary?: LogicalSessionSummary;
@@ -190,35 +314,12 @@ export function SessionDrawer({ detail, summary, currency, showDiagnosticIds = f
   onSelect: (request: RequestView) => void;
   onClose: () => void;
 }) {
-  const { locale, t } = useI18n();
+  const { t } = useI18n();
   const declaredSessionName = [...detail.requests].reverse().find((request) => request.execution?.session_name)?.execution?.session_name;
-  const reportedSessionId = [...detail.requests].reverse().find((request) => request.structure?.session_id)?.structure?.session_id;
   const title = detail.unlinked
     ? t('sessions.unlinkedRequests')
     : declaredSessionName || summary?.session_name || t('sessions.reportedNameMissing');
-  const summaryCurrency = summary?.costs.length === 1 ? summary.costs[0].currency : undefined;
-  const requestPositions = new Map(detail.requests.map((request, index) => [request.request_id, { index: index + 1, createdAt: request.created_at }]));
-  const confirmedEdges = detail.edges.filter((edge) => edge.relation !== 'candidate');
-  const candidateEdges = detail.edges.filter((edge) => edge.relation === 'candidate');
-  const requestLabel = (requestId: string | null) => {
-    if (!requestId) return t('sessions.root');
-    const request = requestPositions.get(requestId);
-    return request ? t('sessions.timelinePoint', { index: request.index, time: new Date(request.createdAt).toLocaleString(locale) }) : t('sessions.timelineRequest');
-  };
   return <DrawerFrame title={title} eyebrow={t('sessions.logicalSession')} onClose={onClose}>
-    {showDiagnosticIds && <details className="session-diagnostics"><summary>{t('sessions.diagnostics')}</summary><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /></>}</details>}
-    {detail.unlinked && <div className="notice warning" role="status"><b>{t('sessions.unlinkedRequests')}</b><br />{t('sessions.unlinkedDetail')}</div>}
-    {!detail.unlinked && <SemanticExecutionPanel detail={detail} />}
-    <h3>{t('sessions.timeline')}</h3>
-    {detail.has_more && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('sessions.loadEarlier')}</button></div>}
-    <RequestTable requests={detail.requests} currency={currency ?? summaryCurrency} onSelect={onSelect} />
-    <h3>{t('sessions.relationships')}</h3>
-    {detail.edges_truncated && <div className="notice warning">{t('sessions.edgesTruncated')}</div>}
-    <div className="edge-list">{confirmedEdges.map((edge) => <div className="edge" key={`${edge.from_request_id ?? 'root'}-${edge.to_request_id}-${edge.relation}`}>
-      <span className="status ok">{t(`conversationRelation.${edge.relation}`)}</span>
-      <span>{t(`sessions.relationship.${edge.relation}`, { from: requestLabel(edge.from_request_id), to: requestLabel(edge.to_request_id) })}</span>
-      <small className="muted">{t('sessions.confidence', { value: formatPercent(edge.confidence, locale) })}</small>
-    </div>)}{confirmedEdges.length === 0 && <div className="empty">{detail.unlinked ? t('sessions.noGuessedEdges') : t('sessions.singleObservation')}</div>}</div>
-    {candidateEdges.length > 0 && <details className="candidate-edges"><summary>{t('sessions.candidateRelationships', { count: candidateEdges.length })}</summary><p className="muted">{t('sessions.candidateHint')}</p><div className="edge-list">{candidateEdges.map((edge) => <div className="edge" key={`candidate-${edge.from_request_id ?? 'root'}-${edge.to_request_id}`}><span className="status pending">{t('conversationRelation.candidate')}</span><span>{t('sessions.relationshipSentence', { from: requestLabel(edge.from_request_id), to: requestLabel(edge.to_request_id) })}</span><small className="muted">{t('sessions.confidence', { value: formatPercent(edge.confidence, locale) })}</small></div>)}</div></details>}
+    <SessionDetailSurface detail={detail} summary={summary} currency={currency} showDiagnosticIds={showDiagnosticIds} loading={loading} onLoadOlder={onLoadOlder} onSelect={onSelect} />
   </DrawerFrame>;
 }
