@@ -108,6 +108,14 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Run browser-backed web contracts
         run: MTC_REQUIRE_BROWSER=1 npm run test:localization
+      - name: Retain Overview trend browser evidence
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: overview-trends-browser-${{ github.sha }}
+          path: web/e2e-artifacts/overview-trends/
+          if-no-files-found: warn
+          retention-days: 14
       - name: Build the browser-test service before Cucumber.js starts it
         run: cargo build --locked --manifest-path ../Cargo.toml --bin memeloop-token-center
       - run: npm run test:e2e

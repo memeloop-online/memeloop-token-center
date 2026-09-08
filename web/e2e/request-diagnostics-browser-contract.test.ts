@@ -42,21 +42,24 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     const page = await browser.newPage();
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-diagnostics.html`);
-    await page.locator('.request-diagnostics').waitFor();
+    const recorded = page.locator('[data-fixture-request="recorded"]');
+    const historicalGap = page.locator('[data-fixture-request="historical-gap"]');
+    const recordedDiagnostics = recorded.locator('.request-diagnostics');
+    const historicalGapDiagnostics = historicalGap.locator('.request-diagnostics');
+    await Promise.all([recordedDiagnostics.waitFor(), historicalGapDiagnostics.waitFor()]);
 
     const tableId = page.locator('.request-id-control.compact code');
     assert.equal(await tableId.getAttribute('title'), requestId);
     assert.equal(await tableId.textContent(), requestId);
     assert.match(await page.locator('.request-token-cell small').textContent() ?? '', /Cache read 40.*Cache write 20/);
-    const recorded = page.locator('[data-fixture-request="recorded"]');
     assert.match(await recorded.textContent() ?? '', /http_429/);
     assert.match(await recorded.textContent() ?? '', new RegExp(upstreamId));
     assert.match(await recorded.textContent() ?? '', new RegExp(routeId));
-    const historicalGap = page.locator('[data-fixture-request="historical-gap"]');
     const historicalGapText = await historicalGap.textContent() ?? '';
     assert.match(historicalGapText, /Completed at—/);
     assert.match(historicalGapText, /Final upstream ID—/);
     assert.match(historicalGapText, /Final route ID—/);
+    assert.doesNotMatch(historicalGapText, /Cache read|Cache write/, 'missing historical cache fields must remain absent rather than becoming zero-valued rows');
     assert.equal((await page.locator('tbody tr').nth(1).locator('td').nth(7).textContent())?.trim(), '—', 'an explicit historical null currency must not inherit the current credential currency');
 
     await page.evaluate(() => {
@@ -79,7 +82,10 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
         const layout = await page.evaluate(() => {
           const tableScroller = document.querySelector<HTMLElement>('.table-scroll')!;
           const compactId = document.querySelector<HTMLElement>('.request-id-control.compact code')!;
-          const diagnostics = document.querySelector<HTMLElement>('.request-diagnostics')!;
+          const diagnostics = [...document.querySelectorAll<HTMLElement>('.request-diagnostics')].map((element) => ({
+            clientWidth: element.clientWidth,
+            scrollWidth: element.scrollWidth,
+          }));
           return {
             documentClientWidth: document.documentElement.clientWidth,
             documentScrollWidth: document.documentElement.scrollWidth,
@@ -87,14 +93,14 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
             tableScrollWidth: tableScroller.scrollWidth,
             compactIdClientWidth: compactId.clientWidth,
             compactIdScrollWidth: compactId.scrollWidth,
-            diagnosticsClientWidth: diagnostics.clientWidth,
-            diagnosticsScrollWidth: diagnostics.scrollWidth,
+            diagnostics,
           };
         });
         assert.ok(layout.documentScrollWidth <= layout.documentClientWidth, `${theme} ${width}px fixture must not create page overflow`);
         assert.ok(layout.tableScrollWidth >= layout.tableClientWidth, `${theme} ${width}px table remains in its own scroll container`);
         assert.ok(layout.compactIdScrollWidth >= layout.compactIdClientWidth, `${theme} ${width}px request ID remains safely clipped in its cell`);
-        assert.ok(layout.diagnosticsScrollWidth <= layout.diagnosticsClientWidth, `${theme} ${width}px detail diagnostics must remain contained`);
+        assert.equal(layout.diagnostics.length, 2, `${theme} ${width}px fixture must retain both recorded and historical diagnostic surfaces`);
+        for (const diagnostics of layout.diagnostics) assert.ok(diagnostics.scrollWidth <= diagnostics.clientWidth, `${theme} ${width}px each detail diagnostics surface must remain contained`);
       }
     }
   } finally {

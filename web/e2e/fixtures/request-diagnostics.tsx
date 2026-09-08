@@ -36,9 +36,16 @@ const request: RequestView = {
 };
 
 const historicalGap: RequestView = {
-  ...request,
   request_id: '3d9f7abc-b767-4668-a8d1-baa042ea1df2',
+  created_at: Date.UTC(2026, 8, 8, 12, 34, 56),
   completed_at: null,
+  protocol: 'openai',
+  model: 'fixture-long-model-name-for-request-observability',
+  status_code: 429,
+  duration_ms: 1234,
+  input_tokens: 160,
+  output_tokens: 32,
+  error_code: 'http_429',
   upstream_account_id: null,
   route_id: null,
   currency: null,

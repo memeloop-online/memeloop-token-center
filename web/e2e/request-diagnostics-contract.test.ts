@@ -16,8 +16,9 @@ test('request table exposes copyable durable IDs and its recorded token billing 
   assert.match(copyButton, /navigator\.clipboard\?\.writeText/);
   assert.match(components, /request\.tokenBreakdown/);
   assert.match(components, /requestTokenBreakdown/);
-  assert.match(components, /cached_input_tokens !== undefined/);
-  assert.match(components, /cache_write_tokens !== undefined/);
+  assert.match(components, /const cachedInputTokens = request\.cached_input_tokens;/);
+  assert.match(components, /const cacheWriteTokens = request\.cache_write_tokens;/);
+  assert.match(components, /if \(cachedInputTokens === undefined \|\| cacheWriteTokens === undefined\) return undefined;/);
   assert.doesNotMatch(components, /cached_input_tokens \?\? 0/);
   assert.doesNotMatch(components, /cache_write_tokens \?\? 0/);
 });

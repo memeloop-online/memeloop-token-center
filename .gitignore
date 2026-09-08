@@ -12,6 +12,7 @@
 .DS_Store
 web/test-results/
 web/playwright-report/
+web/e2e-artifacts/
 /tests/load/results/*-latest.json
 /tests/load/results/local-*.json
 node_modules/
