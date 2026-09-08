@@ -11,7 +11,7 @@ import { CredentialsPage, PricingPage, ProvidersPage, RoutesPage, ServiceCredent
 import { GenerationsPage, OverviewPage, PluginsPage, UsagePage } from './pages/OperatorPages';
 import { RequestsPage } from './pages/RequestsPage';
 import { SessionsPage } from './pages/SessionsPage';
-import { SystemSettingsPage } from './pages/SystemSettingsPage';
+import { OperatorAccessSettings, SystemSettingsPage } from './pages/SystemSettingsPage';
 import { operatorRouteKeys, isOperatorRouteKey, type OperatorRouteKey } from './scope/operatorRoutes';
 import { TenantManager } from './TenantManager';
 import {
@@ -133,6 +133,15 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     navigate('sessions');
   }
 
+  const accessSettings = <OperatorAccessSettings
+    credentialInput={scope.credentialInput}
+    credential={scope.credential}
+    authenticating={scope.authenticating}
+    onCredentialInput={scope.setCredentialInput}
+    onConnect={(credential) => { void scope.authenticate(credential); }}
+    onClear={scope.clearCredential}
+  />;
+
   let page: ReactNode = null;
   // Pages mount only after authentication and tenant discovery have produced
   // an exact scope. This prevents a transient empty tenant from turning a
@@ -153,7 +162,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
         case 'credentials': page = <CredentialsPage {...pageProps} />; break;
         case 'service-credentials': page = <ServiceCredentialsPage {...pageProps} />; break;
         case 'plugins': page = <PluginsPage {...pageProps} />; break;
-        case 'settings': page = <SystemSettingsPage {...pageProps} />; break;
+        case 'settings': page = <>{accessSettings}<SystemSettingsPage {...pageProps} /></>; break;
       }
     } else {
       const registered = pluginRegistry.pages.get(activeRoute);
@@ -161,17 +170,9 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
         ? <PluginContributionPage registered={registered} token={scope.activeCredential} tenant={scope.tenant} />
         : <div className="notice error" role="alert">This plugin page is no longer installed or available.</div>;
     }
-  }
+  } else if (!scope.authenticating) page = accessSettings;
 
   const content = <>
-    <header className="hero compact">
-      <div><span className="eyebrow">{t('operator.eyebrow')}</span><h1>Token Center</h1><p>{t('operator.subtitle')}</p><a className="button secondary portal-link" href="/portal">{t('operator.openPortal')}</a></div>
-      <div className="credential operator-credential">
-        <input aria-label={t('operator.serviceCredential')} autoComplete="off" type="password" value={scope.credentialInput} onChange={(event) => scope.setCredentialInput(event.target.value)} placeholder={t('operator.tokenPlaceholder')} />
-        <button type="button" disabled={!scope.credentialInput.trim()} onClick={() => void scope.authenticate(scope.credentialInput)}>{t('common.connect')}</button>
-        {scope.credential && <button type="button" className="secondary clear-credential" onClick={scope.clearCredential}>{t('common.clearCredential')}</button>}
-      </div>
-    </header>
     {scope.authenticating && <div className="console-context"><div><b>{t('common.loading')}</b></div></div>}
     {scope.activeCredential && scope.tenants.length === 0 && <div className="console-context"><div><b>{t('operator.noTenants')}</b></div></div>}
     {scope.activeCredential && scope.tenants.length > 1 && <div className="tenant-scope-switcher"><label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={scope.tenant} onChange={(event) => scope.setTenant(event.target.value)}>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{value.external_id}</option>)}</select></label></div>}
