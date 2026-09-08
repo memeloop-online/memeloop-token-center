@@ -7,7 +7,7 @@ pub(super) use framer::{
     SseFramerRejection, SseIdleControl, redacted_sse_event_bytes,
 };
 pub(super) use responses::{
-    ResponseIdentityGate, ResponsesStreamingSanitizer, is_sse_field_line, parse_sse_event,
-    safe_failure_event, trim_ascii,
+    ResponseIdentityGate, ResponsesStreamingSanitizer, is_response_metadata_event,
+    is_sse_field_line, parse_sse_event, safe_failure_event, trim_ascii,
 };
 pub(in crate::api) use unique_json::parse_unique_json;

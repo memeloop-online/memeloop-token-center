@@ -280,6 +280,13 @@ impl ResponsesStreamingSanitizer {
                 "event_type_mismatch",
             ));
         }
+        if is_response_metadata_event(payload_name) {
+            // Codex may send this opaque envelope before the response
+            // lifecycle. It has a top-level response_id rather than the
+            // lifecycle response.id that binds identity, so drop only this
+            // exact type before it can reach the identity gate.
+            return Ok(());
+        }
         if payload_name != "error" && !payload_name.starts_with("response.") {
             // Unknown provider events are opaque metadata. Do not let them
             // establish identity, affect lifecycle/accounting state, or
@@ -373,6 +380,13 @@ fn is_response_lifecycle_event_name(name: &str) -> bool {
             | "response.error"
             | "error"
     )
+}
+
+/// `response.metadata` is an opaque Codex envelope, not a Responses
+/// lifecycle event. Keep this exact so other `response.*` events retain the
+/// normal identity and terminal validation.
+pub(in crate::api) fn is_response_metadata_event(name: &str) -> bool {
+    name == "response.metadata"
 }
 
 pub(in crate::api) fn parse_sse_event(

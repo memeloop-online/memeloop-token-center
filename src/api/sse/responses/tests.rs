@@ -381,6 +381,46 @@ fn sanitizer_drops_opaque_metadata_before_response_lifecycle() {
 }
 
 #[test]
+fn sanitizer_drops_response_metadata_before_response_identity() {
+    let mut sanitizer = ResponsesStreamingSanitizer::default();
+    assert!(sanitizer
+        .push(
+            b"event: response.metadata\ndata: {\"type\":\"response.metadata\",\"response_id\":\"resp-metadata\"}\n\n",
+        )
+        .unwrap()
+        .is_empty());
+    assert!(!sanitizer.saw_protocol_event());
+
+    let mut output = sanitizer
+        .push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-metadata\"}}\n\n")
+        .unwrap()
+        .to_vec();
+    assert!(sanitizer
+        .push(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-metadata\"}}\n\ndata: [DONE]\n\n")
+        .unwrap()
+        .is_empty());
+    output.extend_from_slice(&sanitizer.finish().unwrap());
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("response.created"));
+    assert!(output.contains("response.completed"));
+    assert!(output.contains("data: [DONE]"));
+    assert!(!output.contains("response.metadata"));
+
+    for metadata in [
+        b"data: {\"type\":\"response.metadata.extra\",\"response_id\":\"resp-metadata\"}\n\n"
+            .as_slice(),
+        b"event: response.created\ndata: {\"type\":\"response.metadata\",\"response_id\":\"resp-metadata\"}\n\n"
+            .as_slice(),
+    ] {
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
+        assert_eq!(
+            sanitizer.push(metadata),
+            Err("upstream_invalid_response"),
+        );
+    }
+}
+
+#[test]
 fn sanitizer_rejection_stages_are_static_and_content_free() {
     let cases = [
         (

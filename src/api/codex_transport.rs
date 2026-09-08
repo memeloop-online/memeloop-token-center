@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use super::super::sse::{
     BoundedSseEvent, BoundedSseFramer, ResponseIdentityGate, ResponsesStreamingSanitizer,
-    SseFramerRejection, is_sse_field_line, parse_sse_event, parse_unique_json, trim_ascii,
+    SseFramerRejection, is_response_metadata_event, is_sse_field_line, parse_sse_event,
+    parse_unique_json, trim_ascii,
 };
 use super::{
     MAX_PROXY_LIFETIME, MAX_PROXY_RESPONSE_BODY, MAX_REPORTED_TOKENS,
@@ -857,6 +858,9 @@ impl BufferedResponsesParser {
         if event_kind.is_some_and(|event_kind| event_kind != payload_kind) {
             return Err("upstream_invalid_response");
         }
+        if is_response_metadata_event(payload_kind) {
+            return Ok(());
+        }
         let kind = payload_kind;
         if self.completed_response.is_some() || self.terminal_failure {
             self.invalid = true;
@@ -1239,6 +1243,33 @@ mod tests {
         assert_eq!(body["output"][1]["id"], "item-1");
         assert_eq!(result.usage.input_tokens, 3);
         assert_eq!(result.usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn buffered_parser_drops_response_metadata_before_response_identity() {
+        let stream = concat!(
+            "event: response.metadata\n",
+            "data: {\"type\":\"response.metadata\",\"response_id\":\"resp-metadata\"}\n\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-metadata\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-metadata\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let result = parse_buffered_sse_for_test(stream.as_bytes()).unwrap();
+        let response: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(response["id"], "resp-metadata");
+        assert_eq!(result.usage.input_tokens, 1);
+        assert_eq!(result.usage.output_tokens, 1);
+        assert!(response.get("metadata").is_none());
+
+        for metadata in [
+            b"data: {\"type\":\"response.metadata.extra\",\"response_id\":\"resp-metadata\"}\n\n"
+                .as_slice(),
+            b"event: response.created\ndata: {\"type\":\"response.metadata\",\"response_id\":\"resp-metadata\"}\n\n"
+                .as_slice(),
+        ] {
+            let mut parser = BufferedResponsesParser::default();
+            assert_eq!(parser.push(metadata), Err("upstream_invalid_response"));
+        }
     }
 
     fn completed_stream_with_usage(usage: &Value) -> Vec<u8> {
