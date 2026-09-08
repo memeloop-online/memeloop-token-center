@@ -11,6 +11,7 @@ import './theme.css';
 import './app-shell.css';
 import './styles/metrics.css';
 import './styles/request-table.css';
+import './sessionViews.css';
 
 const Operator = lazy(() => import('./operator/Operator').then((module) => ({ default: module.Operator })));
 

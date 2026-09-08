@@ -1,4 +1,4 @@
-import type { RequestEvent, RequestListCursor, RequestView, TypedFilterAst } from '../../types';
+import type { RequestEvent, RequestListCursor, RequestView, TypedFilterAst } from '../../types.js';
 
 export const emptyTypedFilterAst: TypedFilterAst = { logical_operator: 'and', conditions: [] };
 

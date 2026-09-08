@@ -4,7 +4,6 @@ import { formatCurrency, formatMetricNumber, formatMilliseconds, formatPercent }
 import { useI18n } from './i18n.js';
 import { deriveSemanticExecution } from './sessionSemantics.js';
 import type { ConversationRequest, LogicalSessionDetail, LogicalSessionSummary, RequestView, UsageAnalysisCost } from './types.js';
-import './sessionViews.css';
 
 const semanticPalette = ['#6859d9', '#18a999', '#e68a2e', '#d74f70', '#4078c0', '#8a63b8'];
 
