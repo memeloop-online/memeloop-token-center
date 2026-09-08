@@ -200,7 +200,11 @@ Then('六类可靠关系、候选关系、未关联请求和语义执行图被�
   await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
   const unlinked = page.locator('.session-card').filter({ hasText: '未关联请求' }).first();
   await visible(unlinked);
-  assert.match(await unlinked.textContent() ?? '', /未关联会话/);
+  const unlinkedText = await unlinked.textContent() ?? '';
+  // The compact session sidebar intentionally names this aggregation after
+  // the requests it contains. It must not be presented as an unnamed session.
+  assert.match(unlinkedText, /未关联请求/);
+  assert.doesNotMatch(unlinkedText, /未命名会话/);
 });
 
 When('连续新请求进入活跃状态并分别完成为成功和错误', async function (this: DogfoodWorld) {
