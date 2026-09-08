@@ -864,8 +864,11 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                 request: RequestView {
                     request_id: parse_uuid(row.try_get("id")?)?,
                     created_at: row.try_get("created_at")?,
+                    completed_at: None,
                     protocol: row.try_get("protocol")?,
                     model: row.try_get("model")?,
+                    upstream_account_id: None,
+                    route_id: None,
                     status_code: row.try_get("status_code")?,
                     duration_ms: row.try_get("duration_ms")?,
                     input_tokens: row.try_get("input_tokens")?,
@@ -873,6 +876,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                     cache_write_tokens: row.try_get("cache_write_tokens")?,
                     output_tokens: row.try_get("output_tokens")?,
                     cost: micros_to_decimal_string(row.try_get("cost_micros")?),
+                    currency: None,
                     error_code: row.try_get("error_code")?,
                     session_context: Some(RequestSessionContext {
                         session_id: row.try_get("session_id")?,

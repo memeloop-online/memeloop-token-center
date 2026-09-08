@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { api } from '../api';
+import { CopyButton } from '../CopyButton';
 import { Shell } from '../components';
 import { clearRememberedCredential, readRememberedCredential, rememberCredential } from '../credentialStorage';
 import { useI18n } from '../i18n';
@@ -174,13 +175,13 @@ export function SelfPortal({ route, onRouteChange, showNavigation = true, embedd
     : `signed-out:${credentialScopeGeneration}`;
 
   const content = <div className="self-portal" data-self-route={activeRoute}>
-    {!credentialView ? <header className="hero self-sign-in"><div><h1>{t('self.title')}</h1></div><form className="credential" onSubmit={submitCredential}><label><span>{t('self.credential')}</span><span className="credential-input"><input autoComplete="off" type={credentialVisible ? 'text' : 'password'} value={credentialInput} onChange={(event) => setCredentialInput(event.target.value)} placeholder={t('self.placeholder')} /><button type="button" className="secondary credential-visibility" aria-pressed={credentialVisible} onClick={() => setCredentialVisible((visible) => !visible)}>{t(credentialVisible ? 'common.hide' : 'common.show')}</button></span></label><button type="submit" disabled={authenticating || !credentialInput.trim()}>{authenticating ? t('common.loading') : t('common.load')}</button>{credential && <button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button>}</form></header> : <>
-      <div className="console-context self-account-status"><div><b>{credentialView.alias}</b><span>{t('common.savedCredentialInUse')}</span></div><button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button></div>
+    {!credentialView ? <header className="hero self-sign-in"><div><h1>{t('self.title')}</h1></div><form className="credential" onSubmit={submitCredential}><label><span>{t('self.credential')}</span><span className="credential-input"><input autoComplete="off" type={credentialVisible ? 'text' : 'password'} value={credentialInput} onChange={(event) => setCredentialInput(event.target.value)} placeholder={t('self.placeholder')} /><button type="button" className="secondary credential-visibility" aria-pressed={credentialVisible} onClick={() => setCredentialVisible((visible) => !visible)}>{t(credentialVisible ? 'common.hide' : 'common.show')}</button></span></label><button type="submit" disabled={authenticating || !credentialInput.trim()}>{authenticating ? t('common.loading') : t('common.load')}</button>{credentialInput.trim() && <CopyButton value={credentialInput} label={t('common.copySecret')} />}{credential && <><CopyButton value={credential} label={t('common.copySecret')} /><button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button></>}</form></header> : <>
+      <div className="console-context self-account-status"><div><b>{credentialView.alias}</b><span>{t('common.savedCredentialInUse')}</span></div><div className="button-row"><CopyButton value={credential} label={t('common.copySecret')} /><button type="button" className="secondary clear-credential" onClick={clearCredential}>{t('common.clearCredential')}</button></div></div>
       {showNavigation && <SelfPortalNavigation activeRoute={activeRoute} onNavigate={navigate} />}
     </>}
     {error && <div className="notice error" role="alert">{error}</div>}
     {page && <Suspense key={credentialScopeKey} fallback={<div className="boot">{t('common.loading')}</div>}>{page}</Suspense>}
-    {requestDetail && <RequestDetailDrawer detail={requestDetail} currency={credentialView?.currency} onClose={() => setRequestDetail(undefined)} />}
+    {requestDetail && <RequestDetailDrawer detail={requestDetail} currency={credentialView?.currency} onOpenSession={(sessionId) => { setRequestDetail(undefined); openSession(sessionId); }} onClose={() => setRequestDetail(undefined)} />}
   </div>;
 
   return embedded ? content : <Shell>{content}</Shell>;

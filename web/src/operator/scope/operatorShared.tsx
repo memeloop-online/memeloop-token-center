@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { CopyButton } from '../../CopyButton';
 import { useI18n } from '../../i18n';
 
 export type Translate = (key: string, variables?: Record<string, string | number>) => string;
@@ -28,12 +28,9 @@ export function WriteScopeNotice({ tenant }: { tenant: string }) {
 
 export function OneTimeSecret({ value, message }: { value: string; message: string }) {
   const { t } = useI18n();
-  const [copied, setCopied] = useState(false);
   return <div className="one-time" role="status">
     <b>{message}</b>
     <code>{value}</code>
-    <button type="button" className="secondary" onClick={async () => { await navigator.clipboard.writeText(value); setCopied(true); }}>
-      {copied ? t('common.copied') : t('common.copySecret')}
-    </button>
+    <CopyButton value={value} label={t('common.copySecret')} />
   </div>;
 }

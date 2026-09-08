@@ -40,9 +40,78 @@
   font-variant-numeric: lining-nums tabular-nums;
 }
 
+.request-time-cell time,
+.request-token-cell > span,
+.request-token-cell small {
+  display: block;
+}
+
+.request-id-control {
+  align-items: center;
+  display: flex;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.request-id-control code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.request-id-control.compact {
+  margin-top: 0.25rem;
+  max-width: 18rem;
+}
+
+.request-id-control.compact code {
+  color: var(--muted, #82979e);
+  font-size: 0.7rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.request-id-control > .copy-control {
+  flex: 0 0 auto;
+}
+
+.request-id-control > .copy-control button {
+  font-size: 0.65rem;
+  padding: 0.2rem 0.35rem;
+}
+
+.request-token-cell {
+  min-width: 18rem;
+  white-space: normal;
+}
+
+.request-token-cell small {
+  color: var(--muted, #82979e);
+  font-size: 0.7rem;
+  line-height: 1.35;
+  margin-top: 0.25rem;
+}
+
+.request-diagnostic-session {
+  font-weight: inherit;
+  text-align: left;
+}
+
+.request-archive-diagnostics {
+  margin-top: -1rem;
+}
+
 @media (max-width: 599px) {
   .request-session-cell {
     min-width: 8.5rem;
     max-width: 12rem;
+  }
+
+  .request-id-control.compact {
+    max-width: 12rem;
+  }
+
+  .request-token-cell {
+    min-width: 16rem;
   }
 }

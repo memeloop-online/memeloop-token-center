@@ -170,6 +170,21 @@ async fn postgres_observability_queries_use_the_same_bound_contract() {
         .await
         .unwrap();
     assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.request_id, confirmed_request);
+    assert_eq!(request.upstream_account_id, Some(upstream_id));
+    assert_eq!(request.route_id, Some(route_id));
+    assert!(request.completed_at.is_some());
+    assert_eq!(request.currency.as_deref(), Some("USD"));
+    let detail = state
+        .db
+        .request_archive_refs_for_tenant(&tenant, confirmed_request)
+        .await
+        .unwrap();
+    assert_eq!(detail.view.upstream_account_id, Some(upstream_id));
+    assert_eq!(detail.view.route_id, Some(route_id));
+    assert!(detail.view.completed_at.is_some());
+    assert_eq!(detail.view.currency.as_deref(), Some("USD"));
     let now = memeloop_token_center::db::unix_millis();
     let stats = state
         .db
@@ -361,7 +376,7 @@ async fn operator_and_self_observability_filters_are_bounded_scoped_and_keyset_p
         },
     )
     .await;
-    record(
+    let other_tenant_request = record(
         &state,
         &other,
         RecordedRequest {
@@ -434,6 +449,30 @@ async fn operator_and_self_observability_filters_are_bounded_scoped_and_keyset_p
         projected_request["session_context"]["session_name"],
         "Operator-visible session"
     );
+    assert_eq!(projected_request["upstream_account_id"], upstream.to_string());
+    assert_eq!(projected_request["route_id"], alpha_route.to_string());
+    assert!(projected_request["completed_at"].is_i64());
+    assert_eq!(projected_request["currency"], "USD");
+
+    let (status, detail) = get_json(
+        &state,
+        &format!("/internal/v1/requests/{alpha_request}"),
+        &service.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["upstream_account_id"], upstream.to_string());
+    assert_eq!(detail["route_id"], alpha_route.to_string());
+    assert!(detail["completed_at"].is_i64());
+    assert_eq!(detail["currency"], "USD");
+
+    let (status, _) = get_json(
+        &state,
+        &format!("/internal/v1/requests/{other_tenant_request}"),
+        &service.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let (status, stats) = get_json(
         &state,

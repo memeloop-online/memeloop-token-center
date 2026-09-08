@@ -168,6 +168,38 @@
   border-color: #c4a858;
 }
 
+:root[data-theme='light'] .operator-monitoring .monitoring-top-list > li {
+  color: #173238;
+  background: #f8fbf9;
+  border-color: #b9ceca;
+}
+
+:root[data-theme='light'] .operator-monitoring .monitoring-top-heading code {
+  color: #087d70;
+}
+
+:root[data-theme='light'] .operator-monitoring .monitoring-metric-list dt,
+:root[data-theme='light'] .operator-monitoring .monitoring-outcomes > li {
+  color: #526970;
+}
+
+:root[data-theme='light'] .operator-monitoring .monitoring-outcomes {
+  border-color: #91aea9;
+}
+
+:root[data-theme='light'] .operator-monitoring .monitoring-outcomes code {
+  color: #8c2424;
+}
+
+:root[data-theme='light'] .operator-monitoring .monitoring-routing-status > small,
+:root[data-theme='light'] .operator-monitoring .status.unknown {
+  color: #526970;
+}
+
+:root[data-theme='light'] .operator-monitoring .status.unknown {
+  border-color: #91aea9;
+}
+
 @media (width <= 900px) {
   .mobile-controls {
     display: flex;

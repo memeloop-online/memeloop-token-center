@@ -415,8 +415,19 @@ pub struct EntitlementReconcileResult {
 pub struct RequestView {
     pub request_id: Uuid,
     pub created_at: i64,
+    /// Time at which terminal accounting was committed. A missing value is a
+    /// request that is still pending (or an imported record without a native
+    /// terminal timestamp).
+    pub completed_at: Option<i64>,
     pub protocol: String,
     pub model: String,
+    /// Stable upstream identity assigned to this request. For text traffic
+    /// this is the final pending assignment after any pre-delivery failover,
+    /// not an attempt history.
+    pub upstream_account_id: Option<Uuid>,
+    /// Stable route identity assigned to this request. Historical generation
+    /// jobs can lack a route snapshot.
+    pub route_id: Option<Uuid>,
     pub status_code: Option<i64>,
     pub duration_ms: Option<i64>,
     pub input_tokens: i64,
@@ -424,6 +435,10 @@ pub struct RequestView {
     pub cache_write_tokens: i64,
     pub output_tokens: i64,
     pub cost: String,
+    /// Historical request currency when it was durably captured. It remains
+    /// absent for generation history whose currency cannot be recovered
+    /// without consulting mutable key state.
+    pub currency: Option<String>,
     pub error_code: Option<String>,
     /// Bounded, persisted conversation semantics for this request. A missing
     /// value means this request kind has no request/session projection (for

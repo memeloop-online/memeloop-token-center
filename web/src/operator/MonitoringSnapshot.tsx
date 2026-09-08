@@ -1,5 +1,5 @@
 import { Metric, NumberMetric } from '../components';
-import { formatCurrency, formatMilliseconds, formatNumber, formatPercent } from '../format';
+import { formatCurrency, formatElapsedTime, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import type { MonitoringHealth, OperatorMonitoringSnapshot, UsageAnalysisCost } from '../types';
 
@@ -14,12 +14,13 @@ function CostLines({ costs }: { costs: UsageAnalysisCost[] }) {
 function healthClass(status: MonitoringHealth['status']) {
   if (status === 'healthy') return 'ok';
   if (status === 'unhealthy') return 'bad';
-  return 'pending';
+  if (status === 'degraded') return 'pending';
+  return 'unknown';
 }
 
 function HealthBadge({ health }: { health: MonitoringHealth }) {
   const { t } = useI18n();
-  return <span className={`status ${healthClass(health.status)}`} title={health.version}>{t(`monitoring.health.${health.status}`)}</span>;
+  return <span className="monitoring-routing-status" title={health.version}><small>{t('monitoring.routingStatus')}</small><span className={`status ${healthClass(health.status)}`}>{t(`monitoring.health.${health.status}`)}</span></span>;
 }
 
 function Freshness({ snapshot }: { snapshot: OperatorMonitoringSnapshot }) {
@@ -27,7 +28,7 @@ function Freshness({ snapshot }: { snapshot: OperatorMonitoringSnapshot }) {
   const freshness = snapshot.freshness;
   if (freshness.latest_terminal_created_at === null) return <span>{t('monitoring.noTerminalTraffic')}</span>;
   const occurred = new Date(freshness.latest_terminal_created_at).toLocaleString(locale);
-  const age = freshness.age_millis === null ? '—' : formatMilliseconds(freshness.age_millis, locale);
+  const age = formatElapsedTime(freshness.age_millis, locale);
   return <span title={occurred}>{t('monitoring.freshnessAge', { age })}</span>;
 }
 

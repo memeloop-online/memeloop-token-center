@@ -133,3 +133,14 @@ export function formatMilliseconds(value: number | null | undefined, locale: Loc
   if (value === null || value === undefined || !Number.isFinite(value)) return '—';
   return `${formatNumber(value, locale, 2)} ms`;
 }
+
+/** A compact elapsed time for dashboard freshness, distinct from request latency. */
+export function formatElapsedTime(value: number | null | undefined, locale: Locale) {
+  if (value === null || value === undefined || !Number.isFinite(value) || value < 0) return '—';
+  const totalSeconds = Math.floor(value / 1_000);
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor(totalSeconds % 3_600 / 60);
+  const seconds = totalSeconds % 60;
+  if (locale === 'zh-CN') return `${formatNumber(hours, locale)}小时${formatNumber(minutes, locale)}分${formatNumber(seconds, locale)}秒`;
+  return `${formatNumber(hours, locale)}h ${formatNumber(minutes, locale)}m ${formatNumber(seconds, locale)}s`;
+}

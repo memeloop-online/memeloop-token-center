@@ -6,8 +6,11 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
         view: crate::model::RequestView {
             request_id,
             created_at: 1,
+            completed_at: Some(2),
             protocol: "openai".to_owned(),
             model: "request-detail-test".to_owned(),
+            upstream_account_id: Some(Uuid::nil()),
+            route_id: Some(Uuid::nil()),
             status_code: Some(200),
             duration_ms: Some(1),
             input_tokens: 1,
@@ -15,6 +18,7 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
             cache_write_tokens: 0,
             output_tokens: 1,
             cost: "0".to_owned(),
+            currency: Some("USD".to_owned()),
             error_code: None,
             session_context: None,
         },
@@ -41,6 +45,10 @@ async fn request_detail_response_has_exact_content_length_and_bounded_json_body(
         .expect("bounded request detail body");
     assert_eq!(body.len(), content_length);
     let detail: Value = serde_json::from_slice(&body).expect("request detail JSON body");
+    assert_eq!(detail["upstream_account_id"], Uuid::nil().to_string());
+    assert_eq!(detail["route_id"], Uuid::nil().to_string());
+    assert_eq!(detail["completed_at"], 2);
+    assert_eq!(detail["currency"], "USD");
     assert_eq!(detail["request_body"]["prompt"], "detail body");
     assert_eq!(detail["response_body"]["output"], "detail body");
 }

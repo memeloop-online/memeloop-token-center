@@ -6221,12 +6221,24 @@ components:
           items: { $ref: '#/components/schemas/MemeLoopCloudSubscriptionEvent' }
     RequestSummary:
       type: object
-      required: [request_id, created_at, protocol, model, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost, error_code, session_context]
+      required: [request_id, created_at, completed_at, protocol, model, upstream_account_id, route_id, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost, currency, error_code, session_context]
       properties:
         request_id: { type: string, format: uuid }
         created_at: { type: integer, format: int64 }
+        completed_at:
+          type: [integer, 'null']
+          format: int64
+          description: Terminal accounting timestamp in Unix milliseconds; null while pending or when the historical record lacks a terminal timestamp.
         protocol: { type: string }
         model: { type: string }
+        upstream_account_id:
+          type: [string, 'null']
+          format: uuid
+          description: Stable final upstream assignment. For text traffic this is not a routing-attempt history.
+        route_id:
+          type: [string, 'null']
+          format: uuid
+          description: Stable recorded route assignment; null when historical traffic has no route snapshot.
         status_code: { type: [integer, 'null'], format: int64 }
         duration_ms: { type: [integer, 'null'], format: int64 }
         input_tokens: { type: integer, format: int64 }
@@ -6242,6 +6254,9 @@ components:
           description: Input tokens written to the upstream cache tier.
         output_tokens: { type: integer, format: int64 }
         cost: { $ref: '#/components/schemas/Money' }
+        currency:
+          type: [string, 'null']
+          description: Durably recorded historical billing currency. Generation history returns null rather than consulting current key configuration.
         error_code: { type: [string, 'null'] }
         session_context:
           description: |

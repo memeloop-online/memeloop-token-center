@@ -1,21 +1,13 @@
-import { DrawerFrame } from '../components';
-import { formatCurrency, formatMilliseconds, formatNumber } from '../format';
+import { DrawerFrame, RequestDiagnostics } from '../components';
+import { formatCurrency, formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import type { GenerationAsset, GenerationJob, RequestDetail } from '../types';
 
-export function RequestDetailDrawer({ detail, currency, onClose }: { detail: RequestDetail; currency?: string; onClose: () => void }) {
-  const { locale, t } = useI18n();
-  const successful = detail.status_code !== null && detail.status_code < 400;
+export function RequestDetailDrawer({ detail, currency, onOpenSession, onClose }: { detail: RequestDetail; currency?: string; onOpenSession?: (sessionId: string) => void; onClose: () => void }) {
+  const { t } = useI18n();
   return <DrawerFrame title={detail.model} eyebrow={t('request.detail')} onClose={onClose}>
-    <p className="muted break-anywhere request-identity">{detail.request_id}</p>
-    <div className="request-diagnostics">
-      <span><b>{t('request.time')}</b>{new Date(detail.created_at).toLocaleString(locale)}</span>
-      <span><b>{t('request.status')}</b><i className={`status ${successful ? 'ok' : detail.status_code ? 'bad' : 'pending'}`}>{detail.status_code ?? t('common.running')}</i></span>
-      <span><b>{t('request.protocol')}</b>{detail.protocol}</span>
-      <span><b>{t('request.duration')}</b>{formatMilliseconds(detail.duration_ms, locale)}</span>
-      <span><b>{t('request.tokens')}</b>{formatNumber(detail.input_tokens + detail.output_tokens, locale)} <small>{formatNumber(detail.input_tokens, locale)} + {formatNumber(detail.output_tokens, locale)}</small></span>
-      <span><b>{t('request.cost')}</b>{currency ? formatCurrency(detail.cost, currency, locale) : '—'}</span>
-      <span><b>{t('request.error')}</b>{detail.error_code ?? '—'}</span>
+    <RequestDiagnostics request={detail} currency={currency} onOpenSession={onOpenSession} />
+    <div className="request-diagnostics request-archive-diagnostics">
       <span><b>{t('self.archive')}</b>{detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
       {detail.provenance && <span><b>{t('request.provenance')}</b>{detail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {detail.provenance.source}</span>}
     </div>

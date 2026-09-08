@@ -1,7 +1,8 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { CopyButton } from './CopyButton.js';
 import type { RequestView, StatsBucket } from './types.js';
 import { useI18n } from './i18n.js';
-import { formatCurrency, formatMetricNumber, formatNumber } from './format.js';
+import { formatCurrency, formatMetricNumber, formatMilliseconds, formatNumber } from './format.js';
 
 export function Shell({ children, operator = false }: { children: ReactNode; operator?: boolean }) {
   const { locale, setLocale, t } = useI18n();
@@ -91,6 +92,82 @@ export function Buckets({ values, onSelect }: { values: StatsBucket[]; onSelect?
   );
 }
 
+function requestTokenBreakdown(request: RequestView) {
+  const cachedInputTokens = request.cached_input_tokens;
+  const cacheWriteTokens = request.cache_write_tokens;
+  if (cachedInputTokens === undefined || cacheWriteTokens === undefined) return undefined;
+  return {
+    input: Math.max(0, request.input_tokens - cachedInputTokens - cacheWriteTokens),
+    cached: cachedInputTokens,
+    cacheWrite: cacheWriteTokens,
+    output: request.output_tokens,
+  };
+}
+
+function RequestIdentifier({ requestId, compact = false }: { requestId: string; compact?: boolean }) {
+  const { t } = useI18n();
+  return <span className={`request-id-control${compact ? ' compact' : ''}`}>
+    <code title={requestId}>{requestId}</code>
+    <CopyButton value={requestId} label={t('common.copy')} />
+  </span>;
+}
+
+function recordedCurrency(request: RequestView, fallbackCurrency?: string) {
+  // A received null is historical data: generation and archive-only rows do
+  // not inherit today's credential currency. Older streams predate the field
+  // and alone may use the local credential as a presentation fallback.
+  return request.currency === undefined ? fallbackCurrency : request.currency;
+}
+
+/**
+ * The raw-request API deliberately exposes only fields that were durably
+ * recorded for the request. Keep its diagnostics in one surface so the self
+ * portal and operator request drawer cannot drift or turn absent telemetry
+ * into inferred values.
+ */
+export function RequestDiagnostics({
+  request,
+  currency,
+  onOpenSession,
+}: {
+  request: RequestView;
+  currency?: string;
+  onOpenSession?: (sessionId: string) => void;
+}) {
+  const { locale, t } = useI18n();
+  const successful = request.status_code !== null && request.status_code < 400;
+  const tokenBreakdown = requestTokenBreakdown(request);
+  const currencyForRequest = recordedCurrency(request, currency);
+  const context = request.session_context;
+  const sessionLabel = context?.session_name ?? t('sessions.reportedNameMissing');
+  const sessionMetadata = [context?.task_kind, context?.agent_id].filter(Boolean).join(' · ');
+
+  return <div className="request-diagnostics">
+    <span><b>{t('request.request')}</b><RequestIdentifier requestId={request.request_id} /></span>
+    <span><b>{t('request.receivedAt')}</b>{new Date(request.created_at).toLocaleString(locale)}</span>
+    <span><b>{t('request.completedAt')}</b>{request.completed_at === null || request.completed_at === undefined ? '—' : new Date(request.completed_at).toLocaleString(locale)}</span>
+    <span><b>{t('request.status')}</b><i className={`status ${successful ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</i></span>
+    <span><b>{t('request.protocol')}</b>{request.protocol}</span>
+    <span><b>{t('request.duration')}</b>{formatMilliseconds(request.duration_ms, locale)}</span>
+    <span><b>{t('request.upstreamId')}</b>{request.upstream_account_id ?? '—'}</span>
+    <span><b>{t('request.routeId')}</b>{request.route_id ?? '—'}</span>
+    <span><b>{t('request.tokens')}</b>{formatNumber(request.input_tokens + request.output_tokens, locale)}
+      {tokenBreakdown && <small>{t('request.tokenBreakdown', { input: formatNumber(tokenBreakdown.input, locale), cached: formatNumber(tokenBreakdown.cached, locale), cacheWrite: formatNumber(tokenBreakdown.cacheWrite, locale), output: formatNumber(tokenBreakdown.output, locale) })}</small>}
+    </span>
+    <span><b>{t('request.cost')}</b>{currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</span>
+    <span><b>{t('request.error')}</b>{request.error_code ?? '—'}</span>
+    {context && <span><b>{t('request.session')}</b>
+      {context.association === 'confirmed'
+        ? context.session_id && onOpenSession
+          ? <button type="button" className="table-link request-diagnostic-session" onClick={() => onOpenSession(context.session_id!)}>{sessionLabel}</button>
+          : <span>{sessionLabel}</span>
+        : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
+      {context.association === 'confirmed' && context.session_id && <small><code className="break-anywhere">{context.session_id}</code>{sessionMetadata && ` · ${sessionMetadata}`}</small>}
+      {context.association === 'unlinked' && sessionMetadata && <small>{sessionMetadata}</small>}
+    </span>}
+  </div>;
+}
+
 export function RequestTable({
   requests,
   onSelect,
@@ -108,15 +185,17 @@ export function RequestTable({
   return (
     <div className="table-scroll">
       <table>
-        <thead><tr><th>{t('request.time')}</th><th>{t('request.model')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.protocol')}</th><th>{t('request.status')}</th><th>{t('request.duration')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
+        <thead><tr><th>{t('request.receivedAt')}</th><th>{t('request.model')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.protocol')}</th><th>{t('request.status')}</th><th>{t('request.duration')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
         <tbody>
           {requests.map((request) => {
             const context = request.session_context;
             const sessionLabel = context?.session_name
               ?? (context?.association === 'confirmed' ? t('sessions.reportedNameMissing') : t('sessions.unlinkedRequests'));
             const sessionMeta = [context?.task_kind, context?.agent_id].filter(Boolean).join(' · ');
+            const tokenBreakdown = requestTokenBreakdown(request);
+            const currencyForRequest = recordedCurrency(request, currency);
             return <tr key={request.request_id}>
-              <td>{new Date(request.created_at).toLocaleString(locale)}</td>
+              <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
               <td><code>{request.model}</code></td>
               {showsSession && <td className="request-session-cell">
                 {!context
@@ -131,8 +210,8 @@ export function RequestTable({
               <td>{request.protocol}</td>
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
               <td>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</td>
-              <td title={request.cached_input_tokens || request.cache_write_tokens ? t('request.tokenBreakdown', { input: formatNumber(Math.max(0, request.input_tokens - (request.cached_input_tokens ?? 0) - (request.cache_write_tokens ?? 0)), locale), cached: formatNumber(request.cached_input_tokens ?? 0, locale), cacheWrite: formatNumber(request.cache_write_tokens ?? 0, locale), output: formatNumber(request.output_tokens, locale) }) : undefined}>{formatNumber(request.input_tokens + request.output_tokens, locale)}</td>
-              <td>{request.currency || currency ? formatCurrency(request.cost, request.currency ?? currency ?? '', locale) : '—'}</td>
+              <td className="request-token-cell"><span>{formatNumber(request.input_tokens + request.output_tokens, locale)}</span>{tokenBreakdown && <small>{t('request.tokenBreakdown', { input: formatNumber(tokenBreakdown.input, locale), cached: formatNumber(tokenBreakdown.cached, locale), cacheWrite: formatNumber(tokenBreakdown.cacheWrite, locale), output: formatNumber(tokenBreakdown.output, locale) })}</small>}</td>
+              <td>{currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</td>
               <td>{request.error_code ? <code className="error-code">{request.error_code}</code> : '—'}</td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}
             </tr>

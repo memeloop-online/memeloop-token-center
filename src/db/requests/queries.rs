@@ -169,7 +169,7 @@ impl Database {
     ) -> Result<Vec<RequestView>, AppError> {
         validate_request_filter(&filter)?;
         let rows = sqlx::query(
-            "SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.error_code, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source FROM request_records r LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id WHERE r.key_id = $1 AND r.created_at >= $2 AND r.created_at <= $3 AND (r.created_at < $4 OR (r.created_at = $4 AND r.id < $5)) AND ($6 = '' OR r.model = $6) AND ($7 = '' OR r.protocol = $7) AND ($8 = '' OR ($8 = 'success' AND r.status_code BETWEEN 200 AND 399) OR ($8 = 'error' AND r.status_code >= 400) OR ($8 = 'pending' AND r.status_code IS NULL)) AND ($9 = '' OR r.error_code = $9) AND ($10 = '' OR r.upstream_account_id = $10) AND ($11 = '' OR r.model_route_id = $11) AND ($12 < 0 OR r.duration_ms >= $12) AND ($13 < 0 OR r.duration_ms <= $13) AND ($14 < 0 OR r.cost_micros >= $14) AND ($15 < 0 OR r.cost_micros <= $15) ORDER BY r.created_at DESC, r.id DESC LIMIT $16",
+            "SELECT r.id, r.created_at, r.completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.currency, r.error_code, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source FROM request_records r LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id WHERE r.key_id = $1 AND r.created_at >= $2 AND r.created_at <= $3 AND (r.created_at < $4 OR (r.created_at = $4 AND r.id < $5)) AND ($6 = '' OR r.model = $6) AND ($7 = '' OR r.protocol = $7) AND ($8 = '' OR ($8 = 'success' AND r.status_code BETWEEN 200 AND 399) OR ($8 = 'error' AND r.status_code >= 400) OR ($8 = 'pending' AND r.status_code IS NULL)) AND ($9 = '' OR r.error_code = $9) AND ($10 = '' OR r.upstream_account_id = $10) AND ($11 = '' OR r.model_route_id = $11) AND ($12 < 0 OR r.duration_ms >= $12) AND ($13 < 0 OR r.duration_ms <= $13) AND ($14 < 0 OR r.cost_micros >= $14) AND ($15 < 0 OR r.cost_micros <= $15) ORDER BY r.created_at DESC, r.id DESC LIMIT $16",
         )
         .bind(key_id.to_string())
         .bind(filter.from_created_at.unwrap_or(0))
@@ -267,7 +267,7 @@ impl Database {
         let locator = self.request_record_locator(&request_id).await?;
         if let Some(locator) = locator.filter(|locator| locator.key_id == key_id.to_string()) {
             let row = sqlx::query(
-                "SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.error_code, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source FROM request_records r LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id WHERE r.id = $1 AND r.created_at = $2 AND r.key_id = $3",
+                "SELECT r.id, r.created_at, r.completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.currency, r.error_code, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source FROM request_records r LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id WHERE r.id = $1 AND r.created_at = $2 AND r.key_id = $3",
             )
             .bind(&request_id)
             .bind(locator.created_at)
@@ -300,7 +300,7 @@ impl Database {
         let locator = self.request_record_locator(&request_id_string).await?;
         if let Some(locator) = locator {
             let row = sqlx::query(
-                "SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.error_code, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source FROM request_records r JOIN tenants t ON t.id = r.tenant_id LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id WHERE r.id = $1 AND r.created_at = $2 AND r.tenant_id = $3 AND t.external_id = $4",
+                "SELECT r.id, r.created_at, r.completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.currency, r.error_code, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source FROM request_records r JOIN tenants t ON t.id = r.tenant_id LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id WHERE r.id = $1 AND r.created_at = $2 AND r.tenant_id = $3 AND t.external_id = $4",
             )
             .bind(&request_id_string)
             .bind(locator.created_at)
@@ -313,7 +313,7 @@ impl Database {
             }
         }
         let row = sqlx::query(
-            "SELECT g.id, g.created_at, g.completed_at, g.public_model, g.status, g.cost_micros, g.error_code, g.request_object, g.result_json FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE g.id = $1 AND t.external_id = $2",
+            "SELECT g.id, g.created_at, g.completed_at, g.public_model, g.upstream_account_id, g.model_route_id AS route_id, g.status, g.cost_micros, g.error_code, g.request_object, g.result_json FROM generation_jobs g JOIN tenants t ON t.id = g.tenant_id WHERE g.id = $1 AND t.external_id = $2",
         )
         .bind(&request_id_string)
         .bind(tenant_external_id)
@@ -338,7 +338,7 @@ impl Database {
         let request_id = request_id.to_string();
         if let Some(locator) = self.request_record_locator(&request_id).await? {
             let row = sqlx::query(
-                "SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.error_code, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source FROM request_records r LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id WHERE r.id = $1 AND r.created_at = $2",
+                "SELECT r.id, r.created_at, r.completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.currency, r.error_code, r.request_object, r.response_object, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source FROM request_records r LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id WHERE r.id = $1 AND r.created_at = $2",
             )
             .bind(&request_id)
             .bind(locator.created_at)
@@ -348,7 +348,7 @@ impl Database {
             return request_archive_refs_from_row(row);
         }
         let row = sqlx::query(
-            "SELECT id, created_at, completed_at, public_model, status, cost_micros, error_code, request_object, result_json FROM generation_jobs WHERE id = $1",
+            "SELECT id, created_at, completed_at, public_model, upstream_account_id, model_route_id AS route_id, status, cost_micros, error_code, request_object, result_json FROM generation_jobs WHERE id = $1",
         )
         .bind(&request_id)
         .fetch_optional(&self.pool)
@@ -431,7 +431,7 @@ impl Database {
         request_id: Uuid,
     ) -> Result<RequestArchiveRefs, AppError> {
         let row = sqlx::query(
-            "SELECT id, created_at, completed_at, public_model, status, cost_micros, error_code, request_object, result_json FROM generation_jobs WHERE id = $1 AND key_id = $2",
+            "SELECT id, created_at, completed_at, public_model, upstream_account_id, model_route_id AS route_id, status, cost_micros, error_code, request_object, result_json FROM generation_jobs WHERE id = $1 AND key_id = $2",
         )
         .bind(request_id.to_string())
         .bind(key_id.to_string())
@@ -448,7 +448,7 @@ fn build_operator_request_list_query(
 ) -> PortableRequestListQuery {
     let page_limit = filter.limit.clamp(1, 500) + i64::from(filter.lookahead);
     let mut query = PortableRequestListQuery::new(
-        "SELECT id, created_at, protocol, model, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost_micros, error_code, session_id, session_association, session_name, task_kind, agent_id, semantics_source FROM (SELECT * FROM (SELECT r.id, r.created_at, r.protocol, r.model, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.error_code, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source FROM request_records r",
+        "SELECT id, created_at, completed_at, protocol, model, upstream_account_id, route_id, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost_micros, currency, error_code, session_id, session_association, session_name, task_kind, agent_id, semantics_source FROM (SELECT * FROM (SELECT r.id, r.created_at, r.completed_at, r.protocol, r.model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.cost_micros, r.currency, r.error_code, r.conversation_cluster_id AS session_id, CASE WHEN r.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END AS session_association, observation.session_name, observation.task_kind, observation.agent_id, observation.metadata_source AS semantics_source FROM request_records r",
     );
     push_operator_identity_joins(&mut query, "r", filter);
     query.push(" LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id");
@@ -459,7 +459,7 @@ fn build_operator_request_list_query(
     query.push(") AS request_page");
 
     if generation_branch_can_match(filter) {
-        query.push(" UNION ALL SELECT * FROM (SELECT g.id, g.created_at, 'generation' AS protocol, g.public_model AS model, CASE WHEN g.status = 'succeeded' THEN 200 WHEN g.status IN ('failed', 'cancelled') THEN 502 ELSE NULL END AS status_code, CASE WHEN g.completed_at IS NULL THEN NULL ELSE g.completed_at - g.created_at END AS duration_ms, 0 AS input_tokens, 0 AS cached_input_tokens, 0 AS cache_write_tokens, 0 AS output_tokens, g.cost_micros, g.error_code, NULL AS session_id, NULL AS session_association, NULL AS session_name, NULL AS task_kind, NULL AS agent_id, NULL AS semantics_source FROM generation_jobs g");
+        query.push(" UNION ALL SELECT * FROM (SELECT g.id, g.created_at, g.completed_at, 'generation' AS protocol, g.public_model AS model, g.upstream_account_id, g.model_route_id AS route_id, CASE WHEN g.status = 'succeeded' THEN 200 WHEN g.status IN ('failed', 'cancelled') THEN 502 ELSE NULL END AS status_code, CASE WHEN g.completed_at IS NULL THEN NULL ELSE g.completed_at - g.created_at END AS duration_ms, 0 AS input_tokens, 0 AS cached_input_tokens, 0 AS cache_write_tokens, 0 AS output_tokens, g.cost_micros, NULL AS currency, g.error_code, NULL AS session_id, NULL AS session_association, NULL AS session_name, NULL AS task_kind, NULL AS agent_id, NULL AS semantics_source FROM generation_jobs g");
         push_operator_identity_joins(&mut query, "g", filter);
         query.push(" WHERE 1 = 1");
         push_generation_job_filters(&mut query, tenant_external_id, filter);
@@ -900,8 +900,17 @@ fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
     Ok(RequestView {
         request_id: parse_uuid(row.try_get("id")?)?,
         created_at: row.try_get("created_at")?,
+        completed_at: row.try_get("completed_at")?,
         protocol: row.try_get("protocol")?,
         model: row.try_get("model")?,
+        upstream_account_id: row
+            .try_get::<Option<String>, _>("upstream_account_id")?
+            .map(parse_uuid)
+            .transpose()?,
+        route_id: row
+            .try_get::<Option<String>, _>("route_id")?
+            .map(parse_uuid)
+            .transpose()?,
         status_code: row.try_get("status_code")?,
         duration_ms: row.try_get("duration_ms")?,
         input_tokens: row.try_get("input_tokens")?,
@@ -909,6 +918,7 @@ fn request_view_from_row(row: &AnyRow) -> Result<RequestView, AppError> {
         cache_write_tokens: row.try_get("cache_write_tokens")?,
         output_tokens: row.try_get("output_tokens")?,
         cost: micros_to_decimal_string(row.try_get("cost_micros")?),
+        currency: row.try_get("currency")?,
         error_code: row.try_get("error_code")?,
         session_context: request_session_context_from_row(row)?,
     })
@@ -981,8 +991,11 @@ fn session_archive_unlinked_refs_from_row(row: AnyRow) -> Result<RequestArchiveR
         view: RequestView {
             request_id: parse_uuid(request_id.clone())?,
             created_at: row.try_get("created_at")?,
+            completed_at: None,
             protocol: row.try_get("protocol")?,
             model: row.try_get("model")?,
+            upstream_account_id: None,
+            route_id: None,
             status_code: row.try_get("status_code")?,
             duration_ms: row.try_get("duration_ms")?,
             input_tokens: row.try_get("input_tokens")?,
@@ -990,6 +1003,7 @@ fn session_archive_unlinked_refs_from_row(row: AnyRow) -> Result<RequestArchiveR
             cache_write_tokens: row.try_get("cache_write_tokens")?,
             output_tokens: row.try_get("output_tokens")?,
             cost: "0".to_owned(),
+            currency: None,
             error_code: row.try_get("error_code")?,
             session_context: request_session_context_from_row(&row)?,
         },
@@ -1017,8 +1031,17 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
         view: RequestView {
             request_id: parse_uuid(row.try_get("id")?)?,
             created_at,
+            completed_at,
             protocol: "generation".to_owned(),
             model: row.try_get("public_model")?,
+            upstream_account_id: row
+                .try_get::<Option<String>, _>("upstream_account_id")?
+                .map(parse_uuid)
+                .transpose()?,
+            route_id: row
+                .try_get::<Option<String>, _>("route_id")?
+                .map(parse_uuid)
+                .transpose()?,
             status_code: match status.as_str() {
                 "succeeded" => Some(200),
                 "failed" | "cancelled" => Some(502),
@@ -1030,6 +1053,7 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
             cache_write_tokens: 0,
             output_tokens: 0,
             cost: micros_to_decimal_string(row.try_get("cost_micros")?),
+            currency: None,
             error_code: row.try_get("error_code")?,
             session_context: None,
         },

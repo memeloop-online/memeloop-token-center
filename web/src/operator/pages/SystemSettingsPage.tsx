@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../api';
+import { CopyButton } from '../../CopyButton';
 import { useI18n } from '../../i18n';
 import type { FilterAssistantSettings, ModelRouteView } from '../../types';
 import { messageOf, queryForTenant } from '../scope/operatorShared';
@@ -34,7 +35,7 @@ export function OperatorAccessSettings({ credentialInput, credential, authentica
       if (typeof submittedCredential === 'string' && submittedCredential.trim()) onConnect(submittedCredential);
     }}>
       <label htmlFor="operator-access-credential">{t('settings.accessCredential')}<input id="operator-access-credential" name="credential" autoComplete="new-password" type="password" value={credentialInput} onChange={(event) => onCredentialInput(event.target.value)} placeholder={t('operator.tokenPlaceholder')} /></label>
-      <div className="button-row"><button type="submit" disabled={!credentialInput.trim()}>{credential ? t('settings.replaceCredential') : t('common.connect')}</button>{credential && <button type="button" className="secondary" onClick={onClear}>{t('common.clearCredential')}</button>}</div>
+      <div className="button-row"><button type="submit" disabled={!credentialInput.trim()}>{credential ? t('settings.replaceCredential') : t('common.connect')}</button>{credentialInput.trim() && <CopyButton value={credentialInput} label={t('common.copySecret')} />}{credential && <><CopyButton value={credential} label={t('common.copySecret')} /><button type="button" className="secondary" onClick={onClear}>{t('common.clearCredential')}</button></>}</div>
     </form>
   </article>;
 }

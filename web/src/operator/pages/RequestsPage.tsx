@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../../api';
-import { DrawerFrame, Metric, NumberMetric, RequestTable } from '../../components';
+import { DrawerFrame, Metric, NumberMetric, RequestDiagnostics, RequestTable } from '../../components';
 import { formatMilliseconds, formatPercent } from '../../format';
 import { useI18n } from '../../i18n';
 import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, TypedFilterAst, UpstreamAccount } from '../../types';
@@ -111,7 +111,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={onOpenSession} />
-    {detail && <RequestDrawer detail={detail} onClose={() => setDetail(undefined)} />}
+    {detail && <RequestDrawer detail={detail} onOpenSession={onOpenSession} onClose={() => setDetail(undefined)} />}
   </>;
 }
 
@@ -148,7 +148,19 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   </article>;
 }
 
-function RequestDrawer({ detail, onClose }: { detail: RequestDetail; onClose: () => void }) {
+function RequestDrawer({ detail, onOpenSession, onClose }: { detail: RequestDetail; onOpenSession: (sessionId: string) => void; onClose: () => void }) {
   const { t } = useI18n();
-  return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}><p className="muted break-anywhere">{detail.request_id} · {detail.status_code ?? t('common.running')} · {detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</p><h3>{t('request.error')}</h3><pre>{detail.error_code ?? t('common.none')}</pre><details className="request-technical-details"><summary>{t('request.technicalDetails')}</summary><h3>{t('request.request')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre><h3>{t('request.response')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>{detail.provenance && <><h3>{t('request.provenance')}</h3><pre>{JSON.stringify(detail.provenance, null, 2)}</pre></>}</details></DrawerFrame>;
+  return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}>
+    <RequestDiagnostics request={detail} onOpenSession={onOpenSession} />
+    <div className="request-diagnostics request-archive-diagnostics">
+      <span><b>{t('self.archive')}</b>{detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
+      {detail.provenance && <span><b>{t('request.provenance')}</b>{detail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {detail.provenance.source}</span>}
+    </div>
+    <details className="request-technical-details">
+      <summary>{t('request.technicalDetails')}</summary>
+      <h3>{t('request.request')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre>
+      <h3>{t('request.response')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>
+      {detail.provenance && <><h3>{t('request.provenance')}</h3><pre>{JSON.stringify(detail.provenance, null, 2)}</pre></>}
+    </details>
+  </DrawerFrame>;
 }

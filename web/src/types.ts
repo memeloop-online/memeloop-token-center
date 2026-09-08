@@ -1,6 +1,9 @@
 export interface RequestView {
   request_id: string;
+  /** Server receipt time in Unix milliseconds; it is not an upstream start time. */
   created_at: number;
+  /** Server-recorded terminal completion time, when this history source retained it. */
+  completed_at?: number | null;
   protocol: string;
   model: string;
   status_code: number | null;
@@ -13,6 +16,10 @@ export interface RequestView {
   cache_write_tokens?: number;
   output_tokens: number;
   cost: string;
+  /** Stable final upstream assignment, not a routing-attempt history. */
+  upstream_account_id?: string | null;
+  /** Stable final model-route assignment, not a routing-attempt history. */
+  route_id?: string | null;
   currency?: string | null;
   error_code: string | null;
   session_context?: RequestSessionContext | null;

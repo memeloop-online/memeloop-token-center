@@ -21,6 +21,24 @@
   margin-bottom: 6px;
 }
 
+.monitoring-routing-status {
+  display: inline-grid;
+  gap: 4px;
+  justify-items: end;
+}
+
+.monitoring-routing-status > small {
+  color: #71868d;
+  font-size: 9px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+
+.operator-monitoring .status.unknown {
+  color: #9aadb3;
+  border-color: #597079;
+}
+
 .monitoring-cost-lines {
   display: inline-flex;
   flex-wrap: wrap;

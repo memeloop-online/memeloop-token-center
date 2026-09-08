@@ -1128,6 +1128,10 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
     let requests = database.list_all_requests(&tenant, 10).await.unwrap();
     assert_eq!(requests[0].protocol, "generation");
     assert_eq!(requests[0].status_code, Some(200));
+    assert_eq!(requests[0].upstream_account_id, Some(account.id));
+    assert!(requests[0].route_id.is_none());
+    assert!(requests[0].completed_at.is_some());
+    assert!(requests[0].currency.is_none());
     let key_detail = database
         .request_archive_refs(key.key_id, job_id)
         .await
@@ -1148,6 +1152,10 @@ async fn postgres_migrations_queue_aggregates_and_events_work_together() {
         .request_archive_refs_for_tenant(&tenant, job_id)
         .await
         .unwrap();
+    assert_eq!(operator_detail.view.upstream_account_id, Some(account.id));
+    assert!(operator_detail.view.route_id.is_none());
+    assert!(operator_detail.view.completed_at.is_some());
+    assert!(operator_detail.view.currency.is_none());
     assert_eq!(operator_detail.view.cost, "0.25");
     assert_eq!(operator_detail.response_json, Some(result));
     let events = database
