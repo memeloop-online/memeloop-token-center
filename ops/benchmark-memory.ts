@@ -11,6 +11,7 @@ import { dirname, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { StreamStartBarrier } from "./benchmark-stream-barrier.ts";
 
 export const MIB = 1024 * 1024;
 export const RESPONSE_LIMIT_BYTES = 64 * MIB;
@@ -48,7 +49,39 @@ async function memorySummary(pid: number, durationMs = 1000, intervalMs = 100): 
 export function assetGatewayRssEvidence(phasePeakRssMib: number, phaseStartRssMib: number, originalIdleRssMib: number): Obj { return { gateway_phase_delta_rss_mib: round(Math.max(0, phasePeakRssMib - phaseStartRssMib)), gateway_cumulative_delta_from_original_idle_mib: round(Math.max(0, phasePeakRssMib - originalIdleRssMib)) }; }
 function rssSlope(samples: Obj[], name: string): number { if (samples.length < 3) return 0; const tail = samples.slice(Math.floor(samples.length / 3)); const xs = tail.map((sample) => Number(sample.elapsed_seconds)); const ys = tail.map((sample) => Number(sample[name].rss_mib)); const meanX = xs.reduce((a, b) => a + b, 0) / xs.length; const meanY = ys.reduce((a, b) => a + b, 0) / ys.length; const denominator = xs.reduce((sum, value) => sum + (value - meanX) ** 2, 0); return denominator ? xs.reduce((sum, x, index) => sum + (x - meanX) * (ys[index]! - meanY), 0) / denominator * 60 : 0; }
 
-export class MockState { assets = new Map<string, number>(); imageRawBytes = 11 * MIB; imageItemCount = 10; standardImageRequests = 0; responsesToolImageRequests = 0; activeStreams = 0; peakStreams = 0; begin(): void { this.activeStreams += 1; this.peakStreams = Math.max(this.peakStreams, this.activeStreams); } end(): void { this.activeStreams -= 1; } resetStreamPeak(): void { if (this.activeStreams) throw new HarnessFailure("cannot reset mock concurrency while a stream is active"); this.peakStreams = 0; } }
+export class MockState {
+  assets = new Map<string, number>();
+  imageRawBytes = 11 * MIB;
+  imageItemCount = 10;
+  standardImageRequests = 0;
+  responsesToolImageRequests = 0;
+  activeStreams = 0;
+  peakStreams = 0;
+  streamStartBarrier?: StreamStartBarrier;
+
+  begin(): void { this.activeStreams += 1; this.peakStreams = Math.max(this.peakStreams, this.activeStreams); }
+  end(): void { this.activeStreams -= 1; }
+  resetStreamPeak(): void { if (this.activeStreams) throw new HarnessFailure("cannot reset mock concurrency while a stream is active"); this.peakStreams = 0; }
+  armStreamStartBarrier(required: number, timeoutMs: number): StreamStartBarrier {
+    if (this.streamStartBarrier && !this.streamStartBarrier.evidence().released) throw new HarnessFailure("cannot replace an active stream start barrier");
+    this.streamStartBarrier = new StreamStartBarrier(required, timeoutMs);
+    return this.streamStartBarrier;
+  }
+
+  async waitForStreamStart(request: IncomingMessage, response: ServerResponse, barrier: StreamStartBarrier | undefined): Promise<boolean> {
+    if (!barrier) return true;
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    request.once("aborted", abort);
+    response.once("close", abort);
+    try {
+      return await barrier.arrive(controller.signal);
+    } finally {
+      request.off("aborted", abort);
+      response.off("close", abort);
+    }
+  }
+}
 
 async function requestJson(request: IncomingMessage): Promise<Obj> { const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk)); const value = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"); if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("body is not an object"); return value as Obj; }
 function jsonResponse(response: ServerResponse, status: number, value: unknown): void { const body = Buffer.from(JSON.stringify(value)); response.writeHead(status, { "content-type": "application/json", "content-length": body.length }); response.end(body); }
@@ -92,7 +125,7 @@ async function writeStreamChunk(response: ServerResponse, chunk: Buffer): Promis
   return !response.destroyed;
 }
 
-async function streamChatSse(response: ServerResponse, state: MockState, total: number, maximumFrameBytes: number, delayMs: number): Promise<void> {
+async function streamChatSse(request: IncomingMessage, response: ServerResponse, state: MockState, total: number, maximumFrameBytes: number, delayMs: number, barrier?: StreamStartBarrier): Promise<void> {
   const finish = chatSseFrame([{ index: 0, delta: {}, finish_reason: "stop" }]);
   const usage = chatSseFrame([], { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 });
   const done = Buffer.from("data: [DONE]\n\n");
@@ -107,6 +140,10 @@ async function streamChatSse(response: ServerResponse, state: MockState, total: 
 
   state.begin();
   try {
+    if (!await state.waitForStreamStart(request, response, barrier)) {
+      if (!response.destroyed) response.destroy();
+      return;
+    }
     response.writeHead(200, { "content-type": "text/event-stream", "content-length": total });
     for (let index = 0; index < frameCount; index += 1) {
       const payloadLength = basePayloadBytes + (index < extraPayloadFrames ? 1 : 0);
@@ -122,7 +159,7 @@ async function streamChatSse(response: ServerResponse, state: MockState, total: 
 export function createMockServer(state = new MockState()): Server {
   return createServer(async (request, response) => { try {
     const path = request.url ?? "/";
-    if (request.method === "POST" && path === "/v1/chat/completions") { const body = await requestJson(request); const benchmark = body.benchmark; if (benchmark?.mode === "stream" || benchmark?.mode === "oversize") { await streamChatSse(response, state, Number(benchmark.bytes), Math.max(4096, Math.min(Number(benchmark.chunk_bytes ?? 262144), MIB)), Number(benchmark.delay_ms ?? 0)); return; } jsonResponse(response, 200, { id: "chatcmpl-memory-benchmark", object: "chat.completion", model: body.model ?? "benchmark-text", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 } }); return; }
+    if (request.method === "POST" && path === "/v1/chat/completions") { const body = await requestJson(request); const benchmark = body.benchmark; if (benchmark?.mode === "stream" || benchmark?.mode === "oversize") { await streamChatSse(request, response, state, Number(benchmark.bytes), Math.max(4096, Math.min(Number(benchmark.chunk_bytes ?? 262144), MIB)), Number(benchmark.delay_ms ?? 0), benchmark?.mode === "stream" ? state.streamStartBarrier : undefined); return; } jsonResponse(response, 200, { id: "chatcmpl-memory-benchmark", object: "chat.completion", model: body.model ?? "benchmark-text", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 } }); return; }
     if (request.method === "POST" && path === "/api/v3/contents/generations/tasks") { const body = await requestJson(request); const assetMib = Number(body.benchmark_asset_mib ?? 100); const id = `bench-${assetMib}-${randomUUID().slice(0, 12)}`; state.assets.set(id, assetMib * MIB); jsonResponse(response, 200, { id }); return; }
     if (request.method === "POST" && path === "/v1/images/generations") { const body = await requestJson(request); if (body.n !== state.imageItemCount) { jsonResponse(response, 400, { error: "unexpected image result count" }); return; } state.standardImageRequests += 1; const base = Math.floor(state.imageRawBytes / state.imageItemCount); const remainder = state.imageRawBytes % state.imageItemCount; const data = Array.from({ length: state.imageItemCount }, (_, index) => ({ b64_json: Buffer.alloc(base + (index < remainder ? 1 : 0), "x").toString("base64"), revised_prompt: `memory benchmark image ${index}` })); jsonResponse(response, 200, { created: 1_700_000_000, data, usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 }, provider_secret: "must-not-reach-the-client" }); return; }
     if (request.method === "POST" && path === "/v1/responses") { const body = await requestJson(request); if (body.stream !== false || body.tools?.[0]?.type !== "image_generation") { jsonResponse(response, 400, { error: "unexpected Responses image request" }); return; } state.responsesToolImageRequests += 1; jsonResponse(response, 200, { id: "resp_memory_image", output: [{ type: "image_generation_call", id: "ig_memory_image", result: Buffer.alloc(state.imageRawBytes, "x").toString("base64"), provider_secret: "must-not-reach-the-client" }], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } }); return; }
@@ -283,7 +320,7 @@ export async function execute(args: Arguments): Promise<[number, Obj]> {
     const key = await seed(urls.control!, urls.gateway!, serviceToken, mockUrl); await smallChat(urls.gateway!, key); await smallChat(urls.gateway!, key); await smallChat(urls.gateway!, key); await delay(1000);
     const idleEntries = await Promise.all(Object.entries(children).map(async ([role, child]) => [role, await memorySummary(child.pid!)] as const)); const idle = Object.fromEntries(idleEntries) as Obj; const idleGateway = idle.gateway.rss_mib_median as number; const idleWorker = idle.worker.rss_mib_median as number; const idleControl = idle.control.rss_mib_median as number;
     seedControlScale(database); const controlScale = await runControlScale(urls.control!, serviceToken, children.control!.pid!, idleControl);
-    const streamBytes = values.stream_mib * MIB; const streamStarted = performance.now(); state.resetStreamPeak(); const stream = await withSampler({ gateway: children.gateway!.pid! }, async (sampler) => { const received = await Promise.all(Array.from({ length: values.concurrency }, () => streamChat(urls.gateway!, key, streamBytes, 5))); const peak = sampler.maxCurrentRss("gateway"); return { concurrency: values.concurrency, bytes_per_response: streamBytes, bytes_received: received.reduce((a, b) => a + b, 0), observed_peak_concurrency: state.peakStreams, duration_seconds: round((performance.now() - streamStarted) / 1000), gateway_peak_rss_mib: round(peak), gateway_delta_rss_mib: round(peak - idleGateway), gateway_lifetime_high_water: sampler.lifetimeHighWaterEvidence("gateway"), sample_count: sampler.samples.length }; });
+    const streamBytes = values.stream_mib * MIB; const streamStarted = performance.now(); state.resetStreamPeak(); const streamStartBarrier = state.armStreamStartBarrier(values.concurrency, 30_000); const stream = await withSampler({ gateway: children.gateway!.pid! }, async (sampler) => { const received = await Promise.all(Array.from({ length: values.concurrency }, () => streamChat(urls.gateway!, key, streamBytes, 5))); const peak = sampler.maxCurrentRss("gateway"); return { concurrency: values.concurrency, bytes_per_response: streamBytes, bytes_received: received.reduce((a, b) => a + b, 0), observed_peak_concurrency: state.peakStreams, start_barrier: streamStartBarrier.evidence(), duration_seconds: round((performance.now() - streamStarted) / 1000), gateway_peak_rss_mib: round(peak), gateway_delta_rss_mib: round(peak - idleGateway), gateway_lifetime_high_water: sampler.lifetimeHighWaterEvidence("gateway"), sample_count: sampler.samples.length }; });
     const standardImage = await runSynchronousImages(urls.gateway!, key, children.gateway!.pid!, idleGateway, { name: "standard-openai-images", model: "benchmark-image", results: 10, upstreamRequests: () => state.standardImageRequests });
     await delay(2000); const responsesImageBaseline = await memorySummary(children.gateway!.pid!);
     const responsesImage = await runSynchronousImages(urls.gateway!, key, children.gateway!.pid!, responsesImageBaseline.rss_mib_median, { name: "codex-responses-tool", model: "benchmark-responses-image", results: 1, upstreamRequests: () => state.responsesToolImageRequests }); responsesImage.gateway_phase_start = responsesImageBaseline;
@@ -295,7 +332,7 @@ export async function execute(args: Arguments): Promise<[number, Obj]> {
     const preSoak = processMemory(children.gateway!.pid!).rss_mib as number; const soak = await runSoak(urls.gateway!, key, values.soak_seconds, Math.min(4, values.concurrency), args.targetRps, children.gateway!.pid!); await delay(5000); const cooldown = await memorySummary(children.gateway!.pid!); soak.route_recovery_after_response_limit = routeRecovery; soak.pre_soak_gateway_rss_mib = round(preSoak); soak.cooldown_gateway_rss_mib = cooldown.rss_mib_median; soak.retained_delta_from_idle_mib = round(cooldown.rss_mib_median - idleGateway);
     const checks: Obj[] = [
       check("100k-row control resources remain page bounded", controlScale.maximum_page_rows, "<=", 100, controlScale.maximum_page_rows <= 100), check("bounded control pages remain below 1 MiB", controlScale.maximum_response_bytes, "<=", MIB, controlScale.maximum_response_bytes <= MIB), check("concurrent control list RSS delta", controlScale.control_delta_rss_mib, "<=", args.controlListDeltaMaxMib, controlScale.control_delta_rss_mib <= args.controlListDeltaMaxMib), check("gateway idle RSS", idleGateway, "<=", args.idleMaxMib, idleGateway <= args.idleMaxMib),
-      check("concurrent streams reached EOF", stream.bytes_received, "==", values.concurrency * streamBytes, stream.bytes_received === values.concurrency * streamBytes), check("mock observed configured stream concurrency", stream.observed_peak_concurrency, ">=", values.concurrency, stream.observed_peak_concurrency >= values.concurrency), check("concurrent stream memory samples", stream.sample_count, ">=", 2, stream.sample_count >= 2), check("concurrent stream RSS delta", stream.gateway_delta_rss_mib, "<=", args.streamDeltaMaxMib, stream.gateway_delta_rss_mib <= args.streamDeltaMaxMib),
+      check("concurrent streams reached EOF", stream.bytes_received, "==", values.concurrency * streamBytes, stream.bytes_received === values.concurrency * streamBytes), check("stream start barrier admitted and released every configured stream", stream.start_barrier, "==", { required: values.concurrency, admitted: values.concurrency, released: true, failure: null }, stream.start_barrier.admitted === values.concurrency && stream.start_barrier.released && stream.start_barrier.failure === null), check("mock observed configured stream concurrency", stream.observed_peak_concurrency, ">=", values.concurrency, stream.observed_peak_concurrency >= values.concurrency), check("concurrent stream memory samples", stream.sample_count, ">=", 2, stream.sample_count >= 2), check("concurrent stream RSS delta", stream.gateway_delta_rss_mib, "<=", args.streamDeltaMaxMib, stream.gateway_delta_rss_mib <= args.streamDeltaMaxMib),
       check("two bounded standard OpenAI image responses completed", standardImage.first_responses, "==", 2, standardImage.first_responses === 2), check("standard OpenAI image response cap", standardImage.maximum_response_bytes, "<=", 16 * MIB, standardImage.maximum_response_bytes <= 16 * MIB), check("standard OpenAI image exact HTTP replay", standardImage.content_length_and_replay_exact, "==", true, standardImage.content_length_and_replay_exact === true && standardImage.exact_replays === 2 && standardImage.upstream_requests === 2), check("standard OpenAI image RSS delta", standardImage.gateway_delta_rss_mib, "<=", args.imageDeltaMaxMib, standardImage.gateway_delta_rss_mib <= args.imageDeltaMaxMib),
       check("two bounded Codex Responses-tool image responses completed", responsesImage.first_responses, "==", 2, responsesImage.first_responses === 2), check("Codex Responses-tool image response cap", responsesImage.maximum_response_bytes, "<=", 16 * MIB, responsesImage.maximum_response_bytes <= 16 * MIB), check("Codex Responses-tool exact HTTP replay", responsesImage.content_length_and_replay_exact, "==", true, responsesImage.content_length_and_replay_exact === true && responsesImage.exact_replays === 2 && responsesImage.upstream_requests === 2), check("Codex Responses-tool image RSS delta", responsesImage.gateway_delta_rss_mib, "<=", args.imageDeltaMaxMib, responsesImage.gateway_delta_rss_mib <= args.imageDeltaMaxMib), check("disconnects recorded as downstream disconnects", disconnect.recorded_downstream_disconnected_errors, ">=", disconnectAttempts, disconnect.recorded_downstream_disconnected_errors >= disconnectAttempts),
       check("64 MiB response cap stopped and classified the upstream body", responseLimit.client_bytes_received, "between", [RESPONSE_LIMIT_BYTES - MIB, RESPONSE_LIMIT_BYTES], responseLimit.http_status_before_stream_abort === 200 && responseLimit.client_bytes_received >= RESPONSE_LIMIT_BYTES - MIB && responseLimit.client_bytes_received <= RESPONSE_LIMIT_BYTES && responseLimit.recorded_upstream_response_too_large_errors >= 1),

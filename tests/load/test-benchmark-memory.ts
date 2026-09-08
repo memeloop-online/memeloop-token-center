@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 import { assetGatewayRssEvidence, chatPayload, createMockServer, HarnessFailure, MockState, seed, smallChat, streamChat, waitForTextRouteRecovery } from "../../ops/benchmark-memory.ts";
+import { StreamStartBarrier } from "../../ops/benchmark-stream-barrier.ts";
 
 const benchmarkEntry = resolve(import.meta.dirname, "../../ops/benchmark-memory.ts");
 
@@ -37,6 +38,36 @@ test("asset gateway gate uses elevated phase start, not original idle", () => {
   const evidence = assetGatewayRssEvidence(180, 150, 40); assert.equal(evidence.gateway_phase_delta_rss_mib, 30); assert.equal(evidence.gateway_cumulative_delta_from_original_idle_mib, 140); assert.ok(evidence.gateway_phase_delta_rss_mib <= 96); assert.ok(evidence.gateway_cumulative_delta_from_original_idle_mib > 96);
 });
 test("asset gateway phase delta never reports negative growth", () => assert.equal(assetGatewayRssEvidence(149, 150, 40).gateway_phase_delta_rss_mib, 0));
+
+test("stream start barrier releases only after every configured stream arrives", async () => {
+  const barrier = new StreamStartBarrier(3, 1_000);
+  let released = false;
+  const first = barrier.arrive().then((value) => { released = value; return value; });
+  await Promise.resolve();
+  assert.equal(released, false);
+  const second = barrier.arrive();
+  await Promise.resolve();
+  assert.equal(released, false);
+  const third = barrier.arrive();
+  assert.deepEqual(await Promise.all([first, second, third]), [true, true, true]);
+  assert.deepEqual(barrier.evidence(), { required: 3, admitted: 3, released: true, failure: null });
+});
+
+test("stream start barrier releases every waiter after a client disconnect", async () => {
+  const barrier = new StreamStartBarrier(3, 1_000);
+  const controller = new AbortController();
+  const first = barrier.arrive();
+  const disconnected = barrier.arrive(controller.signal);
+  controller.abort();
+  assert.deepEqual(await Promise.all([first, disconnected]), [false, false]);
+  assert.deepEqual(barrier.evidence(), { required: 3, admitted: 2, released: true, failure: "client_disconnected" });
+});
+
+test("stream start barrier releases waiters after its bounded timeout", async () => {
+  const barrier = new StreamStartBarrier(2, 1);
+  assert.equal(await barrier.arrive(), false);
+  assert.deepEqual(barrier.evidence(), { required: 2, admitted: 1, released: true, failure: "timeout" });
+});
 
 test("every benchmark route explicitly confirms its custom model", async () => {
   const requests: Array<[string, Record<string, any>]> = [];
