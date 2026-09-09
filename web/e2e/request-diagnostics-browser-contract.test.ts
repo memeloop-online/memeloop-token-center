@@ -38,11 +38,14 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
   const address = server.httpServer?.address();
   assert.ok(address && typeof address !== 'string');
   const browser = await chromium.launch({ executablePath, headless: true });
+  const context = await browser.newContext();
   try {
-    const page = await browser.newPage();
+    const origin = `http://127.0.0.1:${address.port}`;
+    // Establish clipboard permissions before loading the fixture document.
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin });
+    const page = await context.newPage();
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
-    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-diagnostics.html`);
-    await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `http://127.0.0.1:${address.port}` });
+    await page.goto(`${origin}/e2e/fixtures/request-diagnostics.html`);
     const recorded = page.locator('[data-fixture-request="recorded"]');
     const historicalGap = page.locator('[data-fixture-request="historical-gap"]');
     const recordedDiagnostics = recorded.locator('.request-diagnostics');
@@ -65,9 +68,14 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.doesNotMatch(historicalGapText, /Cache read|Cache write/, 'missing historical cache fields must remain absent rather than becoming zero-valued rows');
     assert.equal((await page.locator('tbody tr').nth(1).locator('td').nth(7).textContent())?.trim(), '—', 'an explicit historical null currency must not inherit the current credential currency');
 
+    assert.equal(await page.evaluate(() => typeof navigator.clipboard?.writeText), 'function', 'the fixture must exercise the browser Clipboard API');
     await recordedRow.locator('.request-id-control.compact .copy-control button').click();
-    await recordedRow.getByRole('button', { name: 'Copied', exact: true }).waitFor();
-    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), requestId);
+    await recordedRow.getByRole('button', { name: 'Copied', exact: true }).waitFor({ timeout: 5_000 });
+    const copiedRequestId = await page.evaluate(async () => new Promise<string>((resolve, reject) => {
+      const timeout = window.setTimeout(() => reject(new Error('clipboard read did not settle')), 5_000);
+      void navigator.clipboard.readText().then((value) => { window.clearTimeout(timeout); resolve(value); }, (reason) => { window.clearTimeout(timeout); reject(reason); });
+    }));
+    assert.equal(copiedRequestId, requestId);
 
     await recordedRow.locator('.request-session-cell .table-link').click();
     assert.equal(await page.locator('[data-fixture-session-opened]').textContent(), sessionId);
@@ -102,6 +110,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
       }
     }
   } finally {
+    await context.close();
     await browser.close();
     await server.close();
   }

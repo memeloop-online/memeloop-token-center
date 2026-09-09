@@ -13,15 +13,17 @@ export interface StreamStartBarrierEvidence {
  * emitting any response bytes.
  */
 export class StreamStartBarrier {
+  private readonly required: number;
   private admitted = 0;
   private released = false;
   private failure: StreamStartBarrierFailure | null = null;
   private readonly waiters = new Set<(released: boolean) => void>();
   private readonly timer: ReturnType<typeof setTimeout>;
 
-  constructor(private readonly required: number, timeoutMs: number) {
+  constructor(required: number, timeoutMs: number) {
     if (!Number.isInteger(required) || required < 1) throw new RangeError("stream start barrier required count must be a positive integer");
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError("stream start barrier timeout must be positive");
+    this.required = required;
     this.timer = setTimeout(() => this.release("timeout"), timeoutMs);
   }
 
