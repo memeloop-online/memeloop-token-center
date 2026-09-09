@@ -337,6 +337,9 @@
   grid-template-columns: minmax(0, 1fr);
 }
 
+.main:has(.provider-layout),
+.main:has(> .provider-list) { width: 100%; }
+
 .provider-list-actions {
   align-items: flex-end;
   display: flex;
@@ -393,6 +396,16 @@
   margin-top: 7px;
 }
 
+.provider-account { flex-direction: column; }
+.provider-account > .account-main { flex: 1 1 auto; width: 100%; }
+.provider-account > .account-meta { align-items: flex-start; }
+.provider-account > .account-meta { flex-direction: row; flex-wrap: wrap; }
+.provider-account > .account-meta .row-actions { flex-basis: 100%; }
+.provider-account > .account-meta .row-actions { flex-wrap: wrap; }
+.provider-account .provider-availability span { font-size: 12px; }
+.provider-account .provider-availability small { font-size: 12px; letter-spacing: 0; text-transform: none; }
+.provider-attempts-title { font-size: 14px; margin: 18px 0 8px; }
+
 .provider-availability {
   border-top: 1px solid #22363c;
   margin-top: 14px;
@@ -418,7 +431,7 @@
 
 .provider-availability-heading > div > b {
   display: block;
-  font-size: 12px;
+  font-size: 15px;
 }
 
 .provider-availability-heading small,
@@ -465,7 +478,7 @@
 
 .provider-availability-scope {
   color: #71868d;
-  font-size: 10px;
+  font-size: 13px;
   margin: 10px 0 0;
 }
 
@@ -486,13 +499,14 @@
   align-items: flex-start;
   display: flex;
   gap: 10px;
+  flex-wrap: wrap;
   justify-content: space-between;
 }
 
 .provider-availability-model-heading > code {
   color: #8bd7cc;
   min-width: 0;
-  font-size: 11px;
+  font-size: 13px;
   overflow-wrap: anywhere;
 }
 
@@ -505,7 +519,7 @@
 
 .provider-availability-metrics dt {
   color: #71868d;
-  font-size: 9px;
+  font-size: 12px;
   letter-spacing: .07em;
   overflow-wrap: anywhere;
   text-transform: uppercase;
@@ -513,9 +527,9 @@
 
 .provider-availability-metrics dd {
   font-family: Georgia, serif;
-  font-size: 16px;
+  font-size: 20px;
   margin: 5px 0 0;
-  overflow-wrap: anywhere;
+  white-space: nowrap;
 }
 
 .provider-recent-attempts {
@@ -528,9 +542,9 @@
 .provider-recent-attempts > li {
   color: #71868d;
   flex-wrap: wrap;
-  font-size: 10px;
+  font-size: 13px;
   min-width: 0;
-  padding: 5px 0;
+  padding: 8px 0;
 }
 
 .provider-recent-attempts time { min-width: 154px; }
@@ -544,7 +558,7 @@
 
 .provider-availability-empty {
   color: #71868d;
-  font-size: 11px;
+  font-size: 13px;
   padding: 14px 0 2px;
 }
 
@@ -557,7 +571,7 @@
 .provider-manual-health > .muted,
 .provider-manual-health-result {
   color: #71868d;
-  font-size: 10px;
+  font-size: 13px;
   margin-top: 5px;
 }
 

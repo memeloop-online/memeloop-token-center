@@ -2,6 +2,7 @@ import { createRoot } from 'react-dom/client';
 
 import { I18nProvider } from '../../src/i18n';
 import { UpstreamAvailability } from '../../src/operator/UpstreamAvailability';
+import type { UpstreamAvailabilityWindow } from '../../src/operator/upstreamAvailabilityWindow';
 import type { OperatorMonitoringSnapshot, UpstreamAccount } from '../../src/types';
 import '../../src/styles.css';
 import '../../src/theme.css';
@@ -58,12 +59,37 @@ const snapshot: OperatorMonitoringSnapshot = {
   ],
 };
 
+const accountWindow: UpstreamAvailabilityWindow = {
+  contract_version: 'upstream_account_availability_v1', generated_at: now,
+  tenant_external_id: 'tenant-alpha', from_created_at: now - 86_400_000, to_created_at: now,
+  granularity: 'hour', latency_is_approximate: true, latency_method: 'fixed_histogram_upper_bound_capped_60000ms',
+  accounts: [
+    { upstream_account_id: observedAccount.id,
+      // Deliberately differs from the capped model snapshot.
+      metrics: { requests: 1234, successful_requests: 1200, failed_requests: 34, avg_duration_ms: 230, p95_duration_ms: 1000, costs: [] },
+      terminal_outcomes: [
+        { id: 'req-newest', source: 'request', created_at: now - 1000, status: 'failure', duration_ms: 250, error_code: 'upstream_timeout' },
+        { id: 'req-not-in-model-snapshot', source: 'request', created_at: now - 2000, status: 'success', duration_ms: 180, error_code: null },
+        { id: 'gen-third', source: 'generation', created_at: now - 3000, status: 'success', duration_ms: 210, error_code: null },
+        { id: 'req-fourth', source: 'request', created_at: now - 4000, status: 'failure', duration_ms: 620, error_code: 'rate_limited' },
+        { id: 'req-fifth', source: 'request', created_at: now - 5000, status: 'success', duration_ms: 190, error_code: null },
+      ],
+    },
+    { upstream_account_id: unobservedAccount.id,
+      metrics: { requests: 0, successful_requests: 0, failed_requests: 0, avg_duration_ms: null, p95_duration_ms: null, costs: [] },
+      terminal_outcomes: [],
+    },
+  ],
+};
+
 function Fixture() {
+  const mode = new URLSearchParams(location.search).get('window');
+  const selectedWindow = mode === 'missing' ? undefined : mode === 'foreign' ? { ...accountWindow, tenant_external_id: 'another-tenant' } : accountWindow;
   return <main className="main">
     <div className="hero compact"><div><span className="eyebrow">Fixture</span><h1>Upstream availability</h1></div></div>
     <article className="panel provider-list">
-      <div className="account provider-account"><div className="account-main"><b>{observedAccount.name}</b><span>openai · API credential</span><UpstreamAvailability account={observedAccount} snapshot={snapshot} manualHealth={{ account_id: observedAccount.id, status: 'unhealthy', error_code: 'probe_timeout', upstream_status: 504, latency_ms: 1_200, checked_at: now - 1_000 }} onOpenRequest={(requestId) => { window.upstreamAvailabilityFixture.openedRequestId = requestId; }} /></div></div>
-      <div className="account provider-account"><div className="account-main"><b>{unobservedAccount.name}</b><span>anthropic · API credential</span><UpstreamAvailability account={unobservedAccount} snapshot={snapshot} /></div></div>
+      <div className="account provider-account"><div className="account-main"><b>{observedAccount.name}</b><span>openai · API credential</span><UpstreamAvailability account={observedAccount} snapshot={snapshot} window={selectedWindow} manualHealth={{ account_id: observedAccount.id, status: 'unhealthy', error_code: 'probe_timeout', upstream_status: 504, latency_ms: 1_200, checked_at: now - 1_000 }} onOpenRequest={(requestId) => { window.upstreamAvailabilityFixture.openedRequestId = requestId; }} /></div></div>
+      <div className="account provider-account"><div className="account-main"><b>{unobservedAccount.name}</b><span>anthropic · API credential</span><UpstreamAvailability account={unobservedAccount} snapshot={snapshot} window={selectedWindow} /></div></div>
     </article>
   </main>;
 }

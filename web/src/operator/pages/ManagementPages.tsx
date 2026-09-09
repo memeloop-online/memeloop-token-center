@@ -24,6 +24,7 @@ import {
 } from '../keyPagination';
 import { directCredentialSchema, supportsDirectConnection } from '../providerConnectionMethods';
 import { UpstreamAvailability } from '../UpstreamAvailability';
+import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
 import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
 
@@ -46,7 +47,7 @@ function isPositiveDecimal(value: string) {
   return /^(?:\d+(?:\.\d+)?|\.\d+)$/.test(normalized) && /[1-9]/.test(normalized);
 }
 
-function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityError, onOpenRequest, onChanged }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityError?: string; onOpenRequest?: (requestId: string) => void; onChanged: () => Promise<void> }) {
+function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, onOpenRequest, onChanged }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; onOpenRequest?: (requestId: string) => void; onChanged: () => Promise<void> }) {
   const { locale, t } = useI18n();
   const [method, setMethod] = useState<'direct' | 'authorization'>('direct');
   const [driver, setDriver] = useState('');
@@ -213,7 +214,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             {!providerAvailable && <span className="pill">{t('providers.retired')}</span>}
             <small>{value.id}</small>
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
-            <UpstreamAvailability account={value} snapshot={availabilitySnapshot} manualHealth={currentHealth} onOpenRequest={onOpenRequest} />
+            <UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} manualHealth={currentHealth} onOpenRequest={onOpenRequest} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">
@@ -900,19 +901,24 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest }: Ope
   const resource = useOperatorResource(
     Boolean(token), `${token}\0${tenant}`,
     async () => {
-      const [providers, values, availability] = await Promise.all([
+      const now = Date.now();
+      const [providers, values, availability, windowResult] = await Promise.all([
         api<ProviderType[]>('/internal/v1/provider-types', token),
         api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token),
-        api<OperatorMonitoringSnapshot>(recentAvailabilityPath(tenant, Date.now()), token)
+        api<OperatorMonitoringSnapshot>(recentAvailabilityPath(tenant, now), token)
           .then((availabilitySnapshot) => ({ availabilitySnapshot, availabilityError: undefined }))
           .catch((reason) => ({ availabilitySnapshot: undefined, availabilityError: messageOf(reason, t('providers.availabilityUnavailable')) })),
+        tenant ? api<UpstreamAvailabilityWindow>(upstreamAvailabilityPath(tenant, now), token)
+          .then((availabilityWindow) => ({ availabilityWindow, windowError: undefined }))
+          .catch((reason) => ({ availabilityWindow: undefined, windowError: messageOf(reason, t('providers.availabilityUnavailable')) }))
+          : Promise.resolve({ availabilityWindow: undefined, windowError: t('providers.accountWindowSelectTenant') }),
       ]);
-      return { providers, values, ...availability };
+      return { providers, values, ...availability, availabilityWindow: windowResult.availabilityWindow, availabilityError: windowResult.windowError ?? availability.availabilityError };
     },
     t('common.requestFailed'),
   );
-  return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, values, availabilitySnapshot, availabilityError }) =>
-    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} availabilitySnapshot={availabilitySnapshot} availabilityError={availabilityError} onOpenRequest={onOpenRequest} onChanged={resource.reload} />
+  return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, values, availabilitySnapshot, availabilityWindow, availabilityError }) =>
+    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} availabilitySnapshot={availabilitySnapshot} availabilityWindow={availabilityWindow} availabilityError={availabilityError} onOpenRequest={onOpenRequest} onChanged={resource.reload} />
   }</ResourceBoundary>;
 }
 
