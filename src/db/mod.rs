@@ -58,6 +58,7 @@ mod session_projection;
 mod tenants;
 mod time;
 mod upstream_account_availability;
+mod upstream_quota_reset;
 mod usage_analysis;
 mod validation;
 
@@ -71,6 +72,7 @@ pub(crate) use session_projection::{
     reclassify_request_session_in_transaction,
 };
 pub use time::unix_millis;
+pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetOperation};
 use validation::*;
 
 const POSTGRES_SERVE_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 30000";

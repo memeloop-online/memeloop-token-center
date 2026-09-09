@@ -159,8 +159,58 @@ pub async fn client_for_config_url(
     proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
+    config_url_client(
+        shared_private_client,
+        value,
+        config,
+        proxy,
+        allow_test_loopback,
+        false,
+    )
+    .await
+}
+
+/// Mutation-only transport: no protocol retry, redirects or inherited proxy.
+pub(crate) async fn client_for_config_url_without_retries(
+    shared_private_client: &reqwest::Client,
+    value: &str,
+    config: &Value,
+    proxy: Option<(&str, OutboundScope)>,
+    allow_test_loopback: bool,
+) -> Result<reqwest::Client, AppError> {
+    config_url_client(
+        shared_private_client,
+        value,
+        config,
+        proxy,
+        allow_test_loopback,
+        true,
+    )
+    .await
+}
+
+async fn config_url_client(
+    shared_private_client: &reqwest::Client,
+    value: &str,
+    config: &Value,
+    proxy: Option<(&str, OutboundScope)>,
+    allow_test_loopback: bool,
+    no_retry: bool,
+) -> Result<reqwest::Client, AppError> {
     let target_scope = scope_from_config(config);
     let Some((proxy_url, proxy_scope)) = proxy else {
+        if no_retry {
+            let target = checked_http_url(value)?;
+            let (host, addresses, loopback) =
+                validated_endpoint(&target, target_scope, allow_test_loopback).await?;
+            validate_transport_security(target.scheme(), &addresses, target_scope, loopback)?;
+            let pins: Vec<_> = host
+                .as_deref()
+                .map(|host| (host, addresses.as_slice()))
+                .into_iter()
+                .collect();
+            return crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal);
+        }
         return client_for_url(
             shared_private_client,
             value,
@@ -213,7 +263,12 @@ pub async fn client_for_config_url(
     if let Some(host) = proxy_host.as_deref() {
         pins.push((host, &proxy_addresses));
     }
-    crate::build_explicit_proxy_http_client(proxy_url, &pins).map_err(|_| AppError::Internal)
+    if no_retry {
+        crate::build_no_retry_http_client(Some(proxy_url), &pins)
+    } else {
+        crate::build_explicit_proxy_http_client(proxy_url, &pins)
+    }
+    .map_err(|_| AppError::Internal)
 }
 
 /// Validate the fixed native Codex target and its remote-DNS proxy without

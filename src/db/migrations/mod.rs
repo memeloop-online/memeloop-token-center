@@ -382,6 +382,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "bounded encrypted response archive spool",
         sql: include_str!("../../../migrations/common/0071_response_archive_spool.sql"),
     },
+    Migration {
+        version: 72,
+        name: "durable upstream quota reset operations",
+        sql: include_str!("../../../migrations/common/0072_upstream_quota_reset_operations.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -749,6 +754,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 71,
         name: "bounded encrypted response archive spool",
         sql: include_str!("../../../migrations/common/0071_response_archive_spool.sql"),
+    },
+    Migration {
+        version: 72,
+        name: "durable upstream quota reset operations",
+        sql: include_str!("../../../migrations/common/0072_upstream_quota_reset_operations.sql"),
     },
 ];
 

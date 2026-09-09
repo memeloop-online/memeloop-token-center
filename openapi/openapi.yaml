@@ -1229,6 +1229,147 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/upstreams/{account_id}/quota-reset/prepare:
+    post:
+      tags: [Upstream providers]
+      operationId: prepareUpstreamQuotaReset
+      summary: Prepare an explicitly confirmed supplier reset-credit consumption
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      description: |
+        Fresh read-only quota/credit observations are required. Creates a durable
+        operation and one-time secret confirmation token, expiring in 120 seconds,
+        bound to this account, credential generation, actor and credit observations.
+        No credit is consumed by prepare. A still-unresolved operation blocks another.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - name: tenant_external_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        '200':
+          description: One-time confirmation secret and immutable operation baseline. Cache-Control no-store.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [operation, confirmation_token]
+                properties:
+                  operation: { $ref: '#/components/schemas/UpstreamQuotaResetOperation' }
+                  confirmation_token: { type: string, writeOnly: false, description: Secret shown once; never logged or persisted by clients. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Missing fresh applicable credits or an unresolved operation. }
+
+  /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}:
+    get:
+      tags: [Upstream providers]
+      operationId: getUpstreamQuotaReset
+      summary: Read durable reset dispatch state without requiring a live supplier credential
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - name: operation_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: tenant_external_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        '200':
+          description: Durable state, never a claim of supplier-side idempotency.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamQuotaResetOperation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/confirm:
+    post:
+      tags: [Upstream providers]
+      operationId: confirmUpstreamQuotaReset
+      summary: Spend one reset credit after explicit confirmation and a durable dispatch claim
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      description: |
+        Consumes a real supplier credit. Only the prepare actor may confirm using
+        the unexpired one-time token. Fresh credit counts and current credential
+        generation must still match. Commits submitted before a single consume
+        POST; redirects and HTTP retries are disabled. Uncertain outcomes become
+        unknown and must never be retried under the same or a new operation.
+        Accepted means HTTP 2xx only, not proven consumption or window recovery.
+        Submitted, accepted and unknown all block another operation pending
+        separately reviewed manual handling. No automated unlock is provided.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - name: operation_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: tenant_external_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [confirmation_token]
+              properties:
+                confirmation_token: { type: string, minLength: 32, maxLength: 256 }
+      responses:
+        '200':
+          description: Durable accepted or unknown dispatch result; Cache-Control no-store.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamQuotaResetOperation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Stale, expired, mismatched or already dispatched confirmation. }
+
+  /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/reconcile:
+    post:
+      tags: [Upstream providers]
+      operationId: reconcileUpstreamQuotaReset
+      summary: Record fresh supplier GET observations without repeating consumption
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      description: |
+        Only dispatched operations can be reconciled. Preserves the original
+        confirmation baseline and state; never infers that a changed credit
+        balance proves this operation succeeded. Does not unlock another reset.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - name: operation_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: tenant_external_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        '200':
+          description: Original baseline plus separately named reconciled observations.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamQuotaResetOperation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Prepared operation or unavailable fresh supplier evidence. }
+
   /internal/v1/upstreams/{account_id}/health:
     post:
       tags: [Upstream providers]
@@ -4728,6 +4869,24 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    UpstreamQuotaResetOperation:
+      type: object
+      required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, error_code, effect, consumes_credits]
+      properties:
+        id: { type: string, format: uuid }
+        upstream_account_id: { type: string, format: uuid }
+        state: { type: string, enum: [prepared, submitted, accepted, unknown, expired] }
+        credential_generation: { type: integer, format: int64 }
+        available_credits: { type: integer, format: int64, description: Immutable preparation baseline. }
+        applicable_credits: { type: integer, format: int64, description: Immutable preparation baseline. }
+        observed_at: { type: integer, format: int64, description: Preparation observation epoch milliseconds. }
+        expires_at: { type: integer, format: int64 }
+        last_reconciled_at: { type: [integer, 'null'], format: int64 }
+        reconciled_available_credits: { type: [integer, 'null'], format: int64 }
+        reconciled_applicable_credits: { type: [integer, 'null'], format: int64 }
+        error_code: { type: [string, 'null'] }
+        effect: { const: supplier_defined_codex_rate_limits }
+        consumes_credits: { const: 1 }
     Health:
       type: object
       additionalProperties: false

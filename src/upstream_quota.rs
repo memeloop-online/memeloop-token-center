@@ -1,5 +1,6 @@
-//! Read-only supplier quota projection. This module has no reset/consume path.
+//! Supplier quota projection; mutations live in the explicit durable reset workflow.
 mod normalize;
+pub(crate) mod reset;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -89,11 +90,11 @@ impl QuotaSnapshot {
             credits: Credits::default(),
             reset_capability: ResetCapability {
                 provider_supported: codex.then_some(true),
-                implementation_available: false,
+                implementation_available: codex,
                 available_credits: None,
                 applicable_credits: None,
                 reason: if codex {
-                    "reset_workflow_not_implemented"
+                    "fresh_confirmation_required"
                 } else {
                     "quota_adapter_not_implemented"
                 },

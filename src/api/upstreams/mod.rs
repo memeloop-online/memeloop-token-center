@@ -26,6 +26,9 @@ pub(in crate::api) use native_codex_upgrade::{
     apply_native_codex_upgrade, prepare_native_codex_upgrade,
 };
 pub(in crate::api) use quota::upstream_quota;
+pub(in crate::api) use quota::{
+    confirm_quota_reset, get_quota_reset, prepare_quota_reset, reconcile_quota_reset,
+};
 
 pub(crate) use oauth::refresh_managed_upstream_oauth;
 pub(in crate::api) use oauth::{

@@ -198,6 +198,23 @@ pub(crate) fn build_pinned_http_client(
         .build()
 }
 
+pub(crate) fn build_no_retry_http_client(
+    proxy_url: Option<&str>,
+    pinned_hosts: &[(&str, &[std::net::SocketAddr])],
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = base_http_client_builder()
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(0);
+    if let Some(proxy_url) = proxy_url {
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url)?);
+    }
+    for (hostname, addresses) in pinned_hosts {
+        builder = builder.resolve_to_addrs(hostname, addresses);
+    }
+    builder.build()
+}
+
 pub(crate) fn build_explicit_proxy_http_client(
     proxy_url: &str,
     pinned_hosts: &[(&str, &[std::net::SocketAddr])],

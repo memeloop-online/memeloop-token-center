@@ -51,6 +51,35 @@ attribution does not change when routes are disabled or replaced.
 
 ### Upstream account availability
 
+Quota reset writes require `providers:write`, explicit tenant/account authorization
+and schema 72. `POST /internal/v1/upstreams/{account_id}/quota-reset/prepare`
+performs fresh supplier GETs and returns `{operation, confirmation_token}`.
+The 120-second token binds actor, account, credential generation/transport revision
+and the exact prepared credit counts. The UI must name the account, supplier-defined
+Codex rate limits and consumption of one reset credit; no specific 5h/weekly window
+selection is supported by the supplier wire contract.
+`POST .../quota-reset/{operation_id}/confirm` accepts only that token and rechecks
+fresh credit counts and credential generation before an atomic dispatch claim.
+One fixed-host POST follows the committed `submitted` state with retries and
+redirects disabled. HTTP 2xx yields `accepted` (not proven quota recovery);
+ambiguous outcomes are `unknown`. Both, and interrupted `submitted`, permanently
+block further reset preparation pending separately reviewed manual handling.
+`GET .../quota-reset/{operation_id}` reads durable state even after credential
+revocation. `POST .../quota-reset/{operation_id}/reconcile` performs only supplier
+GETs, records separately named observed counts and never changes the confirmation
+baseline or infers success/unlocks a new consumption. No manual unlock endpoint
+exists. Cancelling the confirmation dialog sends nothing; prepared operations
+expire after 120 seconds. The supplier `redeem_request_id` is a correlation ID;
+supplier idempotency has not been established and is never assumed.
+All reset acceptance tests use mocks; production acceptance must not consume
+credits without separate explicit authorization.
+This is a fail-closed first-dispatch candidate, not a complete reusable reset
+lifecycle. Evidence-backed operation closure and a separately authorized,
+audited manual unlock workflow remain explicit follow-up work. Until that
+protocol is implemented and reviewed, even `accepted` stays blocked and the UI
+must say supplier acceptance is not proven consumption/recovery. Do not mark
+reset delivery complete based on this candidate or its mocks alone.
+
 `GET /internal/v1/upstreams/{account_id}/quota?tenant_external_id=...` requires
 `providers:read` and an explicit authorized tenant. It returns the sanitized
 `upstream_quota_v1` contract: provider/status, nullable observation and freshness

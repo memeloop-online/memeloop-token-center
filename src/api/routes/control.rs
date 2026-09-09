@@ -108,6 +108,22 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(upstream_quota),
         )
         .route(
+            "/internal/v1/upstreams/{account_id}/quota-reset/prepare",
+            post(prepare_quota_reset),
+        )
+        .route(
+            "/internal/v1/upstreams/{account_id}/quota-reset/{operation_id}",
+            get(get_quota_reset),
+        )
+        .route(
+            "/internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/confirm",
+            post(confirm_quota_reset),
+        )
+        .route(
+            "/internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/reconcile",
+            post(reconcile_quota_reset),
+        )
+        .route(
             "/internal/v1/imports/cpa/managed-oauth/capabilities",
             get(cpa_managed_oauth_capabilities),
         )
