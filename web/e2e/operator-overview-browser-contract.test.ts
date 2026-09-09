@@ -57,8 +57,9 @@ test('Overview keeps current sections visible through independent endpoint failu
 
     await page.getByRole('alert').getByText('Monitoring fixture unavailable', { exact: true }).waitFor();
     await page.locator('.overview-trend-card .usage-echart canvas').nth(1).waitFor();
+    await page.locator('.overview-trend-card .usage-echart canvas').nth(2).waitFor();
     assert.equal(await page.locator('.operator-overview-shortcuts').count(), 0, 'overview should prioritize monitoring instead of repeating sidebar destinations');
-    assert.equal(await page.locator('.overview-trend-card .usage-echart').count(), 2, 'the successful statistics endpoint must render both independent trend charts despite monitoring failure');
+    assert.equal(await page.locator('.overview-trend-card .usage-echart').count(), 3, 'the successful statistics endpoint must render request, latency, and cost trends despite monitoring failure');
     assert.equal(await page.evaluate(() => window.overviewFixture.delayedTenantResponsePending), true, 'the alpha request response must still be pending before the scope change');
 
     const alphaCalls = await page.evaluate(() => window.overviewFixture.calls);
@@ -70,6 +71,7 @@ test('Overview keeps current sections visible through independent endpoint failu
     await page.getByText('beta-current-model', { exact: true }).waitFor();
     await page.locator('.operator-monitoring').waitFor();
     await page.locator('.overview-trend-card .usage-echart canvas').nth(1).waitFor();
+    await page.locator('.overview-trend-card .usage-echart canvas').nth(2).waitFor();
 
     await page.evaluate(() => window.overviewFixture.releaseDelayedTenantResponse());
     await page.waitForTimeout(50);
@@ -86,6 +88,7 @@ test('Overview keeps current sections visible through independent endpoint failu
     await trendData.locator('summary').click();
     await trendData.locator('tbody tr').nth(2).waitFor();
     assert.match(await trendData.locator('thead').textContent() ?? '', /UTC/);
+    assert.match(await trendData.locator('thead').textContent() ?? '', /Cost/);
     assert.equal(await trendData.locator('tbody tr').count(), 3, 'the expanded table exposes the exact returned points, not derived rows');
 
     await mkdir(artifactRoot, { recursive: true });
@@ -101,7 +104,7 @@ test('Overview keeps current sections visible through independent endpoint failu
           charts: [...document.querySelectorAll<HTMLElement>('.overview-trend-card .usage-echart')].map((element) => ({ clientWidth: element.clientWidth, scrollWidth: element.scrollWidth })),
           tables: [...document.querySelectorAll<HTMLElement>('.table-scroll')].map((element) => ({ clientWidth: element.clientWidth, scrollWidth: element.scrollWidth })),
         }));
-        assert.equal(layout.charts.length, 2, `${theme} ${width}px retains both trend charts`);
+        assert.equal(layout.charts.length, 3, `${theme} ${width}px retains request, latency, and cost trend charts`);
         assert.ok(layout.documentScrollWidth <= layout.documentClientWidth, `${theme} ${width}px must not create page-level horizontal overflow`);
         if (width >= 1440) assert.equal(layout.metricColumns, 4, 'eight summary metrics form two balanced rows on wide screens');
         for (const chart of layout.charts) assert.ok(chart.scrollWidth <= chart.clientWidth, `${theme} ${width}px charts must remain contained`);

@@ -14,7 +14,7 @@
 
 .overview-trend-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1.25fr) repeat(2, minmax(0, 1fr));
   gap: 16px;
 }
 
@@ -39,6 +39,12 @@
   font-variant-numeric: tabular-nums lining-nums;
 }
 
+.overview-trend-data td:not(:first-child),
+.overview-trend-data th:not(:first-child) {
+  font-variant-numeric: tabular-nums lining-nums;
+  white-space: nowrap;
+}
+
 .operator-overview-dashboard .metrics.monitoring-metrics-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
@@ -55,8 +61,14 @@
   color: #087d70;
 }
 
+@media (width <= 1320px) {
+  .overview-trend-grid { grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); }
+  .overview-trend-primary { grid-row: span 2; }
+}
+
 @media (width <= 1050px) {
   .overview-trend-grid { grid-template-columns: minmax(0, 1fr); }
+  .overview-trend-primary { grid-row: auto; }
   .operator-overview-dashboard .metrics.monitoring-metrics-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

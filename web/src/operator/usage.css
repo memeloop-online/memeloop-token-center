@@ -27,15 +27,27 @@
 .usage-heatmap-selection { background: #102521; border-left: 3px solid #64d8c4; color: #a9d8cf; font-size: 12px; margin-top: 8px; padding: 9px 11px; }
 .usage-heatmap-table { margin-top: 12px; }
 .usage-heatmap-table th[scope='row'] { font-weight: 500; white-space: nowrap; }
-.usage-page .usage-metrics { grid-template-columns: repeat(auto-fit, minmax(min(100%, 23rem), 1fr)); }
+.usage-page .usage-metrics { grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); }
 .usage-page .usage-metrics .metric strong { font-family: Inter, ui-sans-serif, system-ui, sans-serif; font-size: clamp(27px, 2.1vw, 36px); font-variant-numeric: tabular-nums lining-nums; letter-spacing: -.035em; line-height: 1.12; }
 .usage-page .usage-metrics .metric-number { flex-wrap: nowrap; min-width: 0; }
-.usage-page .usage-metrics .metric-exact { white-space: nowrap; }
+.usage-page .usage-metrics .metric-exact { font-variant-numeric: tabular-nums lining-nums; white-space: nowrap; }
+.usage-page :is(.usage-chart-table, .usage-dimension, .usage-generation-table) :is(td, th) { font-variant-numeric: tabular-nums lining-nums; }
+.usage-page :is(.usage-chart-table, .usage-generation-table) td:not(:first-child) { white-space: nowrap; }
+.usage-page .usage-cost-lines > span { font-variant-numeric: tabular-nums lining-nums; white-space: nowrap; }
+
+@container (width <= 23rem) {
+  .usage-page .usage-metrics .metric strong { font-size: clamp(18px, 8cqw, 27px); letter-spacing: -.025em; }
+}
+
+@media (width >= 1321px) {
+  .usage-overview-chart-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .usage-overview-chart-grid .usage-chart-primary { grid-row: auto; }
+}
 :root[data-theme='light'] .usage-filter-disclosure { background: #f3f8f6; border-color: #c5d6d2; }
 :root[data-theme='light'] .usage-filter-disclosure .usage-controls { border-color: #c5d6d2; }
 :root[data-theme='light'] .usage-heatmap-selection { background: #e8f5f1; color: #285f57; }
 @media (width <= 1220px) { .usage-chart-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .usage-overview-chart-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .usage-overview-chart-grid .usage-chart-primary { grid-row: auto; grid-column: 1 / -1; } }
-@media (width <= 800px) { .usage-chart-grid, .usage-overview-chart-grid { grid-template-columns: minmax(0, 1fr); } .usage-overview-chart-grid .usage-chart-primary { grid-column: auto; } }
+@media (width <= 800px) { .usage-chart-grid, .usage-overview-chart-grid { grid-template-columns: minmax(0, 1fr); } .usage-overview-chart-grid .usage-chart-primary { grid-column: auto; } .usage-chart-card .panel-title { align-items: flex-start; gap: 8px; } .usage-chart-card .panel-title h2 { min-width: 0; } .usage-chart-card .panel-title > span { flex: 0 0 auto; font-variant-numeric: tabular-nums lining-nums; white-space: nowrap; } }
 @media (width <= 620px) { .usage-echart { height: 290px; } .usage-echart-heatmap { height: 360px; } .usage-chart-card { padding-inline: 10px; } .usage-dimension-picker { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 5px; } }
 @media (width <= 480px) { .usage-page .usage-metrics { grid-template-columns: minmax(0, 1fr); } }
 @media (width <= 350px) { .usage-metrics { grid-template-columns: minmax(0, 1fr); } .usage-echart { height: 260px; } .usage-echart-heatmap { height: 320px; } }

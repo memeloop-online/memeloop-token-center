@@ -1,6 +1,6 @@
 import { lazy, Suspense, useMemo } from 'react';
 import { api } from '../api';
-import { latencyOption, throughputOption, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
+import { costOption, latencyOption, throughputOption, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
 import { formatCurrency, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import type { OperatorUsageAnalysis } from '../types';
@@ -9,6 +9,14 @@ import { statsQuery } from './usageState';
 import './overview.css';
 
 const EChart = lazy(() => import('../charts/EChart').then((module) => ({ default: module.EChart })));
+
+function formatCosts(costs: OperatorUsageAnalysis['time_series'][number]['costs'], locale: 'zh-CN' | 'en') {
+  if (!costs.length) return '—';
+  return [...costs]
+    .sort((left, right) => left.currency.localeCompare(right.currency))
+    .map(({ cost, currency }) => formatCurrency(cost, currency, locale))
+    .join(' · ');
+}
 
 /** Independent historical trends: a slow query cannot hide current traffic. */
 export function OverviewTrends({ token, tenant }: { token: string; tenant: string }) {
@@ -37,6 +45,12 @@ export function OverviewTrends({ token, tenant }: { token: string; tenant: strin
   }), [locale]);
   const throughput = useMemo(() => throughputOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
   const latency = useMemo(() => latencyOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
+  const costs = useMemo(() => costOption(stats?.time_series ?? [], copy, format), [stats, copy, format]);
+  const trendCards = [
+    { id: 'throughput', title: t('usage.throughput'), option: throughput },
+    { id: 'latency', title: t('usage.latencyTrend'), option: latency },
+    { id: 'cost', title: t('usage.costTrend'), option: costs },
+  ];
 
   return <section className="overview-trends" aria-label={t('usage.trend')}>
     {resource.state.kind === 'failed' && <div className="notice error" role="alert">{resource.state.message}</div>}
@@ -44,10 +58,7 @@ export function OverviewTrends({ token, tenant }: { token: string; tenant: strin
     {!stats && resource.state.kind !== 'failed' && <div className="panel empty" role="status">{t('common.loading')}</div>}
     {stats && <>
       <div className="overview-trend-grid">
-        {[
-          { title: t('usage.throughput'), option: throughput },
-          { title: t('usage.latencyTrend'), option: latency },
-        ].map(({ title, option }) => <article className="panel overview-trend-card" key={title}>
+        {trendCards.map(({ id, title, option }) => <article className={`panel overview-trend-card${id === 'throughput' ? ' overview-trend-primary' : ''}`} key={id}>
           <div className="panel-title"><h2>{title}</h2><span>{stats.time_zone}</span></div>
           {stats.time_series.length === 0 ? <div className="empty">{t('usage.noData')}</div>
             : <Suspense fallback={<div className="empty">{t('common.loading')}</div>}>
@@ -58,10 +69,10 @@ export function OverviewTrends({ token, tenant }: { token: string; tenant: strin
       <details className="overview-trend-data">
         <summary>{t('usage.trendData')}</summary>
         <div className="table-scroll"><table>
-          <thead><tr><th>{t('request.time')} · UTC</th><th>{copy.success}</th><th>{copy.failures}</th><th>{copy.averageLatency}</th><th>{copy.p95Latency}</th></tr></thead>
+          <thead><tr><th>{t('request.time')} · {stats.time_zone}</th><th>{copy.success}</th><th>{copy.failures}</th><th>{copy.averageLatency}</th><th>{copy.p95Latency}</th><th>{copy.cost}</th></tr></thead>
           <tbody>{stats.time_series.map((point) => <tr key={point.bucket_start}>
             <td>{format.bucket(point.bucket_start)}</td><td>{format.number(point.success)}</td><td>{format.number(point.failed)}</td>
-            <td>{formatMilliseconds(point.avg_duration_ms, locale)}</td><td>{formatMilliseconds(point.p95_duration_ms, locale)}</td>
+            <td>{formatMilliseconds(point.avg_duration_ms, locale)}</td><td>{formatMilliseconds(point.p95_duration_ms, locale)}</td><td>{formatCosts(point.costs, locale)}</td>
           </tr>)}</tbody>
         </table></div>
       </details>
