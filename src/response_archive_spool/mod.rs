@@ -11,4 +11,9 @@ const CHUNK_BYTES: usize = 64 * 1024;
 const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(test)]
+pub(crate) async fn process_one_for_test(state: &crate::AppState) -> bool {
+    upload::process_one(state, uuid::Uuid::new_v4()).await
+}
+
+#[cfg(test)]
 mod tests;

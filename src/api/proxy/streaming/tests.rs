@@ -48,7 +48,7 @@ fn invalid_terminals_use_protocol_specific_fixed_errors_without_success() {
 }
 
 #[test]
-fn capture_preserves_crlf_continuation_and_following_control_frame_for_spool() {
+fn capture_preserves_crlf_continuation_but_drops_post_terminal_control_for_spool() {
     let mut capture = ResponsesSseCapture::for_delivery();
     let chunks = [
         Bytes::from_static(b"data: [DONE]\r\n\r"),
@@ -61,7 +61,7 @@ fn capture_preserves_crlf_continuation_and_following_control_frame_for_spool() {
             archived.extend_from_slice(&frame.bytes);
         }
     }
-    assert_eq!(archived, chunks.concat());
+    assert_eq!(archived, b"data: [DONE]\r\n\r\n");
 }
 
 #[test]

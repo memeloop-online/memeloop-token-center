@@ -112,6 +112,7 @@ async fn chat_done_is_a_hard_same_chunk_terminal_for_delivery_archive_and_settle
         .unwrap();
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!(rows[0].cost, "0.000036");
+    drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
         .db
@@ -175,8 +176,11 @@ async fn fragmented_crlf_comment_frames_fail_without_starting_billable_delivery(
         .await
         .unwrap();
     assert_eq!(
-        body,
-        Bytes::from_static(b": heartbeat\r\n\r\n: heartbeat\r\n\r\n")
+        body.as_ref(),
+        [
+            b": heartbeat\r\n\r\n: heartbeat\r\n\r\n".as_slice(),
+            b"data: {\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream stream did not complete\"}}\n\n".as_slice(),
+        ].concat(),
     );
     upstream.await.unwrap();
     wait_for_request_settlement(&fixture, 1).await;
@@ -275,6 +279,7 @@ async fn strict_chat_consumes_the_lf_of_a_done_crlf_split_across_network_chunks(
         .await
         .unwrap();
     assert_eq!(rows[0].status_code, Some(200));
+    drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
         .db
@@ -380,6 +385,7 @@ async fn strict_chat_strips_secret_event_metadata_without_changing_settlement() 
         .unwrap();
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!(rows[0].cost, "0.000036");
+    drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
         .db

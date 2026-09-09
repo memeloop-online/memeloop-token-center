@@ -2041,6 +2041,20 @@ async fn wait_for_request_settlement(fixture: &CodexRouteFixture, expected: usiz
     .unwrap();
 }
 
+async fn drain_completed_response_archive(fixture: &CodexRouteFixture) {
+    // Gateway-only fixtures do not run background workers. Settlement and
+    // upload are now independent: exercise the real fenced spool worker before
+    // asserting object bytes, without making production delivery await S3.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::response_archive_spool::process_one_for_test(&fixture.state),
+        )
+        .await
+        .expect("bounded test archive worker")
+    );
+}
+
 async fn assert_exactly_once_side_effects(
     fixture: &CodexRouteFixture,
     request_id: Uuid,
@@ -2917,6 +2931,7 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
         Some("upstream_failed_response")
     );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
         .db

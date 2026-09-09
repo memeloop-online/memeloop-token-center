@@ -169,6 +169,7 @@ async fn codex_crlf_terminal_releases_at_eof_and_archives_only_safe_comments() {
         .unwrap();
     assert_eq!(rows[0].status_code, Some(200));
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-crlf")).await;
+    drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
         .db
@@ -231,6 +232,7 @@ async fn codex_failed_then_bare_secret_event_never_reaches_delivery_or_archive()
         rows[0].error_code.as_deref(),
         Some("upstream_failed_response")
     );
+    drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
         .db

@@ -74,6 +74,7 @@ async fn chat_usage_only_terminal_is_archived_and_settled_once() {
     );
     pool.close().await;
 
+    drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
         .db
@@ -288,7 +289,13 @@ async fn strict_chat_empty_named_event_fails_without_contract_charge() {
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    assert_eq!(body, Bytes::from_static(b"event: message\n\n"));
+    assert_eq!(
+        body.as_ref(),
+        [
+            b"event: message\n\n".as_slice(),
+            b"data: {\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream stream did not complete\"}}\n\n".as_slice(),
+        ].concat(),
+    );
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
