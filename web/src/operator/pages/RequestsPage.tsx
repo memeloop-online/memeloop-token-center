@@ -37,7 +37,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   const [upstreamError, setUpstreamError] = useState('');
   const [olderFilteredResultsStale, setOlderFilteredResultsStale] = useState(false);
   const sequence = useRef(0);
-  const errorSource = useRef<'detail' | 'load' | 'refresh'>();
+  const errorSource = useRef<'detail' | 'load' | 'refresh' | undefined>(undefined);
   const olderFilteredResultsVisible = useRef(false);
   const requestsRef = useRef(requests);
   const loadingRef = useRef(false);
