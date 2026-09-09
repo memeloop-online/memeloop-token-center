@@ -28,6 +28,7 @@ export function TenantManager({ token, onChanged }: Props) {
   const { t } = useI18n();
   const [values, setValues] = useState<TenantManagementView[]>();
   const [name, setName] = useState('');
+  const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -42,6 +43,7 @@ export function TenantManager({ token, onChanged }: Props) {
     if (!token || (!force && loadedFor.current === token)) return;
     const request = ++loadSequence.current;
     const loadToken = token;
+    setLoading(true);
     try {
       const next = await api<TenantManagementView[]>(managementPath, loadToken);
       if (request !== loadSequence.current || tokenRef.current !== loadToken) return;
@@ -51,6 +53,8 @@ export function TenantManager({ token, onChanged }: Props) {
     } catch (reason) {
       if (request !== loadSequence.current || tokenRef.current !== loadToken) return;
       setError(messageOf(reason, t('tenants.loadFailed')));
+    } finally {
+      if (request === loadSequence.current && tokenRef.current === loadToken) setLoading(false);
     }
   }
 
@@ -138,7 +142,15 @@ export function TenantManager({ token, onChanged }: Props) {
     }
   }
 
-  useEffect(() => { void load(); }, [token]);
+  useEffect(() => {
+    loadedFor.current = '';
+    setError('');
+    setMessage('');
+    setDialog(undefined);
+    setValues(token ? undefined : []);
+    if (!token) { setLoading(false); return; }
+    void load(true);
+  }, [token]);
 
   const statusFilter = useResourceListStatusFilter('tenants', '', values ?? [], (value) => value.status === 'active');
 
@@ -172,16 +184,16 @@ export function TenantManager({ token, onChanged }: Props) {
         ? t('tenants.restore')
         : t('tenants.delete');
 
-  return <section className="panel tenant-manager">
+  return <section className="panel tenant-manager" aria-busy={loading || Boolean(busy)}>
     <div className="panel-title tenant-manager-title"><div><h2>{t('tenants.title')}</h2><p className="muted">{t('tenants.description')}</p></div>{values && <ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('tenants.archived')} />}</div>
     <div className="tenant-manager-body">
       {!dialog && error && <div className="notice error" role="alert">{error}</div>}
       {message && <div className="notice success" role="status">{message}</div>}
-      <div className="tenant-create-row">
-        <label>{t('tenants.name')}<input value={name} maxLength={200} onChange={(event) => setName(event.target.value)} /></label>
-        <button type="button" disabled={busy === 'create' || !name.trim()} onClick={() => void create()}>{t('tenants.create')}</button>
-      </div>
-      {!values ? <div className="empty">{t('common.loading')}</div> : <div className="account-list tenant-list">
+      <form className="tenant-create-row" onSubmit={(event) => { event.preventDefault(); void create(); }}>
+        <label htmlFor="tenant-external-id">{t('tenants.name')}<input id="tenant-external-id" name="tenant_external_id" autoComplete="off" value={name} maxLength={200} onChange={(event) => setName(event.target.value)} /></label>
+        <button type="submit" disabled={loading || busy === 'create' || !name.trim()}>{t('tenants.create')}</button>
+      </form>
+      {!values ? <div className="empty tenant-list-state" role={loading ? 'status' : undefined} aria-live="polite">{loading ? t('common.loading') : <button type="button" className="secondary" onClick={() => void load(true)}>{t('common.retry')}</button>}</div> : <div className="account-list tenant-list">
         {statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('tenants.active')} empty={t('tenants.empty')} />}
         {statusFilter.values.map((value) => {
           const isDefault = value.external_id === 'default';

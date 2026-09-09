@@ -248,6 +248,7 @@
 .settings-card-heading .status { flex: 0 0 auto; }
 .settings-empty { border: 1px dashed #345057; border-radius: 8px; display: grid; gap: 5px; padding: 18px; }
 .settings-empty b { color: #c9eee8; font-size: 14px; }
+.settings-empty button { align-self: start; margin-top: 4px; }
 .settings-empty span, .system-settings-form small, .settings-status-note { color: #82979d; font-size: 12px; line-height: 1.5; }
 .system-settings-form { display: grid; gap: 14px; margin-top: 20px; max-width: 680px; }
 .system-settings-form label { color: #91aab0; display: grid; font-size: 12px; gap: 7px; }
