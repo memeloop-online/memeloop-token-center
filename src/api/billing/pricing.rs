@@ -51,16 +51,16 @@ pub(in crate::api) async fn model_price_usage_summary(
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
     let filter = query.to_filter(true, None)?;
-    let stats = match tenant {
-        Some(tenant) => state.db.operator_stats_filtered(&tenant, filter).await?,
-        None => state.db.global_operator_stats_filtered(filter).await?,
-    };
+    let models = state
+        .db
+        .pricing_model_usage(tenant.as_deref(), filter)
+        .await?;
     Ok(Json(json!({
-        "models": stats.by_model.into_iter().map(|bucket| json!({
-            "model": bucket.name,
-            "calls": bucket.requests,
-            "input_tokens": bucket.input_tokens,
-            "output_tokens": bucket.output_tokens
+        "models": models.into_iter().map(|(model, calls, input_tokens, output_tokens)| json!({
+            "model": model,
+            "calls": calls,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
         })).collect::<Vec<_>>()
     })))
 }

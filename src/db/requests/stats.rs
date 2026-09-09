@@ -671,7 +671,7 @@ SELECT bucket_kind, name, day_bucket, requests, successful_requests,
     }
 }
 
-fn validate_stats_filter(filter: &StatsFilter) -> Result<(), AppError> {
+pub(super) fn validate_stats_filter(filter: &StatsFilter) -> Result<(), AppError> {
     let from = filter
         .from_created_at
         .ok_or_else(|| AppError::BadRequest("from_created_at is required for statistics".into()))?;

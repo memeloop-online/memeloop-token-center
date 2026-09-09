@@ -1,6 +1,7 @@
 mod conversations;
 mod lifecycle;
 mod metered_projection;
+mod pricing_stats;
 mod queries;
 mod session_archive;
 mod session_archive_commit;
