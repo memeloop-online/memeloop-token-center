@@ -95,9 +95,9 @@ impl Database {
         let after_event_id = after_event_id
             .map(|event_id| event_id.to_string())
             .unwrap_or_default();
-        let rows = sqlx::query(
-            "SELECT e.event_id, e.request_id, e.event_at, e.event_kind, e.key_id, e.protocol, e.model, e.status_code, e.duration_ms, e.input_tokens, e.output_tokens, e.cost_micros, e.error_code FROM request_events e JOIN tenants t ON t.id = e.tenant_id WHERE t.external_id = $1 AND (e.event_at > $2 OR (e.event_at = $3 AND e.event_id > $4)) ORDER BY e.event_at ASC, e.event_id ASC LIMIT $5",
-        )
+        let rows = sqlx::query(sqlx::AssertSqlSafe(enriched_request_events_sql(
+            "SELECT e.tenant_id, e.event_id, e.request_id, e.event_at, e.event_kind, e.key_id, e.protocol, e.model, e.status_code, e.duration_ms, e.input_tokens, e.output_tokens, e.cost_micros, e.error_code FROM request_events e JOIN tenants t ON t.id = e.tenant_id WHERE t.external_id = $1 AND (e.event_at > $2 OR (e.event_at = $3 AND e.event_id > $4)) ORDER BY e.event_at ASC, e.event_id ASC LIMIT $5",
+        )))
         .bind(tenant_external_id)
         .bind(after_event_at)
         .bind(after_event_at)
@@ -105,25 +105,7 @@ impl Database {
         .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(RequestEventView {
-                    event_id: parse_uuid(row.try_get("event_id")?)?,
-                    request_id: parse_uuid(row.try_get("request_id")?)?,
-                    event_at: row.try_get("event_at")?,
-                    event_kind: row.try_get("event_kind")?,
-                    key_id: parse_uuid(row.try_get("key_id")?)?,
-                    protocol: row.try_get("protocol")?,
-                    model: row.try_get("model")?,
-                    status_code: row.try_get("status_code")?,
-                    duration_ms: row.try_get("duration_ms")?,
-                    input_tokens: row.try_get("input_tokens")?,
-                    output_tokens: row.try_get("output_tokens")?,
-                    cost: micros_to_decimal_string(row.try_get("cost_micros")?),
-                    error_code: row.try_get("error_code")?,
-                })
-            })
-            .collect()
+        request_event_views(rows)
     }
 
     pub async fn all_request_events_after(
@@ -135,9 +117,9 @@ impl Database {
         let after_event_id = after_event_id
             .map(|event_id| event_id.to_string())
             .unwrap_or_default();
-        let rows = sqlx::query(
-            "SELECT event_id, request_id, event_at, event_kind, key_id, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_events WHERE (event_at > $1 OR (event_at = $2 AND event_id > $3)) ORDER BY event_at ASC, event_id ASC LIMIT $4",
-        )
+        let rows = sqlx::query(sqlx::AssertSqlSafe(enriched_request_events_sql(
+            "SELECT tenant_id, event_id, request_id, event_at, event_kind, key_id, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code FROM request_events WHERE (event_at > $1 OR (event_at = $2 AND event_id > $3)) ORDER BY event_at ASC, event_id ASC LIMIT $4",
+        )))
         .bind(after_event_at)
         .bind(after_event_at)
         .bind(after_event_id)
@@ -950,6 +932,40 @@ fn request_session_context_from_row(
     }))
 }
 
+/// Enrich one already-bounded event batch, never one lookup per event. Locator
+/// ownership and receipt time constrain the partitioned history join.
+fn enriched_request_events_sql(events: &str) -> String {
+    // Both callers supply closed SQL literals with tenant/key ownership.
+    format!(
+        r#"WITH events AS MATERIALIZED ({events})
+SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
+       CASE WHEN e.event_kind = 'finished' THEN COALESCE(r.completed_at, g.completed_at) ELSE NULL END AS completed_at,
+       COALESCE(r.upstream_account_id, g.upstream_account_id) AS upstream_account_id,
+       COALESCE(r.model_route_id, g.model_route_id) AS route_id, r.currency,
+       CASE WHEN e.event_kind = 'finished' THEN r.cached_input_tokens ELSE NULL END AS cached_input_tokens,
+       CASE WHEN e.event_kind = 'finished' THEN r.cache_write_tokens ELSE NULL END AS cache_write_tokens,
+       r.conversation_cluster_id AS session_id,
+       CASE WHEN r.id IS NULL THEN NULL
+            WHEN r.conversation_cluster_id IS NULL THEN 'unlinked'
+            ELSE 'confirmed' END AS session_association,
+       observation.session_name, observation.task_kind, observation.agent_id,
+       observation.metadata_source AS semantics_source
+  FROM events e
+  LEFT JOIN request_record_locators locator
+    ON locator.id = e.request_id AND locator.tenant_id = e.tenant_id AND locator.key_id = e.key_id
+  LEFT JOIN request_records r
+    ON r.id = locator.id AND r.created_at = locator.created_at
+   AND r.tenant_id = e.tenant_id AND r.key_id = e.key_id
+  LEFT JOIN generation_jobs g
+    ON r.id IS NULL AND e.protocol = 'generation' AND g.id = e.request_id
+   AND g.tenant_id = e.tenant_id AND g.key_id = e.key_id
+  LEFT JOIN conversation_observations observation
+    ON observation.request_id = r.id AND observation.key_id = r.key_id
+   AND observation.cluster_id = r.conversation_cluster_id
+ ORDER BY e.event_at ASC, e.event_id ASC"#
+    )
+}
+
 fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppError> {
     rows.into_iter()
         .map(|row| {
@@ -958,6 +974,20 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
                 request_id: parse_uuid(row.try_get("request_id")?)?,
                 event_at: row.try_get("event_at")?,
                 event_kind: row.try_get("event_kind")?,
+                created_at: row.try_get("created_at")?,
+                completed_at: row.try_get("completed_at")?,
+                upstream_account_id: row
+                    .try_get::<Option<String>, _>("upstream_account_id")?
+                    .map(parse_uuid)
+                    .transpose()?,
+                route_id: row
+                    .try_get::<Option<String>, _>("route_id")?
+                    .map(parse_uuid)
+                    .transpose()?,
+                currency: row.try_get("currency")?,
+                cached_input_tokens: row.try_get("cached_input_tokens")?,
+                cache_write_tokens: row.try_get("cache_write_tokens")?,
+                session_context: request_session_context_from_row(&row)?,
                 key_id: parse_uuid(row.try_get("key_id")?)?,
                 protocol: row.try_get("protocol")?,
                 model: row.try_get("model")?,
@@ -1133,6 +1163,10 @@ fn cursor_id(filter: &RequestListFilter) -> String {
         .map(|id| id.to_string())
         .unwrap_or_else(|| "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned())
 }
+
+#[cfg(test)]
+#[path = "event_contract_tests.rs"]
+mod event_contract_tests;
 
 #[cfg(test)]
 mod query_shape_tests {

@@ -9,9 +9,7 @@ export interface RequestView {
   status_code: number | null;
   duration_ms: number | null;
   input_tokens: number;
-  // Older retained history and stream events did not include cache split
-  // fields. The operator table treats their absence as zero while new API
-  // responses always provide both values.
+  // Missing cache telemetry is unknown, never an inferred zero.
   cached_input_tokens?: number;
   cache_write_tokens?: number;
   output_tokens: number;
@@ -92,6 +90,14 @@ export interface RequestEvent {
   request_id: string;
   event_at: number;
   event_kind: 'started' | 'finished';
+  created_at?: number | null;
+  completed_at?: number | null;
+  upstream_account_id?: string | null;
+  route_id?: string | null;
+  currency?: string | null;
+  cached_input_tokens?: number | null;
+  cache_write_tokens?: number | null;
+  session_context?: RequestSessionContext | null;
   key_id: string;
   protocol: string;
   model: string;

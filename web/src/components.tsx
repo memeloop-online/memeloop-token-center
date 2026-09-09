@@ -173,11 +173,13 @@ export function RequestTable({
   onSelect,
   onOpenSession,
   currency,
+  showRoutingDetails = false,
 }: {
   requests: RequestView[];
   onSelect?: (request: RequestView) => void;
   onOpenSession?: (sessionId: string) => void;
   currency?: string;
+  showRoutingDetails?: boolean;
 }) {
   const { locale, t } = useI18n();
   if (!requests.length) return <div className="empty">{t('common.noRequests')}</div>;
@@ -185,7 +187,7 @@ export function RequestTable({
   return (
     <div className="table-scroll">
       <table>
-        <thead><tr><th>{t('request.receivedAt')}</th><th>{t('request.model')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.protocol')}</th><th>{t('request.status')}</th><th>{t('request.duration')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
+        <thead><tr><th>{t('request.receivedAt')}</th>{showRoutingDetails && <th>{t('request.completedAt')}</th>}<th>{t('request.model')}</th>{showsSession && <th>{t('request.session')}</th>}<th>{t('request.protocol')}</th>{showRoutingDetails && <><th>{t('request.upstreamId')}</th><th>{t('request.routeId')}</th></>}<th>{t('request.status')}</th><th>{t('request.duration')}</th><th>{t('request.tokens')}</th><th>{t('request.cost')}</th><th>{t('request.error')}</th>{onSelect && <th><span className="visually-hidden">{t('request.actions')}</span></th>}</tr></thead>
         <tbody>
           {requests.map((request) => {
             const context = request.session_context;
@@ -196,6 +198,7 @@ export function RequestTable({
             const currencyForRequest = recordedCurrency(request, currency);
             return <tr key={request.request_id}>
               <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
+              {showRoutingDetails && <td>{request.completed_at == null ? '—' : <time>{new Date(request.completed_at).toLocaleString(locale)}</time>}</td>}
               <td><code>{request.model}</code></td>
               {showsSession && <td className="request-session-cell">
                 {!context
@@ -208,6 +211,7 @@ export function RequestTable({
                 {sessionMeta && <small>{sessionMeta}</small>}
               </td>}
               <td>{request.protocol}</td>
+              {showRoutingDetails && <><td><code>{request.upstream_account_id ?? '—'}</code></td><td><code>{request.route_id ?? '—'}</code></td></>}
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
               <td>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</td>
               <td className="request-token-cell"><span>{formatNumber(request.input_tokens + request.output_tokens, locale)}</span>{tokenBreakdown && <small>{t('request.tokenBreakdown', { input: formatNumber(tokenBreakdown.input, locale), cached: formatNumber(tokenBreakdown.cached, locale), cacheWrite: formatNumber(tokenBreakdown.cacheWrite, locale), output: formatNumber(tokenBreakdown.output, locale) })}</small>}</td>

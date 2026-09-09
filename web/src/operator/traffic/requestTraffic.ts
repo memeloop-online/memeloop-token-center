@@ -151,21 +151,33 @@ export function filtersActive(filters: RequestFilters) {
   return Object.values(filters).some(Boolean);
 }
 
-export function requestViewFromEvent(event: RequestEvent, previous?: RequestView): RequestView {
+export function requestViewFromEvent(event: RequestEvent, previous?: RequestView): RequestView | undefined {
+  // A terminal event's time is not its receipt time. Retained legacy events
+  // without a request record must wait for history rather than invent a date.
+  const createdAt = event.created_at ?? previous?.created_at
+    ?? (event.event_kind === 'started' ? event.event_at : undefined);
+  if (createdAt === undefined) return previous;
+  // Replayed starts must not regress an authoritative terminal history row.
+  if (event.event_kind === 'started' && previous?.status_code != null) return previous;
   return {
+    ...previous,
     request_id: event.request_id,
-    created_at: previous?.created_at ?? event.event_at,
+    created_at: createdAt,
+    completed_at: event.completed_at ?? previous?.completed_at,
+    upstream_account_id: event.upstream_account_id ?? previous?.upstream_account_id,
+    route_id: event.route_id ?? previous?.route_id,
+    currency: event.currency ?? previous?.currency,
     protocol: event.protocol,
     model: event.model,
     status_code: event.status_code,
     duration_ms: event.duration_ms,
     input_tokens: event.input_tokens,
-    cached_input_tokens: previous?.cached_input_tokens ?? 0,
-    cache_write_tokens: previous?.cache_write_tokens ?? 0,
+    cached_input_tokens: event.cached_input_tokens ?? previous?.cached_input_tokens,
+    cache_write_tokens: event.cache_write_tokens ?? previous?.cache_write_tokens,
     output_tokens: event.output_tokens,
     cost: event.cost,
     error_code: event.error_code,
-    session_context: previous?.session_context ?? null,
+    session_context: event.session_context ?? previous?.session_context,
   };
 }
 
@@ -176,7 +188,8 @@ export function mergeLiveRequestEvents(
 ) {
   const merged = new Map(snapshot.map((request) => [request.request_id, request]));
   for (const event of liveEvents.values()) {
-    merged.set(event.request_id, requestViewFromEvent(event, merged.get(event.request_id)));
+    const request = requestViewFromEvent(event, merged.get(event.request_id));
+    if (request) merged.set(event.request_id, request);
   }
   // Keep any history page the operator deliberately loaded. The original
   // first page remains bounded at 100 when another server page exists, while
