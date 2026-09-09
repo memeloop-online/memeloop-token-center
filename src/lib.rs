@@ -1,6 +1,4 @@
 pub mod api;
-#[cfg(unix)]
-pub mod native_cli;
 pub mod archive;
 pub mod archive_reaper;
 pub mod archive_staging;
@@ -16,6 +14,8 @@ pub mod generation;
 mod jemalloc_control;
 pub mod metrics;
 pub mod model;
+#[cfg(unix)]
+pub mod native_cli;
 pub mod network;
 pub mod oauth;
 pub mod plugin;
