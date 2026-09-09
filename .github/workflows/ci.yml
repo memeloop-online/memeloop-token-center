@@ -180,11 +180,15 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get \
+          # These clients come from the Ubuntu runner's existing signed sources.
+          # Do not refresh unrelated third-party Chrome indexes for Rust tests.
+          test -s /etc/apt/sources.list.d/ubuntu.sources
+          apt_sources=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-)
+          sudo apt-get "${apt_sources[@]}" \
             -o Acquire::Retries=3 \
             -o DPkg::Lock::Timeout=60 \
             update
-          sudo apt-get \
+          sudo apt-get "${apt_sources[@]}" \
             -o Acquire::Retries=3 \
             -o DPkg::Lock::Timeout=60 \
             install --yes --no-install-recommends postgresql-client sqlite3
@@ -260,8 +264,12 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=60 update
-          sudo apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=60 \
+          # Limit this invocation, not the runner's global APT configuration.
+          # Missing official sources fail closed; signature/hash checks stay on.
+          test -s /etc/apt/sources.list.d/ubuntu.sources
+          apt_sources=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-)
+          sudo apt-get "${apt_sources[@]}" -o Acquire::Retries=3 -o DPkg::Lock::Timeout=60 update
+          sudo apt-get "${apt_sources[@]}" -o Acquire::Retries=3 -o DPkg::Lock::Timeout=60 \
             install --yes --no-install-recommends postgresql-client sqlite3
       - name: SQLite migration and replay smoke test
         env:
