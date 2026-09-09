@@ -7,6 +7,19 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
+// The contract typecheck intentionally excludes TSX browser fixtures.
+declare global {
+  interface Window {
+    confirmFixture: {
+      accepted: number;
+      changeScope: () => void;
+      duplicate: () => void;
+      stale: () => void;
+      unmount: () => void;
+    };
+  }
+}
+
 test('all destructive confirmation entry points use the scoped application dialog', async () => {
   for (const file of ['operator/GroupManager.tsx', 'operator/GenerationWorkspace.tsx', 'self/GenerationsPage.tsx', 'operator/pages/ManagementPages.tsx']) {
     const source = await readFile(new URL(`../src/${file}`, import.meta.url), 'utf8');
