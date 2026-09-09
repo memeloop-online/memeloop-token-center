@@ -51,6 +51,24 @@ attribution does not change when routes are disabled or replaced.
 
 ### Upstream account availability
 
+`GET /internal/v1/upstreams/{account_id}/quota?tenant_external_id=...` requires
+`providers:read` and an explicit authorized tenant. It returns the sanitized
+`upstream_quota_v1` contract: provider/status, nullable observation and freshness
+deadlines (epoch milliseconds), stale marker, plan, all applicable windows,
+supplier credits, reset capability and closed product error codes. Window reset
+times are epoch milliseconds; relative supplier offsets are marked estimated.
+Unknown values stay null, never zero/unlimited. Supplier reset support is
+distinct from MTC implementation availability and available/applicable credits.
+This GET performs no reset, token refresh, probe or model invocation. Only
+server-held credentials reach fixed native supplier GET endpoints; no upstream
+body, email, account header, token or proxy secret is returned. The 30-second
+cache is bounded to 128 identities, four concurrent account reads and one flight
+per identity; each read has an eight-second deadline and 1 MiB response limit.
+Read failures may retain explicitly stale observations for at most five minutes.
+Other providers return unsupported rather than fabricated quota. All responses
+use `Cache-Control: no-store`. Request quota only on explicit account inspection,
+not one automatic request per row on page load.
+
 `GET /internal/v1/upstream-availability` requires a service credential with both
 `providers:read` and `requests:read`. All three query parameters are mandatory:
 `tenant_external_id`, `from_created_at`, and `to_created_at`; unknown parameters

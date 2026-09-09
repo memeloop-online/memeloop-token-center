@@ -1147,6 +1147,88 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/upstreams/{account_id}/quota:
+    get:
+      tags: [Upstream providers]
+      operationId: getUpstreamQuota
+      summary: Read a sanitized native supplier quota snapshot
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      description: |
+        Requires an explicit authorized tenant. Performs only bounded native
+        Codex usage and reset-credit GETs with server-held encrypted credentials.
+        Never consumes a reset credit or exposes supplier bodies or secrets.
+        Snapshots are cached for 30 seconds with bounded singleflight/concurrency;
+        stale observations may be retained for five minutes after a read error.
+        Unsupported means no quota adapter, not zero quota or unlimited usage.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - name: tenant_external_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        '200':
+          description: Sanitized quota; provider-supported reset is distinct from implemented reset.
+          headers:
+            Cache-Control:
+              schema: { const: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_version, upstream_account_id, tenant_external_id, provider, status, observed_at, stale_after, stale, plan_type, windows, credits, reset_capability, error_code]
+                properties:
+                  contract_version: { const: upstream_quota_v1 }
+                  upstream_account_id: { type: string, format: uuid }
+                  tenant_external_id: { type: string }
+                  provider: { type: string }
+                  status: { type: string, enum: [ready, error, unsupported] }
+                  observed_at: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds of supplier observation. }
+                  stale_after: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds freshness deadline. }
+                  stale: { type: boolean }
+                  plan_type: { type: [string, 'null'] }
+                  error_code: { type: [string, 'null'], description: Sanitized product error code; never upstream text. }
+                  credits:
+                    type: object
+                    required: [balance, unlimited, has_credits]
+                    properties:
+                      balance: { type: [string, 'null'], description: Supplier decimal balance, not customer key balance. }
+                      unlimited: { type: [boolean, 'null'] }
+                      has_credits: { type: [boolean, 'null'] }
+                  reset_capability:
+                    type: object
+                    required: [provider_supported, implementation_available, available_credits, applicable_credits, reason, credit_error_code]
+                    properties:
+                      provider_supported: { type: [boolean, 'null'] }
+                      implementation_available: { type: boolean }
+                      available_credits: { type: [integer, 'null'], format: int64 }
+                      applicable_credits: { type: [integer, 'null'], format: int64 }
+                      reason: { type: string }
+                      credit_error_code: { type: [string, 'null'] }
+                  windows:
+                    type: array
+                    maxItems: 68
+                    items:
+                      type: object
+                      required: [id, label, used_percent, remaining, limit, reset_at, period_seconds, source, reset_is_estimated, allowed, limit_reached]
+                      properties:
+                        id: { type: string }
+                        label: { type: string }
+                        used_percent: { type: [number, 'null'] }
+                        remaining: { type: [number, 'null'] }
+                        limit: { type: [number, 'null'] }
+                        reset_at: { type: [integer, 'null'], format: int64, description: Unix epoch milliseconds. }
+                        period_seconds: { type: [integer, 'null'], format: int64 }
+                        source: { type: string }
+                        reset_is_estimated: { type: boolean }
+                        allowed: { type: [boolean, 'null'] }
+                        limit_reached: { type: [boolean, 'null'] }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/upstreams/{account_id}/health:
     post:
       tags: [Upstream providers]
