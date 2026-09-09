@@ -59,7 +59,10 @@ test('credential-bound portal work is abortable and remounts on identity generat
 test('generation catalog selection cannot submit an arbitrary model', async () => {
   const create = await readFile(new URL('../src/self/GeneratePage.tsx', import.meta.url), 'utf8');
   assert.doesNotMatch(create, /<datalist/);
-  assert.match(create, /<select value=\{model\}/);
+  assert.match(create, /<ModelPicker label=\{t\('self\.generationModel'\)\} value=\{model\}/);
+  assert.match(create, /options=\{generationModels\.map\(/);
+  assert.doesNotMatch(create, /<ModelPicker[^>]*\beditable\b/);
+  assert.match(create, /selectedModel\.id !== selectedModelId/);
   assert.match(create, /!catalogAvailable \|\| !selectedModel/);
   assert.match(create, /loadCatalog\(\)/);
 });

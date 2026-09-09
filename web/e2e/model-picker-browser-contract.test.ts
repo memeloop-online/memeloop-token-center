@@ -5,7 +5,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
-test('filters are non-modal themed popovers and model selection is searchable by provider/account with keyboard dismissal', { timeout: 30_000 }, async () => {
+test('filters are non-modal themed popovers and model selection is searchable by provider/account with keyboard dismissal', { timeout: 30_000 }, async (context) => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for model picker interaction contracts');
     return test.skip('Chromium is not installed');
@@ -17,6 +17,9 @@ test('filters are non-modal themed popovers and model selection is searchable by
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
+    page.setDefaultTimeout(5_000);
+    const pageErrors: string[] = [];
+    page.on('pageerror', (error) => pageErrors.push(error.message));
     const writes: string[] = [];
     await page.exposeFunction('recordModelPickerWrite', (path: string) => writes.push(path));
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
@@ -24,6 +27,7 @@ test('filters are non-modal themed popovers and model selection is searchable by
     for (const theme of ['light', 'dark']) {
       await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
       for (const width of [320, 390, 768, 1024, 1440, 1920, 2560]) {
+        context.diagnostic(`checking ${theme} ${width}px dismissal and theme`);
         await page.setViewportSize({ width, height: 900 });
         const trigger = page.locator('.typed-filter-actions button').first();
         await trigger.click();
@@ -42,6 +46,7 @@ test('filters are non-modal themed popovers and model selection is searchable by
       }
     }
     assert.deepEqual(writes, [], 'opening, closing, Escape and outside clicks must not persist presets or invoke the assistant');
+    context.diagnostic('checking nested model picker keyboard selection');
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.locator('.typed-filter-actions button').first().click();
     const filter = page.locator('.typed-filter-dialog');
@@ -57,13 +62,16 @@ test('filters are non-modal themed popovers and model selection is searchable by
     assert.equal(await catalog.getByRole('option').count(), 1);
     await search.press('ArrowDown');
     await search.press('Enter');
+    assert.equal(await filter.isVisible(), true, 'closing the nested model picker must not close the filter editor');
     await filter.getByRole('button', { name: 'Apply filters', exact: true }).click();
     assert.equal(await page.locator('[data-filter-model]').textContent(), 'production-model');
+    context.diagnostic('checking settings provider/account autocomplete');
     await page.locator('.system-settings .model-picker-trigger').click();
     const settingsCatalog = page.locator('.system-settings .shared-model-popover');
     await settingsCatalog.getByRole('combobox').fill('Research account');
     await settingsCatalog.getByRole('option').first().click();
     assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /research-model/);
+    assert.deepEqual(pageErrors, [], 'model picker interactions must not produce page errors');
   } finally {
     await browser.close();
     await server.close();
