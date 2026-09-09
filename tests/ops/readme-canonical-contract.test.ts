@@ -25,16 +25,22 @@ test('README management commands are single-line read-only lookups with failure 
   const blocks = [...readme.matchAll(/```([^\n]+)\n([\s\S]*?)\n```/gu)];
   assert.deepEqual(blocks.map((block) => block[1]), ['bash', 'powershell']);
   for (const [, , command] of blocks) {
+    assert.equal(typeof command, 'string');
+    assert.ok(command);
     assert.equal(command.split('\n').length, 1);
     assert.match(command, /kubectl -n memeloop-token-center-api2-trial get secret memeloop-token-center-secrets/u);
     assert.match(command, /jsonpath=\{\.data\.service-token\}/u);
     assert.doesNotMatch(command, /\b(?:create|apply|patch|delete|replace|rotate|openssl|curl)\b/u);
   }
-  assert.match(blocks[0][2], /set -euo pipefail/u);
-  assert.match(blocks[0][2], /test -n "\$mtc_service_token_b64"/u);
-  assert.match(blocks[0][2], /base64 --decode/u);
-  assert.match(blocks[1][2], /\$LASTEXITCODE -ne 0/u);
-  assert.match(blocks[1][2], /IsNullOrWhiteSpace/u);
-  assert.match(blocks[1][2], /FromBase64String/u);
+  const bash = blocks[0]?.[2];
+  const powershell = blocks[1]?.[2];
+  assert.ok(bash);
+  assert.ok(powershell);
+  assert.match(bash, /set -euo pipefail/u);
+  assert.match(bash, /test -n "\$mtc_service_token_b64"/u);
+  assert.match(bash, /base64 --decode/u);
+  assert.match(powershell, /\$LASTEXITCODE -ne 0/u);
+  assert.match(powershell, /IsNullOrWhiteSpace/u);
+  assert.match(powershell, /FromBase64String/u);
   assert.match(readme, /do not run them in CI/u);
 });
