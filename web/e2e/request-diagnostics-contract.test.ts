@@ -8,6 +8,7 @@ const selfPortal = await readFile(new URL('../src/self/SelfPortal.tsx', import.m
 const operatorRequests = await readFile(new URL('../src/operator/pages/RequestsPage.tsx', import.meta.url), 'utf8');
 const types = await readFile(new URL('../src/types.ts', import.meta.url), 'utf8');
 const copyButton = await readFile(new URL('../src/CopyButton.tsx', import.meta.url), 'utf8');
+const fixture = await readFile(new URL('./fixtures/request-diagnostics.tsx', import.meta.url), 'utf8');
 
 test('request table exposes copyable durable IDs and its recorded token billing split', () => {
   assert.match(components, /RequestIdentifier/);
@@ -31,6 +32,12 @@ test('both Requests drawers reuse the durable request diagnostics surface and se
   assert.match(components, /context\.association === 'confirmed'/);
   assert.match(components, /context\.session_id/);
   assert.match(components, /sessions\.unlinkedRequests/);
+});
+
+test('request diagnostics fixture preserves the Shell grid placement used by the browser contract', () => {
+  assert.match(fixture, /className="app-shell" data-fixture-ready="request-diagnostics"><aside className="rail" aria-hidden="true" \/><main className="main">/);
+  assert.match(fixture, /data-fixture-request="recorded"/);
+  assert.match(fixture, /data-fixture-request="historical-gap"/);
 });
 
 test('request diagnostics use only nullable server-recorded final routing fields', () => {

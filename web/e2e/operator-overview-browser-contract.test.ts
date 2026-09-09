@@ -57,6 +57,7 @@ test('Overview keeps current sections visible through independent endpoint failu
 
     await page.getByRole('alert').getByText('Monitoring fixture unavailable', { exact: true }).waitFor();
     await page.locator('.overview-trend-card .usage-echart canvas').nth(1).waitFor();
+    assert.equal(await page.locator('.operator-overview-shortcuts').count(), 0, 'overview should prioritize monitoring instead of repeating sidebar destinations');
     assert.equal(await page.locator('.overview-trend-card .usage-echart').count(), 2, 'the successful statistics endpoint must render both independent trend charts despite monitoring failure');
     assert.equal(await page.evaluate(() => window.overviewFixture.delayedTenantResponsePending), true, 'the alpha request response must still be pending before the scope change');
 

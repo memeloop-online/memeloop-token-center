@@ -48,7 +48,7 @@ function OverviewRecentRequestsSection({ state, onOpenSession }: { state: Resour
   </article>;
 }
 
-export function OverviewPage({ token, tenant, onNavigate, onOpenSession }: OperatorPageProps & {
+export function OverviewPage({ token, tenant, onOpenSession }: OperatorPageProps & {
   onNavigate: (route: OperatorRouteKey) => void;
   onOpenUsageSession: (session: UsageAnalysisSessionBucket) => void;
   onOpenSession: (sessionId: string) => void;
@@ -64,16 +64,7 @@ export function OverviewPage({ token, tenant, onNavigate, onOpenSession }: Opera
     () => api<OperatorMonitoringSnapshot>(monitoringSnapshotPath(tenant, Date.now()), token),
     t('common.requestFailed'),
   );
-  const destinations: Array<{ route: OperatorRouteKey; label: string }> = [
-    { route: 'requests', label: t('nav.traffic') },
-    { route: 'sessions', label: t('sessions.sessionsMode') },
-    { route: 'usage', label: t('nav.usage') },
-    { route: 'providers', label: t('nav.providers') },
-    { route: 'routes', label: t('nav.routes') },
-    { route: 'credentials', label: t('nav.credentials') },
-  ];
   return <div className="operator-overview-dashboard">
-    <article className="panel operator-overview-shortcuts"><div className="panel-title"><div><h2>{t('usage.overview')}</h2><p className="muted">{t('operator.subtitle')}</p></div></div><div className="row-actions">{destinations.map((item) => <button type="button" className="secondary" key={item.route} onClick={() => onNavigate(item.route)}>{item.label}</button>)}</div></article>
     <OverviewMonitoringSection state={monitoringResource.state} />
     <OverviewTrends token={token} tenant={tenant} />
     <OverviewRecentRequestsSection state={requestResource.state} onOpenSession={onOpenSession} />

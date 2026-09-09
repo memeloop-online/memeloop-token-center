@@ -55,7 +55,9 @@ const historicalGap: RequestView = {
 
 function Fixture() {
   const [openedSession, setOpenedSession] = useState('');
-  return <div className="app-shell" data-fixture-ready="request-diagnostics"><main className="main">
+  // The production shell places main in grid column two after its rail. Keep
+  // the fixture's layout contract identical so narrow-table behavior is real.
+  return <div className="app-shell" data-fixture-ready="request-diagnostics"><aside className="rail" aria-hidden="true" /><main className="main">
     <RequestTable requests={[request, historicalGap]} currency="USD" onOpenSession={setOpenedSession} />
     <section data-fixture-request="recorded"><RequestDiagnostics request={request} currency="USD" onOpenSession={setOpenedSession} /></section>
     <section data-fixture-request="historical-gap"><RequestDiagnostics request={historicalGap} currency="USD" onOpenSession={setOpenedSession} /></section>

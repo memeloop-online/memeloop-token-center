@@ -40,14 +40,7 @@ async function stage<T>(name: string, action: () => Promise<T>, history: string[
 
 async function fixtureDiagnostics(page: Page | undefined, phase: string, history: string[], pageErrors: string[], consoleErrors: string[]) {
   const layout = page ? await Promise.race([
-    page.evaluate(() => {
-    const dimensions = (selector: string) => [...document.querySelectorAll<HTMLElement>(selector)].map((element) => ({
-      clientWidth: element.clientWidth,
-      clientHeight: element.clientHeight,
-      scrollWidth: element.scrollWidth,
-      scrollHeight: element.scrollHeight,
-    }));
-    return {
+    page.evaluate(() => ({
       readyState: document.readyState,
       viewport: { width: document.documentElement.clientWidth, height: document.documentElement.clientHeight, scrollWidth: document.documentElement.scrollWidth },
       fixtureRoots: document.querySelectorAll('[data-fixture-ready="request-diagnostics"]').length,
@@ -55,10 +48,9 @@ async function fixtureDiagnostics(page: Page | undefined, phase: string, history
       historicalDiagnostics: document.querySelectorAll('[data-fixture-request="historical-gap"] .request-diagnostics').length,
       requestRows: document.querySelectorAll('tbody tr').length,
       copyButtons: document.querySelectorAll('.request-id-control.compact .copy-control button').length,
-      tables: dimensions('.table-scroll'),
-      diagnostics: dimensions('.request-diagnostics'),
-    };
-    }).catch((reason: unknown) => ({ evaluationError: reason instanceof Error ? reason.message : String(reason) })),
+      tables: Array.from(document.querySelectorAll<HTMLElement>('.table-scroll'), (element) => ({ clientWidth: element.clientWidth, clientHeight: element.clientHeight, scrollWidth: element.scrollWidth, scrollHeight: element.scrollHeight })),
+      diagnostics: Array.from(document.querySelectorAll<HTMLElement>('.request-diagnostics'), (element) => ({ clientWidth: element.clientWidth, clientHeight: element.clientHeight, scrollWidth: element.scrollWidth, scrollHeight: element.scrollHeight })),
+    })).catch((reason: unknown) => ({ evaluationError: reason instanceof Error ? reason.message : String(reason) })),
     new Promise<{ evaluationError: string }>((resolve) => setTimeout(() => resolve({ evaluationError: `layout diagnostic exceeded ${stepTimeout}ms` }), stepTimeout)),
   ]) : { page: 'not created' };
   return { phase, history, pageErrors, consoleErrors, layout };

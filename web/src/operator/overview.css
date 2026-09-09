@@ -39,10 +39,6 @@
   font-variant-numeric: tabular-nums lining-nums;
 }
 
-.operator-overview-shortcuts .row-actions {
-  flex-wrap: wrap;
-}
-
 .operator-overview-dashboard .metrics.monitoring-metrics-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
@@ -53,6 +49,10 @@
 
 :root[data-theme='light'] .operator-overview-dashboard .metric.negative .metric-value {
   color: #b52f45;
+}
+
+:root[data-theme='light'] .operator-overview-recent td > code {
+  color: #087d70;
 }
 
 @media (width <= 1050px) {
