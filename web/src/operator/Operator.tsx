@@ -168,7 +168,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
         case 'tenants': page = <TenantManager token={scope.activeCredential} onChanged={scope.refreshTenants} />; break;
         case 'credentials': page = <CredentialsPage {...pageProps} />; break;
         case 'service-credentials': page = <ServiceCredentialsPage {...pageProps} />; break;
-        case 'plugins': page = <PluginsPage {...pageProps} catalog={pluginCatalog.state} />; break;
+        case 'plugins': page = <PluginsPage {...pageProps} catalog={pluginCatalog.state} reloadCatalog={pluginCatalog.reload} />; break;
         case 'settings': page = <>{accessSettings}<SystemSettingsPage {...pageProps} /></>; break;
       }
     } else {
