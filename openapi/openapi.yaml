@@ -2080,6 +2080,47 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/model-routes/{route_id}/retire-upstreams:
+    post:
+      tags: [Routing]
+      operationId: retireModelRouteUpstreams
+      summary: Remove disabled upstream candidates while retaining a disabled route and every customer grant
+      description: Requires both routes:write and providers:write. The route must already be disabled. Only explicitly named disabled accounts are removed; provider-group candidates require separate review. Route identity, model, groups, grants, and history remain unchanged. An empty route remains disabled and cannot be enabled without an eligible candidate.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:write
+      x-required-scopes: [routes:write, providers:write]
+      parameters:
+        - name: route_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [tenant_external_id, upstream_account_ids, expected_updated_at, expected_grant_revision]
+              properties:
+                tenant_external_id: { type: string }
+                upstream_account_ids:
+                  type: array
+                  minItems: 1
+                  items: { type: string, format: uuid }
+                expected_updated_at: { type: integer, format: int64 }
+                expected_grant_revision: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Disabled route routing view; zero candidates are permitted, grants are retained.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelRouteRouting' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
   /internal/v1/model-routes/{route_id}/routing:
     get:
       tags: [Groups]

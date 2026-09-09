@@ -28,6 +28,9 @@ use super::types::{
 };
 use crate::provider::ModelRouteView;
 
+#[path = "retirement.rs"]
+mod retirement;
+
 impl Database {
     pub async fn update_routed_model_route(
         &self,

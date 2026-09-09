@@ -93,8 +93,8 @@ use health::{
 };
 use limits::*;
 use model_routes::{
-    create_model_route, delete_model_route, list_model_routes, set_model_route_enabled,
-    update_model_route,
+    create_model_route, delete_model_route, list_model_routes, retire_model_route_upstreams,
+    set_model_route_enabled, update_model_route,
 };
 use plugins::{get_plugin_configuration, get_plugin_service_data, put_plugin_configuration};
 use request_detail::*;

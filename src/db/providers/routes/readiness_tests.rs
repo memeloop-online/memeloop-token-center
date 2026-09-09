@@ -5,6 +5,201 @@ use std::time::Duration;
 const PEPPER: &[u8] = b"route-readiness-test-pepper-at-least-32-bytes";
 const TENANT: &str = "route-readiness";
 
+#[tokio::test]
+async fn retirement_preserves_route_grants_and_allows_zero_candidate_account_deletion() {
+    let (_directory, database, account_id) = sqlite_database().await;
+    let route = database
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: TENANT.to_owned(),
+            public_model: "retired-public".to_owned(),
+            upstream_account_id: account_id,
+            upstream_model: "retired-upstream".to_owned(),
+            protocol: "openai".to_owned(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: TENANT.to_owned(),
+                principal_external_id: "retained-customer".to_owned(),
+                alias: "retained-access".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ZERO,
+                idempotency_key: None,
+            },
+            PEPPER,
+        )
+        .await
+        .unwrap();
+    let original_key_routing = database
+        .credential_routing(issued.key_id, TENANT)
+        .await
+        .unwrap();
+    database
+        .replace_credential_routing(
+            issued.key_id,
+            ReplaceCredentialRoutingInput {
+                tenant_external_id: TENANT.to_owned(),
+                route_ids: vec![route.id],
+                route_group_ids: vec![],
+                expected_grant_revision: original_key_routing.grant_revision,
+            },
+        )
+        .await
+        .unwrap();
+    let current = database
+        .list_model_routes(Some(TENANT))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == route.id)
+        .unwrap();
+    let routing = database.route_routing(route.id, TENANT).await.unwrap();
+    assert!(matches!(
+        database
+            .retire_model_route_upstreams(
+                route.id,
+                TENANT,
+                vec![account_id],
+                current.updated_at,
+                routing.grant_revision,
+            )
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    let disabled_route = database
+        .set_model_route_enabled(route.id, TENANT, false, current.updated_at)
+        .await
+        .unwrap();
+    assert!(matches!(
+        database
+            .retire_model_route_upstreams(
+                route.id,
+                TENANT,
+                vec![account_id],
+                disabled_route.updated_at,
+                routing.grant_revision,
+            )
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    let account = database
+        .list_upstream_accounts(TENANT)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == account_id)
+        .unwrap();
+    let disabled_account = database
+        .set_upstream_account_status(account_id, TENANT, "disabled", account.updated_at)
+        .await
+        .unwrap();
+    assert!(matches!(
+        database
+            .retire_model_route_upstreams(
+                route.id,
+                TENANT,
+                vec![account_id],
+                disabled_route.updated_at - 1,
+                routing.grant_revision,
+            )
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    assert!(matches!(
+        database
+            .retire_model_route_upstreams(
+                route.id,
+                TENANT,
+                vec![account_id, Uuid::new_v4()],
+                disabled_route.updated_at,
+                routing.grant_revision,
+            )
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(
+        database
+            .route_routing(route.id, TENANT)
+            .await
+            .unwrap()
+            .upstream_account_ids,
+        vec![account_id]
+    );
+    assert!(matches!(
+        database
+            .retire_model_route_upstreams(
+                route.id,
+                TENANT,
+                vec![account_id],
+                disabled_route.updated_at,
+                routing.grant_revision + 1,
+            )
+            .await,
+        Err(AppError::Conflict(_))
+    ));
+    let before = database
+        .credential_routing(issued.key_id, TENANT)
+        .await
+        .unwrap();
+    let retired = database
+        .retire_model_route_upstreams(
+            route.id,
+            TENANT,
+            vec![account_id],
+            disabled_route.updated_at,
+            routing.grant_revision,
+        )
+        .await
+        .unwrap();
+    assert!(retired.upstream_account_ids.is_empty());
+    assert!(retired.candidate_upstream_account_ids.is_empty());
+    assert_eq!(retired.granted_credential_ids, vec![issued.key_id]);
+    assert_eq!(retired.grant_revision, routing.grant_revision);
+    let after = database
+        .credential_routing(issued.key_id, TENANT)
+        .await
+        .unwrap();
+    assert_eq!(before.route_ids, after.route_ids);
+    assert_eq!(before.grant_revision, after.grant_revision);
+    assert!(
+        database
+            .set_model_route_enabled(route.id, TENANT, true, retired.updated_at)
+            .await
+            .is_err()
+    );
+    let readiness = database
+        .upstream_deletion_readiness(account_id, TENANT)
+        .await
+        .unwrap();
+    assert!(readiness.can_delete);
+    database
+        .delete_upstream_account(account_id, TENANT, disabled_account.updated_at)
+        .await
+        .unwrap();
+    let retained = database
+        .list_model_routes(Some(TENANT))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == route.id)
+        .unwrap();
+    assert!(!retained.enabled);
+    assert_eq!(retained.upstream_account_id, Uuid::nil());
+    assert_eq!(retained.public_model, "retired-public");
+    assert_eq!(
+        database
+            .credential_routing(issued.key_id, TENANT)
+            .await
+            .unwrap()
+            .route_ids,
+        vec![route.id]
+    );
+}
+
 async fn sqlite_database() -> (tempfile::TempDir, Database, Uuid) {
     let directory = tempfile::tempdir().expect("route readiness temporary directory");
     let database_url = format!(

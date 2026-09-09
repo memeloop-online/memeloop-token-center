@@ -218,6 +218,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
                 .delete(delete_model_route),
         )
         .route(
+            "/internal/v1/model-routes/{route_id}/retire-upstreams",
+            post(retire_model_route_upstreams),
+        )
+        .route(
             "/internal/v1/model-routes/{route_id}/routing",
             get(get_route_routing).put(replace_route_routing),
         )

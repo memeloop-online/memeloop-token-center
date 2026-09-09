@@ -309,6 +309,39 @@ pub(super) struct SetModelRouteEnabledRequest {
     expected_updated_at: i64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RetireModelRouteUpstreamsRequest {
+    tenant_external_id: String,
+    upstream_account_ids: Vec<Uuid>,
+    expected_updated_at: i64,
+    expected_grant_revision: i64,
+}
+
+pub(super) async fn retire_model_route_upstreams(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(route_id): Path<Uuid>,
+    Json(body): Json<RetireModelRouteUpstreamsRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "routes:write").await?;
+    require_service(&headers, &state, "providers:write").await?;
+    let tenant = management_tenant(&service, Some(body.tenant_external_id))?
+        .ok_or_else(|| AppError::BadRequest("tenant_external_id is required".into()))?;
+    Ok(Json(
+        state
+            .db
+            .retire_model_route_upstreams(
+                route_id,
+                &tenant,
+                body.upstream_account_ids,
+                body.expected_updated_at,
+                body.expected_grant_revision,
+            )
+            .await?,
+    ))
+}
+
 pub(super) async fn set_model_route_enabled(
     State(state): State<AppState>,
     headers: HeaderMap,
