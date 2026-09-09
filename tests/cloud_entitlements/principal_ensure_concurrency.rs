@@ -26,6 +26,21 @@ async fn concurrent_service_ensures_share_one_cloud_identity() {
         "principal_external_id": "concurrent-principal",
         "currency": "USD"
     });
+    // Issuing a scoped token does not create/activate its tenant. Preserve the
+    // authentication boundary even though ensure can provision a principal.
+    assert_eq!(
+        fixture
+            .client
+            .post(&url)
+            .bearer_auth(&service.token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    fixture.state.db.create_tenant(tenant, None).await.unwrap();
     let first = fixture
         .client
         .post(&url)

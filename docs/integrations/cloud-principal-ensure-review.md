@@ -47,11 +47,13 @@ Passed locally:
 Added SQLite HTTP test scenarios cover authentication/scope/tenant boundaries,
 valid currency conflicts and invalid currency, replay, concurrent ensure, both
 subscription orderings, zero initial funding and preservation of an existing
-funded/routed account. **These Rust tests have not yet executed successfully.**
-Local Cargo dependency acquisition encountered HTTP/2 errors and then repeated
-timeouts even with multiplexing disabled; CI must prove compilation and execution.
-The local dependency-install containers were stopped, and no test failure has
-been relabeled as passing.
+funded/routed account. CI run `34325181459` compiled the Rust code and executed
+this suite: 9 passed and 4 failed. The new failing fixtures issued tenant-scoped
+service tokens before creating the tenant, which correctly produced HTTP 401.
+The follow-up fixes fixture tenant creation and explicitly tests that a token
+for a nonexistent tenant remains unauthorized. **A successful rerun is still
+required.** Authentication behavior has not been relaxed. Local Cargo acquisition
+failed due to network errors; its stopped containers are not test evidence.
 
 There is no new endpoint-specific PostgreSQL test yet. Existing PostgreSQL Cloud
 subscription tests cover the reused provisioning helper, but are not a substitute

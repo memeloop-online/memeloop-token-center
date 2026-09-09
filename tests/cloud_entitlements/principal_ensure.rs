@@ -5,6 +5,8 @@ async fn scoped_writer(
     tenant: &str,
     name: &str,
 ) -> memeloop_token_center::model::IssuedServiceToken {
+    // Tenant-scoped service authentication requires an existing active tenant.
+    fixture.state.db.create_tenant(tenant, None).await.unwrap();
     fixture
         .state
         .db
