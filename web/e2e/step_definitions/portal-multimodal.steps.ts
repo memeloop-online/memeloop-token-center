@@ -176,7 +176,7 @@ When('管理员通过可见表单保存 CNY 多模态价格', async function (th
   await manualPricing.locator('summary').click();
   await manualPricing.locator('.manual-pricing-body > label select').nth(1).selectOption('CNY');
   await manualPricing.getByLabel('类型').selectOption('generation');
-  await manualPricing.getByRole('textbox', { name: '模型', exact: true }).fill(modelName);
+  await manualPricing.getByRole('combobox', { name: '模型', exact: true }).fill(modelName);
   await manualPricing.getByLabel('计费单位').selectOption('image');
   await manualPricing.getByLabel('单位价格').fill('0.88');
   const responsePromise = page.waitForResponse((response) => response.url().includes(`/internal/v1/generation-prices/CNY/${modelName}`) && response.request().method() === 'POST');
@@ -245,8 +245,12 @@ When('管理员通过可见生成任务页查看排队任务详情并取消', as
   await panel.getByRole('button', { name: '详情', exact: true }).click();
   await assertVisible(page.getByRole('dialog'));
   await assertContains(page.getByRole('dialog'), jobId);
-  page.once('dialog', (dialog) => void dialog.accept());
+  const cancellationResponse = page.waitForResponse((response) => response.url().includes(`/internal/v1/generations/${jobId}?`) && response.request().method() === 'DELETE');
   await page.getByRole('dialog').getByRole('button', { name: '取消', exact: true }).click();
+  const confirmation = page.getByRole('dialog', { name: '请确认操作', exact: true });
+  await assertVisible(confirmation);
+  await confirmation.getByRole('button', { name: '确认继续', exact: true }).click();
+  assert.equal((await cancellationResponse).status(), 200);
 });
 
 Then('生成任务取消请求包含明确租户且页面显示已取消', async function (this: DogfoodWorld) {
@@ -439,13 +443,13 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const manualPricing = page.locator('details.manual-pricing');
   await manualPricing.locator('summary').click();
   await manualPricing.getByLabel('类型').selectOption('generation');
-  await manualPricing.getByRole('textbox', { name: '模型', exact: true }).fill(imageModel);
+  await manualPricing.getByRole('combobox', { name: '模型', exact: true }).fill(imageModel);
   await manualPricing.getByLabel('计费单位').selectOption('job');
   await manualPricing.getByLabel('单位价格').fill('0.2');
   const imagePriceResponsePromise = page.waitForResponse((response) => response.url().includes(`/internal/v1/generation-prices/USD/${imageModel}`) && response.request().method() === 'POST');
   await manualPricing.getByRole('button', { name: '保存手动价格', exact: true }).click();
   assert.equal((await imagePriceResponsePromise).status(), 200);
-  await manualPricing.getByRole('textbox', { name: '模型', exact: true }).fill(videoModel);
+  await manualPricing.getByRole('combobox', { name: '模型', exact: true }).fill(videoModel);
   await manualPricing.locator('.manual-pricing-body > label select').nth(1).selectOption('USD');
   await manualPricing.getByLabel('计费单位').selectOption('second');
   await manualPricing.getByLabel('单位价格').fill('0.1');
@@ -617,8 +621,10 @@ When('用户通过门户创建并取消排队中的图片任务', async function
   const generationTable = generationTableFor(page);
   const row = generationTable.locator('tbody tr').filter({ hasText: observation.imageModel }).first();
   const cancellationResponse = page.waitForResponse((response) => response.url().includes('/self/v1/generations/') && response.request().method() === 'DELETE');
-  page.once('dialog', (dialog) => void dialog.accept());
   await row.getByRole('button', { name: '取消任务', exact: true }).click();
+  const confirmation = page.getByRole('dialog', { name: '请确认操作', exact: true });
+  await assertVisible(confirmation);
+  await confirmation.getByRole('button', { name: '确认继续', exact: true }).click();
   const response = await cancellationResponse;
   assert.equal(response.status(), 200, '任务应在 worker 获取 lease 之前由真实门户控件取消');
   await assertContains(row, '已取消');
