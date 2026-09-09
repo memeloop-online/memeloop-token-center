@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { Shell } from '../../src/components';
 import { I18nProvider } from '../../src/i18n';
 import { OverviewPage } from '../../src/operator/pages/OperatorPages';
-import type { OperatorMonitoringSnapshot, OperatorUsageAnalysis, RequestView, UsageAnalysisMetrics } from '../../src/types';
+import type { OperatorMonitoringSnapshot, OperatorUsageAnalysis, RequestView, TypedFilterAst, UsageAnalysisMetrics } from '../../src/types';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/styles/metrics.css';
@@ -18,6 +18,7 @@ declare global {
     overviewFixture: {
       calls: string[];
       delayedTenantResponsePending: boolean;
+      drilldowns: TypedFilterAst[];
       releaseDelayedTenantResponse: () => void;
     };
   }
@@ -79,6 +80,7 @@ let releaseDelayedTenantResponse: (() => void) | undefined;
 window.overviewFixture = {
   calls: [],
   delayedTenantResponsePending: false,
+  drilldowns: [],
   releaseDelayedTenantResponse: () => {
     releaseDelayedTenantResponse?.();
     releaseDelayedTenantResponse = undefined;
@@ -115,7 +117,7 @@ function Fixture() {
       <button type="button" className="secondary" data-fixture-tenant-switch onClick={() => setTenant((current) => current === alpha ? beta : alpha)}>Switch tenant</button>
     </div>
     <output data-fixture-tenant={tenant}>{tenant}</output>
-    <OverviewPage token="mts_overview_fixture" tenant={tenant} onNavigate={() => undefined} onOpenUsageSession={() => undefined} onOpenSession={() => undefined} />
+    <OverviewPage token="mts_overview_fixture" tenant={tenant} onNavigate={() => undefined} onRequestDrilldown={(ast) => window.overviewFixture.drilldowns.push(ast)} onOpenUsageSession={() => undefined} onOpenSession={() => undefined} />
   </Shell>;
 }
 

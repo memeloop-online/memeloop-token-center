@@ -3,7 +3,8 @@ import { api } from '../api';
 import { costOption, latencyOption, throughputOption, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
 import { formatCurrency, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import type { OperatorUsageAnalysis } from '../types';
+import type { OperatorUsageAnalysis, TypedFilterAst } from '../types';
+import { requestDrilldownForOverviewBucket } from './overviewDrilldown';
 import { useOperatorResource } from './hooks/useOperatorResource';
 import { statsQuery } from './usageState';
 import './overview.css';
@@ -19,7 +20,7 @@ function formatCosts(costs: OperatorUsageAnalysis['time_series'][number]['costs'
 }
 
 /** Independent historical trends: a slow query cannot hide current traffic. */
-export function OverviewTrends({ token, tenant }: { token: string; tenant: string }) {
+export function OverviewTrends({ token, tenant, onDrilldown }: { token: string; tenant: string; onDrilldown?: (ast: TypedFilterAst) => void }) {
   const { locale, t } = useI18n();
   const resource = useOperatorResource(Boolean(token), `${token}\0${tenant}`, () => {
     const query = statsQuery(tenant, {
@@ -51,6 +52,11 @@ export function OverviewTrends({ token, tenant }: { token: string; tenant: strin
     { id: 'latency', title: t('usage.latencyTrend'), option: latency },
     { id: 'cost', title: t('usage.costTrend'), option: costs },
   ];
+  const drillDown = (bucketStart: number) => {
+    if (!stats || !onDrilldown) return;
+    const ast = requestDrilldownForOverviewBucket(bucketStart, stats.granularity);
+    if (ast) onDrilldown(ast);
+  };
 
   return <section className="overview-trends" aria-label={t('usage.trend')}>
     {resource.state.kind === 'failed' && <div className="notice error" role="alert">{resource.state.message}</div>}
@@ -62,7 +68,10 @@ export function OverviewTrends({ token, tenant }: { token: string; tenant: strin
           <div className="panel-title"><h2>{title}</h2><span>{stats.time_zone}</span></div>
           {stats.time_series.length === 0 ? <div className="empty">{t('usage.noData')}</div>
             : <Suspense fallback={<div className="empty">{t('common.loading')}</div>}>
-              <EChart ariaLabel={title} locale={locale} option={option} timeZone={stats.time_zone} />
+              <EChart ariaLabel={title} locale={locale} option={option} timeZone={stats.time_zone} onClick={({ dataIndex }) => {
+                const point = stats.time_series[dataIndex];
+                if (point) drillDown(point.bucket_start);
+              }} />
             </Suspense>}
         </article>)}
       </div>
@@ -71,7 +80,7 @@ export function OverviewTrends({ token, tenant }: { token: string; tenant: strin
         <div className="table-scroll"><table>
           <thead><tr><th>{t('request.time')} · {stats.time_zone}</th><th>{copy.success}</th><th>{copy.failures}</th><th>{copy.averageLatency}</th><th>{copy.p95Latency}</th><th>{copy.cost}</th></tr></thead>
           <tbody>{stats.time_series.map((point) => <tr key={point.bucket_start}>
-            <td>{format.bucket(point.bucket_start)}</td><td>{format.number(point.success)}</td><td>{format.number(point.failed)}</td>
+            <td>{onDrilldown ? <button type="button" className="table-link overview-trend-bucket" onClick={() => drillDown(point.bucket_start)}>{format.bucket(point.bucket_start)}</button> : format.bucket(point.bucket_start)}</td><td>{format.number(point.success)}</td><td>{format.number(point.failed)}</td>
             <td>{formatMilliseconds(point.avg_duration_ms, locale)}</td><td>{formatMilliseconds(point.p95_duration_ms, locale)}</td><td>{formatCosts(point.costs, locale)}</td>
           </tr>)}</tbody>
         </table></div>

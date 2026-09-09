@@ -13,6 +13,7 @@ declare global {
     overviewFixture: {
       calls: string[];
       delayedTenantResponsePending: boolean;
+      drilldowns: unknown[];
       releaseDelayedTenantResponse: () => void;
     };
   }
@@ -20,7 +21,8 @@ declare global {
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const artifactRoot = join(webRoot, 'e2e-artifacts', 'overview-trends');
-const screenshotWidths = [320, 390, 768, 1440, 2560] as const;
+const screenshotWidths = [320, 390, 768, 1024, 1440, 1920, 2560] as const;
+const fixtureNow = Date.UTC(2026, 8, 8, 12, 0, 0);
 
 async function localChromiumExecutable() {
   const defaultExecutable = chromium.executablePath();
@@ -90,6 +92,14 @@ test('Overview keeps current sections visible through independent endpoint failu
     assert.match(await trendData.locator('thead').textContent() ?? '', /UTC/);
     assert.equal(await trendData.getByRole('columnheader', { name: 'Total cost', exact: true }).count(), 1);
     assert.equal(await trendData.locator('tbody tr').count(), 3, 'the expanded table exposes the exact returned points, not derived rows');
+    await trendData.locator('tbody button').nth(1).click();
+    assert.deepEqual(await page.evaluate(() => window.overviewFixture.drilldowns.at(-1)), {
+      logical_operator: 'and',
+      conditions: [{
+        field: 'created_at', operator: 'between', value: { type: 'timestamp', value: fixtureNow - 3_600_000 },
+        upper: { type: 'timestamp', value: fixtureNow - 1 },
+      }],
+    }, 'the accessible time-bucket control uses the exact API bucket window for its request drilldown');
 
     await mkdir(artifactRoot, { recursive: true });
     for (const theme of ['dark', 'light'] as const) {

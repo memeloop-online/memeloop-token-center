@@ -10,7 +10,7 @@ import { createServer } from 'vite';
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url));
 const artifactRoot = join(webRoot, 'e2e-artifacts', 'usage-analysis');
-const viewports = [320, 768, 1440] as const;
+const viewports = [320, 390, 768, 1024, 1440, 1920, 2560] as const;
 
 async function localChromiumExecutable() {
   const defaultExecutable = chromium.executablePath();

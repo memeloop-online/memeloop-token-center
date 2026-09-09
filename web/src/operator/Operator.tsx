@@ -1,10 +1,11 @@
 import { Fragment, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { Shell } from '../components';
 import { useI18n } from '../i18n';
-import type { PluginManifest, UsageAnalysisSessionBucket } from '../types';
+import type { PluginManifest, TypedFilterAst, UsageAnalysisSessionBucket } from '../types';
 import { api } from '../api';
 import './operator.css';
 import type { SessionFocus } from './SessionMonitor';
+import type { RequestDrilldown } from './overviewDrilldown';
 import { useOperatorScope } from './hooks/useOperatorScope';
 import { useOperatorRequestStream } from './hooks/useOperatorRequestStream';
 import { CredentialsPage, PricingPage, ProvidersPage, RoutesPage, ServiceCredentialsPage } from './pages/ManagementPages';
@@ -59,6 +60,8 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
   const [internalRoute, setInternalRoute] = useState<OperatorRouteKey>('requests');
   const [sessionFocus, setSessionFocus] = useState<SessionFocus>();
   const [requestFocus, setRequestFocus] = useState<{ requestId: string; revision: number }>();
+  const [requestDrilldown, setRequestDrilldown] = useState<(RequestDrilldown & { token: string; tenant: string })>();
+  const requestDrilldownRevision = useRef(0);
   const [pluginRegistry, setPluginRegistry] = useState<OperatorPluginRegistry>(() => registerOperatorPluginContributions([]));
   const credentialScope = useRef({ credential: '', generation: 0 });
   if (credentialScope.current.credential !== scope.activeCredential) {
@@ -139,6 +142,19 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     navigate('requests');
   }
 
+  function queueRequestDrilldown(ast: TypedFilterAst) {
+    setRequestDrilldown({
+      ast,
+      revision: ++requestDrilldownRevision.current,
+      token: scope.activeCredential,
+      tenant: scope.tenant,
+    });
+  }
+
+  const activeRequestDrilldown = requestDrilldown?.token === scope.activeCredential && requestDrilldown.tenant === scope.tenant
+    ? requestDrilldown
+    : undefined;
+
   const accessSettings = <OperatorAccessSettings
     credentialInput={scope.credentialInput}
     credential={scope.credential}
@@ -156,8 +172,8 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     const pageProps = { token: scope.activeCredential, tenant: scope.tenant, writeTenant: scope.writeTenant };
     if (isOperatorRouteKey(activeRoute)) {
       switch (activeRoute) {
-        case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onOpenUsageSession={openSession} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} /></>; break;
-        case 'requests': page = <RequestsPage {...pageProps} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} />; break;
+        case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onRequestDrilldown={queueRequestDrilldown} onOpenUsageSession={openSession} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} /></>; break;
+        case 'requests': page = <RequestsPage {...pageProps} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
         case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} revision={stream.revision} eventKeyIds={stream.sessionEventKeyIds} streamState={stream.state} streamError={stream.error} onOpenRequests={() => navigate('requests')} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
         case 'generations': page = <GenerationsPage {...pageProps} />; break;

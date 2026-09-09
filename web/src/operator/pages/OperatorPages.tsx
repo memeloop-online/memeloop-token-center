@@ -1,7 +1,7 @@
 import { api } from '../../api';
 import { RequestTable } from '../../components';
 import { useI18n } from '../../i18n';
-import type { OperatorMonitoringSnapshot, PluginManifest, RequestView, UpstreamAccount, UsageAnalysisSessionBucket } from '../../types';
+import type { OperatorMonitoringSnapshot, PluginManifest, RequestView, TypedFilterAst, UpstreamAccount, UsageAnalysisSessionBucket } from '../../types';
 import { GenerationWorkspace } from '../GenerationWorkspace';
 import { MonitoringSnapshot } from '../MonitoringSnapshot';
 import { OverviewTrends } from '../OverviewTrends';
@@ -48,8 +48,9 @@ function OverviewRecentRequestsSection({ state, onOpenSession }: { state: Resour
   </article>;
 }
 
-export function OverviewPage({ token, tenant, onOpenSession }: OperatorPageProps & {
+export function OverviewPage({ token, tenant, onNavigate, onOpenSession, onRequestDrilldown }: OperatorPageProps & {
   onNavigate: (route: OperatorRouteKey) => void;
+  onRequestDrilldown: (ast: TypedFilterAst) => void;
   onOpenUsageSession: (session: UsageAnalysisSessionBucket) => void;
   onOpenSession: (sessionId: string) => void;
 }) {
@@ -66,7 +67,7 @@ export function OverviewPage({ token, tenant, onOpenSession }: OperatorPageProps
   );
   return <div className="operator-overview-dashboard">
     <OverviewMonitoringSection state={monitoringResource.state} />
-    <OverviewTrends token={token} tenant={tenant} />
+    <OverviewTrends token={token} tenant={tenant} onDrilldown={(ast) => { onRequestDrilldown(ast); onNavigate('requests'); }} />
     <OverviewRecentRequestsSection state={requestResource.state} onOpenSession={onOpenSession} />
   </div>;
 }
