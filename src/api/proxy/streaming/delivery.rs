@@ -69,6 +69,9 @@ pub(super) struct TerminalFrames {
 }
 
 impl TerminalFrames {
+    pub(super) fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
     pub(super) fn hold(&mut self, frame: SseDeliveryFrame) -> Result<Option<SseDeliveryFrame>, ()> {
         if !frame.terminal && self.frames.is_empty() {
             return Ok(Some(frame));
@@ -88,6 +91,18 @@ impl TerminalFrames {
 
     pub(super) fn bytes(&self) -> usize {
         self.bytes
+    }
+}
+
+pub(super) fn invalid_terminal_failure(protocol: Protocol) -> Bytes {
+    match protocol {
+        Protocol::OpenAiResponses => crate::api::sse::safe_failure_event(),
+        Protocol::AnthropicMessages => Bytes::from_static(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream stream did not complete\"}}\n\n",
+        ),
+        _ => Bytes::from_static(
+            b"data: {\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream stream did not complete\"}}\n\n",
+        ),
     }
 }
 

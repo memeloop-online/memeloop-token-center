@@ -1,6 +1,55 @@
 use super::*;
 
 #[tokio::test]
+async fn incomplete_or_failed_tail_revokes_held_success_terminal() {
+    for (label, payload, expected_gap) in [
+        (
+            "incomplete",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"usable text\"}}]}\n\n",
+                "data: [DONE]\n\ndata: ",
+            ),
+            true,
+        ),
+        (
+            "failed",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"usable text\"}}]}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture\"}}\n\n",
+                "data: {\"error\":{\"message\":\"private provider detail\"}}\n\n",
+            ),
+            false,
+        ),
+    ] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(payload, "text/event-stream"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let fixture = resilient_route_fixture(label, &[(upstream.uri(), 0)]).await;
+        let response = send_resilient_chat(&fixture, None, true).await;
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("usable text"));
+        assert!(text.contains("upstream stream did not complete"));
+        assert!(!text.contains("[DONE]"));
+        assert!(!text.contains("response.completed"));
+        assert!(!text.contains("private provider detail"));
+        if expected_gap {
+            let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+            let state: String = sqlx::query_scalar("SELECT state FROM response_archive_spools")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(state, "gap");
+            pool.close().await;
+        }
+        upstream.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn terminal_delivery_observes_sealed_spool_or_explicit_capture_gap() {
     for fail_append in [false, true] {
         let upstream = MockServer::start().await;

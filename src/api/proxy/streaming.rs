@@ -392,7 +392,21 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 )
                 .await;
             }
-            if transport_error.is_none() {
+            let failed = matches!(
+                sse_summary.as_ref().map(|summary| &summary.outcome),
+                Some(ResponsesSseOutcome::Failed)
+            );
+            if transport_error.is_none() && (incomplete || (failed && !terminal_frames.is_empty()))
+            {
+                // A later malformed tail or failure invalidates a held success.
+                // Do not ask the sanitizer whether an error was already emitted:
+                // that error may itself be held behind the revoked success.
+                let _ = tokio::time::timeout(
+                    MAX_DOWNSTREAM_SEND_WAIT,
+                    body_sender.send(Ok(delivery::invalid_terminal_failure(protocol))),
+                )
+                .await;
+            } else if transport_error.is_none() {
                 for frame in terminal_frames.take() {
                     match delivery::send_frame(
                         delivery::FrameDelivery {

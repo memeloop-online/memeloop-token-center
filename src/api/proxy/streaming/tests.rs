@@ -1,6 +1,53 @@
 use super::*;
 
 #[test]
+fn anthropic_message_stop_is_held_until_archive_barrier() {
+    let mut capture = ResponsesSseCapture::for_delivery();
+    let mut held = delivery::TerminalFrames::default();
+    let delivery = capture_sse_delivery(
+        Some(&mut capture),
+        Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hello\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ),
+        false,
+    ).unwrap();
+    let mut immediate = Vec::new();
+    for frame in delivery.frames {
+        if let Some(frame) = held.hold(frame).unwrap() {
+            immediate.extend_from_slice(&frame.bytes);
+        }
+    }
+    assert!(std::str::from_utf8(&immediate).unwrap().contains("hello"));
+    assert!(
+        !std::str::from_utf8(&immediate)
+            .unwrap()
+            .contains("message_stop")
+    );
+    assert!(!held.is_empty());
+    assert!(matches!(
+        capture.finish_summary().outcome,
+        ResponsesSseOutcome::Completed { .. }
+    ));
+    assert!(held.take()[0].terminal);
+}
+
+#[test]
+fn invalid_terminals_use_protocol_specific_fixed_errors_without_success() {
+    for protocol in [
+        Protocol::OpenAiChat,
+        Protocol::OpenAiResponses,
+        Protocol::AnthropicMessages,
+    ] {
+        let bytes = delivery::invalid_terminal_failure(protocol);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("error"));
+        assert!(!text.contains("[DONE]"));
+        assert!(!text.contains("response.completed"));
+        assert!(!text.contains("message_stop"));
+    }
+}
+
+#[test]
 fn capture_preserves_crlf_continuation_and_following_control_frame_for_spool() {
     let mut capture = ResponsesSseCapture::for_delivery();
     let chunks = [
