@@ -165,10 +165,10 @@ impl QuotaCache {
         let now = unix_millis();
         let previous = {
             let cached = entry.cached.lock().await;
-            if now < cached.refresh_after {
-                if let Some(value) = &cached.value {
-                    return value.clone();
-                }
+            if now < cached.refresh_after
+                && let Some(value) = &cached.value
+            {
+                return value.clone();
             }
             cached.value.clone()
         };
@@ -179,10 +179,10 @@ impl QuotaCache {
         // A task can finish between our first read and acquiring flight.
         {
             let cached = entry.cached.lock().await;
-            if unix_millis() < cached.refresh_after {
-                if let Some(value) = &cached.value {
-                    return value.clone();
-                }
+            if unix_millis() < cached.refresh_after
+                && let Some(value) = &cached.value
+            {
+                return value.clone();
             }
         }
         let Ok(_permit) = self.permits.try_acquire() else {
