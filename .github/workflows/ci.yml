@@ -132,6 +132,7 @@ jobs:
           path: |
             web/e2e-artifacts/session-replay/
             web/e2e-artifacts/upstream-availability/
+            web/e2e-artifacts/upstream-quota/
             web/e2e-artifacts/usage-analysis/
           if-no-files-found: warn
           retention-days: 14
