@@ -15,6 +15,7 @@ export function useConfirmDialog(scope: readonly unknown[]) {
   const id = useId();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const proceedRef = useRef<HTMLButtonElement>(null);
   const current = useRef<Confirmation | undefined>(undefined);
   const mounted = useRef(true);
   const scopeRef = useRef(scope);
@@ -66,13 +67,29 @@ export function useConfirmDialog(scope: readonly unknown[]) {
   };
   const confirmationDialog = confirmation ? <dialog ref={dialogRef} className="app-confirm-dialog"
     aria-modal="true" aria-labelledby={`${id}-title`} aria-describedby={`${id}-description`}
+    onKeyDown={(event) => {
+      if (event.key !== 'Tab') return;
+      // showModal makes the background inert, but browsers may still move
+      // boundary Tab focus to browser chrome. Keep this two-action dialog's
+      // keyboard sequence closed in both directions.
+      const first = cancelRef.current;
+      const last = proceedRef.current;
+      if (!first || !last) return;
+      if (event.shiftKey && (document.activeElement === first || document.activeElement === event.currentTarget)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === event.currentTarget)) {
+        event.preventDefault();
+        first.focus();
+      }
+    }}
     onCancel={(event) => { event.preventDefault(); finish(false); }}
     onClose={() => finish(false)}>
     <h2 id={`${id}-title`}>{t('confirmation.title')}</h2>
     <p id={`${id}-description`}>{confirmation.message}</p>
     <div className="button-row">
       <button ref={cancelRef} type="button" className="secondary" onClick={() => finish(false)}>{t('common.cancel')}</button>
-      <button type="button" className="danger" onClick={() => finish(true)}>{t('confirmation.proceed')}</button>
+      <button ref={proceedRef} type="button" className="danger" onClick={() => finish(true)}>{t('confirmation.proceed')}</button>
     </div>
   </dialog> : null;
   return { confirm, confirmationDialog };

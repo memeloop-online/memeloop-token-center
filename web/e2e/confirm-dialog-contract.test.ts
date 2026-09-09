@@ -65,6 +65,14 @@ test('confirmation dialog is themed, keyboard-safe, single-flight and scope fenc
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
       await page.keyboard.press('Shift+Tab');
       assert.equal(await dialog.evaluate((element) => element.contains(document.activeElement)), true, 'keyboard focus remains inside the modal');
+      const proceed = page.getByRole('button', { name: 'Confirm and continue', exact: true });
+      assert.equal(await proceed.evaluate((element) => element === document.activeElement), true, 'backward boundary wraps to the last action');
+      await page.keyboard.press('Tab');
+      assert.equal(await cancel.evaluate((element) => element === document.activeElement), true, 'forward boundary wraps to the first action');
+      await page.keyboard.press('Tab');
+      assert.equal(await proceed.evaluate((element) => element === document.activeElement), true, 'ordinary forward navigation reaches confirm');
+      await page.keyboard.press('Shift+Tab');
+      assert.equal(await cancel.evaluate((element) => element === document.activeElement), true, 'ordinary backward navigation reaches cancel');
       await page.keyboard.press('Escape');
       await dialog.waitFor({ state: 'detached' });
       assert.equal(await trigger.evaluate((element) => element === document.activeElement), true);
