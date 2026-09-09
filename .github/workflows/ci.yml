@@ -116,6 +116,14 @@ jobs:
           path: web/e2e-artifacts/overview-trends/
           if-no-files-found: warn
           retention-days: 14
+      - name: Retain Request diagnostics browser failure evidence
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: request-diagnostics-browser-${{ github.sha }}
+          path: web/e2e-artifacts/request-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
       - name: Build the browser-test service before Cucumber.js starts it
         run: cargo build --locked --manifest-path ../Cargo.toml --bin memeloop-token-center
       - run: npm run test:e2e

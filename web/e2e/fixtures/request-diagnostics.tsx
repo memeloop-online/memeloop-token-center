@@ -55,7 +55,7 @@ const historicalGap: RequestView = {
 
 function Fixture() {
   const [openedSession, setOpenedSession] = useState('');
-  return <div className="app-shell"><main className="main">
+  return <div className="app-shell" data-fixture-ready="request-diagnostics"><main className="main">
     <RequestTable requests={[request, historicalGap]} currency="USD" onOpenSession={setOpenedSession} />
     <section data-fixture-request="recorded"><RequestDiagnostics request={request} currency="USD" onOpenSession={setOpenedSession} /></section>
     <section data-fixture-request="historical-gap"><RequestDiagnostics request={historicalGap} currency="USD" onOpenSession={setOpenedSession} /></section>
