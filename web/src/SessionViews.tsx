@@ -3,6 +3,7 @@ import type { CSSProperties } from 'react';
 import { formatCurrency, formatMetricNumber, formatMilliseconds, formatPercent } from './format.js';
 import { useI18n } from './i18n.js';
 import { deriveSemanticExecution } from './sessionSemantics.js';
+import { SessionReplayPanel, type SessionReplayArchiveLoader } from './sessionReplayViews.js';
 import type { ConversationRequest, LogicalSessionDetail, LogicalSessionSummary, RequestView, UsageAnalysisCost } from './types.js';
 
 const semanticPalette = ['#6859d9', '#18a999', '#e68a2e', '#d74f70', '#4078c0', '#8a63b8'];
@@ -264,7 +265,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
   </div>;
 }
 
-export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose }: {
+export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose, loadReplayArchive }: {
   detail: LogicalSessionDetail;
   summary?: LogicalSessionSummary;
   currency?: string;
@@ -273,6 +274,8 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   onLoadOlder: () => void;
   onSelect: (request: RequestView) => void;
   onClose?: () => void;
+  /** Optional owner-scoped archive reader; the shared view never receives a credential. */
+  loadReplayArchive?: SessionReplayArchiveLoader;
 }) {
   const { locale, t } = useI18n();
   const declaredSessionName = [...detail.requests].reverse().find((request) => request.execution?.session_name)?.execution?.session_name;
@@ -293,6 +296,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
     {showDiagnosticIds && <details className="session-diagnostics"><summary>{t('sessions.diagnostics')}</summary><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /></>}</details>}
     {detail.unlinked && <div className="notice warning" role="status"><b>{t('sessions.unlinkedRequests')}</b><br />{t('sessions.unlinkedDetail')}</div>}
     <SessionActivity detail={detail} summary={summary} currency={currency} loading={loading} onSelect={onSelect} />
+    <SessionReplayPanel detail={detail} loadArchiveDetail={loadReplayArchive} />
     {detail.has_more && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('sessions.loadEarlier')}</button></div>}
     {!detail.unlinked && <details className="session-analysis" open><summary>{t('sessions.semantic')}</summary><SemanticExecutionPanel detail={detail} /></details>}
     <details className="session-relationships"><summary>{t('sessions.relationships')}</summary>{detail.edges_truncated && <div className="notice warning">{t('sessions.edgesTruncated')}</div>}<div className="edge-list">{confirmedEdges.map((edge) => <div className="edge" key={`${edge.from_request_id ?? 'root'}-${edge.to_request_id}-${edge.relation}`}>

@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState, type RefObject } from 'react';
+import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
 import { api } from '../api.js';
 import { useI18n } from '../i18n.js';
 import { SessionDetailSurface, SessionList } from '../SessionViews.js';
 import { drainSessionEventKeys, mergeSessionPage } from './sessionRefresh.js';
 import type {
-  LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, RequestView,
+  LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, RequestDetail, RequestView,
 } from '../types.js';
 
 interface SessionFilters {
@@ -76,6 +76,13 @@ function detailPath(tenant: string, session: LogicalSessionSummary, cursor?: Log
   return `/internal/v1/sessions/${encodeURIComponent(session.session_id)}?${params}`;
 }
 
+function requestArchivePath(tenant: string, requestId: string) {
+  const params = new URLSearchParams();
+  if (tenant) params.set('tenant_external_id', tenant);
+  const query = params.toString();
+  return `/internal/v1/requests/${encodeURIComponent(requestId)}${query ? `?${query}` : ''}`;
+}
+
 function messageOf(reason: unknown, fallback: string) {
   return reason instanceof Error ? reason.message : fallback;
 }
@@ -119,6 +126,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const selectedRef = useRef<LogicalSessionSummary | undefined>(selected);
   filtersRef.current = filters;
   selectedRef.current = selected;
+  const loadReplayArchive = useCallback((request: RequestView, signal: AbortSignal) => api<RequestDetail>(
+    requestArchivePath(tenant, request.request_id), token.trim(), { signal },
+  ), [tenant, token]);
 
   async function loadSessions(older = false, selectedFilters = filters, background = false) {
     const sequence = ++listSequence.current;
@@ -360,7 +370,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
         {listScope === scopeKey && nextCursor && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(true, filters)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
       </section>
       <div className="session-detail-region">
-        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={loading} onLoadOlder={() => void loadEarlier()} onSelect={(request) => { setDetail(undefined); setDetailScope(''); setSelected(undefined); void onSelectRequest(request); }} onClose={() => { setDetail(undefined); setDetailScope(''); setSelected(undefined); }} />}
+        {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={loading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} onSelect={(request) => { setDetail(undefined); setDetailScope(''); setSelected(undefined); void onSelectRequest(request); }} onClose={() => { setDetail(undefined); setDetailScope(''); setSelected(undefined); }} />}
       </div>
     </div>
   </>;

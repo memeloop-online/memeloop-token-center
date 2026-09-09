@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import { SessionDetailSurface, SessionList } from '../SessionViews';
-import type { KeyView, LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, RequestView } from '../types';
+import type { KeyView, LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, RequestDetail, RequestView } from '../types';
 import { selfErrorMessage } from './errors';
 import { sessionDetailPath, sessionsPath } from './requestPaths';
 
@@ -25,6 +25,9 @@ export function SessionsPage({ credential, credentialView, focusSessionId, onErr
   const detailSequence = useRef(0);
   const listController = useRef<AbortController | undefined>(undefined);
   const detailController = useRef<AbortController | undefined>(undefined);
+  const loadReplayArchive = useCallback((request: RequestView, signal: AbortSignal) => api<RequestDetail>(
+    `/self/v1/requests/${encodeURIComponent(request.request_id)}`, credential, { signal },
+  ), [credential]);
 
   async function fetchSessions(before?: LogicalSessionCursor) {
     const sequence = ++listSequence.current;
@@ -133,7 +136,7 @@ export function SessionsPage({ credential, credentialView, focusSessionId, onErr
           {nextCursor && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={() => void fetchSessions(nextCursor)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</button></div>}
         </section>
         <div className="session-detail-region">
-          {detail && <SessionDetailSurface detail={detail} summary={selected} currency={credentialView.currency} loading={loading} onLoadOlder={() => void fetchEarlierDetail()} onSelect={(request) => { setDetail(undefined); setSelected(undefined); onOpenRequest(request); }} onClose={() => { setDetail(undefined); setSelected(undefined); }} />}
+          {detail && <SessionDetailSurface detail={detail} summary={selected} currency={credentialView.currency} loading={loading} onLoadOlder={() => void fetchEarlierDetail()} loadReplayArchive={loadReplayArchive} onSelect={(request) => { setDetail(undefined); setSelected(undefined); onOpenRequest(request); }} onClose={() => { setDetail(undefined); setSelected(undefined); }} />}
         </div>
       </div>
     </article>
