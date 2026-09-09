@@ -6,6 +6,30 @@ use crate::api::{
 };
 use std::collections::VecDeque;
 
+pub(super) fn prepare_forwarded_request(
+    route: &ResolvedUpstream,
+    protocol: Protocol,
+    request: &Value,
+) -> Result<(Value, Option<responses::Context>), AppError> {
+    let mut forwarded = request.clone();
+    if route.driver != crate::oauth::managed::kimi::PROVIDER_DRIVER {
+        if let Some(model) = forwarded.get_mut("model") {
+            *model = Value::String(route.upstream_model.clone());
+        }
+        return Ok((forwarded, None));
+    }
+    if route.base_url != crate::oauth::managed::kimi::BASE_URL {
+        return Err(AppError::BadRequest(
+            "Kimi OAuth requires its fixed base URL".into(),
+        ));
+    }
+    crate::oauth::managed::kimi::validate_credential(&route.credential)?;
+    let context =
+        matches!(protocol, Protocol::OpenAiResponses).then(|| responses::Context::new(request));
+    crate::api::kimi_transport::prepare(protocol, &route.upstream_model, &mut forwarded)?;
+    Ok((forwarded, context))
+}
+
 struct StreamState {
     upstream: super::super::upstream_response::UpstreamByteStream,
     framer: BoundedSseFramer,

@@ -141,24 +141,8 @@ pub(super) fn plan_proxy_route(
         codex_transport::validate_credential_contract(&route.credential)?;
         codex_transport::validate_route_config(&route.config)?;
     }
-    let kimi_response = (route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER
-        && matches!(protocol, Protocol::OpenAiResponses))
-    .then(|| crate::api::kimi_transport::responses::Context::new(request_json));
-    let mut forwarded_json = request_json.clone();
-    if route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
-        if route.base_url != crate::oauth::managed::kimi::BASE_URL {
-            return Err(AppError::BadRequest(
-                "Kimi OAuth requires its fixed base URL".into(),
-            ));
-        }
-        crate::oauth::managed::kimi::validate_credential(&route.credential)?;
-        crate::api::kimi_transport::prepare(protocol, &route.upstream_model, &mut forwarded_json)?;
-    }
-    if let Some(value) = forwarded_json.get_mut("model") {
-        if route.driver != crate::oauth::managed::kimi::PROVIDER_DRIVER {
-            *value = Value::String(route.upstream_model.clone());
-        }
-    }
+    let (mut forwarded_json, kimi_response) =
+        kimi::prepare_forwarded_request(&route, protocol, request_json)?;
     let codex_plan = if is_codex {
         Some(codex_transport::prepare_request_with_id(
             &mut forwarded_json,
