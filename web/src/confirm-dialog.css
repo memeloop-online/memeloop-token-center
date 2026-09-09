@@ -1,0 +1,22 @@
+.app-confirm-dialog {
+  color: #dbe7ef;
+  background: #0b191d;
+  border: 1px solid #294148;
+  border-radius: 16px;
+  padding: 24px;
+  width: min(480px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+  box-sizing: border-box;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 24%);
+}
+.app-confirm-dialog::backdrop { background: rgb(0 0 0 / 36%); }
+.app-confirm-dialog h2 { margin-top: 0; font-size: 18px; }
+.app-confirm-dialog p { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.app-confirm-dialog .button-row { justify-content: flex-end; flex-wrap: wrap; }
+.app-confirm-dialog button:focus-visible { outline: 3px solid #38b8a6; outline-offset: 3px; }
+:root[data-theme='light'] .app-confirm-dialog {
+  color: #17302d;
+  background: #fff;
+  border-color: #c8d6d3;
+}

@@ -1,3 +1,4 @@
+import { useConfirmDialog } from '../useConfirmDialog';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../api';
 import { formatCurrency, formatNumber } from '../format';
@@ -13,6 +14,7 @@ export function GenerationsPage({ credential, credentialView, onError }: {
   onError: (message: string) => void;
 }) {
   const { locale, t } = useI18n();
+  const { confirm, confirmationDialog } = useConfirmDialog([credential, credentialView.key_id]);
   const [jobs, setJobs] = useState<GenerationJob[]>([]);
   const [selected, setSelected] = useState<GenerationJob>();
   const [loading, setLoading] = useState(true);
@@ -74,7 +76,7 @@ export function GenerationsPage({ credential, credentialView, onError }: {
 
   async function cancel(job: GenerationJob) {
     const actionKey = `cancel:${job.job_id}`;
-    if (actionControllers.current.has(actionKey) || cancellingIds.has(job.job_id) || !window.confirm(t('generations.confirmCancel', { model: job.model }))) return;
+    if (actionControllers.current.has(actionKey) || cancellingIds.has(job.job_id) || !await confirm(t('generations.confirmCancel', { model: job.model }))) return;
     const scope = scopeGeneration.current;
     const controller = actionControllers.current.begin(actionKey);
     if (!controller) return;
@@ -126,7 +128,7 @@ export function GenerationsPage({ credential, credentialView, onError }: {
     }
   }
 
-  return <div className="self-page self-generations-page" data-self-page="generations">
+  return <div className="self-page self-generations-page" data-self-page="generations">{confirmationDialog}
     {message && <div className="notice success" role="status">{message}</div>}
     <article className="panel self-generations">
       <div className="panel-title"><h2>{t('self.generations')}</h2><button type="button" className="secondary" disabled={loading} onClick={() => void refresh()}>{loading ? t('common.loading') : t('self.refreshGenerations')}</button></div>

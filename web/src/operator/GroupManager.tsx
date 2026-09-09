@@ -1,3 +1,4 @@
+import { useConfirmDialog } from '../useConfirmDialog';
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { formatNumber } from '../format';
@@ -52,6 +53,7 @@ interface GroupManagerProps {
 
 export function GroupManager({ kind, token, tenant, groups, resources, onChanged }: GroupManagerProps) {
   const { locale, t } = useI18n();
+  const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, kind]);
   const [selectedId, setSelectedId] = useState('');
   const [memberDraft, setMemberDraft] = useState<ComboboxOption[]>([]);
   const [newName, setNewName] = useState('');
@@ -108,7 +110,7 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
     }
   };
 
-  return <article className="panel group-manager" data-group-kind={kind}>
+  return <article className="panel group-manager" data-group-kind={kind}>{confirmationDialog}
     <div className="panel-title"><div><h2>{t(`groups.${kind}.title`)}</h2><p className="muted">{t(`groups.${kind}.description`)}</p></div><span>{formatNumber(groups.length, locale)}</span></div>
     {error && <div className="notice error" role="alert">{error}</div>}
     {message && <div className="notice success" role="status">{message}</div>}
@@ -130,8 +132,8 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
         <MultiCombobox label={t(`groups.${kind}.members`)} options={resources} value={memberDraft} onChange={setMemberDraft} placeholder={t('groups.searchMembers')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
         <div className="group-editor-actions"><button type="button" disabled={busy} onClick={() => void perform(async () => {
           await api(`/internal/v1/${paths[kind]}/${selected.id}/members`, token, { method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, member_ids: memberDraft.map((item) => item.value), expected_updated_at: selected.updated_at }) });
-        }, t('groups.membersSaved'))}>{t('groups.saveMembers')}</button><button type="button" className="danger" disabled={busy} onClick={() => {
-          if (!window.confirm(t('groups.confirmDelete', { name: selected.name }))) return;
+        }, t('groups.membersSaved'))}>{t('groups.saveMembers')}</button><button type="button" className="danger" disabled={busy} onClick={async () => {
+          if (!await confirm(t('groups.confirmDelete', { name: selected.name }))) return;
           void perform(async () => {
             const query = new URLSearchParams({ tenant_external_id: tenant, expected_updated_at: String(selected.updated_at) });
             await api(`/internal/v1/${paths[kind]}/${selected.id}?${query}`, token, { method: 'DELETE' });

@@ -1,3 +1,4 @@
+import { useConfirmDialog } from '../useConfirmDialog';
 import { useEffect, useRef, useState } from 'react';
 import { ApiError, api } from '../api';
 import { DrawerFrame } from '../components';
@@ -18,6 +19,7 @@ function canCancel(job: OperatorGenerationJob) {
 /** `tenant` scopes reads; `writeTenant` is always an explicit mutation target. */
 export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { token: string; tenant: string; writeTenant?: string }) {
   const { locale, t } = useI18n();
+  const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
   const [jobs, setJobs] = useState<OperatorGenerationJob[]>([]);
   const [detail, setDetail] = useState<OperatorGenerationJob>();
   const [loading, setLoading] = useState(false);
@@ -66,7 +68,7 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
   };
 
   const cancel = async (job: OperatorGenerationJob) => {
-    if (!writeTenant || job.tenant_external_id !== writeTenant || !canCancel(job) || !window.confirm(t('generations.confirmCancel', { model: job.model }))) return;
+    if (!writeTenant || job.tenant_external_id !== writeTenant || !canCancel(job) || !await confirm(t('generations.confirmCancel', { model: job.model }))) return;
     const cancelToken = token.trim(); const cancelTenant = writeTenant;
     setBusy(job.job_id); setError(''); setMessage('');
     try {
@@ -101,7 +103,7 @@ export function GenerationWorkspace({ token, tenant, writeTenant = tenant }: { t
 
   const canManage = (job: OperatorGenerationJob) => Boolean(writeTenant) && job.tenant_external_id === writeTenant;
 
-  return <>
+  return <>{confirmationDialog}
     {error && <div className="notice error" role="alert">{error}</div>}
     {message && <div className="notice success" role="status">{message}</div>}
     <article className="panel operator-generations">
