@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { LatestRequestGate } from '../src/operator/SessionMonitor.js';
+import { LatestRequestGate } from '../src/operator/latestRequestGate.js';
 
 const monitorSource = await readFile(new URL('../src/operator/SessionMonitor.tsx', import.meta.url), 'utf8');
 

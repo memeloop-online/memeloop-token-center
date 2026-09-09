@@ -103,7 +103,7 @@ function EntryContent({ entry, t }: { entry: ReplayEntry; t: Translate }) {
 
 /**
  * Displays the bounded, typed P1 archive projection. Archive reads are supplied
- * by the owning surface so this component never owns credentials or broadens
+ * by the owning surface so this component never handles authentication material or broadens
  * archive authorization.
  */
 export function SessionReplayPanel({ detail, loadArchiveDetail }: {

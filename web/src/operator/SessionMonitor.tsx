@@ -3,6 +3,7 @@ import { api } from '../api.js';
 import { useI18n } from '../i18n.js';
 import { SessionDetailSurface, SessionList } from '../SessionViews.js';
 import { drainSessionEventKeys, mergeSessionPage } from './sessionRefresh.js';
+import { LatestRequestGate } from './latestRequestGate.js';
 import type {
   LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary, RequestDetail, RequestView,
 } from '../types.js';
@@ -22,33 +23,7 @@ export interface SessionFocus {
 
 export type SessionStreamState = 'idle' | 'connecting' | 'live' | 'reconnecting';
 
-export interface LatestRequest {
-  signal: AbortSignal;
-  isCurrent: () => boolean;
-}
-
-/** Owns one request lane: starting B aborts A, and invalidating a scope rejects both. */
-export class LatestRequestGate {
-  private sequence = 0;
-  private controller?: AbortController;
-
-  begin(): LatestRequest {
-    this.controller?.abort();
-    const controller = new AbortController();
-    const sequence = ++this.sequence;
-    this.controller = controller;
-    return {
-      signal: controller.signal,
-      isCurrent: () => sequence === this.sequence && !controller.signal.aborted,
-    };
-  }
-
-  invalidate() {
-    this.sequence += 1;
-    this.controller?.abort();
-    this.controller = undefined;
-  }
-}
+export { LatestRequestGate, type LatestRequest } from './latestRequestGate.js';
 
 const emptySessionFilters: SessionFilters = { q: '', keyId: '', model: '', state: '' };
 

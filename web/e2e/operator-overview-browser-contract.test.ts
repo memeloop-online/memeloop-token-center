@@ -88,7 +88,7 @@ test('Overview keeps current sections visible through independent endpoint failu
     await trendData.locator('summary').click();
     await trendData.locator('tbody tr').nth(2).waitFor();
     assert.match(await trendData.locator('thead').textContent() ?? '', /UTC/);
-    assert.match(await trendData.locator('thead').textContent() ?? '', /Cost/);
+    assert.equal(await trendData.getByRole('columnheader', { name: 'Total cost', exact: true }).count(), 1);
     assert.equal(await trendData.locator('tbody tr').count(), 3, 'the expanded table exposes the exact returned points, not derived rows');
 
     await mkdir(artifactRoot, { recursive: true });
