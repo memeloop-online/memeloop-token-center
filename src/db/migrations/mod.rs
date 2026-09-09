@@ -377,6 +377,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "durable client credential recovery envelopes",
         sql: include_str!("../../../migrations/common/0070_key_credential_recovery.sql"),
     },
+    Migration {
+        version: 71,
+        name: "bounded encrypted response archive spool",
+        sql: include_str!("../../../migrations/common/0071_response_archive_spool.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -739,6 +744,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 70,
         name: "durable client credential recovery envelopes",
         sql: include_str!("../../../migrations/common/0070_key_credential_recovery.sql"),
+    },
+    Migration {
+        version: 71,
+        name: "bounded encrypted response archive spool",
+        sql: include_str!("../../../migrations/common/0071_response_archive_spool.sql"),
     },
 ];
 

@@ -38,6 +38,11 @@ pub async fn run_until_shutdown(state: AppState, mut shutdown: watch::Receiver<b
     let mut reaper_task = AbortTaskOnDrop::new(tokio::spawn(async move {
         reaper.run(reaper_shutdown).await;
     }));
+    let spool_state = state.clone();
+    let spool_shutdown = shutdown.clone();
+    let mut spool_task = AbortTaskOnDrop::new(tokio::spawn(async move {
+        crate::response_archive_spool::run(spool_state, spool_shutdown).await;
+    }));
     let mut maintenance = tokio::time::interval(MAINTENANCE_INTERVAL);
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut orphaned_reservation_reaper =
@@ -151,6 +156,12 @@ pub async fn run_until_shutdown(state: AppState, mut shutdown: watch::Receiver<b
         tracing::error!(
             error_code = "reaper_task_failed",
             "archive staging reaper task failed"
+        );
+    }
+    if spool_task.join().await.is_err() {
+        tracing::error!(
+            stage = "response_spool_worker",
+            "response archive worker stopped"
         );
     }
 }

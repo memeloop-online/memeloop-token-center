@@ -230,6 +230,7 @@ impl ResponsesSseCapture {
     }
 
     #[cfg(test)]
+    #[cfg(test)]
     pub(super) fn has_pending_crlf_continuation(&self) -> bool {
         self.framer.has_pending_crlf_continuation()
     }

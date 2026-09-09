@@ -1,17 +1,12 @@
 use super::*;
 
-mod archive;
 mod delivery;
 mod lifecycle;
 mod terminal_delivery;
-
-use archive::{DeferredResponseArchive, cancel_stream_archive, stream_response_archive};
 #[cfg(test)]
-use delivery::try_queue_response_archive_batch;
-use delivery::{
-    CapturedSseDelivery, ResponseArchiveBatch, ResponseArchiveBatchError, capture_sse_delivery,
-    downstream_stream_failure, try_send_response_archive_batch,
-};
+mod tests;
+
+use delivery::{CapturedSseDelivery, capture_sse_delivery, downstream_stream_failure};
 use lifecycle::{StreamingFinalizationInput, finalize_streaming_lifecycle};
 use terminal_delivery::{ResponsesTerminalDelivery, TerminalEof};
 
@@ -57,19 +52,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         buffered_request,
         proxy_lifecycle_permit,
     } = input;
-    // Archive capacity is advisory for text traffic. Never wait for it before
-    // constructing the downstream response or reading the first upstream byte.
-    let archive_stream_permit = buffered_request.archive_available.then(|| {
-        state
-            .proxy_archive_stream_permits
-            .clone()
-            .try_acquire_owned()
-            .ok()
-    });
-    let archive_stream_permit = archive_stream_permit.flatten();
-    if buffered_request.archive_available && archive_stream_permit.is_none() {
-        tracing::warn!(%request_id, stage = "response_archive_capacity", "proxy archive gap");
-    }
     let stream_activity = state
         .metrics
         .active_stream(crate::metrics::ActiveStreamKind::ProxyResponse);
@@ -105,21 +87,16 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let deadline_started = started;
         let lifecycle = async move {
             let mut upstream_stream = upstream.bytes_stream();
-            let archive_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let (mut archive_sender, archive_task) = if let Some(permit) = archive_stream_permit {
-                let (sender, receiver) =
-                    tokio::sync::mpsc::channel::<ResponseArchiveBatch>(PROXY_BODY_CHANNEL_CAPACITY);
-                let task = tokio::spawn(stream_response_archive(
-                    background_state.clone(),
-                    request_id,
-                    permit,
-                    receiver,
-                    archive_complete.clone(),
-                ));
-                (Some(sender), Some(task))
-            } else {
-                (None, None)
+            let spool_identity = crate::db::ArchiveSpoolIdentity {
+                request_id,
+                tenant_id,
+                reservation_id: reservation.id,
             };
+            let mut archive_sender = crate::response_archive_spool::ResponseArchiveProducer::begin(
+                &background_state,
+                spool_identity,
+            )
+            .await;
             let mut usage_capture = Vec::new();
             let mut capture_memory = background_state
                 .metrics
@@ -142,11 +119,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut delivery_confirmed = false;
             let mut delivered_billable = false;
             let mut terminal_delivery = ResponsesTerminalDelivery::default();
-            // A complete SSE event may end with a CR whose paired LF arrives
-            // in the next network chunk. Keep one already bounded batch so a
-            // continuation and immediately following event can be submitted
-            // together without consuming two capacity-one archive slots.
-            let mut deferred_archive = DeferredResponseArchive::default();
             loop {
                 let mut flushing_terminal = false;
                 let next = if let Some(chunk) = terminal_delivery.take_pending() {
@@ -159,7 +131,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         Ok(next) => next,
                         Err(_) => {
                             transport_error = Some("upstream_timeout");
-                            cancel_stream_archive(&archive_complete, &mut archive_sender);
+                            drop(archive_sender.take());
                             let _ = tokio::time::timeout(
                                 MAX_DOWNSTREAM_SEND_WAIT,
                                 body_sender.send(downstream_stream_failure(
@@ -190,7 +162,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 "Responses upstream stream rejected at EOF"
                             );
                             transport_error = Some(error_code);
-                            cancel_stream_archive(&archive_complete, &mut archive_sender);
+                            drop(archive_sender.take());
                             let _ = tokio::time::timeout(
                                 MAX_DOWNSTREAM_SEND_WAIT,
                                 body_sender.send(downstream_stream_failure(
@@ -217,7 +189,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             response_bytes = response_bytes.saturating_add(raw_chunk.len());
                             if response_bytes > MAX_PROXY_RESPONSE_BODY {
                                 transport_error = Some("upstream_response_too_large");
-                                cancel_stream_archive(&archive_complete, &mut archive_sender);
+                                drop(archive_sender.take());
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
                                     body_sender.send(downstream_stream_failure(
@@ -249,10 +221,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                             "Responses upstream stream rejected by protocol sanitizer"
                                         );
                                         transport_error = Some(error_code);
-                                        cancel_stream_archive(
-                                            &archive_complete,
-                                            &mut archive_sender,
-                                        );
+                                        drop(archive_sender.take());
                                         let _ = tokio::time::timeout(
                                             MAX_DOWNSTREAM_SEND_WAIT,
                                             body_sender.send(downstream_stream_failure(
@@ -285,8 +254,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         // Responses and strict Chat. It emits whole events so a
                         // fragmented comment/control frame never confirms
                         // delivery or occupies the archive channel as output.
-                        let archive_continues_deferred_crlf =
-                            deferred_archive.has_pending() && chunk.starts_with(b"\n");
                         let CapturedSseDelivery {
                             frames: delivery_frames,
                             strict_chat_terminal_ready,
@@ -298,7 +265,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             Ok(delivery) => delivery,
                             Err(rejection) => {
                                 transport_error = Some(rejection.error_code());
-                                cancel_stream_archive(&archive_complete, &mut archive_sender);
+                                drop(archive_sender.take());
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
                                     body_sender.send(downstream_stream_failure(
@@ -312,22 +279,13 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 break;
                             }
                         };
-                        let archive_defer_for_crlf = sse_capture.is_some()
-                            && delivery_frames
-                                .last()
-                                .is_some_and(|frame| frame.bytes.ends_with(b"\r"));
-                        if let Some(sender) = archive_sender.as_ref()
-                            && deferred_archive
-                                .queue(
-                                    sender,
-                                    &delivery_frames,
-                                    archive_defer_for_crlf,
-                                    archive_continues_deferred_crlf,
-                                )
-                                .is_err()
+                        if let Some(spool) = archive_sender.as_mut()
+                            && !spool
+                                .append(delivery_frames.iter().map(|f| f.bytes.clone()).collect())
+                                .await
                         {
-                            tracing::warn!(%request_id, stage = "response_archive_backpressure", "proxy archive gap");
-                            cancel_stream_archive(&archive_complete, &mut archive_sender);
+                            tracing::warn!(%request_id, stage = "response_spool_ack", "proxy archive gap");
+                            drop(archive_sender.take());
                         }
                         for frame in delivery_frames {
                             let SseDeliveryFrame { bytes, billable } = frame;
@@ -406,7 +364,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             }
                         }
                         if transport_error.is_some() {
-                            cancel_stream_archive(&archive_complete, &mut archive_sender);
+                            drop(archive_sender.take());
                             break;
                         }
                         if strict_chat_terminal_ready {
@@ -415,7 +373,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     }
                     Err(_) => {
                         transport_error = Some("upstream_stream");
-                        cancel_stream_archive(&archive_complete, &mut archive_sender);
+                        drop(archive_sender.take());
                         let _ = tokio::time::timeout(
                             MAX_DOWNSTREAM_SEND_WAIT,
                             body_sender.send(downstream_stream_failure(
@@ -431,7 +389,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 }
             }
             if transport_error.is_some() {
-                cancel_stream_archive(&archive_complete, &mut archive_sender);
+                drop(archive_sender.take());
             }
             let sse_summary = sse_capture.map(ResponsesSseCapture::finish_summary);
             if matches!(
@@ -440,30 +398,26 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             ) {
                 // A partial SSE event is not a deliverable response and must
                 // not leave a complete-looking archive prefix behind.
-                cancel_stream_archive(&archive_complete, &mut archive_sender);
+                drop(archive_sender.take());
             }
-            if let Some(sender) = archive_sender.as_ref()
-                && deferred_archive.flush(sender).is_err()
-            {
-                tracing::warn!(%request_id, stage = "response_archive_backpressure", "proxy archive gap");
-                cancel_stream_archive(&archive_complete, &mut archive_sender);
-            }
-            // EOF is part of downstream delivery. Close it before awaiting the
-            // archive sidecar or terminal settlement so neither can prolong
-            // the client-visible stream lifetime.
+            // EOF closes independently of S3 upload. Seal only complete,
+            // durably acknowledged streams; a lost ACK never becomes success.
             drop(body_sender);
-            drop(archive_sender.take());
-            let gap_response = format!("gap://{request_id}/response");
-            let (response_archive_attempt, stored_response) = match archive_task {
-                Some(task) => match task.await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!(%request_id, stage = "response_archive_task", "proxy archive gap");
-                        (None, gap_response.clone())
-                    }
-                },
-                None => (None, gap_response.clone()),
+            let spool_sealed = match archive_sender.take() {
+                Some(spool) => spool.seal().await,
+                None => false,
             };
+            if !spool_sealed {
+                crate::response_archive_spool::mark_gap(
+                    &background_state,
+                    spool_identity,
+                    "capture_failed",
+                )
+                .await;
+            }
+            let gap_response = format!("gap://{request_id}/response");
+            let stored_response = gap_response.clone();
+            let response_archive_attempt = None;
             finalize_streaming_lifecycle(StreamingFinalizationInput {
                 state: &background_state,
                 status_code,
@@ -542,7 +496,3 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         .body(Body::from_stream(ReceiverStream::new(body_receiver)))
         .map_err(|_| AppError::Internal)
 }
-
-#[cfg(test)]
-#[path = "streaming/tests.rs"]
-mod tests;

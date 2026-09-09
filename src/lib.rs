@@ -23,6 +23,7 @@ pub mod pricing;
 pub mod provider;
 mod proxy_lifecycle;
 mod request_event_stream;
+mod response_archive_spool;
 pub mod schema;
 pub mod server;
 pub mod session_archive_import;

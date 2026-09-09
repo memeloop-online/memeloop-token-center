@@ -20,8 +20,8 @@ use chat_sse_usage::ChatSseUsageContract;
 pub(in crate::api) use conversation_hints::safe_conversation_hint as safe_response_id;
 use conversation_hints::{client_name, conversation_hints};
 use lifecycle::{
-    AbortTaskOnDrop, begin_streaming_response_archive, finish_proxy_request_with_archive_fallback,
-    run_bounded_proxy_lifecycle, run_bounded_text_archive,
+    finish_proxy_request_with_archive_fallback, run_bounded_proxy_lifecycle,
+    run_bounded_text_archive,
 };
 use routing::{
     CandidateCompatibility, CodexRetryTerminal, CodexRetryTerminalGuard, PROXY_ROUTING_POLICY,

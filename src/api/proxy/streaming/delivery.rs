@@ -1,18 +1,5 @@
 use super::*;
 
-/// One upstream network chunk can contain several fully-framed SSE events.
-/// Keep those immutable slices together so a capacity-one archive channel
-/// cannot mistake intra-chunk framing for archive backpressure.
-pub(super) struct ResponseArchiveBatch {
-    pub(super) chunks: Vec<Bytes>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ResponseArchiveBatchError {
-    BatchLimit,
-    Backpressure,
-}
-
 pub(super) struct CapturedSseDelivery {
     pub(super) frames: Vec<SseDeliveryFrame>,
     pub(super) strict_chat_terminal_ready: bool,
@@ -60,46 +47,4 @@ pub(super) fn capture_sse_delivery(
         strict_chat_terminal_ready: strict_openai_chat_usage
             && capture.strict_chat_terminal_ready(),
     })
-}
-
-impl ResponseArchiveBatch {
-    pub(super) fn from_delivery_frames(
-        frames: &[SseDeliveryFrame],
-    ) -> Result<Option<Self>, ResponseArchiveBatchError> {
-        if frames.is_empty() {
-            return Ok(None);
-        }
-        let bytes = frames.iter().fold(0_usize, |total, frame| {
-            total.saturating_add(frame.bytes.len())
-        });
-        if frames.len() > MAX_SSE_FRAMES_PER_NETWORK_CHUNK
-            || bytes > MAX_PROXY_RESPONSE_BODY
-            || (frames.len() > 1 && bytes > MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK)
-        {
-            return Err(ResponseArchiveBatchError::BatchLimit);
-        }
-        Ok(Some(Self {
-            chunks: frames.iter().map(|frame| frame.bytes.clone()).collect(),
-        }))
-    }
-}
-
-#[cfg(test)]
-pub(super) fn try_queue_response_archive_batch(
-    sender: &tokio::sync::mpsc::Sender<ResponseArchiveBatch>,
-    frames: &[SseDeliveryFrame],
-) -> Result<(), ResponseArchiveBatchError> {
-    let Some(batch) = ResponseArchiveBatch::from_delivery_frames(frames)? else {
-        return Ok(());
-    };
-    try_send_response_archive_batch(sender, batch)
-}
-
-pub(super) fn try_send_response_archive_batch(
-    sender: &tokio::sync::mpsc::Sender<ResponseArchiveBatch>,
-    batch: ResponseArchiveBatch,
-) -> Result<(), ResponseArchiveBatchError> {
-    sender
-        .try_send(batch)
-        .map_err(|_| ResponseArchiveBatchError::Backpressure)
 }
