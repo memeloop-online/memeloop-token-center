@@ -65,6 +65,7 @@ struct SseDeliveryState {
 pub(super) struct SseDeliveryFrame {
     pub(super) bytes: Bytes,
     pub(super) billable: bool,
+    pub(super) terminal: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -248,6 +249,7 @@ impl ResponsesSseCapture {
             delivery.frames.push(SseDeliveryFrame {
                 bytes,
                 billable: matches!(class, ChatSseDeliveryClass::Billable),
+                terminal: !self.terminal_failure && (self.terminal_success || self.saw_done),
             });
         }
     }

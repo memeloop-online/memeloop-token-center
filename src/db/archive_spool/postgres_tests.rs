@@ -201,6 +201,83 @@ impl PgFixture {
 }
 
 #[tokio::test]
+async fn postgres_seal_precedes_terminal_delivery_and_survives_producer_loss() {
+    let Some(mut fixture) = PgFixture::new().await else {
+        return;
+    };
+    fixture.capture().await;
+    fixture.install_commit_barrier().await;
+    let mut blocker = fixture.admin.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(fixture.gate)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let db = fixture.db.clone();
+    let id = fixture.id;
+    let (terminal_tx, mut terminal_rx) = tokio::sync::mpsc::channel(1);
+    let producer = tokio::spawn(async move {
+        assert!(db.seal_response_archive_spool(id, 1, 1).await.unwrap());
+        terminal_tx.send("success-terminal").await.unwrap();
+    });
+    fixture.wait_for_commit().await;
+    assert!(matches!(
+        terminal_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    // Fault window: the producer is lost inside COMMIT. No successful
+    // downstream terminal was observable, even if the server later commits.
+    producer.abort();
+    assert!(producer.await.unwrap_err().is_cancelled());
+    assert!(terminal_rx.recv().await.is_none());
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(fixture.gate)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    drop(blocker);
+    fixture.wait_state("pending").await;
+    fixture.db.close().await;
+    fixture.db = Database {
+        pool: schema_pool(&fixture.url, &fixture.schema).await,
+        backend: DatabaseBackend::PostgreSql,
+    };
+    // Simulate the existing orphan finalizer. It remains the only owner of
+    // settlement; spool recovery never edits the stored charged cost.
+    fixture.terminal().await;
+    let task = fixture
+        .db
+        .claim_response_archive_spool(Uuid::new_v4())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.chunk_count, 1);
+    assert!(
+        fixture
+            .db
+            .load_response_archive_spool_chunk(&task, 0)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let cost: i64 = sqlx::query_scalar("SELECT cost_micros FROM request_records WHERE id = $1")
+        .bind(id.request_id.to_string())
+        .fetch_one(&fixture.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(cost, 123);
+    assert!(
+        fixture
+            .db
+            .claim_response_archive_spool(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn postgres_seal_cancelled_inside_commit_remains_recoverable_after_reconnect() {
     let Some(mut fixture) = PgFixture::new().await else {
         return;

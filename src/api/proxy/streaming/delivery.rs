@@ -5,6 +5,92 @@ pub(super) struct CapturedSseDelivery {
     pub(super) strict_chat_terminal_ready: bool,
 }
 
+pub(super) struct FrameDelivery<'a> {
+    pub state: &'a AppState,
+    pub sender: &'a tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    pub request_id: Uuid,
+    pub tenant_id: Uuid,
+    pub reservation: &'a crate::model::UsageReservation,
+    pub input_token_ceiling: i64,
+    pub output_token_ceiling: i64,
+    pub requested_service_tier: Option<&'a str>,
+    pub confirmed: &'a mut bool,
+}
+
+/// The held terminal and ordinary frames use exactly the same durable
+/// delivery-start transition, including a terminal containing the only output.
+pub(super) async fn send_frame(
+    input: FrameDelivery<'_>,
+    frame: SseDeliveryFrame,
+) -> Result<bool, &'static str> {
+    let SseDeliveryFrame {
+        bytes, billable, ..
+    } = frame;
+    if billable && !*input.confirmed {
+        let permit = tokio::time::timeout(MAX_DOWNSTREAM_SEND_WAIT, input.sender.reserve())
+            .await
+            .map_err(|_| "downstream_backpressure")?
+            .map_err(|_| "downstream_disconnected")?;
+        prepare_proxy_delivery_with_retry(
+            &input.state.db,
+            input.request_id,
+            input.tenant_id,
+            input.reservation,
+            input.input_token_ceiling,
+            input.output_token_ceiling,
+            input.requested_service_tier,
+        )
+        .await
+        .map_err(|_| "delivery_state")?;
+        confirm_proxy_delivery_with_retry(
+            &input.state.db,
+            input.request_id,
+            input.tenant_id,
+            input.reservation,
+        )
+        .await
+        .map_err(|_| "delivery_state")?;
+        *input.confirmed = true;
+        permit.send(Ok(bytes));
+    } else {
+        tokio::time::timeout(MAX_DOWNSTREAM_SEND_WAIT, input.sender.send(Ok(bytes)))
+            .await
+            .map_err(|_| "downstream_backpressure")?
+            .map_err(|_| "downstream_disconnected")?;
+    }
+    Ok(billable)
+}
+
+/// Keep only the bounded terminal tail, never the streamed response body.
+#[derive(Default)]
+pub(super) struct TerminalFrames {
+    frames: Vec<SseDeliveryFrame>,
+    bytes: usize,
+}
+
+impl TerminalFrames {
+    pub(super) fn hold(&mut self, frame: SseDeliveryFrame) -> Result<Option<SseDeliveryFrame>, ()> {
+        if !frame.terminal && self.frames.is_empty() {
+            return Ok(Some(frame));
+        }
+        self.bytes = self.bytes.checked_add(frame.bytes.len()).ok_or(())?;
+        if self.bytes > crate::api::limits::MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK {
+            return Err(());
+        }
+        self.frames.push(frame);
+        Ok(None)
+    }
+
+    pub(super) fn take(&mut self) -> Vec<SseDeliveryFrame> {
+        self.bytes = 0;
+        std::mem::take(&mut self.frames)
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
 pub(super) fn downstream_stream_failure(
     protocol: Protocol,
     is_sse: bool,
@@ -37,6 +123,7 @@ pub(super) fn capture_sse_delivery(
             frames: vec![SseDeliveryFrame {
                 bytes: chunk,
                 billable: true,
+                terminal: false,
             }],
             strict_chat_terminal_ready: false,
         });

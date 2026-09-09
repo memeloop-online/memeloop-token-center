@@ -13,6 +13,15 @@ is bounded waiting, **not** a zero-latency or no-loss guarantee. Database
 availability and commit latency still matter. Already lost historical
 streams cannot be reconstructed by this change.
 
+Successful SSE terminal frames and HTTP EOF are released only after the
+complete capture's seal acknowledgement, or after a bounded attempt to persist
+an explicit gap when capture fails. Ordinary text remains incremental. The
+terminal tail is bounded to 2 MiB and preserves split CRLF framing; it uses the
+same delivery-start accounting as ordinary output. Object upload is still
+asynchronous. A process lost inside seal cannot have delivered a successful
+terminal, while a seal committed despite a lost acknowledgement remains
+recoverable by the worker after the existing request finalizer converges.
+
 ## Bounds and recovery
 
 - 64 KiB plaintext chunks; 64 MiB/request; 65,536 chunks/request.

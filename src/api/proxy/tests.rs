@@ -19,6 +19,7 @@ use crate::{
     model::KeyPolicy,
 };
 
+mod archive_terminal;
 mod chat_sse_usage;
 mod kimi;
 mod sse_delivery;

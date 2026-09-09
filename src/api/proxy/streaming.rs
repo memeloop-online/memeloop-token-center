@@ -119,6 +119,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let mut delivery_confirmed = false;
             let mut delivered_billable = false;
             let mut terminal_delivery = ResponsesTerminalDelivery::default();
+            let mut terminal_frames = delivery::TerminalFrames::default();
+            let mut terminal_memory = background_state
+                .metrics
+                .memory_usage(crate::metrics::MemoryComponent::StreamCapture, 0);
             loop {
                 let mut flushing_terminal = false;
                 let next = if let Some(chunk) = terminal_delivery.take_pending() {
@@ -288,83 +292,55 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             drop(archive_sender.take());
                         }
                         for frame in delivery_frames {
-                            let SseDeliveryFrame { bytes, billable } = frame;
-                            if billable && !delivery_confirmed {
-                                // `delivery_started` is the durable signal the orphan reaper
-                                // uses to charge a stranded stream. Confirm it before any
-                                // billable byte is enqueued, while control frames never reach
-                                // this transition.
-                                match tokio::time::timeout(
-                                    MAX_DOWNSTREAM_SEND_WAIT,
-                                    body_sender.reserve(),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(permit)) => match prepare_proxy_delivery_with_retry(
-                                        &background_state.db,
-                                        request_id,
-                                        tenant_id,
-                                        &reservation,
-                                        input_token_ceiling,
-                                        output_token_ceiling,
-                                        requested_service_tier.as_deref(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            if confirm_proxy_delivery_with_retry(
-                                                &background_state.db,
-                                                request_id,
-                                                tenant_id,
-                                                &reservation,
-                                            )
-                                            .await
-                                            .is_err()
-                                            {
-                                                drop(permit);
-                                                transport_error = Some("delivery_state");
-                                            } else {
-                                                delivery_confirmed = true;
-                                                delivered_billable = true;
-                                                permit.send(Ok::<Bytes, std::io::Error>(bytes));
-                                            }
-                                        }
-                                        Err(_) => {
-                                            drop(permit);
-                                            transport_error = Some("delivery_state");
-                                            let _ = tokio::time::timeout(
-                                                MAX_DOWNSTREAM_SEND_WAIT,
-                                                body_sender.send(downstream_stream_failure(
-                                                    protocol,
-                                                    is_sse,
-                                                    responses_streaming_sanitizer.as_ref(),
-                                                    "response delivery could not be recorded",
-                                                )),
-                                            )
-                                            .await;
-                                        }
-                                    },
-                                    Ok(Err(_)) => transport_error = Some("downstream_disconnected"),
-                                    Err(_) => transport_error = Some("downstream_backpressure"),
+                            let frame = match terminal_frames.hold(frame) {
+                                Ok(Some(frame)) => frame,
+                                Ok(None) => {
+                                    terminal_memory.set_bytes(terminal_frames.bytes());
+                                    continue;
                                 }
-                            } else {
-                                match tokio::time::timeout(
-                                    MAX_DOWNSTREAM_SEND_WAIT,
-                                    body_sender.send(Ok::<Bytes, std::io::Error>(bytes)),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(())) => delivered_billable |= billable,
-                                    Ok(Err(_)) => transport_error = Some("downstream_disconnected"),
-                                    Err(_) => transport_error = Some("downstream_backpressure"),
+                                Err(()) => {
+                                    transport_error =
+                                        Some("upstream_response_event_batch_too_large");
+                                    break;
                                 }
-                            }
-                            if transport_error.is_some() {
-                                break;
+                            };
+                            match delivery::send_frame(
+                                delivery::FrameDelivery {
+                                    state: &background_state,
+                                    sender: &body_sender,
+                                    request_id,
+                                    tenant_id,
+                                    reservation: &reservation,
+                                    input_token_ceiling,
+                                    output_token_ceiling,
+                                    requested_service_tier: requested_service_tier.as_deref(),
+                                    confirmed: &mut delivery_confirmed,
+                                },
+                                frame,
+                            )
+                            .await
+                            {
+                                Ok(billable) => delivered_billable |= billable,
+                                Err(error) => {
+                                    transport_error = Some(error);
+                                    break;
+                                }
                             }
                         }
                         if transport_error.is_some() {
                             drop(archive_sender.take());
+                            if transport_error == Some("delivery_state") {
+                                let _ = tokio::time::timeout(
+                                    MAX_DOWNSTREAM_SEND_WAIT,
+                                    body_sender.send(downstream_stream_failure(
+                                        protocol,
+                                        is_sse,
+                                        responses_streaming_sanitizer.as_ref(),
+                                        "response delivery could not be recorded",
+                                    )),
+                                )
+                                .await;
+                            }
                             break;
                         }
                         if strict_chat_terminal_ready {
@@ -392,17 +368,18 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 drop(archive_sender.take());
             }
             let sse_summary = sse_capture.map(ResponsesSseCapture::finish_summary);
-            if matches!(
+            let incomplete = matches!(
                 sse_summary.as_ref().map(|summary| &summary.outcome),
                 Some(ResponsesSseOutcome::Incomplete)
-            ) {
+            );
+            if incomplete {
                 // A partial SSE event is not a deliverable response and must
                 // not leave a complete-looking archive prefix behind.
                 drop(archive_sender.take());
             }
-            // EOF closes independently of S3 upload. Seal only complete,
-            // durably acknowledged streams; a lost ACK never becomes success.
-            drop(body_sender);
+            // Success terminals and EOF are downstream commit markers. First
+            // make the complete capture recoverable (or record an honest gap).
+            // S3 upload remains asynchronous and is never awaited here.
             let spool_sealed = match archive_sender.take() {
                 Some(spool) => spool.seal().await,
                 None => false,
@@ -415,6 +392,35 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 )
                 .await;
             }
+            if transport_error.is_none() {
+                for frame in terminal_frames.take() {
+                    match delivery::send_frame(
+                        delivery::FrameDelivery {
+                            state: &background_state,
+                            sender: &body_sender,
+                            request_id,
+                            tenant_id,
+                            reservation: &reservation,
+                            input_token_ceiling,
+                            output_token_ceiling,
+                            requested_service_tier: requested_service_tier.as_deref(),
+                            confirmed: &mut delivery_confirmed,
+                        },
+                        frame,
+                    )
+                    .await
+                    {
+                        Ok(billable) => delivered_billable |= billable,
+                        Err(error) => {
+                            transport_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+            drop(body_sender);
+            drop(terminal_frames);
+            terminal_memory.set_bytes(0);
             let gap_response = format!("gap://{request_id}/response");
             let stored_response = gap_response.clone();
             let response_archive_attempt = None;
