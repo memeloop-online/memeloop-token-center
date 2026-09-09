@@ -10,7 +10,11 @@ test('session list reads cancel obsolete work and retain visible data on backgro
   assert.match(source, /const listRequests = useRef\(new LatestRequestGate\(\)\)/);
   assert.match(list, /const request = listRequests\.current\.begin\(\)/);
   assert.match(list, /AbortSignal\.any\(\[request\.signal, AbortSignal\.timeout\(15_000\)\]\)/);
-  assert.match(list, /if \(!older && !background\) setSessions\(\[\]\)/);
+  const failure = list.slice(list.indexOf('} catch (reason)'), list.indexOf('} finally'));
+  assert.match(failure, /setError\(messageOf\(reason, t\('sessions\.loadFailed'\)\)\)/);
+  assert.doesNotMatch(failure, /setSessions\(\[\]\)/, 'failed same-scope reads must preserve visible data');
+  assert.match(source, /loadSessions\(false, filters, visibleSessions\.length > 0\)/, 'retry preserves an already loaded page as a background refresh');
+  assert.match(source, /setSessions\(\[\]\); setListScope\(''\)/, 'scope and filter transitions still clear obsolete data');
   assert.equal((source.match(/listRequests\.current\.invalidate\(\)/g) ?? []).length, 2);
 });
 
