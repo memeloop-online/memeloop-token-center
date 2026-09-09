@@ -1,7 +1,7 @@
 -- Durable, separately-addressed recovery envelopes let an authorized control
 -- client re-copy a still-active credential without changing its key identity
 -- or generation. The envelope is authenticated by application code against
--- its key and generation before it is returned; this table never replaces the
+-- its key and generation before it is returned. This table never replaces the
 -- one-way authentication hash in key_credentials.
 CREATE TABLE IF NOT EXISTS key_credential_recovery_secrets (
     credential_id TEXT PRIMARY KEY REFERENCES key_credentials(id) ON DELETE CASCADE,

@@ -940,21 +940,17 @@ pub(super) async fn apply_migration_range(
         if applied {
             continue;
         }
-        for statement in migration
-            .sql
-            .split(';')
-            .map(str::trim)
-            .filter(|statement| !statement.is_empty())
+        if let Err(error) = sqlx::raw_sql(migration.sql)
+            .execute(&mut **transaction)
+            .await
         {
-            sqlx::query(statement)
-                .execute(&mut **transaction)
-                .await
-                .map_err(|error| {
-                    sqlx::Error::Protocol(format!(
-                        "migration {} ({}) failed at statement `{statement}`: {error}",
-                        migration.version, migration.name
-                    ))
-                })?;
+            tracing::error!(
+                migration_version = migration.version,
+                migration_name = migration.name,
+                error_category = migration_error_category(&error),
+                "database migration execution failed"
+            );
+            return Err(error);
         }
         sqlx::query(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
@@ -966,6 +962,55 @@ pub(super) async fn apply_migration_range(
         .await?;
     }
     Ok(())
+}
+
+fn migration_error_category(error: &sqlx::Error) -> &'static str {
+    match error {
+        sqlx::Error::Database(_) => "database",
+        sqlx::Error::Io(_) => "io",
+        sqlx::Error::Protocol(_) => "protocol",
+        sqlx::Error::AnyDriverError(_) => "any_driver",
+        sqlx::Error::PoolTimedOut => "pool_timeout",
+        sqlx::Error::PoolClosed => "pool_closed",
+        _ => "other",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Database, Migration, apply_migration_range};
+
+    #[tokio::test]
+    async fn raw_sql_migrations_accept_semicolons_in_comments_and_literals() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("migration-delimiters.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let migrations = [Migration {
+            version: 1,
+            name: "delimiter fixture",
+            sql: "CREATE TABLE migration_delimiter_fixture (value TEXT NOT NULL);\n-- A semicolon in a comment; the rest of this line is still a comment.\nINSERT INTO migration_delimiter_fixture (value) VALUES ('literal; value');",
+        }];
+        let mut transaction = database.pool.begin().await.unwrap();
+        apply_migration_range(&mut transaction, &migrations, 1, 1)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let value: String = sqlx::query_scalar("SELECT value FROM migration_delimiter_fixture")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(value, "literal; value");
+    }
 }
 
 pub(super) async fn maintain_postgres_partitions(
