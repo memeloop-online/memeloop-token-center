@@ -132,14 +132,7 @@ pub(super) fn plan_proxy_route(
     route.credential.validate(preparation_now)?;
     let is_codex = codex_transport::is_driver(&route.driver);
     if is_codex {
-        codex_transport::validate_protocol(protocol)?;
-        if route.base_url != codex_transport::BASE_URL {
-            return Err(AppError::BadRequest(
-                "OpenAI Codex account has an invalid fixed base URL".into(),
-            ));
-        }
-        codex_transport::validate_credential_contract(&route.credential)?;
-        codex_transport::validate_route_config(&route.config)?;
+        codex::validate_route(&route, protocol)?;
     }
     let (mut forwarded_json, kimi_response) =
         kimi::prepare_forwarded_request(&route, protocol, request_json)?;

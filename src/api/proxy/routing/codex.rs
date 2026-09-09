@@ -7,6 +7,17 @@ mod retry;
 use retry::{AttemptControl, CodexRetryState, observe_bad_request_disposition};
 pub(in crate::api::proxy) use retry::{CodexRetryTerminal, CodexRetryTerminalGuard};
 
+pub(super) fn validate_route(route: &ResolvedUpstream, protocol: Protocol) -> Result<(), AppError> {
+    codex_transport::validate_protocol(protocol)?;
+    if route.base_url != codex_transport::BASE_URL {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex account has an invalid fixed base URL".into(),
+        ));
+    }
+    codex_transport::validate_credential_contract(&route.credential)?;
+    codex_transport::validate_route_config(&route.config)
+}
+
 pub(super) async fn send_proxy_route(
     state: &AppState,
     headers: &HeaderMap,
