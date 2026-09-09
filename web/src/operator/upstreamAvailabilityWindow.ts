@@ -1,4 +1,4 @@
-import type { MonitoringMetrics, MonitoringTerminalOutcome } from '../types';
+import type { MonitoringMetrics, MonitoringTerminalOutcome } from '../types.js';
 
 export interface UpstreamAvailabilityWindow {
   contract_version: 'upstream_account_availability_v1';

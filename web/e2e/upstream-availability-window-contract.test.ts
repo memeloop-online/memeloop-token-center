@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { upstreamAvailabilityPath } from '../src/operator/upstreamAvailabilityWindow';
+import { upstreamAvailabilityPath } from '../src/operator/upstreamAvailabilityWindow.js';
 
 test('account availability requires an explicit tenant and encodes one inclusive 24 hour window', () => {
   const now = Date.UTC(2026, 8, 9, 12);
