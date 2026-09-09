@@ -51,7 +51,10 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await page.locator('.typed-filter-actions button').first().click();
     const filter = page.locator('.typed-filter-dialog');
     await filter.getByRole('button', { name: 'Add condition', exact: true }).click();
-    await filter.locator('.typed-filter-row').getByLabel('Field', { exact: true }).selectOption('model');
+    const row = filter.locator('.typed-filter-row');
+    await row.waitFor({ state: 'visible' });
+    assert.equal(await row.getByLabel('Operator', { exact: true }).count(), 1, 'operator label must not include the select option list');
+    await row.getByLabel('Field', { exact: true }).selectOption('model');
     await filter.locator('.model-picker-trigger').click();
     const catalog = filter.locator('.shared-model-popover');
     const search = catalog.getByRole('combobox');

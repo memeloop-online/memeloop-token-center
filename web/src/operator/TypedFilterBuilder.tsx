@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { api } from '../api';
 import { useI18n } from '../i18n';
 import { ModelPicker } from '../ModelPicker';
@@ -153,6 +153,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   disabled?: boolean;
 }) {
   const { t } = useI18n();
+  const editorId = useId();
   const [open, setOpen] = useState(false);
   const { anchor, panel, position } = useAnchoredPopover(open);
   const [draft, setDraft] = useState<TypedFilterAst>(ast);
@@ -248,8 +249,8 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
         // mounted preserves the freshly selected field while React swaps that
         // editor from a scalar input to the catalog picker.
         return <div className="typed-filter-row" key={index}>
-          <label><span>{t('filter.field')}</span><select value={condition.field} disabled={disabled} onChange={(event) => selectField(index, event.target.value as TypedFilterField)}>{visibleFields.map((option) => <option key={option.id} value={option.id}>{t(`filter.field.${option.id}`)}</option>)}</select></label>
-          <label><span>{t('filter.operator')}</span><select value={condition.operator} disabled={disabled} onChange={(event) => { const operator = event.target.value as TypedFilterOperator; updateCondition(index, { operator, upper: operator === 'between' ? blankValue(field.type) : undefined }); }}>{operators.map((operator) => <option key={operator} value={operator}>{t(`filter.operator.${operator}`)}</option>)}</select></label>
+          <label><span id={`${editorId}-field-${index}`}>{t('filter.field')}</span><select aria-labelledby={`${editorId}-field-${index}`} value={condition.field} disabled={disabled} onChange={(event) => selectField(index, event.target.value as TypedFilterField)}>{visibleFields.map((option) => <option key={option.id} value={option.id}>{t(`filter.field.${option.id}`)}</option>)}</select></label>
+          <label><span id={`${editorId}-operator-${index}`}>{t('filter.operator')}</span><select aria-labelledby={`${editorId}-operator-${index}`} value={condition.operator} disabled={disabled} onChange={(event) => { const operator = event.target.value as TypedFilterOperator; updateCondition(index, { operator, upper: operator === 'between' ? blankValue(field.type) : undefined }); }}>{operators.map((operator) => <option key={operator} value={operator}>{t(`filter.operator.${operator}`)}</option>)}</select></label>
           <label className="typed-filter-value" data-filter-field={condition.field}><span>{t('filter.value')}</span>{renderValue(condition, index, 'value')}</label>
           {condition.operator === 'between' && <label className="typed-filter-value" data-filter-field={condition.field}><span>{t('filter.upper')}</span>{renderValue(condition, index, 'upper')}</label>}
           <div className="typed-filter-row-actions"><button type="button" className="secondary" disabled={disabled || index === 0} aria-label={t('common.moveUp')} onClick={() => setDraft((current) => { const conditions = [...current.conditions]; [conditions[index - 1], conditions[index]] = [conditions[index], conditions[index - 1]]; return { ...current, conditions }; })}>↑</button><button type="button" className="secondary" disabled={disabled || index + 1 === draft.conditions.length} aria-label={t('common.moveDown')} onClick={() => setDraft((current) => { const conditions = [...current.conditions]; [conditions[index], conditions[index + 1]] = [conditions[index + 1], conditions[index]]; return { ...current, conditions }; })}>↓</button><button type="button" className="secondary" disabled={disabled} aria-label={t('common.remove')} onClick={() => setDraft((current) => ({ ...current, conditions: current.conditions.filter((_, itemIndex) => itemIndex !== index) }))}>×</button></div>
