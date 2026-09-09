@@ -7,6 +7,10 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
+declare global {
+  interface Window { quotaReads: number; quotaWrites: number }
+}
+
 test('quota loads only on demand and shows window/reset evidence without any reset mutation', { timeout: 90_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
