@@ -340,7 +340,9 @@ jobs:
           retention-days: 14
 
   memory-acceptance:
-    needs: [rust]
+    # Do not spend the long-running harness budget on a revision that already
+    # failed a source, browser, migration, or security gate.
+    needs: [rust, web, migration-smoke, api-contract, dependency-security, repository-security]
     permissions:
       contents: read
     uses: ./.github/workflows/memory-acceptance.yml
