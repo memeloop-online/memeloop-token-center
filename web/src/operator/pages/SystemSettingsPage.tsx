@@ -2,7 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../../api';
 import { CopyButton } from '../../CopyButton.js';
 import { useI18n } from '../../i18n';
-import type { FilterAssistantSettings, ModelRouteView } from '../../types';
+import { ModelPicker } from '../../ModelPicker';
+import type { FilterAssistantSettings, GroupView, ModelRouteView, UpstreamAccount } from '../../types';
+import { routeModelOptions } from '../modelCatalog';
 import { messageOf, queryForTenant } from '../scope/operatorShared';
 
 export interface OperatorAccessSettingsProps {
@@ -48,6 +50,8 @@ export function OperatorAccessSettings({ credentialInput, credential, authentica
 export function SystemSettingsPage({ token, tenant }: { token: string; tenant: string; writeTenant?: string }) {
   const { t } = useI18n();
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
+  const [upstreams, setUpstreams] = useState<UpstreamAccount[]>([]);
+  const [groups, setGroups] = useState<GroupView[]>([]);
   const [settings, setSettings] = useState<FilterAssistantSettings | null>();
   const [selectedRouteId, setSelectedRouteId] = useState('');
   const [loading, setLoading] = useState(false);
@@ -63,13 +67,16 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
     if (!token || !tenant) { setRoutes([]); setSettings(undefined); setLoading(false); return; }
     setLoading(true);
     try {
-      const [nextRoutes, nextSettings] = await Promise.all([
+      const [nextRoutes, nextSettings, nextUpstreams, nextGroups] = await Promise.all([
         api<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(tenant)}`, token),
         api<FilterAssistantSettings | null>(`/internal/v1/filter-assistant/settings?tenant_external_id=${encodeURIComponent(tenant)}`, token),
+        api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token),
+        api<GroupView[]>(`/internal/v1/provider-groups${queryForTenant(tenant)}`, token),
       ]);
       if (request !== loadSequence.current) return;
       const enabled = nextRoutes.filter((route) => route.enabled);
       setRoutes(enabled); setSettings(nextSettings); setSelectedRouteId(nextSettings?.model_route_id ?? '');
+      setUpstreams(nextUpstreams); setGroups(nextGroups);
     } catch (reason) {
       if (request !== loadSequence.current) return;
       const nextError = messageOf(reason, t('common.requestFailed'));
@@ -117,7 +124,7 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
           {settings && <span className="status ok">{t('settings.configured')}</span>}
         </div>
         {loading ? <div className="empty" role="status">{t('common.loading')}</div> : loadError ? <div className="settings-empty"><button type="button" className="secondary" onClick={() => void load()}>{t('common.retry')}</button></div> : routes.length === 0 ? <div className="settings-empty"><b>{t('settings.noEnabledRoute')}</b><span>{t('settings.noEnabledRouteHint')}</span></div> : <form className="system-settings-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
-          <label htmlFor="filter-assistant-route">{t('settings.filterAssistantRoute')}<select id="filter-assistant-route" value={selectedRouteId} onChange={(event) => setSelectedRouteId(event.target.value)}><option value="">{t('common.select')}</option>{routes.map((route) => <option key={route.id} value={route.id}>{route.public_model} · {route.upstream_model} · {route.protocol}</option>)}</select><small>{t('settings.filterAssistantRouteHint')}</small></label>
+          <div><ModelPicker label={t('settings.filterAssistantRoute')} value={selectedRouteId} onChange={setSelectedRouteId} disabled={saving} options={routeModelOptions(routes, upstreams, groups, t('modelPicker.unknown'), 'route')} /><small>{t('settings.filterAssistantRouteHint')}</small></div>
           <button type="submit" disabled={saving || !selectedRouteId}>{saving ? t('common.loading') : t('common.save')}</button>
         </form>}
         {settings === null && !loadError && <p className="settings-status-note">{t('settings.filterAssistantNotConfigured')}</p>}

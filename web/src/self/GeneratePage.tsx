@@ -2,6 +2,7 @@ import RjsfForm from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { api } from '../api';
+import { ModelPicker } from '../ModelPicker';
 import { localizeSchema, useI18n } from '../i18n';
 import { schemaFormTemplates } from '../SchemaTemplates';
 import { safeValidator as validator } from '../safeValidator';
@@ -131,7 +132,7 @@ export function GeneratePage({ credential, onError }: { credential: string; onEr
       {message && <div className="notice success" role="status">{message}</div>}
       <label>{t('self.generationKind')}<select value={kind} disabled={!catalogAvailable} onChange={(event) => { setKind(event.target.value as 'image' | 'video'); setModel(''); setParameters({}); }}><option value="image" disabled={catalogAvailable && !models.some((item) => item.modalities?.includes('image'))}>{t('self.image')}</option><option value="video" disabled={catalogAvailable && !models.some((item) => item.modalities?.includes('video'))}>{t('self.video')}</option></select></label>
       {loading ? <div className="boot">{t('common.loading')}</div> : !catalogAvailable ? <div className="notice warning" role="status">{catalogError || t('common.requestFailed')} <button type="button" className="secondary" onClick={() => void loadCatalog()}>{t('common.retry')}</button></div> : generationModels.length === 0 ? <div className="notice warning" role="status">{t('self.noModelsForModality', { modality: t(`self.${kind}`) })}</div> : <form onSubmit={submit}>
-        <label>{t('self.generationModel')}<select value={model} onChange={(event) => { setModel(event.target.value); setParameters({}); }}><option value="">{t('common.select')}</option>{generationModels.map((allowedModel) => <option value={allowedModel.id} key={allowedModel.id}>{allowedModel.id}</option>)}</select></label>
+        <ModelPicker label={t('self.generationModel')} value={model} onChange={(value) => { setModel(value); setParameters({}); }} options={generationModels.map((allowedModel) => ({ key: allowedModel.id, value: allowedModel.id, label: allowedModel.id, provider: allowedModel.owned_by || t('modelPicker.unknown'), upstream: t('modelPicker.unknown'), description: allowedModel.modalities?.join(' · ') }))} />
         <label>{t('self.generationPrompt')}<textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
         {generationNeedsDuration(kind, selectedModel) && <label>{t('self.generationDuration')}<input type="number" min="1" max="60" step="1" value={duration} onChange={(event) => setDuration(event.target.value)} /></label>}
         {visibleSchema && <div className="generation-parameters"><h3>{t('self.workflowParameters')}</h3><RjsfForm key={`${kind}-${model}-${locale}`} schema={localizeSchema(visibleSchema, locale)} formData={parameters} validator={validator} templates={schemaFormTemplates} tagName="div" noHtml5Validate onChange={({ formData }) => setParameters((formData ?? {}) as Record<string, unknown>)}><></></RjsfForm></div>}

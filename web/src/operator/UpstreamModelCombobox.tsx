@@ -1,7 +1,9 @@
-import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
+import { ModelPicker, type ModelPickerOption } from '../ModelPicker';
+import type { UpstreamAccount } from '../types';
 
 interface CatalogModel {
   id: string;
@@ -23,6 +25,7 @@ interface AggregateCatalog {
 interface AccountCatalog {
   status: 'unknown' | 'syncing' | 'ready' | 'stale' | 'failed' | string;
   error_code?: string;
+  models?: Array<{ id: string; protocol: string }>;
 }
 
 function delay(milliseconds: number) {
@@ -41,17 +44,17 @@ interface Props {
   onChange: (value: string) => void;
   customModelConfirmed: boolean;
   onValidityChange: (valid: boolean, allowCustom: boolean) => void;
+  upstreams?: UpstreamAccount[];
 }
 
-export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, customModelConfirmed, onValidityChange }: Props) {
+export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, customModelConfirmed, onValidityChange, upstreams = [] }: Props) {
   const { locale, t } = useI18n();
-  const id = useId();
   const [catalog, setCatalog] = useState<AggregateCatalog>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [syncMessage, setSyncMessage] = useState('');
   const [open, setOpen] = useState(false);
-  const [active, setActive] = useState(-1);
+  const [accountCatalogs, setAccountCatalogs] = useState<Map<string, AccountCatalog>>(new Map());
   const [customConfirmed, setCustomConfirmed] = useState(customModelConfirmed);
   const [partialConfirmed, setPartialConfirmed] = useState(false);
   const [refreshVersion, setRefreshVersion] = useState(0);
@@ -86,6 +89,32 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     return () => { window.clearTimeout(timeout); controller.abort(); };
   }, [token, tenant, sourceKey, value, refreshVersion]);
 
+  useEffect(() => {
+    let current = true;
+    setAccountCatalogs(new Map());
+    if (!open || !token || !tenant) return;
+    const ids = [...new Set(syncAccountIds)];
+    const catalogScope = new URLSearchParams({ tenant_external_id: tenant, limit: '200' });
+    if (value.trim()) catalogScope.set('q', value.trim());
+    let cursor = 0;
+    const read = async () => {
+      while (current && cursor < ids.length) {
+        const accountId = ids[cursor++];
+        try {
+          const next = await api<AccountCatalog>(`/internal/v1/upstreams/${encodeURIComponent(accountId)}/models?${catalogScope}`, token);
+          if (current) setAccountCatalogs((catalogs) => new Map(catalogs).set(accountId, next));
+        } catch {
+          // Missing account provenance stays explicitly unknown; aggregate
+          // coverage and custom/partial-model validation are never inferred.
+        }
+      }
+    };
+    const timeout = window.setTimeout(() => {
+      void Promise.all(Array.from({ length: Math.min(4, ids.length) }, read));
+    }, 250);
+    return () => { current = false; window.clearTimeout(timeout); };
+  }, [open, token, tenant, sourceKey, value, refreshVersion]);
+
   const options = useMemo(() => (catalog?.data ?? []).filter((model) => (model.protocol === protocol || model.protocol === 'any')
     && (!value.trim() || model.id.toLowerCase().includes(value.trim().toLowerCase()))), [catalog, protocol, value]);
   const selected = catalog?.data.find((model) => model.id === value && (model.protocol === protocol || model.protocol === 'any'));
@@ -101,7 +130,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   useEffect(() => validityCallback.current(valid, allowCustom), [valid, allowCustom]);
 
   const choose = (model: CatalogModel) => {
-    onChange(model.id); setCustomConfirmed(false); setPartialConfirmed(false); setOpen(false); setActive(-1);
+    onChange(model.id); setCustomConfirmed(false); setPartialConfirmed(false);
   };
   const sync = async () => {
     if (syncAccountIds.length === 0) return;
@@ -123,18 +152,26 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     } catch (reason) { setError(reason instanceof Error ? reason.message : t('routes.catalogFailed')); }
     finally { setLoading(false); }
   };
-  const onKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === 'ArrowDown') { event.preventDefault(); setOpen(true); setActive((current) => Math.min(current + 1, Math.max(options.length - 1, 0))); }
-    else if (event.key === 'ArrowUp') { event.preventDefault(); setActive((current) => Math.max(current - 1, 0)); }
-    else if (event.key === 'Enter' && open && options[active >= 0 ? active : 0]) { event.preventDefault(); choose(options[active >= 0 ? active : 0]); }
-    else if (event.key === 'Escape') { event.preventDefault(); setOpen(false); }
-  };
+  const groupedOptions: ModelPickerOption[] = options.flatMap((model) => {
+    const accounts = upstreams.filter((account) => syncAccountIds.includes(account.id) && accountCatalogs.get(account.id)?.models?.some((item) => item.id === model.id && (item.protocol === protocol || item.protocol === 'any')));
+    return (accounts.length ? accounts : [undefined]).map((account) => ({
+      key: `${account?.id ?? 'unknown'}:${model.protocol}:${model.id}`, value: model.id, label: model.id,
+      provider: account?.driver || t('modelPicker.unknown'), upstream: account?.name || t('modelPicker.unknown'),
+      description: [
+        model.complete_coverage ? t('routes.fullCoverage') : t('routes.partialCoverage', { supported: formatNumber(model.supported_account_count, locale), eligible: formatNumber(model.eligible_account_count, locale) }),
+        model.context_window ? t('routes.contextWindow', { count: formatNumber(model.context_window, locale) }) : '',
+        model.reservation_token_bound ? t('routes.reservationBound', { count: formatNumber(model.reservation_token_bound, locale) }) : '',
+      ].filter(Boolean).join(' · '),
+    }));
+  });
 
   return <div className="model-combobox">
-    <label htmlFor={`${id}-input`}>{t('routes.upstreamModel')}</label>
-    <input id={`${id}-input`} role="combobox" aria-autocomplete="list" aria-expanded={open} aria-controls={`${id}-list`} aria-activedescendant={open && active >= 0 && options[active] ? `${id}-option-${active}` : undefined} aria-invalid={!valid && Boolean(value.trim())} autoComplete="off" value={value} onFocus={() => setOpen(true)} onBlur={() => window.setTimeout(() => setOpen(false), 100)} onKeyDown={onKeyDown} onChange={(event) => { onChange(event.target.value); setCustomConfirmed(false); setActive(-1); setOpen(true); }} />
+    <ModelPicker label={t('routes.upstreamModel')} editable invalid={!valid && Boolean(value.trim())} value={value} options={groupedOptions} loading={loading} error={error} onOpen={() => setOpen(true)} onChange={(next) => {
+      const option = options.find((model) => model.id === next);
+      if (option) choose(option);
+      else { onChange(next); setCustomConfirmed(false); setPartialConfirmed(false); }
+    }} />
     <div className="catalog-status"><small className="field-hint">{loading ? t('routes.catalogLoading') : error || syncMessage || (catalog ? t('routes.catalogCoverage', { eligible: formatNumber(catalog.eligible_account_count, locale), unknown: formatNumber(catalog.unknown_account_count, locale), stale: formatNumber(catalog.stale_account_count, locale) }) : t('routes.selectCandidatesFirst'))}</small>{syncAccountIds.length > 0 && <button type="button" className="secondary" disabled={loading} onClick={() => void sync()}>{t('routes.syncModels')}</button>}</div>
-    {open && options.length > 0 && <div className="combobox-popover model-options" id={`${id}-list`} role="listbox">{options.map((model, index) => <button type="button" role="option" aria-selected={index === active} className={index === active ? 'active' : ''} id={`${id}-option-${index}`} key={`${model.protocol}:${model.id}`} onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setActive(index)} onClick={() => choose(model)}><span><b>{model.id}</b><small>{model.complete_coverage ? t('routes.fullCoverage') : t('routes.partialCoverage', { supported: formatNumber(model.supported_account_count, locale), eligible: formatNumber(model.eligible_account_count, locale) })}</small></span><span className="model-limits">{model.context_window ? t('routes.contextWindow', { count: formatNumber(model.context_window, locale) }) : ''}{model.reservation_token_bound ? t('routes.reservationBound', { count: formatNumber(model.reservation_token_bound, locale) }) : ''}</span></button>)}</div>}
     {selected && !selected.complete_coverage && <div className="custom-model-confirm"><label><input type="checkbox" checked={partialConfirmed} onChange={(event) => setPartialConfirmed(event.target.checked)} />{t('routes.confirmPartialCoverage', { supported: formatNumber(selected.supported_account_count, locale), eligible: formatNumber(selected.eligible_account_count, locale) })}</label></div>}
     {selected && catalog && (catalog.unknown_account_count > 0 || catalog.stale_account_count > 0) && <div className="notice warning compact">{t('routes.catalogNotReady')}</div>}
     {needsCustomConfirmation && <div className={`custom-model-confirm${customAllowed ? '' : ' disabled'}`}>

@@ -57,8 +57,8 @@ test('request filters hide stale rows and cursors while a replacement query is p
   assert.match(requestsPage, /setUpstreamError\(messageOf/);
   assert.match(requestsPage, /<TypedFilterBuilder ast=\{filters\} disabled=\{loading\} onApply=\{onApply\} onClear=\{onClear\} scope="requests" token=\{token\} tenant=\{tenant\} upstreams=\{upstreams\} \/>/);
   assert.match(typedFilterBuilder, /api<ModelRouteView\[\]>\(`\/internal\/v1\/model-routes\$\{query\}`/);
-  assert.match(typedFilterBuilder, /route\.public_model\.trim\(\)/);
-  assert.match(typedFilterBuilder, /protocols\.add\(route\.protocol\)/);
+  assert.match(typedFilterBuilder, /routeModelOptions\(routes, upstreams, groups/);
+  assert.match(typedFilterBuilder, /<ModelPicker/);
   assert.doesNotMatch(typedFilterBuilder, /\/internal\/v1\/upstream-models/);
   assert.match(typedFilterBuilder, /upstreams\.filter\(\(account\) => account\.status === 'active'\)\.map\(\(account\) => <option value=\{account\.id\}/);
 });

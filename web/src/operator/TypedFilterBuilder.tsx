@@ -1,10 +1,13 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 import { useI18n } from '../i18n';
+import { ModelPicker } from '../ModelPicker';
+import { useAnchoredPopover } from '../useAnchoredPopover';
+import { routeModelOptions } from './modelCatalog';
 import type {
   FilterAssistantPlan, FilterAssistantSettings, FilterPresetState, RequestListCursor,
   ModelRouteView, TypedFilterAst, TypedFilterCondition, TypedFilterField, TypedFilterOperator, TypedFilterValue,
-  UpstreamAccount,
+  UpstreamAccount, GroupView,
 } from '../types';
 
 type BuilderScope = 'requests' | 'usage';
@@ -97,11 +100,6 @@ function conditionLabel(condition: TypedFilterCondition, t: (key: string) => str
   return `${t(`filter.field.${condition.field}`)} ${t(`filter.operator.${condition.operator}`)} ${value}${upper === undefined ? '' : ` – ${upper}`}`;
 }
 
-interface CatalogModel {
-  id: string;
-  protocols: string[];
-}
-
 /**
  * Request and usage filters operate on the public model name recorded in an
  * activity fact, not the provider-native model name.  The route catalog is
@@ -109,13 +107,13 @@ interface CatalogModel {
  * catalog here made a valid public model impossible to select whenever its
  * provider used a different native name.
  */
-function CatalogModelPicker({ disabled, onSelect, tenant, token, value }: {
-  disabled: boolean; onSelect: (model: string) => void; tenant: string; token: string; value: string;
+function CatalogModelPicker({ disabled, onSelect, tenant, token, value, upstreams }: {
+  disabled: boolean; onSelect: (model: string) => void; tenant: string; token: string; value: string; upstreams: UpstreamAccount[];
 }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
-  const [search, setSearch] = useState('');
-  const [models, setModels] = useState<CatalogModel[]>([]);
+  const [routes, setRoutes] = useState<ModelRouteView[]>([]);
+  const [groups, setGroups] = useState<GroupView[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   useEffect(() => {
@@ -123,33 +121,22 @@ function CatalogModelPicker({ disabled, onSelect, tenant, token, value }: {
     const controller = new AbortController();
     const query = tenant ? `?tenant_external_id=${encodeURIComponent(tenant)}` : '';
     setLoading(true); setError('');
-    void api<ModelRouteView[]>(`/internal/v1/model-routes${query}`, token, { signal: controller.signal })
-      .then((routes) => {
+    setRoutes([]); setGroups([]);
+    void Promise.all([
+      api<ModelRouteView[]>(`/internal/v1/model-routes${query}`, token, { signal: controller.signal }),
+      api<GroupView[]>(`/internal/v1/provider-groups${query}`, token, { signal: controller.signal }),
+    ])
+      .then(([nextRoutes, nextGroups]) => {
         if (controller.signal.aborted) return;
-        const byPublicModel = new Map<string, Set<string>>();
-        for (const route of routes) {
-          const name = route.public_model.trim();
-          if (!name) continue;
-          const protocols = byPublicModel.get(name) ?? new Set<string>();
-          protocols.add(route.protocol);
-          byPublicModel.set(name, protocols);
-        }
-        setModels([...byPublicModel].map(([id, protocols]) => ({ id, protocols: [...protocols].sort() })).sort((left, right) => left.id.localeCompare(right.id)));
+        setRoutes(nextRoutes); setGroups(nextGroups);
       })
       .catch((reason: unknown) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : t('filter.catalogUnavailable')); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [open, tenant, token, t]);
 
-  const matchingModels = models.filter((model) => model.id.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()));
   return <div className="typed-filter-model-picker">
-    <button type="button" className="secondary" disabled={disabled || !token} aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen((value) => !value)}>{value || t('filter.selectCatalogModel')}</button>
-    {open && <div className="typed-filter-catalog" role="dialog" aria-label={t('filter.catalogModels')}>
-      <input autoFocus value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('filter.searchCatalog')} aria-label={t('filter.searchCatalog')} />
-      {loading && <small>{t('common.loading')}</small>}{error && <small className="error-text">{error}</small>}
-      <div role="listbox">{matchingModels.map((model) => <button type="button" role="option" key={model.id} aria-selected={model.id === value} onClick={() => { onSelect(model.id); setOpen(false); setSearch(''); }}>{model.id}<small>{model.protocols.join(', ')}</small></button>)}</div>
-      {!loading && !error && matchingModels.length === 0 && <small>{t('filter.catalogEmpty')}</small>}
-    </div>}
+    <ModelPicker label={t('filter.selectCatalogModel')} disabled={disabled || !token} value={value} onChange={onSelect} options={routeModelOptions(routes, upstreams, groups, t('modelPicker.unknown'))} loading={loading} error={error} onOpen={() => setOpen(true)} />
   </div>;
 }
 
@@ -167,6 +154,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
 }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
+  const { anchor, panel, position } = useAnchoredPopover(open);
   const [draft, setDraft] = useState<TypedFilterAst>(ast);
   const [presets, setPresets] = useState<FilterPresetState>({ named: [], recent: [] });
   const [presetName, setPresetName] = useState('');
@@ -177,6 +165,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   const [busy, setBusy] = useState(false);
   const visibleFields = scope === 'usage' ? fields.filter((field) => field.usage) : fields;
   const hasActiveFilters = ast.conditions.length > 0 || externalChips.length > 0;
+  useEffect(() => { setOpen(false); setAssistantPlan(undefined); }, [tenant, token]);
 
   // The editor is a draft.  Synchronizing it in a passive effect while it is
   // closed races a clear followed immediately by opening and adding a row: a
@@ -186,14 +175,18 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   const openEditor = () => { setDraft(ast); setError(''); setOpen(true); };
   useEffect(() => {
     if (!open || !token) return;
+    let current = true;
     const query = tenant ? `?tenant_external_id=${encodeURIComponent(tenant)}` : '';
     void api<FilterPresetState>(`/internal/v1/filter-presets${query}`, token)
-      .then(setPresets).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : t('common.requestFailed')));
+      .then((next) => { if (current) setPresets(next); }).catch((reason: unknown) => { if (current) setError(reason instanceof Error ? reason.message : t('common.requestFailed')); });
+    return () => { current = false; };
   }, [open, tenant, token]);
   useEffect(() => {
     if (!open || !token || !tenant) { setAssistantSettings(undefined); return; }
+    let current = true;
     void api<FilterAssistantSettings | null>(`/internal/v1/filter-assistant/settings?tenant_external_id=${encodeURIComponent(tenant)}`, token)
-      .then(setAssistantSettings).catch(() => setAssistantSettings(null));
+      .then((next) => { if (current) setAssistantSettings(next); }).catch(() => { if (current) setAssistantSettings(null); });
+    return () => { current = false; };
   }, [open, tenant, token]);
 
   const updateCondition = (index: number, patch: Partial<TypedFilterCondition>) => {
@@ -230,7 +223,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   const renderValue = (condition: TypedFilterCondition, index: number, side: 'value' | 'upper') => {
     const value = side === 'value' ? condition.value : condition.upper;
     if (!value) return null;
-    if (value.type === 'model') return <CatalogModelPicker disabled={disabled} onSelect={(model) => setValue(index, side, { type: 'model', value: model })} tenant={tenant} token={token} value={value.value} />;
+    if (value.type === 'model') return <CatalogModelPicker disabled={disabled} onSelect={(model) => setValue(index, side, { type: 'model', value: model })} tenant={tenant} token={token} value={value.value} upstreams={upstreams} />;
     if (value.type === 'protocol') return <select value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: 'protocol', value: event.target.value as 'openai' | 'anthropic' | 'openai-image' | 'generation' })}><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="openai-image">OpenAI Images</option><option value="generation">{t('routes.generation')}</option></select>;
     if (value.type === 'status') return <select value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: 'status', value: event.target.value as 'success' | 'error' | 'pending' })}><option value="success">{t('traffic.success')}</option><option value="error">{t('traffic.failure')}</option><option value="pending">{t('common.running')}</option></select>;
     if (condition.field === 'upstream_account_id') return <select value={value.value} disabled={disabled} onChange={(event) => setValue(index, side, { type: 'uuid', value: event.target.value })}><option value="">{t('common.select')}</option>{upstreams.filter((account) => account.status === 'active').map((account) => <option value={account.id} key={account.id}>{account.name}</option>)}</select>;
@@ -245,9 +238,9 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
       {externalChips.map((chip) => <span className="filter-chip" key={chip.id}>{chip.label}</span>)}
       {!hasActiveFilters && <span className="muted">{t('filter.noneApplied')}</span>}
     </div>
-    <div className="typed-filter-actions"><button type="button" className="secondary" disabled={disabled} onClick={openEditor}>{t('filter.open')}</button>{hasActiveFilters && <button type="button" className="secondary" disabled={disabled} onClick={onClear}>{t('filter.clear')}</button>}</div>
-    {open && <div className="typed-filter-overlay" role="presentation"><section className="typed-filter-dialog" role="dialog" aria-modal="true" aria-label={t('filter.title')}>
-      <div className="panel-title"><div><h2>{t('filter.title')}</h2><p className="muted">{t('filter.description')}</p></div><button type="button" className="secondary" onClick={() => setOpen(false)}>{t('common.close')}</button></div>
+    <div className="typed-filter-actions"><button ref={anchor} type="button" className="secondary" disabled={disabled} aria-haspopup="dialog" aria-expanded={open} onClick={() => open ? setOpen(false) : openEditor()}>{t('filter.open')}</button>{hasActiveFilters && <button type="button" className="secondary" disabled={disabled} onClick={onClear}>{t('filter.clear')}</button>}</div>
+    {open && <section ref={panel} popover="auto" style={position} className="typed-filter-dialog" role="dialog" aria-modal="false" aria-label={t('filter.title')} onToggle={(event) => { if (event.newState === 'closed') setOpen(false); }}>
+      <div className="panel-title"><div><h2>{t('filter.title')}</h2><p className="muted">{t('filter.description')}</p></div><button autoFocus type="button" className="secondary" onClick={() => { setOpen(false); anchor.current?.focus(); }}>{t('common.close')}</button></div>
       {error && <div className="notice error" role="alert">{error}</div>}
       <div className="typed-filter-rows">{draft.conditions.map((condition, index) => {
         const field = fieldDefinition(condition.field); const operators = operatorsFor(field, scope);
@@ -265,6 +258,6 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
       <div className="typed-filter-footer"><button type="button" className="secondary" disabled={disabled || draft.conditions.length >= 12} onClick={() => setDraft((current) => ({ ...current, conditions: [...current.conditions, blankCondition(scope)] }))}>{t('filter.addCondition')}</button><button type="button" disabled={disabled} onClick={apply}>{t('filter.apply')}</button></div>
       <section className="typed-filter-presets"><h3>{t('filter.saved')}</h3><div className="typed-filter-preset-list">{presets.named.map((preset) => <button type="button" className="secondary" key={preset.name} onClick={() => setDraft(preset.ast)}>{preset.name}</button>)}{presets.recent.map((recent, index) => <button type="button" className="secondary" key={`recent-${index}`} onClick={() => setDraft(recent)}>{t('filter.recent')} {index + 1}</button>)}</div><div className="typed-filter-save"><input value={presetName} maxLength={80} onChange={(event) => setPresetName(event.target.value)} placeholder={t('filter.namePlaceholder')} /><button type="button" className="secondary" disabled={busy || !presetName.trim()} onClick={() => void saveNamed()}>{t('filter.save')}</button></div></section>
       {scope === 'requests' && <section className="typed-filter-assistant"><h3>{t('filter.assistant')}</h3>{!tenant ? <div className="empty">{t('filter.assistantTenantRequired')}</div> : assistantSettings === undefined ? <div className="muted">{t('common.loading')}</div> : assistantSettings === null ? <div className="empty">{t('filter.assistantNotConfigured')}</div> : <><label>{t('filter.assistantPrompt')}<input value={assistantPrompt} maxLength={2000} onChange={(event) => setAssistantPrompt(event.target.value)} placeholder={t('filter.assistantPlaceholder')} /></label><button type="button" className="secondary" disabled={busy || !assistantPrompt.trim()} onClick={() => void planWithAssistant()}>{t('filter.createPreview')}</button>{assistantPlan && <div className="typed-filter-preview"><b>{t('filter.preview')}</b><div className="typed-filter-chips">{assistantPlan.ast.conditions.map((condition, index) => <span className="filter-chip" key={`${condition.field}-${index}`}>{conditionLabel(condition, t)}</span>)}</div><button type="button" onClick={() => { setDraft(assistantPlan.ast); setAssistantPlan(undefined); }}>{t('filter.usePreview')}</button></div>}</>}</section>}
-    </section></div>}
+    </section>}
   </div>;
 }

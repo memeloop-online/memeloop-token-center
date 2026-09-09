@@ -134,10 +134,13 @@ export async function submitPortalGeneration(
   const kindSelect = panel.getByLabel('生成类型');
   await kindSelect.selectOption(kind);
   await assertValue(kindSelect, kind);
-  const modelInput = panel.getByLabel('模型');
+  const modelInput = panel.locator('.shared-model-picker .model-picker-trigger');
   const promptInput = panel.getByLabel('提示词');
-  await modelInput.selectOption(generationModel);
-  await assertValue(modelInput, generationModel);
+  await modelInput.click();
+  const catalog = panel.locator('.shared-model-popover');
+  await catalog.getByRole('combobox').fill(generationModel);
+  await catalog.getByRole('option').filter({ hasText: generationModel }).first().click();
+  await assertContains(modelInput, generationModel);
   await promptInput.fill(prompt);
   await assertValue(promptInput, prompt);
   const durationInput = panel.getByLabel('时长（秒）');
@@ -308,7 +311,7 @@ export async function openCatalogModelPicker(row: Locator): Promise<Locator> {
 }
 
 export function catalogModelSearch(catalog: Locator): Locator {
-  return catalog.getByRole('textbox');
+  return catalog.getByRole('combobox');
 }
 
 export async function applyUsageTypedFilter(

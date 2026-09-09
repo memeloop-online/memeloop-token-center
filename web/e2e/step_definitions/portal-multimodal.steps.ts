@@ -786,7 +786,7 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   const catalog = await openCatalogModelPicker(modelCondition);
   assert.equal((await routeCatalogResponse).status(), 200);
   await catalogModelSearch(catalog).fill(model);
-  await catalog.getByRole('option').filter({ hasText: model }).click();
+  await catalog.getByRole('option').filter({ hasText: model }).first().click();
   await completeOperatorRequestQuery(page, tenant, () => dialog.getByRole('button', { name: '应用筛选', exact: true }).click());
   await assertVisible(page.getByRole('heading', { name: '筛选结果', exact: true }));
   const connectionsBeforeFilterReset = observation.connectionUrls.length;

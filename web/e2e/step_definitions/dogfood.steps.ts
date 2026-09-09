@@ -227,7 +227,7 @@ Then('模型、客户端凭据、上游和状态过滤都作用于真实统计 A
     const catalog = await openCatalogModelPicker(row);
     assert.equal((await routeCatalogResponse).status(), 200);
     await catalogModelSearch(catalog).fill(model);
-    await catalog.getByRole('option').filter({ hasText: model }).click();
+    await catalog.getByRole('option').filter({ hasText: model }).first().click();
   }, 'model', model, 51);
   await clearUsageFilters(page);
   await applyUsageTypedFilter(page, 'key_id', async (row) => row.getByLabel('值', { exact: true }).fill(seed.clientKeyId), 'key_id', seed.clientKeyId, 51);

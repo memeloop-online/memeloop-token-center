@@ -91,7 +91,7 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   const catalog = await openCatalogModelPicker(modelCondition);
   assert.equal((await routeCatalogResponse).status(), 200);
   await catalogModelSearch(catalog).fill(model);
-  await catalog.getByRole('option').filter({ hasText: model }).click();
+  await catalog.getByRole('option').filter({ hasText: model }).first().click();
 
   const keyAlias = await addTypedFilterCondition(dialog, 'key_alias');
   await keyAlias.getByLabel('操作符').selectOption('contains');
@@ -211,7 +211,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   assert.equal(new URL(catalogResponse.url()).searchParams.get('account_ids'), seed.upstreamId);
   const catalog = await catalogResponse.json() as { data: Array<{ id: string }> };
   assert.ok(catalog.data.some((catalogModel) => catalogModel.id === 'mock-provider-model-v2'));
-  await routeEditor.locator('.model-options').getByRole('option').filter({ hasText: 'mock-provider-model-v2' }).click();
+  await routeEditor.locator('.shared-model-popover').getByRole('option').filter({ hasText: 'mock-provider-model-v2' }).first().click();
   const updatedRoute = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/model-routes/${seed.routeId}`) && response.request().method() === 'PUT');
   await routeEditor.getByRole('button', { name: '保存', exact: true }).click();
   const updatedRouteResponse = await updatedRoute;

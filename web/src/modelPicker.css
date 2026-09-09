@@ -1,0 +1,21 @@
+:root { --picker-surface: #0d1c20; --picker-inset: #081216; --picker-text: #d7e7e9; --picker-muted: #91aab0; --picker-border: #3d6971; --picker-hover: #173139; }
+:root[data-theme='light'] { --picker-surface: #fff; --picker-inset: #f4f7f8; --picker-text: #19343d; --picker-muted: #526970; --picker-border: #c3d5db; --picker-hover: #e8f4f3; }
+.shared-model-picker { min-width: 0; position: relative; width: 100%; }
+.shared-model-picker > label { color: var(--picker-muted); display: block; font-size: 12px; margin-bottom: 6px; }
+.shared-model-picker > input { width: 100%; }
+.shared-model-picker .model-picker-trigger { align-items: center; color: var(--picker-text); display: flex; justify-content: space-between; gap: 8px; margin: 0; text-align: left; width: 100%; }
+.model-picker-trigger > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shared-model-popover, .typed-filter-dialog[popover] { background: var(--picker-surface); border: 1px solid var(--picker-border); border-radius: 10px; box-shadow: 0 12px 32px rgb(0 0 0 / 18%); color: var(--picker-text); inset: auto; margin: 0; overflow: auto; overscroll-behavior: contain; padding: 12px; position: fixed; }
+.shared-model-popover { width: min(480px, calc(100vw - 16px)); }
+.shared-model-popover::backdrop, .typed-filter-dialog[popover]::backdrop { background: transparent; pointer-events: none; }
+.shared-model-popover > input { box-sizing: border-box; width: 100%; }
+.shared-model-popover h4 { color: var(--picker-text); font-size: 13px; margin: 12px 0 6px; }
+.shared-model-popover h5 { color: var(--picker-muted); font-size: 12px; margin: 8px 0 4px; padding-left: 8px; }
+.shared-model-popover [role='option'] { background: transparent; border: 0; color: var(--picker-text); display: grid; gap: 4px; margin: 0; padding: 8px 12px; text-align: left; width: 100%; }
+.shared-model-popover [role='option']:is(:hover, .active, [aria-selected='true']) { background: var(--picker-hover); }
+.shared-model-popover small { color: var(--picker-muted); overflow-wrap: anywhere; }
+.shared-model-popover b { overflow-wrap: anywhere; }
+.shared-model-picker :focus-visible, .shared-model-popover :focus-visible { outline: 2px solid var(--picker-border); outline-offset: 2px; }
+:root[data-theme='light'] .typed-filter-builder .filter-chip,
+:root[data-theme='light'] .typed-filter-dialog .filter-chip { background: var(--picker-hover); border-color: var(--picker-border); color: var(--picker-text); }
+:root[data-theme='light'] .model-combobox .custom-model-confirm { background: #fff8e5; border-color: #c7ac63; color: #685014; }
