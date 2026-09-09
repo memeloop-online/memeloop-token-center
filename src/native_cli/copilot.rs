@@ -343,7 +343,7 @@ where
     Fut: std::future::Future<Output = Result<(), ProtocolError>>,
 {
     let mut reader = reader.take(16 * 1024 * 1024);
-    let session = Uuid::new_v4();
+    let session = Uuid::now_v7();
     let create = create_session(session, model)?;
     let send = send_prompt(session, prompt)?;
     let connected = exchange(&mut reader, writer, &connect(), None).await?;
@@ -499,7 +499,7 @@ mod tests {
             assert_eq!(request["method"], "session.send");
             write_frame(
                 &mut writer,
-                &json!({"jsonrpc":"2.0","id":5,"result":{"messageId":Uuid::new_v4().to_string()}}),
+                &json!({"jsonrpc":"2.0","id":5,"result":{"messageId":Uuid::now_v7().to_string()}}),
             )
             .await
             .unwrap();
@@ -522,7 +522,7 @@ mod tests {
                     &json!({
                         "jsonrpc":"2.0","method":"session.event",
                         "params":{"sessionId":session,"event":{
-                            "id":Uuid::new_v4().to_string(),"type":kind,"data":data
+                            "id":Uuid::now_v7().to_string(),"type":kind,"data":data
                         }}
                     }),
                 )

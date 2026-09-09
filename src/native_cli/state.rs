@@ -141,7 +141,7 @@ mod tests {
     fn binding() -> StateBinding {
         StateBinding {
             tenant_external_id: "tenant-a".into(),
-            account_id: Uuid::new_v4(),
+            account_id: Uuid::now_v7(),
             generation: 0,
             provider: CliProvider::Copilot,
         }
@@ -170,7 +170,7 @@ mod tests {
         wrong.tenant_external_id = "tenant-b".into();
         assert!(open(&envelope, &wrong, b"synthetic-key").is_err());
         wrong = binding.clone();
-        wrong.account_id = Uuid::new_v4();
+        wrong.account_id = Uuid::now_v7();
         assert!(open(&envelope, &wrong, b"synthetic-key").is_err());
         wrong = binding.clone();
         wrong.generation += 1;
