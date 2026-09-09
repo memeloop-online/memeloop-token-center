@@ -126,7 +126,7 @@ pub(crate) use upstreams::{
 
 use crate::{
     AppState,
-    archive_staging::{ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS, ArchiveStagingPurpose},
+    archive_staging::ArchiveStagingPurpose,
     config::RuntimeRole,
     db::{
         ApplyCloudEntitlementInput, AttachGenerationJobResult, AttachSynchronousImageRequestObject,
@@ -159,8 +159,8 @@ use crate::{
         MAX_DOWNSTREAM_SEND_WAIT, MAX_PROXY_LIFETIME, MAX_PROXY_STREAM_LIFETIME,
         abandon_proxy_archive_attempt, attach_proxy_archive_with_retry,
         begin_proxy_archive_attempt, confirm_proxy_delivery_with_retry,
-        finish_proxy_request_with_retry, heartbeat_proxy_archive_attempt,
-        prepare_proxy_delivery_with_retry, response_archive_requires_cleanup,
+        finish_proxy_request_with_retry, prepare_proxy_delivery_with_retry,
+        response_archive_requires_cleanup,
     },
 };
 

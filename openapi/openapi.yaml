@@ -1336,7 +1336,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { description: Stale, expired, mismatched or already dispatched confirmation. }
+        '409': { description: 'Stale, expired, mismatched or already dispatched confirmation.' }
 
   /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/reconcile:
     post:
