@@ -28,3 +28,9 @@ test('pricing cancels superseded reads, bounds waits and memoizes indexed rows',
   assert.doesNotMatch(pricing, /prices\.find\(/);
   assert.match(pricing, /\}, \[prices, usage\]\)/);
 });
+
+test('manual pricing offers known models without restricting free-form names or inventing attribution', () => {
+  assert.match(pricing, /<ModelPicker label=\{t\('pricing\.model'\)\} value=\{model\} onChange=\{setModel\} options=\{modelOptions\} editable \/>/);
+  assert.match(pricing, /provider: t\('sessionReplay\.unknown'\), upstream: t\('sessionReplay\.unknown'\)/);
+  assert.doesNotMatch(pricing, /\/internal\/v1\/upstreams|\/internal\/v1\/model-routes/);
+});
