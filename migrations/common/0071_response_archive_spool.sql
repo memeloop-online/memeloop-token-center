@@ -36,4 +36,6 @@ CREATE TABLE response_archive_spool_chunks (
     PRIMARY KEY (request_id, seq)
 );
 CREATE INDEX response_archive_spool_claim ON response_archive_spools(state, next_attempt_at, lease_expires_at);
-CREATE INDEX response_archive_spool_expiry ON response_archive_spools(expires_at, cleaned_at);
+CREATE INDEX response_archive_spool_expiry ON response_archive_spools(expires_at, request_id) WHERE cleaned_at IS NULL;
+CREATE INDEX response_archive_spool_bound_gc ON response_archive_spools(updated_at, request_id) WHERE cleaned_at IS NULL AND state = 'bound';
+CREATE INDEX response_archive_spool_exhausted_gc ON response_archive_spools(lease_expires_at, request_id) WHERE cleaned_at IS NULL AND state = 'uploading' AND attempts >= 10;

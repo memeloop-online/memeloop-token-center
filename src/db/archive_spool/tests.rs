@@ -1,5 +1,10 @@
 use super::*;
 
+#[path = "gc_tests.rs"]
+mod gc_tests;
+#[path = "postgres_tests.rs"]
+mod postgres_tests;
+
 async fn fixture() -> (tempfile::TempDir, Database, ArchiveSpoolIdentity) {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::connect(&format!(

@@ -1,6 +1,6 @@
-//! Bounded encrypted spool. Every mutation/read of a lease is serialized against
-//! the singleton budget row (SQLite's immediate transaction is the equivalent).
-//! No transaction encompasses object-storage I/O.
+//! Bounded encrypted spool. Normal mutations serialize against the budget row.
+//! GC uses bounded spool-first transactions with a NOWAIT budget lock; uploads
+//! read bounded snapshot batches. No transaction encompasses object-storage I/O.
 use sqlx::{Any, Row, Transaction, any::AnyRow};
 use uuid::Uuid;
 
@@ -18,6 +18,10 @@ const SPOOL_OVERHEAD: i64 = 1024;
 const CAPTURE_TTL: i64 = 30 * 60 * 1000;
 const RETENTION: i64 = 7 * 24 * 60 * 60 * 1000;
 const LEASE_TTL: i64 = 60 * 1000;
+const GC_CHUNK_LIMIT: i64 = 64;
+const GC_BYTE_LIMIT: i64 = 1024 * 1024;
+const LOAD_CHUNK_LIMIT: i64 = 256;
+pub(crate) const LOAD_BYTE_LIMIT: i64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ArchiveSpoolIdentity {
@@ -201,18 +205,48 @@ impl Database {
         Ok(Some(task))
     }
 
-    pub(crate) async fn load_response_archive_spool_chunk(
+    pub(crate) async fn load_response_archive_spool_batch(
         &self,
         task: &ArchiveSpoolTask,
         seq: i64,
-    ) -> Result<Option<ArchiveSpoolChunk>, AppError> {
-        let (mut tx, now) = self.spool_transaction().await?;
-        if !live_task(&mut tx, task, now).await? {
-            return Ok(None);
+    ) -> Result<Vec<ArchiveSpoolChunk>, AppError> {
+        if seq < 0 || seq >= task.chunk_count {
+            return Ok(Vec::new());
         }
-        let row = sqlx::query("SELECT seq, ciphertext, byte_count FROM response_archive_spool_chunks WHERE request_id = $1 AND seq = $2")
-            .bind(task.identity.request_id.to_string()).bind(seq).fetch_optional(&mut *tx).await?;
-        let chunk = row
+        // A single statement snapshot checks ownership and selects a bounded
+        // prefix. No producer budget lock or per-chunk transaction is needed:
+        // a concurrent expiry/claim is fenced again at heartbeat and final bind.
+        // Calculate sizes before fetching payload; never fetch unrestricted
+        // ciphertext values and only then truncate in application memory.
+        let (length, clock) = match self.backend {
+            DatabaseBackend::PostgreSql => (
+                "OCTET_LENGTH(ciphertext)",
+                "CAST(FLOOR(EXTRACT(EPOCH FROM statement_timestamp()) * 1000) AS BIGINT)",
+            ),
+            DatabaseBackend::Sqlite => (
+                "LENGTH(CAST(ciphertext AS BLOB))",
+                "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+            ),
+        };
+        let sql = format!(
+            "WITH chunk_sizes AS (SELECT seq, {length} AS cipher_len FROM response_archive_spool_chunks WHERE request_id = $1 AND seq >= $2 ORDER BY seq LIMIT $3), bounded AS (SELECT seq, SUM(cipher_len) OVER (ORDER BY seq ROWS UNBOUNDED PRECEDING) AS running_bytes FROM chunk_sizes) SELECT c.seq, c.ciphertext, c.byte_count FROM bounded b JOIN response_archive_spool_chunks c ON c.request_id = $1 AND c.seq = b.seq JOIN response_archive_spools s ON s.request_id = c.request_id WHERE b.running_bytes <= $4 AND s.tenant_id = $5 AND s.reservation_id = $6 AND s.state = 'uploading' AND s.lease_owner = $7 AND s.lease_token = $8 AND s.lease_expires_at > {clock} AND s.expires_at > {clock} AND s.chunk_count = $9 AND s.byte_count = $10 ORDER BY c.seq"
+        );
+        // Only the backend-selected static length/clock expressions are
+        // interpolated; every identity, lease and limit remains a bind.
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(task.identity.request_id.to_string())
+            .bind(seq)
+            .bind(LOAD_CHUNK_LIMIT)
+            .bind(LOAD_BYTE_LIMIT)
+            .bind(task.identity.tenant_id.to_string())
+            .bind(task.identity.reservation_id.to_string())
+            .bind(task.lease_owner.to_string())
+            .bind(task.lease_token.to_string())
+            .bind(task.chunk_count)
+            .bind(task.byte_count)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
             .map(|r| -> Result<_, AppError> {
                 Ok(ArchiveSpoolChunk {
                     seq: r.try_get("seq")?,
@@ -220,9 +254,21 @@ impl Database {
                     byte_count: r.try_get("byte_count")?,
                 })
             })
-            .transpose()?;
-        tx.commit().await?;
-        Ok(chunk)
+            .collect()
+    }
+
+    #[cfg(test)]
+    async fn load_response_archive_spool_chunk(
+        &self,
+        task: &ArchiveSpoolTask,
+        seq: i64,
+    ) -> Result<Option<ArchiveSpoolChunk>, AppError> {
+        Ok(self
+            .load_response_archive_spool_batch(task, seq)
+            .await?
+            .into_iter()
+            .next()
+            .filter(|chunk| chunk.seq == seq))
     }
 
     pub(crate) async fn heartbeat_response_archive_spool(
@@ -300,31 +346,135 @@ impl Database {
         &self,
         limit: i64,
     ) -> Result<u64, AppError> {
-        // Expiry/attempt exhaustion deliberately discards the encrypted source:
-        // the retained gap audit is permanent, not a retryable historical job.
-        // Bound rows keep their archive locator and their staging ownership.
-        let (mut tx, now) = self.spool_transaction().await?;
-        let rows = sqlx::query("SELECT request_id, cipher_bytes, state FROM response_archive_spools WHERE cleaned_at IS NULL AND (state = 'bound' OR expires_at <= $1 OR (state = 'uploading' AND attempts >= 10 AND lease_expires_at <= $1)) ORDER BY expires_at, request_id LIMIT $2")
-            .bind(now).bind(limit.clamp(0, 32)).fetch_all(&mut *tx).await?;
-        for row in &rows {
-            let id: String = row.try_get("request_id")?;
-            let bytes: i64 = row.try_get("cipher_bytes")?;
-            sqlx::query("DELETE FROM response_archive_spool_chunks WHERE request_id = $1")
-                .bind(&id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1 WHERE singleton = 1")
-                .bind(bytes).execute(&mut *tx).await?;
-            sqlx::query("UPDATE response_archive_spools SET state = $1, cleaned_at = $2, cipher_bytes = 0, updated_at = $2, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $3")
-                .bind(if row.try_get::<String, _>("state")? == "bound" { "bound" } else { "gap" }).bind(now).bind(id).execute(&mut *tx).await?;
+        let mut completed = 0;
+        for _ in 0..limit.clamp(0, 32) {
+            match self.cleanup_response_archive_spool_batch().await? {
+                Some(cleaned) => completed += u64::from(cleaned),
+                None => break,
+            }
         }
+        Ok(completed)
+    }
+
+    async fn cleanup_response_archive_spool_batch(&self) -> Result<Option<bool>, AppError> {
+        // Discover one candidate without holding the shared producer budget
+        // lock. Separate indexed predicates avoid scanning retained audit rows.
+        // Database time and eligibility are rechecked after acquiring the lock.
+        let hint_now = super::unix_millis();
+        let bound = sqlx::query("SELECT request_id, updated_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND state = 'bound' ORDER BY updated_at, request_id LIMIT 1")
+            .fetch_optional(&self.pool).await?;
+        let expired = sqlx::query("SELECT request_id, expires_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND expires_at <= $1 ORDER BY expires_at, request_id LIMIT 1")
+            .bind(hint_now).fetch_optional(&self.pool).await?;
+        let exhausted = sqlx::query("SELECT request_id, lease_expires_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND state = 'uploading' AND attempts >= 10 AND lease_expires_at <= $1 ORDER BY lease_expires_at, request_id LIMIT 1")
+            .bind(hint_now).fetch_optional(&self.pool).await?;
+        // Oldest eligible work across all classes wins; a steady stream of
+        // freshly bound rows must not indefinitely hide expired gap payloads.
+        let mut candidate: Option<(i64, String)> = None;
+        for row in [bound, expired, exhausted].into_iter().flatten() {
+            let item = (
+                row.try_get::<i64, _>("eligible_at")?,
+                row.try_get::<String, _>("request_id")?,
+            );
+            if candidate.as_ref().is_none_or(|current| &item < current) {
+                candidate = Some(item);
+            }
+        }
+        let Some((_, id)) = candidate else {
+            return Ok(None);
+        };
+        let mut tx = self.begin_write_transaction().await?;
+        let (clock, row_lock) = match self.backend {
+            DatabaseBackend::PostgreSql => (
+                "CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT)",
+                " FOR UPDATE",
+            ),
+            DatabaseBackend::Sqlite => (
+                "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+                "",
+            ),
+        };
+        let row_sql = format!(
+            "SELECT state, cipher_bytes, {clock} AS db_now FROM response_archive_spools WHERE request_id = $1 AND cleaned_at IS NULL AND (state = 'bound' OR expires_at <= {clock} OR (state = 'uploading' AND attempts >= 10 AND lease_expires_at <= {clock})){row_lock}"
+        );
+        // Clock/locking fragments above are backend constants, never inputs.
+        let Some(row) = sqlx::query(sqlx::AssertSqlSafe(row_sql))
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let now: i64 = row.try_get("db_now")?;
+        let chunk_sql = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT seq, CAST(OCTET_LENGTH(ciphertext) AS BIGINT) AS cipher_len FROM response_archive_spool_chunks WHERE request_id = $1 ORDER BY seq LIMIT $2"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT seq, LENGTH(CAST(ciphertext AS BLOB)) AS cipher_len FROM response_archive_spool_chunks WHERE request_id = $1 ORDER BY seq LIMIT $2"
+            }
+        };
+        let chunks = sqlx::query(chunk_sql)
+            .bind(&id)
+            .bind(GC_CHUNK_LIMIT)
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut released = 0_i64;
+        let mut last_seq = None;
+        for chunk in chunks {
+            let bytes = chunk.try_get::<i64, _>("cipher_len")? + CHUNK_OVERHEAD;
+            // Reserve final-spool overhead even when this batch may be last.
+            if released + bytes + SPOOL_OVERHEAD > GC_BYTE_LIMIT {
+                break;
+            }
+            released += bytes;
+            last_seq = Some(chunk.try_get::<i64, _>("seq")?);
+        }
+        if let Some(seq) = last_seq {
+            sqlx::query(
+                "DELETE FROM response_archive_spool_chunks WHERE request_id = $1 AND seq <= $2",
+            )
+            .bind(&id)
+            .bind(seq)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT seq FROM response_archive_spool_chunks WHERE request_id = $1 LIMIT 1) remaining_chunk")
+            .bind(&id).fetch_one(&mut *tx).await?;
+        let cleaned = remaining == 0;
+        if cleaned {
+            released += SPOOL_OVERHEAD;
+        }
+        let accounted: i64 = row.try_get("cipher_bytes")?;
+        if released > accounted || (cleaned && released != accounted) {
+            return Err(AppError::Internal);
+        }
+        // Partial cleanup fences expired uploaders immediately, but retains
+        // the fixed overhead and cleaned_at=NULL until the final chunk is gone.
+        // Every deletion and both accounting changes commit or roll back together.
+        let bound = row.try_get::<String, _>("state")? == "bound";
+        sqlx::query("UPDATE response_archive_spools SET state = $1, cleaned_at = $2, cipher_bytes = cipher_bytes - $3, updated_at = $4, expires_at = CASE WHEN $5 = 1 THEN expires_at ELSE $4 END, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $6")
+            .bind(if bound { "bound" } else { "gap" }).bind(cleaned.then_some(now))
+            .bind(released).bind(now).bind(i64::from(bound)).bind(&id).execute(&mut *tx).await?;
+        // GC locks its one spool first, then tries the global lock WITHOUT
+        // waiting. Producers use global -> spool order. NOWAIT is essential:
+        // if one is waiting for this spool, abort GC and let that producer
+        // progress rather than creating a lock-order deadlock. The entire
+        // bounded deletion rolls back, so a later pass can safely resume.
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            let _: i64 = sqlx::query_scalar("SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE NOWAIT")
+                .fetch_one(&mut *tx).await?;
+        }
+        // The shared budget is held only for this decrement and commit.
+        sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1 WHERE singleton = 1")
+            .bind(released).execute(&mut *tx).await?;
         tx.commit().await?;
-        Ok(rows.len() as u64)
+        Ok(Some(cleaned))
     }
 
     async fn spool_transaction(&self) -> Result<(Transaction<'_, Any>, i64), AppError> {
         let mut tx = self.begin_write_transaction().await?;
-        // Always first: one common lock order for quota, append, lease and GC.
+        // First for normal mutations. GC uses spool -> budget NOWAIT, never
+        // waits on the reversed order, and rolls its bounded work back on busy.
         let lock = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE"

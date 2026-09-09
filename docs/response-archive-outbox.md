@@ -26,14 +26,24 @@ streams cannot be reconstructed by this change.
 - Upload attempts are leased and renewed; each attempt is bounded to
   120 seconds, with at most ten attempts. Each tick drains at most 32 tasks,
   using the existing shared archive permit budget.
+- Each upload query fetches at most 256 chunks and 1 MiB of ciphertext,
+  checks the lease in the same statement snapshot, and does not take the
+  producer's global budget lock.
 - The response locator and existing archive staging binding are committed
   together under tenant/request/reservation and lease fencing. No upstream
   request is replayed and billing fields are not changed.
 - Lost seal ACKs cannot turn a committed pending spool into a gap. Lost
   bind ACKs cannot undo a committed archive binding.
 - Successful binding allows exact chunk cleanup; unbound chunks are only
-  cleaned after expiry. Audit metadata remains, like request history, and
+  cleaned after retention expiry or an expired tenth-attempt lease.
+  Audit metadata remains, like request history, and
   requires its own operational retention/storage planning.
+- Cleanup commits at most 64 chunks and 1 MiB of accounting units per
+  transaction. A pass performs at most 32 such transactions; interruption
+  preserves earlier committed progress. PostgreSQL GC locks only the
+  selected spool until its final budget decrement, using `NOWAIT` for the
+  reverse-order budget lock; contention rolls back that one small batch.
+  Active-only partial indexes exclude retained cleaned audit rows.
 
 The existing API may report `archive_complete=false` while a sealed spool
 is pending upload. This patch does not introduce new Requests UI fields.
@@ -47,10 +57,22 @@ capture/replay, incomplete-prefix rejection, budget limits, stale leases,
 lost ACKs and exact cleanup. CI must execute them, including migration and
 PostgreSQL coverage, before deployment.
 
+The PostgreSQL regression fixtures block the server inside a real deferred
+`COMMIT` trigger, observe that state through `pg_stat_activity`, cancel the
+client future and then release the server to verify durable recovery.
+Additional cases exercise bounded GC rollback/restart, batch reads while
+the budget is locked, high-count tiny chunks and active-only query plans.
+These are test definitions, not claims that these checks have passed.
+
 The global accounting transaction intentionally serializes admission and
 chunk mutations; realistic database latency/concurrency and S3 outage
 runtime checks remain mandatory. Filling the budget must cause explicit
 gaps, not unbounded memory or billing retries.
+
+GC `NOWAIT` avoids deadlocks and long ownership of the producer budget,
+but has no absolute fairness guarantee under sustained saturation.
+Deferred-cleanup warnings and eventual capacity release must be included
+in the concurrency acceptance gate.
 
 Before integration, update the product Helm `migration.schemaVersion` in
 `values.yaml` and the corresponding `values.schema.json` constant to 71

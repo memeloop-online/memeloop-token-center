@@ -41,11 +41,17 @@ pub(crate) async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
 }
 
 pub(super) async fn process_one(state: &AppState, owner: Uuid) -> bool {
-    let _ = tokio::time::timeout(
+    let cleanup = tokio::time::timeout(
         Duration::from_secs(2),
         state.db.cleanup_response_archive_spools(32),
     )
     .await;
+    if !matches!(cleanup, Ok(Ok(_))) {
+        tracing::warn!(
+            stage = "response_spool_cleanup",
+            "bounded archive cleanup deferred; committed batches are preserved"
+        );
+    }
     let Ok(_permit) = state
         .proxy_archive_stream_permits
         .clone()
@@ -92,7 +98,7 @@ pub(super) async fn process_one(state: &AppState, owner: Uuid) -> bool {
 async fn upload(state: &AppState, task: &ArchiveSpoolTask) -> Result<(), AppError> {
     let _archive_memory = state.metrics.memory_usage(
         crate::metrics::MemoryComponent::ArchiveMultipart,
-        crate::archive::ARCHIVE_MULTIPART_PART_BYTES,
+        crate::archive::ARCHIVE_MULTIPART_PART_BYTES + 1024 * 1024 + super::CHUNK_BYTES * 5,
     );
     let attempt = begin_proxy_archive_attempt(
         &state.db,
@@ -130,26 +136,32 @@ async fn upload(state: &AppState, task: &ArchiveSpoolTask) -> Result<(), AppErro
     let transfer = async {
         let mut writer = state.archive.start_writer(&attempt.object_locator).await?;
         let mut total = 0_i64;
-        for seq in 0..task.chunk_count {
-            let chunk = state
+        let mut seq = 0;
+        while seq < task.chunk_count {
+            let chunks = state
                 .db
-                .load_response_archive_spool_chunk(task, seq)
-                .await?
-                .ok_or(AppError::Internal)?;
-            if chunk.seq != seq {
+                .load_response_archive_spool_batch(task, seq)
+                .await?;
+            if chunks.is_empty() {
                 return Err(AppError::Internal);
             }
-            let bytes = super::cipher::open(
-                task.identity,
-                seq,
-                &chunk.ciphertext,
-                chunk.byte_count,
-                state.config.key_pepper.as_bytes(),
-            )?;
-            total = total
-                .checked_add(chunk.byte_count)
-                .ok_or(AppError::Internal)?;
-            writer.write(bytes).await?;
+            for chunk in chunks {
+                if chunk.seq != seq || seq >= task.chunk_count {
+                    return Err(AppError::Internal);
+                }
+                let bytes = super::cipher::open(
+                    task.identity,
+                    seq,
+                    &chunk.ciphertext,
+                    chunk.byte_count,
+                    state.config.key_pepper.as_bytes(),
+                )?;
+                total = total
+                    .checked_add(chunk.byte_count)
+                    .ok_or(AppError::Internal)?;
+                writer.write(bytes).await?;
+                seq += 1;
+            }
         }
         if total != task.byte_count {
             return Err(AppError::Internal);
