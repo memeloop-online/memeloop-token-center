@@ -34,7 +34,9 @@ and grant revisions, requires disabled accounts, removes only explicitly
 named direct candidate edges, and updates the compatibility account UUID to
 the first remaining direct candidate or nil. It never touches customer
 credentials, grants, route groups, provider-group rules or request history.
-Provider-group candidates are rejected for separate exact membership review.
+Routes with any included provider groups are rejected for separate review,
+including currently empty groups: concurrent provider-group membership writes
+must not resurrect a candidate while this narrow retirement is committing.
 Retiring a missing candidate, changing dependencies, or using a stale revision
 fails atomically. On uncertain delivery, read the authoritative route before
 resuming; do not blindly replay against a new revision.

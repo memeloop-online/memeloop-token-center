@@ -2085,7 +2085,7 @@ paths:
       tags: [Routing]
       operationId: retireModelRouteUpstreams
       summary: Remove disabled upstream candidates while retaining a disabled route and every customer grant
-      description: Requires both routes:write and providers:write. The route must already be disabled. Only explicitly named disabled accounts are removed; provider-group candidates require separate review. Route identity, model, groups, grants, and history remain unchanged. An empty route remains disabled and cannot be enabled without an eligible candidate.
+      description: Requires both routes:write and providers:write. The route must already be disabled. Only explicitly named disabled accounts are removed; routes with included provider groups require separate review, even when those groups are empty. Route identity, model, groups, grants, and history remain unchanged. An empty route remains disabled and cannot be enabled without an eligible candidate.
       security: [{ serviceBearer: [] }]
       x-required-scope: routes:write
       x-required-scopes: [routes:write, providers:write]

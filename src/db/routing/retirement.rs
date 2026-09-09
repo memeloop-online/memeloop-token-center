@@ -43,6 +43,23 @@ impl Database {
             false,
         )
         .await?;
+        // Provider-group membership writers do not all take the routing
+        // relation lock. Reject all included groups, even currently empty ones,
+        // so a concurrent membership addition cannot resurrect a candidate.
+        if sqlx::query(
+            "SELECT 1 FROM model_route_included_provider_groups \
+             WHERE tenant_id = $1 AND model_route_id = $2 LIMIT 1",
+        )
+        .bind(&tenant_id)
+        .bind(route_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some()
+        {
+            return Err(AppError::Conflict(
+                "routes with included provider groups require separate retirement review".into(),
+            ));
+        }
         for account_id in &account_ids {
             // A conditional no-op UPDATE locks the account until commit on both
             // supported databases, preventing a concurrent activation from
@@ -58,25 +75,6 @@ impl Database {
             if account.rows_affected() != 1 {
                 return Err(AppError::Conflict(
                     "disable the upstream account before retiring its route candidates".into(),
-                ));
-            }
-            let group_candidate = sqlx::query(
-                "SELECT 1 FROM upstream_account_provider_groups membership \
-                 JOIN model_route_included_provider_groups included \
-                 ON included.tenant_id = membership.tenant_id \
-                 AND included.provider_group_id = membership.provider_group_id \
-                 WHERE membership.tenant_id = $1 AND membership.upstream_account_id = $2 \
-                 AND included.model_route_id = $3 LIMIT 1",
-            )
-            .bind(&tenant_id)
-            .bind(account_id.to_string())
-            .bind(route_id.to_string())
-            .fetch_optional(&mut *tx)
-            .await?;
-            if group_candidate.is_some() {
-                return Err(AppError::Conflict(
-                    "provider-group candidate membership requires separate retirement review"
-                        .into(),
                 ));
             }
             let removed = sqlx::query(

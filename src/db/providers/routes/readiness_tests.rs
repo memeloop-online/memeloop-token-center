@@ -6,6 +6,90 @@ const PEPPER: &[u8] = b"route-readiness-test-pepper-at-least-32-bytes";
 const TENANT: &str = "route-readiness";
 
 #[tokio::test]
+async fn postgres_retirement_waits_for_concurrent_account_activation_when_configured() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+    let tenant = format!("retirement-activation-{}", Uuid::now_v7());
+    let account = database
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.clone(),
+                name: "retirement-concurrent".into(),
+                driver: "http-json".into(),
+                config: serde_json::json!({"base_url":"http://127.0.0.1:1"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            PEPPER,
+        )
+        .await
+        .unwrap();
+    let route = database
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.clone(),
+            public_model: "retirement-concurrent".into(),
+            upstream_account_id: account.id,
+            upstream_model: "retirement-concurrent".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let route = database
+        .set_model_route_enabled(route.id, &tenant, false, route.updated_at)
+        .await
+        .unwrap();
+    database
+        .set_upstream_account_status(account.id, &tenant, "disabled", account.updated_at)
+        .await
+        .unwrap();
+    let before = database.route_routing(route.id, &tenant).await.unwrap();
+    let mut activation = database.begin_write_transaction().await.unwrap();
+    sqlx::query(
+        "UPDATE upstream_accounts SET status = 'active', updated_at = updated_at + 1 WHERE id = $1",
+    )
+    .bind(account.id.to_string())
+    .execute(&mut *activation)
+    .await
+    .unwrap();
+    let concurrent_database = database.clone();
+    let concurrent_tenant = tenant.clone();
+    let retirement = tokio::spawn(async move {
+        concurrent_database
+            .retire_model_route_upstreams(
+                route.id,
+                &concurrent_tenant,
+                vec![account.id],
+                route.updated_at,
+                before.grant_revision,
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !retirement.is_finished(),
+        "retirement must wait for the account status writer"
+    );
+    activation.commit().await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), retirement)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(AppError::Conflict(_))
+    ));
+    let after = database.route_routing(route.id, &tenant).await.unwrap();
+    assert_eq!(after.upstream_account_ids, vec![account.id]);
+    assert_eq!(after.updated_at, route.updated_at);
+    assert_eq!(after.grant_revision, before.grant_revision);
+}
+
+#[tokio::test]
 async fn retirement_preserves_route_grants_and_allows_zero_candidate_account_deletion() {
     let (_directory, database, account_id) = sqlite_database().await;
     let route = database
