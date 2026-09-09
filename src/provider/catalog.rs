@@ -42,6 +42,7 @@ pub struct ResolvedManagedOAuthAdapter {
 /// Builtins never synthesize an HTTP contribution or accept a client URL.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManagedOAuthAdapterBackend {
+    BuiltinKimi,
     BuiltinCodex,
     BuiltinLegacyGemini,
     ReviewedHttp {
@@ -89,12 +90,14 @@ impl ResolvedManagedOAuthAdapter {
         match &self.backend {
             ManagedOAuthAdapterBackend::ReviewedHttp { normalize_url, .. } => Some(normalize_url),
             ManagedOAuthAdapterBackend::BuiltinCodex
+            | ManagedOAuthAdapterBackend::BuiltinKimi
             | ManagedOAuthAdapterBackend::BuiltinLegacyGemini => None,
         }
     }
 
     pub fn refresh_url(&self) -> &str {
         match &self.backend {
+            ManagedOAuthAdapterBackend::BuiltinKimi => crate::oauth::managed::kimi::TOKEN_ENDPOINT,
             ManagedOAuthAdapterBackend::BuiltinCodex => {
                 crate::oauth::managed::codex::TOKEN_ENDPOINT
             }
@@ -459,6 +462,15 @@ impl ProviderCatalog {
                 refresh_url: crate::oauth::DEFAULT_CURSOR_REFRESH_URL,
             },
         ));
+        let mut kimi = builtin_managed_oauth_provider(
+            crate::oauth::managed::kimi::PROVIDER_DRIVER,
+            "Kimi Code OAuth",
+            crate::oauth::managed::kimi::BASE_URL,
+            true,
+        );
+        kimi.protocols = vec!["openai".to_owned(), "anthropic".to_owned()];
+        kimi.credential_schema["properties"]["expires_at"] = json!({"type": ["integer", "null"], "description": "Unix milliseconds, absent source expiry remains unknown"});
+        types.push(kimi);
         let legacy_types = vec![builtin_managed_oauth_provider(
             "cpa-gemini-oauth-legacy",
             "Legacy Gemini OAuth import",
@@ -469,6 +481,11 @@ impl ProviderCatalog {
             types: Arc::new(types),
             legacy_types: Arc::new(legacy_types),
             builtin_managed_oauth: Arc::new(vec![
+                BuiltinManagedOAuthRegistration {
+                    provider_driver: crate::oauth::managed::kimi::PROVIDER_DRIVER,
+                    source_type: "kimi",
+                    backend: ManagedOAuthAdapterBackend::BuiltinKimi,
+                },
                 BuiltinManagedOAuthRegistration {
                     // Imports normalize directly to the native driver. The
                     // controlled database upgrade handles the small number
@@ -503,6 +520,7 @@ impl ProviderCatalog {
     pub fn supports_direct_credential(&self, driver: &str, credential_kind: &str) -> bool {
         self.get(driver).is_some_and(|provider| {
             self.is_public(driver)
+                && driver != crate::oauth::managed::kimi::PROVIDER_DRIVER
                 && (provider.oauth_adapter.is_none() || credential_kind != "oauth")
         })
     }

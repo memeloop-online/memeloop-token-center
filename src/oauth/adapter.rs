@@ -62,6 +62,19 @@ pub async fn normalize_managed_oauth_document(
     allow_test_loopback: bool,
 ) -> Result<ManagedOAuthNormalizedAccount, AppError> {
     match adapter.backend() {
+        ManagedOAuthAdapterBackend::BuiltinKimi => {
+            let normalized = managed::kimi::normalize(payload)?;
+            network::client_for_config_url(
+                http,
+                managed::kimi::BASE_URL,
+                &normalized.config,
+                normalized.credential.proxy(),
+                allow_test_loopback,
+            )
+            .await
+            .map_err(|_| AppError::BadRequest("CPA Kimi OAuth document is invalid".into()))?;
+            return Ok(normalized);
+        }
         ManagedOAuthAdapterBackend::BuiltinCodex => {
             let normalized = managed::codex::normalize(payload)?;
             if normalized.credential.proxy().is_some() {
@@ -135,6 +148,9 @@ pub async fn refresh_managed_oauth_credential(
         ));
     }
     match adapter.backend() {
+        ManagedOAuthAdapterBackend::BuiltinKimi => {
+            return managed::kimi::refresh(http, credential, allow_test_loopback).await;
+        }
         ManagedOAuthAdapterBackend::BuiltinCodex => {
             return managed::codex::refresh(http, credential, allow_test_loopback).await;
         }

@@ -294,7 +294,7 @@ pub(crate) fn native_config_from_import(config: &Value) -> Result<Value, AppErro
 /// private DNS name because MTC resolves and pins it locally. `socks5h` is
 /// accepted only with a safe private IP-literal proxy so the connection-time
 /// resolver is an explicit, reviewable operator trust boundary.
-fn normalize_private_proxy_url(value: &str) -> Result<String, AppError> {
+pub(super) fn normalize_private_proxy_url(value: &str) -> Result<String, AppError> {
     if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
         return Err(invalid_document());
     }
