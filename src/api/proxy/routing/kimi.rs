@@ -206,11 +206,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/coding/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(body),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
             .expect(1)
             .mount(&server)
             .await;
