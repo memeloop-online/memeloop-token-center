@@ -4,7 +4,10 @@ fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> St
     let base = base_url.trim_end_matches('/');
     match driver {
         "openai-codex" => {
-            format!("{base}/models?client_version={}", env!("CARGO_PKG_VERSION"))
+            format!(
+                "{base}/models?client_version={}",
+                crate::oauth::managed::codex::CLIENT_VERSION
+            )
         }
         driver if crate::provider::is_openai_compatible_http_driver(driver) => {
             if base.ends_with("/v1") {
@@ -104,7 +107,7 @@ pub(in crate::api) async fn probe_upstream_health(
         request
             .header(header::USER_AGENT, crate::oauth::managed::codex::USER_AGENT)
             .header(header::CONNECTION, "Keep-Alive")
-            .header("originator", "codex-tui")
+            .header("originator", crate::oauth::managed::codex::ORIGINATOR)
             .header("chatgpt-account-id", account_id)
     } else {
         request
@@ -170,7 +173,7 @@ mod tests {
             url,
             format!(
                 "https://chatgpt.com/backend-api/codex/models?client_version={}",
-                env!("CARGO_PKG_VERSION")
+                crate::oauth::managed::codex::CLIENT_VERSION
             )
         );
     }

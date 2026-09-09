@@ -341,18 +341,15 @@ async fn discover_codex_models(
     let url = format!(
         "{}/models?client_version={}",
         base_url.trim_end_matches('/'),
-        env!("CARGO_PKG_VERSION")
+        crate::oauth::managed::codex::CLIENT_VERSION,
     );
     let request = credential
         .apply(
             client
                 .get(url)
                 .header(header::ACCEPT, "application/json")
-                .header(
-                    header::USER_AGENT,
-                    concat!("memeloop-token-center/", env!("CARGO_PKG_VERSION")),
-                )
-                .header("originator", "memeloop-token-center")
+                .header(header::USER_AGENT, crate::oauth::managed::codex::USER_AGENT)
+                .header("originator", crate::oauth::managed::codex::ORIGINATOR)
                 .header("chatgpt-account-id", account_id)
                 .timeout(MODEL_CATALOG_TIMEOUT),
             unix_millis(),
@@ -398,6 +395,12 @@ async fn discover_codex_models(
             })
         })
         .collect::<Result<Vec<_>, &'static str>>()?;
+    if normalized.is_empty() {
+        // Do not let an empty trusted set reach catalog replacement: that
+        // would return a 400 after the sync lease was claimed, leaving the
+        // catalog falsely shown as syncing until lease expiry.
+        return Err("codex_no_trusted_models");
+    }
     parse_discovered_models(normalized).map(|models| ("codex_models", models))
 }
 

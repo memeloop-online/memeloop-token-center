@@ -152,8 +152,13 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/models"))
-        .and(query_param("client_version", env!("CARGO_PKG_VERSION")))
+        .and(query_param("client_version", "0.146.0"))
         .and(matches_header("authorization", "Bearer codex-access"))
+        .and(matches_header("originator", "codex-tui"))
+        .and(matches_header(
+            "user-agent",
+            "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)",
+        ))
         .and(matches_header("chatgpt-account-id", "account-123"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "models": [
@@ -226,6 +231,81 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
         updated.config["reservation_token_bounds"]["gpt-codex"],
         272000
     );
+}
+
+#[tokio::test]
+async fn codex_catalog_without_trusted_models_records_error_and_releases_sync_lease() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(query_param("client_version", "0.146.0"))
+        .and(matches_header("authorization", "Bearer codex-access"))
+        .and(matches_header("originator", "codex-tui"))
+        .and(matches_header(
+            "user-agent",
+            "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)",
+        ))
+        .and(matches_header("chatgpt-account-id", "account-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "models": [
+                {"slug": "not-entitled", "supported_in_api": false, "visibility": "list", "context_window": 272000},
+                {"slug": "not-listed", "supported_in_api": true, "visibility": "hide", "context_window": 272000}
+            ]
+        })))
+        // A second call must claim a fresh lease rather than inheriting the
+        // failed catalog sync's 30-second lease.
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (state, _directory) = state("codex-empty-model-catalog").await;
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "codex-empty-tenant".into(),
+                name: "codex-empty-upstream".into(),
+                driver: "openai-codex".into(),
+                config: json!({
+                    "base_url": server.uri(),
+                    "network_scope": "public",
+                    "output_token_limits": {}
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "codex-access".into(),
+                    refresh_token: Some("codex-refresh".into()),
+                    expires_at: Some(unix_millis() + 60_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: Some(json!({
+                        "schema": "openai-codex-oauth-v1",
+                        "account_id": "account-123"
+                    })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("openai_codex_device".into()),
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let (status, catalog) = request(
+            &state,
+            "POST",
+            &format!(
+                "/internal/v1/upstreams/{}/models/sync?tenant_external_id=codex-empty-tenant",
+                account.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{catalog}");
+        assert_eq!(catalog["status"], "error");
+        assert_eq!(catalog["error_code"], "codex_no_trusted_models");
+        assert_eq!(catalog["models"], json!([]));
+    }
 }
 
 #[tokio::test]

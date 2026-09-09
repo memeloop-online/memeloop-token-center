@@ -322,6 +322,7 @@ impl Database {
                 | "redirect_rejected"
                 | "response_too_large"
                 | "invalid_response"
+                | "codex_no_trusted_models"
         ) {
             return Err(AppError::Internal);
         }
