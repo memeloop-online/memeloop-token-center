@@ -4,6 +4,7 @@ import { formatElapsedTime, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import { quotaUsedPercent, upstreamQuotaPath, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import './upstreamQuota.css';
+import { UpstreamQuotaReset } from './UpstreamQuotaReset';
 
 export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnapshot }) {
   const { locale, t } = useI18n();
@@ -16,7 +17,7 @@ export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnap
   const reset = snapshot.reset_capability;
   const resetMessage = reset.provider_supported === false ? 'quota.resetUnsupported'
     : reset.provider_supported === null ? 'quota.resetUnknown'
-    : !reset.implementation_available ? 'quota.resetNotIntegrated' : 'quota.resetReadOnly';
+    : !reset.implementation_available ? 'quota.resetNotIntegrated' : 'quota.resetAvailable';
   return <div className="upstream-quota-details">
     <div className="upstream-quota-meta">
       {snapshot.plan_type && <b>{snapshot.plan_type}</b>}
@@ -50,7 +51,7 @@ export function UpstreamQuotaDetails({ snapshot }: { snapshot: UpstreamQuotaSnap
 }
 
 /** User-triggered read: never starts one upstream request per card on page load. */
-export function UpstreamQuota({ accountId, tenant, token }: { accountId: string; tenant: string; token: string }) {
+export function UpstreamQuota({ accountId, accountName = accountId, tenant, token }: { accountId: string; accountName?: string; tenant: string; token: string }) {
   const { t } = useI18n();
   const [snapshot, setSnapshot] = useState<UpstreamQuotaSnapshot>();
   const [busy, setBusy] = useState(false);
@@ -85,5 +86,6 @@ export function UpstreamQuota({ accountId, tenant, token }: { accountId: string;
     {error && <p role="alert">{t('quota.readFailed')}</p>}
     {!snapshot && !busy && !error && <p>{t(tenant ? 'quota.notLoaded' : 'quota.selectTenant')}</p>}
     {snapshot && <UpstreamQuotaDetails snapshot={snapshot} />}
+    {snapshot && <UpstreamQuotaReset key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} />}
   </section>;
 }

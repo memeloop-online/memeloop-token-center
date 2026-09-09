@@ -8,7 +8,7 @@ import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
 declare global {
-  interface Window { quotaReads: number; quotaWrites: number }
+  interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number }
 }
 
 test('quota loads only on demand and shows window/reset evidence without any reset mutation', { timeout: 90_000 }, async () => {
@@ -51,6 +51,33 @@ test('quota loads only on demand and shows window/reset evidence without any res
       await page.getByRole('button', { name: 'View quota', exact: true }).click();
       await page.getByText(mode === 'error' ? 'Could not read quota. Try again.' : 'The upstream does not support quota reset.', { exact: true }).waitFor();
       assert.equal(await page.evaluate(() => window.quotaWrites), 0);
+    }
+    await page.goto(`${url}?mode=reset`);
+    await page.getByRole('button', { name: 'View quota', exact: true }).click();
+    const resetButton = page.getByRole('button', { name: 'Reset upstream quota', exact: true });
+    await resetButton.waitFor();
+    await resetButton.hover();
+    assert.equal(await page.evaluate(() => window.quotaPrepares), 0, 'hover/read never prepares a reset');
+    await resetButton.click();
+    const dialog = page.getByRole('dialog');
+    await dialog.waitFor();
+    assert.match(await dialog.textContent() ?? '', /quota-account.*1 upstream reset credit.*supplier_defined.*expires/s);
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+    assert.equal(await page.evaluate(() => window.quotaConfirms), 0, 'cancel cannot consume credits');
+    assert.equal(await page.getByRole('button', { name: 'Reset upstream quota', exact: true }).count(), 0);
+    for (const mode of ['reset', 'unknown']) {
+      await page.goto(`${url}?mode=${mode}`);
+      await page.getByRole('button', { name: 'View quota', exact: true }).click();
+      await page.getByRole('button', { name: 'Reset upstream quota', exact: true }).click();
+      await page.getByRole('dialog').waitFor();
+      await page.getByRole('dialog').getByRole('button', { name: 'Confirm and continue', exact: true }).click();
+      await page.getByRole('button', { name: 'Reconcile upstream quota (read only)', exact: true }).waitFor();
+      assert.equal(await page.evaluate(() => window.quotaConfirms), 1);
+      assert.equal(await page.getByRole('button', { name: 'Reset upstream quota', exact: true }).count(), 0);
+      await page.getByRole('button', { name: 'Check operation status', exact: true }).click();
+      await page.getByRole('button', { name: 'Reconcile upstream quota (read only)', exact: true }).click();
+      assert.equal(await page.evaluate(() => window.quotaConfirms), 1, 'status/reconciliation never repeat consume');
+      assert.equal(await page.evaluate(() => window.quotaPrepares), 1, 'locked operation never prepares another reset');
     }
   } finally {
     await browser.close();
