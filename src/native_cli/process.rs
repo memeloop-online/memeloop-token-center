@@ -79,12 +79,12 @@ impl SupervisedChild {
 impl Drop for SupervisedChild {
     fn drop(&mut self) {
         self.terminate();
-        if let Some(mut child) = self.child.take() {
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    let _ = child.wait().await;
-                });
-            }
+        if let Some(mut child) = self.child.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
             // Outside a runtime, Tokio kill_on_drop/orphan reaping remains the
             // fallback. Normal request cancellation always has a runtime.
         }
@@ -244,7 +244,7 @@ pub async fn run(spec: RuntimeCommand) -> Result<RuntimeOutput, RuntimeError> {
     let result = tokio::time::timeout(spec.timeout, operation).await;
     // Kill descendants BEFORE reaping the leader, even after successful EOF.
     // CLI closure of both streams is its completion boundary.
-    let result = match result {
+    match result {
         Ok(Ok(stdout)) => {
             process.terminate();
             let status = process.reap().await?;
@@ -263,8 +263,7 @@ pub async fn run(spec: RuntimeCommand) -> Result<RuntimeOutput, RuntimeError> {
                 Ok(Ok(_)) => unreachable!(),
             }
         }
-    };
-    result
+    }
 }
 
 #[cfg(test)]
