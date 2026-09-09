@@ -6,7 +6,7 @@ and immutable image digest.
 
 | Area | Required acceptance |
 | --- | --- |
-| Authentication | Client and service credentials are isolated, rotated safely and never returned after issuance. |
+| Authentication | Client and service credentials are isolated. Existing credentials are not rotated during migration. Authorized repeat copying returns only the matching encrypted original for the current generation, with no-store responses, scope checks and no secret logging; unavailable originals are explicit. |
 | Tenant policy | Default-tenant actions are clear; tenant CRUD, scope boundaries and cross-tenant denial are verified. |
 | Routing | Model grants, health gates, bounded round-robin failover and provider egress policy are verified. |
 | Accounting | Reservation, settlement, price persistence, cache dimensions, balance, budget and idempotency are verified. |
