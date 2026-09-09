@@ -12,6 +12,7 @@ use memeloop_token_center::{
     provider::{UpstreamAccountView, UpstreamCredential},
 };
 use serde_json::{Value, json};
+use sqlx::Row;
 use tower::ServiceExt;
 use uuid::Uuid;
 use wiremock::{
