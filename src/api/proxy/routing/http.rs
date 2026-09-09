@@ -25,9 +25,11 @@ pub(super) async fn send_reqwest_proxy_route(
     // upstream representation to SSE instead of inheriting a downstream
     // `Accept: application/json` default. Keep generic compatible routes
     // transparent.
-    let accept = if route.route.driver == crate::provider::CBCNX_PROVIDER_DRIVER
-        && matches!(protocol, Protocol::OpenAiResponses)
-        && route.upstream_stream
+    let accept = if (route.route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER
+        && route.upstream_stream)
+        || (route.route.driver == crate::provider::CBCNX_PROVIDER_DRIVER
+            && matches!(protocol, Protocol::OpenAiResponses)
+            && route.upstream_stream)
     {
         HeaderValue::from_static("text/event-stream")
     } else {
@@ -45,6 +47,17 @@ pub(super) async fn send_reqwest_proxy_route(
         .credential
         .apply(request, credential_now)
         .map_err(|_| credential_application_error(&route.route.credential, credential_now))?;
+    if route.route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
+        request = crate::oauth::managed::kimi::apply_headers(request, &route.route.credential)
+            .map_err(|_| ProxySendError::Credential)?;
+        if matches!(
+            protocol,
+            Protocol::AnthropicMessages | Protocol::AnthropicCountTokens
+        ) && !headers.contains_key("anthropic-version")
+        {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
+    }
     if route.route.driver == crate::oauth::copilot::PROVIDER_DRIVER {
         let product = format!("memeloop-token-center/{}", env!("CARGO_PKG_VERSION"));
         request = request

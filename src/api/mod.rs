@@ -40,6 +40,7 @@ mod diagnostics;
 mod generation;
 mod groups;
 mod health;
+mod kimi_transport;
 mod limits;
 mod model_routes;
 mod monitoring_snapshot;

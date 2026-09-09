@@ -20,6 +20,7 @@ use crate::{
 };
 
 mod chat_sse_usage;
+mod kimi;
 mod sse_delivery;
 
 #[test]

@@ -158,7 +158,10 @@ impl Database {
         models: &[DiscoveredUpstreamModel],
     ) -> Result<ReplaceModelCatalogResult, AppError> {
         if models.len() > 10_000
-            || !matches!(source_kind, "openai_v1" | "component" | "codex_models")
+            || !matches!(
+                source_kind,
+                "openai_v1" | "component" | "codex_models" | "kimi_builtin"
+            )
         {
             return Err(AppError::BadRequest(
                 "invalid model catalog snapshot".into(),

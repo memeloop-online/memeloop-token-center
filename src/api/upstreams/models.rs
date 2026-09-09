@@ -255,6 +255,19 @@ async fn discover_models(
     if account.driver == "openai-codex" {
         return discover_codex_models(state, account, credential).await;
     }
+    if account.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
+        credential
+            .validate(unix_millis())
+            .map_err(|_| "credential_invalid")?;
+        crate::oauth::managed::kimi::validate_credential(credential)
+            .map_err(|_| "credential_invalid")?;
+        if account.config.get("base_url").and_then(Value::as_str)
+            != Some(crate::oauth::managed::kimi::BASE_URL)
+        {
+            return Err("destination_invalid");
+        }
+        return Ok(("kimi_builtin", crate::api::kimi_transport::catalog()));
+    }
     if !crate::provider::is_openai_compatible_http_driver(&account.driver) {
         return Err("unsupported");
     }

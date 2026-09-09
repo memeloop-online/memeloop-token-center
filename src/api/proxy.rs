@@ -86,6 +86,12 @@ fn requires_strict_openai_chat_usage(
     route_config: &Value,
     request: &Value,
 ) -> bool {
+    if route_driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
+        // Native Kimi always requests terminal usage, including when omitted
+        // downstream. Do not make billing validation a customer opt-in.
+        return matches!(protocol, Protocol::OpenAiChat)
+            && request.get("stream").and_then(Value::as_bool) == Some(true);
+    }
     matches!(protocol, Protocol::OpenAiChat)
         && crate::provider::is_openai_compatible_http_driver(route_driver)
         && ChatSseUsageContract::from_route_config(route_config).requires_terminal_usage()
@@ -162,13 +168,18 @@ async fn prepare_authorized_proxy_routes(
         openai_chat_choice_count.is_some_and(|count| count != 1);
     let mut skipped_incompatible_strict_route = false;
     let mut skipped_local_protocol_mismatch = false;
+    let mut skipped_kimi_protocol_mismatch = false;
     let mut component_primary = None;
     let mut direct_candidates = Vec::new();
     let mut input_token_ceiling = 0;
     let mut output_token_ceiling = 0;
     for route in resolved_routes {
         if candidate_compatibility(protocol, &route) == CandidateCompatibility::ProtocolMismatch {
-            skipped_local_protocol_mismatch = true;
+            if route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
+                skipped_kimi_protocol_mismatch = true;
+            } else {
+                skipped_local_protocol_mismatch = true;
+            }
             continue;
         }
         if strict_choice_count_is_incompatible
@@ -266,6 +277,11 @@ async fn prepare_authorized_proxy_routes(
         // missing route must never fall back to unscoped process secrets.
         if skipped_local_protocol_mismatch {
             codex_transport::validate_protocol(protocol)?;
+        }
+        if skipped_kimi_protocol_mismatch {
+            return Err(AppError::BadRequest(
+                "native Kimi OAuth does not support this request protocol".into(),
+            ));
         }
         if skipped_incompatible_strict_route {
             validate_openai_chat_choice_count(request_json)?;
