@@ -647,7 +647,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database_url = format!(
             "sqlite://{}?mode=rwc",
-            directory.path().join("deleted-upstream-monitoring.db").display()
+            directory
+                .path()
+                .join("deleted-upstream-monitoring.db")
+                .display()
         );
         let database = Database::connect(&database_url).await.unwrap();
         database.migrate().await.unwrap();

@@ -1326,11 +1326,15 @@ async fn upstream_deletion_readiness_keeps_multi_candidate_routes_and_history_vi
 }
 
 #[tokio::test]
-async fn deleting_a_disabled_unreferenced_upstream_keeps_history_and_a_sanitized_identity_snapshot() {
+async fn deleting_a_disabled_unreferenced_upstream_keeps_history_and_a_sanitized_identity_snapshot()
+{
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
-        directory.path().join("upstream-history-delete.db").display()
+        directory
+            .path()
+            .join("upstream-history-delete.db")
+            .display()
     );
     let state = AppState::initialize(Config::for_test(database_url.clone()))
         .await
@@ -1412,28 +1416,28 @@ async fn deleting_a_disabled_unreferenced_upstream_keeps_history_and_a_sanitized
         .await
         .unwrap();
 
-    assert!(state
-        .db
-        .list_upstream_accounts("history-delete")
-        .await
-        .unwrap()
-        .into_iter()
-        .all(|value| value.id != upstream.id));
-    let retained_request: String = sqlx::query_scalar(
-        "SELECT upstream_account_id FROM request_records WHERE id = $1",
-    )
-    .bind(request_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    assert!(
+        state
+            .db
+            .list_upstream_accounts("history-delete")
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|value| value.id != upstream.id)
+    );
+    let retained_request: String =
+        sqlx::query_scalar("SELECT upstream_account_id FROM request_records WHERE id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(retained_request, upstream.id.to_string());
-    let retained_generation: String = sqlx::query_scalar(
-        "SELECT upstream_account_id FROM generation_jobs WHERE id = $1",
-    )
-    .bind(generation_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let retained_generation: String =
+        sqlx::query_scalar("SELECT upstream_account_id FROM generation_jobs WHERE id = $1")
+            .bind(generation_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(retained_generation, upstream.id.to_string());
     let snapshot = sqlx::query(
         "SELECT tenant_id, name, driver, auth_kind, credential_generation, created_at, deleted_at FROM deleted_upstream_account_snapshots WHERE upstream_account_id = $1",
@@ -1442,12 +1446,30 @@ async fn deleting_a_disabled_unreferenced_upstream_keeps_history_and_a_sanitized
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(snapshot.try_get::<String, _>("tenant_id").unwrap(), upstream.tenant_id.to_string());
-    assert_eq!(snapshot.try_get::<String, _>("name").unwrap(), upstream.name);
-    assert_eq!(snapshot.try_get::<String, _>("driver").unwrap(), upstream.driver);
-    assert_eq!(snapshot.try_get::<String, _>("auth_kind").unwrap(), upstream.auth_kind);
-    assert_eq!(snapshot.try_get::<i64, _>("credential_generation").unwrap(), upstream.credential_generation);
-    assert_eq!(snapshot.try_get::<i64, _>("created_at").unwrap(), upstream.created_at);
+    assert_eq!(
+        snapshot.try_get::<String, _>("tenant_id").unwrap(),
+        upstream.tenant_id.to_string()
+    );
+    assert_eq!(
+        snapshot.try_get::<String, _>("name").unwrap(),
+        upstream.name
+    );
+    assert_eq!(
+        snapshot.try_get::<String, _>("driver").unwrap(),
+        upstream.driver
+    );
+    assert_eq!(
+        snapshot.try_get::<String, _>("auth_kind").unwrap(),
+        upstream.auth_kind
+    );
+    assert_eq!(
+        snapshot.try_get::<i64, _>("credential_generation").unwrap(),
+        upstream.credential_generation
+    );
+    assert_eq!(
+        snapshot.try_get::<i64, _>("created_at").unwrap(),
+        upstream.created_at
+    );
     assert!(snapshot.try_get::<i64, _>("deleted_at").unwrap() >= disabled.updated_at);
     let credentials: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM upstream_credentials WHERE upstream_account_id = $1",
