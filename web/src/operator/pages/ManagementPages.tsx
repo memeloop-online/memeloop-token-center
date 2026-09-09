@@ -336,8 +336,10 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: stri
   const [displayCurrency, setDisplayCurrency] = useState('USD');
   const [loadedCurrency, setLoadedCurrency] = useState('');
   const [pricingLoading, setPricingLoading] = useState(false);
+  const [usageFailed, setUsageFailed] = useState(false);
   const [message, setMessage] = useState('');
   const loadSequence = useRef(0);
+  const priceRequest = useRef<AbortController | undefined>(undefined);
   const syncSequence = useRef(0);
   const scopeRef = useRef({ token, tenant, writeTenant, displayCurrency });
   scopeRef.current = { token, tenant, writeTenant, displayCurrency };
@@ -345,18 +347,23 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: stri
     const sequence = ++loadSequence.current;
     const loadToken = token; const loadTenant = tenant;
     if (!loadToken) return;
+    priceRequest.current?.abort();
+    const controller = new AbortController();
+    priceRequest.current = controller;
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]);
+    const current = () => !controller.signal.aborted && sequence === loadSequence.current
+      && scopeRef.current.token === loadToken && scopeRef.current.tenant === loadTenant
+      && scopeRef.current.displayCurrency === requestedCurrency;
     setPricingLoading(true); setPrices([]); setGenerationPrices([]);
-    const scope = queryForTenant(loadTenant);
+    // Publish each independent price table as soon as it arrives. Usage does
+    // not vary by currency and must never gate price rendering.
     const results = await Promise.allSettled([
-      api<ModelPriceView[]>(`/internal/v1/model-prices?currency=${encodeURIComponent(requestedCurrency)}`, loadToken),
-      api<ModelPriceUsageSummary>(`/internal/v1/model-prices/usage-summary${scope}`, loadToken),
-      api<GenerationPriceView[]>(`/internal/v1/generation-prices?currency=${encodeURIComponent(requestedCurrency)}`, loadToken),
+      api<ModelPriceView[]>(`/internal/v1/model-prices?currency=${encodeURIComponent(requestedCurrency)}`, loadToken, { signal })
+        .then((value) => { if (current()) { setPrices(value); setLoadedCurrency(requestedCurrency); } }),
+      api<GenerationPriceView[]>(`/internal/v1/generation-prices?currency=${encodeURIComponent(requestedCurrency)}`, loadToken, { signal })
+        .then((value) => { if (current()) setGenerationPrices(value); }),
     ]);
-    if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
-    const [nextPrices, nextUsage, nextGenerationPrices] = results;
-    setPrices(nextPrices.status === 'fulfilled' ? nextPrices.value : []);
-    setUsage(nextUsage.status === 'fulfilled' ? nextUsage.value : { models: [] });
-    setGenerationPrices(nextGenerationPrices.status === 'fulfilled' ? nextGenerationPrices.value : []);
+    if (!current()) return;
     setLoadedCurrency(requestedCurrency); setPricingLoading(false);
     const failures = results.filter((result) => result.status === 'rejected');
     setError(failures.length ? t('pricing.partialLoad', { count: formatNumber(failures.length, locale) }) : '');
@@ -364,22 +371,38 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: stri
   useEffect(() => {
     loadSequence.current += 1;
     syncSequence.current += 1;
-    setPrices([]); setGenerationPrices([]); setUsage({ models: [] }); setSyncResult(undefined); setLoadedCurrency('');
+    setPrices([]); setGenerationPrices([]); setSyncResult(undefined); setLoadedCurrency('');
     setPricingLoading(false); setSyncing(false); setError(''); setMessage(''); setKind('token'); setModel('');
   }, [token, tenant, writeTenant]);
-  useEffect(() => { void load(displayCurrency); }, [token, tenant, writeTenant, displayCurrency]);
-  const usageByModel = new Map(usage.models.map((value) => [value.model, value]));
+  useEffect(() => {
+    void load(displayCurrency);
+    return () => { priceRequest.current?.abort(); loadSequence.current += 1; };
+  }, [token, tenant, writeTenant, displayCurrency]);
+  useEffect(() => {
+    const controller = new AbortController();
+    setUsage({ models: [] }); setUsageFailed(false);
+    if (token) void api<ModelPriceUsageSummary>(`/internal/v1/model-prices/usage-summary${queryForTenant(tenant)}`, token, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]) })
+      .then((value) => { if (!controller.signal.aborted) setUsage(value); })
+      .catch(() => { if (!controller.signal.aborted) setUsageFailed(true); });
+    return () => controller.abort();
+  }, [token, tenant]);
   const renderCurrency = loadedCurrency || displayCurrency;
-  const rows = Array.from(new Set([...usage.models.map((value) => value.model), ...prices.map((value) => value.model)])).sort().flatMap((name) => {
-    const price = prices.find((value) => value.model === name);
-    const tiers = price?.tiers?.length ? price.tiers : price ? [{ service_tier: 'default', input_per_million: price.input_per_million, cached_input_per_million: price.input_per_million, cache_write_per_million: price.input_per_million, output_per_million: price.output_per_million, source: price.source, updated_at: price.updated_at, cache_price_estimated: true }] : [undefined];
-    return tiers.map((tier, index) => ({ model: name, usage: index === 0 ? usageByModel.get(name) : undefined, tier }));
-  });
+  const rows = useMemo(() => {
+    const usageByModel = new Map(usage.models.map((value) => [value.model, value]));
+    const pricesByModel = new Map(prices.map((value) => [value.model, value]));
+    return Array.from(new Set([...usageByModel.keys(), ...pricesByModel.keys()])).sort().flatMap((name) => {
+      const price = pricesByModel.get(name);
+      const tiers = price?.tiers?.length ? price.tiers : price ? [{ service_tier: 'default', input_per_million: price.input_per_million, cached_input_per_million: price.input_per_million, cache_write_per_million: price.input_per_million, output_per_million: price.output_per_million, source: price.source, updated_at: price.updated_at, cache_price_estimated: true }] : [undefined];
+      return tiers.map((tier, index) => ({ model: name, usage: index === 0 ? usageByModel.get(name) : undefined, tier }));
+    });
+  }, [prices, usage]);
   const schema = kind === 'generation' ? schemas?.generation_price : schemas?.model_price;
   const sync = async () => {
     if (!writeTenant) return;
     const syncToken = token; const syncTenant = tenant; const syncWriteTenant = writeTenant; const syncCurrency = displayCurrency;
     const sequence = ++syncSequence.current;
+    // A pre-sync read must not overwrite newly synchronized prices.
+    priceRequest.current?.abort(); loadSequence.current += 1; setPricingLoading(false);
     setSyncing(true); setError(''); setMessage('');
     try {
       const result = await api<ModelPriceSyncResult>('/internal/v1/model-prices/sync', syncToken, { method: 'POST', body: JSON.stringify({ models: usage.models.map((value) => value.model), currency: displayCurrency, tenant_external_id: syncWriteTenant }) });
@@ -389,6 +412,7 @@ function Pricing({ token, tenant, writeTenant = tenant, schemas }: { token: stri
     finally { if (sequence === syncSequence.current && scopeRef.current.token === syncToken && scopeRef.current.tenant === syncTenant && scopeRef.current.writeTenant === syncWriteTenant && scopeRef.current.displayCurrency === syncCurrency) setSyncing(false); }
   };
   return <div className="pricing-page"><WriteScopeNotice tenant={writeTenant} />
+    {usageFailed && <div className="notice error" role="alert">{t('pricing.partialLoad')}</div>}
     <article className="panel pricing-overview"><div className="panel-title"><div><h2>{t('pricing.title')}</h2><p className="muted">{t('pricing.description')}</p></div><div className="pricing-heading-actions"><label>{t('pricing.viewCurrency')}<select aria-label={t('pricing.viewCurrency')} value={displayCurrency} onChange={(event) => { const next = event.target.value; syncSequence.current += 1; setSyncing(false); setSyncResult(undefined); setMessage(''); setDisplayCurrency(next); setCurrency(next); }}><option value="USD">USD</option><option value="CNY">CNY</option></select></label><div className="disabled-action"><button type="button" onClick={() => void sync()} disabled={!writeTenant || syncing}>{syncing ? t('pricing.syncing') : t('pricing.sync')}</button></div></div></div>
       <div className="pricing-summary"><span>{t('pricing.usedModels', { count: formatNumber(usage.models.length, locale) })}</span><span>{t('pricing.saved', { count: formatNumber(prices.length, locale) })}</span><span>{t('pricing.sourceOrder')}: models.dev → LiteLLM → OpenRouter</span></div>
       {error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}
@@ -931,12 +955,15 @@ export function PricingPage({ token, tenant, writeTenant }: OperatorPageProps) {
   const { t } = useI18n();
   const resource = useOperatorResource(
     Boolean(token), token,
-    () => api<ConfigurationSchemas>('/internal/v1/schemas', token),
+    () => api<ConfigurationSchemas>('/internal/v1/schemas', token, { signal: AbortSignal.timeout(10_000) }),
     t('common.requestFailed'),
   );
-  return <ResourceBoundary resource={resource.state} scopeKey={token}>{(schemas) =>
-    <Pricing token={token} tenant={tenant} writeTenant={writeTenant} schemas={schemas} />
-  }</ResourceBoundary>;
+  // Schemas are only needed by the manual editor, not the price tables.
+  // Keep it mounted while schema discovery completes or fails.
+  return <>
+    {resource.state.kind === 'failed' && <div className="notice error" role="alert">{resource.state.message}</div>}
+    <Pricing key={`${token}\0${tenant}`} token={token} tenant={tenant} writeTenant={writeTenant} schemas={resource.state.kind === 'ready' ? resource.state.value : undefined} />
+  </>;
 }
 
 export function RoutesPage({ token, tenant, writeTenant }: OperatorPageProps) {
