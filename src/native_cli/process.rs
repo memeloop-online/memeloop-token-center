@@ -1,7 +1,8 @@
-use std::{ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
+use std::{ffi::OsString, future::Future, path::PathBuf, process::Stdio, time::Duration};
 
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeError {
@@ -53,6 +54,132 @@ impl Drop for ProcessGroup {
     }
 }
 
+/// The process remains owned even when its request future is cancelled. Group
+/// termination occurs synchronously; reaping is scheduled on the Tokio runtime.
+struct SupervisedChild {
+    group: Option<ProcessGroup>,
+    child: Option<Child>,
+}
+
+impl SupervisedChild {
+    fn terminate(&mut self) {
+        drop(self.group.take());
+    }
+
+    async fn reap(&mut self) -> Result<std::process::ExitStatus, RuntimeError> {
+        self.child
+            .as_mut()
+            .ok_or(RuntimeError::Io)?
+            .wait()
+            .await
+            .map_err(|_| RuntimeError::Io)
+    }
+}
+
+impl Drop for SupervisedChild {
+    fn drop(&mut self) {
+        self.terminate();
+        if let Some(mut child) = self.child.take() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
+            // Outside a runtime, Tokio kill_on_drop/orphan reaping remains the
+            // fallback. Normal request cancellation always has a runtime.
+        }
+    }
+}
+
+fn spawn(spec: &RuntimeCommand) -> Result<SupervisedChild, RuntimeError> {
+    if !spec.executable.is_absolute()
+        || !spec.home.is_absolute()
+        || !spec.workspace.is_absolute()
+        || spec.home == spec.workspace
+        || spec.input.len() > INPUT_LIMIT
+        || spec.timeout.is_zero()
+        || spec.timeout > Duration::from_secs(180)
+    {
+        return Err(RuntimeError::Configuration);
+    }
+    let mut command = tokio::process::Command::new(&spec.executable);
+    command
+        .args(&spec.arguments)
+        .env_clear()
+        .env("HOME", &spec.home)
+        .env("NO_OPEN_BROWSER", "1")
+        .env("CURSOR_INVOKED_AS", "cursor-agent")
+        .env("COPILOT_AUTO_UPDATE", "false")
+        .current_dir(&spec.workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    let child = command.spawn().map_err(|_| RuntimeError::Spawn)?;
+    let raw_pid = child.id().ok_or(RuntimeError::Spawn)?;
+    let pid = i32::try_from(raw_pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .and_then(Pid::from_raw)
+        .ok_or(RuntimeError::Spawn)?;
+    Ok(SupervisedChild {
+        group: Some(ProcessGroup(pid)),
+        child: Some(child),
+    })
+}
+
+/// Bidirectional protocol exchange with a long-lived native CLI. The closure
+/// owns both pipes, must bound its writes/reads, validate its terminal response,
+/// and must not return raw runtime diagnostics. A successful exchange ends the
+/// CLI process: it need not naturally exit. Protocol callbacks are NOT retried.
+///
+/// `spec.input` must be empty: only the protocol closure owns stdin. Stderr is
+/// drained concurrently and limited even while the callback waits for events.
+/// Timeout/cancellation kills the complete original process group and reaps.
+pub async fn run_interactive<T, F, Fut>(
+    spec: RuntimeCommand,
+    exchange: F,
+) -> Result<T, RuntimeError>
+where
+    F: FnOnce(ChildStdin, ChildStdout) -> Fut,
+    Fut: Future<Output = Result<T, RuntimeError>>,
+{
+    if !spec.input.is_empty() {
+        return Err(RuntimeError::Configuration);
+    }
+    let mut process = spawn(&spec)?;
+    let child = process.child.as_mut().ok_or(RuntimeError::Io)?;
+    let stdin = child.stdin.take().ok_or(RuntimeError::Io)?;
+    let stdout = child.stdout.take().ok_or(RuntimeError::Io)?;
+    let stderr = child.stderr.take().ok_or(RuntimeError::Io)?;
+    let operation = async {
+        let exchange = exchange(stdin, stdout);
+        let diagnostics = bounded_read(stderr, STDERR_LIMIT);
+        tokio::pin!(exchange, diagnostics);
+        let (result, diagnostics_finished) = tokio::select! {
+            biased;
+            result = &mut diagnostics => {
+                result?;
+                (exchange.await, true)
+            }
+            result = &mut exchange => (result, false),
+        };
+        // Terminate before reaping even on successful protocol completion:
+        // SDK stdio servers normally stay alive waiting for another request.
+        process.terminate();
+        if !diagnostics_finished {
+            diagnostics.await?;
+        }
+        let _ = process.reap().await?;
+        result
+    };
+    let result = tokio::time::timeout(spec.timeout, operation).await;
+    process.terminate();
+    let _ = process.reap().await;
+    result.map_err(|_| RuntimeError::Timeout)?
+}
+
 async fn bounded_read(
     mut reader: impl AsyncRead + Unpin,
     limit: usize,
@@ -78,38 +205,9 @@ async fn bounded_read(
 /// Explicit timeout/error paths also reap the child. No stderr, argv, prompt,
 /// account path or OS error is included in a returned error.
 pub async fn run(spec: RuntimeCommand) -> Result<RuntimeOutput, RuntimeError> {
-    if !spec.executable.is_absolute()
-        || !spec.home.is_absolute()
-        || !spec.workspace.is_absolute()
-        || spec.home == spec.workspace
-        || spec.input.len() > INPUT_LIMIT
-        || spec.timeout.is_zero()
-        || spec.timeout > Duration::from_secs(180)
-    {
-        return Err(RuntimeError::Configuration);
-    }
-    let mut command = tokio::process::Command::new(&spec.executable);
-    command
-        .args(&spec.arguments)
-        .env_clear()
-        .env("HOME", &spec.home)
-        .env("NO_OPEN_BROWSER", "1")
-        .env("CURSOR_INVOKED_AS", "cursor-agent")
-        .env("COPILOT_AUTO_UPDATE", "false")
-        .current_dir(&spec.workspace)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
-    let mut child = command.spawn().map_err(|_| RuntimeError::Spawn)?;
-    let raw_pid = child.id().ok_or(RuntimeError::Spawn)?;
-    let pid = i32::try_from(raw_pid)
-        .ok()
-        .filter(|pid| *pid > 1)
-        .and_then(Pid::from_raw)
-        .ok_or(RuntimeError::Spawn)?;
-    let group = ProcessGroup(pid);
+    let mut process = spawn(&spec)?;
+    let pid = process.group.as_ref().ok_or(RuntimeError::Io)?.0;
+    let child = process.child.as_mut().ok_or(RuntimeError::Io)?;
     let mut stdin = child.stdin.take().ok_or(RuntimeError::Io)?;
     let stdout = child.stdout.take().ok_or(RuntimeError::Io)?;
     let stderr = child.stderr.take().ok_or(RuntimeError::Io)?;
@@ -148,8 +246,8 @@ pub async fn run(spec: RuntimeCommand) -> Result<RuntimeOutput, RuntimeError> {
     // CLI closure of both streams is its completion boundary.
     let result = match result {
         Ok(Ok(stdout)) => {
-            drop(group);
-            let status = child.wait().await.map_err(|_| RuntimeError::Io)?;
+            process.terminate();
+            let status = process.reap().await?;
             if status.success() {
                 Ok(RuntimeOutput { stdout })
             } else {
@@ -157,8 +255,8 @@ pub async fn run(spec: RuntimeCommand) -> Result<RuntimeOutput, RuntimeError> {
             }
         }
         other => {
-            drop(group);
-            let _ = child.wait().await;
+            process.terminate();
+            let _ = process.reap().await;
             match other {
                 Err(_) => Err(RuntimeError::Timeout),
                 Ok(Err(error)) => Err(error),
@@ -190,6 +288,75 @@ mod tests {
     }
 
     // CI-only mock processes; never invoke an installed supplier runtime.
+    #[tokio::test]
+    async fn interactive_protocol_supports_multiple_round_trips() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let output = run_interactive(
+            fixture("/bin/cat", &[], home.path(), workspace.path()),
+            |mut stdin, mut stdout| async move {
+                for payload in [b"first".as_slice(), b"second".as_slice()] {
+                    stdin
+                        .write_all(payload)
+                        .await
+                        .map_err(|_| RuntimeError::Io)?;
+                    stdin.flush().await.map_err(|_| RuntimeError::Io)?;
+                    let mut output = vec![0; payload.len()];
+                    stdout
+                        .read_exact(&mut output)
+                        .await
+                        .map_err(|_| RuntimeError::Io)?;
+                    if output != payload {
+                        return Err(RuntimeError::Protocol);
+                    }
+                }
+                Ok(2_usize)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, 2);
+    }
+
+    #[tokio::test]
+    async fn interactive_terminal_result_terminates_long_lived_process() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let result = run_interactive(
+            fixture("/bin/sleep", &["30"], home.path(), workspace.path()),
+            |_, _| async { Ok("completed") },
+        )
+        .await;
+        assert_eq!(result.unwrap(), "completed");
+    }
+
+    #[tokio::test]
+    async fn interactive_protocol_failure_and_timeout_are_preserved() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let spec = fixture("/bin/cat", &[], home.path(), workspace.path());
+        let result =
+            run_interactive(spec, |_, _| async { Err::<(), _>(RuntimeError::Protocol) }).await;
+        assert_eq!(result.unwrap_err(), RuntimeError::Protocol);
+        let mut spec = fixture("/bin/sleep", &["30"], home.path(), workspace.path());
+        spec.timeout = Duration::from_millis(30);
+        let result = run_interactive(spec, |_, _| async {
+            std::future::pending::<Result<(), RuntimeError>>().await
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), RuntimeError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn interactive_rejects_second_stdin_owner_before_spawn() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut spec = fixture("/never-run", &[], home.path(), workspace.path());
+        spec.input = b"unexpected".to_vec();
+        let result = run_interactive(spec, |_, _| async { Ok(()) }).await;
+        assert_eq!(result.unwrap_err(), RuntimeError::Configuration);
+    }
+
     #[tokio::test]
     async fn subprocess_stdin_is_bounded_and_success_is_reaped() {
         let home = tempfile::tempdir().unwrap();
