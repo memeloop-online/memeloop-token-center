@@ -9,6 +9,28 @@ import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, 
 
 const operatorGenerationCancellations = new WeakMap<DogfoodWorld, { status: number; body: { status: string } }>();
 
+async function completeOperatorRequestQuery(page: Page, scopedTenant: string, action: () => Promise<unknown>): Promise<void> {
+  // A heading or selected option updates before the replacement query settles.
+  // This SSE cursor scenario changes scopes sequentially; request cancellation
+  // races are covered separately and must not be mistaken for stream failures.
+  const completed = page.waitForResponse((response) => {
+    const request = response.request();
+    const url = new URL(response.url());
+    return url.origin === baseURL.origin
+      && url.pathname === '/internal/v1/requests/query'
+      && request.method() === 'POST'
+      && request.postDataJSON()?.tenant_external_id === scopedTenant;
+  });
+  const [response] = await Promise.all([completed, action()]);
+  assert.equal(response.status(), 200, 'the tenant-scoped request query must succeed');
+  assert.equal(await response.finished(), null, 'the tenant-scoped request query must finish before the next scope change');
+  await eventually(
+    async () => assert.equal(await operatorTrafficPanel(page).locator('.typed-filter-actions button').first().isEnabled(), true),
+    10_000,
+    'the request query did not leave its loading state',
+  );
+}
+
 When('下游用户以中文亮色主题在手机视口打开自助门户', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   const seed = runtime.requireSeed();
@@ -708,7 +730,7 @@ When('浏览器模拟实时请求流断线超过五秒并重放最后事件', as
   });
 
   await connectOperator(this, 'dark', runtime.requireSeed().globalServiceCredential, 'visible');
-  await openAppRoute(page, 'operator', 'requests');
+  await completeOperatorRequestQuery(page, tenant, () => openAppRoute(page, 'operator', 'requests'));
   await assertCount(operatorTrafficPanel(page).locator('tbody tr').filter({ hasText: baseline.model }), 1);
   await assertCount(operatorTrafficPanel(page).locator('tbody tr').filter({ hasText: missingOne.model }), 1);
   await assertCount(operatorTrafficPanel(page).locator('tbody tr').filter({ hasText: missingTwo.model }), 1);
@@ -744,7 +766,7 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
 
   const connectionsBeforeTabChange = observation.connectionUrls.length;
   await openAppRoute(page, 'operator', 'usage');
-  await openAppRoute(page, 'operator', 'requests');
+  await completeOperatorRequestQuery(page, tenant, () => openAppRoute(page, 'operator', 'requests'));
   await eventually(
     () => assert.ok(observation.connectionUrls.length > connectionsBeforeTabChange),
     10_000,
@@ -765,10 +787,10 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   assert.equal((await routeCatalogResponse).status(), 200);
   await catalogModelSearch(catalog).fill(model);
   await catalog.getByRole('option').filter({ hasText: model }).click();
-  await dialog.getByRole('button', { name: '应用筛选', exact: true }).click();
+  await completeOperatorRequestQuery(page, tenant, () => dialog.getByRole('button', { name: '应用筛选', exact: true }).click());
   await assertVisible(page.getByRole('heading', { name: '筛选结果', exact: true }));
   const connectionsBeforeFilterReset = observation.connectionUrls.length;
-  await builder.getByRole('button', { name: '清除', exact: true }).click();
+  await completeOperatorRequestQuery(page, tenant, () => builder.getByRole('button', { name: '清除', exact: true }).click());
   await eventually(
     () => assert.ok(observation.connectionUrls.length > connectionsBeforeFilterReset),
     10_000,
@@ -785,10 +807,10 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
     (options, selectedTenant) => options.map((option) => option.getAttribute('value')).find((value) => value && value !== selectedTenant),
     tenant,
   ))!;
-  await tenantPicker.selectOption(alternateTenant);
+  await completeOperatorRequestQuery(page, alternateTenant, () => tenantPicker.selectOption(alternateTenant));
   await assertValue(tenantPicker, alternateTenant);
   const connectionsBeforeTenantReset = observation.connectionUrls.length;
-  await tenantPicker.selectOption(tenant);
+  await completeOperatorRequestQuery(page, tenant, () => tenantPicker.selectOption(tenant));
   await assertValue(tenantPicker, tenant);
   await eventually(
     () => assert.ok(observation.connectionUrls.length > connectionsBeforeTenantReset),
