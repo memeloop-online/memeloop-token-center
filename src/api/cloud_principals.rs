@@ -17,14 +17,10 @@ pub(in crate::api) async fn ensure_memeloop_cloud_principal(
     Json(body): Json<EnsureCloudPrincipalRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "keys:write").await?;
-    if body.tenant_external_id != body.tenant_external_id.trim()
-        || body.principal_external_id != body.principal_external_id.trim()
-    {
-        return Err(AppError::BadRequest(
-            "tenant_external_id and principal_external_id must not have surrounding whitespace"
-                .into(),
-        ));
-    }
+    super::cloud_entitlements::validate_cloud_principal_identity(
+        &body.tenant_external_id,
+        &body.principal_external_id,
+    )?;
     require_service_tenant(&service, &body.tenant_external_id)?;
     let credential = state
         .db

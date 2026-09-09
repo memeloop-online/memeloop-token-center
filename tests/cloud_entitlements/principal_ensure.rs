@@ -186,6 +186,143 @@ async fn ensure_and_subscription_share_identity_without_mutation() {
 }
 
 #[tokio::test]
+async fn padded_webhook_before_ensure_cannot_fork_the_normalized_identity() {
+    let fixture = Fixture::new().await;
+    let tenant = "cloud-padded-webhook-first";
+    let principal = "cloud-padded-webhook-first-member";
+    assert_eq!(
+        fixture
+            .send(
+                "cloud-padded-webhook-first-event",
+                &active(
+                    &format!(" {tenant}"),
+                    principal,
+                    "cloud-padded-webhook-first-subscription",
+                    "cycle",
+                    "10",
+                    1,
+                    10,
+                ),
+            )
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let service = scoped_writer(&fixture, tenant, "cloud-padded-webhook-first-writer").await;
+    let ensured: Value = fixture
+        .client
+        .post(ensure_url(&fixture))
+        .bearer_auth(&service.token)
+        .json(&ensure_request(tenant, principal))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let managed = fixture
+        .state
+        .db
+        .list_managed_keys(Some(tenant), Some(principal))
+        .await
+        .unwrap();
+    assert_eq!(managed.len(), 1);
+    assert_eq!(
+        managed[0].key_id,
+        Uuid::parse_str(ensured["key_id"].as_str().unwrap()).unwrap()
+    );
+    assert!(
+        fixture
+            .state
+            .db
+            .list_entitlements(Some(tenant), Some("memeloop-cloud"), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .state
+            .db
+            .list_cloud_subscription_events(Some(tenant), Some(principal), None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn padded_webhook_after_ensure_cannot_fork_the_normalized_identity() {
+    let fixture = Fixture::new().await;
+    let tenant = "cloud-padded-ensure-first";
+    let principal = "cloud-padded-ensure-first-member";
+    let service = scoped_writer(&fixture, tenant, "cloud-padded-ensure-first-writer").await;
+    let ensured: Value = fixture
+        .client
+        .post(ensure_url(&fixture))
+        .bearer_auth(&service.token)
+        .json(&ensure_request(tenant, principal))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .send(
+                "cloud-padded-ensure-first-event",
+                &active(
+                    tenant,
+                    &format!("{principal} "),
+                    "cloud-padded-ensure-first-subscription",
+                    "cycle",
+                    "10",
+                    1,
+                    10,
+                ),
+            )
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let managed = fixture
+        .state
+        .db
+        .list_managed_keys(Some(tenant), Some(principal))
+        .await
+        .unwrap();
+    assert_eq!(managed.len(), 1);
+    assert_eq!(
+        managed[0].key_id,
+        Uuid::parse_str(ensured["key_id"].as_str().unwrap()).unwrap()
+    );
+    assert_eq!(managed[0].available_balance, "0");
+    assert!(
+        fixture
+            .state
+            .db
+            .list_entitlements(Some(tenant), Some("memeloop-cloud"), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .state
+            .db
+            .list_cloud_subscription_events(Some(tenant), Some(principal), None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn ensure_enforces_scope_tenant_currency_and_identity_shape() {
     let fixture = Fixture::new().await;
     let tenant = "cloud-ensure-auth";

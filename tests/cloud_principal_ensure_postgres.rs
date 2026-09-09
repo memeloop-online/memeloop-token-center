@@ -7,6 +7,8 @@ use memeloop_token_center::{
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use std::sync::Arc;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 const WEBHOOK_SECRET: &str = "postgres-cloud-principal-ensure-secret-longer-than-32-bytes";
@@ -240,6 +242,130 @@ async fn postgres_principal_ensure_is_concurrent_stable_and_subscription_preserv
         StatusCode::CREATED
     );
 
+    inspection.close().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn postgres_first_ensure_and_subscription_interleave_without_forking_identity() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let unique = Uuid::now_v7();
+    let tenant = format!("postgres-principal-interleave-{unique}");
+    let principal = format!("member-{unique}");
+    let mut config = Config::for_test(database_url.clone());
+    config.memeloop_cloud_webhook_secret = Some(WEBHOOK_SECRET.into());
+    let state = AppState::initialize(config).await.unwrap();
+
+    state.db.create_tenant(&tenant, None).await.unwrap();
+    let service = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: format!("postgres-principal-interleave-writer-{unique}"),
+                scopes: vec!["keys:write".into()],
+                tenant_external_id: Some(tenant.clone()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let served_state = state.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, api::router(served_state))
+            .await
+            .unwrap();
+    });
+    let client = Client::new();
+    let ensure_url =
+        format!("http://{address}/internal/v1/integrations/memeloop-cloud/principals/ensure");
+    let subscription_url =
+        format!("http://{address}/internal/v1/integrations/memeloop-cloud/subscription");
+    let gate = Arc::new(Barrier::new(3));
+    let ensure = tokio::spawn({
+        let client = client.clone();
+        let gate = gate.clone();
+        let body = ensure_request(&tenant, &principal);
+        let token = service.token.clone();
+        async move {
+            gate.wait().await;
+            client
+                .post(ensure_url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    let subscription = tokio::spawn({
+        let client = client.clone();
+        let gate = gate.clone();
+        let body = subscription(&tenant, &principal);
+        async move {
+            gate.wait().await;
+            send_subscription(&client, &subscription_url, &body).await
+        }
+    });
+    gate.wait().await;
+    let (ensured, snapshot) = tokio::join!(ensure, subscription);
+    let ensured: Value = ensured
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let snapshot: Value = snapshot
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ensured["key_id"], snapshot["credential"]["key_id"]);
+    assert_eq!(ensured["account_id"], snapshot["credential"]["account_id"]);
+
+    let key_id = Uuid::parse_str(ensured["key_id"].as_str().unwrap()).unwrap();
+    let account_id = Uuid::parse_str(ensured["account_id"].as_str().unwrap()).unwrap();
+    let managed = state
+        .db
+        .list_managed_keys(Some(&tenant), Some(&principal))
+        .await
+        .unwrap();
+    assert_eq!(managed.len(), 1);
+    assert_eq!(managed[0].key_id, key_id);
+    assert_eq!(managed[0].account_id, account_id);
+    assert_eq!(managed[0].available_balance, "10");
+    assert_eq!(managed[0].policy.requests_per_minute, 17);
+    assert_eq!(
+        state
+            .db
+            .list_entitlements(
+                Some(&tenant),
+                Some("memeloop-cloud"),
+                Some("postgres-principal-ensure-subscription"),
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let inspection = PgPool::connect(&database_url).await.unwrap();
+    let account_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM credit_accounts a JOIN principals p ON p.id = a.principal_id JOIN tenants t ON t.id = a.tenant_id WHERE t.external_id = $1 AND p.external_id = $2",
+    )
+    .bind(&tenant)
+    .bind(&principal)
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(account_count, 1);
     inspection.close().await;
     server.abort();
 }
