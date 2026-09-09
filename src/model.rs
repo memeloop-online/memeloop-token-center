@@ -224,6 +224,15 @@ pub struct IssuedKey {
     pub fingerprint: String,
 }
 
+/// A credential that an explicitly authorized management caller requested to
+/// copy. This is never included in a list or self-service representation.
+#[derive(Serialize)]
+pub struct RecoveredClientCredential {
+    pub key_id: Uuid,
+    pub credential_generation: i64,
+    pub key: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct KeyView {
     pub key_id: Uuid,
@@ -292,6 +301,7 @@ pub struct ManagedKeyView {
     pub status: String,
     pub credential_generation: i64,
     pub fingerprint: Option<String>,
+    pub credential_recovery_available: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub policy: KeyPolicy,

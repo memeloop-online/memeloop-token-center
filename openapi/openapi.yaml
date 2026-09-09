@@ -264,6 +264,56 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/keys/{key_id}/credential-recovery:
+    put:
+      tags: [Client credentials]
+      operationId: storeClientCredentialRecovery
+      summary: Store an already-active client credential for future authorized copying
+      description: |
+        Verifies the supplied credential against the active stable key and stores only a
+        key- and generation-bound encrypted envelope. It does not rotate, replace, or
+        otherwise change the credential. This supports an authorized importer that still
+        has source access; existing credentials without an envelope cannot be reconstructed.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters: [{ $ref: '#/components/parameters/KeyId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StoreClientCredentialRecoveryRequest' }
+      responses:
+        '204': { description: Encrypted recovery envelope stored; no secret is returned. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/keys/{key_id}/credential-recovery/copy:
+    post:
+      tags: [Client credentials]
+      operationId: copyClientCredential
+      summary: Copy a durable active client credential
+      description: |
+        Returns plaintext only for an explicit, authorized copy action and only while the
+        matching key generation remains active. Credential lists and self-service APIs never
+        contain the secret. A key created before recovery envelopes were enabled returns 404
+        until an authorized importer stores its still-valid source credential.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters: [{ $ref: '#/components/parameters/KeyId' }]
+      responses:
+        '200':
+          description: The active client credential for immediate copying.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecoveredClientCredential' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/keys/{key_id}/alias:
     patch:
       tags: [Client credentials]
@@ -944,10 +994,12 @@ paths:
       summary: Read the blockers before deleting an upstream provider
       description: |
         Returns the exact lifecycle, explicit-model-route, immutable-history, and
-        import-provenance constraints that DELETE checks. Explicit route counts
-        include every direct and multi-candidate reference, including disabled
-        routes retained for audit. This is a read-only preview; DELETE repeats
-        all checks transactionally.
+        import-provenance state for deletion. Explicit route counts include every
+        direct and multi-candidate reference, including disabled routes retained
+        for audit. Request and generation history is retained with a sanitized
+        upstream identity snapshot and does not block physical account deletion.
+        This is a read-only preview; DELETE repeats the blocking checks
+        transactionally.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:read
       parameters:
@@ -1026,11 +1078,11 @@ paths:
       operationId: deleteUpstreamProvider
       summary: Delete a disabled, unreferenced unified upstream
       description: |
-        The account must be disabled, have no direct or multi-candidate model-route
-        references, no text or generation request history, and no retained import
-        provenance. Otherwise it must remain disabled for audit and the operation
-        returns 409. A missing account, including a repeated successful delete,
-        returns 204.
+        The account must be disabled and have no direct or multi-candidate
+        model-route references or retained import provenance. DELETE writes a
+        sanitized historical identity snapshot and preserves request and generation
+        facts while physically removing the account and its credentials. A missing
+        account, including a repeated successful delete, returns 204.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:write
       parameters:
@@ -4645,10 +4697,29 @@ components:
         credential_generation: { type: integer, format: int64, minimum: 1 }
         key: { type: string, writeOnly: true, description: One-time native credential secret. }
         fingerprint: { type: string }
+    StoreClientCredentialRecoveryRequest:
+      type: object
+      additionalProperties: false
+      required: [key]
+      properties:
+        key:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+          description: Existing active credential supplied by an authorized source importer. It is never echoed.
+    RecoveredClientCredential:
+      type: object
+      additionalProperties: false
+      required: [key_id, credential_generation, key]
+      properties:
+        key_id: { type: string, format: uuid }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+        key: { type: string, writeOnly: true, description: Active credential returned only by an explicit no-store copy action. }
     ManagedClientCredential:
       type: object
       additionalProperties: false
-      required: [key_id, account_id, tenant_external_id, principal_external_id, alias, currency, status, credential_generation, fingerprint, created_at, updated_at, policy, available_balance, reserved_balance]
+      required: [key_id, account_id, tenant_external_id, principal_external_id, alias, currency, status, credential_generation, fingerprint, credential_recovery_available, created_at, updated_at, policy, available_balance, reserved_balance]
       properties:
         key_id: { type: string, format: uuid }
         account_id: { type: string, format: uuid }
@@ -4659,6 +4730,7 @@ components:
         status: { $ref: '#/components/schemas/CredentialStatus' }
         credential_generation: { type: integer, format: int64 }
         fingerprint: { type: [string, 'null'] }
+        credential_recovery_available: { type: boolean, description: Whether the active credential can be copied through the explicit management action. }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
         policy: { $ref: '#/components/schemas/CredentialPolicy' }
@@ -4984,8 +5056,8 @@ components:
       properties:
         requires_disabled: { type: boolean, description: The stable upstream must first transition to disabled. }
         model_route_count: { type: integer, format: int64, minimum: 0, description: Distinct direct or multi-candidate model routes, including disabled routes. }
-        request_history_count: { type: integer, format: int64, minimum: 0, description: Immutable request-history rows attributed to this upstream. }
-        generation_history_count: { type: integer, format: int64, minimum: 0, description: Immutable generation-history rows attributed to this upstream. }
+        request_history_count: { type: integer, format: int64, minimum: 0, description: Immutable request-history rows attributed to this upstream and retained after physical deletion. }
+        generation_history_count: { type: integer, format: int64, minimum: 0, description: Immutable generation-history rows attributed to this upstream and retained after physical deletion. }
         imported_for_audit: { type: boolean, description: Immutable import provenance retains the upstream for audit. }
         can_delete: { type: boolean, description: All deletion blockers were absent when this read completed; DELETE verifies them again transactionally. }
     DisconnectUpstreamOAuthRequest:
@@ -5450,7 +5522,7 @@ components:
         expires_at: { type: [integer, 'null'], format: int64 }
         error_code:
           type: [string, 'null']
-          enum: [unsupported, destination_invalid, credential_invalid, connection_failed, authentication_failed, rate_limited, upstream_unavailable, redirect_rejected, response_too_large, invalid_response, null]
+          enum: [unsupported, destination_invalid, credential_invalid, connection_failed, authentication_failed, rate_limited, upstream_unavailable, redirect_rejected, response_too_large, invalid_response, codex_no_trusted_models, null]
         models:
           type: array
           maxItems: 200

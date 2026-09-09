@@ -1368,6 +1368,98 @@ async fn operator_can_explicitly_set_and_read_metered_unlimited_enforcement() {
 }
 
 #[tokio::test]
+async fn credential_copy_is_explicit_authorized_and_never_part_of_the_key_list() {
+    let (state, _directory) = test_state().await;
+    let issued = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "credential-copy-api".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "recoverable".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::ZERO,
+                idempotency_key: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let read_only = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "credential-copy-read-only".to_owned(),
+                scopes: vec!["keys:read".to_owned()],
+                tenant_external_id: Some("credential-copy-api".to_owned()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let service_token = state.config.service_token.clone();
+    let control = router_for_role(state, RuntimeRole::Control);
+    let copy_path = format!(
+        "/internal/v1/keys/{}/credential-recovery/copy",
+        issued.key_id
+    );
+
+    let forbidden = control
+        .clone()
+        .oneshot(
+            Request::post(&copy_path)
+                .header(header::AUTHORIZATION, format!("Bearer {}", read_only.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let listed = control
+        .clone()
+        .oneshot(
+            Request::get("/internal/v1/keys?tenant_external_id=credential-copy-api")
+                .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = axum::body::to_bytes(listed.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&listed).contains(&issued.key));
+    let listed: Value = serde_json::from_slice(&listed).unwrap();
+    assert_eq!(listed[0]["credential_recovery_available"], true);
+
+    let copied = control
+        .oneshot(
+            Request::post(copy_path)
+                .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(copied.status(), StatusCode::OK);
+    assert_eq!(
+        copied.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+    let copied: Value = serde_json::from_slice(
+        &axum::body::to_bytes(copied.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(copied["key"], issued.key);
+    assert_eq!(copied["credential_generation"], 1);
+}
+
+#[tokio::test]
 async fn retired_bridge_is_absent_and_native_codex_rejects_raw_credentials() {
     let (state, _directory) = test_state().await;
     let control = router_for_role(state, RuntimeRole::Control);

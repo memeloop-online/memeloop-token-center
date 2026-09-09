@@ -168,6 +168,63 @@ pub(in crate::api) async fn rotate_key(
     Ok(Json(issued))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct StoreClientCredentialRecoveryRequest {
+    key: String,
+}
+
+/// Stores an authorized caller's already-existing credential as a durable,
+/// key-bound encrypted recovery envelope. It never changes the credential
+/// generation or returns the supplied secret.
+pub(in crate::api) async fn store_key_credential_recovery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key_id): Path<Uuid>,
+    Json(body): Json<StoreClientCredentialRecoveryRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "keys:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_key_tenant(key_id, tenant).await?;
+    }
+    state
+        .db
+        .store_key_credential_recovery_secret(
+            key_id,
+            &body.key,
+            state.config.key_pepper.as_bytes(),
+            service.service_id,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Explicitly returns a durable recovery envelope's plaintext for copying.
+/// Neither list nor self-service responses include this value.
+pub(in crate::api) async fn copy_key_credential(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let service = require_service(&headers, &state, "keys:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_key_tenant(key_id, tenant).await?;
+    }
+    let recovered = state
+        .db
+        .copy_key_credential(
+            key_id,
+            state.config.key_pepper.as_bytes(),
+            service.service_id,
+        )
+        .await?;
+    let mut response = Json(recovered).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct RenameKeyRequest {

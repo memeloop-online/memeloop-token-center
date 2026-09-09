@@ -367,6 +367,16 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
             "../../../migrations/common/0068_monitoring_snapshot_outcome_indexes.sql"
         ),
     },
+    Migration {
+        version: 69,
+        name: "deleted upstream account audit snapshots",
+        sql: include_str!("../../../migrations/common/0069_deleted_upstream_account_snapshots.sql"),
+    },
+    Migration {
+        version: 70,
+        name: "durable client credential recovery envelopes",
+        sql: include_str!("../../../migrations/common/0070_key_credential_recovery.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -719,6 +729,16 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!(
             "../../../migrations/common/0068_monitoring_snapshot_outcome_indexes.sql"
         ),
+    },
+    Migration {
+        version: 69,
+        name: "deleted upstream account audit snapshots",
+        sql: include_str!("../../../migrations/common/0069_deleted_upstream_account_snapshots.sql"),
+    },
+    Migration {
+        version: 70,
+        name: "durable client credential recovery envelopes",
+        sql: include_str!("../../../migrations/common/0070_key_credential_recovery.sql"),
     },
 ];
 

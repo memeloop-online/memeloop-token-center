@@ -1,6 +1,10 @@
 use std::collections::BTreeSet;
 
 use super::super::*;
+use super::recovery::{
+    remove_key_credential_recovery_secrets_in_transaction,
+    store_issued_key_credential_recovery_secret_in_transaction,
+};
 use crate::db::routing::{
     bump_credential_grant_revisions, bump_route_grant_revisions, lock_routing_relation_writes,
 };
@@ -200,6 +204,8 @@ impl Database {
         .execute(&mut **tx)
         .await?;
         insert_credential(tx, &issued, 1, now).await?;
+        store_issued_key_credential_recovery_secret_in_transaction(tx, &issued, 1, pepper, now)
+            .await?;
         Ok((
             tenant_id,
             ProvisionedCloudCredential {
@@ -240,7 +246,7 @@ impl Database {
             .unwrap_or_else(|| (i64::MAX, "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned()));
         let key_id = key_id.map(|id| id.to_string()).unwrap_or_default();
         let rows = sqlx::query(
-            "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND ($3 = '' OR k.id = $3) AND (k.created_at < $4 OR (k.created_at = $4 AND k.id < $5)) ORDER BY k.created_at DESC, k.id DESC LIMIT $6",
+            "SELECT k.id, k.account_id, t.external_id AS tenant_external_id, p.external_id AS principal_external_id, k.alias, k.currency, k.status, k.credential_generation, (SELECT c.fingerprint FROM key_credentials c WHERE c.key_id = k.id AND c.generation = k.credential_generation AND c.revoked_at IS NULL ORDER BY c.id LIMIT 1) AS fingerprint, CASE WHEN k.status = 'active' AND EXISTS (SELECT 1 FROM key_credential_recovery_secrets recovery JOIN key_credentials credential ON credential.id = recovery.credential_id WHERE recovery.key_id = k.id AND recovery.credential_generation = k.credential_generation AND credential.key_id = k.id AND credential.generation = k.credential_generation AND credential.revoked_at IS NULL) THEN 1 ELSE 0 END AS credential_recovery_available, k.created_at, k.updated_at, k.policy_json, a.available_micros, a.reserved_micros FROM key_records k JOIN tenants t ON t.id = k.tenant_id JOIN principals p ON p.id = k.principal_id JOIN credit_accounts a ON a.id = k.account_id WHERE ($1 = '' OR t.external_id = $1) AND ($2 = '' OR p.external_id = $2) AND ($3 = '' OR k.id = $3) AND (k.created_at < $4 OR (k.created_at = $4 AND k.id < $5)) ORDER BY k.created_at DESC, k.id DESC LIMIT $6",
         )
         .bind(tenant_external_id.unwrap_or_default())
         .bind(principal_external_id.unwrap_or_default())
@@ -259,11 +265,12 @@ impl Database {
             ));
         }
         let mut transaction = self.begin_write_transaction().await?;
-        let current = sqlx::query("SELECT status FROM key_records WHERE id = $1")
-            .bind(key_id.to_string())
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(AppError::NotFound)?;
+        let current =
+            sqlx::query("SELECT status, credential_generation FROM key_records WHERE id = $1")
+                .bind(key_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(AppError::NotFound)?;
         if current.try_get::<String, _>("status")? == "revoked" && status != "revoked" {
             return Err(AppError::BadRequest(
                 "a revoked credential cannot be reactivated".into(),
@@ -289,6 +296,13 @@ impl Database {
             .bind(now)
             .bind(key_id.to_string())
             .execute(&mut *transaction)
+            .await?;
+            remove_key_credential_recovery_secrets_in_transaction(
+                &mut transaction,
+                key_id,
+                current.try_get("credential_generation")?,
+                now,
+            )
             .await?;
         }
         transaction.commit().await?;
@@ -500,6 +514,10 @@ impl Database {
         .await?;
 
         insert_credential(&mut tx, &issued, 1, now).await?;
+        store_issued_key_credential_recovery_secret_in_transaction(
+            &mut tx, &issued, 1, pepper, now,
+        )
+        .await?;
         if initial_balance_micros != 0 {
             sqlx::query(
                 "INSERT INTO ledger_entries (id, account_id, key_id, kind, amount_micros, currency, source, created_at) VALUES ($1, $2, $3, 'grant', $4, $5, 'initial', $6)",
@@ -605,6 +623,12 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         insert_credential(&mut tx, &issued, generation, now).await?;
+        remove_key_credential_recovery_secrets_in_transaction(&mut tx, key_id, generation - 1, now)
+            .await?;
+        store_issued_key_credential_recovery_secret_in_transaction(
+            &mut tx, &issued, generation, pepper, now,
+        )
+        .await?;
         sqlx::query(
             "UPDATE key_records SET credential_generation = $1, updated_at = $2 WHERE id = $3",
         )
@@ -636,6 +660,7 @@ impl Database {
         tx.commit().await?;
         Ok(response)
     }
+
     pub async fn authenticate_key(
         &self,
         value: &str,
@@ -1082,6 +1107,7 @@ async fn insert_credential(
     .await?;
     Ok(())
 }
+
 fn managed_key_view(row: AnyRow) -> Result<ManagedKeyView, AppError> {
     let policy_json: String = row.try_get("policy_json")?;
     Ok(ManagedKeyView {
@@ -1094,6 +1120,7 @@ fn managed_key_view(row: AnyRow) -> Result<ManagedKeyView, AppError> {
         status: row.try_get("status")?,
         credential_generation: row.try_get("credential_generation")?,
         fingerprint: row.try_get("fingerprint")?,
+        credential_recovery_available: row.try_get::<i64, _>("credential_recovery_available")? != 0,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         policy: serde_json::from_str(&policy_json).map_err(|_| AppError::Internal)?,
@@ -1194,6 +1221,164 @@ mod tests {
     use super::super::super::*;
 
     #[tokio::test]
+    async fn durable_recovery_envelope_keeps_the_active_key_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("credential-recovery.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"credential recovery pepper longer than thirty-two bytes";
+        let issued = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "credential-recovery".to_owned(),
+                    principal_external_id: "member".to_owned(),
+                    alias: "recoverable".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::ZERO,
+                    idempotency_key: None,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+
+        let listed = database
+            .list_managed_keys(Some("credential-recovery"), Some("member"))
+            .await
+            .unwrap();
+        assert!(listed[0].credential_recovery_available);
+        let copied = database
+            .copy_key_credential(issued.key_id, pepper, None)
+            .await
+            .unwrap();
+        assert_eq!(copied.key, issued.key);
+        assert_eq!(copied.credential_generation, 1);
+        assert_eq!(
+            database
+                .authenticate_key(&copied.key, pepper)
+                .await
+                .unwrap()
+                .credential_generation,
+            1
+        );
+
+        let ciphertext: String =
+            sqlx::query("SELECT ciphertext FROM key_credential_recovery_secrets WHERE key_id = $1")
+                .bind(issued.key_id.to_string())
+                .fetch_one(&database.pool)
+                .await
+                .unwrap()
+                .try_get("ciphertext")
+                .unwrap();
+        assert!(!ciphertext.contains(&issued.key));
+        let audit = sqlx::query(
+            "SELECT action, actor_service_id FROM key_credential_recovery_audit WHERE key_id = $1 ORDER BY created_at, id",
+        )
+        .bind(issued.key_id.to_string())
+        .fetch_all(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(audit.len(), 2);
+        assert_eq!(audit[0].try_get::<String, _>("action").unwrap(), "stored");
+        assert_eq!(
+            audit[1].try_get::<String, _>("action").unwrap(),
+            "retrieved"
+        );
+        assert!(audit.iter().all(|row| {
+            row.try_get::<Option<String>, _>("actor_service_id")
+                .unwrap()
+                .is_none()
+        }));
+    }
+
+    #[tokio::test]
+    async fn unavailable_credential_can_be_authorizedly_supplemented_without_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("credential-recovery-supplement.db")
+                .display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let pepper = b"credential recovery supplement pepper longer than thirty-two bytes";
+        let issued = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: "credential-recovery-supplement".to_owned(),
+                    principal_external_id: "member".to_owned(),
+                    alias: "supplementable".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::ZERO,
+                    idempotency_key: None,
+                },
+                pepper,
+            )
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM key_credential_recovery_secrets WHERE key_id = $1")
+            .bind(issued.key_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            database
+                .copy_key_credential(issued.key_id, pepper, None)
+                .await,
+            Err(AppError::NotFound)
+        ));
+        assert!(matches!(
+            database
+                .store_key_credential_recovery_secret(
+                    issued.key_id,
+                    "mtc_not_the_active_credential_material",
+                    pepper,
+                    None,
+                )
+                .await,
+            Err(AppError::BadRequest(_))
+        ));
+        database
+            .store_key_credential_recovery_secret(issued.key_id, &issued.key, pepper, None)
+            .await
+            .unwrap();
+        let copied = database
+            .copy_key_credential(issued.key_id, pepper, None)
+            .await
+            .unwrap();
+        assert_eq!(copied.key, issued.key);
+        assert_eq!(copied.credential_generation, 1);
+
+        database
+            .set_key_status(issued.key_id, "revoked")
+            .await
+            .unwrap();
+        assert!(matches!(
+            database
+                .copy_key_credential(issued.key_id, pepper, None)
+                .await,
+            Err(AppError::Forbidden)
+        ));
+        let remaining: i64 = sqlx::query(
+            "SELECT COUNT(*) AS count FROM key_credential_recovery_secrets WHERE key_id = $1",
+        )
+        .bind(issued.key_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap()
+        .try_get("count")
+        .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
     async fn sqlite_key_rotation_is_concurrent_idempotent_and_resource_bound() {
         let directory = tempfile::tempdir().unwrap();
         let database_url = format!(
@@ -1255,6 +1440,14 @@ mod tests {
             .unwrap();
         assert_eq!(authenticated.account_id, issued.account_id);
         assert_eq!(authenticated.policy.requests_per_minute, 60);
+        assert_eq!(
+            database
+                .copy_key_credential(issued.key_id, pepper, None)
+                .await
+                .unwrap()
+                .key,
+            rotated[0].key
+        );
 
         let service = database
             .create_service_token(

@@ -1,6 +1,7 @@
 use super::*;
 
 mod keys;
+mod recovery;
 mod service_tokens;
 
 pub(crate) use keys::{
