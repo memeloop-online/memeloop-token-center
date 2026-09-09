@@ -26,6 +26,7 @@ mod request_event_stream;
 pub mod schema;
 pub mod server;
 pub mod session_archive_import;
+mod upstream_quota;
 pub mod worker;
 
 use std::{sync::Arc, time::Duration};
@@ -63,6 +64,7 @@ pub struct AppState {
     pub(crate) gateway_body_rejections: Arc<gateway_body::GatewayBodyRejectionMetrics>,
     pub(crate) proxy_lifecycle_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) proxy_archive_stream_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) upstream_quota: Arc<upstream_quota::QuotaCache>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +122,7 @@ impl AppState {
             plugins,
             metrics: metrics::Metrics::default(),
             request_event_streams: request_event_stream::RequestEventStreamLimiter::default(),
+            upstream_quota: Arc::new(upstream_quota::QuotaCache::default()),
             gateway_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 gateway_body_read_concurrency,
             )),

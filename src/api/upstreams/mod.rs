@@ -7,6 +7,7 @@ mod native_codex_upgrade;
 mod oauth;
 mod oauth_claude;
 mod oauth_copilot;
+mod quota;
 
 pub(in crate::api) use accounts::{
     create_upstream, delete_upstream, get_upstream_deletion_readiness, list_upstreams,
@@ -24,6 +25,7 @@ pub(in crate::api) use models::{
 pub(in crate::api) use native_codex_upgrade::{
     apply_native_codex_upgrade, prepare_native_codex_upgrade,
 };
+pub(in crate::api) use quota::upstream_quota;
 
 pub(crate) use oauth::refresh_managed_upstream_oauth;
 pub(in crate::api) use oauth::{
