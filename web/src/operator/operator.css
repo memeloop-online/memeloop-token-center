@@ -998,6 +998,50 @@
   overflow-wrap: anywhere;
 }
 
+.credential-recovery-control {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.credential-recovery-unavailable {
+  color: #71868d;
+}
+
+.credential-recovery-manual {
+  background: #0d1d21;
+  border: 1px solid #294047;
+  display: grid;
+  gap: 8px;
+  max-width: 100%;
+  padding: 10px;
+}
+
+.credential-recovery-manual b {
+  color: #b7c7cb;
+  font-size: 14px;
+}
+
+.credential-recovery-manual code {
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.credential-recovery-manual button {
+  justify-self: start;
+}
+
+:root[data-theme='light'] .credential-recovery-manual {
+  background: #f5f8f9;
+  border-color: #cbd8dc;
+}
+
+:root[data-theme='light'] .credential-recovery-manual b {
+  color: #354b53;
+}
+
 .policy-chips {
   display: flex;
   flex-wrap: wrap;

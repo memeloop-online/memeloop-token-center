@@ -10,7 +10,7 @@ import { safeValidator as validator } from '../../safeValidator';
 import type {
   ConfigurationSchemas, CredentialRoutingView, GenerationPriceView, GroupView, KeyLimitSnapshot, KeyListCursor, KeyView,
   ModelPriceSyncResult, ModelPriceUsageSummary, ModelPriceView, ModelRouteView, ProviderType,
-  ServiceTokenView, UpstreamAccount, UpstreamDeletionReadiness, UpstreamHealth,
+  OperatorMonitoringSnapshot, ServiceTokenView, UpstreamAccount, UpstreamDeletionReadiness, UpstreamHealth,
 } from '../../types';
 import { GroupManager, useGroups } from '../GroupManager';
 import { MultiCombobox, type ComboboxOption } from '../MultiCombobox';
@@ -23,6 +23,7 @@ import {
   type KeyListLoadState, type KeyListRequestIdentity,
 } from '../keyPagination';
 import { directCredentialSchema, supportsDirectConnection } from '../providerConnectionMethods';
+import { UpstreamAvailability } from '../UpstreamAvailability';
 import { useOperatorResource, type ResourceState } from '../hooks/useOperatorResource';
 import { enumLabel, messageOf, OneTimeSecret, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
 
@@ -30,12 +31,22 @@ function Form(props: FormProps) {
   return <RjsfForm {...props} noHtml5Validate onError={() => { /* Validation is rendered inline. */ }} />;
 }
 
+function recentAvailabilityPath(tenant: string, now: number) {
+  const query = new URLSearchParams({
+    scope: tenant ? 'tenant' : 'global',
+    from_created_at: String(now - 86_400_000),
+    to_created_at: String(now),
+  });
+  if (tenant) query.set('tenant_external_id', tenant);
+  return `/internal/v1/monitoring-snapshot?${query}`;
+}
+
 function isPositiveDecimal(value: string) {
   const normalized = value.trim();
   return /^(?:\d+(?:\.\d+)?|\.\d+)$/.test(normalized) && /[1-9]/.test(normalized);
 }
 
-function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, onChanged }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; onChanged: () => Promise<void> }) {
+function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityError, onOpenRequest, onChanged }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityError?: string; onOpenRequest?: (requestId: string) => void; onChanged: () => Promise<void> }) {
   const { locale, t } = useI18n();
   const [method, setMethod] = useState<'direct' | 'authorization'>('direct');
   const [driver, setDriver] = useState('');
@@ -160,8 +171,6 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
     const messages: string[] = [];
     if (readiness.requires_disabled) messages.push(t('providers.deleteRequiresDisabled'));
     if (readiness.model_route_count > 0) messages.push(t('providers.deleteBlockedRoutes', { count: formatNumber(readiness.model_route_count, locale) }));
-    if (readiness.request_history_count > 0) messages.push(t('providers.deleteBlockedRequestHistory', { count: formatNumber(readiness.request_history_count, locale) }));
-    if (readiness.generation_history_count > 0) messages.push(t('providers.deleteBlockedGenerationHistory', { count: formatNumber(readiness.generation_history_count, locale) }));
     if (readiness.imported_for_audit) messages.push(t('providers.deleteBlockedImport'));
     if (readiness.can_delete) messages.push(t('providers.deleteReady'));
     return messages;
@@ -188,10 +197,10 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
 
   return <><WriteScopeNotice tenant={writeTenant} /><section className="provider-layout">
     <article className="panel provider-list"><div className="panel-title"><div><h2>{t('providers.title')}</h2><p className="muted">{t('providers.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
-      {error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}
+      {error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{availabilityError && <div className="notice error" role="alert">{availabilityError}</div>}{message && <div className="notice success" role="status">{message}</div>}
       <div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('providers.empty')} />}{statusFilter.values.map((value) => {
         const providerAvailable = providers.some((provider) => provider.id === value.driver);
-        const currentHealth = value.status === 'active' && providerAvailable ? health[value.id] : undefined;
+        const currentHealth = providerAvailable ? health[value.id] : undefined;
         const manageable = canManage(value);
         const memberships = providerGroups.groups.filter((group) => group.member_ids.includes(value.id));
         const currentReadiness = deletionReadiness[value.id];
@@ -204,7 +213,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             {!providerAvailable && <span className="pill">{t('providers.retired')}</span>}
             <small>{value.id}</small>
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
-            {currentHealth && <small className={`status ${currentHealth.status === 'healthy' ? 'ok' : 'pending'}`}>{currentHealth.status === 'healthy' ? t('providers.healthy') : t('providers.unhealthy')}{currentHealth.upstream_status ? ` · HTTP ${formatNumber(currentHealth.upstream_status, locale)}` : ''}{currentHealth.latency_ms !== undefined ? ` · ${formatNumber(currentHealth.latency_ms, locale, 2)} ms` : ''}</small>}
+            <UpstreamAvailability account={value} snapshot={availabilitySnapshot} manualHealth={currentHealth} onOpenRequest={onOpenRequest} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">
@@ -214,7 +223,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <div className="row-actions">
               {providerAvailable && <>
                 <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setEditing(value)}>{t('providers.edit')}</button>
-                <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.health')}</button>
+                <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</button>
                 {value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}
                 {value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}
                 {value.auth_kind === 'oauth' && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</button>}
@@ -613,6 +622,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const [keyError, setKeyError] = useState('');
   const [routeError, setRouteError] = useState('');
   const [secret, setSecret] = useState('');
+  const [manualRecoverySecret, setManualRecoverySecret] = useState<{ keyId: string; key: string }>();
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const scopeGeneration = useRef(0);
@@ -694,7 +704,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   useEffect(() => {
     scopeGeneration.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
     setRenaming(undefined); setAliasDraft(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
-    setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(''); setMessage(''); setError(''); void load();
+    setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(''); setManualRecoverySecret(undefined); setMessage(''); setError(''); void load();
     return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); };
   }, [token, tenant, writeTenant]);
   const loadMore = async () => {
@@ -733,6 +743,31 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const canReadLimits = canReadCredentialLimits(token);
   const canWrite = canWriteCredential(writeTenant);
   const canManage = (value: KeyView) => canWrite && value.tenant_external_id === writeTenant;
+  const copyRecoveredCredential = async (value: KeyView) => {
+    if (!canManage(value) || value.status !== 'active' || !value.credential_recovery_available) return;
+    const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant;
+    setBusy(`copy-${value.key_id}`); setError(''); setMessage(''); setManualRecoverySecret(undefined);
+    try {
+      const result = await api<{ key_id: string; credential_generation: number; key: string }>(`/internal/v1/keys/${value.key_id}/credential-recovery/copy`, operationToken, { method: 'POST' });
+      if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
+      if (result.key_id !== value.key_id || result.credential_generation !== value.credential_generation) throw new Error(t('common.requestFailed'));
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
+        await navigator.clipboard.writeText(result.key);
+        if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
+        setMessage(t('credentials.copySuccess', { alias: value.alias }));
+      } catch {
+        if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
+        // The recovered value remains only in this component state so the
+        // authorized operator can manually copy it. It is never persisted.
+        setManualRecoverySecret({ keyId: value.key_id, key: result.key });
+      }
+    } catch (reason) {
+      if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) setError(messageOf(reason, t('common.requestFailed')));
+    } finally {
+      if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) setBusy('');
+    }
+  };
   const routeOptions = routes.filter((route) => route.tenant_external_id === writeTenant).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }));
   const routeGroupOptions = routeGroups.groups.map((group) => ({ value: group.id, label: group.name, description: t('groups.memberCount', { count: formatNumber(group.member_count, locale) }) }));
   const openRouting = async (value: KeyView) => {
@@ -768,6 +803,16 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       <div className="account-list">{filteredValues.length === 0 && (loadingKeys ? <div className="empty">{t('common.loading')}</div> : keyListState === 'failed' ? <div className="empty">{t('credentials.loadFailed', { count: formatNumber(values.length, locale) })}</div> : <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={values.length === 0 ? t('credentials.empty') : t('credentials.noFilterResults')} />)}{filteredValues.map((value) => {
         const memberships = credentialGroups.groups.filter((group) => group.member_ids.includes(value.key_id));
         return <div className="managed-resource" key={value.key_id}><div className="managed-resource-header"><div><b>{value.alias}</b><small>{value.key_id}</small><span>{!tenant && <>{t('credentials.tenant')}: {value.tenant_external_id ?? '—'} · </>}{value.principal_external_id ?? t('common.unknownPrincipal')} · {formatCurrency(value.available_balance, value.currency, locale)}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div>
+          <div className="credential-recovery-control">
+            {value.credential_recovery_available && value.status === 'active'
+              ? <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={() => void copyRecoveredCredential(value)}>{busy === `copy-${value.key_id}` ? t('common.loading') : t('credentials.copy')}</button>
+              : <span className="pill credential-recovery-unavailable" title={t('credentials.copyUnavailable')}>{t('credentials.copyUnavailable')}</span>}
+            {manualRecoverySecret?.keyId === value.key_id && <div className="credential-recovery-manual" role="status">
+              <b>{t('credentials.copyManual')}</b>
+              <code>{manualRecoverySecret.key}</code>
+              <button type="button" className="secondary" onClick={() => setManualRecoverySecret(undefined)}>{t('common.close')}</button>
+            </div>}
+          </div>
           {memberships.length > 0 && <div className="table-chip-list credential-group-chips" aria-label={t('groups.credential.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
           <div className="policy-chips"><span>{enumLabel(t, 'enforcementMode', value.policy.enforcement_mode)}</span><span>RPM {formatNumber(value.policy.requests_per_minute, locale)}</span><span>TPM {formatNumber(value.policy.tokens_per_minute, locale)}</span><span>{t('self.concurrency')} {formatNumber(value.policy.max_concurrency, locale)}</span><span>{t('budget.daily')}: {value.policy.daily_budget === null ? '—' : formatCurrency(value.policy.daily_budget, value.currency, locale)}</span><span>{t('budget.weekly')}: {value.policy.weekly_budget === null ? '—' : formatCurrency(value.policy.weekly_budget, value.currency, locale)}</span><span>{t('budget.lifetime')}: {value.policy.lifetime_budget === null ? '—' : formatCurrency(value.policy.lifetime_budget, value.currency, locale)}</span></div>
           <div className="row-actions"><button type="button" className="secondary" disabled={!canWrite} onClick={() => { setRenaming(renaming === value.key_id ? undefined : value.key_id); setAliasDraft(value.alias); }}>{t('credentials.rename')}</button><button type="button" className="secondary" disabled={!canReadLimits} onClick={async () => { try { const snapshot = await api<KeyLimitSnapshot>(`/internal/v1/keys/${value.key_id}/limits`, token); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setLimitSnapshots((current) => ({ ...current, [value.key_id]: snapshot })); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{t('credentials.viewLimits')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked' || Boolean(busy)} onClick={async () => { if (!window.confirm(`${t('credentials.rotate')} · ${value.alias}\n${value.key_id}`)) return; setBusy(`rotate-${value.key_id}`); try { const result = await api<{ key: string }>(`/internal/v1/keys/${value.key_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setSecret(result.key); setMessage(t('credentials.rotated', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.rotate')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked'} onClick={() => setEditingPolicy(editingPolicy === value.key_id ? undefined : value.key_id)}>{t('credentials.editPolicy')}</button><button type="button" className="secondary" disabled={!canWrite || value.status === 'revoked'} onClick={() => void openRouting(value)}>{t('credentials.routing')}</button><button type="button" className="secondary" disabled={!canWrite || !value.account_id || value.status === 'revoked'} title={!value.account_id ? t('credentials.accountMissing') : undefined} onClick={() => setGranting(granting === value.key_id ? undefined : value.key_id)}>{t('credentials.grant')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canWrite} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; try { await api(`/internal/v1/keys/${value.key_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setMessage(t(nextStatus === 'active' ? 'credentials.resumed' : 'credentials.suspended', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } }}>{value.status === 'active' ? t('credentials.suspend') : t('credentials.resume')}</button>}</div>
@@ -850,21 +895,24 @@ function ResourceBoundary<T>({ resource, scopeKey, children }: {
   return <>{resource.kind === 'ready' && resource.refreshError && <div className="notice error" role="alert">{resource.refreshError}</div>}{children(value)}</>;
 }
 
-export function ProvidersPage({ token, tenant, writeTenant }: OperatorPageProps) {
+export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest }: OperatorPageProps & { onOpenRequest?: (requestId: string) => void }) {
   const { t } = useI18n();
   const resource = useOperatorResource(
     Boolean(token), `${token}\0${tenant}`,
     async () => {
-      const [providers, values] = await Promise.all([
+      const [providers, values, availability] = await Promise.all([
         api<ProviderType[]>('/internal/v1/provider-types', token),
         api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token),
+        api<OperatorMonitoringSnapshot>(recentAvailabilityPath(tenant, Date.now()), token)
+          .then((availabilitySnapshot) => ({ availabilitySnapshot, availabilityError: undefined }))
+          .catch((reason) => ({ availabilitySnapshot: undefined, availabilityError: messageOf(reason, t('providers.availabilityUnavailable')) })),
       ]);
-      return { providers, values };
+      return { providers, values, ...availability };
     },
     t('common.requestFailed'),
   );
-  return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, values }) =>
-    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} onChanged={resource.reload} />
+  return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, values, availabilitySnapshot, availabilityError }) =>
+    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} availabilitySnapshot={availabilitySnapshot} availabilityError={availabilityError} onOpenRequest={onOpenRequest} onChanged={resource.reload} />
   }</ResourceBoundary>;
 }
 
