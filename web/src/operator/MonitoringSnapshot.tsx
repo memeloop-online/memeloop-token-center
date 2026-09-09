@@ -2,6 +2,7 @@ import { Metric, NumberMetric } from '../components';
 import { formatCurrency, formatElapsedTime, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import type { MonitoringHealth, OperatorMonitoringSnapshot, UsageAnalysisCost } from '../types';
+import { monitoringAccountGroups } from './monitoringAccountGroups';
 
 function CostLines({ costs }: { costs: UsageAnalysisCost[] }) {
   const { locale } = useI18n();
@@ -68,14 +69,16 @@ export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringS
       </section>
     </article>
     <article className="panel monitoring-top-panel">
-      <div className="panel-title"><h2>{t('monitoring.topUpstreams')}</h2><span>{t('monitoring.topLimit')}</span></div>
+      <div className="panel-title"><h2>{t('monitoring.topUpstreams')}</h2><span>{t('monitoring.topAccountModelsScope')}</span></div>
       {!snapshot.top_upstream_models.length
         ? <div className="empty">{t('monitoring.noStableUpstreamTraffic')}</div>
-        : <ol className="monitoring-top-list">{snapshot.top_upstream_models.map((value) => {
+        : <ol className="monitoring-top-list">{monitoringAccountGroups(snapshot.top_upstream_models).map((group) => <li key={group.id} data-upstream-account-id={group.id}>
+          <div className="monitoring-account-heading"><b>{group.name}</b><code title={group.id}>{group.id}</code></div>
+          <ol className="monitoring-account-models">{group.models.map((value) => {
           const metrics = value.metrics;
           return <li key={`${value.upstream_account_id}\0${value.model}`}>
             <div className="monitoring-top-heading">
-              <div><b>{value.upstream_name}</b><code>{value.model}</code></div>
+              <div><code>{value.model}</code></div>
               <RoutingStatusBadge health={value.health} />
             </div>
             <MonitoringMetricList metrics={metrics} />
@@ -89,7 +92,8 @@ export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringS
               </li>)}
             </ol>
           </li>;
-        })}</ol>}
+          })}</ol>
+        </li>)}</ol>}
     </article>
   </section>;
 }

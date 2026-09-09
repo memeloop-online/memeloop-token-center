@@ -46,11 +46,16 @@
 }
 
 .monitoring-top-list,
+.monitoring-account-models,
 .monitoring-outcomes {
   list-style: none;
   margin: 0;
   padding: 0;
 }
+
+.monitoring-account-heading { display: grid; gap: 5px; margin-bottom: 14px; }
+.monitoring-account-heading > code { color: #71868d; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.monitoring-account-models > li + li { border-top: 1px solid #1d2c31; margin-top: 14px; padding-top: 14px; }
 
 .monitoring-top-list > li {
   border-top: 1px solid #1d2c31;
