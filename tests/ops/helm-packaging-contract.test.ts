@@ -55,6 +55,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     const postgres = Math.max(...migrationVersions('common'), ...migrationVersions('postgres'));
     assert.equal(sqlite, postgres);
     assert.equal(Number(/^  schemaVersion: ([0-9]+)$/m.exec(read('charts/memeloop-token-center/values.yaml'))?.[1]), sqlite);
+    const valuesSchema = JSON.parse(read('charts/memeloop-token-center/values.schema.json'));
+    assert.equal(valuesSchema.properties.migration.properties.schemaVersion.const, sqlite);
     has('default', `memeloop.io/schema-generation: "v${sqlite}"`);
     count('default', 'image: "ghcr.io/memeloop-online/memeloop-token-center:0.1.0"', 4);
     count('digest', `image: "ghcr.io/memeloop-online/memeloop-token-center@${reviewed}"`, 4); lacks('digest', 'must-not-render');

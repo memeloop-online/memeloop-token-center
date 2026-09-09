@@ -976,43 +976,6 @@ fn migration_error_category(error: &sqlx::Error) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{Database, Migration, apply_migration_range};
-
-    #[tokio::test]
-    async fn raw_sql_migrations_accept_semicolons_in_comments_and_literals() {
-        let directory = tempfile::tempdir().unwrap();
-        let database_url = format!(
-            "sqlite://{}?mode=rwc",
-            directory.path().join("migration-delimiters.db").display()
-        );
-        let database = Database::connect(&database_url).await.unwrap();
-        sqlx::query(
-            "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
-        )
-        .execute(&database.pool)
-        .await
-        .unwrap();
-        let migrations = [Migration {
-            version: 1,
-            name: "delimiter fixture",
-            sql: "CREATE TABLE migration_delimiter_fixture (value TEXT NOT NULL);\n-- A semicolon in a comment; the rest of this line is still a comment.\nINSERT INTO migration_delimiter_fixture (value) VALUES ('literal; value');",
-        }];
-        let mut transaction = database.pool.begin().await.unwrap();
-        apply_migration_range(&mut transaction, &migrations, 1, 1)
-            .await
-            .unwrap();
-        transaction.commit().await.unwrap();
-
-        let value: String = sqlx::query_scalar("SELECT value FROM migration_delimiter_fixture")
-            .fetch_one(&database.pool)
-            .await
-            .unwrap();
-        assert_eq!(value, "literal; value");
-    }
-}
-
 pub(super) async fn maintain_postgres_partitions(
     connection: &mut AnyConnection,
 ) -> Result<PartitionMaintenanceReport, sqlx::Error> {
@@ -1111,4 +1074,41 @@ fn is_default_partition_overlap(error: &sqlx::Error) -> bool {
         sqlx::Error::Database(database_error)
             if database_error.code().as_deref() == Some("23514")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Database, Migration, apply_migration_range};
+
+    #[tokio::test]
+    async fn raw_sql_migrations_accept_semicolons_in_comments_and_literals() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("migration-delimiters.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL)",
+        )
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let migrations = [Migration {
+            version: 1,
+            name: "delimiter fixture",
+            sql: "CREATE TABLE migration_delimiter_fixture (value TEXT NOT NULL);\n-- A semicolon in a comment; the rest of this line is still a comment.\nINSERT INTO migration_delimiter_fixture (value) VALUES ('literal; value');",
+        }];
+        let mut transaction = database.pool.begin().await.unwrap();
+        apply_migration_range(&mut transaction, &migrations, 1, 1)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let value: String = sqlx::query_scalar("SELECT value FROM migration_delimiter_fixture")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(value, "literal; value");
+    }
 }

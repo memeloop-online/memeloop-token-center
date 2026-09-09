@@ -9,6 +9,13 @@ struct KeyCredentialRecoveryEnvelope {
     key: String,
 }
 
+struct KeyCredentialRecoverySecret<'a> {
+    credential_id: Uuid,
+    key_id: Uuid,
+    generation: i64,
+    credential: &'a str,
+}
+
 impl Database {
     /// Seals a caller-supplied existing credential only when it is exactly the
     /// active credential for this stable key and generation. This supports an
@@ -52,10 +59,12 @@ impl Database {
         }
         store_key_credential_recovery_secret_in_transaction(
             &mut tx,
-            parse_uuid(current.try_get("credential_id")?)?,
-            key_id,
-            current.try_get("credential_generation")?,
-            credential,
+            KeyCredentialRecoverySecret {
+                credential_id: parse_uuid(current.try_get("credential_id")?)?,
+                key_id,
+                generation: current.try_get("credential_generation")?,
+                credential,
+            },
             pepper,
             actor_service_id,
             unix_millis(),
@@ -134,10 +143,12 @@ pub(super) async fn store_issued_key_credential_recovery_secret_in_transaction(
 ) -> Result<(), AppError> {
     store_key_credential_recovery_secret_in_transaction(
         tx,
-        issued.credential_id,
-        issued.key_id,
-        generation,
-        &issued.secret,
+        KeyCredentialRecoverySecret {
+            credential_id: issued.credential_id,
+            key_id: issued.key_id,
+            generation,
+            credential: &issued.secret,
+        },
         pepper,
         None,
         now,
@@ -167,14 +178,17 @@ fn key_credential_recovery_aad(key_id: Uuid, generation: i64) -> String {
 
 async fn store_key_credential_recovery_secret_in_transaction(
     tx: &mut Transaction<'_, Any>,
-    credential_id: Uuid,
-    key_id: Uuid,
-    generation: i64,
-    credential: &str,
+    secret: KeyCredentialRecoverySecret<'_>,
     pepper: &[u8],
     actor_service_id: Option<Uuid>,
     now: i64,
 ) -> Result<(), AppError> {
+    let KeyCredentialRecoverySecret {
+        credential_id,
+        key_id,
+        generation,
+        credential,
+    } = secret;
     let aad = key_credential_recovery_aad(key_id, generation);
     let envelope = KeyCredentialRecoveryEnvelope {
         key_id,
