@@ -18,10 +18,11 @@ function ManualHealthCheck({ health }: { health?: UpstreamHealth }) {
   </section>;
 }
 
-export function UpstreamAvailability({ account, snapshot, window, manualHealth, onOpenRequest }: {
+export function UpstreamAvailability({ account, snapshot, window, loading = false, manualHealth, onOpenRequest }: {
   account: UpstreamAccount;
   snapshot?: OperatorMonitoringSnapshot;
   window?: UpstreamAvailabilityWindow;
+  loading?: boolean;
   manualHealth?: UpstreamHealth;
   onOpenRequest?: (requestId: string) => void;
 }) {
@@ -42,7 +43,7 @@ export function UpstreamAvailability({ account, snapshot, window, manualHealth, 
         {account.credential_expires_at !== null && <span className="provider-availability-state"><small>{t('providers.credentialStatus')}</small><span className={`status ${expired ? 'bad' : 'pending'}`}>{expired ? t('providers.credentialExpired') : t('providers.credentialExpires', { time: new Date(account.credential_expires_at).toLocaleString(locale) })}</span></span>}
       </div>
     </div>
-    {!facts ? <div className="provider-availability-empty">{t('providers.availabilityUnavailable')}</div> : <>
+    {!facts ? <div className="provider-availability-empty" role={loading ? 'status' : undefined}>{t(loading ? 'common.loading' : 'providers.availabilityUnavailable')}</div> : <>
       <p className="provider-availability-scope">{t('providers.accountWindowScope')}</p>
       <dl className="provider-availability-metrics provider-account-metrics">
         <div><dt>{t('usage.requests')}</dt><dd>{formatNumber(facts.metrics.requests, locale)}</dd></div>

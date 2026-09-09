@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { Shell } from '../components';
 import { useI18n } from '../i18n';
 import type { PluginManifest, TypedFilterAst, UsageAnalysisSessionBucket } from '../types';
@@ -7,6 +7,7 @@ import './operator.css';
 import type { SessionFocus } from './SessionMonitor';
 import type { RequestDrilldown } from './overviewDrilldown';
 import { useOperatorScope } from './hooks/useOperatorScope';
+import { useOperatorResource } from './hooks/useOperatorResource';
 import { useOperatorRequestStream } from './hooks/useOperatorRequestStream';
 import { CredentialsPage, PricingPage, ProvidersPage, RoutesPage, ServiceCredentialsPage } from './pages/ManagementPages';
 import { GenerationsPage, OverviewPage, PluginsPage, UsagePage } from './pages/OperatorPages';
@@ -19,7 +20,6 @@ import {
   PluginContributionPage,
   PluginOverviewCards,
   registerOperatorPluginContributions,
-  type OperatorPluginRegistry,
   type PluginNavigationSection,
 } from './pluginContributions';
 import type { PluginRouteKey } from '../app/routes';
@@ -62,7 +62,13 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
   const [requestFocus, setRequestFocus] = useState<{ requestId: string; revision: number }>();
   const [requestDrilldown, setRequestDrilldown] = useState<(RequestDrilldown & { token: string; tenant: string })>();
   const requestDrilldownRevision = useRef(0);
-  const [pluginRegistry, setPluginRegistry] = useState<OperatorPluginRegistry>(() => registerOperatorPluginContributions([]));
+  const pluginCatalog = useOperatorResource(
+    Boolean(scope.activeCredential), scope.activeCredential,
+    (signal) => api<PluginManifest[]>('/internal/v1/plugins', scope.activeCredential, { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) }),
+    t('common.requestFailed'),
+  );
+  const pluginManifests = pluginCatalog.state.kind === 'ready' ? pluginCatalog.state.value : undefined;
+  const pluginRegistry = useMemo(() => registerOperatorPluginContributions(pluginManifests ?? []), [pluginManifests]);
   const credentialScope = useRef({ credential: '', generation: 0 });
   if (credentialScope.current.credential !== scope.activeCredential) {
     credentialScope.current = {
@@ -84,29 +90,8 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
   });
 
   useEffect(() => {
-    let active = true;
-    const credential = scope.activeCredential;
-    if (!credential) {
-      const empty = registerOperatorPluginContributions([]);
-      setPluginRegistry(empty);
-      onPluginNavigation?.(empty.navigation);
-      return () => { active = false; };
-    }
-    void api<PluginManifest[]>('/internal/v1/plugins', credential)
-      .then((manifests) => {
-        if (!active) return;
-        const next = registerOperatorPluginContributions(manifests);
-        setPluginRegistry(next);
-        onPluginNavigation?.(next.navigation);
-      })
-      .catch(() => {
-        if (!active) return;
-        const empty = registerOperatorPluginContributions([]);
-        setPluginRegistry(empty);
-        onPluginNavigation?.(empty.navigation);
-      });
-    return () => { active = false; };
-  }, [onPluginNavigation, scope.activeCredential]);
+    onPluginNavigation?.(pluginRegistry.navigation);
+  }, [onPluginNavigation, pluginRegistry]);
 
   function navigate(next: OperatorRouteKey) {
     if (route === undefined) setInternalRoute(next);
@@ -183,7 +168,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
         case 'tenants': page = <TenantManager token={scope.activeCredential} onChanged={scope.refreshTenants} />; break;
         case 'credentials': page = <CredentialsPage {...pageProps} />; break;
         case 'service-credentials': page = <ServiceCredentialsPage {...pageProps} />; break;
-        case 'plugins': page = <PluginsPage {...pageProps} />; break;
+        case 'plugins': page = <PluginsPage {...pageProps} catalog={pluginCatalog.state} />; break;
         case 'settings': page = <>{accessSettings}<SystemSettingsPage {...pageProps} /></>; break;
       }
     } else {

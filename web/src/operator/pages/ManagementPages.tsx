@@ -48,7 +48,7 @@ function isPositiveDecimal(value: string) {
   return /^(?:\d+(?:\.\d+)?|\.\d+)$/.test(normalized) && /[1-9]/.test(normalized);
 }
 
-function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, onOpenRequest, onChanged }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; onOpenRequest?: (requestId: string) => void; onChanged: () => Promise<void> }) {
+function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, availabilityLoading, onOpenRequest, onChanged }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; availabilityLoading?: boolean; onOpenRequest?: (requestId: string) => void; onChanged: () => Promise<void> }) {
   const { locale, t } = useI18n();
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
   const [method, setMethod] = useState<'direct' | 'authorization'>('direct');
@@ -216,7 +216,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             {!providerAvailable && <span className="pill">{t('providers.retired')}</span>}
             <small>{value.id}</small>
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
-            <UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} manualHealth={currentHealth} onOpenRequest={onOpenRequest} />
+            <UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">
@@ -929,25 +929,40 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest }: Ope
   const { t } = useI18n();
   const resource = useOperatorResource(
     Boolean(token), `${token}\0${tenant}`,
-    async () => {
+    async (signal) => {
+      const [providers, values] = await Promise.all([
+        api<ProviderType[]>('/internal/v1/provider-types', token, { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) }),
+        api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token, { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) }),
+      ]);
+      return { providers, values };
+    },
+    t('common.requestFailed'),
+  );
+  // Statistics are independent: a slow aggregation must not hold the account
+  // list, create forms, or OAuth actions behind a four-request waterfall.
+  const statistics = useOperatorResource(
+    Boolean(token), `${token}\0${tenant}`,
+    async (signal) => {
       const now = Date.now();
-      const [providers, values, availability, windowResult] = await Promise.all([
-        api<ProviderType[]>('/internal/v1/provider-types', token),
-        api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token),
-        api<OperatorMonitoringSnapshot>(recentAvailabilityPath(tenant, now), token)
+      const [availability, windowResult] = await Promise.all([
+        api<OperatorMonitoringSnapshot>(recentAvailabilityPath(tenant, now), token, { signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) })
           .then((availabilitySnapshot) => ({ availabilitySnapshot, availabilityError: undefined }))
           .catch((reason) => ({ availabilitySnapshot: undefined, availabilityError: messageOf(reason, t('providers.availabilityUnavailable')) })),
-        tenant ? api<UpstreamAvailabilityWindow>(upstreamAvailabilityPath(tenant, now), token)
+        tenant ? api<UpstreamAvailabilityWindow>(upstreamAvailabilityPath(tenant, now), token, { signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) })
           .then((availabilityWindow) => ({ availabilityWindow, windowError: undefined }))
           .catch((reason) => ({ availabilityWindow: undefined, windowError: messageOf(reason, t('providers.availabilityUnavailable')) }))
           : Promise.resolve({ availabilityWindow: undefined, windowError: t('providers.accountWindowSelectTenant') }),
       ]);
-      return { providers, values, ...availability, availabilityWindow: windowResult.availabilityWindow, availabilityError: windowResult.windowError ?? availability.availabilityError };
+      return { ...availability, availabilityWindow: windowResult.availabilityWindow, availabilityError: windowResult.windowError ?? availability.availabilityError };
     },
     t('common.requestFailed'),
   );
-  return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, values, availabilitySnapshot, availabilityWindow, availabilityError }) =>
-    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} availabilitySnapshot={availabilitySnapshot} availabilityWindow={availabilityWindow} availabilityError={availabilityError} onOpenRequest={onOpenRequest} onChanged={resource.reload} />
+  const availability = statistics.state.kind === 'ready' ? statistics.state.value : {
+    availabilityError: statistics.state.kind === 'failed' ? statistics.state.message : undefined,
+    availabilityLoading: statistics.state.kind === 'idle' || statistics.state.kind === 'loading',
+  };
+  return <ResourceBoundary resource={resource.state} scopeKey={`${token}\0${tenant}`}>{({ providers, values }) =>
+    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onChanged={async () => { await Promise.all([resource.reload(), statistics.reload()]); }} />
   }</ResourceBoundary>;
 }
 

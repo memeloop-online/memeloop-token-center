@@ -96,14 +96,9 @@ export function GenerationsPage({ token, tenant, writeTenant }: OperatorPageProp
   return <GenerationWorkspace token={token} tenant={tenant} writeTenant={writeTenant} />;
 }
 
-export function PluginsPage({ token, tenant, writeTenant }: OperatorPageProps) {
+export function PluginsPage({ token, tenant, writeTenant, catalog }: OperatorPageProps & { catalog: ResourceState<PluginManifest[]> }) {
   const { t } = useI18n();
-  const resource = useOperatorResource(
-    Boolean(token), token,
-    () => api<PluginManifest[]>('/internal/v1/plugins', token),
-    t('common.requestFailed'),
-  );
-  if (resource.state.kind === 'idle' || resource.state.kind === 'loading') return <div className="empty">{t('common.loading')}</div>;
-  if (resource.state.kind === 'failed') return <div className="notice error" role="alert">{resource.state.message}</div>;
-  return <>{resource.state.refreshError && <div className="notice error" role="alert">{resource.state.refreshError}</div>}<Plugins token={token} tenant={tenant} writeTenant={writeTenant} values={resource.state.value} /></>;
+  if (catalog.scopeKey !== token || catalog.kind === 'idle' || catalog.kind === 'loading') return <div className="empty">{t('common.loading')}</div>;
+  if (catalog.kind === 'failed') return <div className="notice error" role="alert">{catalog.message}</div>;
+  return <>{catalog.refreshError && <div className="notice error" role="alert">{catalog.refreshError}</div>}<Plugins key={`${token}\0${tenant}\0${writeTenant}`} token={token} tenant={tenant} writeTenant={writeTenant} values={catalog.value} /></>;
 }

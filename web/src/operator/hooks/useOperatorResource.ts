@@ -32,29 +32,33 @@ function reducer<T>(state: ResourceState<T>, action: ResourceAction<T>): Resourc
 export function useOperatorResource<T>(
   enabled: boolean,
   scopeKey: string,
-  load: () => Promise<T>,
+  load: (signal: AbortSignal) => Promise<T>,
   fallbackMessage: string,
 ) {
   const [state, dispatch] = useReducer(reducer<T>, { kind: 'idle', scopeKey });
   const loadRef = useRef(load);
   const fallbackMessageRef = useRef(fallbackMessage);
   const sequence = useRef(0);
+  const controller = useRef<AbortController | undefined>(undefined);
   loadRef.current = load;
   fallbackMessageRef.current = fallbackMessage;
 
   const reload = useCallback(async () => {
+    controller.current?.abort();
     if (!enabled) {
       sequence.current += 1;
       dispatch({ type: 'reset', scopeKey });
       return;
     }
     const request = ++sequence.current;
+    const current = new AbortController();
+    controller.current = current;
     dispatch({ type: 'loading', scopeKey });
     try {
-      const value = await loadRef.current();
-      if (request === sequence.current) dispatch({ type: 'ready', scopeKey, value });
+      const value = await loadRef.current(current.signal);
+      if (!current.signal.aborted && request === sequence.current) dispatch({ type: 'ready', scopeKey, value });
     } catch (reason) {
-      if (request === sequence.current) {
+      if (!current.signal.aborted && request === sequence.current) {
         dispatch({ type: 'failed', scopeKey, message: reason instanceof Error ? reason.message : fallbackMessageRef.current });
       }
     }
@@ -66,7 +70,7 @@ export function useOperatorResource<T>(
     // lifecycle, so they cannot reset business state.
     dispatch({ type: 'reset', scopeKey });
     void reload();
-    return () => { sequence.current += 1; };
+    return () => { sequence.current += 1; controller.current?.abort(); };
   }, [reload, scopeKey]);
 
   // Effects run after paint. Never expose a ready value from the previous
