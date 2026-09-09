@@ -2,11 +2,17 @@
 //! linonetwo/CLIProxyAPI v7.2.128-onetwo.1, not a runtime dependency on that service.
 use super::{AppError, Protocol};
 use serde_json::{Value, json};
+mod messages;
+pub(in crate::api) mod responses;
+mod responses_request;
 
 pub(super) fn supports(protocol: Protocol) -> bool {
     matches!(
         protocol,
-        Protocol::OpenAiChat | Protocol::AnthropicMessages | Protocol::AnthropicCountTokens
+        Protocol::OpenAiChat
+            | Protocol::OpenAiResponses
+            | Protocol::AnthropicMessages
+            | Protocol::AnthropicCountTokens
     )
 }
 
@@ -39,11 +45,14 @@ pub(super) fn prepare(
             "native Kimi OAuth supports Chat Completions and Anthropic Messages/count_tokens; this protocol is unavailable".into(),
         ));
     }
+    if matches!(protocol, Protocol::OpenAiResponses) {
+        *request = responses_request::convert(request)?;
+    }
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be an object".into()))?;
     object.insert("model".into(), Value::String(normalize_model(model)));
-    if matches!(protocol, Protocol::OpenAiChat)
+    if matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses)
         && object.get("stream").and_then(Value::as_bool) == Some(true)
     {
         let options = object.entry("stream_options").or_insert_with(|| json!({}));
@@ -53,6 +62,9 @@ pub(super) fn prepare(
         // Billing must see the terminal usage chunk even when the client omitted
         // this option; retain every other client stream option.
         options.insert("include_usage".into(), Value::Bool(true));
+    }
+    if matches!(protocol, Protocol::OpenAiChat | Protocol::OpenAiResponses) {
+        messages::repair(request);
     }
     Ok(())
 }
@@ -114,7 +126,9 @@ mod tests {
         let mut body = json!({"thinking":{"type":"enabled","budget_tokens":1024}});
         prepare(Protocol::AnthropicMessages, "kimi-k3", &mut body).unwrap();
         assert_eq!(body["thinking"]["budget_tokens"], 1024);
-        assert!(prepare(Protocol::OpenAiResponses, "kimi-k3", &mut body).is_err());
+        let mut responses = json!({"input":"hello"});
+        prepare(Protocol::OpenAiResponses, "kimi-k3", &mut responses).unwrap();
+        assert_eq!(responses["messages"][0]["content"], "hello");
         assert!(prepare(Protocol::OpenAiEmbeddings, "kimi-k3", &mut body).is_err());
         assert!(supports(Protocol::AnthropicCountTokens));
         assert_eq!(catalog().len(), 16);

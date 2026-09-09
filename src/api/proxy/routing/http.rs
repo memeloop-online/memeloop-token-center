@@ -17,7 +17,14 @@ pub(super) async fn send_reqwest_proxy_route(
     )
     .await
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
-    let target_url = network::upstream_api_url(&outbound_base_url, protocol.path());
+    let target_url = network::upstream_api_url(
+        &outbound_base_url,
+        if route.kimi_response.is_some() {
+            Protocol::OpenAiChat.path()
+        } else {
+            protocol.path()
+        },
+    );
     let mut request = outbound_http
         .post(target_url)
         .body(route.forwarded_body.clone());
@@ -86,7 +93,11 @@ pub(super) async fn send_reqwest_proxy_route(
     );
     match upstream_result {
         Ok(response) => Ok(ProxyRouteResponse {
-            response: UpstreamResponse::Reqwest(response),
+            response: if let Some(context) = route.kimi_response.clone() {
+                super::kimi::translate(response, context, route.upstream_stream)?
+            } else {
+                UpstreamResponse::Reqwest(response)
+            },
             upstream_activity,
             codex_retry: CodexRetryTerminalGuard::inactive(),
         }),

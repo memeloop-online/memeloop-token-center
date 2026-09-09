@@ -25,6 +25,7 @@ where
 
 mod codex;
 mod http;
+mod kimi;
 mod probe;
 mod readiness;
 
@@ -44,6 +45,7 @@ pub(super) struct PreparedProxyRoute {
     pub(super) codex_store_disabled: bool,
     codex_session_id: Option<String>,
     pub(super) component_request: Option<(PreparedProviderRequest, RequestContext)>,
+    kimi_response: Option<crate::api::kimi_transport::responses::Context>,
 }
 
 pub(super) struct PlannedProxyRoute {
@@ -55,6 +57,7 @@ pub(super) struct PlannedProxyRoute {
     codex_store_disabled: bool,
     codex_session_id: Option<String>,
     component_context: Option<RequestContext>,
+    kimi_response: Option<crate::api::kimi_transport::responses::Context>,
 }
 
 impl PlannedProxyRoute {
@@ -138,6 +141,9 @@ pub(super) fn plan_proxy_route(
         codex_transport::validate_credential_contract(&route.credential)?;
         codex_transport::validate_route_config(&route.config)?;
     }
+    let kimi_response = (route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER
+        && matches!(protocol, Protocol::OpenAiResponses))
+    .then(|| crate::api::kimi_transport::responses::Context::new(request_json));
     let mut forwarded_json = request_json.clone();
     if route.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
         if route.base_url != crate::oauth::managed::kimi::BASE_URL {
@@ -165,7 +171,14 @@ pub(super) fn plan_proxy_route(
     };
     let output_token_ceiling = match codex_plan.as_ref() {
         Some(plan) => plan.output_token_ceiling,
-        None => inject_controlled_output_ceiling(protocol, &mut forwarded_json)?,
+        None => inject_controlled_output_ceiling(
+            if kimi_response.is_some() {
+                Protocol::OpenAiChat
+            } else {
+                protocol
+            },
+            &mut forwarded_json,
+        )?,
     };
     let upstream_stream = forwarded_json.get("stream").and_then(Value::as_bool) == Some(true);
     let component_adapter = state
@@ -210,6 +223,7 @@ pub(super) fn plan_proxy_route(
         codex_store_disabled,
         codex_session_id,
         component_context,
+        kimi_response,
     })
 }
 
@@ -240,6 +254,7 @@ pub(super) async fn materialize_proxy_route(
         codex_store_disabled: planned.codex_store_disabled,
         codex_session_id: planned.codex_session_id,
         component_request,
+        kimi_response: planned.kimi_response,
     })
 }
 
