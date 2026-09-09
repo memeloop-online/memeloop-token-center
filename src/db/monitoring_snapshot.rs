@@ -493,13 +493,18 @@ async fn upstream_health(
     generated_at: i64,
 ) -> Result<(String, MonitoringHealth), AppError> {
     let row = sqlx::query(
-        "SELECT account.name, account.status, account.credential_generation, \
+        "SELECT COALESCE(account.name, deleted.name, target.upstream_account_id) AS name, \
+                account.status, account.credential_generation, \
                 health.credential_generation AS health_generation, \
                 health.consecutive_failures, health.cooldown_until, health.updated_at \
-           FROM upstream_accounts account \
+           FROM (SELECT $1 AS upstream_account_id) target \
+      LEFT JOIN upstream_accounts account \
+             ON account.id = target.upstream_account_id \
+      LEFT JOIN deleted_upstream_account_snapshots deleted \
+             ON deleted.upstream_account_id = target.upstream_account_id \
       LEFT JOIN upstream_account_health health \
              ON health.upstream_account_id = account.id \
-          WHERE account.id = $1",
+          WHERE account.id IS NOT NULL OR deleted.upstream_account_id IS NOT NULL",
     )
     .bind(upstream_account_id)
     .fetch_optional(connection)
@@ -508,12 +513,18 @@ async fn upstream_health(
         return Ok((upstream_account_id.to_owned(), unknown_health()));
     };
     let name: String = row.try_get("name")?;
-    let account_status: String = row.try_get("status")?;
-    let credential_generation: i64 = row.try_get("credential_generation")?;
+    let account_status: Option<String> = row.try_get("status")?;
+    let credential_generation: Option<i64> = row.try_get("credential_generation")?;
     let health_generation: Option<i64> = row.try_get("health_generation")?;
     let consecutive_failures: Option<i64> = row.try_get("consecutive_failures")?;
     let cooldown_until: Option<i64> = row.try_get("cooldown_until")?;
     let observed_at: Option<i64> = row.try_get("updated_at")?;
+    let Some(account_status) = account_status else {
+        return Ok((name, unknown_health()));
+    };
+    let Some(credential_generation) = credential_generation else {
+        return Err(AppError::Internal);
+    };
     let status = if account_status != "active" {
         "unhealthy"
     } else if health_generation == Some(credential_generation) {
@@ -629,5 +640,39 @@ mod tests {
         assert_eq!(plan.left_to_created_at, 100 * HOUR_MILLIS - 1);
         assert_eq!(plan.right_from_created_at, 123 * HOUR_MILLIS);
         assert_eq!(plan.right_to_created_at, now);
+    }
+
+    #[tokio::test]
+    async fn deleted_upstream_snapshot_retains_monitoring_identity_without_health_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("deleted-upstream-monitoring.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let tenant_id = Uuid::now_v7().to_string();
+        let upstream_account_id = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, 1)")
+            .bind(&tenant_id)
+            .bind("deleted-upstream-monitoring")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO deleted_upstream_account_snapshots (upstream_account_id, tenant_id, name, driver, auth_kind, credential_generation, created_at, deleted_at) VALUES ($1, $2, 'deleted-monitoring-provider', 'http-json', 'api_key', 3, 1, 2)",
+        )
+        .bind(&upstream_account_id)
+        .bind(&tenant_id)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let mut connection = database.pool.acquire().await.unwrap();
+        let (name, health) = upstream_health(&mut connection, &upstream_account_id, 3)
+            .await
+            .unwrap();
+        assert_eq!(name, "deleted-monitoring-provider");
+        assert_eq!(health.status, "unknown");
+        assert_eq!(health.observed_at, None);
     }
 }

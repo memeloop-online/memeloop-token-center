@@ -1326,6 +1326,140 @@ async fn upstream_deletion_readiness_keeps_multi_candidate_routes_and_history_vi
 }
 
 #[tokio::test]
+async fn deleting_a_disabled_unreferenced_upstream_keeps_history_and_a_sanitized_identity_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("upstream-history-delete.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let upstream = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "history-delete".into(),
+                name: "deleted-history-provider".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url": "https://api.example.test"}),
+                credential: UpstreamCredential::ApiKey {
+                    value: "history-delete-secret".into(),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                },
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let disabled = state
+        .db
+        .set_upstream_account_status(
+            upstream.id,
+            "history-delete",
+            "disabled",
+            upstream.updated_at,
+        )
+        .await
+        .unwrap();
+
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    let request_id = Uuid::now_v7();
+    let generation_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id, upstream_account_id) VALUES ($1, $2, $3, 1, 'openai', 'history-delete-model', 0, 0, 0, '{}', $4, $5)",
+    )
+    .bind(request_id.to_string())
+    .bind(upstream.tenant_id.to_string())
+    .bind(Uuid::now_v7().to_string())
+    .bind(Uuid::now_v7().to_string())
+    .bind(upstream.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO generation_jobs (id, tenant_id, key_id, upstream_account_id, reservation_id, public_model, upstream_model, driver, status, request_object, estimated_units, next_attempt_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 'history-delete-model', 'history-delete-model', 'http-json', 'failed', '{}', 1, 1, 1, 1)",
+    )
+    .bind(generation_id.to_string())
+    .bind(upstream.tenant_id.to_string())
+    .bind(Uuid::now_v7().to_string())
+    .bind(upstream.id.to_string())
+    .bind(Uuid::now_v7().to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let readiness = state
+        .db
+        .upstream_deletion_readiness(upstream.id, "history-delete")
+        .await
+        .unwrap();
+    assert!(!readiness.requires_disabled);
+    assert_eq!(readiness.model_route_count, 0);
+    assert_eq!(readiness.request_history_count, 1);
+    assert_eq!(readiness.generation_history_count, 1);
+    assert!(readiness.can_delete);
+
+    state
+        .db
+        .delete_upstream_account(upstream.id, "history-delete", disabled.updated_at)
+        .await
+        .unwrap();
+
+    assert!(state
+        .db
+        .list_upstream_accounts("history-delete")
+        .await
+        .unwrap()
+        .into_iter()
+        .all(|value| value.id != upstream.id));
+    let retained_request: String = sqlx::query_scalar(
+        "SELECT upstream_account_id FROM request_records WHERE id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_request, upstream.id.to_string());
+    let retained_generation: String = sqlx::query_scalar(
+        "SELECT upstream_account_id FROM generation_jobs WHERE id = $1",
+    )
+    .bind(generation_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_generation, upstream.id.to_string());
+    let snapshot = sqlx::query(
+        "SELECT tenant_id, name, driver, auth_kind, credential_generation, created_at, deleted_at FROM deleted_upstream_account_snapshots WHERE upstream_account_id = $1",
+    )
+    .bind(upstream.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(snapshot.try_get::<String, _>("tenant_id").unwrap(), upstream.tenant_id.to_string());
+    assert_eq!(snapshot.try_get::<String, _>("name").unwrap(), upstream.name);
+    assert_eq!(snapshot.try_get::<String, _>("driver").unwrap(), upstream.driver);
+    assert_eq!(snapshot.try_get::<String, _>("auth_kind").unwrap(), upstream.auth_kind);
+    assert_eq!(snapshot.try_get::<i64, _>("credential_generation").unwrap(), upstream.credential_generation);
+    assert_eq!(snapshot.try_get::<i64, _>("created_at").unwrap(), upstream.created_at);
+    assert!(snapshot.try_get::<i64, _>("deleted_at").unwrap() >= disabled.updated_at);
+    let credentials: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_credentials WHERE upstream_account_id = $1",
+    )
+    .bind(upstream.id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(credentials, 0);
+}
+
+#[tokio::test]
 async fn private_proxy_requires_global_operator_and_never_appears_in_account_view() {
     let mock = MockServer::start().await;
     let directory = tempfile::tempdir().unwrap();

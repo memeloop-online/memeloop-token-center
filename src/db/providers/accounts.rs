@@ -289,8 +289,10 @@ impl Database {
 
     /// Read the actual deletion constraints for one upstream identity. This is
     /// deliberately a read-only preview: DELETE repeats these checks in its
-    /// transaction so a concurrent relation or history write cannot turn this
-    /// result into permission to remove the account.
+    /// transaction so a concurrent relation write cannot turn this result into
+    /// permission to remove the account. Request and generation counts remain
+    /// visible as immutable facts, but do not retain the live account entity:
+    /// DELETE snapshots its safe metadata before physical removal.
     pub async fn upstream_deletion_readiness(
         &self,
         account_id: Uuid,
@@ -312,11 +314,7 @@ impl Database {
             imported_for_audit,
         ) = upstream_deletion_dependency_counts(&self.pool, &tenant_id, account_id).await?;
         let requires_disabled = account.try_get::<String, _>("status")? != "disabled";
-        let can_delete = !requires_disabled
-            && model_route_count == 0
-            && request_history_count == 0
-            && generation_history_count == 0
-            && !imported_for_audit;
+        let can_delete = !requires_disabled && model_route_count == 0 && !imported_for_audit;
         Ok(UpstreamDeletionReadiness {
             requires_disabled,
             model_route_count,
@@ -358,8 +356,8 @@ impl Database {
         let tenant_id: String = account.try_get("tenant_id")?;
         let (
             model_route_count,
-            request_history_count,
-            generation_history_count,
+            _request_history_count,
+            _generation_history_count,
             imported_for_audit,
         ) = upstream_deletion_dependency_counts(&mut *tx, &tenant_id, account_id).await?;
         if imported_for_audit {
@@ -372,9 +370,19 @@ impl Database {
                 "the upstream provider still has model routes and must be retained".into(),
             ));
         }
-        if request_history_count > 0 || generation_history_count > 0 {
+        let deleted_at = unix_millis();
+        let snapshotted = sqlx::query(
+            "INSERT INTO deleted_upstream_account_snapshots (upstream_account_id, tenant_id, name, driver, auth_kind, credential_generation, created_at, deleted_at) SELECT id, tenant_id, name, driver, auth_kind, credential_generation, created_at, $1 FROM upstream_accounts WHERE id = $2 AND tenant_id = $3 AND status = 'disabled' AND updated_at = $4 ON CONFLICT(upstream_account_id) DO NOTHING",
+        )
+        .bind(deleted_at)
+        .bind(account_id.to_string())
+        .bind(&tenant_id)
+        .bind(expected_updated_at)
+        .execute(&mut *tx)
+        .await?;
+        if snapshotted.rows_affected() != 1 {
             return Err(AppError::Conflict(
-                "the upstream provider has request history and must be retained for audit".into(),
+                "reload the upstream provider before deleting it".into(),
             ));
         }
         sqlx::query("DELETE FROM upstream_credentials WHERE upstream_account_id = $1")
@@ -390,7 +398,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let deleted = sqlx::query(
-            "DELETE FROM upstream_accounts WHERE id = $1 AND tenant_id = $2 AND status = 'disabled' AND updated_at = $3 AND NOT EXISTS (SELECT 1 FROM model_routes r WHERE r.tenant_id = $2 AND (r.upstream_account_id = $1 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $1))) AND NOT EXISTS (SELECT 1 FROM request_records history WHERE history.tenant_id = $2 AND history.upstream_account_id = $1) AND NOT EXISTS (SELECT 1 FROM generation_jobs history WHERE history.tenant_id = $2 AND history.upstream_account_id = $1) AND NOT EXISTS (SELECT 1 FROM upstream_account_imports imported WHERE imported.tenant_id = $2 AND imported.upstream_account_id = $1)",
+            "DELETE FROM upstream_accounts WHERE id = $1 AND tenant_id = $2 AND status = 'disabled' AND updated_at = $3 AND NOT EXISTS (SELECT 1 FROM model_routes r WHERE r.tenant_id = $2 AND (r.upstream_account_id = $1 OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = $1))) AND NOT EXISTS (SELECT 1 FROM upstream_account_imports imported WHERE imported.tenant_id = $2 AND imported.upstream_account_id = $1)",
         )
         .bind(account_id.to_string())
         .bind(tenant_id)
