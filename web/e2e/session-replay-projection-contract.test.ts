@@ -91,7 +91,8 @@ test('reports unavailable, redacted, and out-of-session data as unknown rather t
     ['redacted', 'request', 'redacted'], ['other', 'request', 'outside_session'], ['other', 'response', 'outside_session'],
   ]);
   const redactedMessage = replay.items.find((item) => item.kind === 'message' && item.requestId === 'redacted');
-  assert.deepEqual(redactedMessage && { text: redactedMessage.text, unknown: redactedMessage.unknown }, { text: null, unknown: 'redacted' });
+  assert.ok(redactedMessage?.kind === 'message');
+  assert.deepEqual({ text: redactedMessage.text, unknown: redactedMessage.unknown }, { text: null, unknown: 'redacted' });
 });
 
 test('bounds retained text and projection item count with explicit truncation', () => {
