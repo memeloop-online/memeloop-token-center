@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import type { Locator, Page } from 'playwright';
 import { baseURL, eventually, model, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
+import { requestEventFixture } from '../support/request-event-fixture.js';
+export { requestEventFixture } from '../support/request-event-fixture.js';
 
 export interface RealtimeReconnectObservation {
   connectionUrls: string[];
@@ -200,24 +202,6 @@ export async function assertGenerationDownload(page: Page, generationModel: stri
   assert.ok(path, 'Playwright did not persist the generated asset download');
   assert.equal((await readFile(path)).toString('utf8'), expectedBody);
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
-}
-
-export function requestEventFixture(eventId: string, requestId: string, eventAt: number, eventModel: string) {
-  return {
-    event_id: eventId,
-    request_id: requestId,
-    event_at: eventAt,
-    event_kind: 'finished' as const,
-    key_id: '019f0000-0000-7000-a000-000000000001',
-    protocol: 'openai',
-    model: eventModel,
-    status_code: 200,
-    duration_ms: 42,
-    input_tokens: 5,
-    output_tokens: 7,
-    cost: '0.000019',
-    error_code: null,
-  };
 }
 
 export function sseRequestEvent(event: ReturnType<typeof requestEventFixture>): string {
