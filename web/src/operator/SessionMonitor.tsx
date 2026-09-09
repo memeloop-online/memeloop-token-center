@@ -163,7 +163,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
       setErrorScope(requestScope);
       // A failed live refresh is not an empty result set. Keep the current
       // scoped page (including older pages) and report the refresh failure.
-      if (!older && !background) setSessions([]);
+      // Keep an already rendered page while a same-scope manual retry fails.
+      // Scope/filter transitions clear their own state before starting a read.
     } finally {
       if (request.isCurrent() && sequence === listSequence.current) {
         listInFlight.current = false;
@@ -346,7 +347,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, focus, st
   const visibleDetail = detailScope === scopeKey ? detail : undefined;
   const visibleError = errorScope === scopeKey ? error : '';
   return <>
-    {visibleError && <div className="notice error" role="alert">{visibleError}</div>}
+    {visibleError && <div className="notice error" role="alert">{visibleError} <button type="button" className="secondary" disabled={loading} onClick={() => void loadSessions(false, filters, visibleSessions.length > 0)}>{t('sessions.retryLoad')}</button></div>}
     <div className={`session-live-state ${status}`} role="status">{t(`sessions.live.${status}`)}</div>
     <form className="session-controls" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }); }}>
       <label>{t('sessions.search')}<input value={draft.q} onChange={(event) => setDraft({ ...draft, q: event.target.value })} placeholder={t('sessions.searchPlaceholder')} /></label>

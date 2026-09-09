@@ -256,20 +256,40 @@ impl Database {
                        OR (last_activity_at = $4 AND session_id < $5)
                     ORDER BY last_activity_at DESC, session_id DESC
                     LIMIT $3
+               ), latest_ids AS MATERIALIZED (
+                   SELECT recent.key_id, recent.session_id,
+                          (SELECT latest.id FROM request_records latest
+                            WHERE latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id = recent.session_id
+                            ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
+                          (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
+                            WHERE latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id = recent.session_id
+                            ORDER BY latest.source_started_at DESC, latest.archive_request_id DESC LIMIT 1) AS archive_id
+                     FROM recent
+                    WHERE recent.session_id <> 'unlinked:' || recent.key_id
+                   UNION ALL
+                   SELECT recent.key_id, recent.session_id,
+                          (SELECT latest.id FROM request_records latest
+                            WHERE latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id IS NULL
+                            ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1),
+                          (SELECT latest.archive_request_id FROM session_archive_unlinked_requests latest
+                            WHERE latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id IS NULL
+                            ORDER BY latest.source_started_at DESC, latest.archive_request_id DESC LIMIT 1)
+                     FROM recent
+                    WHERE recent.session_id = 'unlinked:' || recent.key_id
                ), recent_activity AS (
                    SELECT recent.key_id, recent.session_id, request.model,
                           request.protocol, request.status_code, request.created_at,
                           request.id, 1 AS live, observation.session_name,
                           observation.task_kind
-                     FROM recent
+                     FROM latest_ids recent
                      JOIN request_records request
                        ON request.key_id = recent.key_id
                       AND request.conversation_cluster_id = recent.session_id
-                      AND request.id = (
-                          SELECT latest.id FROM request_records latest
-                           WHERE latest.key_id = recent.key_id
-                             AND latest.conversation_cluster_id = recent.session_id
-                           ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
+                      AND request.id = recent.request_id
                      LEFT JOIN conversation_observations observation
                        ON observation.request_id = request.id
                       AND observation.key_id = request.key_id
@@ -278,16 +298,12 @@ impl Database {
                           request.protocol, request.status_code, request.created_at,
                           request.id, 1, observation.session_name,
                           observation.task_kind
-                     FROM recent
+                     FROM latest_ids recent
                      JOIN request_records request
                        ON request.key_id = recent.key_id
                       AND request.conversation_cluster_id IS NULL
                       AND recent.session_id = 'unlinked:' || recent.key_id
-                      AND request.id = (
-                          SELECT latest.id FROM request_records latest
-                           WHERE latest.key_id = recent.key_id
-                             AND latest.conversation_cluster_id IS NULL
-                           ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
+                      AND request.id = recent.request_id
                      LEFT JOIN conversation_observations observation
                        ON observation.request_id = request.id
                       AND observation.key_id = request.key_id
@@ -296,17 +312,11 @@ impl Database {
                           archive.protocol, archive.status_code,
                           archive.source_started_at, archive.archive_request_id, 0,
                           observation.session_name, observation.task_kind
-                     FROM recent
+                     FROM latest_ids recent
                      JOIN session_archive_unlinked_requests archive
                        ON archive.key_id = recent.key_id
                       AND archive.conversation_cluster_id = recent.session_id
-                      AND archive.archive_request_id = (
-                          SELECT latest.archive_request_id
-                            FROM session_archive_unlinked_requests latest
-                           WHERE latest.key_id = recent.key_id
-                             AND latest.conversation_cluster_id = recent.session_id
-                           ORDER BY latest.source_started_at DESC,
-                                    latest.archive_request_id DESC LIMIT 1)
+                      AND archive.archive_request_id = recent.archive_id
                      LEFT JOIN conversation_observations observation
                        ON observation.request_id = archive.archive_request_id
                       AND observation.key_id = archive.key_id
@@ -315,18 +325,12 @@ impl Database {
                           archive.protocol, archive.status_code,
                           archive.source_started_at, archive.archive_request_id, 0,
                           observation.session_name, observation.task_kind
-                     FROM recent
+                     FROM latest_ids recent
                      JOIN session_archive_unlinked_requests archive
                        ON archive.key_id = recent.key_id
                       AND archive.conversation_cluster_id IS NULL
                       AND recent.session_id = 'unlinked:' || recent.key_id
-                      AND archive.archive_request_id = (
-                          SELECT latest.archive_request_id
-                            FROM session_archive_unlinked_requests latest
-                           WHERE latest.key_id = recent.key_id
-                             AND latest.conversation_cluster_id IS NULL
-                           ORDER BY latest.source_started_at DESC,
-                                    latest.archive_request_id DESC LIMIT 1)
+                      AND archive.archive_request_id = recent.archive_id
                      LEFT JOIN conversation_observations observation
                        ON observation.request_id = archive.archive_request_id
                       AND observation.key_id = archive.key_id
