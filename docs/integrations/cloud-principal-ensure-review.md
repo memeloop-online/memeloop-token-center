@@ -52,13 +52,24 @@ this suite: 9 passed and 4 failed. The new failing fixtures issued tenant-scoped
 service tokens before creating the tenant, which correctly produced HTTP 401.
 The follow-up fixes fixture tenant creation and explicitly tests that a token
 for a nonexistent tenant remains unauthorized. **A successful rerun is still
-required.** Authentication behavior has not been relaxed. Local Cargo acquisition
-failed due to network errors; its stopped containers are not test evidence.
+required at that checkpoint.** The follow-up run `34325996135` at `a95206f`
+has now passed the complete Rust job: format, all-target/all-feature clippy with
+warnings denied, and all-target/all-feature tests. Authentication behavior has not
+been relaxed. Local Cargo acquisition failed due to network errors; its stopped
+containers are not test evidence.
 
-There is no new endpoint-specific PostgreSQL test yet. Existing PostgreSQL Cloud
-subscription tests cover the reused provisioning helper, but are not a substitute
-for the new service-Bearer route and its concurrent execution on PostgreSQL.
-Please retain this gap in readiness review.
+The same run's web job failed in the existing provider-routing browser scenario
+(`web/e2e/step_definitions/provider-routing.steps.ts:186`) after a
+`database_busy` HTTP 500; 19/20 scenarios passed. This PR does not change that
+web path, but the failure is not dismissed as a confirmed flake or counted as
+passing. A subsequent green run or maintainer diagnosis is still required.
+
+The follow-up adds `tests/cloud_principal_ensure_postgres.rs`: real service-Bearer
+HTTP concurrency, one key/account with zero initial balance, and subsequent
+subscription/ensure identity and balance preservation. CI's Rust job supplies
+`MTC_TEST_POSTGRES_URL` and discovers this target via `--all-targets`; without that
+environment it returns early and must not be counted as a PostgreSQL pass.
+The new PostgreSQL target still needs its first successful CI execution.
 
 ## Follow-up requirements outside this narrow PR
 

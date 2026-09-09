@@ -10,6 +10,9 @@ key ID 和 credit account ID，但不会创建权益、修改策略或路由，�
 tenant-scoped token 访问其他租户返回 403。两个 external ID 必须是无首尾空白的有效标识，避免
 Cloud 和 Token Center 对稳定身份作出不同规范化。
 
+租户限定服务令牌要求其租户已存在且处于 active 状态；创建令牌本身不会创建租户。
+不存在或已停用的租户仍被认证层拒绝（401），ensure 不能绕过该租户生命周期边界。
+
 ## 认证与重试
 
 配置至少 32 字节、无空白字符的 `MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET`。请求必须携带：
