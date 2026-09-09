@@ -55,6 +55,7 @@ mod session_analytics;
 mod session_projection;
 mod tenants;
 mod time;
+mod upstream_account_availability;
 mod usage_analysis;
 mod validation;
 
@@ -157,6 +158,10 @@ pub use routing::{
 };
 pub(crate) use routing::{
     UpstreamAttemptAdmission, UpstreamFailureKind, upstream_probe_heartbeat_interval,
+};
+pub use upstream_account_availability::{
+    UpstreamAccountAvailability, UpstreamAccountAvailabilityFilter,
+    UpstreamAccountAvailabilityWindow,
 };
 pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
 

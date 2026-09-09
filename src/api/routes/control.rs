@@ -100,6 +100,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(list_upstreams).post(create_upstream),
         )
         .route(
+            "/internal/v1/upstream-availability",
+            get(upstream_account_availability),
+        )
+        .route(
             "/internal/v1/imports/cpa/managed-oauth/capabilities",
             get(cpa_managed_oauth_capabilities),
         )

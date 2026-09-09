@@ -1,4 +1,5 @@
 mod accounts;
+mod availability;
 mod health;
 mod managed_import;
 mod models;
@@ -11,6 +12,7 @@ pub(in crate::api) use accounts::{
     create_upstream, delete_upstream, get_upstream_deletion_readiness, list_upstreams,
     rotate_upstream_credential, set_upstream_status, update_upstream,
 };
+pub(in crate::api) use availability::upstream_account_availability;
 pub(in crate::api) use health::probe_upstream_health;
 pub(in crate::api) use managed_import::{
     MAX_MANAGED_OAUTH_IMPORT_REQUEST, cpa_managed_oauth_capabilities, import_cpa_managed_oauth,
