@@ -96,6 +96,30 @@ test("operator monitoring snapshot has explicit scope/window and bounded termina
   assert.equal(operation["x-query-plan"]["raw-request-records"], "forbidden");
 });
 
+test("upstream availability requires both scopes and an explicit tenant/window", () => {
+  const document = cloneDocument(); const operation = document.paths["/internal/v1/upstream-availability"].get;
+  assert.deepEqual(operation.security, [{ serviceBearer: [] }]);
+  assert.equal(operation["x-required-scope"], "providers:read");
+  assert.deepEqual(operation["x-required-scopes"], ["providers:read", "requests:read"]);
+  const parameters = Object.fromEntries(operation.parameters.map((item: Obj) => [item.name, item]));
+  assert.deepEqual(Object.keys(parameters), ["tenant_external_id", "from_created_at", "to_created_at"]);
+  for (const parameter of Object.values(parameters) as Obj[]) assert.equal(parameter.required, true);
+  for (const name of ["from_created_at", "to_created_at"]) assert.equal(parameters[name].schema.minimum, 0);
+  assert.equal(operation.responses["200"].headers["Cache-Control"].schema.const, "no-store");
+  assert.equal(operation.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UpstreamAccountAvailabilityWindow");
+  const window = document.components.schemas.UpstreamAccountAvailabilityWindow;
+  assert.equal(window.properties.contract_version.const, "upstream_account_availability_v1");
+  assert.deepEqual(window.properties.granularity.enum, ["hour", "day"]);
+  assert.equal(window.properties.latency_is_approximate.const, true);
+  assert.equal(window.properties.latency_method.const, "fixed_histogram_upper_bound_capped_60000ms");
+  assert.equal(window.properties.accounts.maxItems, undefined);
+  const account = document.components.schemas.UpstreamAccountAvailability;
+  assert.deepEqual(account.required, ["upstream_account_id", "metrics", "terminal_outcomes"]);
+  assert.equal(account.properties.metrics.$ref, "#/components/schemas/MonitoringMetrics");
+  assert.equal(account.properties.terminal_outcomes.maxItems, 5);
+  assert.equal(account.properties.terminal_outcomes.items.$ref, "#/components/schemas/MonitoringTerminalOutcome");
+});
+
 test("OAuth reauthorization reuses the unified upstream resource", () => {
   const document = cloneDocument(); for (const [segment, schema] of [["cursor", "StartCursorOAuthRequest"], ["provider-adapter", "StartProviderAdapterOAuthRequest"], ["codex", "StartCodexOAuthRequest"]] as const) { const start = document.paths[`/internal/v1/oauth/${segment}/start`].post; const poll = document.paths[`/internal/v1/oauth/${segment}/poll`].post; assert.equal(start["x-required-scope"], "oauth:write"); assert.equal(poll["x-required-scope"], "oauth:write"); const target = document.components.schemas[schema].properties.upstream_account_id; assert.deepEqual([target.type, target.format], ["string", "uuid"]); assert.equal(poll.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UpstreamProvider"); }
   for (const path of ["/internal/v1/oauth/subscription-bridge/start", "/internal/v1/oauth/subscription-bridge/poll", "/internal/v1/imports/cpa/subscription-accounts"]) assert.ok(!(path in document.paths)); for (const schema of ["StartSubscriptionBridgeRequest", "SubscriptionBridgeCredential"]) assert.ok(!(schema in document.components.schemas)); assert.equal(document.paths["/internal/v1/oauth/codex/start"].post.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/CodexDeviceLoginStart"); assert.equal(document.components.schemas.CodexDeviceLoginStart.properties.security_notice.const, "only_continue_if_you_started_this_login");

@@ -987,6 +987,57 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/upstream-availability:
+    get:
+      tags: [Upstream providers]
+      operationId: getUpstreamAccountAvailability
+      summary: Read tenant-scoped terminal traffic for every current upstream account
+      description: |
+        Requires both `providers:read` and `requests:read`. An explicit tenant is
+        mandatory even for global service credentials; tenant-scoped credentials
+        may only select their own tenant. Unknown query parameters are rejected.
+        Both bounds are required inclusive Unix epoch milliseconds, must be
+        non-negative, and must satisfy from_created_at <= to_created_at with a
+        difference no greater than 93 days. Differences through 31 days use hour
+        granularity; longer windows use day granularity. Complete buckets use
+        terminal rollups and partial edges use request/generation terminal facts.
+        Every current account is included, without top-model truncation, including
+        disabled accounts and accounts with no terminal traffic. Empty accounts
+        have zero counts, null latency metrics, and empty costs/outcomes; this
+        response does not assign a health status. Each account includes at most
+        five newest terminal facts across all models, with explicit source.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      x-required-scopes: [providers:read, requests:read]
+      parameters:
+        - name: tenant_external_id
+          in: query
+          required: true
+          description: Trimmed non-empty tenant selector, limited to 200 UTF-8 bytes.
+          schema: { type: string, minLength: 1, maxLength: 200 }
+        - name: from_created_at
+          in: query
+          required: true
+          description: Inclusive Unix epoch milliseconds start.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: to_created_at
+          in: query
+          required: true
+          description: Inclusive Unix epoch milliseconds end; at most 93 days after the start.
+          schema: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: Account-complete terminal metrics for the selected tenant and exact window.
+          headers:
+            Cache-Control:
+              schema: { const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamAccountAvailabilityWindow' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/upstreams/{account_id}/deletion-readiness:
     get:
       tags: [Upstream providers]
@@ -6556,6 +6607,35 @@ components:
         errors:
           type: array
           items: { $ref: '#/components/schemas/StatisticsBucket' }
+    UpstreamAccountAvailabilityWindow:
+      type: object
+      additionalProperties: false
+      required: [contract_version, generated_at, tenant_external_id, from_created_at, to_created_at, granularity, latency_is_approximate, latency_method, accounts]
+      properties:
+        contract_version: { type: string, const: upstream_account_availability_v1 }
+        generated_at: { type: integer, format: int64, minimum: 0 }
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        from_created_at: { type: integer, format: int64, minimum: 0 }
+        to_created_at: { type: integer, format: int64, minimum: 0 }
+        granularity: { type: string, enum: [hour, day] }
+        latency_is_approximate: { type: boolean, const: true }
+        latency_method: { type: string, const: fixed_histogram_upper_bound_capped_60000ms }
+        accounts:
+          type: array
+          description: All current accounts for the tenant, ordered by stable account ID; no top-N truncation or pagination.
+          items: { $ref: '#/components/schemas/UpstreamAccountAvailability' }
+    UpstreamAccountAvailability:
+      type: object
+      additionalProperties: false
+      required: [upstream_account_id, metrics, terminal_outcomes]
+      properties:
+        upstream_account_id: { type: string, minLength: 1 }
+        metrics: { $ref: '#/components/schemas/MonitoringMetrics' }
+        terminal_outcomes:
+          type: array
+          maxItems: 5
+          description: Newest terminal request/generation facts across all models for this account in the inclusive window; excludes in-flight traffic.
+          items: { $ref: '#/components/schemas/MonitoringTerminalOutcome' }
     MonitoringMetrics:
       type: object
       additionalProperties: false

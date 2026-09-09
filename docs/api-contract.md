@@ -49,6 +49,38 @@ Route selection honors enabled state, grants, priority, health and bounded
 round-robin behavior. A client may access only visible models. Historical request
 attribution does not change when routes are disabled or replaced.
 
+### Upstream account availability
+
+`GET /internal/v1/upstream-availability` requires a service credential with both
+`providers:read` and `requests:read`. All three query parameters are mandatory:
+`tenant_external_id`, `from_created_at`, and `to_created_at`; unknown parameters
+are rejected. The trimmed tenant selector must be non-empty and no more than
+200 UTF-8 bytes. Even global credentials must explicitly select a tenant;
+tenant-scoped credentials cannot select another tenant.
+
+Time bounds are non-negative, inclusive Unix epoch milliseconds with start no
+later than end. The difference must not exceed 93 days. Differences through
+31 days use hourly rollups; longer windows use daily rollups. Partial edge
+buckets read terminal request/generation facts to preserve the exact window.
+Invalid selectors/windows return 400; missing authentication returns 401 and
+insufficient scopes or a tenant-boundary violation returns 403.
+
+The `Cache-Control: no-store` response is an
+`UpstreamAccountAvailabilityWindow`, version `upstream_account_availability_v1`,
+with generation time, resolved tenant, echoed bounds, granularity, latency
+metadata, and `accounts`. It contains every current account for that tenant
+(including disabled accounts), ordered by stable account ID, without pagination
+or top-model truncation. Each account has `upstream_account_id`,
+`MonitoringMetrics`, and at most five newest `MonitoringTerminalOutcome` entries
+across all models. Outcomes retain their `request` or `generation` source and
+original creation timestamp; in-flight traffic is excluded.
+
+Accounts with no terminal traffic have zero counts, null average/p95 latency,
+and empty costs/outcomes; no health status is inferred. Costs remain separate
+by currency. `latency_is_approximate` is true and `latency_method` is
+`fixed_histogram_upper_bound_capped_60000ms`: p95 is the fixed-histogram upper
+bound capped at 60000 ms.
+
 ## Pricing and generation
 
 Pricing is durable and uses model, currency and service tier. It records input,
