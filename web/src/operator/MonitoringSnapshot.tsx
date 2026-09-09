@@ -11,14 +11,14 @@ function CostLines({ costs }: { costs: UsageAnalysisCost[] }) {
   ))}</span>;
 }
 
-function healthClass(status: MonitoringHealth['status']) {
+export function healthClass(status: MonitoringHealth['status']) {
   if (status === 'healthy') return 'ok';
   if (status === 'unhealthy') return 'bad';
   if (status === 'degraded') return 'pending';
   return 'unknown';
 }
 
-function HealthBadge({ health }: { health: MonitoringHealth }) {
+export function RoutingStatusBadge({ health }: { health: MonitoringHealth }) {
   const { t } = useI18n();
   return <span className="monitoring-routing-status" title={health.version}><small>{t('monitoring.routingStatus')}</small><span className={`status ${healthClass(health.status)}`}>{t(`monitoring.health.${health.status}`)}</span></span>;
 }
@@ -54,7 +54,7 @@ export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringS
     <article className="panel">
       <div className="panel-title monitoring-heading">
         <div><h2 id="monitoring-heading">{t('monitoring.title')}</h2><p className="muted">{range}</p></div>
-        <HealthBadge health={snapshot.health} />
+        <RoutingStatusBadge health={snapshot.health} />
       </div>
       <section className="metrics operator-monitoring-metrics monitoring-metrics-grid" aria-label={t('monitoring.summary')}>
         <NumberMetric label={t('usage.requests')} value={summary.requests} />
@@ -76,7 +76,7 @@ export function MonitoringSnapshot({ snapshot }: { snapshot: OperatorMonitoringS
           return <li key={`${value.upstream_account_id}\0${value.model}`}>
             <div className="monitoring-top-heading">
               <div><b>{value.upstream_name}</b><code>{value.model}</code></div>
-              <HealthBadge health={value.health} />
+              <RoutingStatusBadge health={value.health} />
             </div>
             <MonitoringMetricList metrics={metrics} />
             <ol className="monitoring-outcomes" aria-label={t('monitoring.terminalOutcomes')}>

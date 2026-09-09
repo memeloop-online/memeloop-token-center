@@ -58,6 +58,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
   const scope = useOperatorScope();
   const [internalRoute, setInternalRoute] = useState<OperatorRouteKey>('requests');
   const [sessionFocus, setSessionFocus] = useState<SessionFocus>();
+  const [requestFocus, setRequestFocus] = useState<{ requestId: string; revision: number }>();
   const [pluginRegistry, setPluginRegistry] = useState<OperatorPluginRegistry>(() => registerOperatorPluginContributions([]));
   const credentialScope = useRef({ credential: '', generation: 0 });
   if (credentialScope.current.credential !== scope.activeCredential) {
@@ -133,6 +134,11 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     navigate('sessions');
   }
 
+  function openRequestById(requestId: string) {
+    setRequestFocus({ requestId, revision: Date.now() });
+    navigate('requests');
+  }
+
   const accessSettings = <OperatorAccessSettings
     credentialInput={scope.credentialInput}
     credential={scope.credential}
@@ -151,11 +157,11 @@ export function Operator({ route, onRouteChange, onPluginNavigation, embedded = 
     if (isOperatorRouteKey(activeRoute)) {
       switch (activeRoute) {
         case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onOpenUsageSession={openSession} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} /></>; break;
-        case 'requests': page = <RequestsPage {...pageProps} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} />; break;
+        case 'requests': page = <RequestsPage {...pageProps} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} />; break;
         case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} revision={stream.revision} eventKeyIds={stream.sessionEventKeyIds} streamState={stream.state} streamError={stream.error} onOpenRequests={() => navigate('requests')} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
         case 'generations': page = <GenerationsPage {...pageProps} />; break;
-        case 'providers': page = <ProvidersPage {...pageProps} />; break;
+        case 'providers': page = <ProvidersPage {...pageProps} onOpenRequest={openRequestById} />; break;
         case 'routes': page = <RoutesPage {...pageProps} />; break;
         case 'pricing': page = <PricingPage {...pageProps} />; break;
         case 'tenants': page = <TenantManager token={scope.activeCredential} onChanged={scope.refreshTenants} />; break;

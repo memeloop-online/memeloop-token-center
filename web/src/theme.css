@@ -200,6 +200,52 @@
   border-color: #91aea9;
 }
 
+:root[data-theme='light'] .provider-availability {
+  border-color: #c5d6d2;
+}
+
+:root[data-theme='light'] .provider-availability-heading small,
+:root[data-theme='light'] .provider-availability-state > small,
+:root[data-theme='light'] .provider-availability-state .monitoring-routing-status > small,
+:root[data-theme='light'] .provider-manual-health > small,
+:root[data-theme='light'] .provider-availability-metrics dt,
+:root[data-theme='light'] .provider-availability-scope,
+:root[data-theme='light'] .provider-availability-empty,
+:root[data-theme='light'] .provider-manual-health > .muted,
+:root[data-theme='light'] .provider-manual-health-result,
+:root[data-theme='light'] .provider-recent-attempts > li {
+  color: #526970;
+}
+
+:root[data-theme='light'] .provider-availability-metrics > div {
+  background: #f8fbf9;
+  border-color: #c5d6d2;
+}
+
+:root[data-theme='light'] .provider-availability-model {
+  background: #f8fbf9;
+  border-color: #c5d6d2;
+}
+
+:root[data-theme='light'] .provider-availability-model-heading > code {
+  color: #087d70;
+}
+
+:root[data-theme='light'] .provider-recent-attempts,
+:root[data-theme='light'] .provider-manual-health {
+  border-color: #91aea9;
+}
+
+:root[data-theme='light'] .provider-recent-attempts code,
+:root[data-theme='light'] .provider-manual-health-result code {
+  color: #8c2424;
+}
+
+:root[data-theme='light'] .provider-availability .status.unknown {
+  border-color: #91aea9;
+  color: #526970;
+}
+
 @media (width <= 900px) {
   .mobile-controls {
     display: flex;

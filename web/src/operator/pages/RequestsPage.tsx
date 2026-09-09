@@ -9,7 +9,7 @@ import { messageOf, queryForTenant } from '../scope/operatorShared';
 import { TypedFilterBuilder } from '../TypedFilterBuilder';
 import { emptyTypedFilterAst, mergeLiveRequestEvents, summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody } from '../traffic/requestTraffic';
 
-export function RequestsPage({ token, tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession }: {
+export function RequestsPage({ token, tenant, liveEvents, streamRevision, streamState, streamError, onOpenSessions, onOpenSession, requestFocus, onRequestFocusHandled }: {
   token: string;
   tenant: string;
   liveEvents: ReadonlyMap<string, RequestEvent>;
@@ -18,6 +18,8 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
   streamError: string;
   onOpenSessions: () => void;
   onOpenSession: (sessionId: string) => void;
+  requestFocus?: { requestId: string; revision: number };
+  onRequestFocusHandled?: (revision: number) => void;
 }) {
   const { t } = useI18n();
   const [requests, setRequests] = useState<RequestView[]>([]);
@@ -91,17 +93,27 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
     setRequests((current) => mergeLiveRequestEvents(current, new Map(liveEventsRef.current), !hasOlderRef.current));
   }, [streamRevision]);
 
-  async function selectRequest(request: RequestView) {
+  async function openRequestDetail(requestId: string) {
     const requestSequence = ++detailSequence.current;
     detailAbort.current?.abort(); const controller = new AbortController(); detailAbort.current = controller;
     try {
       setError('');
-      const next = await api<RequestDetail>(`/internal/v1/requests/${request.request_id}${queryForTenant(tenant)}`, token, { signal: controller.signal });
+      const next = await api<RequestDetail>(`/internal/v1/requests/${requestId}${queryForTenant(tenant)}`, token, { signal: controller.signal });
       if (requestSequence === detailSequence.current) setDetail(next);
     } catch (reason) {
       if (requestSequence === detailSequence.current && !controller.signal.aborted) setError(messageOf(reason, t('traffic.detailFailed')));
     } finally { if (detailAbort.current === controller) detailAbort.current = null; }
   }
+
+  async function selectRequest(request: RequestView) {
+    await openRequestDetail(request.request_id);
+  }
+
+  useEffect(() => {
+    if (!requestFocus) return;
+    void openRequestDetail(requestFocus.requestId);
+    onRequestFocusHandled?.(requestFocus.revision);
+  }, [requestFocus?.revision, tenant, token]);
 
   return <>
     {error && <div className="notice error" role="alert">{error}</div>}
