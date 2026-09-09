@@ -54,7 +54,7 @@ oci-client = { version = "0.17", optional = true, default-features = false, feat
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "socks", "stream"] }
 regex = "1"
 rust_decimal = { version = "=1.42.1", default-features = false, features = ["serde-with-str", "std"] }
-rustix = { version = "1", features = ["fs", "time"] }
+rustix = { version = "1", features = ["fs", "time", "process"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

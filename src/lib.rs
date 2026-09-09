@@ -1,4 +1,6 @@
 pub mod api;
+#[cfg(unix)]
+pub mod native_cli;
 pub mod archive;
 pub mod archive_reaper;
 pub mod archive_staging;
