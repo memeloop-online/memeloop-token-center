@@ -2,6 +2,14 @@
 
 MemeLoop Cloud 通过 `PUT /internal/v1/integrations/memeloop-cloud/subscription` 发送完整订阅快照。这个接口只部署在 control role；生产环境应保持集群内或 Tailnet 可达，不应加入公开 gateway Ingress。
 
+在发送首个快照前，Cloud 可使用 tenant-scoped、具有 `keys:write` 的 service Bearer 调用
+`POST /internal/v1/integrations/memeloop-cloud/principals/ensure`，body 为
+`tenant_external_id`、`principal_external_id` 和 `currency`。它确保与 webhook 完全相同的稳定
+key ID 和 credit account ID，但不会创建权益、修改策略或路由，也不会记入任何额度。重放不会轮换
+凭据；仅在原始的一次性凭据加密重放窗口仍有效时返回 `key`。同一稳定身份使用不同币种返回 409，
+tenant-scoped token 访问其他租户返回 403。两个 external ID 必须是无首尾空白的有效标识，避免
+Cloud 和 Token Center 对稳定身份作出不同规范化。
+
 ## 认证与重试
 
 配置至少 32 字节、无空白字符的 `MTC_MEMELOOP_CLOUD_WEBHOOK_SECRET`。请求必须携带：

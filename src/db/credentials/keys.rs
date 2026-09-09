@@ -42,6 +42,36 @@ pub(crate) struct CloudCredentialProvisioningInput<'a> {
 }
 
 impl Database {
+    /// Ensures the stable MemeLoop Cloud credential identity exists without
+    /// changing its policy, routing, entitlement, or credit balance.
+    pub async fn ensure_cloud_credential(
+        &self,
+        tenant_external_id: &str,
+        principal_external_id: &str,
+        currency: &str,
+        provisioning_idempotency_key: &str,
+        pepper: &[u8],
+    ) -> Result<ProvisionedCloudCredential, AppError> {
+        let now = unix_millis();
+        let mut tx = self.begin_write_transaction().await?;
+        let (_, credential) = self
+            .provision_or_load_cloud_credential_in_transaction(
+                &mut tx,
+                CloudCredentialProvisioningInput {
+                    tenant_external_id,
+                    principal_external_id,
+                    currency,
+                    provisioning_idempotency_key,
+                    create_if_missing: true,
+                    pepper,
+                    now,
+                },
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(credential)
+    }
+
     pub(crate) async fn provision_or_load_cloud_credential_in_transaction(
         &self,
         tx: &mut Transaction<'_, Any>,

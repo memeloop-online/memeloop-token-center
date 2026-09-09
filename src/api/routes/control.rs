@@ -281,6 +281,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             "/internal/v1/integrations/memeloop-cloud/events",
             get(list_memeloop_cloud_subscription_events),
         )
+        .route(
+            "/internal/v1/integrations/memeloop-cloud/principals/ensure",
+            post(ensure_memeloop_cloud_principal),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             authenticate_control_before_body,
