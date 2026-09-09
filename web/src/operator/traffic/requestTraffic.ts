@@ -1,6 +1,21 @@
-import type { RequestEvent, RequestListCursor, RequestView, TypedFilterAst } from '../../types.js';
+import type { RequestEvent, RequestListCursor, RequestListResponse, RequestView, TypedFilterAst } from '../../types.js';
 
 export const emptyTypedFilterAst: TypedFilterAst = { logical_operator: 'and', conditions: [] };
+
+// A filtered view cannot safely decide from a partial stream event whether a
+// newly arrived request matches every server-side predicate. Refresh it from
+// the query endpoint instead. Keep the usual quiet-period debounce, but cap
+// it so a continuous stream never leaves a pending request stale forever.
+export const filteredRequestRefreshDebounceMs = 250;
+export const filteredRequestRefreshMaxWaitMs = 1_500;
+
+export function filteredRequestRefreshDelay(now: number, firstPendingAt?: number) {
+  const first = firstPendingAt ?? now;
+  return Math.max(0, Math.min(
+    now + filteredRequestRefreshDebounceMs,
+    first + filteredRequestRefreshMaxWaitMs,
+  ) - now);
+}
 
 export function typedFiltersActive(ast: TypedFilterAst) {
   return ast.conditions.length > 0;
@@ -63,6 +78,23 @@ export function typedRequestQueryBody(tenant: string, ast: TypedFilterAst, befor
     before_id: before?.before_id,
     ast,
   };
+}
+
+/**
+ * Replace a refreshed filtered first page without discarding already-loaded
+ * explicitly loaded older pages. The server cursor is an exclusive boundary,
+ * so only rows strictly older than it are retained; stale first-page rows
+ * cannot survive.
+ */
+export function mergeRefreshedRequestPage(current: readonly RequestView[], refreshed: RequestListResponse, preserveOlder = false) {
+  const cursor = refreshed.next_cursor;
+  if (!cursor || !preserveOlder) return refreshed.requests;
+  const older = current.filter((request) => request.created_at < cursor.before_created_at
+    || (request.created_at === cursor.before_created_at && request.request_id < cursor.before_id));
+  const merged = new Map(refreshed.requests.map((request) => [request.request_id, request]));
+  for (const request of older) merged.set(request.request_id, request);
+  return [...merged.values()].sort((left, right) => right.created_at - left.created_at
+    || right.request_id.localeCompare(left.request_id));
 }
 
 export interface RequestFilters {
