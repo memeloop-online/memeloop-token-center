@@ -141,6 +141,11 @@ impl Database {
             filter.cursor.unwrap_or((-1, String::new()));
         let model = filter.model.unwrap_or_default();
         let query = search_prefix(filter.query.as_deref());
+        // Only the latest activity supplies presentation metadata. Select the
+        // newest live/archive row per returned session through the existing
+        // cursor indexes before joining observations or ranking sources. Joining
+        // every historical request here made an unlinked session sort its entire
+        // history for a single label. Aggregate totals and filters stay complete.
         let rows = sqlx::query(
             r#"WITH completed AS (
                    SELECT totals.tenant_id, totals.key_id, totals.session_id,
@@ -260,6 +265,11 @@ impl Database {
                      JOIN request_records request
                        ON request.key_id = recent.key_id
                       AND request.conversation_cluster_id = recent.session_id
+                      AND request.id = (
+                          SELECT latest.id FROM request_records latest
+                           WHERE latest.key_id = recent.key_id
+                             AND latest.conversation_cluster_id = recent.session_id
+                           ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
                      LEFT JOIN conversation_observations observation
                        ON observation.request_id = request.id
                       AND observation.key_id = request.key_id
@@ -273,6 +283,11 @@ impl Database {
                        ON request.key_id = recent.key_id
                       AND request.conversation_cluster_id IS NULL
                       AND recent.session_id = 'unlinked:' || recent.key_id
+                      AND request.id = (
+                          SELECT latest.id FROM request_records latest
+                           WHERE latest.key_id = recent.key_id
+                             AND latest.conversation_cluster_id IS NULL
+                           ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
                      LEFT JOIN conversation_observations observation
                        ON observation.request_id = request.id
                       AND observation.key_id = request.key_id
@@ -285,6 +300,13 @@ impl Database {
                      JOIN session_archive_unlinked_requests archive
                        ON archive.key_id = recent.key_id
                       AND archive.conversation_cluster_id = recent.session_id
+                      AND archive.archive_request_id = (
+                          SELECT latest.archive_request_id
+                            FROM session_archive_unlinked_requests latest
+                           WHERE latest.key_id = recent.key_id
+                             AND latest.conversation_cluster_id = recent.session_id
+                           ORDER BY latest.source_started_at DESC,
+                                    latest.archive_request_id DESC LIMIT 1)
                      LEFT JOIN conversation_observations observation
                        ON observation.request_id = archive.archive_request_id
                       AND observation.key_id = archive.key_id
@@ -298,6 +320,13 @@ impl Database {
                        ON archive.key_id = recent.key_id
                       AND archive.conversation_cluster_id IS NULL
                       AND recent.session_id = 'unlinked:' || recent.key_id
+                      AND archive.archive_request_id = (
+                          SELECT latest.archive_request_id
+                            FROM session_archive_unlinked_requests latest
+                           WHERE latest.key_id = recent.key_id
+                             AND latest.conversation_cluster_id IS NULL
+                           ORDER BY latest.source_started_at DESC,
+                                    latest.archive_request_id DESC LIMIT 1)
                      LEFT JOIN conversation_observations observation
                        ON observation.request_id = archive.archive_request_id
                       AND observation.key_id = archive.key_id

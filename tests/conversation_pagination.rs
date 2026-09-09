@@ -893,6 +893,74 @@ async fn logical_session_api_is_stable_key_scoped_and_cursor_paginated() {
 }
 
 #[tokio::test]
+async fn logical_session_latest_metadata_keeps_complete_live_and_archive_totals() {
+    let fixture = Fixture::new("latest-session-metadata").await;
+    for index in 0..8 {
+        let request_id = fixture.start_request("memory://latest-metadata").await;
+        fixture
+            .state
+            .db
+            .record_request_finished(FinishRequest {
+                request_id,
+                status_code: if index == 0 { 500 } else { 200 },
+                duration_ms: 10,
+                input_tokens: 2,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 3,
+                service_tier: None,
+                cost_micros: 5,
+                error_code: (index == 0).then(|| "fixture_error".into()),
+                response_object: "memory://latest-metadata-response".into(),
+            })
+            .await
+            .expect("finish fixture activity");
+    }
+    let archived_at = memeloop_token_center::db::unix_millis() + 1_000;
+    for (id, model) in [
+        ("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "older-archive-tie"),
+        ("ffffffff-ffff-4fff-8fff-ffffffffffff", "latest-archive-tie"),
+    ] {
+        sqlx::query(
+            "INSERT INTO session_archive_unlinked_requests (tenant_id, source, external_request_id, archive_request_id, key_id, principal_id, source_started_at, protocol, model, status_code, duration_ms, input_tokens, output_tokens, imported_at) VALUES ($1, 'fixture', $2, $2, $3, $4, $5, 'openai-responses', $6, 200, 20, 4, 6, $5)",
+        )
+        .bind(fixture.key.tenant_id.to_string())
+        .bind(id)
+        .bind(fixture.key.key_id.to_string())
+        .bind(fixture.key.principal_id.to_string())
+        .bind(archived_at)
+        .bind(model)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert archive fixture activity");
+    }
+    sqlx::query(
+        "INSERT INTO session_archive_totals (tenant_id, key_id, session_id, last_activity_at, requests, errors, input_tokens, output_tokens, duration_count, duration_sum_ms) VALUES ($1, $2, $3, $4, 2, 0, 8, 12, 2, 40)",
+    )
+    .bind(fixture.key.tenant_id.to_string())
+    .bind(fixture.key.key_id.to_string())
+    .bind(format!("unlinked:{}", fixture.key.key_id))
+    .bind(archived_at)
+    .execute(&fixture.pool)
+    .await
+    .expect("insert complete archive totals");
+    let (status, body) = fixture
+        .get("/self/v1/sessions?limit=1&state=has_errors")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let summary = &body["sessions"][0];
+    assert_eq!(summary["model"], "latest-archive-tie");
+    assert_eq!(summary["last_status"], "success");
+    assert_eq!(summary["last_activity_at"], archived_at);
+    assert_eq!(summary["requests"], 8);
+    assert_eq!(summary["errors"], 1);
+    assert_eq!(summary["input_tokens"], 16);
+    assert_eq!(summary["archived_only_requests"], 2);
+    assert_eq!(summary["archived_only_input_tokens"], 8);
+    assert_eq!(body["next_cursor"], Value::Null);
+}
+
+#[tokio::test]
 async fn candidates_are_visible_but_do_not_merge_and_empty_context_never_links() {
     let fixture = Fixture::new("candidate").await;
     let first_request = fixture.start_request("memory://first").await;
@@ -2050,6 +2118,62 @@ async fn postgres_110k_conversation_pages_are_indexed_and_bounded() {
         "{detail_plan}"
     );
     assert!(execution_time_ms(&detail_plan) <= 250.0, "{detail_plan}");
+
+    // Exercise the actual logical-session query, not only the old conversation
+    // projection endpoint. The large session must not feed 110k historical rows
+    // into the metadata window just to return its latest model.
+    let sessions = state
+        .db
+        .self_recent_sessions(
+            key.tenant_id,
+            memeloop_token_center::db::LogicalSessionListFilter {
+                limit: 50,
+                state: "all".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("PostgreSQL large logical session page");
+    assert_eq!(sessions.len(), 51);
+    assert_eq!(sessions[0].cluster_id, Some(cluster_id));
+    assert_eq!(sessions[0].model, "gpt-scale");
+    let source = include_str!("../src/db/session_analytics.rs");
+    let (_, query) = source
+        .split_once("r#\"WITH completed AS (")
+        .expect("actual session query start");
+    let (query, _) = query.split_once("\"#,").expect("actual session query end");
+    let explain = format!("EXPLAIN (ANALYZE, FORMAT TEXT, TIMING OFF) WITH completed AS ({query}");
+    // Test-only SQL safety boundary: query text is read from the checked-in
+    // source, never from a user or fixture value; every value remains bound.
+    let plan = sqlx::query(sqlx::AssertSqlSafe(explain))
+        .bind(key.tenant_id.to_string())
+        .bind("")
+        .bind(51_i64)
+        .bind(-1_i64)
+        .bind("")
+        .bind("all")
+        .bind("")
+        .bind("")
+        .fetch_all(&pool)
+        .await
+        .expect("explain actual logical session metadata query")
+        .into_iter()
+        .map(|row| row.get::<String, _>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let window_input = plan
+        .lines()
+        .skip_while(|line| !line.contains("WindowAgg"))
+        .skip(1)
+        .find_map(|line| line.split_once("actual rows=").map(|(_, value)| value))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("window input cardinality in PostgreSQL plan");
+    assert!(
+        window_input <= 102,
+        "metadata must rank at most two source rows per returned session, not historical requests: {plan}"
+    );
+    assert!(execution_time_ms(&plan) <= 2_500.0, "{plan}");
 }
 
 async fn postgres_plan(pool: &AnyPool, sql: &'static str, binds: &[String]) -> String {
