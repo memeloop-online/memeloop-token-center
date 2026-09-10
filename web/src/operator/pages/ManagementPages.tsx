@@ -19,7 +19,7 @@ import { MultiCombobox, type ComboboxOption } from '../MultiCombobox';
 import { CredentialObjectTemplate, FormSection, ManagedGrantField, ManagementForm, ScopePickerWidget } from '../ManagementForm';
 import { RouteCandidateSummary } from '../RouteCandidateSummary';
 import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceListStatusFilter } from '../ResourceListStatusFilter';
-import { UpstreamModelCombobox } from '../UpstreamModelCombobox';
+import { UpstreamModelCombobox, modelCatalogScopeKey, type CatalogValidity } from '../UpstreamModelCombobox';
 import {
   applyKeyPage, canLoadMoreKeys, canReadCredentialLimits, canWriteCredential,
   credentialListPresentation, keyListPath, matchesCredentialSearch,
@@ -474,7 +474,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
   routeGroups: GroupView[];
   credentials: KeyView[];
   onChange: (draft: RouteDraft) => void;
-  onCatalogValidity: (valid: boolean, allowCustom: boolean) => void;
+  onCatalogValidity: (validity: CatalogValidity) => void;
   onCredentialQuery: (query: string) => void;
 }) {
   const { locale, t } = useI18n();
@@ -516,7 +516,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     </div>
     <RouteCandidateSummary route={draft} groups={providerGroups} accounts={upstreams} />
     <label>{t('routes.protocol')}<select aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</select><small className={`field-hint${protocolCompatible ? '' : ' field-error'}`}>{t(protocolCompatible ? 'routes.protocolCompatibilityHint' : 'routes.protocolIncompatible')}</small></label>
-    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={onCatalogValidity} />
+    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} providers={providers} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={onCatalogValidity} />
     </FormSection>
     <FormSection title={t('forms.routeAccess')} hint={t('forms.routeAccessHint')}>
     <MultiCombobox label={t('routes.routeGroups')} options={routeGroupOptions} value={routeGroupValue} onChange={(selected) => onChange({ ...draft, route_group_ids: selected.filter((item) => !item.created).map((item) => item.value), route_group_names: selected.filter((item) => item.created).map((item) => item.label) })} placeholder={t('routes.searchOrCreateRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} allowCreate createLabel={(name) => t('routes.createRouteGroupNamed', { name })} hint={t('routes.routeGroupsHint')} />
@@ -533,10 +533,10 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const providerGroups = useGroups('provider', token, writeTenant);
   const routeGroups = useGroups('route', token, writeTenant);
   const [form, setForm] = useState<RouteDraft>(emptyRouteDraft);
-  const [formCatalog, setFormCatalog] = useState({ valid: false, allowCustom: false });
+  const [formCatalog, setFormCatalog] = useState<CatalogValidity>({ scopeKey: '', valid: false, allowCustom: false });
   const [editing, setEditing] = useState<ModelRouteView>();
   const [editForm, setEditForm] = useState<RouteDraft>(emptyRouteDraft);
-  const [editCatalog, setEditCatalog] = useState({ valid: false, allowCustom: false });
+  const [editCatalog, setEditCatalog] = useState<CatalogValidity>({ scopeKey: '', valid: false, allowCustom: false });
   const formMutation = useRef<symbol | undefined>(undefined);
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
@@ -581,15 +581,15 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   };
   useEffect(() => {
     formMutation.current = undefined;
-    loadSequence.current += 1; setRoutes([]); setCredentials([]); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false });
-    setEditing(undefined); setEditForm(emptyRouteDraft); setEditCatalog({ valid: false, allowCustom: false });
+    loadSequence.current += 1; setRoutes([]); setCredentials([]); setForm(emptyRouteDraft); setFormCatalog({ scopeKey: '', valid: false, allowCustom: false });
+    setEditing(undefined); setEditForm(emptyRouteDraft); setEditCatalog({ scopeKey: '', valid: false, allowCustom: false });
     setBusy(''); setMessage(''); setError(''); void load();
     return () => { loadAbort.current?.abort(); credentialSearchAbort.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const statusFilter = useResourceListStatusFilter('model-routes', tenant, routes, (route) => route.enabled);
   const scopedUpstreams = upstreams.filter((value) => !value.tenant_external_id || value.tenant_external_id === writeTenant);
   const canManage = (route: ModelRouteView) => Boolean(writeTenant) && route.tenant_external_id === writeTenant;
-  const canSubmit = (draft: RouteDraft, catalogValid: boolean) => {
+  const canSubmit = (draft: RouteDraft, catalog: CatalogValidity) => {
     const included = providerGroups.groups.filter(group => draft.included_provider_group_ids.includes(group.id)).flatMap(group => group.member_ids);
     const excluded = new Set(providerGroups.groups.filter(group => draft.excluded_provider_group_ids.includes(group.id)).flatMap(group => group.member_ids));
     const candidates = [...new Set([...draft.upstream_account_ids, ...included])].filter(id => !excluded.has(id));
@@ -598,13 +598,14 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       const provider = providers.find(value => value.id === account?.driver);
       return !provider || provider.protocols.includes(draft.protocol);
     });
-    return Boolean(writeTenant && catalogValid && draft.public_model.trim() && draft.upstream_model.trim()
+    const currentScopeKey = modelCatalogScopeKey(token, writeTenant, draft.protocol, draft.upstream_account_ids, draft.included_provider_group_ids, draft.excluded_provider_group_ids, candidates, draft.upstream_model);
+    return Boolean(writeTenant && catalog.scopeKey === currentScopeKey && catalog.valid && draft.public_model.trim() && draft.upstream_model.trim()
       && Number.isInteger(draft.priority) && draft.priority >= -1000000 && draft.priority <= 1000000
       && candidates.length > 0 && compatible);
   };
   const beginEdit = (route: ModelRouteView) => {
     setEditing(route);
-    setEditCatalog({ valid: false, allowCustom: false });
+    setEditCatalog({ scopeKey: '', valid: false, allowCustom: false });
     setEditForm({
       public_model: route.public_model,
       upstream_account_id: route.upstream_account_id ?? route.upstream_account_ids?.[0] ?? '',
@@ -621,8 +622,8 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     });
     setMessage(''); setError('');
   };
-  const submitRoute = async (draft: RouteDraft, catalog: { valid: boolean; allowCustom: boolean }, existing?: ModelRouteView) => {
-    if (formMutation.current || busy || !canSubmit(draft, catalog.valid)) return;
+  const submitRoute = async (draft: RouteDraft, catalog: CatalogValidity, existing?: ModelRouteView) => {
+    if (formMutation.current || busy || !canSubmit(draft, catalog)) return;
     const operation = Symbol('route-form');
     formMutation.current = operation;
     const current = () => formMutation.current === operation && scopeRef.current.token === token
@@ -636,7 +637,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       });
       if (!current()) return;
       if (existing) setEditing(undefined);
-      else { setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); }
+      else { setForm(emptyRouteDraft); setFormCatalog({ scopeKey: '', valid: false, allowCustom: false }); }
       setMessage(t(existing ? 'routes.updated' : 'routes.created'));
       await Promise.all([load(), routeGroups.load()]);
     } catch (reason) {
@@ -670,16 +671,16 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       {editing && <form className="inline-editor form-panel" onSubmit={event => { event.preventDefault(); void submitRoute(editForm, editCatalog, editing); }}>
         <div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div>
         <fieldset className="management-schema-form" disabled={Boolean(busy)} aria-busy={busy === editing.id}>
-          <RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} />
-          <div className="management-form-actions"><button type="submit" disabled={Boolean(busy) || !canSubmit(editForm, editCatalog.valid)}>{t('common.save')}</button>{busy === editing.id && <span role="status">{t('forms.saving')}</span>}</div>
+          <RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={setEditCatalog} onCredentialQuery={searchCredential} />
+          <div className="management-form-actions"><button type="submit" disabled={Boolean(busy) || !canSubmit(editForm, editCatalog)}>{t('common.save')}</button>{busy === editing.id && <span role="status">{t('forms.saving')}</span>}</div>
         </fieldset>
       </form>}
     </article>
     <details className="panel create-resource"><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary>
       <form className="create-resource-body form-panel" onSubmit={event => { event.preventDefault(); void submitRoute(form, formCatalog); }}>
         <fieldset className="management-schema-form" disabled={Boolean(busy)} aria-busy={busy === 'create'}>
-          <RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} />
-          <div className="management-form-actions"><button type="submit" disabled={Boolean(busy) || !canSubmit(form, formCatalog.valid)}>{t('routes.create')}</button>{busy === 'create' && <span role="status">{t('forms.saving')}</span>}</div>
+          <RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={setFormCatalog} onCredentialQuery={searchCredential} />
+          <div className="management-form-actions"><button type="submit" disabled={Boolean(busy) || !canSubmit(form, formCatalog)}>{t('routes.create')}</button>{busy === 'create' && <span role="status">{t('forms.saving')}</span>}</div>
         </fieldset>
       </form>
     </details>

@@ -1,12 +1,21 @@
 import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { flushSync } from 'react-dom';
 import { I18nProvider } from '../../src/i18n';
 import { CredentialsPage, RoutesPage, ServiceCredentialsPage } from '../../src/operator/pages/ManagementPages';
+import { UpstreamModelCombobox } from '../../src/operator/UpstreamModelCombobox';
+import type { ProviderType, UpstreamAccount } from '../../src/types';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
-window.formFixture = { writes: [], finish: () => {} };
+window.formFixture = {
+  writes: [], reads: [], holdCatalog: false, finish: () => {},
+  changeAndSubmit: (change) => {
+    flushSync(change);
+    document.querySelector<HTMLFormElement>('.create-resource > form')?.requestSubmit();
+  },
+};
 const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
 const accountId = '11111111-1111-4111-8111-111111111111';
 const keySchema = {
@@ -42,17 +51,41 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     } },
   });
   if (url.pathname.endsWith('/provider-types')) return json([{ id: 'fixture-provider', display_name: 'Fixture Provider', protocols: ['openai'], modalities: ['text'], config_schema: {}, credential_schema: {} }]);
-  if (url.pathname.endsWith('/upstreams')) return json([{ id: accountId, tenant_external_id: 'alpha', name: 'Production account', driver: 'fixture-provider', status: 'active' }]);
+  window.formFixture.reads.push(url.pathname + url.search);
+  if (url.pathname.endsWith('/upstreams')) return json([
+    { id: accountId, tenant_external_id: 'alpha', name: 'Production account', driver: 'fixture-provider', status: 'active' },
+    { id: '22222222-2222-4222-8222-222222222222', tenant_external_id: 'alpha', name: 'Backup account', driver: 'fixture-provider', status: 'active' },
+  ]);
+  if (url.pathname.endsWith('/upstream-models') && window.formFixture.holdCatalog) return new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+  });
+  const eligibleCount = new URLSearchParams(location.search).get('view') === 'large-catalog' ? 500 : 1;
   if (url.pathname.endsWith('/upstream-models')) return json({
-    eligible_account_count: 1, unknown_account_count: 0, stale_account_count: 0,
-    data: [{ id: 'fixture-model', protocol: 'openai', supported_account_count: 1, eligible_account_count: 1, complete_coverage: true }],
+    eligible_account_count: eligibleCount, unknown_account_count: 0, stale_account_count: 0,
+    data: !url.searchParams.get('q') || url.searchParams.get('q') === 'fixture-model'
+      ? [{ id: 'fixture-model', protocol: 'openai', supported_account_count: eligibleCount, eligible_account_count: eligibleCount, complete_coverage: true }] : [],
   });
   if (url.pathname.endsWith('/models')) return json({ status: 'ready', models: [{ id: 'fixture-model', protocol: 'openai' }] });
   return json([]);
 };
+const largeAccounts = Array.from({ length: 500 }, (_, index) => ({
+  id: `account-${String(index).padStart(3, '0')}`, name: `Account ${index}`, driver: 'fixture-provider', status: 'active',
+})) as UpstreamAccount[];
+function LargeCatalog() {
+  const [members, setMembers] = useState(largeAccounts.map(account => account.id));
+  return <>
+    <button onClick={() => setMembers(members.slice(0, -1))}>Change group membership</button>
+    <UpstreamModelCombobox token="fixture-control" tenant="alpha" protocol="openai"
+      accountIds={[]} includedProviderGroupIds={['unchanged-group-id']} excludedProviderGroupIds={[]}
+      syncAccountIds={members} value="fixture-model" onChange={() => {}} customModelConfirmed={false}
+      onValidityChange={() => {}} upstreams={largeAccounts}
+      providers={[{ id: 'fixture-provider', display_name: 'Fixture Provider' } as ProviderType]} />
+  </>;
+}
 function Fixture() {
   const [tenant, setTenant] = useState('alpha');
   const view = new URLSearchParams(location.search).get('view');
+  if (view === 'large-catalog') return <LargeCatalog />;
   const Component = view === 'routes' ? RoutesPage : view === 'services' ? ServiceCredentialsPage : CredentialsPage;
   return <main style={{ padding: 12, minWidth: 0 }}>
     <button onClick={() => setTenant('beta')}>Switch tenant</button>

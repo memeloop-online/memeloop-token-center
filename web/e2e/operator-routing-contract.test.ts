@@ -121,3 +121,29 @@ test('routing UI distinguishes candidate pools, permission bundles and saved eff
   assert.match(upstreamModel, /browseModelQuery/);
   assert.match(upstreamModel, /onQueryChange=\{setSearchQuery\}/);
 });
+
+test('catalog and submit validity synchronously require the same complete scope, including live group membership', () => {
+  const upstreamModel = readFileSync(new URL('../src/operator/UpstreamModelCombobox.tsx', import.meta.url), 'utf8');
+  assert.match(upstreamModel, /JSON\.stringify\(\[token, tenant, protocol, \.\.\.\[accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds\]\.map\(ids => \[\.\.\.new Set\(ids\)\]\.sort\(\)\), model\.trim\(\)\]\)/);
+  assert.match(upstreamModel, /catalogResult\?\.scopeKey === scopeKey \? catalogResult\.data : undefined/);
+  assert.match(upstreamModel, /browseResult\?\.scopeKey === browseScopeKey/);
+  assert.match(upstreamModel, /confirmationScope === scopeKey && partialConfirmed/);
+  assert.match(upstreamModel, /confirmationScope === scopeKey && customConfirmed/);
+  assert.match(upstreamModel, /validityCallback\.current\(\{ scopeKey, valid, allowCustom \}\)/);
+  assert.match(managementPages, /modelCatalogScopeKey\(token, writeTenant, draft\.protocol, draft\.upstream_account_ids, draft\.included_provider_group_ids, draft\.excluded_provider_group_ids, candidates, draft\.upstream_model\)/);
+  assert.match(managementPages, /catalog\.scopeKey === currentScopeKey && catalog\.valid/);
+  assert.match(managementPages, /!canSubmit\(draft, catalog\)\) return/);
+  assert.match(managementPages, /providerGroups\.groups\.filter\(group => draft\.included_provider_group_ids\.includes\(group\.id\)\)\.flatMap\(group => group\.member_ids\)/);
+  assert.doesNotMatch(managementPages, /canSubmit\([^)]*catalog\.valid/);
+});
+
+test('model browsing caps account provenance, preserves unknown coverage and searches provider display names', () => {
+  const upstreamModel = readFileSync(new URL('../src/operator/UpstreamModelCombobox.tsx', import.meta.url), 'utf8');
+  assert.match(upstreamModel, /const ids = \[\.\.\.new Set\(syncAccountIds\)\]\.sort\(\)\.slice\(0, 8\)/);
+  assert.match(upstreamModel, /Math\.min\(4, ids\.length\)/);
+  assert.match(upstreamModel, /model\.supported_account_count > accounts\.length/);
+  assert.match(upstreamModel, /provenanceIncomplete \|\| !accounts\.length \? \[undefined\]/);
+  assert.match(upstreamModel, /browsing \|\| provenanceLoading/);
+  assert.match(upstreamModel, /providers\.find\(provider => provider\.id === account\.driver\)\?\.display_name/);
+  assert.match(managementPages, /<UpstreamModelCombobox[^>]*providers=\{providers\}/);
+});

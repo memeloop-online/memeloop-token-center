@@ -1654,6 +1654,14 @@
   box-shadow: 0 12px 28px rgb(45 72 69 / 18%);
 }
 
+:root[data-theme='light'] .combobox-popover button {
+  color: #294c49;
+}
+
+:root[data-theme='light'] .combobox-popover button small {
+  color: #4f6b67;
+}
+
 :root[data-theme='light'] .selection-chip,
 :root[data-theme='light'] .table-chip-list span,
 :root[data-theme='light'] .group-list button.active,
