@@ -16,6 +16,7 @@ import type {
 } from '../../types';
 import { GroupManager, useGroups } from '../GroupManager';
 import { MultiCombobox, type ComboboxOption } from '../MultiCombobox';
+import { CredentialObjectTemplate, FormSection, ManagedGrantField, ManagementForm, ScopePickerWidget } from '../ManagementForm';
 import { ResourceListStatusEmpty, ResourceListStatusFilterControl, useResourceListStatusFilter } from '../ResourceListStatusFilter';
 import { UpstreamModelCombobox } from '../UpstreamModelCombobox';
 import {
@@ -459,7 +460,7 @@ function selections(ids: string[], options: ComboboxOption[]) {
 
 function routeRequest(draft: RouteDraft, customModelConfirmed: boolean) {
   const { upstream_account_id: _legacyAccountId, ...request } = draft;
-  return { ...request, custom_model_confirmed: customModelConfirmed };
+  return { ...request, public_model: draft.public_model.trim(), upstream_model: draft.upstream_model.trim(), custom_model_confirmed: customModelConfirmed };
 }
 
 function RouteFields({ token, tenant, draft, upstreams, providers, providerGroups, routeGroups, credentials, onChange, onCatalogValidity, onCredentialQuery }: {
@@ -488,7 +489,8 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     ? knownProtocols
     : knownProtocols.filter((protocol) => candidateProtocolSets.every((values) => values?.includes(protocol)));
   const protocolCompatible = supportedByAll.includes(draft.protocol);
-  const upstreamOptions = upstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }));
+  const upstreamOptions = upstreams.map((value) => ({ value: value.id, label: value.name, description: value.id,
+    group: providers.find(provider => provider.id === value.driver)?.display_name || value.driver }));
   const providerGroupOptions = providerGroups.map((value) => ({ value: value.id, label: value.name, description: t('groups.memberCount', { count: formatNumber(value.member_count, locale) }) }));
   const routeGroupOptions = routeGroups.map((value) => ({ value: value.id, label: value.name, description: t('groups.memberCount', { count: formatNumber(value.member_count, locale) }) }));
   const credentialOptions = credentials.map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }));
@@ -497,7 +499,11 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     ...draft.route_group_names.map((name) => ({ value: `new:${name}`, label: name, created: true })),
   ];
   return <>
-    <label>{t('routes.publicModel')}<input value={draft.public_model} onChange={(event) => onChange({ ...draft, public_model: event.target.value })} /></label>
+    <FormSection title={t('forms.routeIdentity')} hint={t('forms.routeIdentityHint')}>
+    <label>{t('routes.publicModel')}<input required autoComplete="off" value={draft.public_model} onChange={(event) => onChange({ ...draft, public_model: event.target.value })} /></label>
+    <label>{t('routes.priority')}<input type="number" required step={1} min={-1000000} max={1000000} value={Number.isFinite(draft.priority) ? draft.priority : ''} onChange={(event) => onChange({ ...draft, priority: event.target.value === '' ? Number.NaN : Number(event.target.value) })} /><small className="field-hint">{t('forms.routePriorityHint')}</small></label>
+    </FormSection>
+    <FormSection title={t('forms.routeSource')} hint={t('forms.routeSourceHint')}>
     <MultiCombobox label={t('routes.explicitUpstreams')} options={upstreamOptions} value={selections(draft.upstream_account_ids, upstreamOptions)} onChange={(selected) => {
       const upstream_account_ids = selected.map((item) => item.value);
       const upstream_account_id = upstream_account_ids[0] ?? '';
@@ -509,9 +515,11 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     </div>
     <label>{t('routes.protocol')}<select aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</select><small className={`field-hint${protocolCompatible ? '' : ' field-error'}`}>{t(protocolCompatible ? 'routes.protocolCompatibilityHint' : 'routes.protocolIncompatible')}</small></label>
     <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={onCatalogValidity} />
-    <label>{t('routes.priority')}<input type="number" min={-1000000} max={1000000} value={draft.priority} onChange={(event) => onChange({ ...draft, priority: Number(event.target.value) })} /></label>
+    </FormSection>
+    <FormSection title={t('forms.routeAccess')} hint={t('forms.routeAccessHint')}>
     <MultiCombobox label={t('routes.routeGroups')} options={routeGroupOptions} value={routeGroupValue} onChange={(selected) => onChange({ ...draft, route_group_ids: selected.filter((item) => !item.created).map((item) => item.value), route_group_names: selected.filter((item) => item.created).map((item) => item.label) })} placeholder={t('routes.searchOrCreateRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} allowCreate createLabel={(name) => t('routes.createRouteGroupNamed', { name })} hint={t('routes.routeGroupsHint')} />
     <MultiCombobox label={t('routes.exactCredentials')} options={credentialOptions} value={selections(draft.granted_credential_ids, credentialOptions)} onChange={(selected) => onChange({ ...draft, granted_credential_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchCredentials')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exactCredentialsHint')} onQueryChange={onCredentialQuery} />
+    </FormSection>
   </>;
 }
 
@@ -527,6 +535,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const [editing, setEditing] = useState<ModelRouteView>();
   const [editForm, setEditForm] = useState<RouteDraft>(emptyRouteDraft);
   const [editCatalog, setEditCatalog] = useState({ valid: false, allowCustom: false });
+  const formMutation = useRef<symbol | undefined>(undefined);
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -569,6 +578,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     });
   };
   useEffect(() => {
+    formMutation.current = undefined;
     loadSequence.current += 1; setRoutes([]); setCredentials([]); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false });
     setEditing(undefined); setEditForm(emptyRouteDraft); setEditCatalog({ valid: false, allowCustom: false });
     setBusy(''); setMessage(''); setError(''); void load();
@@ -577,8 +587,19 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const statusFilter = useResourceListStatusFilter('model-routes', tenant, routes, (route) => route.enabled);
   const scopedUpstreams = upstreams.filter((value) => !value.tenant_external_id || value.tenant_external_id === writeTenant);
   const canManage = (route: ModelRouteView) => Boolean(writeTenant) && route.tenant_external_id === writeTenant;
-  const canSubmit = (draft: RouteDraft, catalogValid: boolean) => Boolean(writeTenant && catalogValid && draft.public_model.trim() && draft.upstream_model.trim()
-    && (draft.upstream_account_ids.length > 0 || draft.included_provider_group_ids.length > 0));
+  const canSubmit = (draft: RouteDraft, catalogValid: boolean) => {
+    const included = providerGroups.groups.filter(group => draft.included_provider_group_ids.includes(group.id)).flatMap(group => group.member_ids);
+    const excluded = new Set(providerGroups.groups.filter(group => draft.excluded_provider_group_ids.includes(group.id)).flatMap(group => group.member_ids));
+    const candidates = [...new Set([...draft.upstream_account_ids, ...included])].filter(id => !excluded.has(id));
+    const compatible = candidates.every(id => {
+      const account = scopedUpstreams.find(value => value.id === id);
+      const provider = providers.find(value => value.id === account?.driver);
+      return !provider || provider.protocols.includes(draft.protocol);
+    });
+    return Boolean(writeTenant && catalogValid && draft.public_model.trim() && draft.upstream_model.trim()
+      && Number.isInteger(draft.priority) && draft.priority >= -1000000 && draft.priority <= 1000000
+      && candidates.length > 0 && compatible);
+  };
   const beginEdit = (route: ModelRouteView) => {
     setEditing(route);
     setEditCatalog({ valid: false, allowCustom: false });
@@ -598,18 +619,31 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     });
     setMessage(''); setError('');
   };
-  const saveEdit = async () => {
-    if (!editing || !canSubmit(editForm, editCatalog.valid)) return;
-    setBusy(editing.id); setMessage(''); setError('');
+  const submitRoute = async (draft: RouteDraft, catalog: { valid: boolean; allowCustom: boolean }, existing?: ModelRouteView) => {
+    if (formMutation.current || busy || !canSubmit(draft, catalog.valid)) return;
+    const operation = Symbol('route-form');
+    formMutation.current = operation;
+    const current = () => formMutation.current === operation && scopeRef.current.token === token
+      && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant;
+    setBusy(existing?.id ?? 'create'); setMessage(''); setError('');
     try {
-      await api(`/internal/v1/model-routes/${editing.id}`, token, { method: 'PUT', body: JSON.stringify({ ...routeRequest(editForm, editCatalog.allowCustom), tenant_external_id: writeTenant, expected_updated_at: editing.updated_at, expected_grant_revision: editing.grant_revision }) });
-      setEditing(undefined); setMessage(t('routes.updated')); await Promise.all([load(), routeGroups.load]);
+      await api(existing ? `/internal/v1/model-routes/${existing.id}` : '/internal/v1/model-routes', token, {
+        method: existing ? 'PUT' : 'POST',
+        body: JSON.stringify({ ...routeRequest(draft, catalog.allowCustom), tenant_external_id: writeTenant,
+          ...(existing ? { expected_updated_at: existing.updated_at, expected_grant_revision: existing.grant_revision } : {}) }),
+      });
+      if (!current()) return;
+      if (existing) setEditing(undefined);
+      else { setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); }
+      setMessage(t(existing ? 'routes.updated' : 'routes.created'));
+      await Promise.all([load(), routeGroups.load()]);
     } catch (reason) {
+      if (!current()) return;
       if (reason instanceof ApiError && reason.status === 409) {
-        setEditing(undefined); setError(t('routes.concurrentChangeReloaded')); await Promise.all([load(), routeGroups.load]);
+        setEditing(undefined); setError(t('routes.concurrentChangeReloaded')); await Promise.all([load(), routeGroups.load()]);
       } else setError(messageOf(reason, t('common.requestFailed')));
     }
-    finally { setBusy(''); }
+    finally { if (current()) { formMutation.current = undefined; setBusy(''); } }
   };
   const setEnabled = async (route: ModelRouteView, enabled: boolean) => {
     setBusy(route.id); setMessage(''); setError('');
@@ -631,9 +665,22 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   };
   return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="management-layout">
     <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="table-scroll"><table><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id}>{!tenant && <td><code>{route.tenant_external_id ?? '—'}</code></td>}<td><code>{route.public_model}</code></td><td><div className="table-chip-list">{(route.upstream_account_ids ?? (route.upstream_account_id ? [route.upstream_account_id] : [])).map((id) => <span key={id}>{upstreams.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code>{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('common.remove')}</button></div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
-      {editing && <div className="inline-editor form-panel"><div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div><RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === editing.id || !canSubmit(editForm, editCatalog.valid)} onClick={() => void saveEdit()}>{t('common.save')}</button></div>}
+      {editing && <form className="inline-editor form-panel" onSubmit={event => { event.preventDefault(); void submitRoute(editForm, editCatalog, editing); }}>
+        <div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div>
+        <fieldset className="management-schema-form" disabled={Boolean(busy)} aria-busy={busy === editing.id}>
+          <RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(valid, allowCustom) => setEditCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} />
+          <div className="management-form-actions"><button type="submit" disabled={Boolean(busy) || !canSubmit(editForm, editCatalog.valid)}>{t('common.save')}</button>{busy === editing.id && <span role="status">{t('forms.saving')}</span>}</div>
+        </fieldset>
+      </form>}
     </article>
-    <details className="panel create-resource"><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel"><RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} /><button type="button" disabled={busy === 'create' || !canSubmit(form, formCatalog.valid)} onClick={async () => { setBusy('create'); setMessage(''); setError(''); try { await api('/internal/v1/model-routes', token, { method: 'POST', body: JSON.stringify({ ...routeRequest(form, formCatalog.allowCustom), tenant_external_id: writeTenant }) }); setForm(emptyRouteDraft); setFormCatalog({ valid: false, allowCustom: false }); setMessage(t('routes.created')); await Promise.all([load(), routeGroups.load]); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } finally { setBusy(''); } }}>{t('routes.create')}</button></div></details>
+    <details className="panel create-resource"><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary>
+      <form className="create-resource-body form-panel" onSubmit={event => { event.preventDefault(); void submitRoute(form, formCatalog); }}>
+        <fieldset className="management-schema-form" disabled={Boolean(busy)} aria-busy={busy === 'create'}>
+          <RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(valid, allowCustom) => setFormCatalog({ valid, allowCustom })} onCredentialQuery={searchCredential} />
+          <div className="management-form-actions"><button type="submit" disabled={Boolean(busy) || !canSubmit(form, formCatalog.valid)}>{t('routes.create')}</button>{busy === 'create' && <span role="status">{t('forms.saving')}</span>}</div>
+        </fieldset>
+      </form>
+    </details>
   </section><section className="routing-group-managers">
     <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
     <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={routes.filter(canManage).map((route) => ({ value: route.id, label: route.public_model, description: route.protocol }))} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
@@ -869,13 +916,18 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
           {granting === value.key_id && value.account_id && <div className="inline-editor form-panel"><h3>{t('credentials.grantFor', { alias: value.alias })}</h3><label>{t('credentials.grantAmount')} ({value.currency})<input inputMode="decimal" value={grant.amount} onChange={(event) => setGrant({ ...grant, amount: event.target.value })} /></label><label>{t('credentials.grantSource')}<input value={grant.source} onChange={(event) => setGrant({ ...grant, source: event.target.value })} /></label><button type="button" disabled={!canWrite || Boolean(busy) || !isPositiveDecimal(grant.amount) || !grant.source.trim()} onClick={async () => { const amount = grant.amount.trim(); const source = grant.source.trim(); if (!await confirm(`${t('credentials.grantFor', { alias: value.alias })}\n${t('credentials.grantAmount')}: ${amount} ${value.currency}\n${t('credentials.grantSource')}: ${source}`)) return; setBusy(`grant-${value.key_id}`); try { await api(`/internal/v1/accounts/${value.account_id}/grants`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ amount, source }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant) return; setGranting(undefined); setGrant({ amount: '', source: '' }); setMessage(t('credentials.granted')); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant) setBusy(''); } }}>{t('credentials.confirmGrant')}</button></div>}
         </div>})}</div>{keyListState === 'failed' ? <div className="load-more"><button type="button" className="secondary" onClick={() => void load()}>{t('credentials.retryLoad')}</button></div> : nextCursor && (keyListState === 'more' || keyListState === 'loading-more') && <div className="load-more"><button type="button" className="secondary" disabled={!canLoadMore} onClick={() => void loadMore()}>{loadingKeys ? t('common.loading') : t('credentials.loadMore')}</button></div>}</article>
     <details className="panel create-resource"><summary><span><b>{t('credentials.createTitle')}</b><small>{t('credentials.createRoutingHint')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">
+      {createFormSchema ? <ManagementForm key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)}
+        uiSchema={{ 'ui:ObjectFieldTemplate': CredentialObjectTemplate, 'ui:order': ['alias', 'principal_external_id', 'tenant_external_id', 'route_ids', 'route_group_ids', 'currency', 'initial_balance', 'policy', '*'],
+          tenant_external_id: { 'ui:widget': 'hidden' }, route_ids: { 'ui:field': ManagedGrantField }, route_group_ids: { 'ui:field': ManagedGrantField },
+          policy: { 'ui:order': ['enforcement_mode', 'requests_per_minute', 'tokens_per_minute', 'max_concurrency', 'daily_budget', 'weekly_budget', 'lifetime_budget', '*'] } }}
+        formContext={{ routeFields: <>
       <MultiCombobox label={t('credentials.exactRoutes')} options={routeOptions} value={selections(newRouteIds, routeOptions)} onChange={(selected) => setNewRouteIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRoutes')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
       <MultiCombobox label={t('credentials.routeGroups')} options={routeGroupOptions} value={selections(newRouteGroupIds, routeGroupOptions)} onChange={(selected) => setNewRouteGroupIds(selected.map((item) => item.value))} placeholder={t('credentials.searchRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('credentials.existingGroupsOnly')} />
-      {createFormSchema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try {
+        </> }} disabled={!canWrite} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; setError(''); setMessage(''); try {
         const created = await api<{ key: string; key_id: string }>('/internal/v1/keys', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant, route_ids: newRouteIds, route_group_ids: newRouteGroupIds }) });
         if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return;
         setNewRouteIds([]); setNewRouteGroupIds([]); setSecret(created.key); setMessage(t(newRouteIds.length || newRouteGroupIds.length ? 'credentials.created' : 'credentials.createdNoRoutes')); await load();
-      } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!canWrite}>{t('credentials.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}
+      } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!canWrite}>{t('credentials.create')}</button></ManagementForm> : <div className="empty">{t('providers.schemaMissing')}</div>}
     </div></details>
   </section>{writeTenant && <GroupManager kind="credential" token={token} tenant={writeTenant} groups={credentialGroups.groups} resources={values.filter(canManage).map((value) => ({ value: value.key_id, label: value.alias, description: value.key_id }))} onChanged={credentialGroups.load} />}</>;
 }
@@ -908,7 +960,21 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, schem
   const canManage = (value: ServiceTokenView) => Boolean(writeTenant) && (!value.tenant_external_id || value.tenant_external_id === writeTenant);
   return <>{confirmationDialog}{secret && <OneTimeSecret value={secret} message={t('services.oneTimeSecret')} />}<section className="management-layout">
     <article className="panel"><div className="panel-title"><div><h2>{t('services.title')}</h2><p className="muted">{t('services.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{message && <div className="notice success" role="status">{message}</div>}<div className="account-list">{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('status.active')} empty={t('services.empty')} />}{statusFilter.values.map((value) => <div className="managed-resource" key={value.service_id}><div className="managed-resource-header"><div><b>{value.name}</b><small>{value.service_id}</small><span>{value.tenant_external_id ?? t('services.globalScope')} · {value.scopes.join(' · ')}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions"><button type="button" className="secondary" disabled={!canManage(value) || value.status === 'revoked' || Boolean(busy)} onClick={async () => { if (!await confirm(`${t('services.rotate')} · ${value.name}\n${value.service_id}`)) return; setBusy(`rotate-${value.service_id}`); try { const result = await api<{ token: string }>(`/internal/v1/service-tokens/${value.service_id}/rotate`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setSecret(result.token); setMessage(t('services.rotated', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } }}>{t('services.rotate')}</button>{value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={async () => { const nextStatus = value.status === 'active' ? 'suspended' : 'active'; setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{value.status === 'active' ? t('services.suspend') : t('services.resume')}</button>}</div></div>)}</div></article>
-    <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">{schema ? <Form key={`${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)} uiSchema={{ tenant_external_id: { 'ui:widget': 'hidden' } }} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => { if (!writeTenant) return; try { const created = await api<{ token: string }>('/internal/v1/service-tokens', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) }); setSecret(created.token); setMessage(t('services.created')); await load(); } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); } }}><button type="submit" disabled={!writeTenant}>{t('services.create')}</button></Form> : <div className="empty">{t('providers.schemaMissing')}</div>}</div></details>
+    <details className="panel create-resource"><summary><span><b>{t('services.createTitle')}</b><small>{t('services.description')}</small></span><span aria-hidden="true">＋</span></summary><div className="create-resource-body form-panel">
+      {schema ? <ManagementForm key={`${token}-${tenant}-${writeTenant}-${locale}`} schema={localizeSchema(schema as RJSFSchema, locale)}
+        uiSchema={{ 'ui:order': ['name', 'tenant_external_id', 'scopes', '*'], tenant_external_id: { 'ui:widget': 'hidden' }, scopes: { 'ui:widget': ScopePickerWidget, 'ui:options': { label: false } } }}
+        disabled={!writeTenant} validator={validator} templates={schemaFormTemplates} onSubmit={async ({ formData }) => {
+          if (!writeTenant) return;
+          setError(''); setMessage('');
+          try {
+            const created = await api<{ token: string }>('/internal/v1/service-tokens', token, { method: 'POST', body: JSON.stringify({ ...formData, tenant_external_id: writeTenant }) });
+            if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return;
+            setSecret(created.token); setMessage(t('services.created')); await load();
+          } catch (reason) {
+            if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed')));
+          }
+        }}><button type="submit" disabled={!writeTenant}>{t('services.create')}</button></ManagementForm> : <div className="empty">{t('providers.schemaMissing')}</div>}
+    </div></details>
   </section></>;
 }
 

@@ -1,0 +1,44 @@
+.management-form-section {
+  border: 1px solid #2c4b4c;
+  border-radius: 12px;
+  margin: 0;
+  min-inline-size: 0;
+  padding: 16px;
+}
+.management-form-section > legend {
+  font-size: .9rem;
+  font-weight: 650;
+  max-width: 100%;
+  padding: 0 6px;
+  overflow-wrap: anywhere;
+}
+.management-form-section > .field-hint { margin: 0 0 14px; }
+.management-form-fields,
+.credential-form-sections { display: grid; gap: 16px; min-width: 0; }
+.management-form-fields > *,
+.management-schema-form,
+.management-schema-form fieldset { min-width: 0; min-inline-size: 0; }
+.management-schema-form legend { max-width: 100%; overflow-wrap: anywhere; }
+.management-schema-form input,
+.management-schema-form select,
+.management-schema-form textarea { max-width: 100%; }
+.management-schema-form { border: 0; margin: 0; padding: 0; min-inline-size: 0; }
+.management-schema-form:has(> .management-form-section) { display: grid; gap: 18px; }
+.combobox-group-title { font-size: .75rem; font-weight: 650; padding: 8px 10px; overflow-wrap: anywhere; }
+.combobox-popover button { width: 100%; }
+.group-manager { container-type: inline-size; }
+@container (width < 620px) {
+  .group-editor-layout { grid-template-columns: minmax(0, 1fr); }
+  .group-rename { grid-template-columns: minmax(0, 1fr) auto; }
+}
+.management-form-submit { border: 0; margin: 16px 0 0; padding: 0; }
+.management-form-submit button { min-height: 44px; }
+.management-form-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.management-form-actions button { min-height: 44px; }
+.management-form-feedback { overflow-wrap: anywhere; }
+:root[data-theme='light'] .management-form-section { border-color: #cbdeda; }
+@media (max-width: 480px) {
+  .management-form-section { padding: 12px; }
+  .management-form-actions > button,
+  .management-form-submit > button { width: 100%; }
+}

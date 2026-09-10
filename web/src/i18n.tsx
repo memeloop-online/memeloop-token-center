@@ -4,6 +4,16 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'forms.identity': '1 · 凭据身份', 'forms.identityHint': '别名用于辨认凭据；用户主体用于关联同一客户。',
+  'forms.access': '2 · 模型授权', 'forms.balance': '3 · 余额与币种',
+  'forms.balanceHint': '余额与限流策略共同决定可用范围。预付费凭据的初始余额为 0 时无法付费调用。',
+  'forms.policy': '4 · 策略与限额', 'forms.policyHint': '仅配置当前凭据。日限额与滚动七天限额为可选项；不会修改其他已有凭据。',
+  'forms.saving': '正在保存，请稍候…', 'forms.searchScopes': '搜索并选择权限',
+  'forms.scopesHint': '仅选择此集成需要的权限。读取和写入权限相互独立。',
+  'forms.routeIdentity': '1 · 对外模型', 'forms.routeIdentityHint': '客户端使用此模型名。上游的实际模型在下一步选择。',
+  'forms.routeSource': '2 · 上游来源与模型', 'forms.routeSourceHint': '先选账号或账号组，再从对应目录选择模型。排除组优先。',
+  'forms.routeAccess': '3 · 分组与授权', 'forms.routeAccessHint': '明确哪些凭据可使用此路由；未授予权限的凭据不会自动获得访问。',
+  'forms.routePriorityHint': '整数，范围 −1,000,000 至 1,000,000。保留 0 使用默认优先级。',
   'language.zh': '中文', 'language.en': 'English',
   'theme.light': '切换到亮色主题', 'theme.dark': '切换到暗色主题',
   'shell.operator': '管理端', 'shell.selfService': '自助端',
@@ -403,6 +413,16 @@ const zh = {
 } as const;
 
 const en = {
+  'forms.identity': '1 · Credential identity', 'forms.identityHint': 'Use an alias to recognize the credential and a principal to associate it with a customer.',
+  'forms.access': '2 · Model access', 'forms.balance': '3 · Balance and currency',
+  'forms.balanceHint': 'Balance and policy jointly determine access. A prepaid credential with zero initial credit cannot make paid calls.',
+  'forms.policy': '4 · Policy and limits', 'forms.policyHint': 'Applies only to this credential. Daily and rolling seven-day budgets are optional; existing credentials are unchanged.',
+  'forms.saving': 'Saving, please wait…', 'forms.searchScopes': 'Search and select permissions',
+  'forms.scopesHint': 'Select only the permissions this integration needs. Read and write scopes are separate.',
+  'forms.routeIdentity': '1 · Public model', 'forms.routeIdentityHint': 'Clients use this model name. Select the actual upstream model in the next section.',
+  'forms.routeSource': '2 · Upstream sources and model', 'forms.routeSourceHint': 'Choose accounts or account groups, then choose a model from their catalog. Exclusions take precedence.',
+  'forms.routeAccess': '3 · Groups and access', 'forms.routeAccessHint': 'Explicitly grant access to this route. Other credentials do not automatically receive access.',
+  'forms.routePriorityHint': 'An integer from −1,000,000 to 1,000,000. Keep 0 for the default priority.',
   'language.zh': '中文', 'language.en': 'English', 'theme.light': 'Switch to light theme', 'theme.dark': 'Switch to dark theme',
   'shell.operator': 'Operator', 'shell.selfService': 'Self-service',
   'common.connect': 'Connect', 'common.load': 'Continue', 'common.loading': 'Loading…', 'common.none': 'None', 'common.running': 'Running', 'common.select': 'Select', 'common.all': 'All',

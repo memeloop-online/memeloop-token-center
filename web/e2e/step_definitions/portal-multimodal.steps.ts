@@ -462,11 +462,11 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const credentialPanel = page.locator('details.create-resource').filter({ hasText: '创建客户端凭据' });
   await credentialPanel.locator('summary').click();
   const credentialForm = credentialPanel.locator('form');
-  await credentialForm.locator('#root_principal_external_id').fill('browser-multimodal-user');
-  await credentialForm.locator('#root_alias').fill('Browser multimodal credential');
-  await credentialForm.locator('#root_currency').selectOption('USD');
-  await credentialForm.locator('#root_initial_balance').fill('10');
-  await assertNoCount(credentialForm.locator('#root_policy_allowed_models'));
+  await credentialForm.locator('[id$="_principal_external_id"]').fill('browser-multimodal-user');
+  await credentialForm.locator('[id$="_alias"]').fill('Browser multimodal credential');
+  await credentialForm.locator('[id$="_currency"]').selectOption('USD');
+  await credentialForm.locator('[id$="_initial_balance"]').fill('10');
+  await assertNoCount(credentialForm.locator('[id$="_policy_allowed_models"]'));
   const newCredentialRoutes = credentialPanel.getByRole('combobox', { name: '具体路由', exact: true });
   await newCredentialRoutes.fill(imageModel);
   await newCredentialRoutes.press('Enter');

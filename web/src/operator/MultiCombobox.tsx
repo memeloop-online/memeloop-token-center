@@ -1,9 +1,10 @@
-import { useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 
 export interface ComboboxOption {
   value: string;
   label: string;
   description?: string;
+  group?: string;
   created?: boolean;
 }
 
@@ -20,6 +21,9 @@ interface MultiComboboxProps {
   disabled?: boolean;
   hint?: string;
   onQueryChange?: (query: string) => void;
+  inputId?: string;
+  required?: boolean;
+  invalid?: boolean;
 }
 
 function normalized(value: string) {
@@ -29,7 +33,7 @@ function normalized(value: string) {
 function rowsForQuery(options: ComboboxOption[], value: ComboboxOption[], query: string, allowCreate: boolean) {
   const selected = new Set(value.map((item) => item.value));
   const available = options.filter((item) => !selected.has(item.value)
-    && (!query.trim() || `${item.label} ${item.description ?? ''}`.toLowerCase().includes(normalized(query))));
+    && (!query.trim() || `${item.label} ${item.description ?? ''} ${item.group ?? ''}`.toLowerCase().includes(normalized(query))));
   const canCreate = allowCreate && Boolean(query.trim())
     && !options.some((item) => normalized(item.label) === normalized(query))
     && !value.some((item) => normalized(item.label) === normalized(query));
@@ -40,7 +44,7 @@ function rowsForQuery(options: ComboboxOption[], value: ComboboxOption[], query:
 
 export function MultiCombobox({
   label, options, value, onChange, placeholder, emptyText, removeLabel, allowCreate = false,
-  createLabel, disabled = false, hint, onQueryChange,
+  createLabel, disabled = false, hint, onQueryChange, inputId, required = false, invalid = false,
 }: MultiComboboxProps) {
   const id = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -48,6 +52,11 @@ export function MultiCombobox({
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const rows = useMemo(() => rowsForQuery(options, value, query, allowCreate), [options, value, query, allowCreate]);
+  const groups = new Map<string, ComboboxOption[]>();
+  rows.forEach(item => groups.set(item.group ?? '', [...(groups.get(item.group ?? '') ?? []), item]));
+  useEffect(() => {
+    if (open && activeIndex >= 0) document.getElementById(`${id}-option-${activeIndex}`)?.scrollIntoView({ block: 'nearest' });
+  }, [open, activeIndex, id]);
 
   const choose = (item: ComboboxOption) => {
     onChange([...value, item]);
@@ -63,19 +72,24 @@ export function MultiCombobox({
     } else if (event.key === 'ArrowUp') {
       event.preventDefault(); setOpen(true); setActiveIndex((current) => Math.max(current - 1, 0));
     } else if (event.key === 'Enter') {
+      // Enter belongs to the autocomplete, even for an empty result. It must
+      // never submit the surrounding create/edit form accidentally.
+      event.preventDefault();
       // React may not have committed the input/open state before a fast keyboard user presses Enter.
       const currentRows = rowsForQuery(options, value, event.currentTarget.value, allowCreate);
       const item = currentRows[activeIndex >= 0 ? activeIndex : 0];
-      if (item) { event.preventDefault(); choose(item); }
+      if (open && item) choose(item);
     } else if (event.key === 'Escape') {
-      event.preventDefault(); setOpen(false);
+      if (open) { event.preventDefault(); event.stopPropagation(); setOpen(false); }
     } else if (event.key === 'Backspace' && !query && value.length > 0) {
       onChange(value.slice(0, -1));
     }
   };
 
-  return <div className={`multi-combobox${disabled ? ' disabled' : ''}`}>
-    <label id={`${id}-label`} htmlFor={`${id}-input`}>{label}</label>
+  return <div className={`multi-combobox${disabled ? ' disabled' : ''}`} onBlur={(event) => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false);
+  }}>
+    <label id={`${id}-label`} htmlFor={inputId ?? `${id}-input`}>{label}{required ? ' *' : ''}</label>
     {hint && <small className="field-hint" id={`${id}-hint`}>{hint}</small>}
     <div className="multi-combobox-control" onClick={() => inputRef.current?.focus()}>
       {value.map((item) => <span className={`selection-chip${item.created ? ' pending' : ''}`} key={item.value}>
@@ -85,10 +99,12 @@ export function MultiCombobox({
         }}>×</button>
       </span>)}
       <input
-        id={`${id}-input`}
+        id={inputId ?? `${id}-input`}
         ref={inputRef}
         role="combobox"
         aria-autocomplete="list"
+        aria-required={required}
+        aria-invalid={invalid}
         aria-expanded={open}
         aria-controls={`${id}-listbox`}
         aria-activedescendant={open && activeIndex >= 0 && rows[activeIndex] ? `${id}-option-${activeIndex}` : undefined}
@@ -98,7 +114,6 @@ export function MultiCombobox({
         placeholder={value.length === 0 ? placeholder : ''}
         value={query}
         onFocus={() => setOpen(true)}
-        onBlur={() => window.setTimeout(() => setOpen(false), 100)}
         onChange={(event) => {
           setQuery(event.target.value); setActiveIndex(-1); setOpen(true);
           onQueryChange?.(event.target.value);
@@ -107,8 +122,11 @@ export function MultiCombobox({
       />
     </div>
     {open && !disabled && <div className="combobox-popover" id={`${id}-listbox`} role="listbox" aria-labelledby={`${id}-label`}>
-      {rows.map((item, index) => <button
+      {[...groups].map(([group, entries]) => <div key={group} role={group ? 'group' : undefined} aria-label={group || undefined}>
+      {group && <div className="combobox-group-title">{group}</div>}
+      {entries.map((item) => { const index = rows.indexOf(item); return <button
         type="button"
+        tabIndex={-1}
         role="option"
         aria-selected={index === activeIndex}
         className={index === activeIndex ? 'active' : ''}
@@ -117,7 +135,8 @@ export function MultiCombobox({
         onMouseDown={(event) => event.preventDefault()}
         onMouseEnter={() => setActiveIndex(index)}
         onClick={() => choose(item)}
-      ><span>{item.created ? createLabel?.(item.label) ?? item.label : item.label}</span>{item.description && <small>{item.description}</small>}</button>)}
+      ><span>{item.created ? createLabel?.(item.label) ?? item.label : item.label}</span>{item.description && <small>{item.description}</small>}</button>; })}
+      </div>)}
       {rows.length === 0 && <div className="combobox-empty">{emptyText}</div>}
     </div>}
   </div>;
