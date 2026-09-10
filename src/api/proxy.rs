@@ -12,8 +12,10 @@ mod sse_capture;
 mod streaming;
 mod upstream_response;
 
+#[cfg(test)]
+use crate::db::UpstreamFailureKind;
 use crate::{
-    db::{UpstreamAttemptAdmission, UpstreamFailureKind},
+    db::UpstreamAttemptAdmission,
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},
 };
 use chat_sse_usage::ChatSseUsageContract;
@@ -24,11 +26,12 @@ use lifecycle::{
     run_bounded_text_archive,
 };
 use routing::{
-    CandidateCompatibility, CodexRetryTerminal, CodexRetryTerminalGuard, PROXY_ROUTING_POLICY,
-    PreparedProxyRoute, PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput,
-    ProxySendError, UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_compatibility,
-    materialize_proxy_route, plan_proxy_route, refresh_route_snapshot, retryable_upstream_status,
-    send_proxy_route,
+    AdmittedProxyRouteInput, CandidateCompatibility, CodexRetryTerminal, CodexRetryTerminalGuard,
+    DeferredSharedProbe, NextSendableProxyRouteInput, PROXY_ROUTING_POLICY, PreparedProxyRoute,
+    PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput, ProxySendError,
+    UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_compatibility,
+    materialize_proxy_route, plan_proxy_route, prepare_admitted_proxy_route,
+    refresh_route_snapshot, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -296,29 +299,35 @@ async fn prepare_authorized_proxy_routes(
     })
 }
 
-struct NextSendableProxyRouteInput<'a> {
-    request: ProxyRequestContext<'a>,
-    reservation_id: Uuid,
-    assigned_route: &'a mut (Uuid, Uuid),
-    candidates: &'a mut std::vec::IntoIter<ResolvedUpstream>,
-    failover_reason: Option<UpstreamHealthReason>,
-}
-
 async fn next_sendable_proxy_route(
     input: NextSendableProxyRouteInput<'_>,
-) -> Result<Option<(PreparedProxyRoute, UpstreamAttemptGuard)>, AppError> {
+) -> Result<Option<(PreparedProxyRoute, UpstreamAttemptGuard, usize, usize)>, AppError> {
     let NextSendableProxyRouteInput {
         request,
         reservation_id,
         assigned_route,
         candidates,
         mut failover_reason,
+        candidate_rank,
+        outbound_attempts,
+        deferred_shared_probes,
     } = input;
     let state = request.state;
-    let key = request.key;
     let request_id = request.request_id;
+    let outbound_attempt = outbound_attempts.saturating_add(1);
     for mut route in candidates.by_ref() {
+        *candidate_rank = (*candidate_rank).saturating_add(1);
+        let rank = *candidate_rank;
         if refresh_route_snapshot(state, &mut route).await? != PreparedRouteReadiness::Ready {
+            tracing::warn!(
+                %request_id,
+                upstream_account_id = %route.account_id,
+                candidate_rank = rank,
+                outbound_attempt,
+                admission_reason = "route_snapshot_unavailable",
+                stage = "upstream_admission_skip",
+                "proxy skipped an authorized upstream before sending"
+            );
             state.metrics.observe_upstream_health(
                 UpstreamHealthEvent::Skipped,
                 UpstreamHealthReason::Unavailable,
@@ -332,6 +341,15 @@ async fn next_sendable_proxy_route(
             .expires_at()
             .is_some_and(|expires_at| expires_at <= preparation_now)
         {
+            tracing::warn!(
+                %request_id,
+                upstream_account_id = %route.account_id,
+                candidate_rank = rank,
+                outbound_attempt,
+                admission_reason = "credential_expired",
+                stage = "upstream_admission_skip",
+                "proxy skipped an authorized upstream before sending"
+            );
             state.metrics.observe_upstream_health(
                 UpstreamHealthEvent::Skipped,
                 UpstreamHealthReason::Unavailable,
@@ -355,7 +373,38 @@ async fn next_sendable_proxy_route(
                 state.config.upstream_health,
             )
             .await?;
-        if admission == UpstreamAttemptAdmission::Unavailable {
+        if let UpstreamAttemptAdmission::Unavailable {
+            cooldown_until,
+            probe_lease_until,
+            shared_probe_eligible,
+        } = admission
+        {
+            let now = unix_millis();
+            let admission_reason = if cooldown_until > now {
+                "cooldown"
+            } else if probe_lease_until > now {
+                "probe_lease"
+            } else {
+                "claim_contention"
+            };
+            tracing::warn!(
+                %request_id,
+                upstream_account_id = %planned.route.account_id,
+                candidate_rank = rank,
+                outbound_attempt,
+                admission_reason,
+                cooldown_until,
+                probe_lease_until,
+                stage = "upstream_admission_skip",
+                "proxy skipped an authorized upstream before sending"
+            );
+            if shared_probe_eligible {
+                deferred_shared_probes.push_back(DeferredSharedProbe {
+                    route: planned.route.clone(),
+                    candidate_rank: rank,
+                    probe_lease_until,
+                });
+            }
             state.metrics.observe_upstream_health(
                 UpstreamHealthEvent::Skipped,
                 UpstreamHealthReason::Cooldown,
@@ -363,54 +412,112 @@ async fn next_sendable_proxy_route(
             failover_reason = Some(UpstreamHealthReason::Cooldown);
             continue;
         }
-        let mut upstream_attempt = UpstreamAttemptGuard::new(
-            state,
-            request_id,
-            planned.route.account_id,
-            planned.route.credential_generation,
+        return prepare_admitted_proxy_route(AdmittedProxyRouteInput {
+            request,
+            reservation_id,
+            assigned_route,
+            failover_reason,
+            planned,
             admission,
-        );
-        let next_assignment = (planned.route.account_id, planned.route.route_id);
-        if *assigned_route != next_assignment {
-            if let Err(error) = state
-                .db
-                .reassign_pending_proxy_upstream(
-                    request_id,
-                    key.tenant_id,
-                    reservation_id,
-                    *assigned_route,
-                    next_assignment,
-                )
-                .await
-            {
-                upstream_attempt
-                    .complete(UpstreamAttemptTerminal::Inconclusive)
-                    .await;
-                return Err(error);
-            }
+            shared_probe_permit: None,
+            candidate_rank: rank,
+            outbound_attempt,
+        })
+        .await
+        .map(Some);
+    }
+    while let Some(mut deferred) = deferred_shared_probes.pop_front() {
+        if refresh_route_snapshot(state, &mut deferred.route).await?
+            != PreparedRouteReadiness::Ready
+        {
             tracing::warn!(
                 %request_id,
-                failed_upstream_account_id = %assigned_route.0,
-                next_upstream_account_id = %next_assignment.0,
-                stage = "upstream_failover",
-                "proxy is switching to the next authorized upstream before downstream delivery"
+                upstream_account_id = %deferred.route.account_id,
+                candidate_rank = deferred.candidate_rank,
+                outbound_attempt,
+                admission_reason = "deferred_route_snapshot_unavailable",
+                stage = "upstream_admission_skip",
+                "proxy skipped a stale deferred recovery route before sending"
             );
-            state.metrics.observe_upstream_health(
-                UpstreamHealthEvent::Failover,
-                failover_reason.unwrap_or(UpstreamHealthReason::Unavailable),
-            );
-            *assigned_route = next_assignment;
+            continue;
         }
-        let prepared = match materialize_proxy_route(state, planned).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                upstream_attempt
-                    .complete(UpstreamAttemptTerminal::Inconclusive)
-                    .await;
-                return Err(error);
+        let preparation_now = unix_millis();
+        if deferred
+            .route
+            .credential
+            .expires_at()
+            .is_some_and(|expires_at| expires_at <= preparation_now)
+        {
+            tracing::warn!(
+                %request_id,
+                upstream_account_id = %deferred.route.account_id,
+                candidate_rank = deferred.candidate_rank,
+                outbound_attempt,
+                admission_reason = "deferred_credential_expired",
+                stage = "upstream_admission_skip",
+                "proxy skipped an expired deferred recovery route before sending"
+            );
+            continue;
+        }
+        let planned = plan_proxy_route(ProxyRoutePlanInput {
+            request,
+            route: deferred.route,
+            preparation_now,
+        })?;
+        if planned.is_component() {
+            return Err(AppError::Internal);
+        }
+        let transport_policy = routing::runtime_transport_policy(
+            &planned.route.config,
+            state.config.upstream_health.shared_probe_attempts,
+        );
+        match routing::join_shared_probe(
+            state,
+            planned.route.account_id,
+            planned.route.credential_generation,
+            transport_policy.shared_probe_attempts,
+        )
+        .await?
+        {
+            Some((admission, permit)) => {
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %planned.route.account_id,
+                    candidate_rank = deferred.candidate_rank,
+                    outbound_attempt,
+                    probe_lease_until = deferred.probe_lease_until,
+                    shared_probe_limit = transport_policy.shared_probe_attempts,
+                    transport_policy_source = transport_policy.source,
+                    stage = "upstream_shared_probe_admission",
+                    "proxy admitted bounded recovery traffic after exhausting other candidates"
+                );
+                return prepare_admitted_proxy_route(AdmittedProxyRouteInput {
+                    request,
+                    reservation_id,
+                    assigned_route,
+                    failover_reason,
+                    planned,
+                    admission,
+                    shared_probe_permit: Some(permit),
+                    candidate_rank: deferred.candidate_rank,
+                    outbound_attempt,
+                })
+                .await
+                .map(Some);
             }
-        };
-        return Ok(Some((prepared, upstream_attempt)));
+            None => {
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %planned.route.account_id,
+                    candidate_rank = deferred.candidate_rank,
+                    outbound_attempt,
+                    shared_probe_limit = transport_policy.shared_probe_attempts,
+                    transport_policy_source = transport_policy.source,
+                    stage = "upstream_shared_probe_rejected",
+                    "bounded shared probe capacity is unavailable"
+                );
+            }
+        }
     }
     Ok(None)
 }
@@ -724,6 +831,8 @@ pub(super) async fn proxy(
         model_route_id.ok_or(AppError::Internal)?,
     );
     let mut outbound_attempts = 0_usize;
+    let mut candidate_rank = 0_usize;
+    let mut deferred_shared_probes = std::collections::VecDeque::new();
     let mut next_failover_reason = None;
     let (active_route, upstream, upstream_activity, mut codex_retry, mut upstream_attempt) = loop {
         if outbound_attempts == PROXY_ROUTING_POLICY.max_attempts() {
@@ -736,6 +845,9 @@ pub(super) async fn proxy(
             assigned_route: &mut assigned_route,
             candidates: &mut route_candidates,
             failover_reason: next_failover_reason.take(),
+            candidate_rank: &mut candidate_rank,
+            outbound_attempts,
+            deferred_shared_probes: &mut deferred_shared_probes,
         })
         .await
         {
@@ -749,21 +861,32 @@ pub(super) async fn proxy(
                 return finish_proxy_failure(&buffered_request, "upstream_candidate_invalid").await;
             }
         };
-        let Some((active_route, mut upstream_attempt)) = selected else {
+        let Some((active_route, mut upstream_attempt, selected_candidate_rank, outbound_attempt)) =
+            selected
+        else {
             return finish_proxy_unavailable(&buffered_request, "upstream_unavailable").await;
         };
-        let (result, rate_limit) =
-            match send_proxy_route(&state, &headers, protocol, request_id, &active_route).await {
-                Ok(mut result)
-                    if active_route.is_codex()
-                        && result.response.status() == StatusCode::TOO_MANY_REQUESTS =>
-                {
-                    let (response, kind) = routing::classify_rate_limit(result.response).await;
-                    result.response = response;
-                    (Ok(result), Some(kind))
-                }
-                result => (result, None),
-            };
+        let (result, rate_limit) = match send_proxy_route(
+            &state,
+            &headers,
+            protocol,
+            request_id,
+            &active_route,
+            selected_candidate_rank,
+            outbound_attempt,
+        )
+        .await
+        {
+            Ok(mut result)
+                if active_route.is_codex()
+                    && result.response.status() == StatusCode::TOO_MANY_REQUESTS =>
+            {
+                let (response, kind) = routing::classify_rate_limit(result.response).await;
+                result.response = response;
+                (Ok(result), Some(kind))
+            }
+            result => (result, None),
+        };
         let consumed_outbound_attempt = !matches!(
             &result,
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable)
@@ -771,42 +894,21 @@ pub(super) async fn proxy(
         if consumed_outbound_attempt {
             outbound_attempts += 1;
         }
-        let failure = match &result {
-            Ok(result) if result.response.status() == StatusCode::TOO_MANY_REQUESTS => Some((
-                rate_limit.unwrap_or(UpstreamFailureKind::RateLimited),
-                UpstreamHealthReason::RateLimited,
-            )),
-            Ok(result) if retryable_upstream_status(result.response.status()) => Some((
-                UpstreamFailureKind::Unavailable,
-                UpstreamHealthReason::Unavailable,
-            )),
-            // Same-account retry is exhausted. The complete 400 is evidence
-            // of an upstream response, so the account is marked unavailable
-            // but the request is never replayed to a different account.
-            Err(ProxySendError::RetryableCodexBadRequest) => Some((
-                UpstreamFailureKind::Unavailable,
-                UpstreamHealthReason::Unavailable,
-            )),
-            Err(ProxySendError::RetryableConnection | ProxySendError::AmbiguousResponse(_)) => {
-                Some((
-                    UpstreamFailureKind::Connection,
-                    UpstreamHealthReason::Connection,
-                ))
-            }
-            Ok(_) => None,
-            Err(
-                ProxySendError::CodexBadRequest
-                | ProxySendError::CandidateUnavailable
-                | ProxySendError::NonRetryableTransport
-                | ProxySendError::CredentialUnavailable
-                | ProxySendError::Credential,
-            ) => None,
-        };
+        let failure = routing::classify_attempt_failure(&result, rate_limit);
         let candidate_unavailable = matches!(
             &result,
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable)
         );
         if candidate_unavailable {
+            tracing::warn!(
+                %request_id,
+                upstream_account_id = %active_route.route.account_id,
+                candidate_rank = selected_candidate_rank,
+                outbound_attempt,
+                send_error = ?result.as_ref().err(),
+                stage = "upstream_send_preparation_skip",
+                "proxy candidate became unusable before an outbound attempt"
+            );
             upstream_attempt
                 .complete(UpstreamAttemptTerminal::Inconclusive)
                 .await;
@@ -816,23 +918,34 @@ pub(super) async fn proxy(
             );
         }
         if let Some((kind, reason)) = failure {
+            let status = result
+                .as_ref()
+                .ok()
+                .map(|result| result.response.status().as_u16());
+            tracing::warn!(
+                %request_id,
+                upstream_account_id = %active_route.route.account_id,
+                candidate_rank = selected_candidate_rank,
+                outbound_attempt,
+                failure_kind = kind.as_str(),
+                ?status,
+                send_error = ?result.as_ref().err(),
+                stage = "upstream_send_failure",
+                "proxy upstream attempt failed"
+            );
             upstream_attempt
                 .complete(UpstreamAttemptTerminal::Failed { kind, reason })
                 .await;
         }
         let failover_reason = match &result {
-            // A complete 429 is a definite capacity rejection before model
-            // execution, so moving to another authorized account cannot
-            // duplicate billable work. Other HTTP responses, including a
-            // 5xx, are preserved for the caller after recording health: the
-            // provider may already have accepted the POST despite its error.
             Ok(result)
                 if result.response.status() == StatusCode::TOO_MANY_REQUESTS
-                    && !route_candidates.as_slice().is_empty() =>
+                    && (!route_candidates.as_slice().is_empty()
+                        || !deferred_shared_probes.is_empty()) =>
             {
                 Some(UpstreamHealthReason::RateLimited)
             }
-            Err(ProxySendError::RetryableConnection) => failure.map(|(_, reason)| reason),
+            Err(ProxySendError::RetryableConnection(_)) => failure.map(|(_, reason)| reason),
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable) => {
                 Some(UpstreamHealthReason::Unavailable)
             }
@@ -875,7 +988,7 @@ pub(super) async fn proxy(
                 )
                 .await;
             }
-            Err(ProxySendError::RetryableConnection | ProxySendError::CandidateUnavailable) => {
+            Err(ProxySendError::RetryableConnection(_) | ProxySendError::CandidateUnavailable) => {
                 return finish_proxy_unavailable(&buffered_request, "upstream_connection").await;
             }
             Err(ProxySendError::RetryableCodexBadRequest) => {
@@ -898,14 +1011,14 @@ pub(super) async fn proxy(
                 .await;
             }
             Err(ProxySendError::AmbiguousResponse(error_code)) => {
+                upstream_attempt
+                    .complete(UpstreamAttemptTerminal::Inconclusive)
+                    .await;
                 return finish_proxy_failure(&buffered_request, error_code).await;
             }
             Err(ProxySendError::NonRetryableTransport) => {
                 upstream_attempt
-                    .complete(UpstreamAttemptTerminal::Failed {
-                        kind: UpstreamFailureKind::Connection,
-                        reason: UpstreamHealthReason::Connection,
-                    })
+                    .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
                 return finish_proxy_failure(&buffered_request, "upstream_transport").await;
             }

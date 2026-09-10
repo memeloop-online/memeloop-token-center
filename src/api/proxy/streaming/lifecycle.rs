@@ -27,6 +27,53 @@ pub(super) struct StreamingFinalizationInput<'a> {
     pub(super) gap_response: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamingUpstreamEvidence {
+    Succeeded,
+    Inconclusive,
+    InvalidResponse,
+}
+
+fn streaming_upstream_evidence(
+    terminal_result_failed: bool,
+    transport_error: Option<&str>,
+    sse_summary: Option<&ResponsesSseSummary>,
+    error_code: Option<&str>,
+) -> StreamingUpstreamEvidence {
+    if sse_summary.is_some_and(|summary| summary.observed_protocol_invalid) {
+        return StreamingUpstreamEvidence::InvalidResponse;
+    }
+    if matches!(
+        transport_error,
+        Some(
+            "upstream_stream"
+                | "upstream_timeout"
+                | "upstream_response_event_batch_too_large"
+                | "downstream_disconnected"
+                | "downstream_backpressure"
+                | "delivery_state"
+        )
+    ) {
+        return StreamingUpstreamEvidence::Inconclusive;
+    }
+    if sse_summary.is_some_and(|summary| summary.protocol_invalid) {
+        return StreamingUpstreamEvidence::InvalidResponse;
+    }
+    if matches!(
+        sse_summary.map(|summary| &summary.outcome),
+        Some(ResponsesSseOutcome::Failed)
+    ) {
+        return StreamingUpstreamEvidence::Inconclusive;
+    }
+    if error_code.is_some() {
+        StreamingUpstreamEvidence::InvalidResponse
+    } else if terminal_result_failed {
+        StreamingUpstreamEvidence::Inconclusive
+    } else {
+        StreamingUpstreamEvidence::Succeeded
+    }
+}
+
 pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInput<'_>) {
     let StreamingFinalizationInput {
         state,
@@ -207,16 +254,15 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         // known; deleting it here could leave a committed row dangling.
         tracing::error!(%request_id, stage = "terminal_transaction", "proxy request finalization failed");
     }
-    let attempt_terminal = if terminal_result_failed
-        || matches!(
-            transport_error,
-            Some("downstream_disconnected" | "downstream_backpressure" | "delivery_state")
-        ) {
-        UpstreamAttemptTerminal::Inconclusive
-    } else if error_code.is_some() {
-        UpstreamAttemptTerminal::invalid_response()
-    } else {
-        UpstreamAttemptTerminal::Succeeded
+    let attempt_terminal = match streaming_upstream_evidence(
+        terminal_result_failed,
+        transport_error,
+        sse_summary.as_ref(),
+        error_code,
+    ) {
+        StreamingUpstreamEvidence::Succeeded => UpstreamAttemptTerminal::Succeeded,
+        StreamingUpstreamEvidence::Inconclusive => UpstreamAttemptTerminal::Inconclusive,
+        StreamingUpstreamEvidence::InvalidResponse => UpstreamAttemptTerminal::invalid_response(),
     };
     upstream_attempt.complete(attempt_terminal).await;
     codex_retry.complete(if terminal_result_failed {
@@ -224,4 +270,122 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     } else {
         retry_terminal
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(
+        outcome: ResponsesSseOutcome,
+        observed_protocol_invalid: bool,
+        protocol_invalid: bool,
+    ) -> ResponsesSseSummary {
+        ResponsesSseSummary {
+            outcome,
+            usage: None,
+            usage_invalid: false,
+            observed_protocol_invalid,
+            protocol_invalid,
+        }
+    }
+
+    #[test]
+    fn valid_failed_response_is_request_scoped_inconclusive_evidence() {
+        let failed = summary(ResponsesSseOutcome::Failed, false, false);
+        assert_eq!(
+            streaming_upstream_evidence(
+                false,
+                None,
+                Some(&failed),
+                Some("upstream_failed_response")
+            ),
+            StreamingUpstreamEvidence::Inconclusive
+        );
+    }
+
+    #[test]
+    fn protocol_invalid_failure_survives_terminal_settlement_failure() {
+        let invalid_failed = summary(ResponsesSseOutcome::Failed, true, true);
+        assert_eq!(
+            streaming_upstream_evidence(
+                true,
+                None,
+                Some(&invalid_failed),
+                Some("upstream_failed_response")
+            ),
+            StreamingUpstreamEvidence::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn local_event_batch_boundary_is_inconclusive_evidence() {
+        assert_eq!(
+            streaming_upstream_evidence(
+                false,
+                Some("upstream_response_event_batch_too_large"),
+                None,
+                Some("upstream_response_event_batch_too_large")
+            ),
+            StreamingUpstreamEvidence::Inconclusive
+        );
+    }
+
+    #[test]
+    fn ambiguous_transport_dominates_its_derived_incomplete_capture_state() {
+        let incomplete = summary(ResponsesSseOutcome::Incomplete, false, true);
+        assert_eq!(
+            streaming_upstream_evidence(
+                false,
+                Some("upstream_stream"),
+                Some(&incomplete),
+                Some("upstream_stream")
+            ),
+            StreamingUpstreamEvidence::Inconclusive
+        );
+    }
+
+    #[test]
+    fn observed_protocol_violation_precedes_a_later_ambiguous_transport_failure() {
+        let invalid_failed = summary(ResponsesSseOutcome::Failed, true, true);
+        assert_eq!(
+            streaming_upstream_evidence(
+                false,
+                Some("upstream_stream"),
+                Some(&invalid_failed),
+                Some("upstream_stream")
+            ),
+            StreamingUpstreamEvidence::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn observed_invalid_usage_precedes_a_later_ambiguous_transport_failure() {
+        let mut invalid_usage = summary(ResponsesSseOutcome::Incomplete, true, true);
+        invalid_usage.usage_invalid = true;
+        assert_eq!(
+            streaming_upstream_evidence(
+                false,
+                Some("upstream_stream"),
+                Some(&invalid_usage),
+                Some("upstream_stream")
+            ),
+            StreamingUpstreamEvidence::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn settlement_failure_changes_an_otherwise_valid_success_to_inconclusive() {
+        let completed = summary(
+            ResponsesSseOutcome::Completed {
+                response_id: Some("resp-valid".to_owned()),
+            },
+            false,
+            false,
+        );
+        assert_eq!(
+            streaming_upstream_evidence(true, None, Some(&completed), None),
+            StreamingUpstreamEvidence::Inconclusive
+        );
+    }
 }

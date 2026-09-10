@@ -33,7 +33,11 @@ async fn malformed_strict_chat_output_never_releases_half_open_admission() {
             released.await.unwrap();
             socket.write_all(b"0\r\n\r\n").await.unwrap();
         });
-        let fixture = response_usage_fixture_with_uri("invalid-probe-prefix", endpoint, 0).await;
+        let mut fixture =
+            response_usage_fixture_with_uri("invalid-probe-prefix", endpoint, 0).await;
+        std::sync::Arc::make_mut(&mut fixture.state.config)
+            .upstream_health
+            .shared_probe_attempts = 0;
         make_account_half_open_probe(&fixture).await;
         let body = json!({"model": fixture.model, "messages": [{"role":"user","content":"fixture"}],
             "stream": true, "stream_options": {"include_usage": true}, "max_tokens":16});
@@ -133,8 +137,93 @@ async fn completed_only_codex_with_invalid_usage_never_records_recovery() {
 }
 
 #[tokio::test]
+async fn sole_half_open_account_retains_bounded_capacity_while_primary_probe_is_slow() {
+    let mut fixture = codex_route_fixture("bounded-shared-probe").await;
+    std::sync::Arc::make_mut(&mut fixture.state.config)
+        .upstream_health
+        .shared_probe_attempts = 1;
+    make_account_half_open_probe_with_kind(&fixture, UpstreamFailureKind::Connection).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (release, released) = tokio::sync::watch::channel(false);
+    let upstream = tokio::spawn(async move {
+        let mut handlers = Vec::new();
+        for index in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut released = released.clone();
+            handlers.push(tokio::spawn(async move {
+                begin_response(&mut socket).await;
+                chunk(
+                    &mut socket,
+                    format!(
+                        "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-shared-{index}\"}}}}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await;
+                while !*released.borrow() {
+                    released.changed().await.unwrap();
+                }
+                chunk(
+                    &mut socket,
+                    completed_codex_sse(&format!("shared probe {index}")).as_bytes(),
+                )
+                .await;
+                socket.write_all(b"0\r\n\r\n").await.unwrap();
+            }));
+        }
+        for handler in handlers {
+            handler.await.unwrap();
+        }
+    });
+
+    let first = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint.clone(),
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "primary slow probe", "stream": true}),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint.clone(),
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "bounded shared probe", "stream": true}),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let denied = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "beyond shared bound", "stream": true}),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = to_bytes(denied.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+
+    release.send(true).unwrap();
+    let (first_body, second_body) = tokio::join!(
+        to_bytes(first.into_body(), MAX_PROXY_RESPONSE_BODY),
+        to_bytes(second.into_body(), MAX_PROXY_RESPONSE_BODY),
+    );
+    assert!(first_body.is_ok());
+    assert!(second_body.is_ok());
+    tokio::time::timeout(Duration::from_secs(3), upstream)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn validated_delivered_probe_opens_concurrent_admission_before_long_stream_eof() {
-    let fixture = codex_route_fixture("delivered-long-probe").await;
+    let mut fixture = codex_route_fixture("delivered-long-probe").await;
+    std::sync::Arc::make_mut(&mut fixture.state.config)
+        .upstream_health
+        .shared_probe_attempts = 0;
     make_account_half_open_probe(&fixture).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());

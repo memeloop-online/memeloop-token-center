@@ -101,7 +101,7 @@ pub(super) async fn send_reqwest_proxy_route(
             upstream_activity,
             codex_retry: CodexRetryTerminalGuard::inactive(),
         }),
-        Err(error) if error.is_connect() => Err(ProxySendError::RetryableConnection),
+        Err(error) if error.is_connect() => Err(ProxySendError::RetryableConnection("connect")),
         // Do not replay ambiguous POST delivery.
         Err(_) => Err(ProxySendError::NonRetryableTransport),
     }

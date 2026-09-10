@@ -1,38 +1,31 @@
 use super::*;
+use crate::db::UpstreamFailureKind;
 
-#[cfg(test)]
-tokio::task_local! {
-    static TEST_CREDENTIAL_APPLICATION_NOW: std::cell::Cell<Option<i64>>;
-}
-
-pub(super) fn credential_application_now() -> i64 {
-    #[cfg(test)]
-    if let Ok(Some(now)) = TEST_CREDENTIAL_APPLICATION_NOW.try_with(|clock| clock.take()) {
-        return now;
-    }
-    unix_millis()
-}
-
-#[cfg(test)]
-pub(super) async fn with_test_credential_application_now_once<F>(now: i64, future: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    TEST_CREDENTIAL_APPLICATION_NOW
-        .scope(std::cell::Cell::new(Some(now)), future)
-        .await
-}
-
+mod admission;
+mod clock;
 mod codex;
 mod http;
 mod kimi;
+mod outcome;
 mod probe;
 mod readiness;
 
 pub(super) use crate::provider::PROXY_ROUTING_POLICY;
+pub(super) use admission::{
+    AdmittedProxyRouteInput, DeferredSharedProbe, NextSendableProxyRouteInput,
+    prepare_admitted_proxy_route,
+};
+pub(super) use clock::credential_application_now;
+#[cfg(test)]
+pub(super) use clock::with_test_credential_application_now_once;
 pub(super) use codex::quota::classify_rate_limit;
-pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard};
-pub(super) use probe::{UpstreamAttemptGuard, UpstreamAttemptTerminal};
+#[cfg(test)]
+pub(super) use codex::with_test_pre_delivery_connect_failures;
+pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard, runtime_transport_policy};
+pub(super) use outcome::classify_attempt_failure;
+pub(super) use probe::{
+    SharedProbePermit, UpstreamAttemptGuard, UpstreamAttemptTerminal, join_shared_probe,
+};
 pub(super) use readiness::{
     CandidateCompatibility, PreparedRouteReadiness, candidate_compatibility,
     credential_application_error, refresh_route_snapshot,
@@ -238,7 +231,7 @@ pub(super) async fn materialize_proxy_route(
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum ProxySendError {
-    RetryableConnection,
+    RetryableConnection(&'static str),
     RetryableCodexBadRequest,
     CodexBadRequest,
     CandidateUnavailable,
@@ -260,9 +253,19 @@ pub(super) async fn send_proxy_route(
     protocol: Protocol,
     request_id: Uuid,
     route: &PreparedProxyRoute,
+    candidate_rank: usize,
+    outbound_attempt: usize,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
     if route.is_codex() {
-        return codex::send_proxy_route(state, headers, request_id, route).await;
+        return codex::send_proxy_route(
+            state,
+            headers,
+            request_id,
+            route,
+            candidate_rank,
+            outbound_attempt,
+        )
+        .await;
     }
     http::send_reqwest_proxy_route(state, headers, protocol, request_id, route).await
 }

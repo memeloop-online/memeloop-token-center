@@ -40,6 +40,7 @@ pub(super) struct ResponsesSseCapture {
     framing_rejection: Option<crate::api::sse::SseFramerRejection>,
     response_id: Option<String>,
     invalid: bool,
+    observed_protocol_invalid: bool,
     terminal_success: bool,
     terminal_failure: bool,
     usage: Option<TokenUsage>,
@@ -79,6 +80,8 @@ pub(super) struct ResponsesSseSummary {
     pub(super) outcome: ResponsesSseOutcome,
     pub(super) usage: Option<TokenUsage>,
     pub(super) usage_invalid: bool,
+    pub(super) observed_protocol_invalid: bool,
+    pub(super) protocol_invalid: bool,
 }
 
 impl ResponsesSseCapture {
@@ -130,6 +133,9 @@ impl ResponsesSseCapture {
             // A later blank line must not let an oversized event recover into
             // a complete-looking terminal stream.
             self.invalid = true;
+            if matches!(rejection, crate::api::sse::SseFramerRejection::EventLimit) {
+                self.observed_protocol_invalid = true;
+            }
             self.framing_rejection = Some(rejection);
             return Err(rejection);
         }
@@ -175,6 +181,7 @@ impl ResponsesSseCapture {
             let bytes = self.delivery_event_bytes(&event);
             self.finish_delivery_event(bytes, class);
         }
+        self.observed_protocol_invalid |= self.invalid;
         Ok(())
     }
 
@@ -190,14 +197,15 @@ impl ResponsesSseCapture {
     }
 
     pub(super) fn finish_summary(mut self) -> ResponsesSseSummary {
-        if !self.framer.is_complete() {
-            self.invalid = true;
-        }
         if let Some(chat_usage) = self.chat_usage.as_ref() {
             self.usage = chat_usage.usage();
             let usage_invalid = chat_usage.usage_invalid();
             self.usage_invalid |= usage_invalid;
             self.invalid |= usage_invalid;
+            self.observed_protocol_invalid |= usage_invalid;
+        }
+        if !self.framer.is_complete() {
+            self.invalid = true;
         }
         let outcome = if self.terminal_failure {
             ResponsesSseOutcome::Failed
@@ -210,10 +218,13 @@ impl ResponsesSseCapture {
         } else {
             ResponsesSseOutcome::Incomplete
         };
+        let protocol_invalid = self.invalid || matches!(&outcome, ResponsesSseOutcome::Incomplete);
         ResponsesSseSummary {
             outcome,
             usage: self.usage,
             usage_invalid: self.usage_invalid,
+            observed_protocol_invalid: self.observed_protocol_invalid,
+            protocol_invalid,
         }
     }
 
@@ -412,11 +423,20 @@ impl ResponsesSseCapture {
                 }
             }
         }
-        if value.get("error").is_some_and(|error| !error.is_null())
+        let reports_error = value.get("error").is_some_and(|error| !error.is_null())
             || value
                 .pointer("/response/error")
-                .is_some_and(|error| !error.is_null())
+                .is_some_and(|error| !error.is_null());
+        if reports_error
+            && !matches!(
+                payload_kind.or(event_kind),
+                Some(ResponsesSseEventKind::Failed)
+            )
         {
+            // A typed failed event below owns its first/duplicate terminal
+            // transition. Marking it here as well would misclassify every
+            // ordinary `response.failed` carrying an error object as a
+            // duplicate, protocol-invalid terminal.
             self.terminal_failure = true;
         }
         if self.require_explicit_completed

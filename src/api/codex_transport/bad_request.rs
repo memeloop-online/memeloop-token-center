@@ -27,8 +27,9 @@ pub(in crate::api) enum BadRequestUnclassifiableReason {
 }
 
 /// Classify the narrowly-defined subset of Codex 400 responses which are safe
-/// to replay before downstream delivery. Every other result remains
-/// unclassifiable rather than being treated as an ordinary rejection.
+/// to replay before downstream delivery. A complete, bounded JSON body without
+/// known transient semantics is a definite ordinary rejection and must not be
+/// replayed; bodies which cannot be inspected safely remain unclassifiable.
 pub(in crate::api) async fn classify_bad_request(
     response: UpstreamResponse,
 ) -> BadRequestDisposition {

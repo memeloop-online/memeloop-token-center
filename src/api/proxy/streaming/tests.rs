@@ -1,5 +1,47 @@
 use super::*;
 
+fn batch_limit_chunk() -> Vec<u8> {
+    b"data: {}\n\n".repeat(crate::api::limits::MAX_SSE_FRAMES_PER_NETWORK_CHUNK + 1)
+}
+
+#[test]
+fn batch_limit_without_prior_invalidity_has_no_observed_protocol_violation() {
+    let mut capture = ResponsesSseCapture::for_responses();
+    assert!(matches!(
+        capture.push_delivery_frames(&batch_limit_chunk()),
+        Err(crate::api::sse::SseFramerRejection::BatchLimit)
+    ));
+    let summary = capture.finish_summary();
+    assert!(!summary.observed_protocol_invalid);
+    assert!(summary.protocol_invalid);
+}
+
+#[test]
+fn batch_limit_preserves_a_prior_semantic_protocol_violation() {
+    let mut capture = ResponsesSseCapture::for_responses();
+    capture.push_delivery_frames(b"data: not-json\n\n").unwrap();
+    assert!(matches!(
+        capture.push_delivery_frames(&batch_limit_chunk()),
+        Err(crate::api::sse::SseFramerRejection::BatchLimit)
+    ));
+    let summary = capture.finish_summary();
+    assert!(summary.observed_protocol_invalid);
+    assert!(summary.protocol_invalid);
+}
+
+#[test]
+fn event_limit_is_observed_protocol_invalidity() {
+    let mut capture = ResponsesSseCapture::for_responses();
+    let oversized = vec![b'x'; crate::api::limits::MAX_RESPONSES_SSE_EVENT_BYTES + 1];
+    assert!(matches!(
+        capture.push_delivery_frames(&oversized),
+        Err(crate::api::sse::SseFramerRejection::EventLimit)
+    ));
+    let summary = capture.finish_summary();
+    assert!(summary.observed_protocol_invalid);
+    assert!(summary.protocol_invalid);
+}
+
 #[test]
 fn strict_chat_valid_prefix_is_not_confused_with_missing_final_usage() {
     let mut capture = ResponsesSseCapture::for_openai_chat_usage();
@@ -8,9 +50,14 @@ fn strict_chat_valid_prefix_is_not_confused_with_missing_final_usage() {
     ).unwrap();
     assert!(frames.iter().any(|frame| frame.billable));
     assert!(capture.can_confirm_probe_delivery());
+    let summary = capture.finish_summary();
     assert!(
-        capture.finish_summary().usage_invalid,
+        summary.usage_invalid,
         "final usage is correctly incomplete until DONE"
+    );
+    assert!(
+        summary.observed_protocol_invalid,
+        "usage invalidity discovered during finalization remains independent of EOF truncation"
     );
 }
 

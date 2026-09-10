@@ -413,6 +413,32 @@ impl ProviderCatalog {
         let codex = types
             .last_mut()
             .expect("OpenAI Codex provider was just inserted");
+        codex.config_schema["properties"]["transport_policy"] = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "default": {},
+            "description": "Runtime-adjustable recovery policy for this account and its encrypted SOCKS5H binding. Changes apply to newly prepared requests without a service release.",
+            "properties": {
+                "connect_attempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4,
+                    "default": 2
+                },
+                "connect_retry_delay_millis": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 2000,
+                    "default": 150
+                },
+                "shared_probe_attempts": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4,
+                    "default": 1
+                }
+            }
+        });
         codex.oauth_adapter = Some(OAuthAdapterContribution {
             api_version: "oauth-adapter-v1".to_owned(),
             flow_kind: OAuthFlowKind::OpenaiDevice,

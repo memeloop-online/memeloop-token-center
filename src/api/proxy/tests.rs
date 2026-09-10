@@ -918,8 +918,8 @@ async fn codex_retry_then_definite_429_fails_over_but_5xx_does_not() {
                 if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     ResponseTemplate::new(400).set_body_json(json!({
                         "error": {
-                            "type": "invalid_request_error",
-                            "message": "private definite rejection"
+                            "type": "temporarily_unavailable",
+                            "message": "private transient rejection"
                         }
                     }))
                 } else {
@@ -1048,11 +1048,12 @@ async fn codex_retry_then_definite_429_fails_over_but_5xx_does_not() {
 }
 
 #[tokio::test]
-async fn codex_definite_ordinary_400_retries_the_same_account_once_with_a_large_body() {
-    let fixture = codex_route_fixture("definite-400-same-account-retry").await;
+async fn codex_definite_ordinary_400_is_not_replayed_with_a_large_body() {
+    let fixture = codex_route_fixture("definite-400-no-replay").await;
     // This fixture intentionally sends about 1 MiB of JSON. Raise this test
     // credential's TPM only so pre-admission does not reject it before the
-    // upstream 400/retry behavior under test; production defaults stay fixed.
+    // upstream 400 single-dispatch behavior under test; production defaults
+    // stay fixed.
     fixture
         .state
         .db
@@ -1077,27 +1078,16 @@ async fn codex_definite_ordinary_400_retries_the_same_account_once_with_a_large_
         .await
         .unwrap();
     let upstream = MockServer::start().await;
-    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let attempts_for_response = attempts.clone();
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .and(header_matcher("chatgpt-account-id", "account-123"))
-        .respond_with(move |_: &wiremock::Request| {
-            if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                ResponseTemplate::new(400).set_body_json(json!({
-                    "error": {
-                        "type": "invalid_request_error",
-                        "message": "private ordinary rejection"
-                    }
-                }))
-            } else {
-                ResponseTemplate::new(200).set_body_raw(
-                    completed_codex_sse("same-account retry answer").into_bytes(),
-                    "text/event-stream",
-                )
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "type": "invalid_request_error",
+                "message": "private ordinary rejection"
             }
-        })
-        .expect(2)
+        })))
+        .expect(1)
         .mount(&upstream)
         .await;
 
@@ -1116,12 +1106,12 @@ async fn codex_definite_ordinary_400_retries_the_same_account_once_with_a_large_
         }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("same-account retry answer"));
+    assert!(body.contains("upstream rejected the request"));
     assert!(!body.contains("private ordinary rejection"));
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
@@ -1131,22 +1121,12 @@ async fn codex_definite_ordinary_400_retries_the_same_account_once_with_a_large_
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].status_code, Some(200));
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    assert_eq!(rows[0].status_code, Some(400));
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     assert_response_archives_omit(&fixture, "private ordinary rejection").await;
     let requests = upstream.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].body, requests[1].body);
-    assert_eq!(
-        requests[0].headers.get("session-id"),
-        requests[1].headers.get("session-id")
-    );
-    assert_eq!(
-        requests[0].headers.get("chatgpt-account-id"),
-        requests[1].headers.get("chatgpt-account-id")
-    );
+    assert_eq!(requests.len(), 1);
     assert_codex_wire(&requests[0], &fixture.upstream_model);
-    assert_codex_wire(&requests[1], &fixture.upstream_model);
     let rendered_metrics = fixture
         .state
         .metrics
@@ -1155,13 +1135,9 @@ async fn codex_definite_ordinary_400_retries_the_same_account_once_with_a_large_
         "memeloop_token_center_codex_bad_request_classifications_total{classification=\"ordinary\"} 1"
     ));
     assert!(
-        rendered_metrics.contains(
-            "memeloop_token_center_codex_bad_request_retries_total{outcome=\"started\"} 1"
-        )
+        !rendered_metrics
+            .contains("memeloop_token_center_codex_bad_request_retries_total{outcome=\"started\"}")
     );
-    assert!(rendered_metrics.contains(
-        "memeloop_token_center_codex_bad_request_retries_total{outcome=\"succeeded\"} 1"
-    ));
     assert!(!rendered_metrics.contains("private ordinary rejection"));
     upstream.verify().await;
 }
@@ -1178,8 +1154,8 @@ async fn codex_retry_buffered_incomplete_sse_records_failed_terminal() {
             if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 ResponseTemplate::new(400).set_body_json(json!({
                     "error": {
-                        "type": "invalid_request_error",
-                        "message": "private definite rejection"
+                        "type": "temporarily_unavailable",
+                        "message": "private transient rejection"
                     }
                 }))
             } else {
@@ -1270,8 +1246,8 @@ async fn codex_retry_buffered_completion_requires_a_single_matching_response_id(
                 if attempts_for_response.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     ResponseTemplate::new(400).set_body_json(json!({
                         "error": {
-                            "type": "invalid_request_error",
-                            "message": "private definite rejection"
+                            "type": "temporarily_unavailable",
+                            "message": "private transient rejection"
                         }
                     }))
                 } else {
@@ -1476,62 +1452,95 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
 }
 
 #[tokio::test]
-async fn codex_invalid_request_400_retries_once_without_failing_over_or_cooling_down() {
-    let fixture = codex_route_fixture("ordinary-400").await;
-    let upstream = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(codex_transport::RESPONSES_PATH))
-        .and(header_matcher("chatgpt-account-id", "account-123"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": {
-                "type": "invalid_request_error",
-                "message": "private context rejection detail"
-            }
-        })))
-        .expect(2)
-        .mount(&upstream)
-        .await;
-    Mock::given(method("POST"))
-        .and(header_matcher("chatgpt-account-id", "account-456"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)
-        .mount(&upstream)
-        .await;
-    add_codex_standby_route(&fixture, "codex-route-ordinary-400", "account-456").await;
+async fn codex_ordinary_json_400_is_returned_once_without_failover_or_cooldown() {
+    for (label, upstream_body, sensitive) in [
+        (
+            "known",
+            json!({
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "private context rejection detail"
+                }
+            }),
+            Some("private context rejection detail"),
+        ),
+        ("empty", json!({}), None),
+        (
+            "unknown-shape",
+            json!({"unexpected": {"code": "not-a-transient-error"}}),
+            None,
+        ),
+    ] {
+        let fixture_name = format!("ordinary-400-{label}");
+        let fixture = codex_route_fixture(&fixture_name).await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(codex_transport::RESPONSES_PATH))
+            .and(header_matcher("chatgpt-account-id", "account-123"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(upstream_body))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(header_matcher("chatgpt-account-id", "account-456"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let tenant = format!("codex-route-{fixture_name}");
+        add_codex_standby_route(&fixture, &tenant, "account-456").await;
 
-    let response = send_codex_route(
-        &fixture,
-        &upstream,
-        "/v1/responses",
-        json!({"model": fixture.model, "input": "ordinary rejection", "stream": false}),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        let response = send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({"model": fixture.model, "input": "ordinary rejection", "stream": false}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("upstream rejected the request"), "{label}");
+        if let Some(sensitive) = sensitive {
+            assert!(!body.contains(sensitive), "{label}");
+            assert_response_archives_omit(&fixture, sensitive).await;
+        }
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let health_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        )
+        .bind(fixture.upstream_account_id.to_string())
+        .fetch_one(&pool)
         .await
         .unwrap();
-    let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("upstream rejected the request"));
-    assert!(!body.contains("private context rejection detail"));
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
-    )
-    .bind(fixture.upstream_account_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(health_rows, 0);
-    pool.close().await;
-    assert_response_archives_omit(&fixture, "private context rejection detail").await;
-    let requests = upstream.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].body, requests[1].body);
-    assert_eq!(
-        requests[0].headers.get("session-id"),
-        requests[1].headers.get("session-id")
-    );
-    upstream.verify().await;
+        assert_eq!(health_rows, 0, "{label}");
+        let selected_account: String = sqlx::query_scalar(
+            "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(fixture.key_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            selected_account,
+            fixture.upstream_account_id.to_string(),
+            "{label}"
+        );
+        pool.close().await;
+        let rendered_metrics = fixture
+            .state
+            .metrics
+            .render(&crate::metrics::RuntimeMetrics::default());
+        assert!(rendered_metrics.contains(
+            "memeloop_token_center_codex_bad_request_classifications_total{classification=\"ordinary\"} 1"
+        ));
+        assert!(!rendered_metrics.contains(
+            "memeloop_token_center_codex_bad_request_retries_total{outcome=\"started\"}"
+        ));
+        upstream.verify().await;
+    }
 }
 
 #[tokio::test]
@@ -2932,6 +2941,19 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
         Some("upstream_failed_response")
     );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let health_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        health_rows, 0,
+        "a valid provider failure is request-scoped evidence, not shared-account health evidence"
+    );
+    pool.close().await;
     drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
@@ -3313,7 +3335,16 @@ fn responses_sse_requires_terminal_event_and_payload_to_match() {
     capture.push(
         b"event: response.failed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-mismatch\",\"error\":null}}\n\n",
     );
-    assert_eq!(capture.finish(), ResponsesSseOutcome::Failed);
+    let summary = capture.finish_summary();
+    assert_eq!(summary.outcome, ResponsesSseOutcome::Failed);
+    assert!(
+        summary.observed_protocol_invalid,
+        "the mismatch is observed before EOF or transport-derived invalidity"
+    );
+    assert!(
+        summary.protocol_invalid,
+        "a failed terminal with a mismatched completed payload retains invalid protocol evidence"
+    );
 }
 
 #[test]
@@ -3570,8 +3601,19 @@ fn responses_sse_capture_requires_an_unambiguous_success_terminal() {
 
     let mut failed = ResponsesSseCapture::default();
     failed.push(created);
-    failed.push(b"data: {\"type\":\"response.failed\"}\n\ndata: [DONE]\n\n");
-    assert_eq!(failed.finish(), ResponsesSseOutcome::Failed);
+    failed.push(
+        b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"provider failure\"}}}\n\ndata: [DONE]\n\n",
+    );
+    let failed = failed.finish_summary();
+    assert_eq!(failed.outcome, ResponsesSseOutcome::Failed);
+    assert!(
+        !failed.observed_protocol_invalid,
+        "a well-formed provider failure has no independently observed protocol violation"
+    );
+    assert!(
+        !failed.protocol_invalid,
+        "a well-formed provider failure remains valid request-scoped evidence"
+    );
 
     let mut conflicting = ResponsesSseCapture::default();
     conflicting.push(created);

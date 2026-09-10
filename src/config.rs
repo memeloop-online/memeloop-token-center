@@ -13,15 +13,22 @@ pub const MIN_RESPONSES_BODY_MAX_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = 4;
 pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = 8;
+pub const DEFAULT_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 1;
+pub const MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 4;
 
-/// Per-account circuit-breaker timings. These values deliberately belong to
-/// process configuration rather than route or credential records: routing
-/// health is shared by every key that may use an account, and operators need
-/// to tune recovery pressure without rewriting account metadata.
+/// Global circuit-breaker safety defaults. Provider/account transport policy
+/// may narrow or tune supported recovery controls at runtime; these values
+/// remain the bounded fallback and lease timing authority.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpstreamHealthConfig {
     pub probe_lease_millis: i64,
     pub probe_heartbeat_millis: i64,
+    /// Extra process-local attempts allowed to share the current half-open
+    /// lease epoch after every other authorized candidate has been exhausted.
+    /// The database probe remains the global recovery fence; this small local
+    /// bound prevents one slow probe from turning the sole usable account into
+    /// zero capacity without permitting an unbounded recovery wave.
+    pub shared_probe_attempts: u32,
     pub rate_limited_cooldown_millis: i64,
     pub unavailable_cooldown_millis: i64,
     pub invalid_response_cooldown_millis: i64,
@@ -32,6 +39,7 @@ impl UpstreamHealthConfig {
     pub const DEFAULT: Self = Self {
         probe_lease_millis: 30_000,
         probe_heartbeat_millis: 10_000,
+        shared_probe_attempts: DEFAULT_UPSTREAM_SHARED_PROBE_ATTEMPTS,
         rate_limited_cooldown_millis: 30_000,
         unavailable_cooldown_millis: 15_000,
         invalid_response_cooldown_millis: 15_000,
@@ -47,6 +55,10 @@ impl UpstreamHealthConfig {
             probe_heartbeat_millis: health_millis(
                 "MTC_UPSTREAM_HEALTH_PROBE_HEARTBEAT_MILLIS",
                 Self::DEFAULT.probe_heartbeat_millis,
+            )?,
+            shared_probe_attempts: env_u32(
+                "MTC_UPSTREAM_HEALTH_SHARED_PROBE_ATTEMPTS",
+                Self::DEFAULT.shared_probe_attempts,
             )?,
             rate_limited_cooldown_millis: health_millis(
                 "MTC_UPSTREAM_HEALTH_RATE_LIMITED_COOLDOWN_MILLIS",
@@ -73,6 +85,11 @@ impl UpstreamHealthConfig {
         if self.probe_heartbeat_millis >= self.probe_lease_millis {
             return Err(ConfigError::InvalidUpstreamHealthConfig(
                 "probe heartbeat must be shorter than the probe lease",
+            ));
+        }
+        if self.shared_probe_attempts > MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS {
+            return Err(ConfigError::InvalidUpstreamHealthConfig(
+                "shared probe attempts must be between 0 and 4 per process",
             ));
         }
         Ok(())
@@ -711,6 +728,14 @@ mod tests {
         assert!(UpstreamHealthConfig::DEFAULT.validate().is_ok());
         let invalid = UpstreamHealthConfig {
             probe_heartbeat_millis: UpstreamHealthConfig::DEFAULT.probe_lease_millis,
+            ..UpstreamHealthConfig::DEFAULT
+        };
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::InvalidUpstreamHealthConfig(_))
+        ));
+        let invalid = UpstreamHealthConfig {
+            shared_probe_attempts: MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS + 1,
             ..UpstreamHealthConfig::DEFAULT
         };
         assert!(matches!(
