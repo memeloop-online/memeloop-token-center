@@ -14,68 +14,7 @@ impl Database {
         kind: GroupKind,
         tenant_external_id: &str,
     ) -> Result<Vec<GroupView>, AppError> {
-        let (groups, memberships, group_column) = kind.tables();
-        let member_column = kind.member_column();
-        let impact_columns = match kind {
-            GroupKind::Provider => {
-                "(SELECT COUNT(DISTINCT route_id) FROM (
-                    SELECT included.model_route_id AS route_id
-                    FROM model_route_included_provider_groups included
-                    WHERE included.tenant_id = g.tenant_id AND included.provider_group_id = g.id
-                    UNION
-                    SELECT excluded.model_route_id AS route_id
-                    FROM model_route_excluded_provider_groups excluded
-                    WHERE excluded.tenant_id = g.tenant_id AND excluded.provider_group_id = g.id
-                ) referenced) AS route_reference_count,
-                (SELECT COUNT(DISTINCT route.id)
-                 FROM model_routes route
-                 WHERE route.tenant_id = g.tenant_id AND route.enabled = 1
-                   AND (
-                     EXISTS (SELECT 1 FROM model_route_included_provider_groups included
-                             WHERE included.tenant_id = route.tenant_id
-                               AND included.model_route_id = route.id
-                               AND included.provider_group_id = g.id)
-                     OR EXISTS (SELECT 1 FROM model_route_excluded_provider_groups excluded
-                                WHERE excluded.tenant_id = route.tenant_id
-                                  AND excluded.model_route_id = route.id
-                                  AND excluded.provider_group_id = g.id)
-                   )) AS enabled_route_reference_count,
-                CAST(0 AS BIGINT) AS credential_grant_count,
-                CAST(0 AS BIGINT) AS active_credential_grant_count"
-            }
-            GroupKind::Route => {
-                "CAST(0 AS BIGINT) AS route_reference_count,
-                CAST(0 AS BIGINT) AS enabled_route_reference_count,
-                (SELECT COUNT(*) FROM routing_grants grant_row
-                 WHERE grant_row.tenant_id = g.tenant_id
-                   AND grant_row.route_group_id = g.id) AS credential_grant_count,
-                (SELECT COUNT(*) FROM routing_grants grant_row
-                 JOIN key_records key_record
-                   ON key_record.tenant_id = grant_row.tenant_id
-                  AND key_record.id = grant_row.key_id
-                 WHERE grant_row.tenant_id = g.tenant_id
-                   AND grant_row.route_group_id = g.id
-                   AND key_record.status = 'active') AS active_credential_grant_count"
-            }
-            GroupKind::Credential => {
-                "CAST(0 AS BIGINT) AS route_reference_count,
-                CAST(0 AS BIGINT) AS enabled_route_reference_count,
-                CAST(0 AS BIGINT) AS credential_grant_count,
-                CAST(0 AS BIGINT) AS active_credential_grant_count"
-            }
-        };
-        let sql = format!(
-            "SELECT g.id, g.tenant_id, t.external_id AS tenant_external_id,
-                    g.name, g.created_at, g.updated_at,
-                    (SELECT COUNT(*) FROM {memberships} m
-                     WHERE m.tenant_id = g.tenant_id AND m.{group_column} = g.id) AS member_count,
-                    {impact_columns}
-             FROM {groups} g
-             JOIN tenants t ON t.id = g.tenant_id
-             WHERE t.external_id = $1
-             ORDER BY g.normalized_name ASC, g.id ASC
-             LIMIT 500"
-        );
+        let sql = list_groups_sql(kind);
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(tenant_external_id)
             .fetch_all(&self.pool)
@@ -259,6 +198,113 @@ impl Database {
     }
 }
 
+fn list_groups_sql(kind: GroupKind) -> String {
+    let (groups, memberships, group_column) = kind.tables();
+    let (impact_ctes, impact_columns, impact_join) = match kind {
+        GroupKind::Provider => (
+            ",
+             provider_group_route_refs AS (
+                 SELECT included.tenant_id, included.model_route_id,
+                        included.provider_group_id AS group_id
+                 FROM model_route_included_provider_groups included
+                 JOIN group_page g
+                   ON g.tenant_id = included.tenant_id
+                  AND g.id = included.provider_group_id
+                 UNION
+                 SELECT excluded.tenant_id, excluded.model_route_id,
+                        excluded.provider_group_id AS group_id
+                 FROM model_route_excluded_provider_groups excluded
+                 JOIN group_page g
+                   ON g.tenant_id = excluded.tenant_id
+                  AND g.id = excluded.provider_group_id
+             ),
+             impact_counts AS (
+                 SELECT route_ref.tenant_id, route_ref.group_id,
+                        COUNT(*) AS route_reference_count,
+                        SUM(CASE WHEN route.enabled = 1 THEN 1 ELSE 0 END)
+                            AS enabled_route_reference_count
+                 FROM provider_group_route_refs route_ref
+                 JOIN model_routes route
+                   ON route.tenant_id = route_ref.tenant_id
+                  AND route.id = route_ref.model_route_id
+                 GROUP BY route_ref.tenant_id, route_ref.group_id
+             )",
+            "COALESCE(impact.route_reference_count, CAST(0 AS BIGINT))
+                 AS route_reference_count,
+             COALESCE(impact.enabled_route_reference_count, CAST(0 AS BIGINT))
+                 AS enabled_route_reference_count,
+             CAST(0 AS BIGINT) AS credential_grant_count,
+             CAST(0 AS BIGINT) AS active_credential_grant_count",
+            "LEFT JOIN impact_counts impact
+               ON impact.tenant_id = g.tenant_id AND impact.group_id = g.id",
+        ),
+        GroupKind::Route => (
+            ",
+             impact_counts AS (
+                 SELECT grant_row.tenant_id, grant_row.route_group_id AS group_id,
+                        COUNT(*) AS credential_grant_count,
+                        SUM(CASE WHEN key_record.status = 'active' THEN 1 ELSE 0 END)
+                            AS active_credential_grant_count
+                 FROM routing_grants grant_row
+                 JOIN group_page g
+                   ON g.tenant_id = grant_row.tenant_id
+                  AND g.id = grant_row.route_group_id
+                 LEFT JOIN key_records key_record
+                   ON key_record.tenant_id = grant_row.tenant_id
+                  AND key_record.id = grant_row.key_id
+                 WHERE grant_row.route_group_id IS NOT NULL
+                 GROUP BY grant_row.tenant_id, grant_row.route_group_id
+             )",
+            "CAST(0 AS BIGINT) AS route_reference_count,
+             CAST(0 AS BIGINT) AS enabled_route_reference_count,
+             COALESCE(impact.credential_grant_count, CAST(0 AS BIGINT))
+                 AS credential_grant_count,
+             COALESCE(impact.active_credential_grant_count, CAST(0 AS BIGINT))
+                 AS active_credential_grant_count",
+            "LEFT JOIN impact_counts impact
+               ON impact.tenant_id = g.tenant_id AND impact.group_id = g.id",
+        ),
+        GroupKind::Credential => (
+            "",
+            "CAST(0 AS BIGINT) AS route_reference_count,
+             CAST(0 AS BIGINT) AS enabled_route_reference_count,
+             CAST(0 AS BIGINT) AS credential_grant_count,
+             CAST(0 AS BIGINT) AS active_credential_grant_count",
+            "",
+        ),
+    };
+    format!(
+        "WITH selected_tenant AS (
+             SELECT id, external_id FROM tenants WHERE external_id = $1
+         ),
+         group_page AS MATERIALIZED (
+             SELECT g.id, g.tenant_id, tenant.external_id AS tenant_external_id,
+                    g.name, g.normalized_name, g.created_at, g.updated_at
+             FROM {groups} g
+             JOIN selected_tenant tenant ON tenant.id = g.tenant_id
+             ORDER BY g.normalized_name ASC, g.id ASC
+             LIMIT 500
+         ),
+         member_counts AS (
+             SELECT m.tenant_id, m.{group_column} AS group_id, COUNT(*) AS member_count
+             FROM {memberships} m
+             JOIN group_page g
+               ON g.tenant_id = m.tenant_id AND g.id = m.{group_column}
+             GROUP BY m.tenant_id, m.{group_column}
+         )
+         {impact_ctes}
+         SELECT g.id, g.tenant_id, g.tenant_external_id,
+                g.name, g.created_at, g.updated_at,
+                COALESCE(member_counts.member_count, CAST(0 AS BIGINT)) AS member_count,
+                {impact_columns}
+         FROM group_page g
+         LEFT JOIN member_counts
+           ON member_counts.tenant_id = g.tenant_id AND member_counts.group_id = g.id
+         {impact_join}
+         ORDER BY g.normalized_name ASC, g.id ASC"
+    )
+}
+
 fn normalize_group_name(raw: &str) -> Result<(String, String), AppError> {
     let name = raw.trim();
     if name.is_empty() || name.len() > 100 || name.chars().any(char::is_control) {
@@ -284,4 +330,239 @@ fn group_view(row: AnyRow, member_ids: Vec<Uuid>) -> Result<GroupView, AppError>
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_decimal::Decimal;
+    use serde_json::json;
+
+    use super::*;
+    use crate::db::{CreateKeyInput, CreateModelRouteInput, CreateUpstreamAccountInput};
+    use crate::model::KeyPolicy;
+    use crate::provider::UpstreamCredential;
+
+    #[test]
+    fn provider_impact_query_is_set_based_for_the_bounded_group_page() {
+        let sql = list_groups_sql(GroupKind::Provider);
+
+        assert_eq!(sql.matches("JOIN model_routes route").count(), 1);
+        assert_eq!(
+            sql.matches("model_route_included_provider_groups").count(),
+            1
+        );
+        assert_eq!(
+            sql.matches("model_route_excluded_provider_groups").count(),
+            1
+        );
+        assert!(sql.contains("provider_group_route_refs"));
+        assert!(sql.contains(" UNION\n"));
+        assert!(
+            sql.find("LIMIT 500").unwrap() < sql.find("provider_group_route_refs").unwrap(),
+            "the bounded group page must be selected before impact aggregation"
+        );
+        assert!(!sql.contains("EXISTS"));
+        assert!(!sql.contains("provider_group_id = g.id"));
+    }
+
+    #[tokio::test]
+    async fn grouped_impact_counts_deduplicate_routes_and_preserve_enabled_and_active_subsets() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("group-impact-counts.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let tenant = "group-impact-counts";
+        let account = database
+            .create_upstream_account(
+                CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.to_owned(),
+                    name: "impact-account".to_owned(),
+                    driver: "http-json".to_owned(),
+                    config: json!({"base_url": "https://impact.example.test"}),
+                    credential: UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                b"group impact counts test key material",
+            )
+            .await
+            .unwrap();
+        let provider_group = database
+            .create_group(
+                GroupKind::Provider,
+                CreateGroupInput {
+                    tenant_external_id: tenant.to_owned(),
+                    name: "Referenced provider group".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let other_provider_group = database
+            .create_group(
+                GroupKind::Provider,
+                CreateGroupInput {
+                    tenant_external_id: tenant.to_owned(),
+                    name: "Other provider group".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let route_group = database
+            .create_group(
+                GroupKind::Route,
+                CreateGroupInput {
+                    tenant_external_id: tenant.to_owned(),
+                    name: "Granted route group".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut routes = Vec::new();
+        for index in 0..3 {
+            routes.push(
+                database
+                    .create_model_route(CreateModelRouteInput {
+                        tenant_external_id: tenant.to_owned(),
+                        public_model: format!("impact-model-{index}"),
+                        upstream_account_id: account.id,
+                        upstream_model: format!("impact-upstream-{index}"),
+                        protocol: "openai".to_owned(),
+                        priority: index,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        routes[1] = database
+            .set_model_route_enabled(routes[1].id, tenant, false, routes[1].updated_at)
+            .await
+            .unwrap();
+        let tenant_id = account.tenant_id.to_string();
+        for (table, route_id, group_id) in [
+            (
+                "model_route_included_provider_groups",
+                routes[0].id,
+                provider_group.id,
+            ),
+            (
+                "model_route_excluded_provider_groups",
+                routes[0].id,
+                provider_group.id,
+            ),
+            (
+                "model_route_included_provider_groups",
+                routes[1].id,
+                provider_group.id,
+            ),
+            (
+                "model_route_excluded_provider_groups",
+                routes[2].id,
+                other_provider_group.id,
+            ),
+        ] {
+            let sql = format!(
+                "INSERT INTO {table} \
+                 (tenant_id, model_route_id, provider_group_id, created_at) \
+                 VALUES ($1, $2, $3, 1)"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&tenant_id)
+                .bind(route_id.to_string())
+                .bind(group_id.to_string())
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        }
+
+        let active_key = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: tenant.to_owned(),
+                    principal_external_id: "active-principal".to_owned(),
+                    alias: "active-key".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::ZERO,
+                    idempotency_key: None,
+                },
+                b"group impact counts downstream pepper",
+            )
+            .await
+            .unwrap();
+        let suspended_key = database
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: tenant.to_owned(),
+                    principal_external_id: "suspended-principal".to_owned(),
+                    alias: "suspended-key".to_owned(),
+                    currency: "USD".to_owned(),
+                    policy: KeyPolicy::default(),
+                    initial_balance: Decimal::ZERO,
+                    idempotency_key: None,
+                },
+                b"group impact counts downstream pepper",
+            )
+            .await
+            .unwrap();
+        database
+            .set_key_status(suspended_key.key_id, "suspended")
+            .await
+            .unwrap();
+        for key_id in [active_key.key_id, suspended_key.key_id] {
+            sqlx::query(
+                "INSERT INTO routing_grants \
+                 (tenant_id, key_id, model_route_id, route_group_id, created_at) \
+                 VALUES ($1, $2, NULL, $3, 1)",
+            )
+            .bind(&tenant_id)
+            .bind(key_id.to_string())
+            .bind(route_group.id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO routing_grants \
+             (tenant_id, key_id, model_route_id, route_group_id, created_at) \
+             VALUES ($1, $2, $3, NULL, 1)",
+        )
+        .bind(&tenant_id)
+        .bind(active_key.key_id.to_string())
+        .bind(routes[0].id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        let provider_groups = database
+            .list_groups(GroupKind::Provider, tenant)
+            .await
+            .unwrap();
+        let referenced = provider_groups
+            .iter()
+            .find(|group| group.id == provider_group.id)
+            .unwrap();
+        assert_eq!(referenced.route_reference_count, 2);
+        assert_eq!(referenced.enabled_route_reference_count, 1);
+        let other = provider_groups
+            .iter()
+            .find(|group| group.id == other_provider_group.id)
+            .unwrap();
+        assert_eq!(other.route_reference_count, 1);
+        assert_eq!(other.enabled_route_reference_count, 1);
+
+        let route_groups = database
+            .list_groups(GroupKind::Route, tenant)
+            .await
+            .unwrap();
+        let granted = route_groups
+            .iter()
+            .find(|group| group.id == route_group.id)
+            .unwrap();
+        assert_eq!(granted.credential_grant_count, 2);
+        assert_eq!(granted.active_credential_grant_count, 1);
+    }
 }
