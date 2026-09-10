@@ -4,6 +4,7 @@ use super::super::super::*;
 use futures_util::{StreamExt, stream};
 
 const MAX_BODY: usize = 64 * 1024;
+const MAX_CHUNKS: usize = 256;
 const MAX_COOLDOWN: i64 = 7 * 24 * 60 * 60 * 1_000;
 const UNKNOWN_RESET_COOLDOWN: i64 = 15 * 60 * 1_000;
 
@@ -76,8 +77,21 @@ pub(in crate::api::proxy) async fn classify_rate_limit(
     let mut parts = response.into_parts();
     let mut prefix = Vec::new();
     let mut body = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
     let read = async {
         loop {
+            // Empty and permanently-ready chunks consume work and metadata
+            // even when the byte budget is unchanged. Bound both, and yield
+            // so a ready stream cannot starve the timeout/cancellation owner.
+            if prefix.len() >= MAX_CHUNKS || tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            if !prefix.is_empty() && prefix.len().is_multiple_of(16) {
+                tokio::task::yield_now().await;
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+            }
             match parts.stream.next().await {
                 Some(Ok(chunk)) => {
                     let fits = body.len().saturating_add(chunk.len()) <= MAX_BODY;
@@ -97,7 +111,7 @@ pub(in crate::api::proxy) async fn classify_rate_limit(
             }
         }
     };
-    let complete = tokio::time::timeout(std::time::Duration::from_millis(500), read)
+    let complete = tokio::time::timeout_at(deadline, read)
         .await
         .unwrap_or(false);
     let kind = classify(
@@ -210,5 +224,60 @@ mod tests {
             let (response, _) = classify_rate_limit(response).await;
             assert_eq!(response.bytes_stream().collect::<Vec<_>>().await, chunks);
         }
+    }
+
+    #[tokio::test]
+    async fn infinitely_ready_empty_chunks_stop_at_chunk_budget_and_preserve_suffix() {
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = polled.clone();
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            headers: HeaderMap::new(),
+            version: http::Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(stream::repeat_with(move || {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Bytes::new())
+            })),
+        };
+        let (response, kind) = classify_rate_limit(response).await;
+        let captured = polled.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(captured <= MAX_CHUNKS);
+        assert_eq!(kind, UpstreamFailureKind::RateLimited);
+        let chunks = response
+            .bytes_stream()
+            .take(captured + 2)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(chunks, vec![Ok(Bytes::new()); captured + 2]);
+        assert_eq!(
+            polled.load(std::sync::atomic::Ordering::SeqCst),
+            captured + 2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_restores_captured_prefix_and_delayed_unread_suffix() {
+        let prefix = Bytes::from_static(b"{\"error\":");
+        let suffix = Bytes::from_static(b"{\"type\":\"usage_limit_reached\"}}");
+        let expected = vec![Ok(prefix.clone()), Ok(suffix.clone())];
+        let delayed = stream::once(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok(suffix)
+        });
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            headers: HeaderMap::new(),
+            version: http::Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(stream::once(async move { Ok(prefix) }).chain(delayed)),
+        };
+        let (response, kind) = classify_rate_limit(response).await;
+        assert_eq!(
+            kind,
+            UpstreamFailureKind::RateLimited,
+            "partial JSON is not exhaustion evidence"
+        );
+        assert_eq!(response.bytes_stream().collect::<Vec<_>>().await, expected);
     }
 }
