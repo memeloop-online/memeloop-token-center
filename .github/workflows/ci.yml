@@ -23,18 +23,18 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
       - name: Resolve expensive CI scopes
         id: scope
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          memory=false
-          plugin_installer=false
-          if [ "$EVENT_NAME" = push ]; then
-            memory=true
-            plugin_installer=true
-          else
+          changed="$RUNNER_TEMP/ci-changed-paths.txt"
+          : > "$changed"
+          if [ "$EVENT_NAME" = pull_request ]; then
             case "$BASE_SHA" in
               ''|*[!0-9a-fA-F]*)
                 echo 'pull request base SHA must be exact hexadecimal' >&2
@@ -43,18 +43,9 @@ jobs:
             esac
             test "${#BASE_SHA}" -eq 40
             git cat-file -e "$BASE_SHA^{commit}"
-            changed="$(git diff --name-only --diff-filter=ACDMRT "$BASE_SHA" "$GITHUB_SHA")"
-            if printf '%s\n' "$changed" | grep -Eq \
-              '^(\.github/workflows/(ci|memory-acceptance)\.yml|ops/(benchmark-|ci/(create|install)-memory-binary)|tests/(load/|ops/memory-binary-contract\.test\.ts))'; then
-              memory=true
-            fi
-            if printf '%s\n' "$changed" | grep -Eq \
-              '^(\.cargo/|\.github/workflows/ci\.yml|Cargo\.(toml|lock)|Dockerfile\.plugin-installer|packaging/cosign/|src/|migrations/|schemas/|wit/|vendor/|tests/ops/plugin-installer-image-contract\.test\.ts)'; then
-              plugin_installer=true
-            fi
+            git diff --name-only --diff-filter=ACDMRT "$BASE_SHA" "$GITHUB_SHA" > "$changed"
           fi
-          echo "memory=$memory" >> "$GITHUB_OUTPUT"
-          echo "plugin_installer=$plugin_installer" >> "$GITHUB_OUTPUT"
+          node ops/ci/detect-expensive-ci-scopes.ts "$EVENT_NAME" "$changed" "$GITHUB_OUTPUT"
 
   repository-security:
     runs-on: ubuntu-latest
@@ -108,7 +99,7 @@ jobs:
         if: steps.cargo-audit-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Verify the restored RustSec scanner version
-        run: cargo audit --version | grep -Eq '^cargo-audit 0\.22\.2($|[[:space:]])'
+        run: cargo-audit --version | grep -Fx 'cargo-audit 0.22.2'
       - name: Enforce the current RustSec advisory database with no exceptions
         run: cargo audit --deny warnings
       - name: Reject forbidden dependency re-entry and verify vendored provenance
@@ -646,6 +637,8 @@ jobs:
         run: node ops/ci/run-release-source-contracts.ts
       - name: Validate exact-revision memory binary reuse
         run: node --test tests/ops/memory-binary-contract.test.ts
+      - name: Validate fail-closed expensive CI scope detection
+        run: node --test tests/ops/ci-scope-contract.test.ts
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         if: needs.changes.outputs.plugin_installer == 'true'
       - name: Build the cached hardened plugin installer contract image
