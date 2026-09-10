@@ -147,7 +147,10 @@ impl Database {
     }
 
     /// Returns every currently authorized candidate in deterministic failover
-    /// order. Lower route priorities are exhausted first; candidates at the
+    /// order. A matching authorized account hint is preferred without
+    /// narrowing the set, so health admission and request-local failover may
+    /// continue with the remaining authorized candidates. Without a matching
+    /// hint, lower route priorities are exhausted first; candidates at the
     /// same priority use weighted rendezvous ordering so a stable selection
     /// seed remains sticky while the candidate set is unchanged.
     pub async fn resolve_authorized_upstream_candidates_with_hint(
@@ -172,31 +175,25 @@ impl Database {
              JOIN model_route_eligible_upstream_accounts candidates
                ON candidates.tenant_id = r.tenant_id AND candidates.model_route_id = r.id
              JOIN upstream_accounts a ON a.id = candidates.upstream_account_id AND a.tenant_id = r.tenant_id
-             JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $6)
+             JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > $5)
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
                AND r.enabled = 1 AND a.status = 'active'
-               AND ($4 = '' OR a.id = $4)
                AND (
-                 EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $5 AND g.model_route_id = r.id)
+                 EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $4 AND g.model_route_id = r.id)
                  OR EXISTS (
                    SELECT 1 FROM routing_grants g
                    JOIN model_route_group_memberships membership
                      ON membership.tenant_id = g.tenant_id AND membership.route_group_id = g.route_group_id
-                   WHERE g.tenant_id = r.tenant_id AND g.key_id = $5
+                   WHERE g.tenant_id = r.tenant_id AND g.key_id = $4
                      AND g.route_group_id IS NOT NULL AND membership.model_route_id = r.id
                  )
                )
              ORDER BY r.priority ASC, r.id ASC, a.id ASC
-             LIMIT $7",
+             LIMIT $6",
         )
         .bind(tenant_id.to_string())
         .bind(public_model)
         .bind(protocol)
-        .bind(
-            upstream_account_hint
-                .map(|id| id.to_string())
-                .unwrap_or_default(),
-        )
         .bind(key_id.to_string())
         .bind(unix_millis())
         .bind(PROXY_ROUTING_POLICY.candidate_query_limit())
@@ -220,8 +217,9 @@ impl Database {
         }
         let mut candidates = candidates.into_values().collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
-            left.priority
-                .cmp(&right.priority)
+            hint_rank(upstream_account_hint, left)
+                .cmp(&hint_rank(upstream_account_hint, right))
+                .then_with(|| left.priority.cmp(&right.priority))
                 .then_with(|| {
                     weighted_rendezvous_score(key_id, selection_seed, left)
                         .total_cmp(&weighted_rendezvous_score(key_id, selection_seed, right))
@@ -430,6 +428,10 @@ impl RoutingCandidate {
             credential_ciphertext: row.try_get("credential_ciphertext")?,
         })
     }
+}
+
+fn hint_rank(hint: Option<Uuid>, candidate: &RoutingCandidate) -> u8 {
+    u8::from(hint.is_some_and(|hint| hint != candidate.account_id))
 }
 
 fn weighted_rendezvous_score(
