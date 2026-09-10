@@ -32,6 +32,16 @@ WORKDIR /build
 COPY .cargo/config.toml /build/.cargo/config.toml
 COPY Cargo.toml Cargo.lock ./
 COPY vendor ./vendor
+# Compile the locked dependency graph before application sources are copied.
+# Source-only changes can then reuse this expensive release layer in both the
+# packaging contract and the immutable publication build.
+RUN mkdir -p src/bin tests \
+    && printf 'pub fn dependency_cache_marker() {}\n' > src/lib.rs \
+    && printf 'fn main() {}\n' > src/bin/install-plugin-oci.rs \
+    && printf 'fn main() {}\n' > tests/cucumber.rs \
+    && cargo build --locked --release --features plugin-distribution --bin install-plugin-oci \
+    && cargo clean --release --package memeloop-token-center \
+    && rm -rf src tests
 COPY src ./src
 COPY migrations ./migrations
 COPY schemas ./schemas

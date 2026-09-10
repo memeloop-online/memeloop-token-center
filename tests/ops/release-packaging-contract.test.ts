@@ -5,7 +5,7 @@ import { parse } from 'yaml';
 import { contains, occurrences, read, repository, run } from './contract-helpers.ts';
 
 type WorkflowStep = { id?: string; if?: string; name?: string; uses?: string; run?: string; with?: Record<string, unknown>; env?: Record<string, unknown> };
-type WorkflowJob = { steps?: WorkflowStep[] };
+type WorkflowJob = { if?: string; needs?: string | string[]; steps?: WorkflowStep[]; uses?: string; with?: Record<string, unknown> };
 
 test('release contains only runtime images and no retired migration delivery surface', () => {
   const dockerfile = read('Dockerfile');
@@ -29,6 +29,15 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.equal(occurrences(workflows, 'actions/checkout@'), occurrences(workflows, 'persist-credentials: false'));
 
   const parsed = parse(workflow) as { jobs?: Record<string, WorkflowJob> };
+  const memoryBinary = parsed.jobs?.['memory-binary'];
+  const memoryAcceptance = parsed.jobs?.['memory-acceptance'];
+  assert.equal(memoryBinary?.if, "needs.changes.outputs.memory == 'true'");
+  assert.equal(memoryAcceptance?.if, "needs.changes.outputs.memory == 'true'");
+  assert.ok(memoryBinary?.needs?.includes('changes'));
+  assert.ok(memoryAcceptance?.needs?.includes('memory-binary'));
+  assert.equal(memoryAcceptance?.uses, './.github/workflows/memory-acceptance.yml');
+  assert.equal(memoryAcceptance?.with?.binary_artifact, 'memory-binary-${{ github.sha }}');
+
   const publish = parsed.jobs?.['publish-ghcr'];
   assert.ok(publish, 'publish-ghcr job is missing');
   const publishSteps = publish.steps ?? [];
@@ -44,6 +53,11 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.match(serializedMatrix, /memeloop-token-center/);
   assert.match(serializedMatrix, /memeloop-token-center-plugin-installer/);
   assert.doesNotMatch(serializedMatrix, /importer/);
+  const packaging = parsed.jobs?.packaging;
+  const cachedPluginBuild = packaging?.steps?.find((step) => step.name === 'Build the cached hardened plugin installer contract image');
+  assert.equal(cachedPluginBuild?.with?.['cache-from'], 'type=gha,scope=plugin-installer');
+  assert.equal(cachedPluginBuild?.with?.['cache-to'], 'type=gha,mode=max,scope=plugin-installer');
+  assert.equal(cachedPluginBuild?.with?.load, true);
   for (const line of workflow.split('\n').filter((line) => /cargo (?:build|clippy|test|run|tree)(?:\s|$)/.test(line))) assert.ok(line.includes('--locked'), `Cargo command lacks --locked: ${line}`);
   run(process.execPath, ['web/scripts/verify-github-workflow-policy.mjs', '.github/workflows/ci.yml', repository]);
 });
