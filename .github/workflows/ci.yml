@@ -108,7 +108,7 @@ jobs:
         if: steps.cargo-audit-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Verify the restored RustSec scanner version
-        run: test "$(cargo audit --version)" = "cargo-audit 0.22.2"
+        run: cargo audit --version | grep -Eq '^cargo-audit 0\.22\.2($|[[:space:]])'
       - name: Enforce the current RustSec advisory database with no exceptions
         run: cargo audit --deny warnings
       - name: Reject forbidden dependency re-entry and verify vendored provenance
