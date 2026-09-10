@@ -344,27 +344,27 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
 
   await openAppRoute(page, 'operator', 'routes');
   const routeForm = page.locator('details.create-resource').filter({ hasText: '创建模型路由' });
-  await routeForm.locator('summary').click();
+  await routeForm.locator(':scope > summary').click();
   await routeForm.getByLabel('公开模型').fill(imageModel);
   await routeForm.getByLabel('协议').selectOption('generation');
   const imageUpstreamPicker = routeForm.getByRole('combobox', { name: '具体提供商', exact: true });
   await imageUpstreamPicker.fill('Browser UI ComfyUI');
   const imageScopeCatalog = page.waitForResponse((response) => {
     const url = new URL(response.url());
-    return response.request().method() === 'GET'
-      && url.pathname === '/internal/v1/upstream-models'
-      && url.searchParams.get('account_ids') === comfyUpstream.id
-      && !url.searchParams.has('q');
+    return response.request().method() === 'POST'
+      && url.pathname === '/internal/v1/upstream-models/query'
+      && response.request().postDataJSON().account_ids.join(',') === comfyUpstream.id
+      && !response.request().postDataJSON().q;
   });
   await routeForm.getByRole('option', { name: /Browser UI ComfyUI/ }).click();
   assert.equal((await imageScopeCatalog).status(), 200);
   await assertVisible(routeForm.locator('.selection-chip').filter({ hasText: 'Browser UI ComfyUI' }));
   const imageCatalogResponsePromise = page.waitForResponse((response) => {
     const url = new URL(response.url());
-    return response.request().method() === 'GET'
-      && url.pathname === '/internal/v1/upstream-models'
-      && url.searchParams.get('account_ids') === comfyUpstream.id
-      && url.searchParams.get('q') === 'browser-workflow-v1';
+    return response.request().method() === 'POST'
+      && url.pathname === '/internal/v1/upstream-models/query'
+      && response.request().postDataJSON().account_ids.join(',') === comfyUpstream.id
+      && response.request().postDataJSON().q === 'browser-workflow-v1';
   }, { timeout: 10_000 });
   await routeForm.getByLabel('上游模型').fill('browser-workflow-v1');
   const imageCatalogResponse = await imageCatalogResponsePromise;
@@ -398,20 +398,20 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await upstreamPicker.fill('Browser UI Seedance');
   const videoScopeCatalog = page.waitForResponse((response) => {
     const url = new URL(response.url());
-    return response.request().method() === 'GET'
-      && url.pathname === '/internal/v1/upstream-models'
-      && url.searchParams.get('account_ids') === seedanceUpstream.id
-      && !url.searchParams.has('q');
+    return response.request().method() === 'POST'
+      && url.pathname === '/internal/v1/upstream-models/query'
+      && response.request().postDataJSON().account_ids.join(',') === seedanceUpstream.id
+      && !response.request().postDataJSON().q;
   });
   await routeForm.getByRole('option', { name: /Browser UI Seedance/ }).click();
   assert.equal((await videoScopeCatalog).status(), 200);
   await assertVisible(routeForm.locator('.selection-chip').filter({ hasText: 'Browser UI Seedance' }));
   const videoCatalogResponsePromise = page.waitForResponse((response) => {
     const url = new URL(response.url());
-    return response.request().method() === 'GET'
-      && url.pathname === '/internal/v1/upstream-models'
-      && url.searchParams.get('account_ids') === seedanceUpstream.id
-      && url.searchParams.get('q') === 'seedance-browser-v1';
+    return response.request().method() === 'POST'
+      && url.pathname === '/internal/v1/upstream-models/query'
+      && response.request().postDataJSON().account_ids.join(',') === seedanceUpstream.id
+      && response.request().postDataJSON().q === 'seedance-browser-v1';
   }, { timeout: 10_000 });
   await routeForm.getByLabel('上游模型').fill('seedance-browser-v1');
   const videoCatalogResponse = await videoCatalogResponsePromise;

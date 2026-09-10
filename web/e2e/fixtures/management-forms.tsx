@@ -12,6 +12,7 @@ import '../../src/operator/operator.css';
 window.formFixture = {
   writes: [], reads: [], holdCatalog: false, finish: () => {},
   catalogResolvers: [],
+  catalogQueries: [],
   syncRequests: 0, syncActive: 0, syncPeak: 0, cancelledSyncRequests: 0, syncMode: 'ready',
   changeAndSubmit: (change) => {
     flushSync(change);
@@ -39,6 +40,26 @@ const keySchema = {
 };
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(String(input), location.origin);
+  if (url.pathname === '/internal/v1/upstream-models/query') {
+    if (init?.method !== 'POST' || url.search) throw new Error('Catalog must use a JSON-body POST with no account IDs in the URL');
+    const body = JSON.parse(String(init.body)) as Window['formFixture']['catalogQueries'][number];
+    if (!Array.isArray(body.account_ids) || body.account_ids.length > 500
+      || !Array.isArray(body.include_provider_group_ids) || body.include_provider_group_ids.length > 100
+      || !Array.isArray(body.exclude_provider_group_ids) || body.exclude_provider_group_ids.length > 100) throw new Error('Invalid catalog selection arrays');
+    window.formFixture.catalogQueries.push(body);
+    const eligibleCount = body.account_ids.length || 500;
+    const aggregate = {
+      eligible_account_count: eligibleCount, unknown_account_count: 0, stale_account_count: 0,
+      data: !body.q || body.q === 'fixture-model'
+        ? [{ id: 'fixture-model', protocol: 'openai', supported_account_count: eligibleCount, eligible_account_count: eligibleCount, complete_coverage: true }] : [],
+    };
+    if (window.formFixture.holdCatalog) return new Promise((resolve, reject) => {
+      window.formFixture.catalogResolvers.push(() => resolve(json(aggregate)));
+      init.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+    });
+    return json(aggregate);
+  }
+  if (url.pathname === '/internal/v1/upstream-models') throw new Error('Legacy GET catalog cannot represent 101–500 explicit candidates');
   if (url.pathname.endsWith('/models/sync') || (url.pathname.endsWith('/models') && !url.searchParams.has('limit'))) {
     window.formFixture.syncRequests += 1;
     window.formFixture.syncActive += 1;
@@ -72,29 +93,19 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     { id: accountId, tenant_external_id: 'alpha', name: 'Production account', driver: 'fixture-provider', status: 'active' },
     { id: '22222222-2222-4222-8222-222222222222', tenant_external_id: 'alpha', name: 'Backup account', driver: 'fixture-provider', status: 'active' },
   ]);
-  const eligibleCount = new URLSearchParams(location.search).get('view') === 'large-catalog' ? 500 : 1;
-  const aggregate = {
-    eligible_account_count: eligibleCount, unknown_account_count: 0, stale_account_count: 0,
-    data: !url.searchParams.get('q') || url.searchParams.get('q') === 'fixture-model'
-      ? [{ id: 'fixture-model', protocol: 'openai', supported_account_count: eligibleCount, eligible_account_count: eligibleCount, complete_coverage: true }] : [],
-  };
-  if (url.pathname.endsWith('/upstream-models') && window.formFixture.holdCatalog) return new Promise((resolve, reject) => {
-    window.formFixture.catalogResolvers.push(() => resolve(json(aggregate)));
-    init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
-  });
-  if (url.pathname.endsWith('/upstream-models')) return json(aggregate);
   if (url.pathname.endsWith('/models')) return json({ status: 'ready', models: [{ id: 'fixture-model', protocol: 'openai' }] });
   return json([]);
 };
 const largeAccounts = Array.from({ length: 500 }, (_, index) => ({
-  id: `account-${String(index).padStart(3, '0')}`, name: `Account ${index}`, driver: 'fixture-provider', status: 'active',
+  id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`, name: `Account ${index}`, driver: 'fixture-provider', status: 'active',
 })) as UpstreamAccount[];
 function LargeCatalog() {
-  const [members, setMembers] = useState(largeAccounts.map(account => account.id));
+  const explicitCount = Number(new URLSearchParams(location.search).get('explicit'));
+  const [members, setMembers] = useState(largeAccounts.slice(0, explicitCount || 500).map(account => account.id));
   return <>
     <button onClick={() => setMembers(members.slice(0, -1))}>Change group membership</button>
     <UpstreamModelCombobox token="fixture-control" tenant="alpha" protocol="openai"
-      accountIds={[]} includedProviderGroupIds={['unchanged-group-id']} excludedProviderGroupIds={[]}
+      accountIds={explicitCount ? members : []} includedProviderGroupIds={explicitCount ? [] : ['11111111-1111-4111-8111-111111111111']} excludedProviderGroupIds={[]}
       syncAccountIds={members} value="fixture-model" onChange={() => {}} customModelConfirmed={false}
       onValidityChange={() => {}} upstreams={largeAccounts}
       providers={[{ id: 'fixture-provider', display_name: 'Fixture Provider' } as ProviderType]} />

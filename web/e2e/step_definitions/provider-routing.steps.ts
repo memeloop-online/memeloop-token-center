@@ -198,17 +198,18 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   await routeRow.getByRole('button', { name: '编辑', exact: true }).click();
   const routeEditor = page.locator('.inline-editor');
   const synchronizedModels = page.waitForResponse((response) => response.url().includes(`/internal/v1/upstreams/${seed.upstreamId}/models/sync`) && response.request().method() === 'POST');
-  await routeEditor.getByRole('button', { name: '同步模型', exact: true }).click();
+  await routeEditor.getByRole('button', { name: /^同步模型/ }).click();
   assert.equal((await synchronizedModels).status(), 200);
   await assertContains(routeEditor.locator('.catalog-status'), '已同步 1 个候选提供商的模型目录');
   const catalogSearch = page.waitForResponse((response) => {
     const url = new URL(response.url());
-    return url.pathname === '/internal/v1/upstream-models' && url.searchParams.get('q') === 'mock-provider-model-v2';
+    return response.request().method() === 'POST' && url.pathname === '/internal/v1/upstream-models/query'
+      && response.request().postDataJSON().q === 'mock-provider-model-v2';
   });
   await routeEditor.getByLabel('上游模型').fill('mock-provider-model-v2');
   const catalogResponse = await catalogSearch;
   assert.equal(catalogResponse.status(), 200);
-  assert.equal(new URL(catalogResponse.url()).searchParams.get('account_ids'), seed.upstreamId);
+  assert.deepEqual(catalogResponse.request().postDataJSON().account_ids, [seed.upstreamId]);
   const catalog = await catalogResponse.json() as { data: Array<{ id: string }> };
   assert.ok(catalog.data.some((catalogModel) => catalogModel.id === 'mock-provider-model-v2'));
   await routeEditor.locator('.shared-model-popover').getByRole('option').filter({ hasText: 'mock-provider-model-v2' }).first().click();
@@ -313,16 +314,16 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   await assertContains(reloadedProviderGroups.locator('.selection-chip'), 'Browser mock upstream');
 
   const routeEditor = page.locator('details.create-resource').filter({ hasText: '创建模型路由' });
-  await routeEditor.locator('summary').click();
+  await routeEditor.locator(':scope > summary').click();
   await routeEditor.getByLabel('公开模型').fill(groupedModel);
   const includeProviders = routeEditor.getByRole('combobox', { name: '包含提供商组', exact: true });
   await includeProviders.fill('主力');
   const groupCatalog = page.waitForResponse((response) => {
     const url = new URL(response.url());
-    return response.request().method() === 'GET'
-      && url.pathname === '/internal/v1/upstream-models'
-      && url.searchParams.get('include_provider_group_ids') === providerGroup.id
-      && !url.searchParams.has('q');
+    return response.request().method() === 'POST'
+      && url.pathname === '/internal/v1/upstream-models/query'
+      && response.request().postDataJSON().include_provider_group_ids.join(',') === providerGroup.id
+      && !response.request().postDataJSON().q;
   });
   await includeProviders.press('Enter');
   await assertContains(includeProviders.locator('..').locator('.selection-chip'), '主力提供商');
@@ -330,9 +331,9 @@ When('管理员用键盘创建提供商组和路由组', { timeout: 120_000 }, a
   assert.equal(groupCatalogResponse.status(), 200);
   const groupedCatalog = page.waitForResponse((response) => {
     const url = new URL(response.url());
-    return url.pathname === '/internal/v1/upstream-models'
-      && url.searchParams.get('include_provider_group_ids') === providerGroup.id
-      && url.searchParams.get('q') === 'mock-provider-model';
+    return response.request().method() === 'POST' && url.pathname === '/internal/v1/upstream-models/query'
+      && response.request().postDataJSON().include_provider_group_ids.join(',') === providerGroup.id
+      && response.request().postDataJSON().q === 'mock-provider-model';
   });
   await routeEditor.getByLabel('上游模型').fill('mock-provider-model');
   const groupedCatalogResponse = await groupedCatalog;

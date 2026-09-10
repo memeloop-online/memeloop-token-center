@@ -11,6 +11,7 @@ declare global {
       writes: Array<{ path: string; body: Record<string, unknown> }>;
       reads: string[]; holdCatalog: boolean; finish: () => void;
       catalogResolvers: Array<() => void>;
+      catalogQueries: Array<{ tenant_external_id: string; account_ids: string[]; include_provider_group_ids: string[]; exclude_provider_group_ids: string[]; q?: string; limit: number }>;
       syncRequests: number; syncActive: number; syncPeak: number; cancelledSyncRequests: number;
       syncMode: 'ready' | 'syncing' | 'hold';
       changeAndSubmit: (change: () => void) => void;
@@ -155,6 +156,27 @@ test('credential and route forms group fields, stay within the viewport and guar
         await create.getByLabel('Priority', { exact: false }).fill('1.5');
         assert.equal(await submit.isDisabled(), true);
       }
+    }
+    for (const explicitCount of [101, 500]) {
+      await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/management-forms.html?view=large-catalog&explicit=${explicitCount}`);
+      await page.getByRole('combobox', { name: 'Upstream model', exact: true }).click();
+      await page.locator('.shared-model-popover input').fill('Fixture Provider');
+      await page.locator('.shared-model-popover').getByRole('group', { name: 'Fixture Provider', exact: true }).waitFor();
+      await page.locator('.shared-model-popover input').fill(`Account ${explicitCount - 1}`);
+      await page.locator('.shared-model-popover').getByRole('group', { name: `Account ${explicitCount - 1}`, exact: true }).waitFor();
+      const queries = await page.evaluate(() => window.formFixture.catalogQueries);
+      assert.ok(queries.some(query => query.q === 'fixture-model'), 'selection validation must also use the batch endpoint');
+      assert.ok(queries.some(query => !query.q), 'provider/account source searches must not be sent as model-ID queries');
+      for (const query of queries) {
+        assert.equal(query.tenant_external_id, 'alpha');
+        assert.equal(query.limit, 100);
+        assert.equal(query.account_ids.length, explicitCount);
+        assert.equal(new Set(query.account_ids).size, explicitCount);
+        assert.deepEqual(query.include_provider_group_ids, []);
+        assert.deepEqual(query.exclude_provider_group_ids, []);
+        assert.ok(query.q === undefined || query.q === 'fixture-model');
+      }
+      assert.equal(await page.evaluate(() => window.formFixture.writes.length), 0, 'read-only catalog POSTs are not route mutations');
     }
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/management-forms.html?view=large-catalog`);
     const largeModel = page.getByRole('combobox', { name: 'Upstream model', exact: true });

@@ -171,6 +171,17 @@ test('model synchronization has hard account, concurrency, poll and lifetime bou
   assert.doesNotMatch(upstreamModel, /Promise\.all\(syncAccountIds\.map|attempt < 40/);
 });
 
+test('selected and browsed catalogs use body-based batch queries for up to 500 explicit accounts', () => {
+  const upstreamModel = readFileSync(new URL('../src/operator/UpstreamModelCombobox.tsx', import.meta.url), 'utf8');
+  assert.match(upstreamModel, /api<AggregateCatalog>\('\/internal\/v1\/upstream-models\/query', token, \{\s+method: 'POST', signal/);
+  assert.match(upstreamModel, /account_ids: \[\.\.\.new Set\(accountIds\)\]\.sort\(\)/);
+  assert.match(upstreamModel, /include_provider_group_ids: \[\.\.\.new Set\(includedProviderGroupIds\)\]\.sort\(\)/);
+  assert.match(upstreamModel, /exclude_provider_group_ids: \[\.\.\.new Set\(excludedProviderGroupIds\)\]\.sort\(\)/);
+  assert.match(upstreamModel, /queryCatalog\(browseModelQuery, controller\.signal\)/);
+  assert.match(upstreamModel, /queryCatalog\(value\.trim\(\), controller\.signal\)/);
+  assert.doesNotMatch(upstreamModel, /upstream-models\?\$\{|query\.set\('account_ids'/);
+});
+
 test('route mutations refresh provider-group impact counts before releasing the form', () => {
   const routeWorkspace = managementPages.slice(managementPages.indexOf('function RouteWorkspace('), managementPages.indexOf('function CredentialWorkspace('));
   assert.match(routeWorkspace, /setMessage\(t\(existing \? 'routes.updated' : 'routes.created'\)\);\s+await Promise\.all\(\[load\(\), routeGroups\.load\(\), providerGroups\.load\(\)\]\)/);

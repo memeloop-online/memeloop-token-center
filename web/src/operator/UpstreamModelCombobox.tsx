@@ -100,6 +100,17 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     .slice(0, 8);
   const browseCatalog = browseResult?.scopeKey === browseScopeKey ? browseResult.data : undefined;
   const accountCatalogs = provenance?.scopeKey === provenanceScopeKey ? provenance.catalogs : new Map<string, AccountCatalog>();
+  const queryCatalog = (query: string, signal: AbortSignal) => api<AggregateCatalog>('/internal/v1/upstream-models/query', token, {
+    method: 'POST', signal,
+    body: JSON.stringify({
+      tenant_external_id: tenant,
+      account_ids: [...new Set(accountIds)].sort(),
+      include_provider_group_ids: [...new Set(includedProviderGroupIds)].sort(),
+      exclude_provider_group_ids: [...new Set(excludedProviderGroupIds)].sort(),
+      q: query || undefined,
+      limit: 100,
+    }),
+  });
 
   useEffect(() => {
     setSyncMessage('');
@@ -112,13 +123,8 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     const controller = new AbortController();
     setBrowsing(true);
     const timeout = window.setTimeout(async () => {
-      const query = new URLSearchParams({ tenant_external_id: tenant, limit: '100' });
-      if (accountIds.length) query.set('account_ids', accountIds.join(','));
-      if (includedProviderGroupIds.length) query.set('include_provider_group_ids', includedProviderGroupIds.join(','));
-      if (excludedProviderGroupIds.length) query.set('exclude_provider_group_ids', excludedProviderGroupIds.join(','));
-      if (browseModelQuery) query.set('q', browseModelQuery);
       try {
-        const result = await api<AggregateCatalog>(`/internal/v1/upstream-models?${query}`, token, { signal: controller.signal });
+        const result = await queryCatalog(browseModelQuery, controller.signal);
         if (!controller.signal.aborted) setBrowseCatalog({ scopeKey: browseScopeKey, data: result });
       } catch (reason) {
         if (!controller.signal.aborted) setBrowseError(reason instanceof Error ? reason.message : t('routes.catalogFailed'));
@@ -137,14 +143,9 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     const controller = new AbortController();
     setLoading(true); setError('');
     const timeout = window.setTimeout(async () => {
-      const query = new URLSearchParams({ tenant_external_id: tenant, limit: '100' });
-      if (accountIds.length) query.set('account_ids', accountIds.join(','));
-      if (includedProviderGroupIds.length) query.set('include_provider_group_ids', includedProviderGroupIds.join(','));
-      if (excludedProviderGroupIds.length) query.set('exclude_provider_group_ids', excludedProviderGroupIds.join(','));
-      if (value.trim()) query.set('q', value.trim());
       setLoading(true); setError('');
       try {
-        const data = await api<AggregateCatalog>(`/internal/v1/upstream-models?${query}`, token, { signal: controller.signal });
+        const data = await queryCatalog(value.trim(), controller.signal);
         if (!controller.signal.aborted) setCatalog({ scopeKey: catalogKey, data });
       }
       catch (reason) { if (!controller.signal.aborted) { setCatalog(undefined); setError(reason instanceof Error ? reason.message : t('routes.catalogFailed')); } }
