@@ -8,8 +8,58 @@ import { resolve } from "node:path";
 import test from "node:test";
 import { assetGatewayRssEvidence, chatPayload, createMockServer, HarnessFailure, MockState, seed, smallChat, streamChat, waitForTextRouteRecovery } from "../../ops/benchmark-memory.ts";
 import { StreamStartBarrier } from "../../ops/benchmark-stream-barrier.ts";
+import { DatabaseSync } from "node:sqlite";
+import { FirstSoakFailureEvidence, readSoakFailureClassification } from "../../ops/benchmark-soak-diagnostics.ts";
 
 const benchmarkEntry = resolve(import.meta.dirname, "../../ops/benchmark-memory.ts");
+
+test("first soak failure evidence is frozen before repeated cooldown failures", () => {
+  const evidence = new FirstSoakFailureEvidence();
+  let reads = 0;
+  evidence.capture(() => { reads += 1; return { status: 502, code: "upstream_transport" }; });
+  for (let index = 0; index < 99; index += 1) evidence.capture(() => { reads += 1; return { status: 503 }; });
+  assert.equal(reads, 1);
+  assert.equal(evidence.value?.status, 502);
+  assert.equal(evidence.value?.code, "upstream_transport");
+  const failedRead = new FirstSoakFailureEvidence();
+  failedRead.capture(() => { throw new Error("secret diagnostic error"); });
+  assert.equal(failedRead.value?.reason, "first_failure_capture_unavailable");
+  assert.ok(!JSON.stringify(failedRead.value).includes("secret"));
+  const source = readFileSync(benchmarkEntry, "utf8");
+  assert.match(source, /check\("soak request failures", soak.failures, "==", 0, soak.failures === 0\)/u);
+  assert.match(source, /failures \+= 1; firstFailureEvidence\.capture\(firstFailure\)/u);
+});
+
+test("soak classification reads are tenant/time bounded and omit payloads", () => {
+  const temporary = mkdtempSync(resolve(tmpdir(), "mtc-soak-classification-"));
+  const path = resolve(temporary, "fixture.db");
+  const database = new DatabaseSync(path);
+  try {
+    database.exec(`
+      CREATE TABLE tenants(id TEXT, external_id TEXT);
+      CREATE TABLE upstream_accounts(id TEXT, tenant_id TEXT, credential TEXT);
+      CREATE TABLE upstream_account_health(upstream_account_id TEXT, consecutive_failures INTEGER, cooldown_until INTEGER, last_failure_kind TEXT, updated_at INTEGER);
+      CREATE TABLE request_records(id TEXT, tenant_id TEXT, status_code INTEGER, error_code TEXT, created_at INTEGER, completed_at INTEGER, upstream_account_id TEXT, request_payload TEXT);
+      INSERT INTO tenants VALUES ('bench', 'memory-benchmark'), ('other', 'other');
+      INSERT INTO upstream_accounts VALUES ('account', 'bench', 'credential-secret'), ('foreign', 'other', 'foreign-secret');
+      INSERT INTO upstream_account_health VALUES ('account', 1, 5000, 'transport', 200), ('foreign', 1, 5000, 'transport', 200);
+      INSERT INTO request_records VALUES ('first-failure', 'bench', 502, 'upstream_transport', 200, 210, 'account', 'payload-secret');
+      INSERT INTO request_records VALUES ('foreign-failure', 'other', 502, 'upstream_transport', 200, 210, 'foreign', 'foreign-secret');
+      INSERT INTO request_records VALUES ('old-failure', 'bench', 502, 'upstream_transport', 1, 2, 'account', 'old-secret');
+    `);
+    const before = database.prepare("SELECT COUNT(*) AS count FROM request_records").get();
+    const evidence = readSoakFailureClassification(path, 100);
+    assert.equal(evidence.available, true);
+    const rendered = JSON.stringify(evidence);
+    assert.ok(rendered.includes("first-failure"));
+    assert.ok(rendered.includes("upstream_transport"));
+    for (const forbidden of ["foreign", "old-failure", "secret", "request_payload", "credential"]) assert.ok(!rendered.includes(forbidden));
+    assert.deepEqual(database.prepare("SELECT COUNT(*) AS count FROM request_records").get(), before);
+  } finally {
+    database.close();
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
 
 test("TypeScript CLI exposes the memory harness without a shell wrapper", () => {
   const result = spawnSync(process.execPath, [benchmarkEntry, "--help"], { encoding: "utf8", shell: false });
