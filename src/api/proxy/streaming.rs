@@ -44,7 +44,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         protocol,
         is_codex_route,
         codex_retry,
-        upstream_attempt,
+        mut upstream_attempt,
         strict_openai_chat_usage,
         upstream_activity,
         request_id,
@@ -315,6 +315,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     output_token_ceiling,
                                     requested_service_tier: requested_service_tier.as_deref(),
                                     confirmed: &mut delivery_confirmed,
+                                    probe: ((matches!(protocol, Protocol::OpenAiResponses)
+                                        || strict_openai_chat_usage)
+                                        && sse_capture.as_ref().is_some_and(
+                                            ResponsesSseCapture::can_confirm_probe_delivery,
+                                        ))
+                                    .then_some(&mut upstream_attempt),
                                 },
                                 frame,
                             )
@@ -419,6 +425,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             output_token_ceiling,
                             requested_service_tier: requested_service_tier.as_deref(),
                             confirmed: &mut delivery_confirmed,
+                            probe: (matches!(protocol, Protocol::OpenAiResponses)
+                                || strict_openai_chat_usage)
+                                .then_some(&mut upstream_attempt),
                         },
                         frame,
                     )

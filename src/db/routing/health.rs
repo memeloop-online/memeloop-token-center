@@ -4,6 +4,8 @@ use uuid::Uuid;
 use super::super::{AppError, Database, unix_millis};
 use crate::config::UpstreamHealthConfig;
 
+mod delivery;
+
 #[cfg(test)]
 mod quota_tests;
 
@@ -395,6 +397,7 @@ impl Database {
             "UPDATE upstream_account_health SET probe_lease_until = $1, updated_at = $2
              WHERE upstream_account_id = $3 AND credential_generation = $4
                AND probe_lease_token = $5
+               AND consecutive_failures > 0
                AND EXISTS (
                  SELECT 1 FROM upstream_accounts account
                  WHERE account.id = upstream_account_health.upstream_account_id

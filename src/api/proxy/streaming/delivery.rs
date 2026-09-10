@@ -15,6 +15,7 @@ pub(super) struct FrameDelivery<'a> {
     pub output_token_ceiling: i64,
     pub requested_service_tier: Option<&'a str>,
     pub confirmed: &'a mut bool,
+    pub probe: Option<&'a mut UpstreamAttemptGuard>,
 }
 
 /// The held terminal and ordinary frames use exactly the same durable
@@ -57,6 +58,9 @@ pub(super) async fn send_frame(
             .await
             .map_err(|_| "downstream_backpressure")?
             .map_err(|_| "downstream_disconnected")?;
+    }
+    if billable && let Some(probe) = input.probe {
+        probe.delivered_validated_output().await;
     }
     Ok(billable)
 }

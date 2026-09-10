@@ -22,7 +22,9 @@ impl UpstreamAttemptTerminal {
 
 /// Owns the half-open circuit-breaker transition after an HTTP response has
 /// been admitted. A 2xx header is not recovery: only the buffered or streaming
-/// terminal path can confirm protocol validity and durable settlement.
+/// terminal path can confirm final validity and settlement. Validated,
+/// durably delivered streaming output may independently release half-open
+/// admission without losing this attempt's fenced terminal responsibility.
 #[must_use]
 pub(in crate::api::proxy) struct UpstreamAttemptGuard {
     state: Option<AppState>,
@@ -31,6 +33,8 @@ pub(in crate::api::proxy) struct UpstreamAttemptGuard {
     credential_generation: i64,
     lease_token: Option<Uuid>,
     heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    delivery_recovery_attempted: bool,
+    recovered_on_delivery: bool,
 }
 
 impl UpstreamAttemptGuard {
@@ -91,6 +95,47 @@ impl UpstreamAttemptGuard {
             credential_generation,
             lease_token,
             heartbeat_stop,
+            delivery_recovery_attempted: false,
+            recovered_on_delivery: false,
+        }
+    }
+
+    /// Call only after a protocol-validated billable frame is durably recorded
+    /// and enqueued downstream. Headers, comments and usage-only frames do not
+    /// establish recovery. This is not request completion or usage settlement.
+    pub(in crate::api::proxy) async fn delivered_validated_output(&mut self) {
+        if self.delivery_recovery_attempted {
+            return;
+        }
+        self.delivery_recovery_attempted = true;
+        let (Some(state), Some(token)) = (self.state.as_ref(), self.lease_token) else {
+            return;
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            state.db.record_upstream_account_probe_delivery(
+                self.upstream_account_id,
+                self.credential_generation,
+                token,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {
+                self.recovered_on_delivery = true;
+                state.metrics.observe_upstream_health(
+                    UpstreamHealthEvent::Recovered,
+                    UpstreamHealthReason::Success,
+                );
+                self.stop_heartbeat();
+            }
+            Ok(Ok(false)) => {}
+            _ => tracing::warn!(
+                request_id = %self.request_id,
+                upstream_account_id = %self.upstream_account_id,
+                stage = "probe_delivery_ack",
+                "streaming probe recovery acknowledgement unavailable"
+            ),
         }
     }
 
@@ -105,6 +150,7 @@ impl UpstreamAttemptGuard {
             self.upstream_account_id,
             self.credential_generation,
             self.lease_token,
+            self.recovered_on_delivery,
             terminal,
         )
         .await;
@@ -127,6 +173,7 @@ impl Drop for UpstreamAttemptGuard {
         let upstream_account_id = self.upstream_account_id;
         let credential_generation = self.credential_generation;
         let lease_token = self.lease_token;
+        let recovered_on_delivery = self.recovered_on_delivery;
         // Proxy guards are created and dropped on the Tokio request runtime.
         // Cancellation cannot prove either upstream failure or recovery. It
         // must not make a half-open account healthy, and it must not let a
@@ -138,6 +185,7 @@ impl Drop for UpstreamAttemptGuard {
                 upstream_account_id,
                 credential_generation,
                 lease_token,
+                recovered_on_delivery,
                 UpstreamAttemptTerminal::Inconclusive,
             )
             .await;
@@ -151,6 +199,7 @@ async fn record_terminal(
     upstream_account_id: Uuid,
     credential_generation: i64,
     lease_token: Option<Uuid>,
+    recovered_on_delivery: bool,
     terminal: UpstreamAttemptTerminal,
 ) {
     match terminal {
@@ -167,11 +216,11 @@ async fn record_terminal(
                 )
                 .await
             {
-                Ok(true) => state.metrics.observe_upstream_health(
+                Ok(true) if !recovered_on_delivery => state.metrics.observe_upstream_health(
                     UpstreamHealthEvent::Recovered,
                     UpstreamHealthReason::Success,
                 ),
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(error) => tracing::warn!(
                     %request_id,
                     %upstream_account_id,

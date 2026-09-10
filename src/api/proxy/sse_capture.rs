@@ -225,6 +225,10 @@ impl ResponsesSseCapture {
             && !self.framer.has_pending_crlf_continuation()
     }
 
+    pub(super) fn can_confirm_probe_delivery(&self) -> bool {
+        !self.invalid && !self.terminal_failure && !self.usage_invalid
+    }
+
     #[cfg(test)]
     pub(super) fn saw_done(&self) -> bool {
         self.saw_done

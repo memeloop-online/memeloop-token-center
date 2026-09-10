@@ -1,5 +1,7 @@
 use super::*;
 
+mod delivered_probe;
+
 async fn make_account_half_open_probe(fixture: &CodexRouteFixture) {
     fixture
         .state
