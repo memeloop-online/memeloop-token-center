@@ -6889,16 +6889,36 @@ async fn responses_requests_have_direct_parent_edge(world: &mut TokenCenterWorld
 
 #[then("the failed Responses id does not form a continuation edge")]
 async fn failed_responses_id_is_not_a_parent(world: &mut TokenCenterWorld) {
-    let clusters = world
-        .client
-        .get(format!("{}/self/v1/conversations", world.service_url))
-        .bearer_auth(&world.current_key)
-        .send()
-        .await
-        .expect("conversation clusters")
-        .json::<Value>()
-        .await
-        .expect("conversation clusters JSON");
+    // EOF precedes asynchronous terminal/projection work. Wait for both
+    // requests to be represented, not for the desired number of clusters:
+    // an incorrect merged cluster must still fail the lineage assertion.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let clusters = loop {
+        let snapshot = world
+            .client
+            .get(format!("{}/self/v1/conversations", world.service_url))
+            .bearer_auth(&world.current_key)
+            .send()
+            .await
+            .expect("conversation clusters")
+            .json::<Value>()
+            .await
+            .expect("conversation clusters JSON");
+        let represented = snapshot
+            .as_array()
+            .expect("conversation cluster array")
+            .iter()
+            .map(|cluster| cluster["request_count"].as_u64().expect("request count"))
+            .sum::<u64>();
+        if represented >= 2 {
+            break snapshot;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both terminal requests must reach the conversation projection: {snapshot}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     let clusters = clusters.as_array().expect("conversation cluster array");
     assert_eq!(clusters.len(), 2, "{clusters:?}");
     assert!(
