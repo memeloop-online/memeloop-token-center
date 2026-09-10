@@ -30,6 +30,7 @@ mod probe;
 mod readiness;
 
 pub(super) use crate::provider::PROXY_ROUTING_POLICY;
+pub(super) use codex::quota::classify_rate_limit;
 pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard};
 pub(super) use probe::{UpstreamAttemptGuard, UpstreamAttemptTerminal};
 pub(super) use readiness::{

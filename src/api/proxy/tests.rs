@@ -21,6 +21,7 @@ use crate::{
 
 mod archive_terminal;
 mod chat_sse_usage;
+mod codex_quota;
 mod kimi;
 mod sse_delivery;
 

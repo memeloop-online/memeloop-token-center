@@ -4,6 +4,9 @@ use uuid::Uuid;
 use super::super::{AppError, Database, unix_millis};
 use crate::config::UpstreamHealthConfig;
 
+#[cfg(test)]
+mod quota_tests;
+
 pub(crate) fn upstream_probe_heartbeat_interval(
     health: UpstreamHealthConfig,
 ) -> std::time::Duration {
@@ -13,6 +16,7 @@ pub(crate) fn upstream_probe_heartbeat_interval(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UpstreamFailureKind {
     RateLimited,
+    RateLimitedUntil { until: i64, exhausted: bool },
     Unavailable,
     InvalidResponse,
     Connection,
@@ -29,6 +33,12 @@ impl UpstreamFailureKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::RateLimited => "rate_limited",
+            Self::RateLimitedUntil {
+                exhausted: true, ..
+            } => "quota_exhausted",
+            Self::RateLimitedUntil {
+                exhausted: false, ..
+            } => "rate_limited",
             Self::Unavailable => "unavailable",
             Self::InvalidResponse => "invalid_response",
             Self::Connection => "connection",
@@ -37,10 +47,21 @@ impl UpstreamFailureKind {
 
     fn base_cooldown_millis(self, health: UpstreamHealthConfig) -> i64 {
         match self {
-            Self::RateLimited => health.rate_limited_cooldown_millis,
+            Self::RateLimited | Self::RateLimitedUntil { .. } => {
+                health.rate_limited_cooldown_millis
+            }
             Self::Unavailable => health.unavailable_cooldown_millis,
             Self::InvalidResponse => health.invalid_response_cooldown_millis,
             Self::Connection => health.connection_cooldown_millis,
+        }
+    }
+
+    fn explicit_deadline(self, now: i64, health: UpstreamHealthConfig) -> i64 {
+        match self {
+            Self::RateLimitedUntil { until, .. } => until
+                .max(now.saturating_add(health.rate_limited_cooldown_millis))
+                .min(now.saturating_add(7 * 24 * 60 * 60 * 1_000)),
+            _ => 0,
         }
     }
 }
@@ -156,6 +177,7 @@ impl Database {
     ) -> Result<bool, AppError> {
         let now = unix_millis();
         let base = kind.base_cooldown_millis(health);
+        let explicit_deadline = kind.explicit_deadline(now, health);
         // The conflict predicate is shared by PostgreSQL and SQLite. It keeps
         // a statement that observed an old account generation from replacing
         // newer health, and lets the current half-open probe remain the sole
@@ -176,6 +198,12 @@ impl Database {
                      ELSE 1
                  END,
                  cooldown_until = CASE
+                     WHEN $7 > 0 THEN CASE
+                         WHEN upstream_account_health.credential_generation = excluded.credential_generation
+                              AND upstream_account_health.cooldown_until > $7
+                             THEN upstream_account_health.cooldown_until
+                         ELSE $7
+                     END
                      WHEN upstream_account_health.credential_generation = excluded.credential_generation
                           AND upstream_account_health.cooldown_until > excluded.updated_at
                          THEN upstream_account_health.cooldown_until
@@ -211,10 +239,11 @@ impl Database {
         )
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
-        .bind(now.saturating_add(base))
+        .bind(now.saturating_add(base).max(explicit_deadline))
         .bind(kind.as_str())
         .bind(now)
         .bind(base)
+        .bind(explicit_deadline)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -248,10 +277,11 @@ impl Database {
     ) -> Result<bool, AppError> {
         let now = unix_millis();
         let base = kind.base_cooldown_millis(health);
+        let explicit_deadline = kind.explicit_deadline(now, health);
         let result = sqlx::query(
             "UPDATE upstream_account_health SET
                  consecutive_failures = consecutive_failures + 1,
-                 cooldown_until = $1 + CASE
+                 cooldown_until = CASE WHEN $7 > 0 THEN $7 ELSE $1 + CASE
                      WHEN consecutive_failures >= 6 THEN $2 * 64
                      WHEN consecutive_failures = 5 THEN $2 * 32
                      WHEN consecutive_failures = 4 THEN $2 * 16
@@ -259,7 +289,7 @@ impl Database {
                      WHEN consecutive_failures = 2 THEN $2 * 4
                      WHEN consecutive_failures = 1 THEN $2 * 2
                      ELSE $2
-                 END,
+                 END END,
                  probe_lease_until = 0,
                  probe_lease_token = '',
                  last_failure_kind = $3,
@@ -279,6 +309,7 @@ impl Database {
         .bind(upstream_account_id.to_string())
         .bind(credential_generation)
         .bind(lease_token.to_string())
+        .bind(explicit_deadline)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)

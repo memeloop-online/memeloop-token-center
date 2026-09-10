@@ -1,6 +1,7 @@
 use super::*;
 use crate::metrics::CodexBadRequestRetry;
 
+pub(super) mod quota;
 #[path = "codex/retry.rs"]
 mod retry;
 

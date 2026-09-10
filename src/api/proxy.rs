@@ -752,7 +752,18 @@ pub(super) async fn proxy(
         let Some((active_route, mut upstream_attempt)) = selected else {
             return finish_proxy_unavailable(&buffered_request, "upstream_unavailable").await;
         };
-        let result = send_proxy_route(&state, &headers, protocol, request_id, &active_route).await;
+        let (result, rate_limit) =
+            match send_proxy_route(&state, &headers, protocol, request_id, &active_route).await {
+                Ok(mut result)
+                    if active_route.is_codex()
+                        && result.response.status() == StatusCode::TOO_MANY_REQUESTS =>
+                {
+                    let (response, kind) = routing::classify_rate_limit(result.response).await;
+                    result.response = response;
+                    (Ok(result), Some(kind))
+                }
+                result => (result, None),
+            };
         let consumed_outbound_attempt = !matches!(
             &result,
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable)
@@ -762,7 +773,7 @@ pub(super) async fn proxy(
         }
         let failure = match &result {
             Ok(result) if result.response.status() == StatusCode::TOO_MANY_REQUESTS => Some((
-                UpstreamFailureKind::RateLimited,
+                rate_limit.unwrap_or(UpstreamFailureKind::RateLimited),
                 UpstreamHealthReason::RateLimited,
             )),
             Ok(result) if retryable_upstream_status(result.response.status()) => Some((
