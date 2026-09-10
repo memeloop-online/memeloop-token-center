@@ -16,8 +16,65 @@ impl Database {
     ) -> Result<Vec<GroupView>, AppError> {
         let (groups, memberships, group_column) = kind.tables();
         let member_column = kind.member_column();
+        let impact_columns = match kind {
+            GroupKind::Provider => {
+                "(SELECT COUNT(DISTINCT route_id) FROM (
+                    SELECT included.model_route_id AS route_id
+                    FROM model_route_included_provider_groups included
+                    WHERE included.tenant_id = g.tenant_id AND included.provider_group_id = g.id
+                    UNION
+                    SELECT excluded.model_route_id AS route_id
+                    FROM model_route_excluded_provider_groups excluded
+                    WHERE excluded.tenant_id = g.tenant_id AND excluded.provider_group_id = g.id
+                ) referenced) AS route_reference_count,
+                (SELECT COUNT(DISTINCT route.id)
+                 FROM model_routes route
+                 WHERE route.tenant_id = g.tenant_id AND route.enabled = 1
+                   AND (
+                     EXISTS (SELECT 1 FROM model_route_included_provider_groups included
+                             WHERE included.tenant_id = route.tenant_id
+                               AND included.model_route_id = route.id
+                               AND included.provider_group_id = g.id)
+                     OR EXISTS (SELECT 1 FROM model_route_excluded_provider_groups excluded
+                                WHERE excluded.tenant_id = route.tenant_id
+                                  AND excluded.model_route_id = route.id
+                                  AND excluded.provider_group_id = g.id)
+                   )) AS enabled_route_reference_count,
+                CAST(0 AS BIGINT) AS credential_grant_count,
+                CAST(0 AS BIGINT) AS active_credential_grant_count"
+            }
+            GroupKind::Route => {
+                "CAST(0 AS BIGINT) AS route_reference_count,
+                CAST(0 AS BIGINT) AS enabled_route_reference_count,
+                (SELECT COUNT(*) FROM routing_grants grant_row
+                 WHERE grant_row.tenant_id = g.tenant_id
+                   AND grant_row.route_group_id = g.id) AS credential_grant_count,
+                (SELECT COUNT(*) FROM routing_grants grant_row
+                 JOIN key_records key_record
+                   ON key_record.tenant_id = grant_row.tenant_id
+                  AND key_record.id = grant_row.key_id
+                 WHERE grant_row.tenant_id = g.tenant_id
+                   AND grant_row.route_group_id = g.id
+                   AND key_record.status = 'active') AS active_credential_grant_count"
+            }
+            GroupKind::Credential => {
+                "CAST(0 AS BIGINT) AS route_reference_count,
+                CAST(0 AS BIGINT) AS enabled_route_reference_count,
+                CAST(0 AS BIGINT) AS credential_grant_count,
+                CAST(0 AS BIGINT) AS active_credential_grant_count"
+            }
+        };
         let sql = format!(
-            "SELECT g.id, g.tenant_id, t.external_id AS tenant_external_id, g.name, g.created_at, g.updated_at, (SELECT COUNT(*) FROM {memberships} m WHERE m.tenant_id = g.tenant_id AND m.{group_column} = g.id) AS member_count FROM {groups} g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $1 ORDER BY g.normalized_name ASC, g.id ASC LIMIT 500"
+            "SELECT g.id, g.tenant_id, t.external_id AS tenant_external_id,
+                    g.name, g.created_at, g.updated_at,
+                    (SELECT COUNT(*) FROM {memberships} m
+                     WHERE m.tenant_id = g.tenant_id AND m.{group_column} = g.id) AS member_count,
+                    {impact_columns}
+             FROM {groups} g
+             JOIN tenants t ON t.id = g.tenant_id
+             WHERE t.external_id = $1
+             ORDER BY g.normalized_name ASC, g.id ASC
+             LIMIT 500"
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(tenant_external_id)
@@ -93,6 +150,10 @@ impl Database {
             name,
             member_ids: Vec::new(),
             member_count: 0,
+            route_reference_count: 0,
+            enabled_route_reference_count: 0,
+            credential_grant_count: 0,
+            active_credential_grant_count: 0,
             created_at: now,
             updated_at: now,
         })
@@ -216,6 +277,10 @@ fn group_view(row: AnyRow, member_ids: Vec<Uuid>) -> Result<GroupView, AppError>
         name: row.try_get("name")?,
         member_count: row.try_get("member_count")?,
         member_ids,
+        route_reference_count: row.try_get("route_reference_count")?,
+        enabled_route_reference_count: row.try_get("enabled_route_reference_count")?,
+        credential_grant_count: row.try_get("credential_grant_count")?,
+        active_credential_grant_count: row.try_get("active_credential_grant_count")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

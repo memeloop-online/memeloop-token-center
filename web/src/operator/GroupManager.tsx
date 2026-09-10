@@ -67,6 +67,9 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
   const selected = groups.find((group) => group.id === selectedId);
   const membersChanged = Boolean(selected && (selected.member_ids.length !== memberDraft.length
     || memberDraft.some(member => !selected.member_ids.includes(member.value))));
+  const activeImpact = kind === 'provider'
+    ? selected?.enabled_route_reference_count ?? 0
+    : kind === 'route' ? selected?.active_credential_grant_count ?? 0 : 0;
   const selectGroup = (id: string) => {
     const group = groups.find((value) => value.id === id);
     setSelectedId(id);
@@ -133,13 +136,26 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
         })}{membersChanged && ` · ${t('routing.unsavedMembers')}`}</p>
         {kind === 'route' && <p className="field-hint">{t('routing.groupGrantHint')}</p>}
         {kind === 'route' && selected.member_ids.length === 0 && <p className="notice warning compact">{t('routing.emptyRouteGroup')}</p>}
+        {kind === 'provider' && <p className="field-hint">{t('routing.providerGroupImpact', {
+          total: formatNumber(selected.route_reference_count, locale),
+          active: formatNumber(selected.enabled_route_reference_count, locale),
+        })}</p>}
+        {kind === 'route' && <p className="field-hint">{t('routing.routeGroupImpact', {
+          total: formatNumber(selected.credential_grant_count, locale),
+          active: formatNumber(selected.active_credential_grant_count, locale),
+        })}</p>}
         <div className="group-rename"><label>{t('groups.name')}<input maxLength={100} value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} /></label><button type="button" className="secondary" disabled={busy || !renameDraft.trim() || renameDraft.trim() === selected.name} onClick={() => void perform(async () => {
           await api(`/internal/v1/${paths[kind]}/${selected.id}`, token, { method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, name: renameDraft.trim(), expected_updated_at: selected.updated_at }) });
         }, t('groups.renamed', { name: renameDraft.trim() }))}>{t('common.save')}</button></div>
         <MultiCombobox label={t(`groups.${kind}.members`)} options={resources} value={memberDraft} onChange={setMemberDraft} placeholder={t('groups.searchMembers')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
-        <div className="group-editor-actions"><button type="button" disabled={busy || !membersChanged} onClick={() => void perform(async () => {
-          await api(`/internal/v1/${paths[kind]}/${selected.id}/members`, token, { method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, member_ids: memberDraft.map((item) => item.value), expected_updated_at: selected.updated_at }) });
-        }, t('groups.membersSaved'))}>{t('groups.saveMembers')}</button><button type="button" className="danger" disabled={busy} onClick={async () => {
+        <div className="group-editor-actions"><button type="button" disabled={busy || !membersChanged} onClick={async () => {
+          if (activeImpact > 0 && !await confirm(t(kind === 'provider' ? 'routing.confirmProviderGroupMembers' : 'routing.confirmRouteGroupMembers', {
+            count: formatNumber(activeImpact, locale),
+          }))) return;
+          void perform(async () => {
+            await api(`/internal/v1/${paths[kind]}/${selected.id}/members`, token, { method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, member_ids: memberDraft.map((item) => item.value), expected_updated_at: selected.updated_at }) });
+          }, t('groups.membersSaved'));
+        }}>{t('groups.saveMembers')}</button><button type="button" className="danger" disabled={busy} onClick={async () => {
           if (!await confirm(t('groups.confirmDelete', { name: selected.name }))) return;
           void perform(async () => {
             const query = new URLSearchParams({ tenant_external_id: tenant, expected_updated_at: String(selected.updated_at) });

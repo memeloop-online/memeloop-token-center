@@ -401,6 +401,10 @@ export interface GroupView {
   name: string;
   member_count: number;
   member_ids: string[];
+  route_reference_count: number;
+  enabled_route_reference_count: number;
+  credential_grant_count: number;
+  active_credential_grant_count: number;
   created_at: number;
   updated_at: number;
 }

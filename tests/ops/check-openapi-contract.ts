@@ -149,6 +149,8 @@ function validateGroupContracts(document: Obj): void {
   }
   const schemas = document.components?.schemas ?? {}; for (const name of ["CreateRoutingGroupRequest", "ReplaceRoutingGroupRequest", "ReplaceRoutingGroupMembersRequest"]) if (name in schemas) throw new ContractFailure(`group schema name is not neutral: ${name}`);
   const responses = document.components?.responses ?? {}; for (const name of ["RoutingGroupList", "RoutingGroupCreated", "RoutingGroupUpdated"]) if (name in responses) throw new ContractFailure(`group response name is not neutral: ${name}`);
+  const groupImpact = ["route_reference_count", "enabled_route_reference_count", "credential_grant_count", "active_credential_grant_count"];
+  if (!subset(groupImpact, schemas.Group?.required ?? [])) throw new ContractFailure("group responses must expose routing impact counts before membership changes");
   const enriched = ["upstream_account_ids", "included_provider_group_ids", "excluded_provider_group_ids", "route_group_ids", "granted_credential_ids", "candidate_upstream_account_ids", "custom_model_confirmed", "grant_revision"];
   if (!subset(enriched, schemas.ModelRoute?.required ?? [])) throw new ContractFailure("model-route lists must return enriched associations and CAS");
   if ("allow_unverified_custom_model" in (schemas.ModelRoute?.properties ?? {})) throw new ContractFailure("model route exposed the retired custom-model field name");

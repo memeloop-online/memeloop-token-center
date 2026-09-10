@@ -5891,7 +5891,7 @@ components:
     Group:
       type: object
       additionalProperties: false
-      required: [id, tenant_id, tenant_external_id, name, member_ids, member_count, created_at, updated_at]
+      required: [id, tenant_id, tenant_external_id, name, member_ids, member_count, route_reference_count, enabled_route_reference_count, credential_grant_count, active_credential_grant_count, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
@@ -5903,6 +5903,10 @@ components:
           uniqueItems: true
           items: { type: string, format: uuid }
         member_count: { type: integer, format: int64, minimum: 0, maximum: 10000 }
+        route_reference_count: { type: integer, format: int64, minimum: 0 }
+        enabled_route_reference_count: { type: integer, format: int64, minimum: 0 }
+        credential_grant_count: { type: integer, format: int64, minimum: 0 }
+        active_credential_grant_count: { type: integer, format: int64, minimum: 0 }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
     CreateGroupRequest:

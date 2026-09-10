@@ -354,6 +354,23 @@ async fn group_and_routing_http_contract_is_tenant_scoped_cas_safe_and_enriched(
         route_with_provider_group["grant_revision"], route_grant_revision,
         "non-grant association edits must not bump the direct-grant revision"
     );
+    let (status, provider_groups) = request_json(
+        &state,
+        "GET",
+        "/internal/v1/provider-groups?tenant_external_id=routing-http-a",
+        &service.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let provider_group = provider_groups
+        .as_array()
+        .and_then(|groups| groups.iter().find(|group| group["id"] == provider_group_id))
+        .expect("provider group used by the route");
+    assert_eq!(provider_group["route_reference_count"], 1);
+    assert_eq!(provider_group["enabled_route_reference_count"], 1);
+    assert_eq!(provider_group["credential_grant_count"], 0);
+    assert_eq!(provider_group["active_credential_grant_count"], 0);
 
     let (status, route_without_reverse_grant) = request_json(
         &state,
@@ -494,6 +511,10 @@ async fn group_and_routing_http_contract_is_tenant_scoped_cas_safe_and_enriched(
         .as_array()
         .and_then(|groups| groups.iter().find(|group| group["id"] == route_group_id))
         .expect("route group created with the route");
+    assert_eq!(route_group["credential_grant_count"], 1);
+    assert_eq!(route_group["active_credential_grant_count"], 1);
+    assert_eq!(route_group["route_reference_count"], 0);
+    assert_eq!(route_group["enabled_route_reference_count"], 0);
     let (status, _) = request_json(
         &state,
         "PUT",

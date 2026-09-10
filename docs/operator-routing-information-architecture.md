@@ -39,7 +39,10 @@
   authoritative live eligibility, show it as unknown, never as healthy.
 - Group edits must distinguish saved membership from the unsaved editor. This
   UI does not assume credentials have received a group and does not expand
-  permissions automatically.
+  permissions automatically. Provider groups expose total/enabled referencing
+  routes; route groups expose total/active credential grants. Saving a
+  membership change that affects an enabled route or active credential requires
+  an explicit impact confirmation.
 
 ## Verification boundary
 

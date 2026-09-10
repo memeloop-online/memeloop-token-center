@@ -67,6 +67,16 @@ pub struct GroupView {
     pub name: String,
     pub member_ids: Vec<Uuid>,
     pub member_count: i64,
+    /// Model routes whose configured candidate set references this provider
+    /// group. Zero for route and credential groups.
+    pub route_reference_count: i64,
+    /// Enabled subset of `route_reference_count`.
+    pub enabled_route_reference_count: i64,
+    /// Credential grants that reference this route group. Zero for provider
+    /// and credential groups.
+    pub credential_grant_count: i64,
+    /// Active-key subset of `credential_grant_count`.
+    pub active_credential_grant_count: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
