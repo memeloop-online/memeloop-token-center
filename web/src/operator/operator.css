@@ -825,6 +825,16 @@
   margin-left: 10px;
 }
 
+.combobox-popover[popover] {
+  box-sizing: border-box;
+  margin: 0;
+  position: fixed;
+  right: auto;
+  width: min(520px, calc(100vw - 16px));
+  max-width: calc(100vw - 16px);
+}
+.combobox-popover[popover]::backdrop { background: transparent; }
+
 .combobox-empty {
   color: #63777e;
   font-size: 11px;

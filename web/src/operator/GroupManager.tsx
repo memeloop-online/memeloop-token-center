@@ -65,6 +65,8 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
   const scope = useRef({ kind, token, tenant });
   scope.current = { kind, token, tenant };
   const selected = groups.find((group) => group.id === selectedId);
+  const membersChanged = Boolean(selected && (selected.member_ids.length !== memberDraft.length
+    || memberDraft.some(member => !selected.member_ids.includes(member.value))));
   const selectGroup = (id: string) => {
     const group = groups.find((value) => value.id === id);
     setSelectedId(id);
@@ -126,11 +128,16 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
     {groups.length === 0 ? <div className="empty">{t(`groups.${kind}.empty`)}</div> : <div className="group-editor-layout">
       <div className="group-list" role="list" aria-label={t(`groups.${kind}.title`)}>{groups.map((group) => <button type="button" role="listitem" className={group.id === selectedId ? 'active' : ''} key={group.id} onClick={() => selectGroup(group.id)}><span>{group.name}</span><small>{t('groups.memberCount', { count: formatNumber(group.member_count, locale) })}</small></button>)}</div>
       {selected && <div className="group-editor">
+        <p className="field-hint" role="status">{t('routing.groupMembership', {
+          saved: formatNumber(selected.member_ids.length, locale), draft: formatNumber(memberDraft.length, locale),
+        })}{membersChanged && ` · ${t('routing.unsavedMembers')}`}</p>
+        {kind === 'route' && <p className="field-hint">{t('routing.groupGrantHint')}</p>}
+        {kind === 'route' && selected.member_ids.length === 0 && <p className="notice warning compact">{t('routing.emptyRouteGroup')}</p>}
         <div className="group-rename"><label>{t('groups.name')}<input maxLength={100} value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} /></label><button type="button" className="secondary" disabled={busy || !renameDraft.trim() || renameDraft.trim() === selected.name} onClick={() => void perform(async () => {
           await api(`/internal/v1/${paths[kind]}/${selected.id}`, token, { method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, name: renameDraft.trim(), expected_updated_at: selected.updated_at }) });
         }, t('groups.renamed', { name: renameDraft.trim() }))}>{t('common.save')}</button></div>
         <MultiCombobox label={t(`groups.${kind}.members`)} options={resources} value={memberDraft} onChange={setMemberDraft} placeholder={t('groups.searchMembers')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} />
-        <div className="group-editor-actions"><button type="button" disabled={busy} onClick={() => void perform(async () => {
+        <div className="group-editor-actions"><button type="button" disabled={busy || !membersChanged} onClick={() => void perform(async () => {
           await api(`/internal/v1/${paths[kind]}/${selected.id}/members`, token, { method: 'PUT', body: JSON.stringify({ tenant_external_id: tenant, member_ids: memberDraft.map((item) => item.value), expected_updated_at: selected.updated_at }) });
         }, t('groups.membersSaved'))}>{t('groups.saveMembers')}</button><button type="button" className="danger" disabled={busy} onClick={async () => {
           if (!await confirm(t('groups.confirmDelete', { name: selected.name }))) return;

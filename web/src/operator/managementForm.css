@@ -36,6 +36,11 @@
 .management-form-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .management-form-actions button { min-height: 44px; }
 .management-form-feedback { overflow-wrap: anywhere; }
+.route-candidate-summary { min-width: 0; max-width: 100%; }
+.route-candidate-summary summary { cursor: pointer; white-space: normal; overflow-wrap: anywhere; }
+.route-candidate-summary ul { display: grid; gap: 12px; list-style: none; margin: 12px 0; padding: 0; }
+.route-candidate-summary li { display: grid; gap: 4px; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.route-candidate-summary small { font-family: monospace; overflow-wrap: anywhere; }
 :root[data-theme='light'] .management-form-section { border-color: #cbdeda; }
 @media (max-width: 480px) {
   .management-form-section { padding: 12px; }

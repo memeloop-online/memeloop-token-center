@@ -1,4 +1,5 @@
-import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useId, useMemo, useState, type KeyboardEvent } from 'react';
+import { useAnchoredPopover } from '../useAnchoredPopover';
 
 export interface ComboboxOption {
   value: string;
@@ -47,9 +48,9 @@ export function MultiCombobox({
   createLabel, disabled = false, hint, onQueryChange, inputId, required = false, invalid = false,
 }: MultiComboboxProps) {
   const id = useId();
-  const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
+  const { anchor: inputRef, panel, position } = useAnchoredPopover(open && !disabled);
   const [activeIndex, setActiveIndex] = useState(-1);
   const rows = useMemo(() => rowsForQuery(options, value, query, allowCreate), [options, value, query, allowCreate]);
   const groups = new Map<string, ComboboxOption[]>();
@@ -121,7 +122,8 @@ export function MultiCombobox({
         onKeyDown={onKeyDown}
       />
     </div>
-    {open && !disabled && <div className="combobox-popover" id={`${id}-listbox`} role="listbox" aria-labelledby={`${id}-label`}>
+    {open && !disabled && <section ref={panel} popover="auto" style={position} className="combobox-popover" id={`${id}-listbox`} role="listbox" aria-labelledby={`${id}-label`}
+      onToggle={event => { if (event.target === event.currentTarget && event.newState === 'closed') setOpen(false); }}>
       {[...groups].map(([group, entries]) => <div key={group} role={group ? 'group' : undefined} aria-label={group || undefined}>
       {group && <div className="combobox-group-title">{group}</div>}
       {entries.map((item) => { const index = rows.indexOf(item); return <button
@@ -138,6 +140,6 @@ export function MultiCombobox({
       ><span>{item.created ? createLabel?.(item.label) ?? item.label : item.label}</span>{item.description && <small>{item.description}</small>}</button>; })}
       </div>)}
       {rows.length === 0 && <div className="combobox-empty">{emptyText}</div>}
-    </div>}
+    </section>}
   </div>;
 }

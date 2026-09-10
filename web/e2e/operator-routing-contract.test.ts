@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { tenantForCredential } from '../src/credentialStorage.js';
 import { operatorRouteKeys } from '../src/operator/scope/operatorRoutes.js';
+import { routeCandidatePreview } from '../src/operator/routeCandidatePreview.js';
+import type { GroupView, ModelRouteView, UpstreamAccount } from '../src/types.js';
 
 const operator = readFileSync(new URL('../src/operator/Operator.tsx', import.meta.url), 'utf8');
 const scope = readFileSync(new URL('../src/operator/hooks/useOperatorScope.ts', import.meta.url), 'utf8');
@@ -69,4 +71,53 @@ test('pricing sync and resource refreshes retain only current operation results'
   assert.match(managementPages, /syncSequence\.current \+= 1; setSyncing\(false\)/);
   assert.match(resourceHook, /refreshError\?: string/);
   assert.match(resourceHook, /refreshError: action\.message/);
+});
+
+test('route candidate previews preserve explicit, included, excluded and missing provenance', () => {
+  const route = {
+    upstream_account_ids: ['explicit', 'also-grouped'],
+    included_provider_group_ids: ['included', 'missing'],
+    excluded_provider_group_ids: ['excluded'],
+  } as ModelRouteView;
+  const groups = [
+    { id: 'included', name: 'Codex OAuth', member_ids: ['also-grouped', 'group-only'] },
+    { id: 'excluded', name: 'Draining', member_ids: ['group-only'] },
+  ] as GroupView[];
+  const accounts = [
+    { id: 'explicit', name: 'Explicit', status: 'active' },
+    { id: 'also-grouped', name: 'Both', status: 'active' },
+    { id: 'group-only', name: 'Excluded', status: 'active' },
+  ] as UpstreamAccount[];
+
+  const preview = routeCandidatePreview(route, groups, accounts);
+  assert.deepEqual(preview.missingGroupIds, ['missing']);
+  assert.equal(preview.configuredCount, 2);
+  assert.equal(preview.excludedCount, 1);
+  assert.equal(preview.candidates.find((candidate) => candidate.id === 'also-grouped')?.explicit, true);
+  assert.deepEqual(
+    preview.candidates.find((candidate) => candidate.id === 'also-grouped')?.includedBy.map((group) => group.name),
+    ['Codex OAuth'],
+  );
+  assert.deepEqual(
+    preview.candidates.find((candidate) => candidate.id === 'group-only')?.excludedBy.map((group) => group.name),
+    ['Draining'],
+  );
+});
+
+test('routing UI distinguishes candidate pools, permission bundles and saved effective access', () => {
+  const candidateSummary = readFileSync(new URL('../src/operator/RouteCandidateSummary.tsx', import.meta.url), 'utf8');
+  const groupManager = readFileSync(new URL('../src/operator/GroupManager.tsx', import.meta.url), 'utf8');
+  const modelPicker = readFileSync(new URL('../src/ModelPicker.tsx', import.meta.url), 'utf8');
+  const upstreamModel = readFileSync(new URL('../src/operator/UpstreamModelCombobox.tsx', import.meta.url), 'utf8');
+
+  assert.match(managementPages, /<RouteCandidateSummary/);
+  assert.match(candidateSummary, /configNotHealth/);
+  assert.match(candidateSummary, /excludedBy/);
+  assert.match(groupManager, /groupGrantHint/);
+  assert.match(groupManager, /emptyRouteGroup/);
+  assert.match(groupManager, /disabled=\{busy \|\| !membersChanged\}/);
+  assert.match(modelPicker, /popover="auto"/);
+  assert.match(modelPicker, /searchableEditable/);
+  assert.match(upstreamModel, /browseModelQuery/);
+  assert.match(upstreamModel, /onQueryChange=\{setSearchQuery\}/);
 });

@@ -50,6 +50,10 @@ interface Props {
 export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, customModelConfirmed, onValidityChange, upstreams = [] }: Props) {
   const { locale, t } = useI18n();
   const [catalog, setCatalog] = useState<AggregateCatalog>();
+  const [browseCatalog, setBrowseCatalog] = useState<AggregateCatalog>();
+  const [searchQuery, setSearchQuery] = useState('');
+  const [browsing, setBrowsing] = useState(false);
+  const [browseError, setBrowseError] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [syncMessage, setSyncMessage] = useState('');
@@ -60,9 +64,35 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   const [refreshVersion, setRefreshVersion] = useState(0);
   const validityCallback = useRef(onValidityChange);
   useEffect(() => { validityCallback.current = onValidityChange; }, [onValidityChange]);
-  const sourceKey = `${accountIds.join(',')}|${includedProviderGroupIds.join(',')}|${excludedProviderGroupIds.join(',')}|${protocol}`;
+  const sourceKey = `${accountIds.join(',')}|${includedProviderGroupIds.join(',')}|${excludedProviderGroupIds.join(',')}|${syncAccountIds.join(',')}|${protocol}`;
   const hasCandidates = accountIds.length > 0 || includedProviderGroupIds.length > 0;
   const customAllowed = accountIds.length > 0 && includedProviderGroupIds.length === 0 && excludedProviderGroupIds.length === 0;
+  // A provider/account query is local provenance filtering, not a model-ID q.
+  const sourceSearch = searchQuery.trim().toLowerCase();
+  const matchesSource = sourceSearch && upstreams.some(account => syncAccountIds.includes(account.id)
+    && [account.driver, account.name, account.id].some(text => text.toLowerCase().includes(sourceSearch)));
+  const browseModelQuery = matchesSource ? '' : searchQuery.trim();
+
+  useEffect(() => {
+    setBrowseCatalog(undefined); setBrowseError('');
+    if (!open || !token || !tenant || !hasCandidates) { setBrowsing(false); return; }
+    const controller = new AbortController();
+    setBrowsing(true);
+    const timeout = window.setTimeout(async () => {
+      const query = new URLSearchParams({ tenant_external_id: tenant, limit: '100' });
+      if (accountIds.length) query.set('account_ids', accountIds.join(','));
+      if (includedProviderGroupIds.length) query.set('include_provider_group_ids', includedProviderGroupIds.join(','));
+      if (excludedProviderGroupIds.length) query.set('exclude_provider_group_ids', excludedProviderGroupIds.join(','));
+      if (browseModelQuery) query.set('q', browseModelQuery);
+      try {
+        const result = await api<AggregateCatalog>(`/internal/v1/upstream-models?${query}`, token, { signal: controller.signal });
+        if (!controller.signal.aborted) setBrowseCatalog(result);
+      } catch (reason) {
+        if (!controller.signal.aborted) setBrowseError(reason instanceof Error ? reason.message : t('routes.catalogFailed'));
+      } finally { if (!controller.signal.aborted) setBrowsing(false); }
+    }, 250);
+    return () => { window.clearTimeout(timeout); controller.abort(); };
+  }, [open, token, tenant, sourceKey, browseModelQuery, refreshVersion]);
 
   useEffect(() => {
     setCustomConfirmed(customModelConfirmed);
@@ -91,17 +121,18 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
 
   useEffect(() => {
     let current = true;
+    const controller = new AbortController();
     setAccountCatalogs(new Map());
     if (!open || !token || !tenant) return;
     const ids = [...new Set(syncAccountIds)];
     const catalogScope = new URLSearchParams({ tenant_external_id: tenant, limit: '200' });
-    if (value.trim()) catalogScope.set('q', value.trim());
+    if (browseModelQuery) catalogScope.set('q', browseModelQuery);
     let cursor = 0;
     const read = async () => {
       while (current && cursor < ids.length) {
         const accountId = ids[cursor++];
         try {
-          const next = await api<AccountCatalog>(`/internal/v1/upstreams/${encodeURIComponent(accountId)}/models?${catalogScope}`, token);
+          const next = await api<AccountCatalog>(`/internal/v1/upstreams/${encodeURIComponent(accountId)}/models?${catalogScope}`, token, { signal: controller.signal });
           if (current) setAccountCatalogs((catalogs) => new Map(catalogs).set(accountId, next));
         } catch {
           // Missing account provenance stays explicitly unknown; aggregate
@@ -112,11 +143,10 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     const timeout = window.setTimeout(() => {
       void Promise.all(Array.from({ length: Math.min(4, ids.length) }, read));
     }, 250);
-    return () => { current = false; window.clearTimeout(timeout); };
-  }, [open, token, tenant, sourceKey, value, refreshVersion]);
+    return () => { current = false; controller.abort(); window.clearTimeout(timeout); };
+  }, [open, token, tenant, sourceKey, browseModelQuery, refreshVersion]);
 
-  const options = useMemo(() => (catalog?.data ?? []).filter((model) => (model.protocol === protocol || model.protocol === 'any')
-    && (!value.trim() || model.id.toLowerCase().includes(value.trim().toLowerCase()))), [catalog, protocol, value]);
+  const options = useMemo(() => ((open ? browseCatalog : catalog)?.data ?? []).filter((model) => model.protocol === protocol || model.protocol === 'any'), [open, browseCatalog, catalog, protocol]);
   const selected = catalog?.data.find((model) => model.id === value && (model.protocol === protocol || model.protocol === 'any'));
   const catalogFresh = Boolean(catalog && catalog.unknown_account_count === 0 && catalog.stale_account_count === 0);
   const selectedValid = Boolean(selected && catalogFresh && (selected.complete_coverage || partialConfirmed));
@@ -166,11 +196,13 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   });
 
   return <div className="model-combobox">
-    <ModelPicker label={t('routes.upstreamModel')} editable invalid={!valid && Boolean(value.trim())} value={value} options={groupedOptions} loading={loading} error={error} onOpen={() => setOpen(true)} onChange={(next) => {
+    <ModelPicker label={t('routes.upstreamModel')} editable searchableEditable invalid={!valid && Boolean(value.trim())} value={value} options={groupedOptions}
+      loading={open ? browsing : loading} error={open ? browseError : error} onQueryChange={setSearchQuery} onOpen={() => setOpen(true)} onClose={() => setOpen(false)} onChange={(next) => {
       const option = options.find((model) => model.id === next);
       if (option) choose(option);
       else { onChange(next); setCustomConfirmed(false); setPartialConfirmed(false); }
     }} />
+    {open && <small className="field-hint">{t('routing.catalogSearchHint')}</small>}
     <div className="catalog-status"><small className="field-hint">{loading ? t('routes.catalogLoading') : error || syncMessage || (catalog ? t('routes.catalogCoverage', { eligible: formatNumber(catalog.eligible_account_count, locale), unknown: formatNumber(catalog.unknown_account_count, locale), stale: formatNumber(catalog.stale_account_count, locale) }) : t('routes.selectCandidatesFirst'))}</small>{syncAccountIds.length > 0 && <button type="button" className="secondary" disabled={loading} onClick={() => void sync()}>{t('routes.syncModels')}</button>}</div>
     {selected && !selected.complete_coverage && <div className="custom-model-confirm"><label><input type="checkbox" checked={partialConfirmed} onChange={(event) => setPartialConfirmed(event.target.checked)} />{t('routes.confirmPartialCoverage', { supported: formatNumber(selected.supported_account_count, locale), eligible: formatNumber(selected.eligible_account_count, locale) })}</label></div>}
     {selected && catalog && (catalog.unknown_account_count > 0 || catalog.stale_account_count > 0) && <div className="notice warning compact">{t('routes.catalogNotReady')}</div>}

@@ -18,15 +18,18 @@ function groupOptions(options: ModelPickerOption[], field: 'provider' | 'upstrea
   return groups;
 }
 
-export function ModelPicker({ label, value, onChange, options, disabled = false, editable = false, onQueryChange, onOpen, loading = false, error = '', popupLabel, invalid = false }: {
+export function ModelPicker({ label, value, onChange, options, disabled = false, editable = false, searchableEditable = false, onQueryChange, onOpen, onClose, loading = false, error = '', popupLabel, invalid = false }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
   options: ModelPickerOption[];
   disabled?: boolean;
   editable?: boolean;
+  /** Keep catalog search independent from an editable exact-model value. */
+  searchableEditable?: boolean;
   onQueryChange?: (query: string) => void;
   onOpen?: () => void;
+  onClose?: () => void;
   loading?: boolean;
   error?: string;
   popupLabel?: string;
@@ -39,14 +42,14 @@ export function ModelPicker({ label, value, onChange, options, disabled = false,
   const [active, setActive] = useState(-1);
   const searchInput = useRef<HTMLInputElement>(null);
   const { anchor, panel, position } = useAnchoredPopover(open);
-  const query = (editable ? value : search).trim().toLocaleLowerCase();
+  const query = (editable && !searchableEditable ? value : search).trim().toLocaleLowerCase();
   const matching = useMemo(() => options.filter((option) =>
     [option.label, option.provider, option.upstream, option.description].some((text) => text?.toLocaleLowerCase().includes(query)))
     .sort((a, b) => a.provider.localeCompare(b.provider) || a.upstream.localeCompare(b.upstream) || a.label.localeCompare(b.label)), [options, query]);
   const groups = groupOptions(matching, 'provider');
   const selected = options.find((option) => option.value === value);
-  const close = (restore = false) => { setOpen(false); setActive(-1); if (restore) anchor.current?.focus(); };
-  const show = () => { if (!open) { setSearch(''); setActive(-1); onOpen?.(); setOpen(true); } };
+  const close = (restore = false) => { setOpen(false); setActive(-1); onClose?.(); if (restore) anchor.current?.focus(); };
+  const show = () => { if (!open) { setSearch(''); if (searchableEditable) onQueryChange?.(''); setActive(-1); onOpen?.(); setOpen(true); } };
   const choose = (option: ModelPickerOption) => { onChange(option.value); close(true); };
   const keyboard = (event: KeyboardEvent<HTMLInputElement | HTMLButtonElement>) => {
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
@@ -65,10 +68,10 @@ export function ModelPicker({ label, value, onChange, options, disabled = false,
   }}>
     <label id={`${id}-label`} htmlFor={`${id}-input`}>{label}</label>
     {editable ? <input ref={anchor} id={`${id}-input`} role="combobox" aria-autocomplete="list" aria-expanded={open} aria-controls={`${id}-list`} aria-activedescendant={activeId} aria-invalid={invalid} disabled={disabled} autoComplete="off" value={value}
-      onClick={show} onFocus={show} onKeyDown={keyboard} onChange={(event) => { onChange(event.target.value); onQueryChange?.(event.target.value); setActive(-1); show(); }} />
+      onClick={show} onFocus={show} onKeyDown={keyboard} onChange={(event) => { show(); onChange(event.target.value); if (searchableEditable) setSearch(event.target.value); onQueryChange?.(event.target.value); setActive(-1); }} />
       : <button ref={anchor} id={`${id}-input`} type="button" className="secondary model-picker-trigger" aria-labelledby={`${id}-label ${id}-value`} aria-haspopup="listbox" aria-expanded={open} aria-controls={`${id}-list`} disabled={disabled} onClick={() => open ? close() : show()} onKeyDown={keyboard}><span id={`${id}-value`}>{selected?.label || value || t('common.select')}</span><span aria-hidden="true">⌄</span></button>}
     {open && <section ref={panel} className="shared-model-popover" popover="auto" style={position} role="dialog" aria-label={popupLabel || t('filter.catalogModels')} onToggle={(event) => { if (event.target === event.currentTarget && event.newState === 'closed') close(); }}>
-      {!editable && <input ref={searchInput} autoFocus role="combobox" aria-label={t('filter.searchCatalog')} aria-autocomplete="list" aria-expanded="true" aria-controls={`${id}-list`} aria-activedescendant={activeId} placeholder={t('filter.searchCatalog')} value={search} onKeyDown={keyboard} onChange={(event) => { setSearch(event.target.value); onQueryChange?.(event.target.value); setActive(-1); }} />}
+      {(!editable || searchableEditable) && <input ref={searchInput} autoFocus={!editable} role="combobox" aria-label={t('filter.searchCatalog')} aria-autocomplete="list" aria-expanded="true" aria-controls={`${id}-list`} aria-activedescendant={activeId} placeholder={t('filter.searchCatalog')} value={search} onKeyDown={keyboard} onChange={(event) => { setSearch(event.target.value); onQueryChange?.(event.target.value); setActive(-1); }} />}
       {loading && <small role="status">{t('common.loading')}</small>}
       {error && <small role="alert" className="error-text">{error}</small>}
       <div id={`${id}-list`} role="listbox" aria-label={label}>
