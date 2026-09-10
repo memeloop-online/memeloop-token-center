@@ -88,12 +88,12 @@ async fn sqlite_v66_preserves_existing_upstream_cooldown_and_probe_lease() {
     .execute(&database.pool)
     .await
     .unwrap();
-    assert_eq!(
+    assert!(
         database
             .claim_upstream_account_attempt(account_id, 7)
             .await
-            .unwrap(),
-        UpstreamAttemptAdmission::Unavailable,
+            .unwrap()
+            .is_unavailable(),
         "the legacy probe lease remains exclusive after cooldown"
     );
 }

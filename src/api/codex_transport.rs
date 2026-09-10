@@ -363,16 +363,50 @@ pub(super) fn validate_route_config(config: &Value) -> Result<(), AppError> {
             "OpenAI Codex account has invalid fixed transport configuration".into(),
         ));
     };
-    if object.len() != 3
+    let known_keys = object.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "base_url"
+                | "network_scope"
+                | "reservation_token_bounds"
+                | "output_token_limits"
+                | "transport_policy"
+        )
+    });
+    if !known_keys
         || object.get("base_url").and_then(Value::as_str) != Some(BASE_URL)
         || object.get("network_scope").and_then(Value::as_str) != Some("public")
         || reservation_bounds(config).is_none()
+        || !valid_transport_policy(object.get("transport_policy"))
     {
         return Err(AppError::BadRequest(
             "OpenAI Codex account has invalid fixed transport configuration".into(),
         ));
     }
     Ok(())
+}
+
+fn valid_transport_policy(policy: Option<&Value>) -> bool {
+    let Some(policy) = policy else {
+        return true;
+    };
+    let Some(policy) = policy.as_object() else {
+        return false;
+    };
+    policy.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "connect_attempts" | "connect_retry_delay_millis" | "shared_probe_attempts"
+        )
+    }) && policy
+        .get("connect_attempts")
+        .is_none_or(|value| value.as_u64().is_some_and(|value| (1..=4).contains(&value)))
+        && policy
+            .get("connect_retry_delay_millis")
+            .is_none_or(|value| value.as_u64().is_some_and(|value| value <= 2_000))
+        && policy
+            .get("shared_probe_attempts")
+            .is_none_or(|value| value.as_u64().is_some_and(|value| value <= 4))
 }
 
 fn trusted_reservation_token_bound(config: &Value, upstream_model: &str) -> Result<i64, AppError> {
@@ -1213,6 +1247,43 @@ mod tests {
             assert!(prepare_request(&mut request, "gpt-codex", &config("gpt-codex", 10)).is_ok());
             assert_eq!(request["service_tier"], tier);
         }
+    }
+
+    #[test]
+    fn route_config_accepts_only_bounded_runtime_transport_policy() {
+        let mut valid = config("gpt-codex", 10);
+        valid.as_object_mut().unwrap().insert(
+            "transport_policy".to_owned(),
+            json!({
+                "connect_attempts": 4,
+                "connect_retry_delay_millis": 2000,
+                "shared_probe_attempts": 4
+            }),
+        );
+        assert!(validate_route_config(&valid).is_ok());
+
+        for invalid_policy in [
+            json!({"connect_attempts": 0}),
+            json!({"connect_attempts": 5}),
+            json!({"connect_retry_delay_millis": 2001}),
+            json!({"shared_probe_attempts": 5}),
+            json!({"unexpected": true}),
+            json!("invalid"),
+        ] {
+            let mut invalid = config("gpt-codex", 10);
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .insert("transport_policy".to_owned(), invalid_policy);
+            assert!(validate_route_config(&invalid).is_err());
+        }
+
+        let mut unknown_top_level = config("gpt-codex", 10);
+        unknown_top_level
+            .as_object_mut()
+            .unwrap()
+            .insert("proxy_url".to_owned(), json!("must-not-live-in-config"));
+        assert!(validate_route_config(&unknown_top_level).is_err());
     }
 
     fn completed_stream() -> Vec<u8> {

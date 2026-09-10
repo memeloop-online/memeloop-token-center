@@ -48,14 +48,17 @@ async fn codex_2xx_non_sse_is_ambiguous_and_never_crosses_accounts() {
     .await
     .unwrap();
     assert_eq!(actual, fixture.upstream_account_id.to_string());
-    let failure_kind: String = sqlx::query_scalar(
-        "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
+    let health_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(failure_kind, "connection");
+    assert_eq!(
+        health_rows, 0,
+        "an ambiguous response must not become definitive shared-account health evidence"
+    );
     let rows = fixture
         .state
         .db

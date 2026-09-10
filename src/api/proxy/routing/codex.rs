@@ -8,6 +8,79 @@ mod retry;
 use retry::{AttemptControl, CodexRetryState, observe_bad_request_disposition};
 pub(in crate::api::proxy) use retry::{CodexRetryTerminal, CodexRetryTerminalGuard};
 
+const DEFAULT_PRE_DELIVERY_CONNECT_ATTEMPTS: usize = 2;
+const MAX_PRE_DELIVERY_CONNECT_ATTEMPTS: usize = 4;
+const DEFAULT_PRE_DELIVERY_CONNECT_RETRY_DELAY_MILLIS: u64 = 150;
+const MAX_PRE_DELIVERY_CONNECT_RETRY_DELAY_MILLIS: u64 = 2_000;
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::api::proxy) struct CodexRuntimeTransportPolicy {
+    pub(in crate::api::proxy) connect_attempts: usize,
+    pub(in crate::api::proxy) connect_retry_delay: std::time::Duration,
+    pub(in crate::api::proxy) shared_probe_attempts: u32,
+    pub(in crate::api::proxy) source: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct CodexAttemptContext {
+    request_id: Uuid,
+    candidate_rank: usize,
+    outbound_attempt: usize,
+    transport_policy: CodexRuntimeTransportPolicy,
+}
+
+pub(in crate::api::proxy) fn runtime_transport_policy(
+    config: &Value,
+    default_shared_probe_attempts: u32,
+) -> CodexRuntimeTransportPolicy {
+    let policy = config.get("transport_policy").and_then(Value::as_object);
+    let connect_attempts = policy
+        .and_then(|policy| policy.get("connect_attempts"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=MAX_PRE_DELIVERY_CONNECT_ATTEMPTS).contains(value))
+        .unwrap_or(DEFAULT_PRE_DELIVERY_CONNECT_ATTEMPTS);
+    let connect_retry_delay_millis = policy
+        .and_then(|policy| policy.get("connect_retry_delay_millis"))
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= MAX_PRE_DELIVERY_CONNECT_RETRY_DELAY_MILLIS)
+        .unwrap_or(DEFAULT_PRE_DELIVERY_CONNECT_RETRY_DELAY_MILLIS);
+    let shared_probe_attempts = policy
+        .and_then(|policy| policy.get("shared_probe_attempts"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value <= crate::config::MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS)
+        .unwrap_or(default_shared_probe_attempts);
+    CodexRuntimeTransportPolicy {
+        connect_attempts,
+        connect_retry_delay: std::time::Duration::from_millis(connect_retry_delay_millis),
+        shared_probe_attempts,
+        source: if policy.is_some() {
+            "account_config"
+        } else {
+            "default"
+        },
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PRE_DELIVERY_CONNECT_FAILURES: std::cell::Cell<usize>;
+}
+
+#[cfg(test)]
+pub(in crate::api::proxy) async fn with_test_pre_delivery_connect_failures<F>(
+    failures: usize,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    TEST_PRE_DELIVERY_CONNECT_FAILURES
+        .scope(std::cell::Cell::new(failures), future)
+        .await
+}
+
 pub(super) fn validate_route(route: &ResolvedUpstream, protocol: Protocol) -> Result<(), AppError> {
     codex_transport::validate_protocol(protocol)?;
     if route.base_url != codex_transport::BASE_URL {
@@ -24,6 +97,8 @@ pub(super) async fn send_proxy_route(
     headers: &HeaderMap,
     request_id: Uuid,
     route: &PreparedProxyRoute,
+    candidate_rank: usize,
+    outbound_attempt: usize,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
     let outbound_base_url = codex_transport::outbound_base_url(&route.route.base_url);
     network::validate_codex_transport(
@@ -41,20 +116,37 @@ pub(super) async fn send_proxy_route(
         .ok_or(ProxySendError::Credential)?;
     // `prepare_request_with_id` has forced the exact outbound document to be
     // non-persistent. An HTTP 400 is still replayable only after a complete,
-    // bounded, domain-level classification; connection ambiguity never enters
-    // this state machine.
+    // bounded, domain-level classification identifies known transient
+    // semantics; connection ambiguity never enters this state machine.
     let mut retry = CodexRetryState::new(route.codex_store_disabled);
+    let transport_policy = runtime_transport_policy(
+        &route.route.config,
+        state.config.upstream_health.shared_probe_attempts,
+    );
     loop {
-        let (response, upstream_activity) =
-            match send_codex_attempt(state, headers, &target_url, route, session_id).await {
-                Ok(response) => response,
-                Err(error) => {
-                    retry
-                        .outcome()
-                        .observe_terminal(&state.metrics, CodexRetryTerminal::Failed);
-                    return Err(error);
-                }
-            };
+        let (response, upstream_activity) = match send_codex_attempt(
+            state,
+            headers,
+            &target_url,
+            route,
+            session_id,
+            CodexAttemptContext {
+                request_id,
+                candidate_rank,
+                outbound_attempt,
+                transport_policy,
+            },
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                retry
+                    .outcome()
+                    .observe_terminal(&state.metrics, CodexRetryTerminal::Failed);
+                return Err(error);
+            }
+        };
         let response = UpstreamResponse::Codex(response);
         if response.status() == StatusCode::BAD_REQUEST {
             let disposition = codex_transport::classify_bad_request(response).await;
@@ -139,7 +231,74 @@ async fn send_codex_attempt(
     target_url: &str,
     route: &PreparedProxyRoute,
     session_id: &str,
+    context: CodexAttemptContext,
 ) -> Result<(wreq::Response, crate::metrics::ActivityGuard), ProxySendError> {
+    let CodexAttemptContext {
+        request_id,
+        candidate_rank,
+        outbound_attempt,
+        transport_policy,
+    } = context;
+    for connect_attempt in 1..=transport_policy.connect_attempts {
+        match send_codex_attempt_once(state, headers, target_url, route, session_id).await {
+            Err(ProxySendError::RetryableConnection(failure_stage))
+                if connect_attempt < transport_policy.connect_attempts =>
+            {
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %route.route.account_id,
+                    candidate_rank,
+                    outbound_attempt,
+                    connect_attempt,
+                    connect_attempt_limit = transport_policy.connect_attempts,
+                    transport_policy_source = transport_policy.source,
+                    failure_kind = "connection",
+                    failure_stage,
+                    stage = "codex_pre_delivery_connect_retry",
+                    "retrying a Codex connection failure before breaker accounting"
+                );
+                tokio::time::sleep(transport_policy.connect_retry_delay).await;
+            }
+            result @ Err(ProxySendError::RetryableConnection(failure_stage)) => {
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %route.route.account_id,
+                    candidate_rank,
+                    outbound_attempt,
+                    connect_attempt,
+                    connect_attempt_limit = transport_policy.connect_attempts,
+                    transport_policy_source = transport_policy.source,
+                    failure_kind = "connection",
+                    failure_stage,
+                    stage = "codex_pre_delivery_connect_exhausted",
+                    "Codex connection retries were exhausted before breaker accounting"
+                );
+                return result;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded Codex connection attempt loop always returns")
+}
+
+async fn send_codex_attempt_once(
+    state: &AppState,
+    headers: &HeaderMap,
+    target_url: &str,
+    route: &PreparedProxyRoute,
+    session_id: &str,
+) -> Result<(wreq::Response, crate::metrics::ActivityGuard), ProxySendError> {
+    #[cfg(test)]
+    if TEST_PRE_DELIVERY_CONNECT_FAILURES
+        .try_with(|remaining| {
+            let current = remaining.get();
+            remaining.set(current.saturating_sub(1));
+            current > 0
+        })
+        .unwrap_or(false)
+    {
+        return Err(ProxySendError::RetryableConnection("test_injected"));
+    }
     let mut request = state
         .codex_http
         .post(target_url)
@@ -175,7 +334,16 @@ async fn send_codex_attempt(
                 || error.is_dns()
                 || error.is_tls() =>
         {
-            Err(ProxySendError::RetryableConnection)
+            let stage = if error.is_proxy_connect() {
+                "proxy_connect"
+            } else if error.is_dns() {
+                "dns"
+            } else if error.is_tls() {
+                "tls"
+            } else {
+                "connect"
+            };
+            Err(ProxySendError::RetryableConnection(stage))
         }
         // A send error after the request leaves the client is ambiguous and is
         // never replayed by this state machine.

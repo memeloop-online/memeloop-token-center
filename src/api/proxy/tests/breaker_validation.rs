@@ -3,14 +3,17 @@ use super::*;
 mod delivered_probe;
 
 async fn make_account_half_open_probe(fixture: &CodexRouteFixture) {
+    make_account_half_open_probe_with_kind(fixture, UpstreamFailureKind::InvalidResponse).await;
+}
+
+async fn make_account_half_open_probe_with_kind(
+    fixture: &CodexRouteFixture,
+    kind: UpstreamFailureKind,
+) {
     fixture
         .state
         .db
-        .record_upstream_account_failure(
-            fixture.upstream_account_id,
-            1,
-            UpstreamFailureKind::InvalidResponse,
-        )
+        .record_upstream_account_failure(fixture.upstream_account_id, 1, kind)
         .await
         .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
@@ -74,6 +77,200 @@ async fn ordinary_client_error_does_not_cool_down_a_shared_account() {
     .await
     .unwrap();
     assert_eq!(health_rows, 0);
+    pool.close().await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_retries_one_pre_delivery_connection_failure_before_breaker_accounting() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("recovered same-account retry"),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = codex_route_fixture("pre-delivery-connect-retry").await;
+    let response = routing::with_test_pre_delivery_connect_failures(
+        1,
+        send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({
+                "model": fixture.model,
+                "input": "retry a safe connection failure",
+                "stream": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let health_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        health_rows, 0,
+        "a recovered same-account connection retry must not open the breaker"
+    );
+    pool.close().await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn codex_exhausted_pre_delivery_connection_retries_open_the_breaker_once() {
+    let upstream = MockServer::start().await;
+    let fixture = codex_route_fixture("pre-delivery-connect-exhausted").await;
+    let response = routing::with_test_pre_delivery_connect_failures(
+        2,
+        send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({
+                "model": fixture.model,
+                "input": "exhaust safe connection retries",
+                "stream": true
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    wait_for_account_failure_count(&fixture, 1).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn ambiguous_codex_response_does_not_open_the_shared_account_breaker() {
+    let (endpoint, upstream) = truncated_sse_upstream_endpoint(
+        b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"private-secret\"}}",
+    )
+    .await;
+    let fixture = codex_route_fixture("ambiguous-response-inconclusive").await;
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({
+            "model": fixture.model,
+            "input": "ambiguous response must not poison the account",
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let rendered = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(rendered.matches("event: error").count(), 1);
+    assert_eq!(rendered.matches("upstream request failed").count(), 1);
+    assert!(!rendered.contains("private-secret"));
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(502));
+    assert!(matches!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_stream") | Some("upstream_incomplete_response")
+    ));
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let health_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        health_rows, 0,
+        "a response that may already have executed is inconclusive account-health evidence"
+    );
+    pool.close().await;
+    upstream.await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_codex_protocol_mismatch_opens_the_invalid_response_breaker() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            concat!(
+                "event: response.failed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-mismatch\",\"error\":null}}\n\n"
+            ),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = codex_route_fixture("failed-protocol-mismatch").await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({
+            "model": fixture.model,
+            "input": "invalid failed terminal",
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    let rendered = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(rendered.matches("event: error").count(), 1);
+    assert_eq!(rendered.matches("upstream request failed").count(), 1);
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_invalid_response")
+    );
+    wait_for_account_failure_count(&fixture, 1).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let failure_kind: String = sqlx::query_scalar(
+        "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failure_kind, "invalid_response");
     pool.close().await;
     upstream.verify().await;
 }

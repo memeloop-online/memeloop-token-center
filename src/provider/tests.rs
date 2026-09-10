@@ -378,9 +378,35 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
             .and_then(Value::as_array)
             .is_some_and(|required| required.contains(&json!("network_scope")))
     );
+    assert_eq!(
+        codex
+            .config_schema
+            .pointer("/properties/transport_policy/properties/connect_attempts/maximum"),
+        Some(&json!(4))
+    );
+    assert_eq!(
+        codex
+            .config_schema
+            .pointer("/properties/transport_policy/properties/shared_probe_attempts/minimum"),
+        Some(&json!(0))
+    );
+    assert!(
+        catalog
+            .get(crate::oauth::managed::kimi::PROVIDER_DRIVER)
+            .unwrap()
+            .config_schema
+            .pointer("/properties/transport_policy")
+            .is_none()
+    );
 
     let gemini = catalog.get("cpa-gemini-oauth-legacy").unwrap();
     assert!(gemini.protocols.is_empty());
+    assert!(
+        gemini
+            .config_schema
+            .pointer("/properties/transport_policy")
+            .is_none()
+    );
 
     let public_ids = catalog
         .list()

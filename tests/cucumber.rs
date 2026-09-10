@@ -992,7 +992,8 @@ async fn malicious_seedance_job_id_is_rejected(world: &mut TokenCenterWorld) {
             world.response = value;
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        world.response = value;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     panic!(
         "malicious upstream job id was not rejected: {}",

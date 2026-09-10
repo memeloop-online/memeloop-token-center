@@ -27,12 +27,28 @@ pub(crate) enum UpstreamFailureKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UpstreamAttemptAdmission {
     Healthy,
-    Probe { lease_token: Uuid },
-    Unavailable,
+    Probe {
+        lease_token: Uuid,
+    },
+    SharedProbe {
+        lease_token: Uuid,
+    },
+    Unavailable {
+        cooldown_until: i64,
+        probe_lease_until: i64,
+        shared_probe_eligible: bool,
+    },
+}
+
+impl UpstreamAttemptAdmission {
+    #[cfg(test)]
+    pub(crate) const fn is_unavailable(self) -> bool {
+        matches!(self, Self::Unavailable { .. })
+    }
 }
 
 impl UpstreamFailureKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::RateLimited => "rate_limited",
             Self::RateLimitedUntil {
@@ -97,7 +113,8 @@ impl Database {
     ) -> Result<UpstreamAttemptAdmission, AppError> {
         let now = unix_millis();
         let row = sqlx::query(
-            "SELECT health.consecutive_failures, health.cooldown_until, health.probe_lease_until
+            "SELECT health.consecutive_failures, health.cooldown_until, health.probe_lease_until,
+                    health.last_failure_kind
              FROM upstream_accounts account
              LEFT JOIN upstream_account_health health
                ON health.upstream_account_id = account.id
@@ -110,7 +127,11 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else {
-            return Ok(UpstreamAttemptAdmission::Unavailable);
+            return Ok(UpstreamAttemptAdmission::Unavailable {
+                cooldown_until: 0,
+                probe_lease_until: 0,
+                shared_probe_eligible: false,
+            });
         };
         let Some(consecutive_failures) = row.try_get::<Option<i64>, _>("consecutive_failures")?
         else {
@@ -121,8 +142,15 @@ impl Database {
         }
         let cooldown_until: i64 = row.try_get("cooldown_until")?;
         let probe_lease_until: i64 = row.try_get("probe_lease_until")?;
+        let last_failure_kind: String = row.try_get("last_failure_kind")?;
         if cooldown_until > now || probe_lease_until > now {
-            return Ok(UpstreamAttemptAdmission::Unavailable);
+            return Ok(UpstreamAttemptAdmission::Unavailable {
+                cooldown_until,
+                probe_lease_until,
+                shared_probe_eligible: last_failure_kind == "connection"
+                    && cooldown_until <= now
+                    && probe_lease_until > now,
+            });
         }
         let lease_token = Uuid::now_v7();
         let result = sqlx::query(
@@ -150,8 +178,55 @@ impl Database {
         Ok(if result.rows_affected() == 1 {
             UpstreamAttemptAdmission::Probe { lease_token }
         } else {
-            UpstreamAttemptAdmission::Unavailable
+            UpstreamAttemptAdmission::Unavailable {
+                cooldown_until,
+                probe_lease_until,
+                shared_probe_eligible: false,
+            }
         })
+    }
+
+    /// Join an already-active half-open lease epoch without taking ownership
+    /// of its heartbeat. Callers must impose a small process-local concurrency
+    /// bound and may use this only after all other authorized candidates have
+    /// proved unsendable. The shared token fences every terminal transition:
+    /// the first conclusive success or failure wins, while stale followers
+    /// become harmless no-ops.
+    pub(crate) async fn join_upstream_account_probe(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+    ) -> Result<Option<UpstreamAttemptAdmission>, AppError> {
+        let now = unix_millis();
+        let token: Option<String> = sqlx::query_scalar(
+            "SELECT health.probe_lease_token
+               FROM upstream_accounts account
+               JOIN upstream_account_health health
+                 ON health.upstream_account_id = account.id
+                AND health.credential_generation = $2
+              WHERE account.id = $1
+                AND account.status = 'active'
+                AND account.credential_generation = $2
+                AND health.consecutive_failures > 0
+                AND health.last_failure_kind = 'connection'
+                AND health.cooldown_until <= $3
+                AND health.probe_lease_until > $3
+                AND health.probe_lease_token <> ''",
+        )
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        token
+            .map(|token| {
+                Uuid::parse_str(&token)
+                    .map_err(|_| {
+                        AppError::Storage("upstream probe lease token is malformed".into())
+                    })
+                    .map(|lease_token| UpstreamAttemptAdmission::SharedProbe { lease_token })
+            })
+            .transpose()
     }
 
     #[cfg(test)]
@@ -462,12 +537,12 @@ mod tests {
             .record_upstream_account_failure(account_id, 1, UpstreamFailureKind::RateLimited)
             .await
             .unwrap();
-        assert_eq!(
+        assert!(
             database
                 .claim_upstream_account_attempt(account_id, 1)
                 .await
-                .unwrap(),
-            UpstreamAttemptAdmission::Unavailable
+                .unwrap()
+                .is_unavailable()
         );
         sqlx::query(
             "UPDATE upstream_account_health SET cooldown_until = 0, probe_lease_until = 0
@@ -487,13 +562,15 @@ mod tests {
             .iter()
             .find_map(|admission| match admission {
                 UpstreamAttemptAdmission::Probe { lease_token } => Some(*lease_token),
-                UpstreamAttemptAdmission::Healthy | UpstreamAttemptAdmission::Unavailable => None,
+                UpstreamAttemptAdmission::Healthy
+                | UpstreamAttemptAdmission::SharedProbe { .. }
+                | UpstreamAttemptAdmission::Unavailable { .. } => None,
             })
             .expect("one caller owns the probe lease");
         assert_eq!(
             admissions
                 .iter()
-                .filter(|admission| **admission == UpstreamAttemptAdmission::Unavailable)
+                .filter(|admission| admission.is_unavailable())
                 .count(),
             1
         );
@@ -510,6 +587,52 @@ mod tests {
                 .unwrap(),
             UpstreamAttemptAdmission::Healthy
         );
+    }
+
+    #[tokio::test]
+    async fn only_an_active_connection_probe_can_be_joined_by_bounded_recovery_traffic() {
+        let (_directory, database, account_id) = fixture().await;
+        for (kind, joinable) in [
+            (UpstreamFailureKind::Connection, true),
+            (UpstreamFailureKind::InvalidResponse, false),
+            (UpstreamFailureKind::Unavailable, false),
+            (UpstreamFailureKind::RateLimited, false),
+        ] {
+            sqlx::query("DELETE FROM upstream_account_health WHERE upstream_account_id = $1")
+                .bind(account_id.to_string())
+                .execute(&database.pool)
+                .await
+                .unwrap();
+            assert!(
+                database
+                    .record_upstream_account_failure(account_id, 1, kind)
+                    .await
+                    .unwrap()
+            );
+            sqlx::query(
+                "UPDATE upstream_account_health SET cooldown_until = 0, probe_lease_until = 0
+                 WHERE upstream_account_id = $1",
+            )
+            .bind(account_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+            let UpstreamAttemptAdmission::Probe { lease_token } = database
+                .claim_upstream_account_attempt(account_id, 1)
+                .await
+                .unwrap()
+            else {
+                panic!("half-open owner must be admitted");
+            };
+            let joined = database
+                .join_upstream_account_probe(account_id, 1)
+                .await
+                .unwrap();
+            assert_eq!(
+                joined,
+                joinable.then_some(UpstreamAttemptAdmission::SharedProbe { lease_token })
+            );
+        }
     }
 
     #[tokio::test]
@@ -597,12 +720,12 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(
+        assert!(
             database
                 .claim_upstream_account_attempt(account_id, 1)
                 .await
-                .unwrap(),
-            UpstreamAttemptAdmission::Unavailable,
+                .unwrap()
+                .is_unavailable(),
             "a renewed long-running lease remains exclusive"
         );
 

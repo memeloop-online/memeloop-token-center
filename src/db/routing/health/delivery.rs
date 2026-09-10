@@ -58,12 +58,12 @@ mod tests {
             .await
             .unwrap();
         let first = open_probe(&database, account).await;
-        assert_eq!(
+        assert!(
             database
                 .claim_upstream_account_attempt(account, 1)
                 .await
-                .unwrap(),
-            UpstreamAttemptAdmission::Unavailable
+                .unwrap()
+                .is_unavailable()
         );
         assert!(
             database
@@ -152,12 +152,12 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(
+        assert!(
             database
                 .claim_upstream_account_attempt(account, 1)
                 .await
-                .unwrap(),
-            UpstreamAttemptAdmission::Unavailable
+                .unwrap()
+                .is_unavailable()
         );
         let third = open_probe(&database, account).await;
         assert!(
@@ -229,6 +229,71 @@ mod tests {
             directory.path().join("delivered-probe.db").display()
         );
         exercise(Database::connect(&url).await.unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn shared_probe_success_cannot_be_overwritten_by_the_slow_owner_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("shared-probe-race.db").display()
+        );
+        let database = Database::connect(&url).await.unwrap();
+        database.migrate().await.unwrap();
+        let tenant = Uuid::new_v4();
+        let account = Uuid::new_v4();
+        sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, 1)")
+            .bind(tenant.to_string())
+            .bind(format!("shared-probe-race-{tenant}"))
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, created_at, updated_at) VALUES ($1, $2, 'shared probe race', 'http-json', 'none', '{}', 'active', 1, 1, 1)")
+            .bind(account.to_string())
+            .bind(tenant.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database
+            .record_upstream_account_failure(account, 1, UpstreamFailureKind::Connection)
+            .await
+            .unwrap();
+        let owner = open_probe(&database, account).await;
+        assert_eq!(
+            database
+                .join_upstream_account_probe(account, 1)
+                .await
+                .unwrap(),
+            Some(UpstreamAttemptAdmission::SharedProbe { lease_token: owner })
+        );
+        assert!(
+            database
+                .record_upstream_account_probe_success(account, 1, owner)
+                .await
+                .unwrap(),
+            "the shared request's independently validated output clears the breaker"
+        );
+        assert!(
+            !database
+                .record_upstream_account_probe_failure(
+                    account,
+                    1,
+                    owner,
+                    UpstreamFailureKind::Connection,
+                )
+                .await
+                .unwrap(),
+            "the original owner cannot recreate health after shared success won"
+        );
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+        )
+        .bind(account.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0);
+        database.close().await;
     }
 
     #[tokio::test]

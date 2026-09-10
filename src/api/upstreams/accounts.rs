@@ -334,8 +334,14 @@ pub(in crate::api) async fn update_upstream(
         .require_upstream_tenant(account_id, &body.tenant_external_id)
         .await?;
     let driver = state.db.upstream_driver(account_id).await?;
+    let current = state
+        .db
+        .upstream_account_for_reauthorization(account_id, &body.tenant_external_id)
+        .await?;
     validate_provider_config_schema(&state, &driver, &body.config)?;
     validate_upstream_destination(&driver, &body.config, &service, &state).await?;
+    let should_sync_models = driver != crate::oauth::codex_device::PROVIDER_DRIVER
+        || codex_model_sync_config(&current.config) != codex_model_sync_config(&body.config);
     let account = state
         .db
         .update_upstream_account(
@@ -348,8 +354,18 @@ pub(in crate::api) async fn update_upstream(
             },
         )
         .await?;
-    super::trigger_upstream_model_sync(state, account_id);
+    if should_sync_models {
+        super::trigger_upstream_model_sync(state, account_id);
+    }
     Ok(Json(account))
+}
+
+fn codex_model_sync_config(config: &Value) -> Value {
+    let mut config = config.clone();
+    if let Some(config) = config.as_object_mut() {
+        config.remove("transport_policy");
+    }
+    config
 }
 
 #[derive(Debug, Deserialize)]
@@ -500,6 +516,29 @@ fn require_proxied_rotation_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_transport_policy_does_not_change_model_sync_inputs() {
+        let base = json!({
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "network_scope": "public",
+            "reservation_token_bounds": {"gpt-codex": 100}
+        });
+        let mut policy = base.clone();
+        policy.as_object_mut().unwrap().insert(
+            "transport_policy".to_owned(),
+            json!({"connect_attempts": 2}),
+        );
+        assert_eq!(
+            codex_model_sync_config(&base),
+            codex_model_sync_config(&policy)
+        );
+        policy["reservation_token_bounds"]["gpt-codex"] = json!(200);
+        assert_ne!(
+            codex_model_sync_config(&base),
+            codex_model_sync_config(&policy)
+        );
+    }
 
     #[test]
     fn proxied_rotation_retains_api_key_or_oauth_kind() {

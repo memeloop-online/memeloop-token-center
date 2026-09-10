@@ -44,11 +44,11 @@ async fn invariants(database: &Database, peer: &Database) {
         deadline, long,
         "a shorter concurrent Retry-After cannot reopen exhausted quota"
     );
-    assert_eq!(
+    assert!(
         peer.claim_upstream_account_attempt(account, 1)
             .await
-            .unwrap(),
-        UpstreamAttemptAdmission::Unavailable
+            .unwrap()
+            .is_unavailable()
     );
     database
         .record_upstream_account_failure(account, 1, UpstreamFailureKind::Connection)

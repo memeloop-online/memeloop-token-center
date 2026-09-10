@@ -41,13 +41,9 @@ impl CodexRetryState {
             Self::Initial {
                 retry_permitted: true
             }
-        );
-        let definite_rejection = matches!(
-            disposition,
-            codex_transport::BadRequestDisposition::DefiniteTransient
-                | codex_transport::BadRequestDisposition::DefiniteOrdinary
-        );
-        if replay_permitted && definite_rejection {
+        ) && disposition
+            == codex_transport::BadRequestDisposition::DefiniteTransient;
+        if replay_permitted {
             *self = Self::Retried;
             AttemptControl::RetrySameAccount
         } else {
@@ -169,7 +165,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn definite_rejections_have_one_same_account_transition() {
+    fn definite_transient_has_one_same_account_transition() {
         let mut retry = CodexRetryState::new(true);
         assert!(matches!(
             retry.after_bad_request(codex_transport::BadRequestDisposition::DefiniteTransient),
@@ -180,6 +176,16 @@ mod tests {
             retry.after_bad_request(codex_transport::BadRequestDisposition::DefiniteOrdinary),
             AttemptControl::Return(ProxySendError::CodexBadRequest)
         ));
+    }
+
+    #[test]
+    fn definite_ordinary_400_never_enters_replay() {
+        let mut retry = CodexRetryState::new(true);
+        assert!(matches!(
+            retry.after_bad_request(codex_transport::BadRequestDisposition::DefiniteOrdinary),
+            AttemptControl::Return(ProxySendError::CodexBadRequest)
+        ));
+        assert_eq!(retry.outcome(), CodexRetryOutcome::NotRetried);
     }
 
     #[test]

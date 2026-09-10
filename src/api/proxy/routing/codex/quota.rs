@@ -1,6 +1,7 @@
 //! Read-only classification of definite HTTP 429 rejection, never a supplier
 //! retry or quota reset. SSE failures do not establish that execution was free.
 use super::super::super::*;
+use crate::db::UpstreamFailureKind;
 use futures_util::{StreamExt, stream};
 
 const MAX_BODY: usize = 64 * 1024;
