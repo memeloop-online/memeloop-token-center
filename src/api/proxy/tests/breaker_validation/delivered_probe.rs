@@ -49,9 +49,25 @@ async fn malformed_strict_chat_output_never_releases_half_open_admission() {
         let _ = to_bytes(second.into_body(), MAX_PROXY_RESPONSE_BODY).await.unwrap();
         assert!(!fixture.state.metrics.render(&crate::metrics::RuntimeMetrics::default()).contains("event=\"recovered\""));
         release.send(()).unwrap();
-        while let Some(frame) = futures_util::StreamExt::next(&mut stream).await { frame.unwrap(); }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(frame) = futures_util::StreamExt::next(&mut stream).await {
+                frame.unwrap();
+            }
+        }).await.expect("malformed strict Chat EOF must close the downstream body");
         server.await.unwrap();
-        wait_for_request_settlement(&fixture, 1).await;
+        // The rejected probe contender is admitted to the request ledger before
+        // account-lease selection, so its 503 is a second terminal record.
+        wait_for_request_settlement(&fixture, 2).await;
+        let rows = fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.completed_at.is_some()));
+        let malformed = rows.iter().find(|row| row.status_code == Some(502))
+            .expect("malformed stream must finish with a protocol failure");
+        assert_eq!(malformed.error_code.as_deref(), Some("upstream_incomplete_response"));
+        let rejected = rows.iter().find(|row| row.status_code == Some(503))
+            .expect("the concurrent request must remain rejected");
+        assert_eq!(rejected.error_code.as_deref(), Some("upstream_unavailable"));
+        assert_eq!((rejected.input_tokens, rejected.output_tokens), (0, 0));
         wait_for_account_failure_count(&fixture, 2).await;
     }
 }
