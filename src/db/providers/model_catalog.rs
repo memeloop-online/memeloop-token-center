@@ -441,7 +441,7 @@ impl Database {
         query: Option<&str>,
         limit: i64,
     ) -> Result<AggregatedUpstreamModelCatalogView, AppError> {
-        if explicit_accounts.len() > 100
+        if explicit_accounts.len() > 500
             || included_provider_groups.len() > 100
             || excluded_provider_groups.len() > 100
         {

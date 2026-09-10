@@ -20,7 +20,8 @@ pub(in crate::api) use managed_import::{
 };
 pub(crate) use models::trigger_upstream_model_sync;
 pub(in crate::api) use models::{
-    aggregate_upstream_models, list_upstream_models, sync_upstream_models,
+    aggregate_upstream_models, aggregate_upstream_models_batch, list_upstream_models,
+    sync_upstream_models,
 };
 pub(in crate::api) use native_codex_upgrade::{
     apply_native_codex_upgrade, prepare_native_codex_upgrade,

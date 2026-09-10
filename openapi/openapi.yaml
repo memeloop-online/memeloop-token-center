@@ -1520,6 +1520,36 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /internal/v1/upstream-models/query:
+    post:
+      tags: [Model routes]
+      operationId: queryEligibleUpstreamModels
+      summary: Query model coverage for a large explicit provider selection
+      description: |
+        JSON-body equivalent of `GET /internal/v1/upstream-models` for route editors
+        that may select up to 500 explicit upstream accounts without constructing an
+        oversized URL. Explicit accounts and included provider groups are unioned,
+        then excluded provider groups are removed. Exclusion always wins. Duplicate
+        identifiers are normalized before querying. Route groups and credential
+        groups never participate. This operation performs no provider synchronization
+        or outbound provider request. Either `providers:read` or `routes:read` is accepted.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpstreamModelBatchQueryRequest' }
+      responses:
+        '200':
+          description: Bounded model union with per-model coverage.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AggregatedUpstreamModelCatalog' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /internal/v1/upstreams/{account_id}/oauth/refresh:
     post:
       tags: [Upstream providers]
@@ -5888,6 +5918,26 @@ components:
         eligible_account_count: { type: integer, format: int64, minimum: 0 }
         unknown_account_count: { type: integer, format: int64, minimum: 0 }
         stale_account_count: { type: integer, format: int64, minimum: 0 }
+    UpstreamModelBatchQueryRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, account_ids]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        account_ids:
+          type: array
+          maxItems: 500
+          items: { type: string, format: uuid }
+        include_provider_group_ids:
+          type: array
+          maxItems: 100
+          items: { type: string, format: uuid }
+        exclude_provider_group_ids:
+          type: array
+          maxItems: 100
+          items: { type: string, format: uuid }
+        q: { type: [string, 'null'], maxLength: 500 }
+        limit: { type: integer, minimum: 1, maximum: 200, default: 100 }
     Group:
       type: object
       additionalProperties: false

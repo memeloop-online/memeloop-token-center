@@ -216,6 +216,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(aggregate_upstream_models),
         )
         .route(
+            "/internal/v1/upstream-models/query",
+            post(aggregate_upstream_models_batch),
+        )
+        .route(
             "/internal/v1/upstreams/{account_id}/oauth/refresh",
             post(refresh_upstream_oauth),
         )

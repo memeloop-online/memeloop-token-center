@@ -68,6 +68,38 @@ async fn request_as(
     (status, value)
 }
 
+async fn request_json_as(
+    state: &AppState,
+    role: RuntimeRole,
+    method_name: &str,
+    uri: &str,
+    token: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = api::router_for_role(state.clone(), role)
+        .oneshot(
+            Request::builder()
+                .method(method_name)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    };
+    (status, value)
+}
+
 #[tokio::test]
 async fn openai_catalog_sync_is_authenticated_bounded_and_failure_preserves_snapshot() {
     let server = MockServer::start().await;
@@ -514,6 +546,160 @@ async fn aggregate_uses_only_provider_groups_and_exclusion_wins() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let get_uri = format!(
+        "/internal/v1/upstream-models?tenant_external_id=aggregate-tenant&account_ids={}&include_provider_group_ids={}&exclude_provider_group_ids={}&q=model&limit=100",
+        accounts[2].id, included.id, excluded.id
+    );
+    let (status, get_catalog) = request_as(&state, "GET", &get_uri, &routes_reader.token).await;
+    assert_eq!(status, StatusCode::OK, "{get_catalog}");
+    let batch_body = json!({
+        "tenant_external_id": "aggregate-tenant",
+        "account_ids": [accounts[2].id, accounts[2].id],
+        "include_provider_group_ids": [included.id, included.id],
+        "exclude_provider_group_ids": [excluded.id, excluded.id],
+        "q": "model",
+        "limit": 100
+    });
+    let (status, batch_catalog) = request_json_as(
+        &state,
+        RuntimeRole::Control,
+        "POST",
+        "/internal/v1/upstream-models/query",
+        &routes_reader.token,
+        batch_body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{batch_catalog}");
+    assert_eq!(batch_catalog, get_catalog);
+    assert_eq!(batch_catalog["eligible_account_count"], 2);
+
+    let wrong_tenant_reader = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "catalog-wrong-tenant-reader".into(),
+                scopes: vec!["routes:read".into()],
+                tenant_external_id: Some("other-tenant".into()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let (status, _) = request_json_as(
+        &state,
+        RuntimeRole::Control,
+        "POST",
+        "/internal/v1/upstream-models/query",
+        &wrong_tenant_reader.token,
+        batch_body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let unprivileged = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "catalog-unprivileged".into(),
+                scopes: vec!["prices:read".into()],
+                tenant_external_id: Some("aggregate-tenant".into()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let (status, _) = request_json_as(
+        &state,
+        RuntimeRole::Control,
+        "POST",
+        "/internal/v1/upstream-models/query",
+        &unprivileged.token,
+        batch_body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = request_json_as(
+        &state,
+        RuntimeRole::Gateway,
+        "POST",
+        "/internal/v1/upstream-models/query",
+        &routes_reader.token,
+        batch_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn batch_catalog_accepts_500_explicit_accounts_and_rejects_501() {
+    let (state, _directory) = state("catalog-batch-bounds").await;
+    let account_ids = (0..500).map(|_| Uuid::now_v7()).collect::<Vec<_>>();
+    for accepted_size in [101, 500] {
+        let (status, body) = request_json_as(
+            &state,
+            RuntimeRole::Control,
+            "POST",
+            "/internal/v1/upstream-models/query",
+            &state.config.service_token,
+            json!({
+                "tenant_external_id": "catalog-batch-tenant",
+                "account_ids": &account_ids[..accepted_size]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["eligible_account_count"], 0);
+        assert_eq!(body["data"], json!([]));
+    }
+
+    let legacy_get_selection = account_ids[..101]
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let (status, _) = request(
+        &state,
+        "GET",
+        &format!(
+            "/internal/v1/upstream-models?tenant_external_id=catalog-batch-tenant&account_ids={legacy_get_selection}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, unknown_group) = request_json_as(
+        &state,
+        RuntimeRole::Control,
+        "POST",
+        "/internal/v1/upstream-models/query",
+        &state.config.service_token,
+        json!({
+            "tenant_external_id": "catalog-batch-tenant",
+            "account_ids": [],
+            "include_provider_group_ids": [Uuid::now_v7()]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unknown_group}");
+    assert_eq!(unknown_group["eligible_account_count"], 0);
+
+    let mut oversized = account_ids;
+    oversized.push(Uuid::now_v7());
+    let (status, body) = request_json_as(
+        &state,
+        RuntimeRole::Control,
+        "POST",
+        "/internal/v1/upstream-models/query",
+        &state.config.service_token,
+        json!({
+            "tenant_external_id": "catalog-batch-tenant",
+            "account_ids": oversized
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
 #[tokio::test]

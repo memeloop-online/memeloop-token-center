@@ -9,6 +9,8 @@ const MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_MODEL_CATALOG_BODY: usize = 2 * 1024 * 1024;
 const MAX_MODEL_COUNT: usize = 10_000;
 const MAX_MODEL_ID_BYTES: usize = 500;
+const MAX_BATCH_ACCOUNT_SELECTION: usize = 500;
+const MAX_GROUP_SELECTION: usize = 100;
 
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct UpstreamModelsQuery {
@@ -34,6 +36,20 @@ pub(in crate::api) struct AggregateUpstreamModelsQuery {
     limit: i64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct AggregateUpstreamModelsBatchRequest {
+    tenant_external_id: String,
+    account_ids: Vec<Uuid>,
+    #[serde(default)]
+    include_provider_group_ids: Vec<Uuid>,
+    #[serde(default)]
+    exclude_provider_group_ids: Vec<Uuid>,
+    q: Option<String>,
+    #[serde(default = "default_model_limit")]
+    limit: i64,
+}
+
 fn default_model_limit() -> i64 {
     100
 }
@@ -46,15 +62,7 @@ pub(in crate::api) async fn list_upstream_models(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service_any(&headers, &state, &["providers:read", "routes:read"]).await?;
     let tenant = account_tenant(&state, &service, account_id, query.tenant_external_id).await?;
-    if query
-        .q
-        .as_ref()
-        .is_some_and(|value| value.len() > MAX_MODEL_ID_BYTES)
-    {
-        return Err(AppError::BadRequest(
-            "model search contains too many bytes".into(),
-        ));
-    }
+    validate_model_search(query.q.as_deref())?;
     Ok(Json(
         state
             .db
@@ -72,15 +80,7 @@ pub(in crate::api) async fn aggregate_upstream_models(
     let tenant = management_tenant(&service, query.tenant_external_id)?.ok_or_else(|| {
         AppError::BadRequest("tenant_external_id is required for a global service".into())
     })?;
-    if query
-        .q
-        .as_ref()
-        .is_some_and(|value| value.len() > MAX_MODEL_ID_BYTES)
-    {
-        return Err(AppError::BadRequest(
-            "model search contains too many bytes".into(),
-        ));
-    }
+    validate_model_search(query.q.as_deref())?;
     let explicit = parse_uuid_list(query.account_ids.as_deref())?;
     let included = parse_uuid_list(query.include_provider_group_ids.as_deref())?;
     let excluded = parse_uuid_list(query.exclude_provider_group_ids.as_deref())?;
@@ -94,6 +94,46 @@ pub(in crate::api) async fn aggregate_upstream_models(
                 &excluded,
                 query.q.as_deref(),
                 query.limit,
+            )
+            .await?,
+    ))
+}
+
+pub(in crate::api) async fn aggregate_upstream_models_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<AggregateUpstreamModelsBatchRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service_any(&headers, &state, &["providers:read", "routes:read"]).await?;
+    let tenant = management_tenant(&service, Some(body.tenant_external_id))?.ok_or_else(|| {
+        AppError::BadRequest("tenant_external_id is required for a global service".into())
+    })?;
+    validate_model_search(body.q.as_deref())?;
+    normalize_uuid_selection(
+        &mut body.account_ids,
+        MAX_BATCH_ACCOUNT_SELECTION,
+        "account_ids",
+    )?;
+    normalize_uuid_selection(
+        &mut body.include_provider_group_ids,
+        MAX_GROUP_SELECTION,
+        "include_provider_group_ids",
+    )?;
+    normalize_uuid_selection(
+        &mut body.exclude_provider_group_ids,
+        MAX_GROUP_SELECTION,
+        "exclude_provider_group_ids",
+    )?;
+    Ok(Json(
+        state
+            .db
+            .aggregate_upstream_models(
+                &tenant,
+                &body.account_ids,
+                &body.include_provider_group_ids,
+                &body.exclude_provider_group_ids,
+                body.q.as_deref(),
+                body.limit,
             )
             .await?,
     ))
@@ -117,6 +157,30 @@ fn parse_uuid_list(value: Option<&str>) -> Result<Vec<Uuid>, AppError> {
         ));
     }
     Ok(values)
+}
+
+fn validate_model_search(value: Option<&str>) -> Result<(), AppError> {
+    if value.is_some_and(|value| value.len() > MAX_MODEL_ID_BYTES) {
+        return Err(AppError::BadRequest(
+            "model search contains too many bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_uuid_selection(
+    values: &mut Vec<Uuid>,
+    maximum: usize,
+    field: &str,
+) -> Result<(), AppError> {
+    if values.len() > maximum {
+        return Err(AppError::BadRequest(format!(
+            "{field} contains more than {maximum} IDs"
+        )));
+    }
+    values.sort_unstable();
+    values.dedup();
+    Ok(())
 }
 
 pub(in crate::api) async fn sync_upstream_models(
