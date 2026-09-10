@@ -19,6 +19,8 @@ impl Database {
             .bind(tenant_external_id)
             .fetch_all(&self.pool)
             .await?;
+        let (groups, memberships, group_column) = kind.tables();
+        let member_column = kind.member_column();
         let member_sql = format!(
             "SELECT m.{group_column} AS group_id, m.{member_column} AS member_id FROM {memberships} m JOIN {groups} g ON g.id = m.{group_column} AND g.tenant_id = m.tenant_id JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $1 ORDER BY m.{group_column}, m.{member_column} LIMIT {}",
             MAX_GROUP_LIST_MEMBERS + 1
