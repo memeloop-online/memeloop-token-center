@@ -131,11 +131,11 @@ async fn validated_delivered_probe_opens_concurrent_admission_before_long_stream
             let complete = completed_codex_sse("long probe output");
             let output_at = complete.find("event: response.output_item.done").unwrap();
             let terminal_at = complete.find("event: response.completed").unwrap();
-            chunk(&mut first, complete[..output_at].as_bytes()).await;
+            chunk(&mut first, &complete.as_bytes()[..output_at]).await;
             output_rx.await.unwrap();
-            chunk(&mut first, complete[output_at..terminal_at].as_bytes()).await;
+            chunk(&mut first, &complete.as_bytes()[output_at..terminal_at]).await;
             eof_rx.await.unwrap();
-            chunk(&mut first, complete[terminal_at..].as_bytes()).await;
+            chunk(&mut first, &complete.as_bytes()[terminal_at..]).await;
             first.write_all(b"0\r\n\r\n").await.unwrap();
         });
         // Only two actual POSTs are permitted. The rejected request below must
