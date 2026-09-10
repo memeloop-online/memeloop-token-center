@@ -226,7 +226,13 @@ impl ResponsesSseCapture {
     }
 
     pub(super) fn can_confirm_probe_delivery(&self) -> bool {
-        !self.invalid && !self.terminal_failure && !self.usage_invalid
+        !self.invalid
+            && !self.terminal_failure
+            && !self.usage_invalid
+            && self
+                .chat_usage
+                .as_ref()
+                .is_none_or(ChatSseUsageState::valid_so_far)
     }
 
     #[cfg(test)]

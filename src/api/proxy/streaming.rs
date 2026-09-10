@@ -425,9 +425,12 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             output_token_ceiling,
                             requested_service_tier: requested_service_tier.as_deref(),
                             confirmed: &mut delivery_confirmed,
-                            probe: (matches!(protocol, Protocol::OpenAiResponses)
+                            probe: ((matches!(protocol, Protocol::OpenAiResponses)
                                 || strict_openai_chat_usage)
-                                .then_some(&mut upstream_attempt),
+                                && sse_summary
+                                    .as_ref()
+                                    .is_some_and(|summary| !summary.usage_invalid))
+                            .then_some(&mut upstream_attempt),
                         },
                         frame,
                     )

@@ -1,6 +1,20 @@
 use super::*;
 
 #[test]
+fn strict_chat_valid_prefix_is_not_confused_with_missing_final_usage() {
+    let mut capture = ResponsesSseCapture::for_openai_chat_usage();
+    let frames = capture.push_delivery_frames(
+        b"data: {\"id\":\"chatcmpl-probe\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"valid output\"},\"finish_reason\":null}]}\n\n",
+    ).unwrap();
+    assert!(frames.iter().any(|frame| frame.billable));
+    assert!(capture.can_confirm_probe_delivery());
+    assert!(
+        capture.finish_summary().usage_invalid,
+        "final usage is correctly incomplete until DONE"
+    );
+}
+
+#[test]
 fn anthropic_message_stop_is_held_until_archive_barrier() {
     let mut capture = ResponsesSseCapture::for_delivery();
     let mut held = delivery::TerminalFrames::default();
