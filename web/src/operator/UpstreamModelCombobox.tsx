@@ -63,6 +63,8 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   const sourceKey = `${accountIds.join(',')}|${includedProviderGroupIds.join(',')}|${excludedProviderGroupIds.join(',')}|${protocol}`;
   const hasCandidates = accountIds.length > 0 || includedProviderGroupIds.length > 0;
   const customAllowed = accountIds.length > 0 && includedProviderGroupIds.length === 0 && excludedProviderGroupIds.length === 0;
+  const hasExplicitCodexOAuth = upstreams.some((account) => accountIds.includes(account.id)
+    && account.driver === 'openai-codex' && account.connection_method === 'oauth');
 
   useEffect(() => {
     setCustomConfirmed(customModelConfirmed);
@@ -172,8 +174,9 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
       else { onChange(next); setCustomConfirmed(false); setPartialConfirmed(false); }
     }} />
     <div className="catalog-status"><small className="field-hint">{loading ? t('routes.catalogLoading') : error || syncMessage || (catalog ? t('routes.catalogCoverage', { eligible: formatNumber(catalog.eligible_account_count, locale), unknown: formatNumber(catalog.unknown_account_count, locale), stale: formatNumber(catalog.stale_account_count, locale) }) : t('routes.selectCandidatesFirst'))}</small>{syncAccountIds.length > 0 && <button type="button" className="secondary" disabled={loading} onClick={() => void sync()}>{t('routes.syncModels')}</button>}</div>
-    {selected && !selected.complete_coverage && <div className="custom-model-confirm"><label><input type="checkbox" checked={partialConfirmed} onChange={(event) => setPartialConfirmed(event.target.checked)} />{t('routes.confirmPartialCoverage', { supported: formatNumber(selected.supported_account_count, locale), eligible: formatNumber(selected.eligible_account_count, locale) })}</label></div>}
-    {selected && catalog && (catalog.unknown_account_count > 0 || catalog.stale_account_count > 0) && <div className="notice warning compact">{t('routes.catalogNotReady')}</div>}
+    {selected && catalogFresh && !selected.complete_coverage && <div className="custom-model-confirm"><label><input type="checkbox" checked={partialConfirmed} onChange={(event) => setPartialConfirmed(event.target.checked)} />{t('routes.confirmPartialCoverage', { supported: formatNumber(selected.supported_account_count, locale), eligible: formatNumber(selected.eligible_account_count, locale) })}</label></div>}
+    {needsCustomConfirmation && customAllowed && <div className="notice warning compact">{t('routes.catalogUnverified')}{hasExplicitCodexOAuth && <> {t('routes.codexCapabilityHint')}</>}</div>}
+    {selected && !catalogFresh && !customAllowed && <div className="notice warning compact">{t('routes.catalogNotReady')}</div>}
     {needsCustomConfirmation && <div className={`custom-model-confirm${customAllowed ? '' : ' disabled'}`}>
       {customAllowed ? <label><input type="checkbox" checked={customConfirmed} onChange={(event) => setCustomConfirmed(event.target.checked)} />{t('routes.confirmCustomModel', { model: value.trim() })}</label> : <span>{t('routes.customUnavailableForGroups')}</span>}
     </div>}
