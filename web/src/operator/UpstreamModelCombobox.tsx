@@ -34,8 +34,13 @@ interface AccountCatalog {
   models?: Array<{ id: string; protocol: string }>;
 }
 
-function delay(milliseconds: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+function delay(milliseconds: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    signal.throwIfAborted();
+    const abort = () => { window.clearTimeout(timeout); reject(signal.reason); };
+    const timeout = window.setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, milliseconds);
+    signal.addEventListener('abort', abort, { once: true });
+  });
 }
 
 interface Props {
@@ -57,8 +62,10 @@ interface Props {
 export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, customModelConfirmed, onValidityChange, upstreams = [], providers = [] }: Props) {
   const { locale, t } = useI18n();
   const scopeKey = modelCatalogScopeKey(token, tenant, protocol, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, value);
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const catalogKey = JSON.stringify([scopeKey, refreshVersion]);
   const [catalogResult, setCatalog] = useState<{ scopeKey: string; data: AggregateCatalog }>();
-  const catalog = catalogResult?.scopeKey === scopeKey ? catalogResult.data : undefined;
+  const catalog = catalogResult?.scopeKey === catalogKey ? catalogResult.data : undefined;
   const [browseResult, setBrowseCatalog] = useState<{ scopeKey: string; data: AggregateCatalog }>();
   const [searchQuery, setSearchQuery] = useState('');
   const [browsing, setBrowsing] = useState(false);
@@ -66,25 +73,38 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [syncMessage, setSyncMessage] = useState('');
+  const [syncing, setSyncing] = useState(false);
+  const syncController = useRef<AbortController | undefined>(undefined);
+  const latestScope = useRef(scopeKey);
+  latestScope.current = scopeKey;
   const [open, setOpen] = useState(false);
   const [provenance, setProvenance] = useState<{ scopeKey: string; catalogs: Map<string, AccountCatalog> }>();
   const [provenanceLoading, setProvenanceLoading] = useState(false);
   const [customConfirmed, setCustomConfirmed] = useState(customModelConfirmed);
   const [partialConfirmed, setPartialConfirmed] = useState(false);
   const [confirmationScope, setConfirmationScope] = useState(scopeKey);
-  const [refreshVersion, setRefreshVersion] = useState(0);
   const validityCallback = useRef(onValidityChange);
   useEffect(() => { validityCallback.current = onValidityChange; }, [onValidityChange]);
   const hasCandidates = accountIds.length > 0 || includedProviderGroupIds.length > 0;
   const customAllowed = accountIds.length > 0 && includedProviderGroupIds.length === 0 && excludedProviderGroupIds.length === 0;
   // A provider/account query is local provenance filtering, not a model-ID q.
   const sourceSearch = searchQuery.trim().toLowerCase();
-  const matchesSource = sourceSearch && upstreams.some(account => syncAccountIds.includes(account.id)
-    && [account.driver, account.name, account.id, providers.find(provider => provider.id === account.driver)?.display_name ?? ''].some(text => text.toLowerCase().includes(sourceSearch)));
+  const matchingSourceIds = new Set(upstreams.filter(account => sourceSearch && syncAccountIds.includes(account.id)
+    && [account.driver, account.name, account.id, providers.find(provider => provider.id === account.driver)?.display_name ?? ''].some(text => text.toLowerCase().includes(sourceSearch))).map(account => account.id));
+  const matchesSource = matchingSourceIds.size > 0;
   const browseModelQuery = matchesSource ? '' : searchQuery.trim();
-  const browseScopeKey = JSON.stringify([scopeKey, browseModelQuery]);
+  const browseScopeKey = JSON.stringify([catalogKey, browseModelQuery]);
+  const provenanceScopeKey = JSON.stringify([browseScopeKey, sourceSearch]);
+  const boundedAccountIds = [...new Set(syncAccountIds)]
+    .sort((left, right) => Number(matchingSourceIds.has(right)) - Number(matchingSourceIds.has(left)) || left.localeCompare(right))
+    .slice(0, 8);
   const browseCatalog = browseResult?.scopeKey === browseScopeKey ? browseResult.data : undefined;
-  const accountCatalogs = provenance?.scopeKey === browseScopeKey ? provenance.catalogs : new Map<string, AccountCatalog>();
+  const accountCatalogs = provenance?.scopeKey === provenanceScopeKey ? provenance.catalogs : new Map<string, AccountCatalog>();
+
+  useEffect(() => {
+    setSyncMessage('');
+    return () => { syncController.current?.abort(); };
+  }, [scopeKey]);
 
   useEffect(() => {
     setBrowseCatalog(undefined); setBrowseError('');
@@ -125,7 +145,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
       setLoading(true); setError('');
       try {
         const data = await api<AggregateCatalog>(`/internal/v1/upstream-models?${query}`, token, { signal: controller.signal });
-        if (!controller.signal.aborted) setCatalog({ scopeKey, data });
+        if (!controller.signal.aborted) setCatalog({ scopeKey: catalogKey, data });
       }
       catch (reason) { if (!controller.signal.aborted) { setCatalog(undefined); setError(reason instanceof Error ? reason.message : t('routes.catalogFailed')); } }
       finally { if (!controller.signal.aborted) setLoading(false); }
@@ -140,7 +160,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     if (!open || !token || !tenant || !browseCatalog?.data.length) return;
     // There is no batch provenance API. Inspect at most eight candidates;
     // larger pools retain an explicit unknown row, never implied completeness.
-    const ids = [...new Set(syncAccountIds)].sort().slice(0, 8);
+    const ids = boundedAccountIds;
     setProvenanceLoading(ids.length > 0);
     const catalogScope = new URLSearchParams({ tenant_external_id: tenant, limit: '200' });
     if (browseModelQuery) catalogScope.set('q', browseModelQuery);
@@ -150,7 +170,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
         const accountId = ids[cursor++];
         try {
           const next = await api<AccountCatalog>(`/internal/v1/upstreams/${encodeURIComponent(accountId)}/models?${catalogScope}`, token, { signal: controller.signal });
-          if (current) setProvenance((previous) => ({ scopeKey: browseScopeKey, catalogs: new Map(previous?.scopeKey === browseScopeKey ? previous.catalogs : []).set(accountId, next) }));
+          if (current) setProvenance((previous) => ({ scopeKey: provenanceScopeKey, catalogs: new Map(previous?.scopeKey === provenanceScopeKey ? previous.catalogs : []).set(accountId, next) }));
         } catch {
           // Missing account provenance stays explicitly unknown; aggregate
           // coverage and custom/partial-model validation are never inferred.
@@ -161,7 +181,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
       void Promise.all(Array.from({ length: Math.min(4, ids.length) }, read)).finally(() => { if (current) setProvenanceLoading(false); });
     }, 250);
     return () => { current = false; controller.abort(); window.clearTimeout(timeout); };
-  }, [open, browseScopeKey, browseCatalog, refreshVersion]);
+  }, [open, provenanceScopeKey, browseCatalog, refreshVersion]);
 
   const options = useMemo(() => ((open ? browseCatalog : catalog)?.data ?? []).filter((model) => model.protocol === protocol || model.protocol === 'any'), [open, browseCatalog, catalog, protocol]);
   const selected = catalog?.data.find((model) => model.id === value.trim() && (model.protocol === protocol || model.protocol === 'any'));
@@ -172,32 +192,63 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   // available instead of leaving the form in a state with neither a usable
   // confirmation nor a valid submit button while synchronization settles.
   const needsCustomConfirmation = Boolean(value.trim() && (!selected || !catalogFresh));
-  const allowCustom = Boolean(needsCustomConfirmation && customAllowed && confirmationScope === scopeKey && customConfirmed);
-  const valid = Boolean(selectedValid || allowCustom);
+  const allowCustom = Boolean(!syncing && needsCustomConfirmation && customAllowed && confirmationScope === scopeKey && customConfirmed);
+  const valid = Boolean(!syncing && (selectedValid || allowCustom));
   useEffect(() => validityCallback.current({ scopeKey, valid, allowCustom }), [scopeKey, valid, allowCustom]);
 
   const choose = (model: CatalogModel) => {
     onChange(model.id); setCustomConfirmed(false); setPartialConfirmed(false);
   };
   const sync = async () => {
-    if (syncAccountIds.length === 0) return;
-    setLoading(true); setError(''); setSyncMessage('');
+    if (!token || !tenant || boundedAccountIds.length === 0 || syncController.current) return;
+    const controller = new AbortController();
+    syncController.current = controller;
+    const current = () => syncController.current === controller && latestScope.current === scopeKey && !controller.signal.aborted;
+    // Eight accounts, two workers, one POST + at most four GETs each:
+    // <= 40 requests and <= 2 in flight, regardless of candidate-pool size.
+    const ids = boundedAccountIds;
+    const deadline = window.setTimeout(() => controller.abort(), 30_000);
+    // Notify the parent's synchronous submit guard before the first POST.
+    // The epoch also rejects any pre-sync GET that resolves during refresh.
+    validityCallback.current({ scopeKey, valid: false, allowCustom: false });
+    setCatalog(undefined); setCustomConfirmed(false); setPartialConfirmed(false);
+    setRefreshVersion((version) => version + 1);
+    setSyncing(true); setError(''); setSyncMessage('');
     try {
       const query = new URLSearchParams({ tenant_external_id: tenant });
-      await Promise.all(syncAccountIds.map(async (accountId) => {
-        let accountCatalog = await api<AccountCatalog>(`/internal/v1/upstreams/${accountId}/models/sync?${query}`, token, { method: 'POST' });
-        for (let attempt = 0; accountCatalog.status === 'syncing' && attempt < 40; attempt += 1) {
-          await delay(250);
-          accountCatalog = await api<AccountCatalog>(`/internal/v1/upstreams/${accountId}/models?${query}`, token);
+      let cursor = 0;
+      let completed = 0;
+      const worker = async () => {
+        while (current() && cursor < ids.length) {
+          const accountId = encodeURIComponent(ids[cursor++]);
+          try {
+            let accountCatalog = await api<AccountCatalog>(`/internal/v1/upstreams/${accountId}/models/sync?${query}`, token, { method: 'POST', signal: controller.signal });
+            for (let attempt = 0; current() && accountCatalog.status === 'syncing' && attempt < 4; attempt += 1) {
+              await delay(250, controller.signal);
+              if (!current()) return;
+              accountCatalog = await api<AccountCatalog>(`/internal/v1/upstreams/${accountId}/models?${query}`, token, { signal: controller.signal });
+            }
+            if (current() && accountCatalog.status === 'ready') completed += 1;
+          } catch {
+            // Failed, cancelled and still-syncing accounts remain unknown.
+          }
         }
-        if (accountCatalog.status !== 'ready') {
-          throw new Error(accountCatalog.error_code || t('routes.syncModelsFailed'));
+      };
+      await Promise.all(Array.from({ length: Math.min(2, ids.length) }, worker));
+      if (!current()) {
+        if (latestScope.current === scopeKey && syncController.current === controller) {
+          setSyncMessage(`${t('routes.syncModelsFailed')} · ${t('modelPicker.unknown')}: ${formatNumber(syncAccountIds.length, locale)}`);
         }
-      }));
-      setSyncMessage(t('routes.syncModelsComplete', { count: formatNumber(syncAccountIds.length, locale) }));
-      setRefreshVersion((current) => current + 1);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : t('routes.catalogFailed')); }
-    finally { setLoading(false); }
+        return;
+      }
+      setSyncMessage(`${t('routes.syncModelsComplete', { count: formatNumber(completed, locale) })} · ${t('modelPicker.unknown')}: ${formatNumber(syncAccountIds.length - completed, locale)}`);
+    } finally {
+      window.clearTimeout(deadline);
+      if (syncController.current === controller) {
+        if (latestScope.current === scopeKey) setRefreshVersion((version) => version + 1);
+        syncController.current = undefined; setSyncing(false);
+      }
+    }
   };
   const groupedOptions: ModelPickerOption[] = options.flatMap((model) => {
     const accounts = upstreams.filter((account) => syncAccountIds.includes(account.id) && accountCatalogs.get(account.id)?.models?.some((item) => item.id === model.id && (item.protocol === protocol || item.protocol === 'any')));
@@ -221,7 +272,8 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
       else { onChange(next); setCustomConfirmed(false); setPartialConfirmed(false); }
     }} />
     {open && <small className="field-hint">{t('routing.catalogSearchHint')}</small>}
-    <div className="catalog-status"><small className="field-hint">{loading ? t('routes.catalogLoading') : error || syncMessage || (catalog ? t('routes.catalogCoverage', { eligible: formatNumber(catalog.eligible_account_count, locale), unknown: formatNumber(catalog.unknown_account_count, locale), stale: formatNumber(catalog.stale_account_count, locale) }) : t('routes.selectCandidatesFirst'))}</small>{syncAccountIds.length > 0 && <button type="button" className="secondary" disabled={loading} onClick={() => void sync()}>{t('routes.syncModels')}</button>}</div>
+    <div className="catalog-status"><small className="field-hint">{loading || syncing ? t('routes.catalogLoading') : error || syncMessage || (catalog ? t('routes.catalogCoverage', { eligible: formatNumber(catalog.eligible_account_count, locale), unknown: formatNumber(catalog.unknown_account_count, locale), stale: formatNumber(catalog.stale_account_count, locale) }) : t('routes.selectCandidatesFirst'))}</small>{syncAccountIds.length > 0 && <button type="button" className="secondary" disabled={loading || syncing} onClick={() => void sync()}>{t('routes.syncModels')} ({formatNumber(boundedAccountIds.length, locale)} / {formatNumber(syncAccountIds.length, locale)})</button>}{syncing && <button type="button" className="secondary" onClick={() => syncController.current?.abort()}>{t('common.cancel')}</button>}</div>
+    {syncAccountIds.length > boundedAccountIds.length && <small className="field-hint">{t('modelPicker.unknown')}: {formatNumber(syncAccountIds.length - boundedAccountIds.length, locale)}</small>}
     {selected && !selected.complete_coverage && <div className="custom-model-confirm"><label><input type="checkbox" checked={confirmationScope === scopeKey && partialConfirmed} onChange={(event) => { setConfirmationScope(scopeKey); setPartialConfirmed(event.target.checked); setCustomConfirmed(false); }} />{t('routes.confirmPartialCoverage', { supported: formatNumber(selected.supported_account_count, locale), eligible: formatNumber(selected.eligible_account_count, locale) })}</label></div>}
     {selected && catalog && (catalog.unknown_account_count > 0 || catalog.stale_account_count > 0) && <div className="notice warning compact">{t('routes.catalogNotReady')}</div>}
     {needsCustomConfirmation && <div className={`custom-model-confirm${customAllowed ? '' : ' disabled'}`}>

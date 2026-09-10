@@ -11,6 +11,8 @@ import '../../src/operator/operator.css';
 
 window.formFixture = {
   writes: [], reads: [], holdCatalog: false, finish: () => {},
+  catalogResolvers: [],
+  syncRequests: 0, syncActive: 0, syncPeak: 0, cancelledSyncRequests: 0, syncMode: 'ready',
   changeAndSubmit: (change) => {
     flushSync(change);
     document.querySelector<HTMLFormElement>('.create-resource > form')?.requestSubmit();
@@ -37,6 +39,20 @@ const keySchema = {
 };
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(String(input), location.origin);
+  if (url.pathname.endsWith('/models/sync') || (url.pathname.endsWith('/models') && !url.searchParams.has('limit'))) {
+    window.formFixture.syncRequests += 1;
+    window.formFixture.syncActive += 1;
+    window.formFixture.syncPeak = Math.max(window.formFixture.syncPeak, window.formFixture.syncActive);
+    if (window.formFixture.syncMode === 'hold') return new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        window.formFixture.syncActive -= 1;
+        window.formFixture.cancelledSyncRequests += 1;
+        reject(new DOMException('Aborted', 'AbortError'));
+      }, { once: true });
+    });
+    window.formFixture.syncActive -= 1;
+    return json({ status: window.formFixture.syncMode });
+  }
   if (init?.method && init.method !== 'GET') {
     window.formFixture.writes.push({ path: url.pathname, body: JSON.parse(String(init.body)) });
     return new Promise(resolve => {
@@ -56,15 +72,17 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     { id: accountId, tenant_external_id: 'alpha', name: 'Production account', driver: 'fixture-provider', status: 'active' },
     { id: '22222222-2222-4222-8222-222222222222', tenant_external_id: 'alpha', name: 'Backup account', driver: 'fixture-provider', status: 'active' },
   ]);
-  if (url.pathname.endsWith('/upstream-models') && window.formFixture.holdCatalog) return new Promise((_resolve, reject) => {
-    init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
-  });
   const eligibleCount = new URLSearchParams(location.search).get('view') === 'large-catalog' ? 500 : 1;
-  if (url.pathname.endsWith('/upstream-models')) return json({
+  const aggregate = {
     eligible_account_count: eligibleCount, unknown_account_count: 0, stale_account_count: 0,
     data: !url.searchParams.get('q') || url.searchParams.get('q') === 'fixture-model'
       ? [{ id: 'fixture-model', protocol: 'openai', supported_account_count: eligibleCount, eligible_account_count: eligibleCount, complete_coverage: true }] : [],
+  };
+  if (url.pathname.endsWith('/upstream-models') && window.formFixture.holdCatalog) return new Promise((resolve, reject) => {
+    window.formFixture.catalogResolvers.push(() => resolve(json(aggregate)));
+    init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
   });
+  if (url.pathname.endsWith('/upstream-models')) return json(aggregate);
   if (url.pathname.endsWith('/models')) return json({ status: 'ready', models: [{ id: 'fixture-model', protocol: 'openai' }] });
   return json([]);
 };

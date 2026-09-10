@@ -10,6 +10,9 @@ declare global {
     formFixture: {
       writes: Array<{ path: string; body: Record<string, unknown> }>;
       reads: string[]; holdCatalog: boolean; finish: () => void;
+      catalogResolvers: Array<() => void>;
+      syncRequests: number; syncActive: number; syncPeak: number; cancelledSyncRequests: number;
+      syncMode: 'ready' | 'syncing' | 'hold';
       changeAndSubmit: (change: () => void) => void;
     };
   }
@@ -84,18 +87,20 @@ test('credential and route forms group fields, stay within the viewport and guar
         await create.getByRole('group', { name: 'Fixture Provider', exact: true }).waitFor();
         const idleOption = create.locator('.combobox-popover button:not(.active)').first();
         assert.equal(await idleOption.isVisible(), true, 'contrast must be measured in an actually open light popover');
-        const contrast = await idleOption.evaluate(option => {
-          const rgb = (color: string) => color.match(/[\d.]+/g)!.slice(0, 3).map(Number);
-          const luminance = (color: string) => rgb(color).map(value => {
+        // A string callback is intentionally not transformed by esbuild:
+        // assigned helper functions must not reference its Node-side __name.
+        const contrast = await idleOption.evaluate<number>(String.raw`option => {
+          const rgb = color => color.match(/[\d.]+/g).slice(0, 3).map(Number);
+          const luminance = color => rgb(color).map(value => {
             const channel = value / 255;
             return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
           }).reduce((sum, channel, index) => sum + channel * [0.2126, 0.7152, 0.0722][index], 0);
-          const background = luminance(getComputedStyle(option.closest('.combobox-popover')!).backgroundColor);
+          const background = luminance(getComputedStyle(option.closest('.combobox-popover')).backgroundColor);
           return Math.min(...[option, ...option.querySelectorAll('span,small')].map(element => {
             const foreground = luminance(getComputedStyle(element).color);
             return (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05);
           }));
-        });
+        }`);
         assert.ok(contrast >= 4.5, `idle option contrast ${contrast} must meet WCAG AA`);
         await upstream.press('ArrowDown');
         await upstream.press('Enter');
@@ -108,6 +113,20 @@ test('credential and route forms group fields, stay within the viewport and guar
         await create.locator('.shared-model-popover').getByRole('group', { name: 'Fixture Provider', exact: true }).waitFor();
         assert.equal(await model.inputValue(), 'fixture-model', 'display-name search does not change the selected model');
         assert.equal(await create.locator('.shared-model-popover [aria-modal=true]').count(), 0);
+        await page.evaluate(() => {
+          window.formFixture.holdCatalog = true;
+          window.formFixture.changeAndSubmit(() => {
+            document.querySelector<HTMLButtonElement>('.create-resource .catalog-status button')!.click();
+          });
+        });
+        await page.waitForFunction(() => window.formFixture.catalogResolvers.length > 0);
+        assert.equal(await submit.isDisabled(), true, 'sync invalidates old coverage before its first POST and replacement GET');
+        assert.equal(await page.evaluate(() => window.formFixture.writes.length), 0, 'same-task sync and submit must not write a route');
+        await page.evaluate(() => {
+          window.formFixture.holdCatalog = false;
+          window.formFixture.catalogResolvers.splice(0).forEach(resolve => resolve());
+        });
+        await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.create-resource button[type=submit]')!.disabled);
         // Change the candidate pool and submit in one browser task, before a
         // replacement aggregate response can make the new scope valid.
         await upstream.fill('Backup account');
@@ -147,11 +166,38 @@ test('credential and route forms group fields, stay within the viewport and guar
     assert.ok(await page.locator('.shared-model-popover').getByRole('group', { name: 'Source not provided', exact: true }).count() > 0,
       'uninspected support must remain explicitly unknown after bounded loading finishes');
     assert.equal(await largeModel.getAttribute('aria-invalid'), 'false');
+    await page.evaluate(() => { window.formFixture.reads = []; });
+    await page.locator('.shared-model-popover input').fill('Account 499');
+    await page.locator('.shared-model-popover').getByRole('group', { name: 'Account 499', exact: true }).waitFor();
+    await page.waitForFunction(() => !document.querySelector('.shared-model-popover [role=status]'));
+    assert.equal(await page.locator('.shared-model-popover').getByRole('option').count(), 1);
+    assert.equal(await page.evaluate(() => window.formFixture.reads.filter(path => /\/upstreams\/[^/]+\/models\?/.test(path)).length), 8,
+      'an account outside the default eight must be prioritized without expanding the read budget');
+    await page.locator('.shared-model-popover input').press('Escape');
+    await page.evaluate(() => { window.formFixture.syncMode = 'syncing'; });
+    const syncButton = page.getByRole('button', { name: /Sync models.*8.*500/ });
+    await syncButton.click();
+    await page.waitForFunction(() => window.formFixture.syncRequests === 40 && !document.querySelector('.catalog-status button:disabled'));
+    assert.equal(await page.evaluate(() => window.formFixture.syncPeak), 1, 'immediate fixture responses never overlap');
+    assert.ok((await page.locator('.catalog-status').textContent())?.includes('Source not provided: 500'),
+      'exhausting four polls never claims that still-syncing candidates completed');
+    await page.evaluate(() => { window.formFixture.syncRequests = 0; window.formFixture.syncMode = 'hold'; window.formFixture.syncPeak = 0; });
+    await syncButton.click();
+    await page.waitForFunction(() => window.formFixture.syncActive === 2);
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.waitForFunction(() => window.formFixture.syncActive === 0);
+    assert.equal(await page.evaluate(() => window.formFixture.syncRequests), 2, 'cancellation must not schedule remaining candidates');
+    assert.equal(await page.evaluate(() => window.formFixture.syncPeak), 2, 'sync has at most two in-flight requests');
+    assert.equal(await page.evaluate(() => window.formFixture.cancelledSyncRequests), 2);
+    await syncButton.click();
+    await page.waitForFunction(() => window.formFixture.syncActive === 2);
     await page.evaluate(() => {
       window.formFixture.holdCatalog = true;
       [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Change group membership')!.click();
     });
     await page.waitForFunction(() => document.querySelector('.shared-model-picker > input')?.getAttribute('aria-invalid') === 'true');
+    await page.waitForFunction(() => window.formFixture.syncActive === 0);
+    assert.equal(await page.evaluate(() => window.formFixture.cancelledSyncRequests), 4, 'scope changes abort both in-flight requests');
     assert.equal(await largeModel.getAttribute('aria-invalid'), 'true', 'unchanged group IDs cannot reuse coverage after membership changes');
     assert.deepEqual(errors, []);
   } finally { await browser.close(); await server.close(); }

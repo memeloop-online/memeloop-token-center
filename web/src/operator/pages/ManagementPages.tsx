@@ -537,6 +537,8 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const [editing, setEditing] = useState<ModelRouteView>();
   const [editForm, setEditForm] = useState<RouteDraft>(emptyRouteDraft);
   const [editCatalog, setEditCatalog] = useState<CatalogValidity>({ scopeKey: '', valid: false, allowCustom: false });
+  const formCatalogRef = useRef(formCatalog);
+  const editCatalogRef = useRef(editCatalog);
   const formMutation = useRef<symbol | undefined>(undefined);
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
@@ -599,7 +601,8 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       return !provider || provider.protocols.includes(draft.protocol);
     });
     const currentScopeKey = modelCatalogScopeKey(token, writeTenant, draft.protocol, draft.upstream_account_ids, draft.included_provider_group_ids, draft.excluded_provider_group_ids, candidates, draft.upstream_model);
-    return Boolean(writeTenant && catalog.scopeKey === currentScopeKey && catalog.valid && draft.public_model.trim() && draft.upstream_model.trim()
+    const currentValidity = catalog === formCatalogRef.current || catalog === editCatalogRef.current;
+    return Boolean(writeTenant && currentValidity && catalog.scopeKey === currentScopeKey && catalog.valid && draft.public_model.trim() && draft.upstream_model.trim()
       && Number.isInteger(draft.priority) && draft.priority >= -1000000 && draft.priority <= 1000000
       && candidates.length > 0 && compatible);
   };
@@ -639,11 +642,11 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       if (existing) setEditing(undefined);
       else { setForm(emptyRouteDraft); setFormCatalog({ scopeKey: '', valid: false, allowCustom: false }); }
       setMessage(t(existing ? 'routes.updated' : 'routes.created'));
-      await Promise.all([load(), routeGroups.load()]);
+      await Promise.all([load(), routeGroups.load(), providerGroups.load()]);
     } catch (reason) {
       if (!current()) return;
       if (reason instanceof ApiError && reason.status === 409) {
-        setEditing(undefined); setError(t('routes.concurrentChangeReloaded')); await Promise.all([load(), routeGroups.load()]);
+        setEditing(undefined); setError(t('routes.concurrentChangeReloaded')); await Promise.all([load(), routeGroups.load(), providerGroups.load()]);
       } else setError(messageOf(reason, t('common.requestFailed')));
     }
     finally { if (current()) { formMutation.current = undefined; setBusy(''); } }
@@ -652,7 +655,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     setBusy(route.id); setMessage(''); setError('');
     try {
       await api(`/internal/v1/model-routes/${route.id}`, token, { method: 'PATCH', body: JSON.stringify({ tenant_external_id: writeTenant, enabled, expected_updated_at: route.updated_at }) });
-      setEditing(undefined); setMessage(t(enabled ? 'routes.enabled' : 'routes.disabled')); await load();
+      setEditing(undefined); setMessage(t(enabled ? 'routes.enabled' : 'routes.disabled')); await Promise.all([load(), providerGroups.load()]);
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
   };
@@ -662,7 +665,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     setBusy(route.id); setMessage(''); setError('');
     try {
       await api(`/internal/v1/model-routes/${route.id}?${query}`, token, { method: 'DELETE' });
-      setEditing(undefined); setMessage(t('routes.deleted')); await load();
+      setEditing(undefined); setMessage(t('routes.deleted')); await Promise.all([load(), providerGroups.load()]);
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
   };
@@ -671,7 +674,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       {editing && <form className="inline-editor form-panel" onSubmit={event => { event.preventDefault(); void submitRoute(editForm, editCatalog, editing); }}>
         <div className="panel-title"><h3>{t('routes.editTitle', { model: editing.public_model })}</h3><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setEditing(undefined)}>{t('common.cancel')}</button></div>
         <fieldset className="management-schema-form" disabled={Boolean(busy)} aria-busy={busy === editing.id}>
-          <RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={setEditCatalog} onCredentialQuery={searchCredential} />
+          <RouteFields token={token} tenant={writeTenant} draft={editForm} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setEditForm} onCatalogValidity={(validity) => { editCatalogRef.current = validity; setEditCatalog(validity); }} onCredentialQuery={searchCredential} />
           <div className="management-form-actions"><button type="submit" disabled={Boolean(busy) || !canSubmit(editForm, editCatalog)}>{t('common.save')}</button>{busy === editing.id && <span role="status">{t('forms.saving')}</span>}</div>
         </fieldset>
       </form>}
@@ -679,7 +682,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     <details className="panel create-resource"><summary><span><b>{t('routes.createTitle')}</b><small>{t('routes.description')}</small></span><span aria-hidden="true">＋</span></summary>
       <form className="create-resource-body form-panel" onSubmit={event => { event.preventDefault(); void submitRoute(form, formCatalog); }}>
         <fieldset className="management-schema-form" disabled={Boolean(busy)} aria-busy={busy === 'create'}>
-          <RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={setFormCatalog} onCredentialQuery={searchCredential} />
+          <RouteFields token={token} tenant={writeTenant} draft={form} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={setForm} onCatalogValidity={(validity) => { formCatalogRef.current = validity; setFormCatalog(validity); }} onCredentialQuery={searchCredential} />
           <div className="management-form-actions"><button type="submit" disabled={Boolean(busy) || !canSubmit(form, formCatalog)}>{t('routes.create')}</button>{busy === 'create' && <span role="status">{t('forms.saving')}</span>}</div>
         </fieldset>
       </form>

@@ -21,7 +21,7 @@ test('all maintained model selectors share the same picker without replacing cat
   const upstream = await readFile(new URL('../src/operator/UpstreamModelCombobox.tsx', import.meta.url), 'utf8');
   assert.match(upstream, /selected\.complete_coverage \|\| \(confirmationScope === scopeKey && partialConfirmed\)/);
   assert.match(upstream, /needsCustomConfirmation && customAllowed && confirmationScope === scopeKey && customConfirmed/);
-  assert.match(upstream, /catalogResult\?\.scopeKey === scopeKey \? catalogResult\.data : undefined/);
+  assert.match(upstream, /catalogResult\?\.scopeKey === catalogKey \? catalogResult\.data : undefined/);
   assert.match(upstream, /validityCallback\.current\(\{ scopeKey, valid, allowCustom \}\)/);
   const management = await readFile(new URL('../src/operator/pages/ManagementPages.tsx', import.meta.url), 'utf8');
   assert.match(management, /catalog\.scopeKey === currentScopeKey && catalog\.valid/);

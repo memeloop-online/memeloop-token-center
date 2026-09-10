@@ -125,7 +125,8 @@ test('routing UI distinguishes candidate pools, permission bundles and saved eff
 test('catalog and submit validity synchronously require the same complete scope, including live group membership', () => {
   const upstreamModel = readFileSync(new URL('../src/operator/UpstreamModelCombobox.tsx', import.meta.url), 'utf8');
   assert.match(upstreamModel, /JSON\.stringify\(\[token, tenant, protocol, \.\.\.\[accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds\]\.map\(ids => \[\.\.\.new Set\(ids\)\]\.sort\(\)\), model\.trim\(\)\]\)/);
-  assert.match(upstreamModel, /catalogResult\?\.scopeKey === scopeKey \? catalogResult\.data : undefined/);
+  assert.match(upstreamModel, /JSON\.stringify\(\[scopeKey, refreshVersion\]\)/);
+  assert.match(upstreamModel, /catalogResult\?\.scopeKey === catalogKey \? catalogResult\.data : undefined/);
   assert.match(upstreamModel, /browseResult\?\.scopeKey === browseScopeKey/);
   assert.match(upstreamModel, /confirmationScope === scopeKey && partialConfirmed/);
   assert.match(upstreamModel, /confirmationScope === scopeKey && customConfirmed/);
@@ -139,11 +140,40 @@ test('catalog and submit validity synchronously require the same complete scope,
 
 test('model browsing caps account provenance, preserves unknown coverage and searches provider display names', () => {
   const upstreamModel = readFileSync(new URL('../src/operator/UpstreamModelCombobox.tsx', import.meta.url), 'utf8');
-  assert.match(upstreamModel, /const ids = \[\.\.\.new Set\(syncAccountIds\)\]\.sort\(\)\.slice\(0, 8\)/);
+  assert.match(upstreamModel, /const boundedAccountIds = \[\.\.\.new Set\(syncAccountIds\)\]/);
+  assert.match(upstreamModel, /Number\(matchingSourceIds\.has\(right\)\) - Number\(matchingSourceIds\.has\(left\)\) \|\| left\.localeCompare\(right\)/);
+  assert.match(upstreamModel, /\.slice\(0, 8\)/);
+  assert.match(upstreamModel, /JSON\.stringify\(\[browseScopeKey, sourceSearch\]\)/);
   assert.match(upstreamModel, /Math\.min\(4, ids\.length\)/);
   assert.match(upstreamModel, /model\.supported_account_count > accounts\.length/);
   assert.match(upstreamModel, /provenanceIncomplete \|\| !accounts\.length \? \[undefined\]/);
   assert.match(upstreamModel, /browsing \|\| provenanceLoading/);
   assert.match(upstreamModel, /providers\.find\(provider => provider\.id === account\.driver\)\?\.display_name/);
   assert.match(managementPages, /<UpstreamModelCombobox[^>]*providers=\{providers\}/);
+});
+
+test('model synchronization has hard account, concurrency, poll and lifetime bounds', () => {
+  const upstreamModel = readFileSync(new URL('../src/operator/UpstreamModelCombobox.tsx', import.meta.url), 'utf8');
+  assert.match(upstreamModel, /const ids = boundedAccountIds/);
+  assert.match(upstreamModel, /Math\.min\(2, ids\.length\)/);
+  assert.match(upstreamModel, /attempt < 4/);
+  assert.match(upstreamModel, /controller\.abort\(\), 30_000/);
+  assert.match(upstreamModel, /latestScope\.current === scopeKey && !controller\.signal\.aborted/);
+  assert.match(upstreamModel, /return \(\) => \{ syncController\.current\?\.abort\(\); \}/);
+  assert.match(upstreamModel, /delay\(250, controller\.signal\)/);
+  assert.match(upstreamModel, /if \(!current\(\)\) return/);
+  assert.match(upstreamModel, /syncAccountIds\.length - completed/);
+  assert.match(upstreamModel, /validityCallback\.current\(\{ scopeKey, valid: false, allowCustom: false \}\)/);
+  assert.match(upstreamModel, /Boolean\(!syncing && \(selectedValid \|\| allowCustom\)\)/);
+  assert.match(managementPages, /catalog === formCatalogRef\.current \|\| catalog === editCatalogRef\.current/);
+  assert.match(managementPages, /formCatalogRef\.current = validity; setFormCatalog\(validity\)/);
+  assert.match(managementPages, /editCatalogRef\.current = validity; setEditCatalog\(validity\)/);
+  assert.doesNotMatch(upstreamModel, /Promise\.all\(syncAccountIds\.map|attempt < 40/);
+});
+
+test('route mutations refresh provider-group impact counts before releasing the form', () => {
+  const routeWorkspace = managementPages.slice(managementPages.indexOf('function RouteWorkspace('), managementPages.indexOf('function CredentialWorkspace('));
+  assert.match(routeWorkspace, /setMessage\(t\(existing \? 'routes.updated' : 'routes.created'\)\);\s+await Promise\.all\(\[load\(\), routeGroups\.load\(\), providerGroups\.load\(\)\]\)/);
+  assert.match(routeWorkspace, /setMessage\(t\(enabled \? 'routes.enabled' : 'routes.disabled'\)\); await Promise\.all\(\[load\(\), providerGroups\.load\(\)\]\)/);
+  assert.match(routeWorkspace, /setMessage\(t\('routes.deleted'\)\); await Promise\.all\(\[load\(\), providerGroups\.load\(\)\]\)/);
 });
