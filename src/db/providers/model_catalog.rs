@@ -251,7 +251,7 @@ impl Database {
             let mut config: Value =
                 serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
             let object = config.as_object_mut().ok_or(AppError::Internal)?;
-            let limits = models
+            let mut limits = models
                 .iter()
                 .map(|model| {
                     model
@@ -264,6 +264,36 @@ impl Database {
                 return Err(AppError::BadRequest(
                     "Codex model catalog did not contain a trusted model".into(),
                 ));
+            }
+            let existing_bounds = object
+                .get("reservation_token_bounds")
+                .or_else(|| object.get("output_token_limits"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let explicit_custom_models = sqlx::query(
+                "SELECT DISTINCT association.upstream_model \
+                 FROM model_route_upstream_accounts association \
+                 WHERE association.tenant_id = $1 \
+                   AND association.upstream_account_id = $2 \
+                   AND association.catalog_policy = 'explicit_custom'",
+            )
+            .bind(&tenant_id)
+            .bind(account_id.to_string())
+            .fetch_all(&mut *transaction)
+            .await?;
+            for row in explicit_custom_models {
+                let model: String = row.try_get("upstream_model")?;
+                if limits.contains_key(&model) {
+                    continue;
+                }
+                if let Some(bound) = existing_bounds
+                    .get(&model)
+                    .and_then(Value::as_i64)
+                    .filter(|bound| (1..=1_000_000_000).contains(bound))
+                {
+                    limits.insert(model, Value::from(bound));
+                }
             }
             object.remove("output_token_limits");
             object.insert("reservation_token_bounds".to_owned(), Value::Object(limits));

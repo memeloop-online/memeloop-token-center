@@ -6,9 +6,9 @@ use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
     db::{
-        CreateGroupInput, CreateServiceTokenInput, CreateUpstreamAccountInput,
-        DiscoveredUpstreamModel, GroupKind, ReplaceGroupMembersInput, ReplaceModelCatalogResult,
-        unix_millis,
+        CreateGroupInput, CreateModelRouteInput, CreateServiceTokenInput,
+        CreateUpstreamAccountInput, DiscoveredUpstreamModel, GroupKind, ReplaceGroupMembersInput,
+        ReplaceModelCatalogResult, unix_millis,
     },
     error::AppError,
     provider::UpstreamCredential,
@@ -230,6 +230,108 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
     assert_eq!(
         updated.config["reservation_token_bounds"]["gpt-codex"],
         272000
+    );
+}
+
+#[tokio::test]
+async fn codex_catalog_sync_preserves_bound_for_explicit_custom_route() {
+    let (state, _directory) = state("codex-custom-model-bound").await;
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "codex-custom-tenant".into(),
+                name: "codex-custom-upstream".into(),
+                driver: "openai-codex".into(),
+                config: json!({
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {
+                        "catalog-model": 100_000,
+                        "gpt-5.6-terra": 100_000,
+                        "unused-custom-model": 100_000
+                    }
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "codex-access".into(),
+                    refresh_token: Some("codex-refresh".into()),
+                    expires_at: Some(unix_millis() + 60_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: Some(json!({
+                        "schema": "openai-codex-oauth-v1",
+                        "account_id": "account-123"
+                    })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("openai_codex_device".into()),
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: "codex-custom-tenant".into(),
+            public_model: "gpt-5.6-terra".into(),
+            upstream_account_id: account.id,
+            upstream_model: "gpt-5.6-terra".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+
+    let lease = Uuid::now_v7();
+    assert!(
+        state
+            .db
+            .claim_upstream_model_catalog_sync(
+                account.id,
+                "codex-custom-tenant",
+                account.credential_generation,
+                lease
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .db
+            .replace_upstream_model_catalog(
+                account.id,
+                "codex-custom-tenant",
+                account.credential_generation,
+                lease,
+                "codex_models",
+                &[DiscoveredUpstreamModel {
+                    model_id: "catalog-model".into(),
+                    protocol: "openai".into(),
+                    context_window: Some(272_000),
+                    reservation_token_bound: Some(272_000),
+                    reservation_bound_source: Some("mtc_context_window_bound".into()),
+                }],
+            )
+            .await
+            .unwrap(),
+        ReplaceModelCatalogResult::Replaced
+    );
+
+    let (updated, _) = state
+        .db
+        .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.config["reservation_token_bounds"],
+        json!({
+            "catalog-model": 272_000,
+            "gpt-5.6-terra": 100_000
+        })
     );
 }
 

@@ -263,6 +263,7 @@ async fn prepare_authorized_proxy_routes(
                     %request_id,
                     %route_id,
                     upstream_account_id = %account_id,
+                    error = %error,
                     stage = "candidate_prepare",
                     "authorized proxy candidate is unusable"
                 );
