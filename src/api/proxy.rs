@@ -30,8 +30,8 @@ use routing::{
     DeferredSharedProbe, NextSendableProxyRouteInput, PROXY_ROUTING_POLICY, PreparedProxyRoute,
     PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput, ProxySendError,
     UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_compatibility,
-    materialize_proxy_route, plan_proxy_route, prepare_admitted_proxy_route,
-    refresh_route_snapshot, send_proxy_route,
+    materialize_proxy_route, permits_service_unavailable_failover, plan_proxy_route,
+    prepare_admitted_proxy_route, refresh_route_snapshot, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -944,6 +944,38 @@ pub(super) async fn proxy(
                         || !deferred_shared_probes.is_empty()) =>
             {
                 Some(UpstreamHealthReason::RateLimited)
+            }
+            Ok(result)
+                if result.response.status() == StatusCode::SERVICE_UNAVAILABLE
+                    && active_route.is_codex() =>
+            {
+                let transport_policy = routing::runtime_transport_policy(
+                    &active_route.route.config,
+                    state.config.upstream_health.shared_probe_attempts,
+                );
+                let policy_permits = permits_service_unavailable_failover(&active_route);
+                let candidate_available = !route_candidates.as_slice().is_empty()
+                    || !deferred_shared_probes.is_empty();
+                let will_failover = policy_permits && candidate_available;
+                tracing::warn!(
+                    %request_id,
+                    upstream_account_id = %active_route.route.account_id,
+                    candidate_rank = selected_candidate_rank,
+                    outbound_attempt,
+                    outbound_attempt_limit = PROXY_ROUTING_POLICY.max_attempts(),
+                    status = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    failure_kind = "unavailable",
+                    failover_policy = "service_unavailable",
+                    replay_contract = "codex_store_false",
+                    delivery_boundary = "not_started",
+                    policy_permits,
+                    candidate_available,
+                    decision = if will_failover { "failover" } else { "return_503" },
+                    transport_policy_source = transport_policy.source,
+                    stage = "upstream_status_failover_decision",
+                    "Codex service-unavailable response reached the bounded failover policy"
+                );
+                will_failover.then_some(UpstreamHealthReason::Unavailable)
             }
             Err(ProxySendError::RetryableConnection(_)) => failure.map(|(_, reason)| reason),
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable) => {

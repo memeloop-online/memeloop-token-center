@@ -12,12 +12,18 @@ const DEFAULT_PRE_DELIVERY_CONNECT_ATTEMPTS: usize = 2;
 const MAX_PRE_DELIVERY_CONNECT_ATTEMPTS: usize = 4;
 const DEFAULT_PRE_DELIVERY_CONNECT_RETRY_DELAY_MILLIS: u64 = 150;
 const MAX_PRE_DELIVERY_CONNECT_RETRY_DELAY_MILLIS: u64 = 2_000;
+const DEFAULT_SERVICE_UNAVAILABLE_FAILOVER: bool = true;
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::api::proxy) struct CodexRuntimeTransportPolicy {
     pub(in crate::api::proxy) connect_attempts: usize,
     pub(in crate::api::proxy) connect_retry_delay: std::time::Duration,
     pub(in crate::api::proxy) shared_probe_attempts: u32,
+    /// Whether a complete HTTP 503 rejection may use the next authorized
+    /// account before any downstream response has started. Codex requests are
+    /// forced to `store:false`; the outer routing budget still caps the total
+    /// number of distinct account attempts.
+    pub(in crate::api::proxy) service_unavailable_failover: bool,
     pub(in crate::api::proxy) source: &'static str,
 }
 
@@ -51,15 +57,58 @@ pub(in crate::api::proxy) fn runtime_transport_policy(
         .and_then(|value| u32::try_from(value).ok())
         .filter(|value| *value <= crate::config::MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS)
         .unwrap_or(default_shared_probe_attempts);
+    let service_unavailable_failover = policy
+        .and_then(|policy| policy.get("service_unavailable_failover"))
+        .and_then(Value::as_bool)
+        .unwrap_or(DEFAULT_SERVICE_UNAVAILABLE_FAILOVER);
     CodexRuntimeTransportPolicy {
         connect_attempts,
         connect_retry_delay: std::time::Duration::from_millis(connect_retry_delay_millis),
         shared_probe_attempts,
+        service_unavailable_failover,
         source: if policy.is_some() {
             "account_config"
         } else {
             "default"
         },
+    }
+}
+
+pub(in crate::api::proxy) fn permits_service_unavailable_failover(
+    route: &PreparedProxyRoute,
+) -> bool {
+    route.is_codex()
+        && route.codex_store_disabled
+        && runtime_transport_policy(&route.route.config, 0).service_unavailable_failover
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn service_unavailable_failover_is_dynamic_and_defaults_on() {
+        let default = runtime_transport_policy(&serde_json::json!({}), 1);
+        assert!(default.service_unavailable_failover);
+        assert_eq!(default.source, "default");
+
+        let disabled = runtime_transport_policy(
+            &serde_json::json!({
+                "transport_policy": {"service_unavailable_failover": false}
+            }),
+            1,
+        );
+        assert!(!disabled.service_unavailable_failover);
+        assert_eq!(disabled.source, "account_config");
+
+        let enabled = runtime_transport_policy(
+            &serde_json::json!({
+                "transport_policy": {"service_unavailable_failover": true}
+            }),
+            1,
+        );
+        assert!(enabled.service_unavailable_failover);
+        assert_eq!(enabled.source, "account_config");
     }
 }
 

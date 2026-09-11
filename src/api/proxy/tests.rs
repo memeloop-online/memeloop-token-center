@@ -226,6 +226,7 @@ async fn add_codex_standby_route(
 
 mod breaker_validation;
 mod codex_delivery_validation;
+mod codex_failover;
 mod credential_readiness;
 
 async fn assert_response_archives_omit(fixture: &CodexRouteFixture, sensitive: &str) {

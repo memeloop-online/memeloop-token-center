@@ -396,7 +396,10 @@ fn valid_transport_policy(policy: Option<&Value>) -> bool {
     policy.keys().all(|key| {
         matches!(
             key.as_str(),
-            "connect_attempts" | "connect_retry_delay_millis" | "shared_probe_attempts"
+            "connect_attempts"
+                | "connect_retry_delay_millis"
+                | "shared_probe_attempts"
+                | "service_unavailable_failover"
         )
     }) && policy
         .get("connect_attempts")
@@ -407,6 +410,9 @@ fn valid_transport_policy(policy: Option<&Value>) -> bool {
         && policy
             .get("shared_probe_attempts")
             .is_none_or(|value| value.as_u64().is_some_and(|value| value <= 4))
+        && policy
+            .get("service_unavailable_failover")
+            .is_none_or(Value::is_boolean)
 }
 
 fn trusted_reservation_token_bound(config: &Value, upstream_model: &str) -> Result<i64, AppError> {
@@ -1257,7 +1263,8 @@ mod tests {
             json!({
                 "connect_attempts": 4,
                 "connect_retry_delay_millis": 2000,
-                "shared_probe_attempts": 4
+                "shared_probe_attempts": 4,
+                "service_unavailable_failover": false
             }),
         );
         assert!(validate_route_config(&valid).is_ok());
@@ -1267,6 +1274,7 @@ mod tests {
             json!({"connect_attempts": 5}),
             json!({"connect_retry_delay_millis": 2001}),
             json!({"shared_probe_attempts": 5}),
+            json!({"service_unavailable_failover": 1}),
             json!({"unexpected": true}),
             json!("invalid"),
         ] {

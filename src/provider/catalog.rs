@@ -436,6 +436,11 @@ impl ProviderCatalog {
                     "minimum": 0,
                     "maximum": 4,
                     "default": 1
+                },
+                "service_unavailable_failover": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Allow a complete HTTP 503 rejection to switch to the next authorized Codex account before downstream delivery. The fixed request attempt budget still applies."
                 }
             }
         });

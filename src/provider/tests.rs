@@ -390,6 +390,14 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
             .pointer("/properties/transport_policy/properties/shared_probe_attempts/minimum"),
         Some(&json!(0))
     );
+    assert_eq!(
+        codex
+            .config_schema
+            .pointer(
+                "/properties/transport_policy/properties/service_unavailable_failover/default"
+            ),
+        Some(&json!(true))
+    );
     assert!(
         catalog
             .get(crate::oauth::managed::kimi::PROVIDER_DRIVER)
