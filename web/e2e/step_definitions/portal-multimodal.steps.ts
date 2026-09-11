@@ -11,13 +11,17 @@ import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, 
 const operatorGenerationCancellations = new WeakMap<DogfoodWorld, { status: number; body: { status: string } }>();
 
 async function completeSelfRequestQuery(page: Page, filters: RequestFilters, action: () => Promise<unknown>): Promise<void> {
-  const waitFor = (path: string) => page.waitForResponse((response) => {
-    const request = response.request();
-    const url = new URL(response.url());
-    return url.origin === baseURL.origin
-      && `${url.pathname}${url.search}` === path
-      && request.method() === 'GET';
-  });
+  const waitFor = (path: string) => {
+    const expected = new URL(path, baseURL);
+    return page.waitForResponse((response) => {
+      const request = response.request();
+      const url = new URL(response.url());
+      return url.origin === baseURL.origin
+        && url.pathname === expected.pathname
+        && url.search === expected.search
+        && request.method() === 'GET';
+    });
+  };
   const [requests, stats] = await Promise.all([
     waitFor(requestsPath(filters)),
     waitFor(statsPath(filters)),
