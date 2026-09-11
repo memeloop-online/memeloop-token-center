@@ -194,6 +194,79 @@ async fn cleanup_time_budget_stops_between_committed_batches() {
 }
 
 #[tokio::test]
+async fn sqlite_cleanup_preserves_oldest_eligible_fairness_across_classes() {
+    let (_dir, db, identity) = fixture().await;
+    let expired = identity.request_id.to_string();
+    let bound = Uuid::new_v4().to_string();
+    let exhausted = Uuid::new_v4().to_string();
+    for (request_id, state, updated_at, expires_at, attempts, lease_expires_at) in [
+        (&expired, "gap", -30_i64, -30_i64, 0_i64, None),
+        (&bound, "bound", -20, i64::MAX, 0, None),
+        (&exhausted, "uploading", -10, i64::MAX, 10, Some(-10_i64)),
+    ] {
+        sqlx::query("INSERT INTO response_archive_spools (request_id, tenant_id, reservation_id, state, cipher_bytes, attempts, next_attempt_at, created_at, updated_at, expires_at, lease_expires_at) VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7, $8, $9)")
+            .bind(request_id)
+            .bind(identity.tenant_id.to_string())
+            .bind(identity.reservation_id.to_string())
+            .bind(state)
+            .bind(SPOOL_OVERHEAD)
+            .bind(attempts)
+            .bind(updated_at)
+            .bind(expires_at)
+            .bind(lease_expires_at)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = $1")
+        .bind(3 * SPOOL_OVERHEAD)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    for expected in [&expired, &bound, &exhausted] {
+        assert_eq!(db.cleanup_response_archive_spools(1).await.unwrap(), 1);
+        let cleaned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND cleaned_at IS NOT NULL",
+        )
+        .bind(expected)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(cleaned, 1, "oldest eligible class must win");
+    }
+    assert_eq!(budget(&db).await, 0);
+}
+
+#[tokio::test]
+async fn sqlite_concurrent_cleanup_workers_serialize_and_both_make_progress() {
+    let (_dir, db, first) = fixture().await;
+    let second = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..first
+    };
+    sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'responses', 'test', 0, 0, 0, 'gap://test/request', $4)")
+        .bind(second.request_id.to_string()).bind(second.tenant_id.to_string())
+        .bind(Uuid::new_v4().to_string()).bind(second.reservation_id.to_string())
+        .execute(&db.pool).await.unwrap();
+    for identity in [first, second] {
+        assert!(db.begin_response_archive_spool(identity).await.unwrap());
+    }
+    sqlx::query("UPDATE response_archive_spools SET expires_at = 0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (left, right) = tokio::join!(
+        db.cleanup_response_archive_spools(1),
+        db.cleanup_response_archive_spools(1)
+    );
+    assert_eq!(left.unwrap(), 1);
+    assert_eq!(right.unwrap(), 1);
+    assert_eq!(budget(&db).await, 0);
+}
+
+#[tokio::test]
 async fn claims_require_terminal_gap_and_fence_old_leases() {
     let (_dir, db, id) = fixture().await;
     assert!(db.begin_response_archive_spool(id).await.unwrap());

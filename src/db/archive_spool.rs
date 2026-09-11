@@ -370,7 +370,16 @@ impl Database {
         let started = Instant::now();
         let mut completed = 0;
         for _ in 0..limit.clamp(0, 32) {
-            match self.cleanup_response_archive_spool_batch().await? {
+            // Keep the transaction owned by an independent task. If the
+            // worker is cancelled for shutdown while this await is pending,
+            // dropping the JoinHandle detaches the batch and lets SQLx finish
+            // its COMMIT/rollback protocol before that connection is reused.
+            let db = self.clone();
+            let batch =
+                tokio::spawn(async move { db.cleanup_response_archive_spool_batch().await })
+                    .await
+                    .map_err(|_| AppError::Internal)??;
+            match batch {
                 Some(cleaned) => completed += u64::from(cleaned),
                 None => break,
             }
@@ -386,53 +395,80 @@ impl Database {
     }
 
     async fn cleanup_response_archive_spool_batch(&self) -> Result<Option<bool>, AppError> {
-        // Discover one candidate without holding the shared producer budget
-        // lock. Separate indexed predicates avoid scanning retained audit rows.
-        // Database time and eligibility are rechecked after acquiring the lock.
-        let hint_now = super::unix_millis();
-        let bound = sqlx::query("SELECT request_id, updated_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND state = 'bound' ORDER BY updated_at, request_id LIMIT 1")
-            .fetch_optional(&self.pool).await?;
-        let expired = sqlx::query("SELECT request_id, expires_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND expires_at <= $1 ORDER BY expires_at, request_id LIMIT 1")
-            .bind(hint_now).fetch_optional(&self.pool).await?;
-        let exhausted = sqlx::query("SELECT request_id, lease_expires_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND state = 'uploading' AND attempts >= 10 AND lease_expires_at <= $1 ORDER BY lease_expires_at, request_id LIMIT 1")
-            .bind(hint_now).fetch_optional(&self.pool).await?;
-        // Oldest eligible work across all classes wins; a steady stream of
-        // freshly bound rows must not indefinitely hide expired gap payloads.
-        let mut candidate: Option<(i64, String)> = None;
-        for row in [bound, expired, exhausted].into_iter().flatten() {
-            let item = (
-                row.try_get::<i64, _>("eligible_at")?,
-                row.try_get::<String, _>("request_id")?,
-            );
-            if candidate.as_ref().is_none_or(|current| &item < current) {
-                candidate = Some(item);
-            }
-        }
-        let Some((_, id)) = candidate else {
-            return Ok(None);
-        };
         let mut tx = self.begin_write_transaction().await?;
-        let (clock, row_lock) = match self.backend {
-            DatabaseBackend::PostgreSql => (
-                "CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT)",
-                " FOR UPDATE SKIP LOCKED",
-            ),
-            DatabaseBackend::Sqlite => (
-                "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
-                "",
-            ),
+        let row = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                // Each indexed class contributes its oldest unlocked row, and
+                // the globally oldest candidate wins. Locking happens during
+                // selection so a busy oldest row cannot hide later work and
+                // concurrent workers naturally fan out across the queue.
+                sqlx::query(
+                    "WITH db_clock AS MATERIALIZED (SELECT CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT) AS db_now),
+                     bound_candidate AS MATERIALIZED (
+                       SELECT s.request_id, s.updated_at AS eligible_at
+                       FROM response_archive_spools s
+                       WHERE s.cleaned_at IS NULL AND s.state = 'bound'
+                       ORDER BY s.updated_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
+                     ),
+                     expired_candidate AS MATERIALIZED (
+                       SELECT s.request_id, s.expires_at AS eligible_at
+                       FROM response_archive_spools s CROSS JOIN db_clock c
+                       WHERE s.cleaned_at IS NULL AND s.expires_at <= c.db_now
+                       ORDER BY s.expires_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
+                     ),
+                     exhausted_candidate AS MATERIALIZED (
+                       SELECT s.request_id, s.lease_expires_at AS eligible_at
+                       FROM response_archive_spools s CROSS JOIN db_clock c
+                       WHERE s.cleaned_at IS NULL AND s.state = 'uploading' AND s.attempts >= 10 AND s.lease_expires_at <= c.db_now
+                       ORDER BY s.lease_expires_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
+                     ),
+                     chosen AS (
+                       SELECT request_id, eligible_at FROM bound_candidate
+                       UNION ALL SELECT request_id, eligible_at FROM expired_candidate
+                       UNION ALL SELECT request_id, eligible_at FROM exhausted_candidate
+                       ORDER BY eligible_at, request_id LIMIT 1
+                     )
+                     SELECT s.request_id, s.state, s.cipher_bytes, c.db_now
+                     FROM chosen JOIN response_archive_spools s USING (request_id) CROSS JOIN db_clock c",
+                )
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+            DatabaseBackend::Sqlite => {
+                // BEGIN IMMEDIATE serializes SQLite writers, so row-level skip
+                // locking is neither available nor necessary. Preserve the
+                // three partial-index-friendly probes and recheck eligibility
+                // using database time inside the write transaction.
+                let hint_now = super::unix_millis();
+                let bound = sqlx::query("SELECT request_id, updated_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND state = 'bound' ORDER BY updated_at, request_id LIMIT 1")
+                    .fetch_optional(&mut *tx).await?;
+                let expired = sqlx::query("SELECT request_id, expires_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND expires_at <= $1 ORDER BY expires_at, request_id LIMIT 1")
+                    .bind(hint_now).fetch_optional(&mut *tx).await?;
+                let exhausted = sqlx::query("SELECT request_id, lease_expires_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND state = 'uploading' AND attempts >= 10 AND lease_expires_at <= $1 ORDER BY lease_expires_at, request_id LIMIT 1")
+                    .bind(hint_now).fetch_optional(&mut *tx).await?;
+                let mut candidate: Option<(i64, String)> = None;
+                for candidate_row in [bound, expired, exhausted].into_iter().flatten() {
+                    let item = (
+                        candidate_row.try_get::<i64, _>("eligible_at")?,
+                        candidate_row.try_get::<String, _>("request_id")?,
+                    );
+                    if candidate.as_ref().is_none_or(|current| &item < current) {
+                        candidate = Some(item);
+                    }
+                }
+                let Some((_, id)) = candidate else {
+                    return Ok(None);
+                };
+                sqlx::query(
+                    "SELECT request_id, state, cipher_bytes, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) AS db_now FROM response_archive_spools WHERE request_id = $1 AND cleaned_at IS NULL AND (state = 'bound' OR expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) OR (state = 'uploading' AND attempts >= 10 AND lease_expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)))",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
         };
-        let row_sql = format!(
-            "SELECT state, cipher_bytes, {clock} AS db_now FROM response_archive_spools WHERE request_id = $1 AND cleaned_at IS NULL AND (state = 'bound' OR expires_at <= {clock} OR (state = 'uploading' AND attempts >= 10 AND lease_expires_at <= {clock})){row_lock}"
-        );
-        // Clock/locking fragments above are backend constants, never inputs.
-        let Some(row) = sqlx::query(sqlx::AssertSqlSafe(row_sql))
-            .bind(&id)
-            .fetch_optional(&mut *tx)
-            .await?
-        else {
-            return Ok(None);
-        };
+        let Some(row) = row else { return Ok(None) };
+        let id: String = row.try_get("request_id")?;
         let now: i64 = row.try_get("db_now")?;
         let chunk_sql = match self.backend {
             DatabaseBackend::PostgreSql => {
@@ -484,11 +520,11 @@ impl Database {
         sqlx::query("UPDATE response_archive_spools SET state = $1, cleaned_at = $2, cipher_bytes = cipher_bytes - $3, updated_at = $4, expires_at = CASE WHEN $5 = 1 THEN expires_at ELSE $4 END, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $6")
             .bind(if bound { "bound" } else { "gap" }).bind(cleaned.then_some(now))
             .bind(released).bind(now).bind(i64::from(bound)).bind(&id).execute(&mut *tx).await?;
-        // GC locks its one spool first, then tries the global lock WITHOUT
-        // waiting. Producers use global -> spool order. NOWAIT is essential:
-        // if one is waiting for this spool, abort GC and let that producer
-        // progress rather than creating a lock-order deadlock. The entire
-        // bounded deletion rolls back, so a later pass can safely resume.
+        // GC locks a bounded candidate set first, then tries the global lock
+        // WITHOUT waiting. Producers use global -> spool order. NOWAIT is
+        // essential: if one is waiting for a candidate, abort GC and let that
+        // producer progress rather than creating a lock-order deadlock. The
+        // entire bounded deletion rolls back, so a later pass can safely resume.
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             let _: i64 = sqlx::query_scalar("SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1 FOR UPDATE NOWAIT")
                 .fetch_one(&mut *tx).await?;
