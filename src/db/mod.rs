@@ -72,7 +72,7 @@ pub(crate) use session_projection::{
     reclassify_request_session_in_transaction,
 };
 pub use time::unix_millis;
-pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetOperation};
+pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetClaim, QuotaResetOperation};
 use validation::*;
 
 const POSTGRES_SERVE_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 30000";
