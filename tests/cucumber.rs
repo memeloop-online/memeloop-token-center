@@ -6880,7 +6880,10 @@ async fn responses_requests_have_direct_parent_edge(world: &mut TokenCenterWorld
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let detail = loop {
         let snapshot = own_conversation_detail(world).await;
-        if snapshot["cluster"]["request_count"].as_u64().is_some_and(|count| count >= 2) {
+        if snapshot["cluster"]["request_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 2)
+        {
             break snapshot;
         }
         assert!(
