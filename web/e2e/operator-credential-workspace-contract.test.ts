@@ -110,13 +110,13 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await plaintext.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_first'));
     await plaintext.getByText('mts_service_secret_first', { exact: true }).waitFor();
     assert.equal(await create.isDisabled(), true, 'visible plaintext blocks another service credential issuance');
-    assert.equal(await plaintext.getByRole('button', { name: 'Rotate', exact: true }).isDisabled(), true, 'visible plaintext blocks rotation from replacing it');
+    assert.equal(await plaintext.getByRole('button', { name: 'Rotate service credential', exact: true }).isDisabled(), true, 'visible plaintext blocks rotation from replacing it');
     plaintext.once('dialog', (dialog) => void dialog.accept());
     await plaintext.getByRole('button', { name: 'Close', exact: true }).click();
     await plaintext.getByText('mts_service_secret_first', { exact: true }).waitFor({ state: 'detached' });
     await plaintext.waitForFunction(() => Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Create service credential' && !button.disabled));
     assert.equal(await create.isDisabled(), false, 'confirmed dismissal clears plaintext and releases issuance controls');
-    assert.equal(await plaintext.getByRole('button', { name: 'Rotate', exact: true }).isDisabled(), false);
+    assert.equal(await plaintext.getByRole('button', { name: 'Rotate service credential', exact: true }).isDisabled(), false);
 
     const aba = await browser.newPage();
     aba.setDefaultTimeout(10_000);
