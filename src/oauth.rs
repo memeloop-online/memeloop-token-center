@@ -267,7 +267,6 @@ mod tests {
     #[tokio::test]
     async fn cursor_poll_rejects_a_provider_removed_after_session_creation_before_network_io() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).expect(0).mount(&server).await;
         let (_directory, database) = sqlite_database().await;
         let now = crate::db::unix_millis();
         let key_material = b"test material with at least 32 bytes";
@@ -312,7 +311,7 @@ mod tests {
             error.to_string(),
             "invalid request: OAuth provider driver is no longer available"
         );
-        server.verify().await;
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

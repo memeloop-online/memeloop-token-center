@@ -758,7 +758,6 @@ fn successful_chat_response() -> ResponseTemplate {
 #[tokio::test]
 async fn active_retired_provider_route_is_rejected_before_credential_or_network_access() {
     let upstream = MockServer::start().await;
-    Mock::given(method("POST")).expect(0).mount(&upstream).await;
     let fixture = resilient_route_fixture("retired-provider", &[(upstream.uri(), 0)]).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("UPDATE upstream_accounts SET driver = 'cpa-gemini-oauth-legacy' WHERE id = $1")
@@ -776,7 +775,7 @@ async fn active_retired_provider_route_is_rejected_before_credential_or_network_
 
     let response = send_resilient_chat(&fixture, Some("retired-provider-session"), false).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    upstream.verify().await;
+    assert!(upstream.received_requests().await.unwrap().is_empty());
     pool.close().await;
 }
 
