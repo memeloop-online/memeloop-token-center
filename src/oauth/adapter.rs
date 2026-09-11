@@ -79,7 +79,7 @@ pub async fn normalize_managed_oauth_document(
             let mut normalized = managed::codex::normalize(payload)?;
             let (credential, _) = managed::codex::restore_remote_dns_proxy(normalized.credential)
                 .map_err(|_| {
-                    AppError::BadRequest("CPA Codex OAuth document is invalid".into())
+                    AppError::BadRequest("Codex OAuth document is invalid".into())
                 })?;
             normalized.credential = credential;
             if normalized.credential.proxy().is_none() {
@@ -94,7 +94,7 @@ pub async fn normalize_managed_oauth_document(
                     allow_test_loopback,
                 )
                 .await
-                .map_err(|_| AppError::BadRequest("CPA Codex OAuth document is invalid".into()))?;
+                .map_err(|_| AppError::BadRequest("Codex OAuth document is invalid".into()))?;
             }
             return Ok(normalized);
         }
