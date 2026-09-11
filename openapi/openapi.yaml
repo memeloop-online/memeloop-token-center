@@ -1939,6 +1939,43 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
+  /internal/v1/imports/cpa/managed-oauth/kimi-cohort:
+    post:
+      tags: [Upstream providers]
+      operationId: importCpaManagedKimiCohort
+      summary: Atomically import the exact two-account native Kimi migration cohort
+      description: |
+        Global-only migration contract. Both Kimi documents are validated before
+        a tenant-scoped managed-import lock and one database transaction replay or
+        create the complete request-order cohort. Exact replays precede conflict
+        checks; a changed source, name conflict, or write failure rolls back both
+        accounts. Newly created credentials must be unexpired and enabled;
+        exact replay remains time-independent. Import performs no DNS lookup,
+        refresh, or other provider call.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: imports:cpa:write
+      x-global-service-only: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CpaManagedKimiCohortRequest' }
+      responses:
+        '200':
+          description: Both accounts were exact replays, or one replay and one create converged atomically.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CpaManagedKimiCohortResult' }
+        '201':
+          description: Both managed Kimi accounts were created atomically.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CpaManagedKimiCohortResult' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /internal/v1/migrations/openai-codex/prepare:
     post:
       tags: [Upstream providers]
@@ -5455,7 +5492,7 @@ components:
     UpstreamProvider:
       type: object
       additionalProperties: false
-      required: [id, tenant_id, tenant_external_id, name, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, can_refresh, can_rotate, can_reauthorize, route_count, created_at, updated_at]
+      required: [id, tenant_id, tenant_external_id, name, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, can_refresh, can_rotate, can_reauthorize, import_source_identity_hash, import_source_document_sha256, route_count, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
@@ -5471,6 +5508,8 @@ components:
         can_refresh: { type: boolean, description: Managed OAuth refresh is available for the active generation. }
         can_rotate: { type: boolean, description: The credential may be replaced without changing the stable account identity. }
         can_reauthorize: { type: boolean, description: An interactive reauthorization endpoint is available. }
+        import_source_identity_hash: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$', description: Operator-keyed source identity for managed imports; null for legacy or directly-created accounts. }
+        import_source_document_sha256: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$', description: SHA-256 of the canonical managed-import document; null for legacy or directly-created accounts. }
         route_count: { type: integer, format: int64, minimum: 0, description: Includes disabled routes retained for audit. }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
@@ -5652,7 +5691,7 @@ components:
     CpaManagedOAuthImportCapabilities:
       type: object
       additionalProperties: false
-      required: [contract_version, source_types]
+      required: [contract_version, source_types, source_identity_contract, account_name_policies, atomic_cohort_contracts, credential_envelope_contract]
       properties:
         contract_version: { const: 1 }
         source_types:
@@ -5660,9 +5699,26 @@ components:
           uniqueItems: true
           items: { type: string, pattern: '^[a-z0-9._-]{1,64}$' }
           description: Sorted source types contributed by the active server catalog.
+        source_identity_contract: { const: operator-hmac-sha256-v1 }
+        account_name_policies:
+          type: object
+          additionalProperties: false
+          required: [kimi]
+          properties:
+            kimi: { const: neutral-server-keyed-source-suffix-v1 }
+        atomic_cohort_contracts:
+          type: array
+          prefixItems:
+            - { const: atomic_kimi_cohort_v1 }
+          minItems: 1
+          maxItems: 1
+        credential_envelope_contract: { const: chacha20poly1305-hkdf-sha256-v2-aad-v1 }
     CpaManagedOAuthImportRequest:
       type: object
       additionalProperties: false
+      dependentRequired:
+        source_identity_hash: [source_document_sha256]
+        source_document_sha256: [source_identity_hash]
       required: [contract_version, tenant_external_id, source, source_type, document]
       properties:
         contract_version: { const: 1 }
@@ -5679,6 +5735,8 @@ components:
               maxLength: 512
               description: Strict POSIX relative path; absolute paths, empty/dot segments, backslashes, NUL, and control characters are rejected and never echoed.
         source_type: { type: string, pattern: '^[a-z0-9._-]{1,64}$' }
+        source_identity_hash: { type: string, pattern: '^[a-f0-9]{64}$', description: Operator-keyed HMAC identity; supplied together with source_document_sha256 by batch-aware importers. }
+        source_document_sha256: { type: string, pattern: '^[a-f0-9]{64}$', description: SHA-256 of the canonical document; supplied together with source_identity_hash. }
         document:
           writeOnly: true
           description: Opaque adapter input. The canonical encoded document is limited to 1 MiB; the complete request has a bounded 64 KiB JSON envelope allowance.
@@ -5689,6 +5747,46 @@ components:
       properties:
         disposition: { type: string, enum: [created, replayed, updated] }
         account: { $ref: '#/components/schemas/UpstreamProvider' }
+    CpaManagedKimiCohortAccount:
+      type: object
+      additionalProperties: false
+      required: [source, source_type, source_identity_hash, source_document_sha256, document]
+      properties:
+        source:
+          type: object
+          additionalProperties: false
+          required: [kind, relative_path]
+          properties:
+            kind: { const: auth_file }
+            relative_path: { type: string, minLength: 1, maxLength: 512 }
+        source_type: { const: kimi }
+        source_identity_hash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        source_document_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        document: { writeOnly: true, description: Opaque Kimi auth document with a 1 MiB canonical encoding limit. }
+    CpaManagedKimiCohortRequest:
+      type: object
+      additionalProperties: false
+      required: [contract_version, tenant_external_id, cohort_contract, accounts]
+      properties:
+        contract_version: { const: 1 }
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        cohort_contract: { const: atomic_kimi_cohort_v1 }
+        accounts:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { $ref: '#/components/schemas/CpaManagedKimiCohortAccount' }
+    CpaManagedKimiCohortResult:
+      type: object
+      additionalProperties: false
+      required: [disposition, accounts]
+      properties:
+        disposition: { type: string, enum: [created, replayed, converged] }
+        accounts:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { $ref: '#/components/schemas/UpstreamProvider' }
     NativeCodexUpgradeTarget:
       type: object
       additionalProperties: false

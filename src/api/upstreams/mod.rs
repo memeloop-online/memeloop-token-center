@@ -16,7 +16,8 @@ pub(in crate::api) use accounts::{
 pub(in crate::api) use availability::upstream_account_availability;
 pub(in crate::api) use health::probe_upstream_health;
 pub(in crate::api) use managed_import::{
-    MAX_MANAGED_OAUTH_IMPORT_REQUEST, cpa_managed_oauth_capabilities, import_cpa_managed_oauth,
+    MAX_MANAGED_OAUTH_COHORT_REQUEST, MAX_MANAGED_OAUTH_IMPORT_REQUEST,
+    cpa_managed_oauth_capabilities, import_cpa_managed_kimi_cohort, import_cpa_managed_oauth,
 };
 pub(crate) use models::trigger_upstream_model_sync;
 pub(in crate::api) use models::{

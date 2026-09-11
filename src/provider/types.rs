@@ -83,6 +83,11 @@ pub struct UpstreamAccountView {
     pub can_refresh: bool,
     pub can_rotate: bool,
     pub can_reauthorize: bool,
+    /// Operator-keyed source identity for managed imports. Legacy and
+    /// directly-created accounts return null rather than inventing provenance.
+    pub import_source_identity_hash: Option<String>,
+    /// SHA-256 of the canonical source document supplied by a managed importer.
+    pub import_source_document_sha256: Option<String>,
     /// Number of model routes that still reference this stable upstream
     /// identity, including disabled routes retained for audit purposes.
     pub route_count: i64,

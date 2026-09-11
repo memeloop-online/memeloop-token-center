@@ -13,7 +13,7 @@ use memeloop_token_center::{
     },
 };
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tower::ServiceExt;
 use wiremock::{
@@ -171,6 +171,44 @@ fn import_request(tenant: &str, relative_path: &str, document: Value) -> Value {
     })
 }
 
+fn with_source_fingerprints(mut request: Value, source_identity_hash: &str) -> Value {
+    request["source_identity_hash"] = json!(source_identity_hash);
+    request["source_document_sha256"] = json!(document_sha256(&request["document"]));
+    request
+}
+
+fn kimi_cohort_account(
+    relative_path: &str,
+    source_identity_hash: &str,
+    access_token: &str,
+    expired: &str,
+) -> Value {
+    let document = json!({
+        "type": "kimi",
+        "access_token": access_token,
+        "refresh_token": format!("{access_token}-refresh"),
+        "token_type": "Bearer",
+        "device_id": format!("{access_token}-device"),
+        "expired": expired,
+    });
+    json!({
+        "source": {"kind": "auth_file", "relative_path": relative_path},
+        "source_type": "kimi",
+        "source_identity_hash": source_identity_hash,
+        "source_document_sha256": document_sha256(&document),
+        "document": document,
+    })
+}
+
+fn kimi_cohort_request(tenant: &str, accounts: Vec<Value>) -> Value {
+    json!({
+        "contract_version": 1,
+        "tenant_external_id": tenant,
+        "cohort_contract": "atomic_kimi_cohort_v1",
+        "accounts": accounts,
+    })
+}
+
 async fn seed_replay(
     state: &AppState,
     tenant: &str,
@@ -206,6 +244,8 @@ async fn seed_replay_with_expiry(
                 tenant_external_id: tenant.into(),
                 source_key,
                 payload_digest,
+                source_identity_hash: None,
+                source_document_sha256: None,
                 contract_version: 1,
                 account_name: format!("Imported {tenant}"),
                 config: json!({"base_url": "https://api.example.test"}),
@@ -363,6 +403,7 @@ async fn capabilities_and_import_are_global_only_and_dedicated_scope_only() {
     for path in [
         "/internal/v1/imports/cpa/managed-oauth/capabilities",
         "/internal/v1/imports/cpa/managed-oauth",
+        "/internal/v1/imports/cpa/managed-oauth/kimi-cohort",
     ] {
         let method = if path.ends_with("capabilities") {
             "GET"
@@ -409,10 +450,292 @@ async fn capabilities_and_import_are_global_only_and_dedicated_scope_only() {
     );
     assert!(source_types.contains(&json!("codex-account")));
     assert!(source_types.contains(&json!("gemini-account")));
+    assert_eq!(value["source_identity_contract"], "operator-hmac-sha256-v1");
+    assert_eq!(
+        value["account_name_policies"]["kimi"],
+        "neutral-server-keyed-source-suffix-v1"
+    );
+    assert_eq!(
+        value["atomic_cohort_contracts"],
+        json!(["atomic_kimi_cohort_v1"])
+    );
+    assert_eq!(
+        value["credential_envelope_contract"],
+        "chacha20poly1305-hkdf-sha256-v2-aad-v1"
+    );
     let encoded = String::from_utf8(body).unwrap();
     for forbidden in ["driver", "normalize", "refresh", "https://", ".test"] {
         assert!(!encoded.contains(forbidden));
     }
+}
+
+#[tokio::test]
+async fn kimi_batch_names_are_server_keyed_and_expired_imports_stay_out_of_refresh_work() {
+    let (_directory, state, _adapter) = test_state().await;
+    let tenant = "kimi-batch-contract";
+    let token = service_token(&state, &["imports:cpa:write", "providers:read"], None).await;
+    let mut created = Vec::new();
+
+    for (identity, path, access, expiry, expected_status) in [
+        (
+            "a".repeat(64),
+            "auth/kimi-primary.json",
+            "kimi-primary-access",
+            "2099-01-01T00:00:00Z",
+            "active",
+        ),
+        (
+            "b".repeat(64),
+            "auth/kimi-secondary.json",
+            "kimi-secondary-access",
+            "2099-01-01T00:00:00Z",
+            "active",
+        ),
+        (
+            "c".repeat(64),
+            "auth/kimi-expired.json",
+            "kimi-expired-access",
+            "2000-01-01T00:00:00Z",
+            "disabled",
+        ),
+    ] {
+        let document = json!({
+            "type": "kimi",
+            "access_token": access,
+            "refresh_token": format!("{access}-refresh"),
+            "token_type": "Bearer",
+            "device_id": format!("{access}-device"),
+            "expired": expiry,
+        });
+        let mut request = import_request(tenant, path, document);
+        request["source_type"] = json!("kimi");
+        let request = with_source_fingerprints(request, &identity);
+        let expected_document_hash = request["source_document_sha256"].clone();
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/internal/v1/imports/cpa/managed-oauth",
+            Some(&token),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        let account = &response["account"];
+        assert_eq!(account["driver"], "kimi-oauth");
+        assert_eq!(account["auth_kind"], "oauth");
+        assert_eq!(account["status"], expected_status);
+        assert_eq!(account["import_source_identity_hash"], identity);
+        assert_eq!(
+            account["import_source_document_sha256"],
+            expected_document_hash
+        );
+        assert!(
+            account["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("Kimi account ")
+        );
+        let encoded = String::from_utf8(body).unwrap();
+        let refresh_secret = format!("{access}-refresh");
+        let device_secret = format!("{access}-device");
+        for secret in [
+            path,
+            access,
+            refresh_secret.as_str(),
+            device_secret.as_str(),
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+        created.push(account.clone());
+    }
+
+    assert_ne!(created[0]["name"], created[1]["name"]);
+    assert_ne!(created[1]["name"], created[2]["name"]);
+    let candidates = state
+        .db
+        .list_managed_oauth_refresh_candidates(i64::MAX, 100)
+        .await
+        .unwrap();
+    let expired_id = uuid::Uuid::parse_str(created[2]["id"].as_str().unwrap()).unwrap();
+    assert!(!candidates.iter().any(|(id, _)| *id == expired_id));
+
+    let (status, body) = call(
+        &state,
+        "GET",
+        &format!("/internal/v1/upstreams?tenant_external_id={tenant}"),
+        Some(&token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let inventory: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(inventory.as_array().unwrap().len(), 3);
+    for account in inventory.as_array().unwrap() {
+        assert!(account["import_source_identity_hash"].is_string());
+        assert!(account["import_source_document_sha256"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn kimi_cohort_is_atomic_ordered_and_exactly_replayable() {
+    let (_directory, state, _adapter) = test_state().await;
+    let token = service_token(&state, &["imports:cpa:write", "providers:read"], None).await;
+    let endpoint = "/internal/v1/imports/cpa/managed-oauth/kimi-cohort";
+    let tenant = "atomic-kimi-cohort";
+    let request = kimi_cohort_request(
+        tenant,
+        vec![
+            kimi_cohort_account(
+                "auth/kimi-one.json",
+                &"d".repeat(64),
+                "cohort-one-secret",
+                "2099-01-01T00:00:00Z",
+            ),
+            kimi_cohort_account(
+                "auth/kimi-two.json",
+                &"e".repeat(64),
+                "cohort-two-secret",
+                "2099-01-01T00:00:00Z",
+            ),
+        ],
+    );
+    let encoded = serde_json::to_vec(&request).unwrap();
+    let (status, body) = call(&state, "POST", endpoint, Some(&token), encoded.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(created["disposition"], "created");
+    assert_eq!(created["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        created["accounts"][0]["import_source_identity_hash"],
+        "d".repeat(64)
+    );
+    assert_eq!(
+        created["accounts"][1]["import_source_identity_hash"],
+        "e".repeat(64)
+    );
+    assert_ne!(
+        created["accounts"][0]["name"],
+        created["accounts"][1]["name"]
+    );
+    for forbidden in [
+        "auth/kimi-one.json",
+        "auth/kimi-two.json",
+        "cohort-one-secret",
+        "cohort-two-secret",
+    ] {
+        assert!(!String::from_utf8_lossy(&body).contains(forbidden));
+    }
+
+    let (status, body) = call(&state, "POST", endpoint, Some(&token), encoded).await;
+    assert_eq!(status, StatusCode::OK);
+    let replayed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(replayed["disposition"], "replayed");
+    assert_eq!(replayed["accounts"][0]["id"], created["accounts"][0]["id"]);
+    assert_eq!(replayed["accounts"][1]["id"], created["accounts"][1]["id"]);
+
+    let rollback_tenant = "atomic-kimi-cohort-rollback";
+    let existing = kimi_cohort_account(
+        "auth/existing.json",
+        &"f".repeat(64),
+        "existing-secret",
+        "2099-01-01T00:00:00Z",
+    );
+    let mut single = import_request(
+        rollback_tenant,
+        "auth/existing.json",
+        existing["document"].clone(),
+    );
+    single["source_type"] = json!("kimi");
+    single["source_identity_hash"] = existing["source_identity_hash"].clone();
+    single["source_document_sha256"] = existing["source_document_sha256"].clone();
+    assert_eq!(
+        call(
+            &state,
+            "POST",
+            "/internal/v1/imports/cpa/managed-oauth",
+            Some(&token),
+            serde_json::to_vec(&single).unwrap(),
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    let mut changed = existing;
+    changed["document"]["access_token"] = json!("changed-existing-secret");
+    changed["source_document_sha256"] = json!(document_sha256(&changed["document"]));
+    let conflicted = kimi_cohort_request(
+        rollback_tenant,
+        vec![
+            kimi_cohort_account(
+                "auth/must-rollback.json",
+                &"9".repeat(64),
+                "must-rollback-secret",
+                "2099-01-01T00:00:00Z",
+            ),
+            changed,
+        ],
+    );
+    assert_eq!(
+        call(
+            &state,
+            "POST",
+            endpoint,
+            Some(&token),
+            serde_json::to_vec(&conflicted).unwrap(),
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        state
+            .db
+            .list_upstream_accounts(rollback_tenant)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let expired_tenant = "atomic-kimi-cohort-expired";
+    let expired = kimi_cohort_request(
+        expired_tenant,
+        vec![
+            kimi_cohort_account(
+                "auth/current.json",
+                &"7".repeat(64),
+                "current-secret",
+                "2099-01-01T00:00:00Z",
+            ),
+            kimi_cohort_account(
+                "auth/expired.json",
+                &"8".repeat(64),
+                "expired-secret",
+                "2000-01-01T00:00:00Z",
+            ),
+        ],
+    );
+    assert_eq!(
+        call(
+            &state,
+            "POST",
+            endpoint,
+            Some(&token),
+            serde_json::to_vec(&expired).unwrap(),
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(
+        state
+            .db
+            .list_upstream_accounts(expired_tenant)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -445,6 +768,8 @@ async fn legacy_gemini_remains_importable_without_advertising_or_scheduling_refr
                 tenant_external_id: tenant.into(),
                 source_key: "a".repeat(64),
                 payload_digest: "b".repeat(64),
+                source_identity_hash: None,
+                source_document_sha256: None,
                 contract_version: 1,
                 account_name: "Legacy Gemini".into(),
                 config: json!({
@@ -1000,6 +1325,8 @@ async fn native_codex_upgrade_api_is_global_allowlisted_and_never_returns_proxy_
                 tenant_external_id: "native-upgrade".into(),
                 source_key: "a".repeat(64),
                 payload_digest: "b".repeat(64),
+                source_identity_hash: None,
+                source_document_sha256: None,
                 contract_version: 1,
                 account_name: "Native account".into(),
                 config: json!({
@@ -1143,6 +1470,12 @@ fn payload_digest(pepper: &[u8], source_type: &str, document: &Value) -> String 
     mac.update(PAYLOAD_DIGEST_DOMAIN);
     mac.update(&serde_json::to_vec(&canonical).unwrap());
     lower_hex(&mac.finalize().into_bytes())
+}
+
+fn document_sha256(document: &Value) -> String {
+    lower_hex(&Sha256::digest(
+        serde_json::to_vec(&canonical_json(document)).unwrap(),
+    ))
 }
 
 fn canonical_json(value: &Value) -> Value {

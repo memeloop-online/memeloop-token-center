@@ -63,17 +63,11 @@ pub async fn normalize_managed_oauth_document(
 ) -> Result<ManagedOAuthNormalizedAccount, AppError> {
     match adapter.backend() {
         ManagedOAuthAdapterBackend::BuiltinKimi => {
-            let normalized = managed::kimi::normalize(payload)?;
-            network::client_for_config_url(
-                http,
-                managed::kimi::BASE_URL,
-                &normalized.config,
-                normalized.credential.proxy(),
-                allow_test_loopback,
-            )
-            .await
-            .map_err(|_| AppError::BadRequest("CPA Kimi OAuth document is invalid".into()))?;
-            return Ok(normalized);
+            // The destination is a compile-time constant and the document
+            // normalizer validates every local field. Import must remain a
+            // pure control-plane operation: DNS/pinning happens only when a
+            // later refresh or inference request actually sends traffic.
+            return managed::kimi::normalize(payload);
         }
         ManagedOAuthAdapterBackend::BuiltinCodex => {
             let normalized = managed::codex::normalize(payload)?;

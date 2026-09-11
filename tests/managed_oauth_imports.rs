@@ -48,6 +48,8 @@ fn active_input(tenant: &str, source: char, digest: char) -> ImportManagedOAuthA
         tenant_external_id: tenant.into(),
         source_key: source.to_string().repeat(64),
         payload_digest: digest.to_string().repeat(64),
+        source_identity_hash: None,
+        source_document_sha256: None,
         contract_version: 1,
         account_name: "Imported Codex".into(),
         config: json!({"base_url": "https://api.example.test"}),
@@ -64,6 +66,22 @@ fn active_input(tenant: &str, source: char, digest: char) -> ImportManagedOAuthA
         status: ManagedOAuthImportStatus::Active,
         adapter: test_adapter(),
     }
+}
+
+fn kimi_input(tenant: &str, source: char, digest: char) -> ImportManagedOAuthAccountInput {
+    let mut input = active_input(tenant, source, digest);
+    input.source_identity_hash = Some(source.to_string().repeat(64));
+    input.source_document_sha256 = Some(digest.to_string().repeat(64));
+    input.account_name = format!("Kimi account {}", source.to_string().repeat(64));
+    input.config = json!({
+        "base_url": "https://api.kimi.com/coding",
+        "network_scope": "public",
+        "reservation_token_bounds": {}
+    });
+    input.adapter = ProviderCatalog::builtins()
+        .managed_oauth_adapter_for_source("kimi")
+        .unwrap();
+    input
 }
 
 fn disabled_input(tenant: &str, source: char, digest: char) -> ImportManagedOAuthAccountInput {
@@ -92,6 +110,84 @@ async fn sqlite_database(label: &str) -> (tempfile::TempDir, String, Database) {
     let database = Database::connect_with_max(&url, 16).await.unwrap();
     database.migrate().await.unwrap();
     (directory, url, database)
+}
+
+async fn source_identity_fingerprint_contract(database: &Database, tenant: &str) {
+    let mut input = active_input(tenant, 'a', 'b');
+    input.source_identity_hash = Some("1".repeat(64));
+    input.source_document_sha256 = Some("2".repeat(64));
+    let created = database
+        .import_cpa_managed_oauth_account(input.clone(), PEPPER)
+        .await
+        .unwrap();
+    assert_eq!(
+        created.account.import_source_identity_hash.as_deref(),
+        Some("1111111111111111111111111111111111111111111111111111111111111111")
+    );
+    assert_eq!(
+        created.account.import_source_document_sha256.as_deref(),
+        Some("2222222222222222222222222222222222222222222222222222222222222222")
+    );
+
+    let replay = database
+        .import_cpa_managed_oauth_account(input.clone(), PEPPER)
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.account.id, created.account.id);
+    let inventory = database.list_upstream_accounts(tenant).await.unwrap();
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(
+        inventory[0].import_source_identity_hash,
+        input.source_identity_hash
+    );
+    assert_eq!(
+        inventory[0].import_source_document_sha256,
+        input.source_document_sha256
+    );
+
+    let mut rekeyed_identity = input;
+    rekeyed_identity.source_key = "3".repeat(64);
+    rekeyed_identity.account_name = "Another imported account".into();
+    let rekeyed = database
+        .import_cpa_managed_oauth_account(rekeyed_identity, PEPPER)
+        .await
+        .unwrap();
+    assert!(rekeyed.replayed);
+    assert_eq!(rekeyed.account.id, created.account.id);
+}
+
+async fn atomic_kimi_cohort_contract(database: &Database, tenant: &str) {
+    let inputs = vec![kimi_input(tenant, 'a', 'b'), kimi_input(tenant, 'c', 'd')];
+    let created = database
+        .import_cpa_managed_kimi_cohort(inputs.clone(), PEPPER)
+        .await
+        .unwrap();
+    assert_eq!(created.created, 2);
+    assert_eq!(created.accounts.len(), 2);
+    assert_eq!(
+        created.accounts[0].import_source_identity_hash,
+        inputs[0].source_identity_hash
+    );
+    assert_eq!(
+        created.accounts[1].import_source_identity_hash,
+        inputs[1].source_identity_hash
+    );
+
+    let mut replay_inputs = inputs;
+    for input in &mut replay_inputs {
+        input.status = ManagedOAuthImportStatus::RefreshRequired;
+        if let UpstreamCredential::OAuth { expires_at, .. } = &mut input.credential {
+            *expires_at = Some(unix_millis() - 1);
+        }
+    }
+    let replayed = database
+        .import_cpa_managed_kimi_cohort(replay_inputs, PEPPER)
+        .await
+        .unwrap();
+    assert_eq!(replayed.created, 0);
+    assert_eq!(replayed.accounts[0].id, created.accounts[0].id);
+    assert_eq!(replayed.accounts[1].id, created.accounts[1].id);
 }
 
 #[tokio::test]
@@ -126,6 +222,31 @@ async fn fresh_sqlite_migrates_to_v34_and_exact_replay_keeps_generation_one() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn sqlite_persists_and_uniquely_indexes_operator_source_identity() {
+    let (_directory, url, database) = sqlite_database("source-fingerprints").await;
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    let migration_name: String =
+        sqlx::query_scalar("SELECT name FROM schema_migrations WHERE version = 75")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(migration_name, "managed OAuth source identity fingerprints");
+    source_identity_fingerprint_contract(&database, "managed-source-fingerprint-sqlite").await;
+
+    let indexes: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_index_list('upstream_account_imports')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "upstream_account_imports_source_identity_idx")
+    );
+    atomic_kimi_cohort_contract(&database, "managed-kimi-cohort-sqlite").await;
 }
 
 #[tokio::test]
@@ -613,6 +734,12 @@ async fn postgres_same_and_mixed_payload_imports_are_serialized() {
     let database = Database::connect_with_max(&database_url, 24).await.unwrap();
     database.migrate().await.unwrap();
     let suffix = Uuid::now_v7();
+    source_identity_fingerprint_contract(
+        &database,
+        &format!("managed-source-fingerprint-pg-{suffix}"),
+    )
+    .await;
+    atomic_kimi_cohort_contract(&database, &format!("managed-kimi-cohort-pg-{suffix}")).await;
     postgres_concurrent_import_case(database.clone(), format!("managed-pg-same-{suffix}"), false)
         .await;
     postgres_concurrent_import_case(database, format!("managed-pg-mixed-{suffix}"), true).await;

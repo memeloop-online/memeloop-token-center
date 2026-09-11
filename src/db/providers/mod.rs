@@ -6,8 +6,8 @@ mod routes;
 
 pub use accounts::{CreateUpstreamAccountInput, UpdateUpstreamAccountInput};
 pub use imports::{
-    ImportManagedOAuthAccountInput, ManagedOAuthImportResult, ManagedOAuthImportStatus,
-    NativeCodexUpgradeReport, NativeCodexUpgradeTarget,
+    ImportManagedOAuthAccountInput, ManagedOAuthCohortImportResult, ManagedOAuthImportResult,
+    ManagedOAuthImportStatus, NativeCodexUpgradeReport, NativeCodexUpgradeTarget,
 };
 pub use model_catalog::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, DiscoveredUpstreamModel,

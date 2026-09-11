@@ -133,6 +133,11 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(MAX_MANAGED_OAUTH_IMPORT_REQUEST)),
         )
         .route(
+            "/internal/v1/imports/cpa/managed-oauth/kimi-cohort",
+            post(import_cpa_managed_kimi_cohort)
+                .layer(DefaultBodyLimit::max(MAX_MANAGED_OAUTH_COHORT_REQUEST)),
+        )
+        .route(
             "/internal/v1/migrations/openai-codex/prepare",
             post(prepare_native_codex_upgrade),
         )

@@ -5,7 +5,7 @@ use serde::Serialize;
 
 const CPA_MANAGED_OAUTH_IMPORT_KIND: &str = "cpa_managed_oauth";
 const CPA_MANAGED_OAUTH_IMPORT_CONTRACT_VERSION: i64 = 1;
-const CPA_MANAGED_OAUTH_NAME_LOCK_SEED: i64 = 734_627_102_948_335;
+const CPA_MANAGED_OAUTH_TENANT_LOCK_SEED: i64 = 734_627_102_948_335;
 const NATIVE_CODEX_UPGRADE_MAX_ACCOUNTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +31,10 @@ pub struct ImportManagedOAuthAccountInput {
     pub source_key: String,
     /// HMAC-SHA256 of the canonical source payload, encoded as lowercase hex.
     pub payload_digest: String,
+    /// Optional operator-keyed source identity. New batch importers provide
+    /// this together with `source_document_sha256`; legacy callers leave both null.
+    pub source_identity_hash: Option<String>,
+    pub source_document_sha256: Option<String>,
     pub contract_version: i64,
     pub account_name: String,
     pub config: Value,
@@ -45,6 +49,12 @@ pub struct ManagedOAuthImportResult {
     pub account: UpstreamAccountView,
     pub replayed: bool,
     pub updated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ManagedOAuthCohortImportResult {
+    pub accounts: Vec<UpstreamAccountView>,
+    pub created: usize,
 }
 
 /// A compare-and-swap snapshot emitted by the review phase of the controlled
@@ -261,7 +271,7 @@ impl Database {
         validate_lowercase_hex_digest(source_key, "managed OAuth source key")?;
         validate_lowercase_hex_digest(payload_digest, "managed OAuth payload digest")?;
         let row = sqlx::query(
-            "SELECT i.payload_digest, a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_account_imports i JOIN tenants t ON t.id = i.tenant_id JOIN upstream_accounts a ON a.id = i.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE t.external_id = $1 AND i.import_kind = $2 AND i.source_key = $3",
+            "SELECT i.payload_digest, i.source_identity_hash AS import_source_identity_hash, i.source_document_sha256 AS import_source_document_sha256, a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_account_imports i JOIN tenants t ON t.id = i.tenant_id JOIN upstream_accounts a ON a.id = i.upstream_account_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE t.external_id = $1 AND i.import_kind = $2 AND i.source_key = $3",
         )
         .bind(tenant_external_id)
         .bind(CPA_MANAGED_OAUTH_IMPORT_KIND)
@@ -333,34 +343,40 @@ impl Database {
             .await?
             .try_get("id")?;
 
-        if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
-                .bind(
-                    serde_json::to_string(&(tenant_id.as_str(), name.as_str()))
-                        .map_err(|_| AppError::Internal)?,
-                )
-                .bind(CPA_MANAGED_OAUTH_NAME_LOCK_SEED)
-                .execute(&mut *tx)
-                .await?;
-        }
+        lock_managed_oauth_tenant(self.backend, &mut tx, &tenant_id).await?;
 
         let claimed = sqlx::query(
-            "INSERT INTO upstream_account_imports (tenant_id, import_kind, source_key, contract_version, payload_digest, upstream_account_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(tenant_id, import_kind, source_key) DO NOTHING",
+            "INSERT INTO upstream_account_imports (tenant_id, import_kind, source_key, contract_version, payload_digest, source_identity_hash, source_document_sha256, upstream_account_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
         )
         .bind(&tenant_id)
         .bind(CPA_MANAGED_OAUTH_IMPORT_KIND)
         .bind(&input.source_key)
         .bind(input.contract_version)
         .bind(&input.payload_digest)
+        .bind(&input.source_identity_hash)
+        .bind(&input.source_document_sha256)
         .bind(account_id.to_string())
         .bind(now)
         .execute(&mut *tx)
         .await?;
 
         if claimed.rows_affected() == 0 {
-            let row =
-                managed_oauth_import_row(self.backend, &mut tx, &tenant_id, &input.source_key)
-                    .await?;
+            let row = managed_oauth_import_row(
+                self.backend,
+                &mut tx,
+                &tenant_id,
+                &input.source_key,
+                input.source_identity_hash.as_deref(),
+            )
+            .await?
+            .ok_or(AppError::Internal)?;
+            if row.try_get::<Option<String>, _>("import_source_identity_hash")?
+                != input.source_identity_hash
+            {
+                return Err(AppError::Conflict(
+                    "managed OAuth source identity already maps to another import".into(),
+                ));
+            }
             let existing_digest: String = row.try_get("payload_digest")?;
             let existing_contract: i64 = row.try_get("contract_version")?;
             if existing_contract != input.contract_version {
@@ -457,20 +473,29 @@ impl Database {
                     "managed OAuth source changed during credential refresh".into(),
                 ));
             }
-            sqlx::query(
-                "UPDATE upstream_account_imports SET payload_digest = $1 WHERE tenant_id = $2 AND import_kind = $3 AND source_key = $4",
+            let updated_import = sqlx::query(
+                "UPDATE upstream_account_imports SET payload_digest = $1, source_document_sha256 = $2 WHERE tenant_id = $3 AND import_kind = $4 AND (source_key = $5 OR ($6 IS NOT NULL AND source_identity_hash = $6))",
             )
             .bind(&input.payload_digest)
+            .bind(&input.source_document_sha256)
             .bind(&tenant_id)
             .bind(CPA_MANAGED_OAUTH_IMPORT_KIND)
             .bind(&input.source_key)
+            .bind(&input.source_identity_hash)
             .execute(&mut *tx)
             .await?;
+            if updated_import.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "managed OAuth source changed during provenance update".into(),
+                ));
+            }
             let existing_id = parse_uuid(existing_id)?;
             tx.commit().await?;
-            let (account, _) = self
+            let (mut account, _) = self
                 .upstream_account_with_credential(existing_id, key_material)
                 .await?;
+            account.import_source_identity_hash = input.source_identity_hash;
+            account.import_source_document_sha256 = input.source_document_sha256;
             return Ok(ManagedOAuthImportResult {
                 account,
                 replayed: false,
@@ -532,6 +557,8 @@ impl Database {
                 can_refresh,
                 can_rotate: true,
                 can_reauthorize: false,
+                import_source_identity_hash: input.source_identity_hash,
+                import_source_document_sha256: input.source_document_sha256,
                 route_count: 0,
                 created_at: now,
                 updated_at: now,
@@ -539,6 +566,197 @@ impl Database {
             replayed: false,
             updated: false,
         })
+    }
+
+    /// Atomically import the exact two-account native Kimi migration cohort.
+    /// Both source identities are validated and locked at tenant scope before
+    /// any account row becomes visible; a mixed replay/create converges in one
+    /// transaction and any conflict rolls the entire cohort back.
+    pub async fn import_cpa_managed_kimi_cohort(
+        &self,
+        inputs: Vec<ImportManagedOAuthAccountInput>,
+        key_material: &[u8],
+    ) -> Result<ManagedOAuthCohortImportResult, AppError> {
+        if inputs.len() != 2 {
+            return Err(AppError::BadRequest(
+                "native Kimi cohort import requires exactly two accounts".into(),
+            ));
+        }
+        let tenant_external_id = inputs[0].tenant_external_id.clone();
+        let mut source_identities = std::collections::BTreeSet::new();
+        for input in &inputs {
+            validate_managed_oauth_import(input)?;
+            validate_initial_status(
+                input.status,
+                &input.credential,
+                input.adapter.can_refresh(),
+                unix_millis(),
+            )?;
+            if input.tenant_external_id != tenant_external_id
+                || input.adapter.provider_driver() != crate::oauth::managed::kimi::PROVIDER_DRIVER
+                || !source_identities.insert(
+                    input
+                        .source_identity_hash
+                        .as_deref()
+                        .ok_or_else(|| {
+                            AppError::BadRequest(
+                                "native Kimi cohort requires source fingerprints".into(),
+                            )
+                        })?
+                        .to_owned(),
+                )
+            {
+                return Err(AppError::BadRequest(
+                    "native Kimi cohort accounts must have distinct source identities".into(),
+                ));
+            }
+        }
+
+        let now = unix_millis();
+        let mut prepared = Vec::with_capacity(2);
+        for input in inputs {
+            prepared.push((
+                serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?,
+                seal_credential(&input.credential, key_material)?,
+                input,
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, $3) ON CONFLICT(external_id) DO NOTHING",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&tenant_external_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let tenant_id: String = sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
+            .bind(&tenant_external_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("id")?;
+        lock_managed_oauth_tenant(self.backend, &mut tx, &tenant_id).await?;
+
+        let mut accounts = Vec::with_capacity(2);
+        let mut created = 0;
+        for (config_json, credential_ciphertext, input) in prepared {
+            let existing = managed_oauth_import_row(
+                self.backend,
+                &mut tx,
+                &tenant_id,
+                &input.source_key,
+                input.source_identity_hash.as_deref(),
+            )
+            .await?;
+            if let Some(row) = existing {
+                if row.try_get::<Option<String>, _>("import_source_identity_hash")?
+                    != input.source_identity_hash
+                {
+                    return Err(AppError::Conflict(
+                        "managed OAuth source identity already maps to another import".into(),
+                    ));
+                }
+                if row.try_get::<i64, _>("contract_version")? != input.contract_version
+                    || row.try_get::<String, _>("payload_digest")? != input.payload_digest
+                {
+                    return Err(AppError::Conflict(
+                        "managed OAuth import source changed and requires reauthorization".into(),
+                    ));
+                }
+                accounts.push(upstream_account_view(row)?);
+                continue;
+            }
+
+            if input.status != ManagedOAuthImportStatus::Active {
+                return Err(AppError::BadRequest(
+                    "new native Kimi cohort accounts must be active and unexpired".into(),
+                ));
+            }
+            let name = input.account_name.trim().to_owned();
+            if sqlx::query("SELECT id FROM upstream_accounts WHERE tenant_id = $1 AND name = $2")
+                .bind(&tenant_id)
+                .bind(&name)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some()
+            {
+                return Err(AppError::Conflict(
+                    "another upstream provider already uses this name".into(),
+                ));
+            }
+
+            let account_id = Uuid::now_v7();
+            let claimed = sqlx::query(
+                "INSERT INTO upstream_account_imports (tenant_id, import_kind, source_key, contract_version, payload_digest, source_identity_hash, source_document_sha256, upstream_account_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
+            )
+            .bind(&tenant_id)
+            .bind(CPA_MANAGED_OAUTH_IMPORT_KIND)
+            .bind(&input.source_key)
+            .bind(input.contract_version)
+            .bind(&input.payload_digest)
+            .bind(&input.source_identity_hash)
+            .bind(&input.source_document_sha256)
+            .bind(account_id.to_string())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            if claimed.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "managed OAuth cohort changed during import".into(),
+                ));
+            }
+            let oauth_refresh_url = input
+                .adapter
+                .can_refresh()
+                .then(|| input.adapter.refresh_url().to_owned());
+            sqlx::query(
+                "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, created_at, updated_at) VALUES ($1, $2, $3, $4, 'oauth', $5, $6, 1, $1, $4, $7, $8, $8)",
+            )
+            .bind(account_id.to_string())
+            .bind(&tenant_id)
+            .bind(&name)
+            .bind(input.adapter.provider_driver())
+            .bind(config_json)
+            .bind(input.status.as_database_status())
+            .bind(oauth_refresh_url)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at) VALUES ($1, $2, 1, $3, $4, $5)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(account_id.to_string())
+            .bind(credential_ciphertext)
+            .bind(input.credential.expires_at())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            accounts.push(UpstreamAccountView {
+                id: account_id,
+                tenant_id: parse_uuid(tenant_id.clone())?,
+                tenant_external_id: Some(tenant_external_id.clone()),
+                name,
+                driver: input.adapter.provider_driver().to_owned(),
+                auth_kind: "oauth".to_owned(),
+                connection_method: "oauth".to_owned(),
+                credential_generation: 1,
+                status: input.status.as_database_status().to_owned(),
+                config: input.config,
+                credential_expires_at: input.credential.expires_at(),
+                can_refresh: input.adapter.can_refresh(),
+                can_rotate: true,
+                can_reauthorize: false,
+                import_source_identity_hash: input.source_identity_hash,
+                import_source_document_sha256: input.source_document_sha256,
+                route_count: 0,
+                created_at: now,
+                updated_at: now,
+            });
+            created += 1;
+        }
+        tx.commit().await?;
+        Ok(ManagedOAuthCohortImportResult { accounts, created })
     }
 
     pub async fn managed_oauth_lifecycle(
@@ -718,27 +936,59 @@ async fn managed_oauth_import_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     tenant_id: &str,
     source_key: &str,
-) -> Result<sqlx::any::AnyRow, AppError> {
+    source_identity_hash: Option<&str>,
+) -> Result<Option<sqlx::any::AnyRow>, AppError> {
     let select = match backend {
         DatabaseBackend::PostgreSql => {
-            "SELECT i.payload_digest, i.contract_version, a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_account_imports i JOIN upstream_accounts a ON a.id = i.upstream_account_id JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE i.tenant_id = $1 AND i.import_kind = $2 AND i.source_key = $3 FOR UPDATE OF i, a, c"
+            "SELECT i.source_key, i.payload_digest, i.contract_version, i.source_identity_hash AS import_source_identity_hash, i.source_document_sha256 AS import_source_document_sha256, a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_account_imports i JOIN upstream_accounts a ON a.id = i.upstream_account_id JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE i.tenant_id = $1 AND i.import_kind = $2 AND (i.source_key = $3 OR ($4 IS NOT NULL AND i.source_identity_hash = $4)) ORDER BY CASE WHEN $4 IS NOT NULL AND i.source_identity_hash = $4 THEN 0 ELSE 1 END LIMIT 1 FOR UPDATE OF i, a, c"
         }
         DatabaseBackend::Sqlite => {
-            "SELECT i.payload_digest, i.contract_version, a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_account_imports i JOIN upstream_accounts a ON a.id = i.upstream_account_id JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE i.tenant_id = $1 AND i.import_kind = $2 AND i.source_key = $3"
+            "SELECT i.source_key, i.payload_digest, i.contract_version, i.source_identity_hash AS import_source_identity_hash, i.source_document_sha256 AS import_source_document_sha256, a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_account_imports i JOIN upstream_accounts a ON a.id = i.upstream_account_id JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE i.tenant_id = $1 AND i.import_kind = $2 AND (i.source_key = $3 OR ($4 IS NOT NULL AND i.source_identity_hash = $4)) ORDER BY CASE WHEN $4 IS NOT NULL AND i.source_identity_hash = $4 THEN 0 ELSE 1 END LIMIT 1"
         }
     };
     sqlx::query(select)
         .bind(tenant_id)
         .bind(CPA_MANAGED_OAUTH_IMPORT_KIND)
         .bind(source_key)
+        .bind(source_identity_hash)
         .fetch_optional(&mut **tx)
-        .await?
-        .ok_or(AppError::Internal)
+        .await
+        .map_err(AppError::from)
+}
+
+async fn lock_managed_oauth_tenant(
+    backend: DatabaseBackend,
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    tenant_id: &str,
+) -> Result<(), AppError> {
+    if matches!(backend, DatabaseBackend::PostgreSql) {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+            .bind(tenant_id)
+            .bind(CPA_MANAGED_OAUTH_TENANT_LOCK_SEED)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 fn validate_managed_oauth_import(input: &ImportManagedOAuthAccountInput) -> Result<(), AppError> {
     validate_lowercase_hex_digest(&input.source_key, "managed OAuth source key")?;
     validate_lowercase_hex_digest(&input.payload_digest, "managed OAuth payload digest")?;
+    match (
+        input.source_identity_hash.as_deref(),
+        input.source_document_sha256.as_deref(),
+    ) {
+        (Some(identity), Some(document)) => {
+            validate_lowercase_hex_digest(identity, "managed OAuth source identity hash")?;
+            validate_lowercase_hex_digest(document, "managed OAuth source document SHA-256")?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(AppError::BadRequest(
+                "managed OAuth source fingerprints must be supplied together".into(),
+            ));
+        }
+    }
     if input.contract_version != CPA_MANAGED_OAUTH_IMPORT_CONTRACT_VERSION {
         return Err(AppError::BadRequest(
             "unsupported managed OAuth import contract version".into(),

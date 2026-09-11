@@ -533,6 +533,8 @@ mod tests {
             can_refresh: true,
             can_rotate: false,
             can_reauthorize: true,
+            import_source_identity_hash: None,
+            import_source_document_sha256: None,
             route_count: 0,
             created_at: now,
             updated_at: now,

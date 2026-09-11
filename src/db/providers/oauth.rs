@@ -832,6 +832,11 @@ impl Database {
                     .as_deref(),
                 row.try_get::<Option<String>, _>("oauth_driver")?.as_deref(),
             ),
+            import_source_identity_hash: row.try_get("import_source_identity_hash").ok().flatten(),
+            import_source_document_sha256: row
+                .try_get("import_source_document_sha256")
+                .ok()
+                .flatten(),
             route_count: row.try_get("route_count")?,
             created_at: row.try_get("created_at")?,
             updated_at,

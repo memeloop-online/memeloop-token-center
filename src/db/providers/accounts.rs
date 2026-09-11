@@ -127,6 +127,8 @@ impl Database {
                 && input.driver != "cpa-gemini-oauth-legacy",
             can_rotate: auth_kind != "none",
             can_reauthorize,
+            import_source_identity_hash: None,
+            import_source_document_sha256: None,
             route_count: 0,
             created_at: now,
             updated_at: now,
@@ -492,6 +494,8 @@ impl Database {
                    a.name, a.driver, a.auth_kind, a.config_json, a.status,
                    a.credential_generation, a.oauth_session_id, a.oauth_driver,
                    a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at,
+                   imported.source_identity_hash AS import_source_identity_hash,
+                   imported.source_document_sha256 AS import_source_document_sha256,
                    COALESCE(route_counts.route_count, 0) AS route_count
             FROM page a
             JOIN tenants t ON t.id = a.tenant_id
@@ -502,6 +506,9 @@ impl Database {
             LEFT JOIN page_route_counts route_counts
               ON route_counts.tenant_id = a.tenant_id
              AND route_counts.upstream_account_id = a.id
+            LEFT JOIN upstream_account_imports imported
+              ON imported.tenant_id = a.tenant_id
+             AND imported.upstream_account_id = a.id
             ORDER BY a.created_at DESC, a.id DESC
             "#,
         )
@@ -629,6 +636,8 @@ pub(super) fn upstream_account_view(
         can_refresh,
         can_rotate,
         can_reauthorize,
+        import_source_identity_hash: row.try_get("import_source_identity_hash").ok().flatten(),
+        import_source_document_sha256: row.try_get("import_source_document_sha256").ok().flatten(),
         route_count: row.try_get("route_count")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,

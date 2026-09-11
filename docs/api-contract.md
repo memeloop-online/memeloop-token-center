@@ -44,6 +44,21 @@ with none of those retained dependencies and repeats the check transactionally,
 so a stale readiness read cannot delete a newly referenced upstream. Otherwise
 the upstream remains disabled for audit and DELETE returns 409.
 
+Managed Kimi migration uses
+`POST /internal/v1/imports/cpa/managed-oauth/kimi-cohort` with the advertised
+`atomic_kimi_cohort_v1` contract. The request contains exactly two accounts,
+each with an operator-keyed source identity HMAC and the SHA-256 of its
+canonical document. The service validates both documents without DNS or other
+provider calls, then takes the same tenant-scoped managed-import lock used by
+single imports and creates/replays both accounts in one transaction. Names use
+a server-keyed neutral suffix, so paths, emails, device identifiers and tokens
+are not exposed. The atomic cohort rejects an expired or disabled new member
+with zero writes, while an exact replay remains time-independent;
+backward-compatible single imports persist expired documents as disabled and
+exclude them from automatic refresh candidates. Inventory and import responses
+return the two source fingerprints; historical imports return null rather than
+fabricated provenance.
+
 Model routes are tenant-scoped, versioned and optimistic-concurrency protected.
 Route selection honors enabled state, grants, priority, health and bounded
 round-robin behavior. A client may access only visible models. Historical request

@@ -11,6 +11,14 @@ Imports retain access and refresh tokens, optional expiry, device ID, OAuth scop
 token type and disabled state. Unknown fields fail closed. Optional private SOCKS
 proxies retain their original URL and require the existing global-operator
 outbound authorization; they are never copied into public account configuration.
+Import normalization is entirely local and performs no DNS or provider call.
+The two-account migration uses the advertised `atomic_kimi_cohort_v1` endpoint,
+which holds one tenant-scoped lock and database transaction across both stable
+source identities. Account names contain only a server-keyed neutral source
+suffix. The atomic cohort rejects an expired/disabled new credential before
+writing while preserving time-independent exact replay; the compatible
+single-import path creates expired credentials disabled and they never enter
+the automatic refresh candidate set.
 
 Refresh uses only `https://auth.kimi.com/api/oauth/token`, the fixed public client
 ID and account-specific device headers. Response size and time are bounded.
