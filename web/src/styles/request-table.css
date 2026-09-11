@@ -115,3 +115,8 @@
     min-width: 16rem;
   }
 }
+.request-upstream-cell span {
+  display: block;
+  margin-bottom: 0.25rem;
+  overflow-wrap: anywhere;
+}
