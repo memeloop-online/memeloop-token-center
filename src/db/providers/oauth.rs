@@ -97,7 +97,11 @@ impl Database {
         let current_credential = open_credential(&ciphertext, key_material)?;
         let current_proxy = current_credential
             .proxy()
-            .map(|(value, _)| value.to_owned());
+            .map(|(value, scope)| (value.to_owned(), scope));
+        let proxy_changed = current_proxy
+            .as_ref()
+            .map(|(value, scope)| (value.as_str(), *scope))
+            != Some((proxy_url.as_str(), crate::network::OutboundScope::Private));
         let replacement = current_credential
             .clone()
             .with_oauth_proxy(proxy_url.clone())?;
@@ -105,7 +109,7 @@ impl Database {
         let new_metadata = replacement.codex_proxy_metadata(key_material)?;
         let mut view = upstream_account_view(row)?;
 
-        if current_proxy.as_deref() != Some(proxy_url.as_str()) {
+        if proxy_changed {
             let replacement_ciphertext = seal_credential(&replacement, key_material)?;
             let next_generation = generation.checked_add(1).ok_or(AppError::Internal)?;
             let next_updated_at = now.max(updated_at.saturating_add(1));
@@ -177,7 +181,7 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
-        Ok((view, current_proxy.as_deref() != Some(proxy_url.as_str())))
+        Ok((view, proxy_changed))
     }
 
     pub async fn disconnect_upstream_oauth(

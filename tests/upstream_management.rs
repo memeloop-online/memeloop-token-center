@@ -395,7 +395,7 @@ async fn legacy_invalid_codex_proxy_remains_listable_and_can_be_repaired() {
         .await
         .unwrap();
     let pepper = state.config.key_pepper.as_bytes();
-    let credential = |proxy_url: &str| UpstreamCredential::OAuth {
+    let credential = |proxy_url: &str, proxy_scope| UpstreamCredential::OAuth {
         access_token: "repair-access-secret".into(),
         refresh_token: Some("repair-refresh-secret".into()),
         expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
@@ -406,7 +406,7 @@ async fn legacy_invalid_codex_proxy_remains_listable_and_can_be_repaired() {
             "account_id": "repair-account"
         })),
         proxy_url: Some(proxy_url.into()),
-        proxy_network_scope: Some(memeloop_token_center::network::OutboundScope::Private),
+        proxy_network_scope: Some(proxy_scope),
     };
     let legacy_proxy = "socks5h://legacy-user:legacy-secret@proxy.example.test:1080";
     let legacy = state
@@ -417,7 +417,31 @@ async fn legacy_invalid_codex_proxy_remains_listable_and_can_be_repaired() {
                 name: "Legacy proxy".into(),
                 driver: "http-json".into(),
                 config: json!({"base_url": "https://api.example.test"}),
-                credential: credential(legacy_proxy),
+                credential: credential(
+                    legacy_proxy,
+                    memeloop_token_center::network::OutboundScope::Private,
+                ),
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("openai_codex_device".into()),
+                oauth_refresh_url: Some("https://auth.openai.com/oauth/token".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let invalid_scope_proxy = "socks5h://100.64.0.22:1080";
+    let invalid_scope = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "codex-proxy-repair-tenant".into(),
+                name: "Invalid proxy scope".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url": "https://api.example.test"}),
+                credential: credential(
+                    invalid_scope_proxy,
+                    memeloop_token_center::network::OutboundScope::Public,
+                ),
                 oauth_session_id: Some(Uuid::now_v7()),
                 oauth_driver: Some("openai_codex_device".into()),
                 oauth_refresh_url: Some("https://auth.openai.com/oauth/token".into()),
@@ -438,7 +462,10 @@ async fn legacy_invalid_codex_proxy_remains_listable_and_can_be_repaired() {
                     "network_scope": "public",
                     "reservation_token_bounds": {}
                 }),
-                credential: credential("socks5h://100.64.0.20:1080"),
+                credential: credential(
+                    "socks5h://100.64.0.20:1080",
+                    memeloop_token_center::network::OutboundScope::Private,
+                ),
                 oauth_session_id: Some(Uuid::now_v7()),
                 oauth_driver: Some("openai_codex_device".into()),
                 oauth_refresh_url: Some("https://auth.openai.com/oauth/token".into()),
@@ -463,6 +490,21 @@ async fn legacy_invalid_codex_proxy_remains_listable_and_can_be_repaired() {
     .execute(&audit_pool)
     .await
     .unwrap();
+    sqlx::query(
+        "UPDATE upstream_accounts SET driver = 'openai-codex', config_json = $1 WHERE id = $2",
+    )
+    .bind(
+        json!({
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "network_scope": "public",
+            "reservation_token_bounds": {}
+        })
+        .to_string(),
+    )
+    .bind(invalid_scope.id.to_string())
+    .execute(&audit_pool)
+    .await
+    .unwrap();
 
     let listed = state
         .db
@@ -475,7 +517,7 @@ async fn legacy_invalid_codex_proxy_remains_listable_and_can_be_repaired() {
         )
         .await
         .unwrap();
-    assert_eq!(listed.len(), 2);
+    assert_eq!(listed.len(), 3);
     let legacy_view = listed.iter().find(|view| view.id == legacy.id).unwrap();
     assert!(legacy_view.has_proxy);
     assert_eq!(legacy_view.proxy_scheme, None);
@@ -486,6 +528,17 @@ async fn legacy_invalid_codex_proxy_remains_listable_and_can_be_repaired() {
     );
     assert!(legacy_view.proxy_fingerprint.is_some());
     assert!(legacy_view.can_update_transport_proxy);
+    let invalid_scope_view = listed
+        .iter()
+        .find(|view| view.id == invalid_scope.id)
+        .unwrap();
+    assert!(invalid_scope_view.has_proxy);
+    assert_eq!(invalid_scope_view.proxy_scheme, None);
+    assert!(!invalid_scope_view.proxy_remote_dns);
+    assert_eq!(
+        invalid_scope_view.proxy_label.as_deref(),
+        Some("Configured proxy requires update")
+    );
     let valid_view = listed.iter().find(|view| view.id == valid.id).unwrap();
     assert_eq!(valid_view.proxy_scheme.as_deref(), Some("socks5h"));
     assert!(valid_view.proxy_remote_dns);
@@ -536,6 +589,50 @@ async fn legacy_invalid_codex_proxy_remains_listable_and_can_be_repaired() {
         assert!(!value.contains("legacy-secret"));
         assert!(!value.contains("proxy.example.test"));
     }
+
+    let (scope_repaired, changed) = state
+        .db
+        .rotate_codex_transport_proxy(
+            invalid_scope.id,
+            "codex-proxy-repair-tenant",
+            invalid_scope_proxy.into(),
+            invalid_scope.updated_at,
+            invalid_scope.credential_generation,
+            "repair-legacy-proxy-scope",
+            None,
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert!(changed);
+    assert_eq!(
+        scope_repaired.credential_generation,
+        invalid_scope.credential_generation + 1
+    );
+    let (persisted, persisted_credential, _, _) = state
+        .db
+        .upstream_account_with_current_credential(invalid_scope.id, pepper)
+        .await
+        .unwrap();
+    assert_eq!(
+        persisted.credential_generation,
+        scope_repaired.credential_generation
+    );
+    assert_eq!(
+        persisted_credential.proxy(),
+        Some((
+            invalid_scope_proxy,
+            memeloop_token_center::network::OutboundScope::Private
+        ))
+    );
+    let scope_audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_transport_proxy_audit WHERE upstream_account_id = $1",
+    )
+    .bind(invalid_scope.id.to_string())
+    .fetch_one(&audit_pool)
+    .await
+    .unwrap();
+    assert_eq!(scope_audit_count, 1);
 }
 
 #[tokio::test]
