@@ -4,6 +4,20 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'quota.retryConfirm': '重试同一次确认', 'quota.retryConfirmSameOperation': '上次确认结果未知。此操作仅使用相同操作 ID 与幂等键重新确认，不会创建新的重置操作。继续？',
+  'connection.title': '服务地址与网络出口', 'connection.fixed': '固定官方地址',
+  'connection.proxy': '网络代理', 'connection.proxyUnknown': '代理状态未知', 'connection.proxyConfigured': '已配置代理',
+  'connection.proxyMissing': '未配置 · 无法启用 Codex', 'connection.proxyNotManaged': '由服务端网络配置管理',
+  'connection.remoteDns': '远端 DNS', 'connection.localDns': '本地 DNS',
+  'connection.endpointHint': 'Base URL 是上游 API 服务地址，不是网络代理。固定官方地址不可修改；更换网络出口请单独配置网络代理。',
+  'connection.editProxy': '配置网络代理', 'connection.proxyUrl': '新的代理地址（不回显）',
+  'connection.proxyHint': 'Codex 仅支持私网 IP 地址的 socks5h:// 代理，在代理端解析 DNS。socks5:// 使用本地 DNS，无法用于 Codex。代理地址及认证信息保存后不会回显；留空不会删除原代理。',
+  'connection.proxyInvalid': '请输入带端口的 socks5h 私网 IP 地址（IPv6 地址需要方括号）。', 'connection.saveProxy': '保存网络代理',
+  'connection.saveFailed': '代理保存失败。请检查地址、权限或重新载入账号后重试；原配置未在此表单中清除。',
+  'connection.saved': '网络代理已保存。保存不会自动探测或刷新上游。',
+  'quota.refreshFailedRetained': '刷新失败，下方保留上次读取结果，不代表当前额度。可再次手动刷新。',
+  'quota.resetNoCredits': '暂无可用于重置的额度；请先刷新额度信息。',
+  'quota.resetExpiredState': '此次确认已过期，没有再次提交重置。',
   'language.zh': '中文', 'language.en': 'English',
   'theme.light': '切换到亮色主题', 'theme.dark': '切换到暗色主题',
   'shell.operator': '管理端', 'shell.selfService': '自助端',
@@ -405,6 +419,20 @@ const zh = {
 } as const;
 
 const en = {
+  'quota.retryConfirm': 'Retry the same confirmation', 'quota.retryConfirmSameOperation': 'The previous confirmation outcome is unknown. Retry with the same operation ID and idempotency key, without creating a new reset operation?',
+  'connection.title': 'Service endpoint and network egress', 'connection.fixed': 'Fixed official endpoint',
+  'connection.proxy': 'Network proxy', 'connection.proxyUnknown': 'Proxy status unknown', 'connection.proxyConfigured': 'Proxy configured',
+  'connection.proxyMissing': 'Missing · Codex cannot be enabled', 'connection.proxyNotManaged': 'Managed by server network configuration',
+  'connection.remoteDns': 'Remote DNS', 'connection.localDns': 'Local DNS',
+  'connection.endpointHint': 'Base URL is the upstream API endpoint, not a network proxy. Fixed official endpoints cannot be changed; configure network egress separately below.',
+  'connection.editProxy': 'Configure network proxy', 'connection.proxyUrl': 'New proxy URL (never displayed after saving)',
+  'connection.proxyHint': 'Codex requires socks5h:// with a private IP address and port, resolving DNS at the proxy. socks5:// uses local DNS and cannot be used for Codex. Saved addresses and credentials are not returned. Leaving this blank does not remove the existing proxy.',
+  'connection.proxyInvalid': 'Enter a socks5h private IP address with a port (brackets are required for IPv6).', 'connection.saveProxy': 'Save network proxy',
+  'connection.saveFailed': 'Proxy could not be saved. Check the address and permissions, or reload the account and retry. This form has not cleared the existing configuration.',
+  'connection.saved': 'Network proxy saved. Saving does not automatically probe or refresh the upstream.',
+  'quota.refreshFailedRetained': 'Refresh failed. The previous result remains below and may not reflect current quota. Retry manually.',
+  'quota.resetNoCredits': 'No applicable reset credits. Refresh quota information first.',
+  'quota.resetExpiredState': 'This confirmation expired. No reset was resubmitted.',
   'language.zh': '中文', 'language.en': 'English', 'theme.light': 'Switch to light theme', 'theme.dark': 'Switch to dark theme',
   'shell.operator': 'Operator', 'shell.selfService': 'Self-service',
   'common.connect': 'Connect', 'common.load': 'Continue', 'common.loading': 'Loading…', 'common.none': 'None', 'common.running': 'Running', 'common.select': 'Select', 'common.all': 'All',

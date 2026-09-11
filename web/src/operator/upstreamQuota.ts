@@ -23,6 +23,9 @@ export interface UpstreamQuotaSnapshot {
     limit_reached: boolean | null;
   }[];
   reset_capability: {
+    prepare_available?: boolean;
+    confirmation_required?: boolean;
+    retryable?: boolean;
     provider_supported: boolean | null;
     implementation_available: boolean;
     prepare_available: boolean;

@@ -1,0 +1,24 @@
+.upstream-connection { border: 1px solid var(--border); border-radius: 12px; padding: 16px; min-width: 0; }
+.upstream-connection h3 { margin: 0 0 12px; font-size: 14px; }
+.upstream-connection dl { display: grid; gap: 12px; margin: 0; }
+.upstream-connection dl > div { display: grid; grid-template-columns: minmax(100px, 140px) minmax(0, 1fr); gap: 12px; }
+.upstream-connection dt { font-size: 12px; color: var(--muted); }
+.upstream-connection dd { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; min-width: 0; }
+.upstream-connection code { overflow-wrap: anywhere; white-space: normal; }
+.upstream-connection p { font-size: 12px; line-height: 1.6; }
+.upstream-proxy-editor { display: grid; gap: 10px; margin-top: 16px; }
+.upstream-proxy-editor label { display: grid; gap: 8px; }
+.upstream-proxy-editor input { width: 100%; min-width: 0; }
+.provider-onboarding .rjsf fieldset { min-width: 0; }
+.provider-onboarding .rjsf fieldset fieldset { padding: 16px; margin: 16px 0; border: 1px solid var(--border); border-radius: 12px; }
+.provider-onboarding .rjsf legend { font-weight: 600; padding: 0 6px; }
+.provider-list .account-list { grid-template-columns: minmax(0, 1fr); }
+.provider-account { padding: 20px; }
+.provider-account > .account-meta { border-top: 1px solid var(--border); padding-top: 16px; width: 100%; }
+@media (min-width: 1100px) {
+  .provider-account > .account-main { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; align-items: start; }
+  .provider-account > .account-main > * { grid-column: 1 / -1; }
+  .provider-account > .account-main > .upstream-connection { grid-column: 1; }
+  .provider-account > .account-main > .provider-availability { grid-column: 2; }
+}
+@media (max-width: 600px) { .upstream-connection dl > div { grid-template-columns: 1fr; gap: 4px; } }
