@@ -14,6 +14,7 @@ use crate::network::{OutboundScope, has_safe_private_ip_literal_host};
 const CURRENT_ENVELOPE_VERSION: &str = "v2";
 pub(super) const LEGACY_ENVELOPE_VERSION: &str = "v1";
 pub(super) const ENVELOPE_AAD: &[u8] = b"memeloop-token-center/upstream-credential/v1";
+const PROXY_FINGERPRINT_DOMAIN: &[u8] = b"memeloop-token-center/upstream-proxy-fingerprint/v1";
 
 pub(super) const MAX_ADAPTER_STATE_BYTES: usize = 16 * 1024;
 pub(super) const MAX_ADAPTER_STATE_DEPTH: usize = 8;
@@ -65,6 +66,15 @@ pub enum UpstreamCredential {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proxy_network_scope: Option<OutboundScope>,
     },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UpstreamProxyMetadata {
+    pub(crate) has_proxy: bool,
+    pub(crate) scheme: Option<String>,
+    pub(crate) remote_dns: bool,
+    pub(crate) label: Option<String>,
+    pub(crate) fingerprint: Option<String>,
 }
 
 impl std::fmt::Debug for UpstreamCredential {
@@ -261,6 +271,66 @@ impl UpstreamCredential {
         }
     }
 
+    pub(crate) fn proxy_metadata(
+        &self,
+        key_material: &[u8],
+    ) -> Result<UpstreamProxyMetadata, AppError> {
+        let Some((proxy_url, _)) = self.proxy() else {
+            return Ok(UpstreamProxyMetadata::default());
+        };
+        validate_proxy_url(proxy_url)?;
+        let parsed = url::Url::parse(proxy_url).map_err(|_| AppError::Internal)?;
+        let scheme = parsed.scheme().to_owned();
+        let remote_dns = scheme == "socks5h";
+        let mut hasher = Sha256::new();
+        hasher.update(PROXY_FINGERPRINT_DOMAIN);
+        hasher.update([0]);
+        hasher.update(key_material);
+        hasher.update([0]);
+        hasher.update(proxy_url.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        Ok(UpstreamProxyMetadata {
+            has_proxy: true,
+            scheme: Some(scheme.clone()),
+            remote_dns,
+            label: Some(if remote_dns {
+                "SOCKS5H private proxy".to_owned()
+            } else {
+                "SOCKS5 private proxy".to_owned()
+            }),
+            fingerprint: Some(format!("proxy_{}", &digest[..16])),
+        })
+    }
+
+    /// Replace only the transport proxy on an existing OAuth credential.
+    /// Token, refresh, expiry, header and identity state are retained exactly.
+    pub(crate) fn with_oauth_proxy(self, proxy_url: String) -> Result<Self, AppError> {
+        validate_codex_proxy_url(&proxy_url)?;
+        match self {
+            Self::OAuth {
+                access_token,
+                refresh_token,
+                expires_at,
+                header,
+                prefix,
+                adapter_state,
+                ..
+            } => Ok(Self::OAuth {
+                access_token,
+                refresh_token,
+                expires_at,
+                header,
+                prefix,
+                adapter_state,
+                proxy_url: Some(proxy_url),
+                proxy_network_scope: Some(OutboundScope::Private),
+            }),
+            _ => Err(AppError::BadRequest(
+                "transport proxy updates require an existing OAuth credential".into(),
+            )),
+        }
+    }
+
     /// Preserve an imported account proxy when an ordinary API-key rotation
     /// supplies only replacement key material. A caller that needs to change
     /// the proxy must use the explicit proxied credential form. Removing it
@@ -330,7 +400,7 @@ fn validate_optional_private_proxy(
     }
 }
 
-fn validate_proxy_url(value: &str) -> Result<(), AppError> {
+pub(crate) fn validate_proxy_url(value: &str) -> Result<(), AppError> {
     if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
         return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
     }
@@ -347,6 +417,18 @@ fn validate_proxy_url(value: &str) -> Result<(), AppError> {
     }
     if parsed.scheme() == "socks5h" && !has_safe_private_ip_literal_host(&parsed) {
         return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_codex_proxy_url(value: &str) -> Result<(), AppError> {
+    validate_proxy_url(value)?;
+    let parsed = url::Url::parse(value)
+        .map_err(|_| AppError::BadRequest("upstream proxy URL is invalid".into()))?;
+    if parsed.scheme() != "socks5h" || !has_safe_private_ip_literal_host(&parsed) {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex requires a private IP-literal socks5h proxy with remote DNS".into(),
+        ));
     }
     Ok(())
 }

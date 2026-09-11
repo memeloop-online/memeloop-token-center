@@ -45,12 +45,13 @@ const MIN_POLL_SECONDS: u64 = 1;
 const MAX_POLL_SECONDS: u64 = 60;
 const MAX_TOKEN_LIFETIME_SECONDS: i64 = 365 * 24 * 60 * 60;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StartCodexDeviceLogin {
     pub tenant_external_id: String,
     pub account_name: String,
     pub operator_service_id: Option<Uuid>,
     pub provider_config: Value,
+    pub proxy_url: Option<String>,
     pub reauthorize: Option<OAuthReauthorizationTarget>,
 }
 
@@ -96,12 +97,14 @@ pub struct CodexDevicePollScope<'a> {
     pub operator_service_id: Option<Uuid>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct CodexDeviceLoginState {
     session_id: Uuid,
     tenant_external_id: String,
     account_name: String,
     provider_config: Value,
+    #[serde(default)]
+    proxy_url: Option<String>,
     operator_service_id: Option<Uuid>,
     device_auth_id: String,
     user_code: String,
@@ -275,6 +278,7 @@ async fn start_codex_device_login_at(
         tenant_external_id: input.tenant_external_id,
         account_name: input.account_name.trim().to_owned(),
         provider_config: input.provider_config,
+        proxy_url: input.proxy_url,
         operator_service_id: input.operator_service_id,
         device_auth_id: response.device_auth_id,
         user_code: user_code.clone(),
@@ -481,8 +485,8 @@ async fn poll_codex_device_login_at(
                 "schema": "openai-codex-oauth-v1",
                 "account_id": claims.openai_auth.chatgpt_account_id,
             })),
-            proxy_url: None,
-            proxy_network_scope: None,
+            proxy_network_scope: state.proxy_url.as_ref().map(|_| OutboundScope::Private),
+            proxy_url: state.proxy_url,
         },
         reauthorize: state.reauthorize,
     };
@@ -806,6 +810,7 @@ mod tests {
                     "network_scope": "public",
                     "reservation_token_bounds": {}
                 }),
+                proxy_url: None,
                 reauthorize: None,
             },
             key_material,

@@ -14,6 +14,171 @@ pub struct ReauthorizeUpstreamAccountInput {
 }
 
 impl Database {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rotate_codex_transport_proxy(
+        &self,
+        account_id: Uuid,
+        tenant_external_id: &str,
+        proxy_url: String,
+        expected_updated_at: i64,
+        expected_credential_generation: i64,
+        idempotency_key: &str,
+        actor_service_id: Option<Uuid>,
+        key_material: &[u8],
+    ) -> Result<(UpstreamAccountView, bool), AppError> {
+        crate::provider::validate_codex_proxy_url(&proxy_url)?;
+        validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
+        let idempotency_key = idempotency_key.trim();
+        let now = unix_millis();
+        let request_hash = upstream_transport_proxy_request_hash(
+            account_id,
+            tenant_external_id,
+            &proxy_url,
+            expected_updated_at,
+            expected_credential_generation,
+            key_material,
+        );
+        let replay_expires_at = now.saturating_add(CREDENTIAL_ROTATION_REPLAY_TTL_MILLIS);
+        let mut tx = self.pool.begin().await?;
+        if let Some(replay) = claim_credential_rotation(
+            &mut tx,
+            UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE,
+            account_id,
+            idempotency_key,
+            &request_hash,
+            now,
+            replay_expires_at,
+        )
+        .await?
+        {
+            let view = open_rotation_replay(
+                replay,
+                UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE,
+                account_id,
+                idempotency_key,
+                &request_hash,
+                key_material,
+                now,
+            )?;
+            tx.commit().await?;
+            return Ok((view, false));
+        }
+
+        let select = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a, c"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2"
+            }
+        };
+        let row = sqlx::query(select)
+            .bind(account_id.to_string())
+            .bind(tenant_external_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let driver: String = row.try_get("driver")?;
+        let auth_kind: String = row.try_get("auth_kind")?;
+        if driver != crate::oauth::codex_device::PROVIDER_DRIVER || auth_kind != "oauth" {
+            return Err(AppError::BadRequest(
+                "transport proxy updates are only available for OpenAI Codex OAuth accounts".into(),
+            ));
+        }
+        let generation: i64 = row.try_get("credential_generation")?;
+        let updated_at: i64 = row.try_get("updated_at")?;
+        if generation != expected_credential_generation || updated_at != expected_updated_at {
+            return Err(AppError::Conflict(
+                "reload the upstream provider before changing its transport proxy".into(),
+            ));
+        }
+        let ciphertext: String = row.try_get("credential_ciphertext")?;
+        let current_credential = open_credential(&ciphertext, key_material)?;
+        let current_proxy = current_credential
+            .proxy()
+            .map(|(value, _)| value.to_owned());
+        let replacement = current_credential
+            .clone()
+            .with_oauth_proxy(proxy_url.clone())?;
+        let old_metadata = current_credential.proxy_metadata(key_material)?;
+        let new_metadata = replacement.proxy_metadata(key_material)?;
+        let mut view = upstream_account_view(row)?;
+
+        if current_proxy.as_deref() != Some(proxy_url.as_str()) {
+            let replacement_ciphertext = seal_credential(&replacement, key_material)?;
+            let next_generation = generation.checked_add(1).ok_or(AppError::Internal)?;
+            let next_updated_at = now.max(updated_at.saturating_add(1));
+            sqlx::query(
+                "UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND generation = $3 AND revoked_at IS NULL",
+            )
+            .bind(now)
+            .bind(account_id.to_string())
+            .bind(generation)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO upstream_credentials (id, upstream_account_id, generation, credential_ciphertext, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(account_id.to_string())
+            .bind(next_generation)
+            .bind(replacement_ciphertext)
+            .bind(replacement.expires_at())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            let changed = sqlx::query(
+                "UPDATE upstream_accounts SET credential_generation = $1, updated_at = $2 WHERE id = $3 AND credential_generation = $4 AND updated_at = $5",
+            )
+            .bind(next_generation)
+            .bind(next_updated_at)
+            .bind(account_id.to_string())
+            .bind(generation)
+            .bind(updated_at)
+            .execute(&mut *tx)
+            .await?;
+            if changed.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "reload the upstream provider before changing its transport proxy".into(),
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO upstream_transport_proxy_audit (id, upstream_account_id, tenant_id, credential_generation, previous_fingerprint, previous_scheme, new_fingerprint, new_scheme, remote_dns, actor_service_id, operator_is_bootstrap, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(account_id.to_string())
+            .bind(view.tenant_id.to_string())
+            .bind(next_generation)
+            .bind(old_metadata.fingerprint)
+            .bind(old_metadata.scheme)
+            .bind(new_metadata.fingerprint.clone())
+            .bind(new_metadata.scheme.clone())
+            .bind(new_metadata.remote_dns)
+            .bind(actor_service_id.map(|id| id.to_string()))
+            .bind(actor_service_id.is_none())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            view.credential_generation = next_generation;
+            view.credential_expires_at = replacement.expires_at();
+            view.updated_at = next_updated_at;
+        }
+        view.attach_proxy_metadata(&replacement, key_material)?;
+        store_credential_rotation_response(
+            &mut tx,
+            idempotency_key,
+            &view,
+            UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE,
+            account_id,
+            &request_hash,
+            replay_expires_at,
+            key_material,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok((view, current_proxy.as_deref() != Some(proxy_url.as_str())))
+    }
+
     pub async fn disconnect_upstream_oauth(
         &self,
         account_id: Uuid,
@@ -154,7 +319,14 @@ impl Database {
         let current_session = row.try_get::<Option<String>, _>("oauth_session_id")?;
         let completed_session = input.oauth_session_id.to_string();
         if current_session.as_deref() == Some(completed_session.as_str()) {
-            let view = upstream_account_view(row)?;
+            let ciphertext = row.try_get::<Option<String>, _>("credential_ciphertext")?;
+            let mut view = upstream_account_view(row)?;
+            if let Some(ciphertext) = ciphertext {
+                let credential = open_credential(&ciphertext, key_material)?;
+                view.attach_proxy_metadata(&credential, key_material)?;
+            } else {
+                view.can_update_transport_proxy = false;
+            }
             tx.commit().await?;
             return Ok(view);
         }
@@ -190,6 +362,16 @@ impl Database {
             key_material,
         )?;
         let credential = input.credential.preserve_proxy_from(&current_credential);
+        if current_driver == crate::oauth::codex_device::PROVIDER_DRIVER
+            && let Some((proxy_url, proxy_scope)) = credential.proxy()
+        {
+            if proxy_scope != crate::network::OutboundScope::Private {
+                return Err(AppError::BadRequest(
+                    "OpenAI Codex proxy endpoint is outside the approved private network".into(),
+                ));
+            }
+            crate::provider::validate_codex_proxy_url(proxy_url)?;
+        }
         credential.validate(now)?;
         let ciphertext = seal_credential(&credential, key_material)?;
         let current_generation: i64 = row.try_get("credential_generation")?;
@@ -234,8 +416,11 @@ impl Database {
             ));
         }
         tx.commit().await?;
-        self.upstream_account_for_reauthorization(account_id, &input.tenant_external_id)
-            .await
+        let (mut view, installed) = self
+            .upstream_account_with_credential(account_id, key_material)
+            .await?;
+        view.attach_proxy_metadata(&installed, key_material)?;
+        Ok(view)
     }
 
     pub async fn rotate_upstream_credential(
@@ -798,7 +983,10 @@ impl Database {
         .await?;
 
         let config_json: String = row.try_get("config_json")?;
-        let view = UpstreamAccountView {
+        let can_update_transport_proxy = row.try_get::<String, _>("driver")?
+            == crate::oauth::codex_device::PROVIDER_DRIVER
+            && auth_kind == "oauth";
+        let mut view = UpstreamAccountView {
             id: account_id,
             tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
             tenant_external_id: Some(row.try_get("tenant_external_id")?),
@@ -813,6 +1001,12 @@ impl Database {
             status,
             config: serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?,
             credential_expires_at: credential.expires_at(),
+            has_proxy: false,
+            proxy_scheme: None,
+            proxy_remote_dns: false,
+            proxy_label: None,
+            proxy_fingerprint: None,
+            can_update_transport_proxy,
             can_refresh: auth_kind == "oauth"
                 && row
                     .try_get::<Option<String>, _>("oauth_session_id")?
@@ -836,6 +1030,7 @@ impl Database {
             created_at: row.try_get("created_at")?,
             updated_at,
         };
+        view.attach_proxy_metadata(&credential, key_material)?;
         store_credential_rotation_response(
             tx,
             idempotency_key,
@@ -862,4 +1057,27 @@ fn upstream_credential_rotation_request_hash(
     hash.update([0]);
     hash.update(encoded);
     Ok(format!("{:x}", hash.finalize()))
+}
+
+fn upstream_transport_proxy_request_hash(
+    account_id: Uuid,
+    tenant_external_id: &str,
+    proxy_url: &str,
+    expected_updated_at: i64,
+    expected_credential_generation: i64,
+    key_material: &[u8],
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"memeloop-token-center/upstream-transport-proxy-request/v1\0");
+    hash.update(key_material);
+    hash.update([0]);
+    hash.update(account_id.as_bytes());
+    hash.update([0]);
+    hash.update(tenant_external_id.as_bytes());
+    hash.update([0]);
+    hash.update(proxy_url.as_bytes());
+    hash.update([0]);
+    hash.update(expected_updated_at.to_be_bytes());
+    hash.update(expected_credential_generation.to_be_bytes());
+    format!("{:x}", hash.finalize())
 }

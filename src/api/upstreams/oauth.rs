@@ -41,7 +41,7 @@ pub(super) async fn reauthorization_target(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct StartCodexOAuthRequest {
     #[serde(default = "default_tenant")]
@@ -49,6 +49,8 @@ pub(in crate::api) struct StartCodexOAuthRequest {
     account_name: String,
     #[serde(default)]
     upstream_account_id: Option<Uuid>,
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 pub(in crate::api) async fn start_codex_oauth(
@@ -58,6 +60,12 @@ pub(in crate::api) async fn start_codex_oauth(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
+    if body.upstream_account_id.is_some() && body.proxy_url.is_some() {
+        return Err(AppError::BadRequest(
+            "reauthorization cannot change the transport proxy; use the transport-proxy endpoint"
+                .into(),
+        ));
+    }
     let provider_config = if let Some(account_id) = body.upstream_account_id {
         let account = state
             .db
@@ -77,6 +85,17 @@ pub(in crate::api) async fn start_codex_oauth(
         })
     };
     validate_provider_config_schema(&state, CODEX_PROVIDER_DRIVER, &provider_config)?;
+    if let Some(proxy_url) = body.proxy_url.as_deref() {
+        require_global_service(&service)?;
+        crate::provider::validate_codex_proxy_url(proxy_url)?;
+        network::validate_codex_transport(
+            crate::oauth::codex_device::BASE_URL,
+            &provider_config,
+            Some((proxy_url, OutboundScope::Private)),
+            false,
+        )
+        .await?;
+    }
     let reauthorize = reauthorization_target(
         &state,
         body.upstream_account_id,
@@ -98,6 +117,7 @@ pub(in crate::api) async fn start_codex_oauth(
                 account_name: body.account_name,
                 operator_service_id: service.service_id,
                 provider_config,
+                proxy_url: body.proxy_url,
                 reauthorize,
             },
             state.config.key_pepper.as_bytes(),
@@ -143,10 +163,17 @@ pub(in crate::api) async fn poll_codex_oauth(
             tenant_external_id,
         } => {
             require_service_tenant(&service, &tenant_external_id)?;
-            let account = state
+            let (mut account, credential, credential_active) = state
                 .db
-                .upstream_account_for_reauthorization(account_id, &tenant_external_id)
+                .upstream_account_with_current_credential(
+                    account_id,
+                    state.config.key_pepper.as_bytes(),
+                )
                 .await?;
+            if credential_active {
+                account.attach_proxy_metadata(&credential, state.config.key_pepper.as_bytes())?;
+            }
+            super::restrict_transport_proxy_capability(&service, &mut account);
             Ok((StatusCode::OK, Json(account)).into_response())
         }
         CodexDevicePollResult::Ready { lease_owner, login } => {
@@ -166,7 +193,7 @@ pub(in crate::api) async fn poll_codex_oauth(
             )
             .await?;
             let reauthorizing = ready.reauthorize.is_some();
-            let account = match ready.reauthorize {
+            let mut account = match ready.reauthorize {
                 Some(target) => {
                     let current_credential = state
                         .db
@@ -232,7 +259,10 @@ pub(in crate::api) async fn poll_codex_oauth(
                     unix_millis(),
                 )
                 .await?;
-            super::trigger_upstream_model_sync(state.clone(), account.id);
+            super::restrict_transport_proxy_capability(&service, &mut account);
+            if account.status == "active" {
+                super::trigger_upstream_model_sync(state.clone(), account.id);
+            }
             Ok((
                 if reauthorizing {
                     StatusCode::OK
@@ -549,9 +579,9 @@ pub(in crate::api) async fn refresh_upstream_oauth(
     if let Some(tenant) = service.tenant_external_id.as_deref() {
         state.db.require_upstream_tenant(account_id, tenant).await?;
     }
-    Ok(Json(
-        refresh_managed_upstream_oauth(&state, account_id, idempotency_key).await?,
-    ))
+    let mut account = refresh_managed_upstream_oauth(&state, account_id, idempotency_key).await?;
+    super::restrict_transport_proxy_capability(&service, &mut account);
+    Ok(Json(account))
 }
 
 #[derive(Debug, Deserialize)]
@@ -570,7 +600,7 @@ pub(in crate::api) async fn disconnect_upstream_oauth(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "oauth:write").await?;
     require_service_tenant(&service, &body.tenant_external_id)?;
-    let (account, oauth_driver, credential) = state
+    let (mut account, oauth_driver, credential) = state
         .db
         .disconnect_upstream_oauth(
             account_id,
@@ -579,6 +609,9 @@ pub(in crate::api) async fn disconnect_upstream_oauth(
             state.config.key_pepper.as_bytes(),
         )
         .await?;
+    account.attach_proxy_metadata(&credential, state.config.key_pepper.as_bytes())?;
+    account.can_update_transport_proxy = false;
+    super::restrict_transport_proxy_capability(&service, &mut account);
     let provider_revocation = if oauth_driver == crate::oauth::claude::OAUTH_DRIVER {
         let status = crate::oauth::claude::revoke_claude_credential(
             &state.http,

@@ -43,8 +43,16 @@ pub(in crate::api) async fn create_upstream(
     }
     validate_upstream_destination(&body.driver, &body.config, &service, &state).await?;
     credential.validate(unix_millis())?;
-    validate_upstream_proxy(&body.config, &credential, &service, &state, true).await?;
-    let account = state
+    validate_upstream_proxy(
+        &body.driver,
+        &body.config,
+        &credential,
+        &service,
+        &state,
+        true,
+    )
+    .await?;
+    let mut account = state
         .db
         .create_upstream_account(
             CreateUpstreamAccountInput {
@@ -60,6 +68,7 @@ pub(in crate::api) async fn create_upstream(
             state.config.key_pepper.as_bytes(),
         )
         .await?;
+    super::restrict_transport_proxy_capability(&service, &mut account);
     super::trigger_upstream_model_sync(state, account.id);
     Ok((StatusCode::CREATED, Json(account)))
 }
@@ -133,6 +142,17 @@ pub(super) async fn validate_upstream_destination(
     if scope == OutboundScope::Private {
         require_global_service(service)?;
     }
+    if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+        if base_url != crate::oauth::codex_device::BASE_URL || scope != OutboundScope::Public {
+            return Err(AppError::BadRequest(
+                "OpenAI Codex must use the fixed official upstream endpoint".into(),
+            ));
+        }
+        // The account-bound socks5h endpoint owns target DNS. Destination
+        // validation for Codex is a fixed-string check and must not resolve or
+        // construct a direct client for chatgpt.com.
+        return validate_provider_config(driver, config);
+    }
     // Building the operation client validates and pins every public DNS answer.
     let _ = network::client_for_url(
         &state.http,
@@ -146,6 +166,7 @@ pub(super) async fn validate_upstream_destination(
 }
 
 async fn validate_upstream_proxy(
+    driver: &str,
     config: &Value,
     credential: &UpstreamCredential,
     service: &AuthenticatedService,
@@ -159,14 +180,18 @@ async fn validate_upstream_proxy(
         require_global_service(service)?;
     }
     let base_url = validate_config(config)?;
-    let _ = network::client_for_config_url(
-        &state.http,
-        &base_url,
-        config,
-        credential.proxy(),
-        state.config.allow_oauth_loopback,
-    )
-    .await?;
+    if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+        network::validate_codex_transport(&base_url, config, credential.proxy(), false).await?;
+    } else {
+        let _ = network::client_for_config_url(
+            &state.http,
+            &base_url,
+            config,
+            credential.proxy(),
+            state.config.allow_oauth_loopback,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -262,15 +287,19 @@ pub(in crate::api) async fn list_upstreams(
 ) -> Result<impl IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id)?;
-    let values = state
+    let mut values = state
         .db
-        .list_upstream_accounts_page(
+        .list_upstream_accounts_page_with_transport(
             tenant.as_deref(),
             query.before_created_at,
             query.before_id,
             query.limit,
+            state.config.key_pepper.as_bytes(),
         )
         .await?;
+    for account in &mut values {
+        super::restrict_transport_proxy_capability(&service, account);
+    }
     Ok(Json(values))
 }
 
@@ -334,15 +363,15 @@ pub(in crate::api) async fn update_upstream(
         .require_upstream_tenant(account_id, &body.tenant_external_id)
         .await?;
     let driver = state.db.upstream_driver(account_id).await?;
-    let current = state
+    let (current, current_credential, credential_active) = state
         .db
-        .upstream_account_for_reauthorization(account_id, &body.tenant_external_id)
+        .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
     validate_provider_config_schema(&state, &driver, &body.config)?;
     validate_upstream_destination(&driver, &body.config, &service, &state).await?;
     let should_sync_models = driver != crate::oauth::codex_device::PROVIDER_DRIVER
         || codex_model_sync_config(&current.config) != codex_model_sync_config(&body.config);
-    let account = state
+    let mut account = state
         .db
         .update_upstream_account(
             account_id,
@@ -354,6 +383,9 @@ pub(in crate::api) async fn update_upstream(
             },
         )
         .await?;
+    account.attach_proxy_metadata(&current_credential, state.config.key_pepper.as_bytes())?;
+    account.can_update_transport_proxy &= credential_active;
+    super::restrict_transport_proxy_capability(&service, &mut account);
     if should_sync_models {
         super::trigger_upstream_model_sync(state, account_id);
     }
@@ -388,21 +420,45 @@ pub(in crate::api) async fn set_upstream_status(
         .db
         .require_upstream_tenant(account_id, &body.tenant_external_id)
         .await?;
+    let (account_before_status, credential, credential_active) = state
+        .db
+        .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
+        .await?;
     if body.status == "active" {
-        let driver = state.db.upstream_driver(account_id).await?;
+        if !credential_active {
+            return Err(AppError::BadRequest(
+                "a disconnected upstream must be reauthorized before activation".into(),
+            ));
+        }
+        let driver = &account_before_status.driver;
         if !state.providers.is_public(&driver) {
             return Err(AppError::BadRequest(
                 "retired upstream providers cannot be enabled".into(),
             ));
         }
-        let (_, credential) = state
-            .db
-            .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
-            .await?;
         credential.validate(unix_millis())?;
+        if driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+            if account_before_status
+                .config
+                .get("base_url")
+                .and_then(Value::as_str)
+                != Some(crate::oauth::codex_device::BASE_URL)
+            {
+                return Err(AppError::BadRequest(
+                    "OpenAI Codex must use the fixed official upstream endpoint".into(),
+                ));
+            }
+            network::validate_codex_transport(
+                crate::oauth::codex_device::BASE_URL,
+                &account_before_status.config,
+                credential.proxy(),
+                false,
+            )
+            .await?;
+        }
     }
     let should_sync = body.status == "active";
-    let account = state
+    let mut account = state
         .db
         .set_upstream_account_status(
             account_id,
@@ -411,6 +467,9 @@ pub(in crate::api) async fn set_upstream_status(
             body.expected_updated_at,
         )
         .await?;
+    account.attach_proxy_metadata(&credential, state.config.key_pepper.as_bytes())?;
+    account.can_update_transport_proxy &= credential_active;
+    super::restrict_transport_proxy_capability(&service, &mut account);
     if should_sync {
         super::trigger_upstream_model_sync(state, account_id);
     }
@@ -475,10 +534,18 @@ pub(in crate::api) async fn rotate_upstream_credential(
         .db
         .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
+    if driver == crate::oauth::codex_device::PROVIDER_DRIVER
+        && credential.proxy() != current_credential.proxy()
+    {
+        return Err(AppError::BadRequest(
+            "use the transport-proxy endpoint to change an OpenAI Codex proxy".into(),
+        ));
+    }
     require_proxied_rotation_kind(&current_credential, &credential)?;
     let credential = credential.preserve_proxy_from(&current_credential);
     credential.validate(unix_millis())?;
     validate_upstream_proxy(
+        &driver,
         &account_before_rotation.config,
         &credential,
         &service,
@@ -486,7 +553,8 @@ pub(in crate::api) async fn rotate_upstream_credential(
         changes_proxy,
     )
     .await?;
-    let (account, changed) = state
+    let response_credential = credential.clone();
+    let (mut account, changed) = state
         .db
         .rotate_upstream_credential_with_outcome(
             account_id,
@@ -495,7 +563,67 @@ pub(in crate::api) async fn rotate_upstream_credential(
             state.config.key_pepper.as_bytes(),
         )
         .await?;
+    account.attach_proxy_metadata(&response_credential, state.config.key_pepper.as_bytes())?;
+    super::restrict_transport_proxy_capability(&service, &mut account);
     if changed {
+        super::trigger_upstream_model_sync(state, account_id);
+    }
+    Ok(Json(account))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct RotateCodexTransportProxyRequest {
+    tenant_external_id: String,
+    proxy_url: String,
+    expected_updated_at: i64,
+    expected_credential_generation: i64,
+}
+
+pub(in crate::api) async fn rotate_codex_transport_proxy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Json(body): Json<RotateCodexTransportProxyRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:write").await?;
+    require_service_tenant(&service, &body.tenant_external_id)?;
+    require_global_service(&service)?;
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .ok_or_else(|| AppError::BadRequest("Idempotency-Key is required".into()))?
+        .to_str()
+        .map_err(|_| AppError::BadRequest("Idempotency-Key must be valid ASCII".into()))?;
+    state
+        .db
+        .require_upstream_tenant(account_id, &body.tenant_external_id)
+        .await?;
+    crate::provider::validate_codex_proxy_url(&body.proxy_url)?;
+    let config = json!({
+        "base_url": crate::oauth::codex_device::BASE_URL,
+        "network_scope": "public",
+    });
+    network::validate_codex_transport(
+        crate::oauth::codex_device::BASE_URL,
+        &config,
+        Some((&body.proxy_url, OutboundScope::Private)),
+        false,
+    )
+    .await?;
+    let (account, changed) = state
+        .db
+        .rotate_codex_transport_proxy(
+            account_id,
+            &body.tenant_external_id,
+            body.proxy_url,
+            body.expected_updated_at,
+            body.expected_credential_generation,
+            idempotency_key,
+            service.service_id,
+            state.config.key_pepper.as_bytes(),
+        )
+        .await?;
+    if changed && account.status == "active" {
         super::trigger_upstream_model_sync(state, account_id);
     }
     Ok(Json(account))

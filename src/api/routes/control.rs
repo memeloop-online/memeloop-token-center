@@ -190,6 +190,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             put(rotate_upstream_credential),
         )
         .route(
+            "/internal/v1/upstreams/{account_id}/transport-proxy",
+            put(rotate_codex_transport_proxy),
+        )
+        .route(
             "/internal/v1/upstreams/{account_id}/deletion-readiness",
             get(get_upstream_deletion_readiness),
         )

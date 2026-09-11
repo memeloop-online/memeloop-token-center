@@ -17,6 +17,7 @@ pub use oauth::ReauthorizeUpstreamAccountInput;
 pub use routes::{CreateModelRouteInput, UpdateModelRouteInput};
 
 const UPSTREAM_CREDENTIAL_ROTATION_RESOURCE: &str = "upstream_credential";
+const UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE: &str = "upstream_transport_proxy";
 const UPSTREAM_OAUTH_REFRESH_RESOURCE: &str = "upstream_oauth_refresh";
 const UPSTREAM_OAUTH_REFRESH_LEASE_MILLIS: i64 = 2 * 60 * 1_000;
 

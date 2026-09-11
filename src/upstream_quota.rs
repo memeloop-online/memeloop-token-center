@@ -282,7 +282,7 @@ async fn read_codex(
         .map_err(|_| "credential_invalid")?;
     // Never use caller/account base_url or network_scope for these fixed
     // supplier endpoints. Only the already-authorized encrypted proxy is reused.
-    let http = crate::network::client_for_config_url(
+    let http = crate::network::client_for_codex_url(
         &state.http,
         USAGE_URL,
         &json!({"network_scope":"public"}),

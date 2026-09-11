@@ -67,15 +67,25 @@ pub(in crate::api) async fn probe_upstream_health(
         })));
     }
     let base_url = validate_config(&account.config)?;
-    let outbound = match network::client_for_config_url(
-        &state.http,
-        &base_url,
-        &account.config,
-        credential.proxy(),
-        state.config.allow_oauth_loopback,
-    )
-    .await
-    {
+    let outbound = match if account.driver == "openai-codex" {
+        network::client_for_codex_url(
+            &state.http,
+            &base_url,
+            &account.config,
+            credential.proxy(),
+            state.config.codex_test_loopback,
+        )
+        .await
+    } else {
+        network::client_for_config_url(
+            &state.http,
+            &base_url,
+            &account.config,
+            credential.proxy(),
+            state.config.allow_oauth_loopback,
+        )
+        .await
+    } {
         Ok(client) => client,
         Err(_) => {
             return Ok(Json(json!({

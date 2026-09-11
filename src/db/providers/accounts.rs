@@ -30,12 +30,29 @@ impl Database {
     ) -> Result<UpstreamAccountView, AppError> {
         validate_upstream_account_name(&input.name)?;
         let _ = validate_config(&input.config)?;
+        if input.driver == crate::oauth::codex_device::PROVIDER_DRIVER
+            && let Some((proxy_url, proxy_scope)) = input.credential.proxy()
+        {
+            if proxy_scope != crate::network::OutboundScope::Private {
+                return Err(AppError::BadRequest(
+                    "OpenAI Codex proxy endpoint is outside the approved private network".into(),
+                ));
+            }
+            crate::provider::validate_codex_proxy_url(proxy_url)?;
+        }
         let now = unix_millis();
         let account_id = Uuid::now_v7();
         let tenant_candidate = Uuid::now_v7();
         let config_json = serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
         let credential_ciphertext = seal_credential(&input.credential, key_material)?;
         let auth_kind = input.credential.auth_kind();
+        let status = if input.driver == crate::oauth::codex_device::PROVIDER_DRIVER
+            && input.credential.proxy().is_none()
+        {
+            "disabled"
+        } else {
+            "active"
+        };
         let credential_expires_at = input.credential.expires_at();
         let can_reauthorize = upstream_can_reauthorize(
             &input.driver,
@@ -82,7 +99,7 @@ impl Database {
             ));
         }
         sqlx::query(
-            "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, 'active', 1, $7, $8, $9, $10, $11)",
+            "INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, oauth_session_id, oauth_driver, oauth_refresh_url, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10, $11, $12)",
         )
         .bind(account_id.to_string())
         .bind(&tenant_id)
@@ -90,6 +107,7 @@ impl Database {
         .bind(&input.driver)
         .bind(auth_kind)
         .bind(config_json)
+        .bind(status)
         .bind(input.oauth_session_id.map(|id| id.to_string()))
         .bind(&input.oauth_driver)
         .bind(&input.oauth_refresh_url)
@@ -109,7 +127,7 @@ impl Database {
         .await?;
         tx.commit().await?;
 
-        Ok(UpstreamAccountView {
+        let mut view = UpstreamAccountView {
             id: account_id,
             tenant_id: parse_uuid(tenant_id)?,
             tenant_external_id: Some(input.tenant_external_id.clone()),
@@ -118,9 +136,16 @@ impl Database {
             auth_kind: auth_kind.to_owned(),
             connection_method: upstream_connection_method(&input.driver, auth_kind),
             credential_generation: 1,
-            status: "active".to_owned(),
+            status: status.to_owned(),
             config: input.config,
             credential_expires_at,
+            has_proxy: false,
+            proxy_scheme: None,
+            proxy_remote_dns: false,
+            proxy_label: None,
+            proxy_fingerprint: None,
+            can_update_transport_proxy: input.driver == crate::oauth::codex_device::PROVIDER_DRIVER
+                && auth_kind == "oauth",
             can_refresh: auth_kind == "oauth"
                 && input.oauth_session_id.is_some()
                 && input.oauth_refresh_url.is_some()
@@ -130,7 +155,9 @@ impl Database {
             route_count: 0,
             created_at: now,
             updated_at: now,
-        })
+        };
+        view.attach_proxy_metadata(&input.credential, key_material)?;
+        Ok(view)
     }
     pub async fn upstream_account_with_credential(
         &self,
@@ -147,6 +174,29 @@ impl Database {
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         Ok((upstream_account_view(row)?, credential))
+    }
+
+    /// Control-plane read of the current generation, including a locally
+    /// revoked OAuth credential retained for stable-identity reauthorization.
+    /// Callers must inspect the boolean before treating it as routable.
+    pub async fn upstream_account_with_current_credential(
+        &self,
+        account_id: Uuid,
+        key_material: &[u8],
+    ) -> Result<(UpstreamAccountView, UpstreamCredential, bool), AppError> {
+        let row = sqlx::query(
+            "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, c.revoked_at, (SELECT COUNT(*) FROM model_routes r WHERE r.tenant_id = a.tenant_id AND (r.upstream_account_id = a.id OR EXISTS (SELECT 1 FROM model_route_upstream_accounts association WHERE association.tenant_id = r.tenant_id AND association.model_route_id = r.id AND association.upstream_account_id = a.id))) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation WHERE a.id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        let ciphertext: String = row.try_get("credential_ciphertext")?;
+        let active = row.try_get::<Option<i64>, _>("revoked_at")?.is_none();
+        let credential = open_credential(&ciphertext, key_material)?;
+        let mut view = upstream_account_view(row)?;
+        view.can_update_transport_proxy &= active;
+        Ok((view, credential, active))
     }
 
     /// Reads the encrypted identity-bearing OAuth credential for a
@@ -390,11 +440,12 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "DELETE FROM credential_rotation_replays WHERE resource_id = $1 AND resource_kind IN ($2, $3)",
+            "DELETE FROM credential_rotation_replays WHERE resource_id = $1 AND resource_kind IN ($2, $3, $4)",
         )
         .bind(account_id.to_string())
         .bind(UPSTREAM_CREDENTIAL_ROTATION_RESOURCE)
         .bind(UPSTREAM_OAUTH_REFRESH_RESOURCE)
+        .bind(UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE)
         .execute(&mut *tx)
         .await?;
         let deleted = sqlx::query(
@@ -513,6 +564,75 @@ impl Database {
         .await?;
         rows.into_iter().map(upstream_account_view).collect()
     }
+
+    /// Control-plane list view with proxy metadata derived from the encrypted
+    /// current credential. Only the sanitized, keyed summary reaches callers.
+    pub async fn list_upstream_accounts_page_with_transport(
+        &self,
+        tenant_external_id: Option<&str>,
+        before_created_at: Option<i64>,
+        before_id: Option<Uuid>,
+        limit: i64,
+        key_material: &[u8],
+    ) -> Result<Vec<UpstreamAccountView>, AppError> {
+        let before_created_at = before_created_at.unwrap_or(i64::MAX);
+        let before_id = before_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned());
+        let rows = sqlx::query(
+            r#"
+            WITH page AS MATERIALIZED (
+                SELECT a.id, a.tenant_id, a.name, a.driver, a.auth_kind,
+                       a.config_json, a.status, a.credential_generation,
+                       a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url,
+                       a.created_at, a.updated_at
+                FROM upstream_accounts a
+                WHERE EXISTS (SELECT 1 FROM tenants visible_tenant WHERE visible_tenant.id = a.tenant_id)
+                  AND ($1 = '' OR a.tenant_id = (SELECT scoped_tenant.id FROM tenants scoped_tenant WHERE scoped_tenant.external_id = $1))
+                  AND (a.created_at < $2 OR (a.created_at = $2 AND a.id < $3))
+                ORDER BY a.created_at DESC, a.id DESC
+                LIMIT $4
+            ), page_route_references AS MATERIALIZED (
+                SELECT route.tenant_id, route.id AS model_route_id, route.upstream_account_id
+                FROM model_routes route
+                JOIN page account ON account.tenant_id = route.tenant_id AND account.id = route.upstream_account_id
+                UNION
+                SELECT association.tenant_id, association.model_route_id, association.upstream_account_id
+                FROM model_route_upstream_accounts association
+                JOIN page account ON account.tenant_id = association.tenant_id AND account.id = association.upstream_account_id
+            ), page_route_counts AS MATERIALIZED (
+                SELECT tenant_id, upstream_account_id, COUNT(*) AS route_count
+                FROM page_route_references
+                GROUP BY tenant_id, upstream_account_id
+            )
+            SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id,
+                   a.name, a.driver, a.auth_kind, a.config_json, a.status,
+                   a.credential_generation, a.oauth_session_id, a.oauth_driver,
+                   a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at,
+                   c.credential_ciphertext,
+                   COALESCE(route_counts.route_count, 0) AS route_count
+            FROM page a
+            JOIN tenants t ON t.id = a.tenant_id
+            LEFT JOIN upstream_credentials c
+              ON c.upstream_account_id = a.id
+             AND c.generation = a.credential_generation
+             AND c.revoked_at IS NULL
+            LEFT JOIN page_route_counts route_counts
+              ON route_counts.tenant_id = a.tenant_id
+             AND route_counts.upstream_account_id = a.id
+            ORDER BY a.created_at DESC, a.id DESC
+            "#,
+        )
+        .bind(tenant_external_id.unwrap_or_default())
+        .bind(before_created_at)
+        .bind(before_id)
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| upstream_account_view_with_transport(row, key_material))
+            .collect()
+    }
     /// Lists every upstream account for a global operator. Tenant-scoped
     /// operators must use `list_upstream_accounts` so the authorization scope
     /// remains visible at the call site.
@@ -614,6 +734,8 @@ pub(super) fn upstream_account_view(
         oauth_session_id.as_deref(),
         oauth_driver.as_deref(),
     );
+    let can_update_transport_proxy =
+        driver == crate::oauth::codex_device::PROVIDER_DRIVER && auth_kind == "oauth";
     Ok(UpstreamAccountView {
         id: parse_uuid(row.try_get("id")?)?,
         tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
@@ -626,6 +748,12 @@ pub(super) fn upstream_account_view(
         status: row.try_get("status")?,
         config: serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?,
         credential_expires_at: row.try_get("expires_at")?,
+        has_proxy: false,
+        proxy_scheme: None,
+        proxy_remote_dns: false,
+        proxy_label: None,
+        proxy_fingerprint: None,
+        can_update_transport_proxy,
         can_refresh,
         can_rotate,
         can_reauthorize,
@@ -633,6 +761,21 @@ pub(super) fn upstream_account_view(
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+pub(super) fn upstream_account_view_with_transport(
+    row: sqlx::any::AnyRow,
+    key_material: &[u8],
+) -> Result<UpstreamAccountView, AppError> {
+    let ciphertext: Option<String> = row.try_get("credential_ciphertext")?;
+    let mut view = upstream_account_view(row)?;
+    if let Some(ciphertext) = ciphertext {
+        let credential = open_credential(&ciphertext, key_material)?;
+        view.attach_proxy_metadata(&credential, key_material)?;
+    } else {
+        view.can_update_transport_proxy = false;
+    }
+    Ok(view)
 }
 pub(super) fn validate_upstream_account_name(name: &str) -> Result<(), AppError> {
     let name = name.trim();

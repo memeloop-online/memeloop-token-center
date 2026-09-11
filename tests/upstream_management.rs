@@ -55,6 +55,301 @@ async fn json_request(
     (status, value)
 }
 
+#[tokio::test]
+async fn codex_transport_proxy_rotation_is_sanitized_fenced_and_audited() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("codex-transport-proxy.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url.clone()))
+        .await
+        .unwrap();
+    let pepper = state.config.key_pepper.as_bytes();
+    let upstream = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "codex-proxy-tenant".into(),
+                name: "Codex fixed upstream".into(),
+                driver: "openai-codex".into(),
+                config: json!({
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {}
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "codex-access-secret".into(),
+                    refresh_token: Some("codex-refresh-secret".into()),
+                    expires_at: Some(memeloop_token_center::db::unix_millis() + 3_600_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: Some(json!({
+                        "schema": "openai-codex-oauth-v1",
+                        "account_id": "codex-account"
+                    })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("openai_codex_device".into()),
+                oauth_refresh_url: Some("https://auth.openai.com/oauth/token".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert_eq!(upstream.status, "disabled");
+    assert!(!upstream.has_proxy);
+    assert!(upstream.can_update_transport_proxy);
+
+    let service = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "codex-proxy-manager".into(),
+                scopes: vec!["providers:read".into(), "providers:write".into()],
+                tenant_external_id: Some("codex-proxy-tenant".into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let operator = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "codex-proxy-global-operator".into(),
+                scopes: vec!["providers:read".into(), "providers:write".into()],
+                tenant_external_id: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+
+    let (status, rejected_activation) = json_request(
+        &state,
+        "PATCH",
+        &format!("/internal/v1/upstreams/{}", upstream.id),
+        &service.token,
+        None,
+        Some(json!({
+            "tenant_external_id": "codex-proxy-tenant",
+            "status": "active",
+            "expected_updated_at": upstream.updated_at
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        !rejected_activation
+            .to_string()
+            .contains("codex-access-secret")
+    );
+
+    let proxy_url = "socks5h://proxy-user:proxy-secret@100.64.0.16:1080";
+    let rotation = json!({
+        "tenant_external_id": "codex-proxy-tenant",
+        "proxy_url": proxy_url,
+        "expected_updated_at": upstream.updated_at,
+        "expected_credential_generation": upstream.credential_generation
+    });
+    let path = format!("/internal/v1/upstreams/{}/transport-proxy", upstream.id);
+    let (status, scoped_rejection) = json_request(
+        &state,
+        "PUT",
+        &path,
+        &service.token,
+        Some("codex-proxy-scoped-service"),
+        Some(rotation.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!scoped_rejection.to_string().contains("proxy-secret"));
+
+    let (status, rotated_json) = json_request(
+        &state,
+        "PUT",
+        &path,
+        &operator.token,
+        Some("codex-proxy-rotation-1"),
+        Some(rotation.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rotated_json}");
+    let rendered = rotated_json.to_string();
+    for secret in [
+        proxy_url,
+        "proxy-user",
+        "proxy-secret",
+        "100.64.0.16",
+        "1080",
+    ] {
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+    let rotated = account(rotated_json);
+    assert!(rotated.has_proxy);
+    assert!(rotated.can_update_transport_proxy);
+    assert_eq!(rotated.proxy_scheme.as_deref(), Some("socks5h"));
+    assert!(rotated.proxy_remote_dns);
+    assert_eq!(
+        rotated.proxy_label.as_deref(),
+        Some("SOCKS5H private proxy")
+    );
+    assert!(
+        rotated
+            .proxy_fingerprint
+            .as_deref()
+            .unwrap()
+            .starts_with("proxy_")
+    );
+    assert_eq!(
+        rotated.credential_generation,
+        upstream.credential_generation + 1
+    );
+    assert!(rotated.updated_at > upstream.updated_at);
+
+    let bypass_proxy = "socks5h://other-user:other-secret@100.64.0.17:1080";
+    let (status, bypass_rejection) = json_request(
+        &state,
+        "PUT",
+        &format!("/internal/v1/upstreams/{}/credential", upstream.id),
+        &operator.token,
+        Some("codex-proxy-generic-credential-bypass"),
+        Some(json!({
+            "credential": {
+                "type": "oauth",
+                "access_token": "replacement-access-secret",
+                "refresh_token": "replacement-refresh-secret",
+                "expires_at": memeloop_token_center::db::unix_millis() + 3_600_000,
+                "adapter_state": {
+                    "schema": "openai-codex-oauth-v1",
+                    "account_id": "codex-account"
+                },
+                "proxy_url": bypass_proxy,
+                "proxy_network_scope": "private"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{bypass_rejection}");
+    assert!(!bypass_rejection.to_string().contains("other-secret"));
+
+    let (status, replay_json) = json_request(
+        &state,
+        "PUT",
+        &path,
+        &operator.token,
+        Some("codex-proxy-rotation-1"),
+        Some(rotation),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        account(replay_json).credential_generation,
+        rotated.credential_generation
+    );
+
+    let (status, listed) = json_request(
+        &state,
+        "GET",
+        "/internal/v1/upstreams?tenant_external_id=codex-proxy-tenant",
+        &service.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed_rendered = listed.to_string();
+    assert!(!listed_rendered.contains("proxy-secret"));
+    assert!(!listed_rendered.contains("100.64.0.16"));
+    let listed = account(listed.as_array().unwrap()[0].clone());
+    assert_eq!(listed.proxy_fingerprint, rotated.proxy_fingerprint);
+    assert!(!listed.can_update_transport_proxy);
+
+    let (status, _) = json_request(
+        &state,
+        "PUT",
+        &path,
+        &operator.token,
+        Some("codex-proxy-stale"),
+        Some(json!({
+            "tenant_external_id": "codex-proxy-tenant",
+            "proxy_url": "socks5h://100.64.0.17:1080",
+            "expected_updated_at": upstream.updated_at,
+            "expected_credential_generation": upstream.credential_generation
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, _) = json_request(
+        &state,
+        "PUT",
+        &path,
+        &operator.token,
+        Some("codex-proxy-local-dns"),
+        Some(json!({
+            "tenant_external_id": "codex-proxy-tenant",
+            "proxy_url": "socks5://100.64.0.17:1080",
+            "expected_updated_at": rotated.updated_at,
+            "expected_credential_generation": rotated.credential_generation
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let audit_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    let audit = sqlx::query(
+        "SELECT previous_fingerprint, previous_scheme, new_fingerprint, new_scheme, remote_dns, actor_service_id FROM upstream_transport_proxy_audit WHERE upstream_account_id = $1",
+    )
+    .bind(upstream.id.to_string())
+    .fetch_all(&audit_pool)
+    .await
+    .unwrap();
+    assert_eq!(audit.len(), 1);
+    assert!(
+        audit[0]
+            .try_get::<Option<String>, _>("previous_fingerprint")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        audit[0]
+            .try_get::<Option<String>, _>("previous_scheme")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        audit[0].try_get::<String, _>("new_scheme").unwrap(),
+        "socks5h"
+    );
+    assert_eq!(audit[0].try_get::<i64, _>("remote_dns").unwrap(), 1);
+    assert_eq!(
+        audit[0]
+            .try_get::<Option<String>, _>("actor_service_id")
+            .unwrap(),
+        Some(operator.service_id.to_string())
+    );
+    for column in ["new_fingerprint", "new_scheme"] {
+        let value: String = audit[0].try_get(column).unwrap();
+        assert!(!value.contains("proxy-secret"));
+        assert!(!value.contains("100.64.0.16"));
+    }
+
+    let credential_ciphertext: String = sqlx::query_scalar(
+        "SELECT credential_ciphertext FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = $2",
+    )
+    .bind(upstream.id.to_string())
+    .bind(rotated.credential_generation)
+    .fetch_one(&audit_pool)
+    .await
+    .unwrap();
+    assert!(!credential_ciphertext.contains("proxy-secret"));
+    assert!(!credential_ciphertext.contains("100.64.0.16"));
+}
+
 fn account(value: Value) -> UpstreamAccountView {
     serde_json::from_value(value).unwrap()
 }
