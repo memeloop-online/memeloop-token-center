@@ -41,15 +41,18 @@ pub(crate) async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
 }
 
 pub(super) async fn process_one(state: &AppState, owner: Uuid) -> bool {
-    let cleanup = tokio::time::timeout(
-        Duration::from_secs(2),
-        state.db.cleanup_response_archive_spools(32),
-    )
-    .await;
-    if !matches!(cleanup, Ok(Ok(_))) {
+    // Stop at a committed transaction boundary instead of cancelling a live
+    // SQL future. The latter can race SQLx's asynchronous rollback with the
+    // next pooled BEGIN and generate transaction-state protocol notices.
+    if state
+        .db
+        .cleanup_response_archive_spools_for(32, Duration::from_secs(2))
+        .await
+        .is_err()
+    {
         tracing::warn!(
             stage = "response_spool_cleanup",
-            "bounded archive cleanup deferred; committed batches are preserved"
+            "response archive cleanup failed; committed batches are preserved"
         );
     }
     let Ok(_permit) = state
