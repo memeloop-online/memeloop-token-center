@@ -1,4 +1,4 @@
-import type { LogicalSessionCursor, LogicalSessionDetail, RequestView } from '../types';
+import type { LogicalSessionCursor, LogicalSessionDetail, RequestView } from '../types.js';
 
 export const requestPageSize = 50;
 export const sessionPageSize = 50;
