@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::{AnyConnection, Row, any::AnyRow};
 use uuid::Uuid;
@@ -15,7 +15,8 @@ use crate::model::{
 #[path = "monitoring_snapshot_sql.rs"]
 mod monitoring_snapshot_sql;
 use monitoring_snapshot_sql::{
-    monitoring_freshness_sql, monitoring_snapshot_sql, monitoring_terminal_outcomes_sql,
+    MonitoringTerminalBatchDialect, monitoring_freshness_sql, monitoring_snapshot_sql,
+    monitoring_terminal_outcomes_batch_sql, monitoring_upstream_health_batch_sql,
 };
 
 const HOUR_MILLIS: i64 = 3_600_000;
@@ -80,6 +81,27 @@ struct MonitoringRange {
     from_created_at: i64,
     to_created_at: i64,
     granularity: MonitoringGranularity,
+}
+
+struct MonitoringBatchContext<'a> {
+    backend: DatabaseBackend,
+    scope: &'a MonitoringScope,
+    tenant_id: &'a str,
+    from_created_at: i64,
+    to_created_at: i64,
+}
+
+#[derive(Default)]
+struct MonitoringStatementCounter {
+    // Explicit statements issued by this module. Transaction protocol
+    // BEGIN/COMMIT messages are deliberately outside this query budget.
+    count: usize,
+}
+
+impl MonitoringStatementCounter {
+    fn record(&mut self) {
+        self.count = self.count.saturating_add(1);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -241,19 +263,33 @@ impl Database {
         scope: MonitoringScope,
         filter: MonitoringSnapshotFilter,
     ) -> Result<OperatorMonitoringSnapshot, AppError> {
+        let mut statement_counter = MonitoringStatementCounter::default();
+        self.operator_monitoring_snapshot_inner(scope, filter, &mut statement_counter)
+            .await
+    }
+
+    async fn operator_monitoring_snapshot_inner(
+        &self,
+        scope: MonitoringScope,
+        filter: MonitoringSnapshotFilter,
+        statement_counter: &mut MonitoringStatementCounter,
+    ) -> Result<OperatorMonitoringSnapshot, AppError> {
         let range = validate_monitoring_range(filter)?;
         let generated_at = unix_millis();
         let tenant_external_id = scope.tenant_external_id().map(str::to_owned);
         let tenant_id = match tenant_external_id.as_deref() {
-            Some(external_id) => sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
-                .bind(external_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .map(|row| row.try_get::<String, _>("id"))
-                .transpose()?
-                // Keep an unknown tenant a strictly empty tenant scope rather
-                // than silently widening it into the global snapshot.
-                .unwrap_or_else(|| Uuid::nil().to_string()),
+            Some(external_id) => {
+                statement_counter.record();
+                sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
+                    .bind(external_id)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .map(|row| row.try_get::<String, _>("id"))
+                    .transpose()?
+                    // Keep an unknown tenant a strictly empty tenant scope rather
+                    // than silently widening it into the global snapshot.
+                    .unwrap_or_else(|| Uuid::nil().to_string())
+            }
             None => String::new(),
         };
         let plan = BucketPlan::new(
@@ -263,12 +299,14 @@ impl Database {
         );
         let mut snapshot = self.pool.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            statement_counter.record();
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .execute(&mut *snapshot)
                 .await?;
         }
 
         let aggregate_sql = monitoring_snapshot_sql(&scope, range.granularity);
+        statement_counter.record();
         let aggregate_rows = match &scope {
             MonitoringScope::Tenant(_) => {
                 sqlx::query(sqlx::AssertSqlSafe(aggregate_sql))
@@ -316,6 +354,7 @@ impl Database {
             &tenant_id,
             range.from_created_at,
             range.to_created_at,
+            statement_counter,
         )
         .await?;
         let freshness = MonitoringFreshness {
@@ -324,20 +363,42 @@ impl Database {
                 .map(|created_at| generated_at.saturating_sub(created_at)),
         };
 
+        let pairs = top.keys().cloned().collect::<Vec<_>>();
+        let upstream_account_ids = pairs
+            .iter()
+            .map(|(upstream_account_id, _)| upstream_account_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let upstream_health = upstream_health_batch(
+            &mut snapshot,
+            &upstream_account_ids,
+            generated_at,
+            statement_counter,
+        )
+        .await?;
+        let mut outcomes = terminal_outcomes_batch(
+            &mut snapshot,
+            MonitoringBatchContext {
+                backend: self.backend,
+                scope: &scope,
+                tenant_id: &tenant_id,
+                from_created_at: range.from_created_at,
+                to_created_at: range.to_created_at,
+            },
+            &pairs,
+            statement_counter,
+        )
+        .await?;
         let mut top_upstream_models = Vec::with_capacity(top.len());
         for ((upstream_account_id, model), accumulator) in top {
-            let (upstream_name, health) =
-                upstream_health(&mut snapshot, &upstream_account_id, generated_at).await?;
-            let terminal_outcomes = terminal_outcomes(
-                &mut snapshot,
-                &scope,
-                &tenant_id,
-                &upstream_account_id,
-                &model,
-                range.from_created_at,
-                range.to_created_at,
-            )
-            .await?;
+            let (upstream_name, health) = upstream_health
+                .get(&upstream_account_id)
+                .cloned()
+                .unwrap_or_else(|| (upstream_account_id.clone(), unknown_health()));
+            let terminal_outcomes = outcomes
+                .remove(&(upstream_account_id.clone(), model.clone()))
+                .unwrap_or_default();
             top_upstream_models.push(MonitoringUpstreamModel {
                 upstream_account_id,
                 upstream_name,
@@ -410,8 +471,10 @@ async fn latest_terminal_created_at(
     tenant_id: &str,
     from_created_at: i64,
     to_created_at: i64,
+    statement_counter: &mut MonitoringStatementCounter,
 ) -> Result<Option<i64>, AppError> {
     let sql = monitoring_freshness_sql(scope);
+    statement_counter.record();
     let row = match scope {
         MonitoringScope::Tenant(_) => {
             sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -434,84 +497,98 @@ async fn latest_terminal_created_at(
         .map_err(Into::into)
 }
 
-async fn terminal_outcomes(
+async fn terminal_outcomes_batch(
     connection: &mut AnyConnection,
-    scope: &MonitoringScope,
-    tenant_id: &str,
-    upstream_account_id: &str,
-    model: &str,
-    from_created_at: i64,
-    to_created_at: i64,
-) -> Result<Vec<MonitoringTerminalOutcome>, AppError> {
-    let sql = monitoring_terminal_outcomes_sql(scope);
-    let rows = match scope {
-        MonitoringScope::Tenant(_) => {
-            sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(tenant_id)
-                .bind(upstream_account_id)
-                .bind(model)
-                .bind(from_created_at)
-                .bind(to_created_at)
-                .fetch_all(connection)
-                .await?
-        }
-        MonitoringScope::Global => {
-            sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(upstream_account_id)
-                .bind(model)
-                .bind(from_created_at)
-                .bind(to_created_at)
-                .fetch_all(connection)
-                .await?
-        }
+    context: MonitoringBatchContext<'_>,
+    pairs: &[(String, String)],
+    statement_counter: &mut MonitoringStatementCounter,
+) -> Result<BTreeMap<(String, String), Vec<MonitoringTerminalOutcome>>, AppError> {
+    let mut outcomes = pairs
+        .iter()
+        .cloned()
+        .map(|pair| (pair, Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    if pairs.is_empty() {
+        return Ok(outcomes);
+    }
+    let dialect = match context.backend {
+        DatabaseBackend::PostgreSql => MonitoringTerminalBatchDialect::PostgreSql,
+        DatabaseBackend::Sqlite => MonitoringTerminalBatchDialect::Sqlite,
     };
-    rows.into_iter()
-        .map(|row| {
-            let source: String = row.try_get("source")?;
-            let status: String = row.try_get("status_class")?;
-            if !matches!(source.as_str(), "request" | "generation")
-                || !matches!(status.as_str(), "success" | "failure")
-            {
-                return Err(AppError::Internal);
-            }
-            let error_code: String = row.try_get("error_code")?;
-            Ok(MonitoringTerminalOutcome {
-                id: row.try_get("id")?,
-                source,
-                created_at: row.try_get("created_at")?,
-                status,
-                duration_ms: row.try_get("duration_ms")?,
-                error_code: (!error_code.is_empty()).then_some(error_code),
-            })
-        })
-        .collect()
+    let sql = monitoring_terminal_outcomes_batch_sql(context.scope, pairs.len(), dialect)
+        .ok_or(AppError::Internal)?;
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+    for (upstream_account_id, model) in pairs {
+        query = query.bind(upstream_account_id).bind(model);
+    }
+    if matches!(context.scope, MonitoringScope::Tenant(_)) {
+        query = query.bind(context.tenant_id);
+    }
+    statement_counter.record();
+    let rows = query
+        .bind(context.from_created_at)
+        .bind(context.to_created_at)
+        .fetch_all(connection)
+        .await?;
+    for row in rows {
+        let upstream_account_id: String = row.try_get("upstream_account_id")?;
+        let model: String = row.try_get("model")?;
+        let pair = (upstream_account_id, model);
+        let Some(pair_outcomes) = outcomes.get_mut(&pair) else {
+            return Err(AppError::Internal);
+        };
+        let source: String = row.try_get("source")?;
+        let status: String = row.try_get("status_class")?;
+        if !matches!(source.as_str(), "request" | "generation")
+            || !matches!(status.as_str(), "success" | "failure")
+        {
+            return Err(AppError::Internal);
+        }
+        let error_code: String = row.try_get("error_code")?;
+        pair_outcomes.push(MonitoringTerminalOutcome {
+            id: row.try_get("id")?,
+            source,
+            created_at: row.try_get("created_at")?,
+            status,
+            duration_ms: row.try_get("duration_ms")?,
+            error_code: (!error_code.is_empty()).then_some(error_code),
+        });
+    }
+    Ok(outcomes)
 }
 
-async fn upstream_health(
+async fn upstream_health_batch(
     connection: &mut AnyConnection,
-    upstream_account_id: &str,
+    upstream_account_ids: &[String],
+    generated_at: i64,
+    statement_counter: &mut MonitoringStatementCounter,
+) -> Result<BTreeMap<String, (String, MonitoringHealth)>, AppError> {
+    if upstream_account_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let sql = monitoring_upstream_health_batch_sql(upstream_account_ids.len())
+        .ok_or(AppError::Internal)?;
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+    for upstream_account_id in upstream_account_ids {
+        query = query.bind(upstream_account_id);
+    }
+    statement_counter.record();
+    let rows = query.fetch_all(connection).await?;
+    let mut health = BTreeMap::new();
+    for row in rows {
+        let upstream_account_id: String = row.try_get("upstream_account_id")?;
+        let value = upstream_health_from_row(&row, generated_at)?;
+        if health.insert(upstream_account_id, value).is_some() {
+            return Err(AppError::Internal);
+        }
+    }
+    Ok(health)
+}
+
+fn upstream_health_from_row(
+    row: &AnyRow,
     generated_at: i64,
 ) -> Result<(String, MonitoringHealth), AppError> {
-    let row = sqlx::query(
-        "SELECT COALESCE(account.name, deleted.name, target.upstream_account_id) AS name, \
-                account.status, account.credential_generation, \
-                health.credential_generation AS health_generation, \
-                health.consecutive_failures, health.cooldown_until, health.updated_at \
-           FROM (SELECT $1 AS upstream_account_id) target \
-      LEFT JOIN upstream_accounts account \
-             ON account.id = target.upstream_account_id \
-      LEFT JOIN deleted_upstream_account_snapshots deleted \
-             ON deleted.upstream_account_id = target.upstream_account_id \
-      LEFT JOIN upstream_account_health health \
-             ON health.upstream_account_id = account.id \
-          WHERE account.id IS NOT NULL OR deleted.upstream_account_id IS NOT NULL",
-    )
-    .bind(upstream_account_id)
-    .fetch_optional(connection)
-    .await?;
-    let Some(row) = row else {
-        return Ok((upstream_account_id.to_owned(), unknown_health()));
-    };
     let name: String = row.try_get("name")?;
     let account_status: Option<String> = row.try_get("status")?;
     let credential_generation: Option<i64> = row.try_get("credential_generation")?;
@@ -599,6 +676,479 @@ fn aggregate_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::{Connection, PgConnection};
+
+    const FIXTURE_FROM: i64 = 1_000;
+    const FIXTURE_TO: i64 = 2_000;
+
+    struct PostgresMonitoringFixture {
+        tenant_id: String,
+        tenant_external_id: String,
+        pairs: Vec<(String, String)>,
+    }
+
+    async fn seed_postgres_monitoring_fixture(
+        database: &Database,
+        pair_count: usize,
+    ) -> PostgresMonitoringFixture {
+        let fixture_id = Uuid::now_v7();
+        let tenant_id = Uuid::now_v7().to_string();
+        let tenant_external_id = format!("monitoring-batch-{fixture_id}");
+        sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, 1)")
+            .bind(&tenant_id)
+            .bind(&tenant_external_id)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let mut pairs = Vec::with_capacity(pair_count);
+        for index in 0..pair_count {
+            let upstream_account_id = Uuid::now_v7().to_string();
+            let model = format!("monitoring-model-{index}");
+            let name = format!("monitoring-upstream-{index}");
+            let account_status = if index == 2 { "disabled" } else { "active" };
+            sqlx::query(
+                "INSERT INTO upstream_accounts (
+                     id, tenant_id, name, driver, auth_kind, config_json, status,
+                     credential_generation, created_at, updated_at
+                 ) VALUES ($1, $2, $3, 'http-json', 'none', '{}', $4, 2, 1, 1)",
+            )
+            .bind(&upstream_account_id)
+            .bind(&tenant_id)
+            .bind(&name)
+            .bind(account_status)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+            let (health_generation, consecutive_failures, cooldown_until) = match index {
+                1 => (2_i64, 1_i64, 0_i64),
+                // A stale breaker generation must not poison the rotated
+                // current credential, even if the old generation was open.
+                3 => (1_i64, 9_i64, i64::MAX),
+                _ => (2_i64, 0_i64, 0_i64),
+            };
+            sqlx::query(
+                "INSERT INTO upstream_account_health (
+                     upstream_account_id, consecutive_failures, cooldown_until,
+                     probe_lease_until, last_failure_kind, updated_at,
+                     credential_generation
+                 ) VALUES ($1, $2, $3, 0, '', 700, $4)",
+            )
+            .bind(&upstream_account_id)
+            .bind(consecutive_failures)
+            .bind(cooldown_until)
+            .bind(health_generation)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+
+            if index == 4 {
+                sqlx::query(
+                    "INSERT INTO deleted_upstream_account_snapshots (
+                         upstream_account_id, tenant_id, name, driver, auth_kind,
+                         credential_generation, created_at, deleted_at
+                     ) VALUES ($1, $2, $3, 'http-json', 'none', 2, 1, 2)",
+                )
+                .bind(&upstream_account_id)
+                .bind(&tenant_id)
+                .bind(&name)
+                .execute(&database.pool)
+                .await
+                .unwrap();
+                sqlx::query("DELETE FROM upstream_accounts WHERE id = $1")
+                    .bind(&upstream_account_id)
+                    .execute(&database.pool)
+                    .await
+                    .unwrap();
+            }
+
+            let fact_prefix = format!("{fixture_id}-{index}");
+            sqlx::query(
+                "INSERT INTO request_stats_facts (
+                     request_id, tenant_id, key_id, created_at, model, protocol,
+                     status_class, error_code, upstream_account_id, model_route_id,
+                     duration_ms, input_tokens, output_tokens, cached_input_tokens,
+                     cache_write_tokens, service_tier, currency, cost_micros
+                 )
+                 SELECT $1 || '-request-' || n::text, $2, $1 || '-key',
+                        1100 + n * 20, $3, 'openai',
+                        CASE WHEN n % 2 = 0 THEN 'success' ELSE 'failure' END,
+                        CASE WHEN n % 2 = 0 THEN '' ELSE 'request_failure' END,
+                        $4, '', 50 + n, 10, 5, 0, 0, 'default', 'USD', 10
+                   FROM generate_series(0, 6) AS fixture(n)",
+            )
+            .bind(&fact_prefix)
+            .bind(&tenant_id)
+            .bind(&model)
+            .bind(&upstream_account_id)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO generation_stats_facts (
+                     job_id, tenant_id, key_id, created_at, model, status_class,
+                     error_code, upstream_account_id, duration_ms, cost_micros,
+                     billed_units, currency
+                 )
+                 SELECT $1 || '-generation-' || n::text, $2, $1 || '-key',
+                        1110 + n * 20, $3,
+                        CASE WHEN n % 2 = 0 THEN 'failure' ELSE 'success' END,
+                        CASE WHEN n % 2 = 0 THEN 'generation_failure' ELSE '' END,
+                        $4, 70 + n, 20, 1, 'USD'
+                   FROM generate_series(0, 6) AS fixture(n)",
+            )
+            .bind(&fact_prefix)
+            .bind(&tenant_id)
+            .bind(&model)
+            .bind(&upstream_account_id)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+            pairs.push((upstream_account_id, model));
+        }
+        PostgresMonitoringFixture {
+            tenant_id,
+            tenant_external_id,
+            pairs,
+        }
+    }
+
+    type OutcomeSignature = (String, String, i64, String, i64, Option<String>);
+
+    fn outcome_signature(outcome: &MonitoringTerminalOutcome) -> OutcomeSignature {
+        (
+            outcome.id.clone(),
+            outcome.source.clone(),
+            outcome.created_at,
+            outcome.status.clone(),
+            outcome.duration_ms,
+            outcome.error_code.clone(),
+        )
+    }
+
+    async fn reference_terminal_outcomes(
+        connection: &mut AnyConnection,
+        tenant_id: &str,
+        upstream_account_id: &str,
+        model: &str,
+    ) -> Vec<OutcomeSignature> {
+        let rows = sqlx::query(
+            "SELECT id, source, created_at, status_class, duration_ms, error_code
+               FROM (
+                     (SELECT f.request_id AS id, 'request' AS source, f.created_at,
+                             f.status_class, f.duration_ms, f.error_code
+                        FROM request_stats_facts f
+                       WHERE f.tenant_id = $1 AND f.upstream_account_id = $2
+                         AND f.model = $3 AND f.created_at >= $4 AND f.created_at <= $5
+                       ORDER BY f.created_at DESC, f.request_id DESC
+                       LIMIT 5)
+                     UNION ALL
+                     (SELECT f.job_id AS id, 'generation' AS source, f.created_at,
+                             f.status_class, f.duration_ms, f.error_code
+                        FROM generation_stats_facts f
+                       WHERE f.tenant_id = $1 AND f.upstream_account_id = $2
+                         AND f.model = $3 AND f.created_at >= $4 AND f.created_at <= $5
+                       ORDER BY f.created_at DESC, f.job_id DESC
+                       LIMIT 5)
+               ) terminal
+              ORDER BY created_at DESC, id DESC
+              LIMIT 5",
+        )
+        .bind(tenant_id)
+        .bind(upstream_account_id)
+        .bind(model)
+        .bind(FIXTURE_FROM)
+        .bind(FIXTURE_TO)
+        .fetch_all(connection)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|row| {
+                let error_code: String = row.try_get("error_code").unwrap();
+                (
+                    row.try_get("id").unwrap(),
+                    row.try_get("source").unwrap(),
+                    row.try_get("created_at").unwrap(),
+                    row.try_get("status_class").unwrap(),
+                    row.try_get("duration_ms").unwrap(),
+                    (!error_code.is_empty()).then_some(error_code),
+                )
+            })
+            .collect()
+    }
+
+    fn collect_plan_index_names(plan: &serde_json::Value, names: &mut BTreeSet<String>) {
+        if let Some(name) = plan.get("Index Name").and_then(serde_json::Value::as_str) {
+            names.insert(name.to_owned());
+        }
+        if let Some(children) = plan.get("Plans").and_then(serde_json::Value::as_array) {
+            for child in children {
+                collect_plan_index_names(child, names);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_monitoring_batch_is_constant_statement_equivalent_and_index_bounded() {
+        let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+        database.migrate().await.unwrap();
+        let one = seed_postgres_monitoring_fixture(&database, 1).await;
+        let ten = seed_postgres_monitoring_fixture(&database, 10).await;
+        let filter = MonitoringSnapshotFilter {
+            from_created_at: FIXTURE_FROM,
+            to_created_at: FIXTURE_TO,
+        };
+
+        let mut one_statement_count = MonitoringStatementCounter::default();
+        let one_snapshot = database
+            .operator_monitoring_snapshot_inner(
+                MonitoringScope::Tenant(one.tenant_external_id),
+                filter.clone(),
+                &mut one_statement_count,
+            )
+            .await
+            .unwrap();
+        let mut ten_statement_count = MonitoringStatementCounter::default();
+        let ten_snapshot = database
+            .operator_monitoring_snapshot_inner(
+                MonitoringScope::Tenant(ten.tenant_external_id.clone()),
+                filter,
+                &mut ten_statement_count,
+            )
+            .await
+            .unwrap();
+        assert_eq!(one_snapshot.top_upstream_models.len(), 1);
+        assert_eq!(ten_snapshot.top_upstream_models.len(), 10);
+        assert_eq!(one_statement_count.count, 6);
+        assert_eq!(ten_statement_count.count, one_statement_count.count);
+
+        let snapshot_by_pair = ten_snapshot
+            .top_upstream_models
+            .iter()
+            .map(|value| {
+                (
+                    (value.upstream_account_id.clone(), value.model.clone()),
+                    value,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut reference_connection = database.pool.acquire().await.unwrap();
+        for (index, pair) in ten.pairs.iter().enumerate() {
+            let value = snapshot_by_pair.get(pair).unwrap();
+            let expected = reference_terminal_outcomes(
+                &mut reference_connection,
+                &ten.tenant_id,
+                &pair.0,
+                &pair.1,
+            )
+            .await;
+            let actual = value
+                .terminal_outcomes
+                .iter()
+                .map(outcome_signature)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual, expected,
+                "terminal outcome mismatch for pair {index}"
+            );
+            let expected_status = match index {
+                1 => "degraded",
+                2 => "unhealthy",
+                4 => "unknown",
+                _ => "healthy",
+            };
+            assert_eq!(value.health.status, expected_status);
+            assert_eq!(value.upstream_name, format!("monitoring-upstream-{index}"));
+        }
+        drop(reference_connection);
+
+        let terminal_sql = monitoring_terminal_outcomes_batch_sql(
+            &MonitoringScope::Tenant(ten.tenant_external_id),
+            ten.pairs.len(),
+            MonitoringTerminalBatchDialect::PostgreSql,
+        )
+        .unwrap();
+        let mut explain_connection = PgConnection::connect(&database_url).await.unwrap();
+        let mut explain_transaction = explain_connection.begin().await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *explain_transaction)
+            .await
+            .unwrap();
+        let mut explain_query = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {terminal_sql}"
+        )));
+        for (upstream_account_id, model) in &ten.pairs {
+            explain_query = explain_query.bind(upstream_account_id).bind(model);
+        }
+        let explain_row = explain_query
+            .bind(&ten.tenant_id)
+            .bind(FIXTURE_FROM)
+            .bind(FIXTURE_TO)
+            .fetch_one(&mut *explain_transaction)
+            .await
+            .unwrap();
+        let explain_json: String = explain_row.try_get_unchecked(0).unwrap();
+        let explain: serde_json::Value = serde_json::from_str(&explain_json).unwrap();
+        let root = &explain[0]["Plan"];
+        let mut index_names = BTreeSet::new();
+        collect_plan_index_names(root, &mut index_names);
+        assert!(index_names.contains("request_stats_facts_monitoring_outcome_idx"));
+        assert!(index_names.contains("generation_stats_facts_monitoring_outcome_idx"));
+        let shared_read_blocks = root
+            .get("Shared Read Blocks")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let shared_hit_blocks = root
+            .get("Shared Hit Blocks")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        assert!(
+            shared_read_blocks <= 256,
+            "shared reads: {shared_read_blocks}"
+        );
+        assert!(
+            shared_read_blocks + shared_hit_blocks <= 1_024,
+            "shared blocks: read={shared_read_blocks}, hit={shared_hit_blocks}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_terminal_batch_bounds_large_history_with_monitoring_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("monitoring-batch.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
+        database.migrate().await.unwrap();
+        let fixture_id = Uuid::now_v7().to_string();
+        let tenant_id = Uuid::now_v7().to_string();
+        let upstream_account_id = Uuid::now_v7().to_string();
+        let model = "sqlite-large-history".to_owned();
+        sqlx::query("INSERT INTO tenants (id, external_id, created_at) VALUES ($1, $2, 1)")
+            .bind(&tenant_id)
+            .bind(format!("sqlite-monitoring-{fixture_id}"))
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE history(n) AS (
+                 SELECT 0
+                 UNION ALL
+                 SELECT n + 1 FROM history WHERE n < 511
+             )
+             INSERT INTO request_stats_facts (
+                 request_id, tenant_id, key_id, created_at, model, protocol,
+                 status_class, error_code, upstream_account_id, model_route_id,
+                 duration_ms, input_tokens, output_tokens, cached_input_tokens,
+                 cache_write_tokens, service_tier, currency, cost_micros
+             )
+             SELECT $1 || '-request-' || n, $2, $1 || '-key', 1000 + n * 2,
+                    $3, 'openai', 'success', '', $4, '', 10, 1, 1, 0, 0,
+                    'default', 'USD', 1
+               FROM history",
+        )
+        .bind(&fixture_id)
+        .bind(&tenant_id)
+        .bind(&model)
+        .bind(&upstream_account_id)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE history(n) AS (
+                 SELECT 0
+                 UNION ALL
+                 SELECT n + 1 FROM history WHERE n < 511
+             )
+             INSERT INTO generation_stats_facts (
+                 job_id, tenant_id, key_id, created_at, model, status_class,
+                 error_code, upstream_account_id, duration_ms, cost_micros,
+                 billed_units, currency
+             )
+             SELECT $1 || '-generation-' || n, $2, $1 || '-key', 1001 + n * 2,
+                    $3, 'success', '', $4, 10, 1, 1, 'USD'
+               FROM history",
+        )
+        .bind(&fixture_id)
+        .bind(&tenant_id)
+        .bind(&model)
+        .bind(&upstream_account_id)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+
+        let mut pairs = vec![(upstream_account_id.clone(), model.clone())];
+        for index in 1..10 {
+            pairs.push((format!("{fixture_id}-empty-{index}"), model.clone()));
+        }
+        let scope = MonitoringScope::Tenant("sqlite-monitoring".to_owned());
+        let mut connection = database.pool.acquire().await.unwrap();
+        let mut statement_counter = MonitoringStatementCounter::default();
+        let outcomes = terminal_outcomes_batch(
+            &mut connection,
+            MonitoringBatchContext {
+                backend: DatabaseBackend::Sqlite,
+                scope: &scope,
+                tenant_id: &tenant_id,
+                from_created_at: 1_000,
+                to_created_at: 10_000,
+            },
+            &pairs,
+            &mut statement_counter,
+        )
+        .await
+        .unwrap();
+        assert_eq!(statement_counter.count, 1);
+        let selected = outcomes
+            .get(&(upstream_account_id.clone(), model.clone()))
+            .unwrap();
+        assert_eq!(selected.len(), 5);
+        assert_eq!(selected[0].id, format!("{fixture_id}-generation-511"));
+        assert_eq!(selected[1].id, format!("{fixture_id}-request-511"));
+        assert_eq!(selected[4].id, format!("{fixture_id}-generation-509"));
+        assert!(pairs[1..].iter().all(|pair| outcomes[pair].is_empty()));
+
+        let sql = monitoring_terminal_outcomes_batch_sql(
+            &scope,
+            pairs.len(),
+            MonitoringTerminalBatchDialect::Sqlite,
+        )
+        .unwrap();
+        let mut plan_query = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")));
+        for (account_id, pair_model) in &pairs {
+            plan_query = plan_query.bind(account_id).bind(pair_model);
+        }
+        let plan_rows = plan_query
+            .bind(&tenant_id)
+            .bind(1_000_i64)
+            .bind(10_000_i64)
+            .fetch_all(&mut *connection)
+            .await
+            .unwrap();
+        let details = plan_rows
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("detail").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| { detail.contains("request_stats_facts_monitoring_outcome_idx") })
+                .count(),
+            10
+        );
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| {
+                    detail.contains("generation_stats_facts_monitoring_outcome_idx")
+                })
+                .count(),
+            10
+        );
+    }
 
     #[test]
     fn monitoring_window_preserves_the_hour_and_day_retention_fences() {
@@ -671,11 +1221,19 @@ mod tests {
         .await
         .unwrap();
         let mut connection = database.pool.acquire().await.unwrap();
-        let (name, health) = upstream_health(&mut connection, &upstream_account_id, 3)
-            .await
-            .unwrap();
+        let mut statements = MonitoringStatementCounter::default();
+        let mut results = upstream_health_batch(
+            &mut connection,
+            std::slice::from_ref(&upstream_account_id),
+            3,
+            &mut statements,
+        )
+        .await
+        .unwrap();
+        let (name, health) = results.remove(&upstream_account_id).unwrap();
         assert_eq!(name, "deleted-monitoring-provider");
         assert_eq!(health.status, "unknown");
         assert_eq!(health.observed_at, None);
+        assert_eq!(statements.count, 1);
     }
 }
