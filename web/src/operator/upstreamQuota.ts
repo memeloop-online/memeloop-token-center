@@ -25,6 +25,9 @@ export interface UpstreamQuotaSnapshot {
   reset_capability: {
     provider_supported: boolean | null;
     implementation_available: boolean;
+    prepare_available: boolean;
+    confirmation_required: boolean;
+    retryable: boolean;
     available_credits: number | null;
     applicable_credits: number | null;
     reason: string | null;

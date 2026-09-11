@@ -392,6 +392,13 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "control list covering indexes",
         sql: include_str!("../../../migrations/common/0073_control_list_covering_indexes.sql"),
     },
+    Migration {
+        version: 74,
+        name: "idempotent audited upstream quota reset confirmation",
+        sql: include_str!(
+            "../../../migrations/common/0074_upstream_quota_reset_idempotency_audit.sql"
+        ),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -769,6 +776,13 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 73,
         name: "control list covering indexes",
         sql: include_str!("../../../migrations/common/0073_control_list_covering_indexes.sql"),
+    },
+    Migration {
+        version: 74,
+        name: "idempotent audited upstream quota reset confirmation",
+        sql: include_str!(
+            "../../../migrations/common/0074_upstream_quota_reset_idempotency_audit.sql"
+        ),
     },
 ];
 

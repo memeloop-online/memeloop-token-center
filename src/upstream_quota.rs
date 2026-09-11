@@ -67,6 +67,12 @@ struct Credits {
 struct ResetCapability {
     provider_supported: Option<bool>,
     implementation_available: bool,
+    /// Preparing performs only read-only checks. Keep it retryable after a
+    /// transient refresh failure instead of turning that failure into a
+    /// permanent product capability decision.
+    prepare_available: bool,
+    confirmation_required: bool,
+    retryable: bool,
     available_credits: Option<i64>,
     applicable_credits: Option<i64>,
     reason: &'static str,
@@ -91,10 +97,13 @@ impl QuotaSnapshot {
             reset_capability: ResetCapability {
                 provider_supported: codex.then_some(true),
                 implementation_available: codex,
+                prepare_available: codex,
+                confirmation_required: codex,
+                retryable: codex,
                 available_credits: None,
                 applicable_credits: None,
                 reason: if codex {
-                    "fresh_confirmation_required"
+                    "quota_refresh_required"
                 } else {
                     "quota_adapter_not_implemented"
                 },
@@ -192,14 +201,23 @@ impl QuotaCache {
         // Includes DNS/proxy setup, both GETs and bounded body decoding.
         let result = tokio::time::timeout(
             Duration::from_secs(8),
-            read_codex(state, credential, empty(None)),
+            read_codex(state, account, credential, empty(None)),
         )
         .await
         .unwrap_or(Err("quota_timeout"));
-        let value = match result {
-            Ok(value) => value,
+        let mut value = match result {
+            Ok(mut value) => {
+                value.finalize_reset_capability();
+                value
+            }
             Err(error) => fallback(error),
         };
+        if value.error_code.is_some() {
+            value.reset_capability.retryable = true;
+            value.reset_capability.prepare_available =
+                value.reset_capability.implementation_available;
+            value.reset_capability.reason = "quota_refresh_failed_retryable";
+        }
         let mut cached = entry.cached.lock().await;
         cached.refresh_after = unix_millis()
             + if value.error_code.is_none() {
@@ -225,6 +243,10 @@ fn stale_or_error(
         {
             value.stale = true;
             value.error_code = empty.error_code;
+            value.reset_capability.retryable = true;
+            value.reset_capability.prepare_available =
+                value.reset_capability.implementation_available;
+            value.reset_capability.reason = "quota_refresh_failed_retryable";
             value
         }
         _ => empty,
@@ -233,11 +255,28 @@ fn stale_or_error(
 
 async fn read_codex(
     state: &AppState,
+    account: &UpstreamAccountView,
     credential: &UpstreamCredential,
     mut snapshot: QuotaSnapshot,
 ) -> Result<QuotaSnapshot, &'static str> {
+    let observation_started_at = unix_millis();
+    let recovery_fence = match state
+        .db
+        .upstream_quota_recovery_fence(account.id, account.credential_generation)
+        .await
+    {
+        Ok(fence) => fence,
+        Err(_) => {
+            tracing::warn!(
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                "failed to capture quota recovery fence; quota read remains read-only"
+            );
+            None
+        }
+    };
     credential
-        .validate(unix_millis())
+        .validate(observation_started_at)
         .map_err(|_| "credential_invalid")?;
     let account_header = crate::oauth::managed::codex::account_header_value(credential)
         .map_err(|_| "credential_invalid")?;
@@ -269,7 +308,80 @@ async fn read_codex(
     snapshot.status = "ready";
     snapshot.observed_at = Some(observed_at);
     snapshot.stale_after = Some(observed_at + FRESH_MS);
+    snapshot.finalize_reset_capability();
+    if snapshot.conclusively_allows_codex()
+        && let Some(recovery_fence) = recovery_fence
+    {
+        match state
+            .db
+            .recover_upstream_quota_from_observation(
+                account.id,
+                account.credential_generation,
+                recovery_fence,
+            )
+            .await
+        {
+            Ok(true) => tracing::info!(
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                observation_started_at,
+                observed_at,
+                "fresh quota evidence cleared an exhausted upstream cooldown"
+            ),
+            Ok(false) => {}
+            Err(_) => tracing::warn!(
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                error_code = "quota_health_recovery_failed",
+                "failed to apply fresh quota recovery evidence"
+            ),
+        }
+    }
     Ok(snapshot)
+}
+
+impl QuotaSnapshot {
+    fn conclusively_allows_codex(&self) -> bool {
+        self.status == "ready"
+            && !self.stale
+            && self.error_code.is_none()
+            && self.windows.iter().any(|window| {
+                window.id.starts_with("code:")
+                    && window.allowed == Some(true)
+                    && window.limit_reached != Some(true)
+            })
+    }
+
+    fn finalize_reset_capability(&mut self) {
+        let capability = &mut self.reset_capability;
+        if capability.provider_supported != Some(true) || !capability.implementation_available {
+            capability.prepare_available = false;
+            capability.confirmation_required = false;
+            capability.retryable = false;
+            return;
+        }
+        capability.confirmation_required = true;
+        if capability.credit_error_code.is_some() {
+            capability.prepare_available = true;
+            capability.retryable = true;
+            capability.reason = "reset_credit_refresh_failed_retryable";
+        } else if capability.available_credits.unwrap_or_default() >= 1
+            && capability.applicable_credits.unwrap_or_default() >= 1
+        {
+            capability.prepare_available = true;
+            capability.retryable = false;
+            capability.reason = "explicit_confirmation_required";
+        } else if capability.available_credits.is_some() && capability.applicable_credits.is_some()
+        {
+            capability.prepare_available = false;
+            capability.retryable = false;
+            capability.reason = "no_applicable_reset_credits";
+        } else {
+            capability.prepare_available = true;
+            capability.retryable = true;
+            capability.reason = "quota_refresh_required";
+        }
+    }
 }
 
 async fn get_json(

@@ -40,6 +40,15 @@ pub(crate) enum UpstreamAttemptAdmission {
     },
 }
 
+/// Exact health row observed before a supplier quota read.  Recovery must
+/// match both fields so a concurrent 429 wins even when two updates share the
+/// same millisecond timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QuotaRecoveryFence {
+    consecutive_failures: i64,
+    updated_at: i64,
+}
+
 impl UpstreamAttemptAdmission {
     #[cfg(test)]
     pub(crate) const fn is_unavailable(self) -> bool {
@@ -85,6 +94,72 @@ impl UpstreamFailureKind {
 }
 
 impl Database {
+    pub(crate) async fn upstream_quota_recovery_fence(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+    ) -> Result<Option<QuotaRecoveryFence>, AppError> {
+        let now = unix_millis();
+        let row = sqlx::query(
+            "SELECT health.consecutive_failures, health.updated_at
+               FROM upstream_accounts account
+               JOIN upstream_account_health health
+                 ON health.upstream_account_id = account.id
+                AND health.credential_generation = $2
+              WHERE account.id = $1
+                AND account.status = 'active'
+                AND account.credential_generation = $2
+                AND health.last_failure_kind = 'quota_exhausted'
+                AND health.probe_lease_until <= $3",
+        )
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(QuotaRecoveryFence {
+                consecutive_failures: row.try_get("consecutive_failures")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Clears only the exact quota-exhaustion row captured before a conclusive,
+    /// fresh supplier observation. A newer 429 or half-open probe changes the
+    /// row and therefore wins over stale management evidence.
+    pub(crate) async fn recover_upstream_quota_from_observation(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        fence: QuotaRecoveryFence,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            "DELETE FROM upstream_account_health
+             WHERE upstream_account_id = $1
+               AND credential_generation = $2
+               AND last_failure_kind = 'quota_exhausted'
+               AND consecutive_failures = $3
+               AND updated_at = $4
+               AND probe_lease_until <= $5
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_health.upstream_account_id
+                   AND account.status = 'active'
+                   AND account.credential_generation = $2
+               )",
+        )
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(fence.consecutive_failures)
+        .bind(fence.updated_at)
+        .bind(unix_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Returns true for healthy accounts. An account recovering from cooldown
     /// is admitted only when this caller atomically owns its short half-open
     /// probe lease, preventing a concurrent request wave from stampeding it.

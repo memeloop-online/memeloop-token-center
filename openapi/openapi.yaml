@@ -1163,6 +1163,8 @@ paths:
         Snapshots are cached for 30 seconds with bounded singleflight/concurrency;
         stale observations may be retained for five minutes after a read error.
         Unsupported means no quota adapter, not zero quota or unlimited usage.
+        A fresh observation may clear a quota-exhausted routing row only when the
+        main code limit reports allowed=true and does not report limit_reached=true.
       parameters:
         - $ref: '#/components/parameters/AccountId'
         - name: tenant_external_id
@@ -1200,10 +1202,13 @@ paths:
                       has_credits: { type: [boolean, 'null'] }
                   reset_capability:
                     type: object
-                    required: [provider_supported, implementation_available, available_credits, applicable_credits, reason, credit_error_code]
+                    required: [provider_supported, implementation_available, prepare_available, confirmation_required, retryable, available_credits, applicable_credits, reason, credit_error_code]
                     properties:
                       provider_supported: { type: [boolean, 'null'] }
                       implementation_available: { type: boolean }
+                      prepare_available: { type: boolean, description: Preparing is read-only and remains retryable after transient refresh failures. }
+                      confirmation_required: { type: boolean }
+                      retryable: { type: boolean, description: Current capability evidence may be refreshed without changing the integration. }
                       available_credits: { type: [integer, 'null'], format: int64 }
                       applicable_credits: { type: [integer, 'null'], format: int64 }
                       reason: { type: string }
@@ -1245,6 +1250,7 @@ paths:
         No credit is consumed by prepare. A still-unresolved operation blocks another.
       parameters:
         - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - name: tenant_external_id
           in: query
           required: true
@@ -1256,15 +1262,20 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [operation, confirmation_token]
+                required: [operation, confirmation_token, idempotency_replayed]
                 properties:
                   operation: { $ref: '#/components/schemas/UpstreamQuotaResetOperation' }
-                  confirmation_token: { type: string, writeOnly: false, description: Secret shown once; never logged or persisted by clients. }
+                  confirmation_token: { type: string, writeOnly: false, description: Memory-only secret returned for the initial preparation and an exact replay of its Idempotency-Key; never logged or durably persisted by clients. }
+                  idempotency_replayed: { type: boolean, description: True when the same caller/account prepare key returned the existing operation. }
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: Missing fresh applicable credits or an unresolved operation. }
+        '503':
+          description: Transient fresh-read or local-capacity failure; retrying the same Idempotency-Key is safe.
+          headers:
+            Retry-After: { schema: { type: integer, minimum: 1 } }
 
   /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}:
     get:
@@ -1309,8 +1320,11 @@ paths:
         Accepted means HTTP 2xx only, not proven consumption or window recovery.
         Submitted, accepted and unknown all block another operation pending
         separately reviewed manual handling. No automated unlock is provided.
+        Transient local capacity, DNS, proxy, or client-construction failures
+        before the durable claim return 503 and are safe to retry with the same key.
       parameters:
         - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
         - name: operation_id
           in: path
           required: true
@@ -1326,12 +1340,13 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [confirmation_token]
+              required: [confirmation_token, confirmation]
               properties:
                 confirmation_token: { type: string, minLength: 32, maxLength: 256 }
+                confirmation: { const: consume_one_supplier_reset_credit }
       responses:
         '200':
-          description: Durable accepted or unknown dispatch result; Cache-Control no-store.
+          description: Durable submitted, accepted, or unknown dispatch result, including an exact idempotent replay; Cache-Control no-store.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/UpstreamQuotaResetOperation' }
@@ -1339,6 +1354,10 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: 'Stale, expired, mismatched or already dispatched confirmation.' }
+        '503':
+          description: Transient pre-claim failure; the operation remains prepared and the same Idempotency-Key is safe to retry.
+          headers:
+            Retry-After: { schema: { type: integer, minimum: 1 } }
 
   /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/reconcile:
     post:
@@ -1371,6 +1390,10 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: Prepared operation or unavailable fresh supplier evidence. }
+        '503':
+          description: Transient fresh-read or local-capacity failure; reconciliation remains read-only and retryable.
+          headers:
+            Retry-After: { schema: { type: integer, minimum: 1 } }
 
   /internal/v1/upstreams/{account_id}/health:
     post:
@@ -4922,7 +4945,7 @@ components:
   schemas:
     UpstreamQuotaResetOperation:
       type: object
-      required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, error_code, effect, consumes_credits]
+      required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, error_code, audit, effect, consumes_credits]
       properties:
         id: { type: string, format: uuid }
         upstream_account_id: { type: string, format: uuid }
@@ -4932,10 +4955,28 @@ components:
         applicable_credits: { type: integer, format: int64, description: Immutable preparation baseline. }
         observed_at: { type: integer, format: int64, description: Preparation observation epoch milliseconds. }
         expires_at: { type: integer, format: int64 }
+        prepared_by_service_id: { type: string }
+        confirmed_by_service_id: { type: [string, 'null'] }
+        confirmed_at: { type: [integer, 'null'], format: int64 }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
         last_reconciled_at: { type: [integer, 'null'], format: int64 }
         reconciled_available_credits: { type: [integer, 'null'], format: int64 }
         reconciled_applicable_credits: { type: [integer, 'null'], format: int64 }
         error_code: { type: [string, 'null'] }
+        audit:
+          type: array
+          maxItems: 32
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, event, actor_service_id, error_code, created_at]
+            properties:
+              id: { type: string, format: uuid }
+              event: { type: string, enum: [prepared, confirmation_claimed, dispatch_accepted, dispatch_unknown, reconciled] }
+              actor_service_id: { type: [string, 'null'] }
+              error_code: { type: [string, 'null'] }
+              created_at: { type: integer, format: int64 }
         effect: { const: supplier_defined_codex_rate_limits }
         consumes_credits: { const: 1 }
     Health:

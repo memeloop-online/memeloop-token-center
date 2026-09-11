@@ -52,14 +52,24 @@ attribution does not change when routes are disabled or replaced.
 ### Upstream account availability
 
 Quota reset writes require `providers:write`, explicit tenant/account authorization
-and schema 72. `POST /internal/v1/upstreams/{account_id}/quota-reset/prepare`
+and schema 74. `POST /internal/v1/upstreams/{account_id}/quota-reset/prepare`
 performs fresh supplier GETs and returns `{operation, confirmation_token}`.
 The 120-second token binds actor, account, credential generation/transport revision
-and the exact prepared credit counts. The UI must name the account, supplier-defined
+and the exact prepared credit counts. Prepare requires one `Idempotency-Key`; an
+exact replay returns the same operation and derives the same confirmation token
+without creating another operation or making another supplier read. The UI keeps
+that token only in memory and may receive it again only by replaying the same
+prepare key. The UI must name the account, supplier-defined
 Codex rate limits and consumption of one reset credit; no specific 5h/weekly window
 selection is supported by the supplier wire contract.
-`POST .../quota-reset/{operation_id}/confirm` accepts only that token and rechecks
-fresh credit counts and credential generation before an atomic dispatch claim.
+`POST .../quota-reset/{operation_id}/confirm` accepts only that token, the literal
+`confirmation=consume_one_supplier_reset_credit`, and one `Idempotency-Key`; it
+rechecks fresh credit counts and credential generation before an atomic dispatch claim.
+An exact confirmation replay returns durable state and never dispatches again;
+another key returns 409, while a missing or different explicit confirmation
+literal is rejected before any claim. Transient refresh, local capacity, DNS, proxy,
+or client-construction failures before that claim return 503 with `Retry-After` and
+remain safe to retry using the same confirmation key.
 One fixed-host POST follows the committed `submitted` state with retries and
 redirects disabled. HTTP 2xx yields `accepted` (not proven quota recovery);
 ambiguous outcomes are `unknown`. Both, and interrupted `submitted`, permanently
@@ -80,6 +90,12 @@ protocol is implemented and reviewed, even `accepted` stays blocked and the UI
 must say supplier acceptance is not proven consumption/recovery. Do not mark
 reset delivery complete based on this candidate or its mocks alone.
 
+Each reset response exposes preparation/confirmation timestamps and actors plus
+the bounded durable event history (`prepared`, `confirmation_claimed`,
+`dispatch_accepted|dispatch_unknown`, and `reconciled`). Raw idempotency keys,
+confirmation tokens, OAuth material, supplier bodies, and proxy secrets are never
+stored in that audit projection or returned.
+
 `GET /internal/v1/upstreams/{account_id}/quota?tenant_external_id=...` requires
 `providers:read` and an explicit authorized tenant. It returns the sanitized
 `upstream_quota_v1` contract: provider/status, nullable observation and freshness
@@ -94,9 +110,20 @@ body, email, account header, token or proxy secret is returned. The 30-second
 cache is bounded to 128 identities, four concurrent account reads and one flight
 per identity; each read has an eight-second deadline and 1 MiB response limit.
 Read failures may retain explicitly stale observations for at most five minutes.
+That stale last-known-good projection keeps reset integration available and marks
+the failure retryable; a transient refresh error is not persisted as a permanent
+loss of reset capability. Preparing is read-only and may retry the fresh check.
 Other providers return unsupported rather than fabricated quota. All responses
 use `Cache-Control: no-store`. Request quota only on explicit account inspection,
 not one automatic request per row on page load.
+
+A successful fresh Codex usage read may clear `quota_exhausted` only when the
+supplier explicitly reports `allowed=true` for the code limit and does not
+explicitly report `limit_reached=true`; an omitted `limit_reached` does not override
+that affirmative allowed signal. The delete
+is fenced by account credential generation, account status, the observation start
+time, health update time, and any half-open lease. Cached/stale/failed/ambiguous
+reads and newer 429 evidence never clear routing health.
 
 `GET /internal/v1/upstream-availability` requires a service credential with both
 `providers:read` and `requests:read`. All three query parameters are mandatory:
