@@ -1,3 +1,5 @@
+use std::future::{Future, ready};
+
 use super::*;
 
 impl Database {
@@ -5,6 +7,29 @@ impl Database {
         &self,
         input: FinishGenerationJobInput<'_>,
     ) -> Result<i64, AppError> {
+        self.finish_generation_job_inner(input, ready(())).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn finish_generation_job_before_write_for_test<F>(
+        &self,
+        input: FinishGenerationJobInput<'_>,
+        before_write: F,
+    ) -> Result<i64, AppError>
+    where
+        F: Future<Output = ()>,
+    {
+        self.finish_generation_job_inner(input, before_write).await
+    }
+
+    async fn finish_generation_job_inner<F>(
+        &self,
+        input: FinishGenerationJobInput<'_>,
+        before_write: F,
+    ) -> Result<i64, AppError>
+    where
+        F: Future<Output = ()>,
+    {
         if !matches!(input.status, "succeeded" | "failed" | "cancelled") {
             return Err(AppError::BadRequest(
                 "invalid terminal generation status".into(),
@@ -60,7 +85,7 @@ impl Database {
             }
         }
         let now = unix_millis();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT j.status, j.lease_owner, j.tenant_id, j.key_id, j.driver, j.created_at, j.estimated_units, j.billed_units, j.cost_micros, j.result_json, j.error_code, j.staged_assets_json, j.reservation_id, j.billing_unit_snapshot, j.micros_per_unit_snapshot, r.account_id, r.enforcement_mode, r.reserved_micros, r.reserved_tokens, r.rate_window_start, r.status AS reservation_status, r.actual_micros FROM generation_jobs j JOIN usage_reservations r ON r.id = j.reservation_id WHERE j.id = $1 FOR UPDATE"
@@ -193,6 +218,7 @@ impl Database {
             return Err(AppError::NotFound);
         }
 
+        before_write.await;
         let cost_micros =
             settle_token_usage_in_transaction(&mut transaction, &reservation, &usage, now).await?;
         if cost_micros != expected_cost_micros {

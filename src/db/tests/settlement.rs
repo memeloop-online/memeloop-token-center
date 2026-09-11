@@ -1,5 +1,6 @@
 use super::super::*;
 use crate::conversation::ConversationHints;
+use sqlx::Connection;
 
 #[test]
 fn responses_auto_tier_alias_settles_against_the_admitted_default_contract() {
@@ -19,6 +20,174 @@ fn responses_auto_tier_alias_settles_against_the_admitted_default_contract() {
     assert!(normalize_proxy_usage(&usage, 44_471, 4_096, Some("flex")).is_err());
     let explicit_auto = normalize_proxy_usage(&usage, 44_471, 4_096, Some("auto")).unwrap();
     assert_eq!(explicit_auto.service_tier.as_deref(), Some("auto"));
+}
+
+#[tokio::test]
+async fn sqlite_generation_terminal_settlement_holds_the_writer_slot_until_refund_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("generation-settlement.db").display()
+    );
+    let database = Database::connect_with_max(&database_url, 4).await.unwrap();
+    database.migrate().await.unwrap();
+    let pepper = b"generation settlement pepper over thirty-two bytes";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "generation-settlement".to_owned(),
+                principal_external_id: "member".to_owned(),
+                alias: "generation-settlement".to_owned(),
+                currency: "USD".to_owned(),
+                policy: KeyPolicy::default(),
+                initial_balance: Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let upstream = database
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "generation-settlement".to_owned(),
+                name: "generation-settlement".to_owned(),
+                driver: "comfyui".to_owned(),
+                config: serde_json::json!({"base_url": "http://127.0.0.1:1"}),
+                credential: UpstreamCredential::None,
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let price = database
+        .upsert_generation_price("generation-settlement", "USD", "job", Decimal::new(25, 2))
+        .await
+        .unwrap();
+    let reservation = database
+        .reserve_usage(&key, &price.reservation_price().unwrap(), 0, 1)
+        .await
+        .unwrap();
+    let reservation_id = reservation.id;
+    let job = database
+        .create_generation_job(CreateGenerationJobInput {
+            job_id: Uuid::now_v7(),
+            key: key.clone(),
+            upstream_account_id: upstream.id,
+            reservation,
+            public_model: "generation-settlement".to_owned(),
+            upstream_model: "workflow-v1".to_owned(),
+            driver: "comfyui".to_owned(),
+            request_object: "objects/blake3/generation-settlement".to_owned(),
+            estimated_units: 1,
+            billing_unit: price.billing_unit.clone(),
+            micros_per_unit: price.micros_per_unit,
+        })
+        .await
+        .unwrap();
+    let worker_id = "generation-settlement-worker";
+    database
+        .claim_generation_job(worker_id)
+        .await
+        .unwrap()
+        .expect("queued generation");
+
+    // The Cucumber contract verifies that Seedance receives one DELETE. Start this lower-level
+    // fixture at the following boundary: upstream accepted that DELETE, but its terminal refund
+    // has not been committed yet.
+    let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+    let (release_finish_tx, release_finish_rx) = tokio::sync::oneshot::channel();
+    let finish_database = database.clone();
+    let job_id = job.job_id;
+    let finish = tokio::spawn(async move {
+        finish_database
+            .finish_generation_job_before_write_for_test(
+                FinishGenerationJobInput {
+                    job_id,
+                    worker_id,
+                    status: "cancelled",
+                    billed_units: 0,
+                    error_code: Some("cancelled_by_user"),
+                    assets: &[],
+                    staged_assets: None,
+                },
+                async move {
+                    read_tx.send(()).unwrap();
+                    release_finish_rx.await.unwrap();
+                },
+            )
+            .await
+    });
+    read_rx.await.unwrap();
+
+    let mut writer_connection = database.pool.acquire().await.unwrap();
+    let competing_writer = writer_connection.begin_with("BEGIN IMMEDIATE");
+    tokio::pin!(competing_writer);
+    assert!(
+        futures_util::poll!(&mut competing_writer).is_pending(),
+        "the terminal transaction must own the SQLite writer slot before its first write"
+    );
+
+    release_finish_tx.send(()).unwrap();
+    assert_eq!(finish.await.unwrap().unwrap(), 0);
+    let mut competing_writer = competing_writer.await.unwrap();
+    sqlx::query("UPDATE generation_jobs SET updated_at = updated_at WHERE id = $1")
+        .bind(job_id.to_string())
+        .execute(&mut *competing_writer)
+        .await
+        .unwrap();
+    competing_writer.commit().await.unwrap();
+
+    let terminal = database.generation_job(key.key_id, job_id).await.unwrap();
+    assert_eq!(terminal.status, "cancelled");
+    assert_eq!(terminal.error_code.as_deref(), Some("cancelled_by_user"));
+    assert_eq!(
+        database.key_view(&key).await.unwrap().available_balance,
+        "10"
+    );
+    let usage_entries = database
+        .list_account_ledger(key.account_id, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.kind == "usage" && entry.source == reservation_id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(usage_entries.len(), 1);
+    assert_eq!(usage_entries[0].amount, "0");
+
+    assert_eq!(
+        database
+            .finish_generation_job(FinishGenerationJobInput {
+                job_id,
+                worker_id,
+                status: "cancelled",
+                billed_units: 0,
+                error_code: Some("cancelled_by_user"),
+                assets: &[],
+                staged_assets: None,
+            })
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        database
+            .list_account_ledger(key.account_id, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.kind == "usage" && entry.source == reservation_id.to_string())
+            .count(),
+        1,
+        "an exact terminal replay must not refund twice"
+    );
 }
 
 #[tokio::test]
