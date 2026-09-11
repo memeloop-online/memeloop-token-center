@@ -531,10 +531,6 @@ mod tests {
             credential_generation: 1,
             priority: 0,
             scheduling_weight: 100,
-            upstream_model: "same-model".to_owned(),
-            driver: "http-json".to_owned(),
-            config_json: "{}".to_owned(),
-            credential_ciphertext: "unused".to_owned(),
         }
     }
 
