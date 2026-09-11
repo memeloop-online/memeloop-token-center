@@ -2,12 +2,45 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { Given, Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
+import { emptyRequestFilters, requestsPath, statsPath, type RequestFilters } from '../../src/self/requestPaths.js';
 import { baseURL, eventually, generationMockCounts, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
 import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertGenerationDownload, assertNoCount, assertNoHorizontalOverflow, assertValue, assertVisible, catalogModelSearch, connectOperator, generationTableFor, metric, multimodalObservations, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, requestEventFixture, realtimeReconnectObservations, requireMultimodalObservation, sseRequestEvent, submitPortalGeneration, uuidPattern, waitForGenerationStatus } from './dogfood.support.js';
 
 const operatorGenerationCancellations = new WeakMap<DogfoodWorld, { status: number; body: { status: string } }>();
+
+async function completeSelfRequestQuery(page: Page, filters: RequestFilters, action: () => Promise<unknown>): Promise<void> {
+  const waitFor = (path: string) => page.waitForResponse((response) => {
+    const request = response.request();
+    const url = new URL(response.url());
+    return url.origin === baseURL.origin
+      && `${url.pathname}${url.search}` === path
+      && request.method() === 'GET';
+  });
+  const [requests, stats] = await Promise.all([
+    waitFor(requestsPath(filters)),
+    waitFor(statsPath(filters)),
+    action(),
+  ]);
+  for (const response of [requests, stats]) {
+    assert.equal(response.status(), 200, 'the self-service request query must succeed');
+    assert.equal(await response.finished(), null, 'the self-service request query must finish before the next filter change');
+  }
+}
+
+async function rejectInvalidSelfCredential(page: Page, action: () => Promise<unknown>): Promise<void> {
+  const rejected = page.waitForResponse((response) => {
+    const request = response.request();
+    const url = new URL(response.url());
+    return url.origin === baseURL.origin && url.pathname === '/self/v1/key' && request.method() === 'GET';
+  });
+  const consoleError = page.waitForEvent('console', (message) =>
+    message.type() === 'error' && message.text().includes('401 (Unauthorized)'));
+  const [response] = await Promise.all([rejected, consoleError, action()]);
+  assert.equal(response.status(), 401, 'the invalid self-service credential must be rejected');
+  assert.equal(await response.finished(), null, 'the invalid credential response must finish before continuing');
+}
 
 async function completeOperatorRequestQuery(page: Page, scopedTenant: string, action: () => Promise<unknown>): Promise<void> {
   // A heading or selected option updates before the replacement query settles.
@@ -82,10 +115,20 @@ When('下游用户筛选失败请求并打开详情', async function (this: Dogf
   await filters.getByLabel('路由 ID').fill(seed.routeId);
   await filters.getByLabel('最低费用').fill('0');
   await filters.getByLabel('最高费用').fill('1000');
-  await filters.getByRole('button', { name: '应用筛选' }).click();
+  await completeSelfRequestQuery(page, {
+    ...emptyRequestFilters,
+    upstreamAccountId: seed.upstreamId,
+    routeId: seed.routeId,
+    minCost: '0',
+    maxCost: '1000',
+  }, () => filters.getByRole('button', { name: '应用筛选' }).click());
   await assertExactText(metric(page, '总请求'), '51');
   await assertCount(page.locator('.self-history tbody tr'), 50);
-  await page.getByRole('button', { name: '按 http_429 筛选请求' }).click();
+  await completeSelfRequestQuery(page, {
+    ...emptyRequestFilters,
+    status: 'error',
+    errorCode: 'http_429',
+  }, () => page.getByRole('button', { name: '按 http_429 筛选请求' }).click());
   await assertValue(filters.getByLabel('状态'), 'error');
   await assertValue(filters.getByLabel('错误码'), 'http_429');
   await assertCount(page.locator('.self-history tbody tr'), 1);
@@ -101,7 +144,8 @@ Then('只能看到自己的错误正文且清除筛选后可加载完整历史',
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
 
   const filters = page.locator('.self-request-filters');
-  await filters.getByRole('button', { name: '清除筛选', exact: true }).click();
+  await completeSelfRequestQuery(page, emptyRequestFilters,
+    () => filters.getByRole('button', { name: '清除筛选', exact: true }).click());
   await assertCount(page.locator('.self-history tbody tr'), 50);
   await page.getByRole('button', { name: '加载更早请求', exact: true }).click();
   await assertCount(page.locator('.self-history tbody tr'), 51);
@@ -129,15 +173,16 @@ When('下游用户输入无效凭据并切换英文', async function (this: Dogf
   const page = this.requirePage();
   await page.getByRole('button', { name: '清空凭据', exact: true }).click();
   await page.locator('input[type="password"]').fill('invalid-browser-test-credential');
-  await page.getByRole('button', { name: '进入', exact: true }).click();
+  await rejectInvalidSelfCredential(page,
+    () => page.getByRole('button', { name: '进入', exact: true }).click());
   await assertContains(page.getByRole('alert'), '凭据无效或已失效');
   await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
-  await page.getByRole('button', { name: 'Continue', exact: true }).click();
+  await rejectInvalidSelfCredential(page,
+    () => page.getByRole('button', { name: 'Continue', exact: true }).click());
 });
 
 Then('中英文都显示安全的无效凭据提示且浏览器没有失败', async function (this: DogfoodWorld) {
   await assertContains(this.requirePage().getByRole('alert'), 'invalid or no longer active');
-  await this.requirePage().waitForTimeout(100);
   assert.ok(this.consoleErrors.length > 0, 'invalid credentials must produce unauthorized resource responses');
   assert.ok(
     this.consoleErrors.every((message) =>
