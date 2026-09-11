@@ -58,8 +58,8 @@ function Fixture() {
   // The production shell places main in grid column two after its rail. Keep
   // the fixture's layout contract identical so narrow-table behavior is real.
   return <div className="app-shell" data-fixture-ready="request-diagnostics"><aside className="rail" aria-hidden="true" /><main className="main">
-    <RequestTable requests={[request, historicalGap]} currency="USD" onOpenSession={setOpenedSession} />
-    <section data-fixture-request="recorded"><RequestDiagnostics request={request} currency="USD" onOpenSession={setOpenedSession} /></section>
+    <RequestTable requests={[request, historicalGap]} showRoutingDetails upstreamNames={new Map([[request.upstream_account_id!, 'Production Codex']])} currency="USD" onOpenSession={setOpenedSession} />
+    <section data-fixture-request="recorded"><RequestDiagnostics request={request} currency="USD" upstreamName="Production Codex" onOpenSession={setOpenedSession} /></section>
     <section data-fixture-request="historical-gap"><RequestDiagnostics request={historicalGap} currency="USD" onOpenSession={setOpenedSession} /></section>
     <output data-fixture-session-opened="true">{openedSession}</output>
   </main></div>;

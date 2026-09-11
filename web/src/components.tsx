@@ -104,6 +104,17 @@ function requestTokenBreakdown(request: RequestView) {
   };
 }
 
+function RequestTokenSummary({ request }: { request: RequestView }) {
+  const { locale, t } = useI18n();
+  const breakdown = requestTokenBreakdown(request);
+  return <small>{breakdown
+    ? t('request.tokenBreakdown', { input: formatNumber(breakdown.input, locale), cached: formatNumber(breakdown.cached, locale), cacheWrite: formatNumber(breakdown.cacheWrite, locale), output: formatNumber(breakdown.output, locale) })
+    : <>{t('usage.inputTokens')}: {formatNumber(request.input_tokens, locale)} · {t('usage.outputTokens')}: {formatNumber(request.output_tokens, locale)}
+      {request.cached_input_tokens !== undefined && <> · {t('usage.cachedTokens')}: {formatNumber(request.cached_input_tokens, locale)}</>}
+      {request.cache_write_tokens !== undefined && <> · {t('usage.cacheWriteTokens')}: {formatNumber(request.cache_write_tokens, locale)}</>}
+    </>}</small>;
+}
+
 function RequestIdentifier({ requestId, compact = false }: { requestId: string; compact?: boolean }) {
   const { t } = useI18n();
   return <span className={`request-id-control${compact ? ' compact' : ''}`}>
@@ -129,14 +140,15 @@ export function RequestDiagnostics({
   request,
   currency,
   onOpenSession,
+  upstreamName,
 }: {
   request: RequestView;
   currency?: string;
   onOpenSession?: (sessionId: string) => void;
+  upstreamName?: string;
 }) {
   const { locale, t } = useI18n();
   const successful = request.status_code !== null && request.status_code < 400;
-  const tokenBreakdown = requestTokenBreakdown(request);
   const currencyForRequest = recordedCurrency(request, currency);
   const context = request.session_context;
   const sessionLabel = context?.session_name ?? t('sessions.reportedNameMissing');
@@ -149,10 +161,10 @@ export function RequestDiagnostics({
     <span><b>{t('request.status')}</b><i className={`status ${successful ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</i></span>
     <span><b>{t('request.protocol')}</b>{request.protocol}</span>
     <span><b>{t('request.duration')}</b>{formatMilliseconds(request.duration_ms, locale)}</span>
-    <span><b>{t('request.upstreamId')}</b>{request.upstream_account_id ?? '—'}</span>
+    <span><b>{t('request.upstreamId')}</b>{upstreamName && <small>{upstreamName}</small>}{request.upstream_account_id ?? '—'}</span>
     <span><b>{t('request.routeId')}</b>{request.route_id ?? '—'}</span>
     <span><b>{t('request.tokens')}</b>{formatNumber(request.input_tokens + request.output_tokens, locale)}
-      {tokenBreakdown && <small>{t('request.tokenBreakdown', { input: formatNumber(tokenBreakdown.input, locale), cached: formatNumber(tokenBreakdown.cached, locale), cacheWrite: formatNumber(tokenBreakdown.cacheWrite, locale), output: formatNumber(tokenBreakdown.output, locale) })}</small>}
+      <RequestTokenSummary request={request} />
     </span>
     <span><b>{t('request.cost')}</b>{currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</span>
     <span><b>{t('request.error')}</b>{request.error_code ?? '—'}</span>
@@ -174,12 +186,14 @@ export function RequestTable({
   onOpenSession,
   currency,
   showRoutingDetails = false,
+  upstreamNames,
 }: {
   requests: RequestView[];
   onSelect?: (request: RequestView) => void;
   onOpenSession?: (sessionId: string) => void;
   currency?: string;
   showRoutingDetails?: boolean;
+  upstreamNames?: ReadonlyMap<string, string>;
 }) {
   const { locale, t } = useI18n();
   if (!requests.length) return <div className="empty">{t('common.noRequests')}</div>;
@@ -194,7 +208,6 @@ export function RequestTable({
             const sessionLabel = context?.session_name
               ?? (context?.association === 'confirmed' ? t('sessions.reportedNameMissing') : t('sessions.unlinkedRequests'));
             const sessionMeta = [context?.task_kind, context?.agent_id].filter(Boolean).join(' · ');
-            const tokenBreakdown = requestTokenBreakdown(request);
             const currencyForRequest = recordedCurrency(request, currency);
             return <tr key={request.request_id}>
               <td className="request-time-cell"><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
@@ -211,10 +224,10 @@ export function RequestTable({
                 {sessionMeta && <small>{sessionMeta}</small>}
               </td>}
               <td>{request.protocol}</td>
-              {showRoutingDetails && <><td><code>{request.upstream_account_id ?? '—'}</code></td><td><code>{request.route_id ?? '—'}</code></td></>}
+              {showRoutingDetails && <><td className="request-upstream-cell">{request.upstream_account_id && upstreamNames?.get(request.upstream_account_id) && <span>{upstreamNames.get(request.upstream_account_id)}</span>}<code>{request.upstream_account_id ?? '—'}</code></td><td><code>{request.route_id ?? '—'}</code></td></>}
               <td><span className={`status ${request.status_code && request.status_code < 400 ? 'ok' : request.status_code ? 'bad' : 'pending'}`}>{request.status_code ?? t('common.running')}</span></td>
               <td>{request.duration_ms === null ? '—' : `${formatNumber(request.duration_ms, locale, 2)} ms`}</td>
-              <td className="request-token-cell"><span>{formatNumber(request.input_tokens + request.output_tokens, locale)}</span>{tokenBreakdown && <small>{t('request.tokenBreakdown', { input: formatNumber(tokenBreakdown.input, locale), cached: formatNumber(tokenBreakdown.cached, locale), cacheWrite: formatNumber(tokenBreakdown.cacheWrite, locale), output: formatNumber(tokenBreakdown.output, locale) })}</small>}</td>
+              <td className="request-token-cell"><span>{formatNumber(request.input_tokens + request.output_tokens, locale)}</span><RequestTokenSummary request={request} /></td>
               <td>{currencyForRequest ? formatCurrency(request.cost, currencyForRequest, locale) : '—'}</td>
               <td>{request.error_code ? <code className="error-code">{request.error_code}</code> : '—'}</td>
               {onSelect && <td><button className="secondary table-action" type="button" onClick={() => onSelect(request)} aria-label={t('request.openDetail', { model: request.model })}>{t('request.inspect')}</button></td>}

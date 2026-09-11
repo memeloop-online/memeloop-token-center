@@ -275,7 +275,7 @@ export function RequestsPage({ token, tenant, liveEvents, streamRevision, stream
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
       onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={onOpenSession} />
-    {detail && <RequestDrawer detail={detail} onOpenSession={onOpenSession} onClose={() => setDetail(undefined)} />}
+    {detail && <RequestDrawer detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} onOpenSession={onOpenSession} onClose={() => setDetail(undefined)} />}
   </>;
 }
 
@@ -310,15 +310,15 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
       <Metric label={t('usage.successRate')} value={formatPercent(summary.successRate, locale)} tone="positive" />
       <Metric label={t('usage.average')} value={formatMilliseconds(summary.averageDurationMs, locale)} />
     </section>}
-    <RequestTable requests={requests} showRoutingDetails onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />
+    <RequestTable requests={requests} showRoutingDetails upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />
     {hasOlder && <div className="load-more"><button type="button" className="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</button></div>}
   </article>;
 }
 
-function RequestDrawer({ detail, onOpenSession, onClose }: { detail: RequestDetail; onOpenSession: (sessionId: string) => void; onClose: () => void }) {
+function RequestDrawer({ detail, upstreamName, onOpenSession, onClose }: { detail: RequestDetail; upstreamName?: string; onOpenSession: (sessionId: string) => void; onClose: () => void }) {
   const { t } = useI18n();
   return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}>
-    <RequestDiagnostics request={detail} onOpenSession={onOpenSession} />
+    <RequestDiagnostics request={detail} onOpenSession={onOpenSession} upstreamName={upstreamName} />
     <div className="request-diagnostics request-archive-diagnostics">
       <span><b>{t('self.archive')}</b>{detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
       {detail.provenance && <span><b>{t('request.provenance')}</b>{detail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {detail.provenance.source}</span>}
