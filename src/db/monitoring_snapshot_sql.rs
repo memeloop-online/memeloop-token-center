@@ -3,6 +3,12 @@ use super::{MonitoringGranularity, MonitoringScope};
 pub(super) const TOP_UPSTREAM_MODEL_LIMIT: usize = 10;
 pub(super) const TERMINAL_OUTCOME_LIMIT: usize = 5;
 
+#[derive(Clone, Copy)]
+pub(super) enum MonitoringTerminalBatchDialect {
+    PostgreSql,
+    Sqlite,
+}
+
 /// The compact aggregate query behind the operator monitoring snapshot.
 ///
 /// Complete buckets use the immutable usage rollups. The two partial buckets
@@ -125,44 +131,191 @@ pub(super) fn monitoring_freshness_sql(scope: &MonitoringScope) -> String {
     )
 }
 
-/// Five terminal outcomes for one already-ranked stable upstream/model pair.
-/// `request_stats_facts` and `generation_stats_facts` are populated only after
-/// their respective lifecycles complete, excluding all started traffic.
-pub(super) fn monitoring_terminal_outcomes_sql(scope: &MonitoringScope) -> String {
-    let predicate = match scope {
-        MonitoringScope::Tenant(_) => {
-            "f.tenant_id = $1 AND f.upstream_account_id = $2 AND f.model = $3 AND f.created_at >= $4 AND f.created_at <= $5"
-        }
-        MonitoringScope::Global => {
-            "f.upstream_account_id = $1 AND f.model = $2 AND f.created_at >= $3 AND f.created_at <= $4"
-        }
+/// Resolve current-account and retained deleted-account identity/health for a
+/// bounded set of already-ranked accounts in one statement.
+pub(super) fn monitoring_upstream_health_batch_sql(account_count: usize) -> Option<String> {
+    let selected = selected_values(account_count, 1)?;
+    Some(format!(
+        r#"WITH selected(upstream_account_id) AS (VALUES {selected})
+SELECT target.upstream_account_id,
+       COALESCE(account.name, deleted.name, target.upstream_account_id) AS name,
+       account.status, account.credential_generation,
+       health.credential_generation AS health_generation,
+       health.consecutive_failures, health.cooldown_until, health.updated_at
+  FROM selected target
+  LEFT JOIN upstream_accounts account
+         ON account.id = target.upstream_account_id
+  LEFT JOIN deleted_upstream_account_snapshots deleted
+         ON deleted.upstream_account_id = target.upstream_account_id
+  LEFT JOIN upstream_account_health health
+         ON health.upstream_account_id = account.id
+ ORDER BY target.upstream_account_id ASC"#,
+    ))
+}
+
+/// Fetch the five newest terminal outcomes for every selected pair in one
+/// statement. PostgreSQL uses two bounded LATERAL index probes per pair so a
+/// large selected time window cannot turn this drilldown into a fact scan.
+/// SQLite uses two bounded CTE index probes per pair and unions their bounded
+/// results, retaining the same one-statement and five-newest contract.
+pub(super) fn monitoring_terminal_outcomes_batch_sql(
+    scope: &MonitoringScope,
+    pair_count: usize,
+    dialect: MonitoringTerminalBatchDialect,
+) -> Option<String> {
+    if pair_count == 0 || pair_count > TOP_UPSTREAM_MODEL_LIMIT {
+        return None;
+    }
+    let first_scope_parameter = pair_count.checked_mul(2)?.checked_add(1)?;
+    let (tenant_predicate, from_parameter, to_parameter) = match scope {
+        MonitoringScope::Tenant(_) => (
+            format!("AND f.tenant_id = ${first_scope_parameter}"),
+            first_scope_parameter.checked_add(1)?,
+            first_scope_parameter.checked_add(2)?,
+        ),
+        MonitoringScope::Global => (
+            String::new(),
+            first_scope_parameter,
+            first_scope_parameter.checked_add(1)?,
+        ),
     };
-    format!(
-        r#"SELECT id, source, created_at, status_class, duration_ms, error_code
-             FROM (
-                   SELECT id, source, created_at, status_class, duration_ms, error_code
-                     FROM (
-                           SELECT f.request_id AS id, 'request' AS source, f.created_at,
-                                  f.status_class, f.duration_ms, f.error_code
-                             FROM request_stats_facts f
-                            WHERE {predicate}
-                            ORDER BY f.created_at DESC, f.request_id DESC
-                            LIMIT {TERMINAL_OUTCOME_LIMIT}
-                     ) request_terminal
-                   UNION ALL
-                   SELECT id, source, created_at, status_class, duration_ms, error_code
-                     FROM (
-                           SELECT f.job_id AS id, 'generation' AS source, f.created_at,
-                                  f.status_class, f.duration_ms, f.error_code
-                             FROM generation_stats_facts f
-                            WHERE {predicate}
-                            ORDER BY f.created_at DESC, f.job_id DESC
-                            LIMIT {TERMINAL_OUTCOME_LIMIT}
-                     ) generation_terminal
-             ) terminal
-            ORDER BY created_at DESC, id DESC
-            LIMIT {TERMINAL_OUTCOME_LIMIT}"#,
-    )
+    let sql = match dialect {
+        MonitoringTerminalBatchDialect::PostgreSql => {
+            let selected = selected_values(pair_count, 2)?;
+            format!(
+                r#"WITH selected(upstream_account_id, model) AS (VALUES {selected})
+SELECT target.upstream_account_id, target.model,
+       terminal.id, terminal.source, terminal.created_at, terminal.status_class,
+       terminal.duration_ms, terminal.error_code
+  FROM selected target
+ CROSS JOIN LATERAL (
+       SELECT candidate.id, candidate.source, candidate.created_at,
+              candidate.status_class, candidate.duration_ms, candidate.error_code
+         FROM (
+              (SELECT f.request_id AS id, 'request' AS source, f.created_at,
+                      f.status_class, f.duration_ms, f.error_code
+                FROM request_stats_facts f
+                WHERE f.upstream_account_id = target.upstream_account_id
+                  AND f.upstream_account_id <> ''
+                  AND f.model = target.model
+                  {tenant_predicate}
+                  AND f.created_at >= ${from_parameter}
+                  AND f.created_at <= ${to_parameter}
+                ORDER BY f.created_at DESC, f.request_id DESC
+                LIMIT {TERMINAL_OUTCOME_LIMIT})
+              UNION ALL
+              (SELECT f.job_id AS id, 'generation' AS source, f.created_at,
+                      f.status_class, f.duration_ms, f.error_code
+                FROM generation_stats_facts f
+                WHERE f.upstream_account_id = target.upstream_account_id
+                  AND f.upstream_account_id <> ''
+                  AND f.model = target.model
+                  {tenant_predicate}
+                  AND f.created_at >= ${from_parameter}
+                  AND f.created_at <= ${to_parameter}
+                ORDER BY f.created_at DESC, f.job_id DESC
+                LIMIT {TERMINAL_OUTCOME_LIMIT})
+         ) candidate
+        ORDER BY candidate.created_at DESC, candidate.id DESC
+        LIMIT {TERMINAL_OUTCOME_LIMIT}
+  ) terminal
+ ORDER BY target.upstream_account_id ASC, target.model ASC,
+          terminal.created_at DESC, terminal.id DESC"#,
+            )
+        }
+        MonitoringTerminalBatchDialect::Sqlite => sqlite_bounded_terminal_batch_sql(
+            pair_count,
+            &tenant_predicate,
+            from_parameter,
+            to_parameter,
+        )?,
+    };
+    Some(sql)
+}
+
+fn sqlite_bounded_terminal_batch_sql(
+    pair_count: usize,
+    tenant_predicate: &str,
+    from_parameter: usize,
+    to_parameter: usize,
+) -> Option<String> {
+    if pair_count == 0 || pair_count > TOP_UPSTREAM_MODEL_LIMIT {
+        return None;
+    }
+    let mut ctes = Vec::with_capacity(pair_count.checked_mul(3)?);
+    let mut pair_selects = Vec::with_capacity(pair_count);
+    for index in 0..pair_count {
+        let upstream_parameter = index.checked_mul(2)?.checked_add(1)?;
+        let model_parameter = upstream_parameter.checked_add(1)?;
+        ctes.push(format!(
+            r#"request_{index} AS (
+    SELECT f.request_id AS id, 'request' AS source, f.created_at,
+           f.status_class, f.duration_ms, f.error_code
+      FROM request_stats_facts f
+     WHERE f.upstream_account_id = ${upstream_parameter}
+       AND f.upstream_account_id <> ''
+       AND f.model = ${model_parameter}
+       {tenant_predicate}
+       AND f.created_at >= ${from_parameter}
+       AND f.created_at <= ${to_parameter}
+     ORDER BY f.created_at DESC, f.request_id DESC
+     LIMIT {TERMINAL_OUTCOME_LIMIT}
+)"#,
+        ));
+        ctes.push(format!(
+            r#"generation_{index} AS (
+    SELECT f.job_id AS id, 'generation' AS source, f.created_at,
+           f.status_class, f.duration_ms, f.error_code
+      FROM generation_stats_facts f
+     WHERE f.upstream_account_id = ${upstream_parameter}
+       AND f.upstream_account_id <> ''
+       AND f.model = ${model_parameter}
+       {tenant_predicate}
+       AND f.created_at >= ${from_parameter}
+       AND f.created_at <= ${to_parameter}
+     ORDER BY f.created_at DESC, f.job_id DESC
+     LIMIT {TERMINAL_OUTCOME_LIMIT}
+)"#,
+        ));
+        ctes.push(format!(
+            r#"pair_{index} AS (
+    SELECT ${upstream_parameter} AS upstream_account_id,
+           ${model_parameter} AS model,
+           candidate.id, candidate.source, candidate.created_at,
+           candidate.status_class, candidate.duration_ms, candidate.error_code
+      FROM (
+            SELECT * FROM request_{index}
+            UNION ALL
+            SELECT * FROM generation_{index}
+      ) candidate
+     ORDER BY candidate.created_at DESC, candidate.id DESC
+     LIMIT {TERMINAL_OUTCOME_LIMIT}
+)"#,
+        ));
+        pair_selects.push(format!("SELECT * FROM pair_{index}"));
+    }
+    Some(format!(
+        "WITH {}\n{}\nORDER BY upstream_account_id ASC, model ASC, created_at DESC, id DESC",
+        ctes.join(",\n"),
+        pair_selects.join("\nUNION ALL\n")
+    ))
+}
+
+fn selected_values(row_count: usize, columns_per_row: usize) -> Option<String> {
+    if row_count == 0 || row_count > TOP_UPSTREAM_MODEL_LIMIT || columns_per_row == 0 {
+        return None;
+    }
+    let mut parameter = 1_usize;
+    let mut rows = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        let mut columns = Vec::with_capacity(columns_per_row);
+        for _ in 0..columns_per_row {
+            columns.push(format!("${parameter}"));
+            parameter = parameter.checked_add(1)?;
+        }
+        rows.push(format!("({})", columns.join(", ")));
+    }
+    Some(rows.join(", "))
 }
 
 fn request_fact_sql(from_parameter: &str, to_parameter: &str, scope_predicate: &str) -> String {
@@ -257,10 +410,15 @@ mod tests {
                 assert!(!sql.contains("generation_jobs"), "{sql}");
                 assert!(sql.contains("LIMIT 10"), "{sql}");
             }
-            let outcomes = monitoring_terminal_outcomes_sql(&scope);
-            assert!(outcomes.contains("LIMIT 5"), "{outcomes}");
-            assert!(!outcomes.contains("request_records"), "{outcomes}");
-            assert!(!outcomes.contains("generation_jobs"), "{outcomes}");
+            for dialect in [
+                MonitoringTerminalBatchDialect::PostgreSql,
+                MonitoringTerminalBatchDialect::Sqlite,
+            ] {
+                let outcomes = monitoring_terminal_outcomes_batch_sql(&scope, 10, dialect).unwrap();
+                assert!(outcomes.contains("LIMIT 5") || outcomes.contains("outcome_rank <= 5"));
+                assert!(!outcomes.contains("request_records"), "{outcomes}");
+                assert!(!outcomes.contains("generation_jobs"), "{outcomes}");
+            }
         }
     }
 }
