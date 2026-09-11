@@ -156,6 +156,44 @@ async fn plaintext_budget_and_cleanup_release_exact_cipher_bytes() {
 }
 
 #[tokio::test]
+async fn cleanup_time_budget_stops_between_committed_batches() {
+    let (_dir, db, first) = fixture().await;
+    let second = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..first
+    };
+    sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'responses', 'test', 0, 0, 0, 'gap://test/request', $4)")
+        .bind(second.request_id.to_string()).bind(second.tenant_id.to_string())
+        .bind(Uuid::new_v4().to_string()).bind(second.reservation_id.to_string())
+        .execute(&db.pool).await.unwrap();
+    for identity in [first, second] {
+        assert!(db.begin_response_archive_spool(identity).await.unwrap());
+        db.fail_response_archive_spool(identity, "capture_failed")
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE response_archive_spools SET expires_at = 0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.cleanup_response_archive_spools_for(32, Duration::ZERO)
+            .await
+            .unwrap(),
+        1
+    );
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE cleaned_at IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 1);
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
+    assert_eq!(budget(&db).await, 0);
+}
+
+#[tokio::test]
 async fn claims_require_terminal_gap_and_fence_old_leases() {
     let (_dir, db, id) = fixture().await;
     assert!(db.begin_response_archive_spool(id).await.unwrap());

@@ -1,6 +1,8 @@
 //! Bounded encrypted spool. Normal mutations serialize against the budget row.
 //! GC uses bounded spool-first transactions with a NOWAIT budget lock; uploads
 //! read bounded snapshot batches. No transaction encompasses object-storage I/O.
+use std::time::{Duration, Instant};
+
 use sqlx::{Any, Row, Transaction, any::AnyRow};
 use uuid::Uuid;
 
@@ -342,15 +344,42 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn cleanup_response_archive_spools(
         &self,
         limit: i64,
     ) -> Result<u64, AppError> {
+        self.cleanup_response_archive_spools_with_budget(limit, None)
+            .await
+    }
+
+    pub(crate) async fn cleanup_response_archive_spools_for(
+        &self,
+        limit: i64,
+        time_budget: Duration,
+    ) -> Result<u64, AppError> {
+        self.cleanup_response_archive_spools_with_budget(limit, Some(time_budget))
+            .await
+    }
+
+    async fn cleanup_response_archive_spools_with_budget(
+        &self,
+        limit: i64,
+        time_budget: Option<Duration>,
+    ) -> Result<u64, AppError> {
+        let started = Instant::now();
         let mut completed = 0;
         for _ in 0..limit.clamp(0, 32) {
             match self.cleanup_response_archive_spool_batch().await? {
                 Some(cleaned) => completed += u64::from(cleaned),
                 None => break,
+            }
+            // Check only between committed batches. Cancelling a SQL future
+            // at a wall-clock deadline can leave the pooled connection waiting
+            // for its asynchronous rollback and race the next BEGIN. Each GC
+            // transaction is already bounded by row/chunk/byte limits.
+            if time_budget.is_some_and(|budget| started.elapsed() >= budget) {
+                break;
             }
         }
         Ok(completed)
@@ -386,7 +415,7 @@ impl Database {
         let (clock, row_lock) = match self.backend {
             DatabaseBackend::PostgreSql => (
                 "CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT)",
-                " FOR UPDATE",
+                " FOR UPDATE SKIP LOCKED",
             ),
             DatabaseBackend::Sqlite => (
                 "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",

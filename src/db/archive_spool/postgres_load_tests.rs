@@ -239,6 +239,48 @@ async fn postgres_gc_nowait_rolls_back_deletes_when_producer_holds_budget() {
 }
 
 #[tokio::test]
+async fn postgres_gc_skips_a_locked_spool_without_cancelling_its_transaction() {
+    let Some(fixture) = PgFixture::new().await else {
+        return;
+    };
+    assert!(
+        fixture
+            .db
+            .begin_response_archive_spool(fixture.id)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE response_archive_spools SET expires_at = 0")
+        .execute(&fixture.db.pool)
+        .await
+        .unwrap();
+    let mut blocker = fixture.db.pool.begin().await.unwrap();
+    sqlx::query("SELECT request_id FROM response_archive_spools FOR UPDATE")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let cleaned = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture
+            .db
+            .cleanup_response_archive_spools_for(32, Duration::from_millis(100)),
+    )
+    .await
+    .expect("GC must skip a locked spool instead of requiring task cancellation")
+    .unwrap();
+    assert_eq!(cleaned, 0);
+
+    blocker.rollback().await.unwrap();
+    assert_eq!(
+        fixture.db.cleanup_response_archive_spools(1).await.unwrap(),
+        1
+    );
+    assert_eq!(budget(&fixture.db).await, 0);
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn postgres_batch_reader_obeys_limits_without_waiting_for_global_budget() {
     let Some(fixture) = PgFixture::new().await else {
         return;
