@@ -6,14 +6,15 @@ use memeloop_token_center::{
     AppState, api,
     config::{Config, RuntimeRole},
     db::{
-        CreateGroupInput, CreateServiceTokenInput, CreateUpstreamAccountInput,
-        DiscoveredUpstreamModel, GroupKind, ReplaceGroupMembersInput, ReplaceModelCatalogResult,
-        unix_millis,
+        CreateGroupInput, CreateModelRouteInput, CreateRoutedModelRouteInput,
+        CreateServiceTokenInput, CreateUpstreamAccountInput, DiscoveredUpstreamModel, GroupKind,
+        ReplaceGroupMembersInput, ReplaceModelCatalogResult, unix_millis,
     },
     error::AppError,
     provider::UpstreamCredential,
 };
 use serde_json::{Value, json};
+use sqlx::Connection;
 use tower::ServiceExt;
 use uuid::Uuid;
 use wiremock::{
@@ -230,6 +231,133 @@ async fn codex_catalog_uses_native_contract_and_persists_context_window_reservat
     assert_eq!(
         updated.config["reservation_token_bounds"]["gpt-codex"],
         272000
+    );
+}
+
+#[tokio::test]
+async fn codex_catalog_sync_preserves_bound_for_explicit_custom_route() {
+    let (state, _directory) = state("codex-custom-model-bound").await;
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: "codex-custom-tenant".into(),
+                name: "codex-custom-upstream".into(),
+                driver: "openai-codex".into(),
+                config: json!({
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {
+                        "catalog-model": 100_000,
+                        "gpt-5.6-terra": 100_000,
+                        "unused-custom-model": 100_000
+                    }
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "codex-access".into(),
+                    refresh_token: Some("codex-refresh".into()),
+                    expires_at: Some(unix_millis() + 60_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: Some(json!({
+                        "schema": "openai-codex-oauth-v1",
+                        "account_id": "account-123"
+                    })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("openai_codex_device".into()),
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: "codex-custom-tenant".into(),
+            public_model: "gpt-5.6-terra".into(),
+            upstream_account_id: account.id,
+            upstream_model: "gpt-5.6-terra".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+
+    let lease = Uuid::now_v7();
+    assert!(
+        state
+            .db
+            .claim_upstream_model_catalog_sync(
+                account.id,
+                "codex-custom-tenant",
+                account.credential_generation,
+                lease
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .db
+            .replace_upstream_model_catalog(
+                account.id,
+                "codex-custom-tenant",
+                account.credential_generation,
+                lease,
+                "codex_models",
+                &[DiscoveredUpstreamModel {
+                    model_id: "catalog-model".into(),
+                    protocol: "openai".into(),
+                    context_window: Some(272_000),
+                    reservation_token_bound: Some(272_000),
+                    reservation_bound_source: Some("mtc_context_window_bound".into()),
+                }],
+            )
+            .await
+            .unwrap(),
+        ReplaceModelCatalogResult::Replaced
+    );
+
+    let (updated, _) = state
+        .db
+        .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.config["reservation_token_bounds"],
+        json!({
+            "catalog-model": 272_000,
+            "gpt-5.6-terra": 100_000
+        })
+    );
+
+    // Catalog pruning may serialize before a new explicit-custom route. The
+    // association transaction must recreate its transport reservation bound
+    // before publishing that route.
+    state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: "codex-custom-tenant".into(),
+            public_model: "unused-custom-model".into(),
+            upstream_account_id: account.id,
+            upstream_model: "unused-custom-model".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let (updated, _) = state
+        .db
+        .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.config["reservation_token_bounds"]["unused-custom-model"],
+        1_000_000_000
     );
 }
 
@@ -803,4 +931,430 @@ async fn postgres_catalog_snapshot_and_generation_cas_use_the_same_contract() {
             .unwrap(),
         ReplaceModelCatalogResult::CredentialGenerationChanged
     );
+}
+
+const POSTGRES_CATALOG_INTERLEAVING_SERIAL_KEY: i64 = 7_341_909_207_811;
+
+async fn postgres_codex_account(
+    database: &memeloop_token_center::db::Database,
+    tenant: &str,
+    account_name: &str,
+) -> memeloop_token_center::provider::UpstreamAccountView {
+    database
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.to_owned(),
+                name: account_name.to_owned(),
+                driver: "openai-codex".to_owned(),
+                config: json!({
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {
+                        "unused-custom-model": 100_000
+                    }
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "postgres-codex-access".to_owned(),
+                    refresh_token: Some("postgres-codex-refresh".to_owned()),
+                    expires_at: Some(unix_millis() + 60_000),
+                    header: "authorization".to_owned(),
+                    prefix: "Bearer ".to_owned(),
+                    adapter_state: Some(json!({
+                        "schema": "openai-codex-oauth-v1",
+                        "account_id": "postgres-account"
+                    })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("openai_codex_device".to_owned()),
+                oauth_refresh_url: None,
+            },
+            b"postgres catalog race pepper is long enough",
+        )
+        .await
+        .expect("create PostgreSQL Codex account")
+}
+
+async fn install_postgres_pause_trigger(
+    pool: &sqlx::AnyPool,
+    function_name: &str,
+    application_name: &str,
+    table: &str,
+    event: &str,
+    predicate: &str,
+    advisory_key: i64,
+) {
+    let trigger_name = format!("{function_name}_trigger");
+    let sql = format!(
+        "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $body$ \
+         BEGIN IF {predicate} THEN \
+           PERFORM set_config('application_name', '{application_name}', false); \
+           PERFORM pg_advisory_xact_lock({advisory_key}); \
+         END IF; \
+         RETURN NEW; END $body$; \
+         CREATE TRIGGER {trigger_name} BEFORE {event} ON {table} \
+         FOR EACH ROW EXECUTE FUNCTION {function_name}();"
+    );
+    // Test-only SQL: every identifier, predicate, and advisory key is derived
+    // from UUIDs generated in this process; no external input reaches it.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(pool)
+        .await
+        .expect("install PostgreSQL interleaving trigger");
+}
+
+async fn wait_for_postgres_advisory_pause(pool: &sqlx::AnyPool, application_name: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE application_name = $1 AND state = 'active' \
+                   AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
+            )
+            .bind(application_name)
+            .fetch_one(pool)
+            .await
+            .expect("inspect PostgreSQL advisory pause");
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expected PostgreSQL advisory pause");
+}
+
+async fn wait_for_postgres_transaction_blocked_by(
+    pool: &sqlx::AnyPool,
+    blocker_application_name: &str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity waiting \
+                 JOIN pg_stat_activity blocker \
+                   ON blocker.application_name = $1 \
+                  AND blocker.pid = ANY(pg_blocking_pids(waiting.pid)) \
+                 WHERE waiting.state = 'active' AND waiting.wait_event_type = 'Lock' \
+                   AND waiting.wait_event = 'transactionid'",
+            )
+            .bind(blocker_application_name)
+            .fetch_one(pool)
+            .await
+            .expect("inspect PostgreSQL transaction blocker");
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expected a PostgreSQL transaction blocked by the paused writer");
+}
+
+async fn postgres_catalog_race_fixture(
+    database_url: &str,
+    label: &str,
+) -> (
+    memeloop_token_center::db::Database,
+    memeloop_token_center::db::Database,
+    sqlx::AnyPool,
+    String,
+    String,
+    memeloop_token_center::provider::UpstreamAccountView,
+) {
+    let tenant = format!("catalog-lock-{label}");
+    let custom_model = format!("custom-{label}");
+    let setup = memeloop_token_center::db::Database::connect_with_max(database_url, 4)
+        .await
+        .expect("connect PostgreSQL catalog setup");
+    setup
+        .migrate()
+        .await
+        .expect("migrate PostgreSQL catalog setup");
+    let account = postgres_codex_account(&setup, &tenant, &format!("postgres-codex-{label}")).await;
+    let observer = sqlx::AnyPool::connect(database_url)
+        .await
+        .expect("connect PostgreSQL catalog observer");
+    sqlx::query(
+        "INSERT INTO routing_relation_write_locks (tenant_id, generation) VALUES ($1, 0) ON CONFLICT (tenant_id) DO NOTHING",
+    )
+    .bind(account.tenant_id.to_string())
+    .execute(&observer)
+    .await
+    .expect("seed committed tenant relation lock");
+    let route = memeloop_token_center::db::Database::connect_with_max(database_url, 2)
+        .await
+        .expect("connect PostgreSQL route writer");
+    let catalog = memeloop_token_center::db::Database::connect_with_max(database_url, 2)
+        .await
+        .expect("connect PostgreSQL catalog writer");
+    (route, catalog, observer, tenant, custom_model, account)
+}
+
+#[tokio::test]
+async fn postgres_route_then_catalog_preserves_the_committed_custom_bound() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        eprintln!("skipping PostgreSQL route/catalog interleaving: MTC_TEST_POSTGRES_URL is unset");
+        return;
+    };
+    let unique = Uuid::now_v7();
+    let label = format!("route-first-{unique}");
+    let (route_database, catalog_database, observer, tenant, custom_model, account) =
+        postgres_catalog_race_fixture(&database_url, &label).await;
+    let mut serial_guard = sqlx::AnyConnection::connect(&database_url)
+        .await
+        .expect("connect route-first serial guard");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(POSTGRES_CATALOG_INTERLEAVING_SERIAL_KEY)
+        .execute(&mut serial_guard)
+        .await
+        .expect("serialize PostgreSQL catalog interleavings");
+    let suffix = unique.simple();
+    let function_name = format!("pause_route_catalog_{suffix}");
+    let paused_application = format!("mtc-pause-route-{unique}");
+    let advisory_key = (unique.as_u128() & i64::MAX as u128) as i64;
+    install_postgres_pause_trigger(
+        &observer,
+        &function_name,
+        &paused_application,
+        "model_routes",
+        "INSERT",
+        &format!("NEW.tenant_id = '{}'", account.tenant_id),
+        advisory_key,
+    )
+    .await;
+    let mut barrier = sqlx::AnyConnection::connect(&database_url)
+        .await
+        .expect("connect route-first barrier");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(advisory_key)
+        .execute(&mut barrier)
+        .await
+        .expect("hold route-first barrier");
+
+    let route_tenant = tenant.clone();
+    let route_model = custom_model.clone();
+    let account_id = account.id;
+    let route_task = tokio::spawn(async move {
+        route_database
+            .create_routed_model_route(CreateRoutedModelRouteInput {
+                tenant_external_id: route_tenant,
+                public_model: format!("public-{route_model}"),
+                upstream_model: route_model,
+                protocol: "openai".to_owned(),
+                priority: 0,
+                enabled: true,
+                upstream_account_ids: vec![account_id],
+                included_provider_group_ids: Vec::new(),
+                excluded_provider_group_ids: Vec::new(),
+                route_group_ids: Vec::new(),
+                route_group_names: Vec::new(),
+                granted_credential_ids: Vec::new(),
+                custom_model_confirmed: true,
+            })
+            .await
+    });
+    wait_for_postgres_advisory_pause(&observer, &paused_application).await;
+
+    let lease = Uuid::now_v7();
+    assert!(
+        catalog_database
+            .claim_upstream_model_catalog_sync(account.id, &tenant, 1, lease)
+            .await
+            .expect("claim route-first catalog lease")
+    );
+    let catalog_tenant = tenant.clone();
+    let account_id = account.id;
+    let catalog_task = tokio::spawn(async move {
+        catalog_database
+            .replace_upstream_model_catalog(
+                account_id,
+                &catalog_tenant,
+                1,
+                lease,
+                "codex_models",
+                &[DiscoveredUpstreamModel {
+                    model_id: "catalog-model".to_owned(),
+                    protocol: "openai".to_owned(),
+                    context_window: Some(272_000),
+                    reservation_token_bound: Some(272_000),
+                    reservation_bound_source: Some("mtc_context_window_bound".to_owned()),
+                }],
+            )
+            .await
+    });
+    wait_for_postgres_transaction_blocked_by(&observer, &paused_application).await;
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(advisory_key)
+        .execute(&mut barrier)
+        .await
+        .expect("release route-first barrier");
+    route_task
+        .await
+        .expect("join route-first writer")
+        .expect("commit route-first association");
+    assert_eq!(
+        catalog_task
+            .await
+            .expect("join route-first catalog")
+            .expect("commit route-first catalog"),
+        ReplaceModelCatalogResult::Replaced
+    );
+    let config_json: String =
+        sqlx::query_scalar("SELECT config_json FROM upstream_accounts WHERE id = $1")
+            .bind(account.id.to_string())
+            .fetch_one(&observer)
+            .await
+            .expect("load route-first config");
+    let config: Value = serde_json::from_str(&config_json).expect("route-first config JSON");
+    assert_eq!(
+        config["reservation_token_bounds"][custom_model.as_str()],
+        1_000_000_000
+    );
+    assert_eq!(config["reservation_token_bounds"]["catalog-model"], 272_000);
+    assert!(
+        config["reservation_token_bounds"]
+            .get("unused-custom-model")
+            .is_none()
+    );
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(POSTGRES_CATALOG_INTERLEAVING_SERIAL_KEY)
+        .execute(&mut serial_guard)
+        .await
+        .expect("release PostgreSQL catalog interleaving guard");
+}
+
+#[tokio::test]
+async fn postgres_catalog_then_route_recreates_the_required_custom_bound_atomically() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        eprintln!("skipping PostgreSQL catalog/route interleaving: MTC_TEST_POSTGRES_URL is unset");
+        return;
+    };
+    let unique = Uuid::now_v7();
+    let label = format!("catalog-first-{unique}");
+    let (route_database, catalog_database, observer, tenant, custom_model, account) =
+        postgres_catalog_race_fixture(&database_url, &label).await;
+    let mut serial_guard = sqlx::AnyConnection::connect(&database_url)
+        .await
+        .expect("connect catalog-first serial guard");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(POSTGRES_CATALOG_INTERLEAVING_SERIAL_KEY)
+        .execute(&mut serial_guard)
+        .await
+        .expect("serialize PostgreSQL catalog interleavings");
+    let suffix = unique.simple();
+    let function_name = format!("pause_catalog_route_{suffix}");
+    let paused_application = format!("mtc-pause-catalog-{unique}");
+    let advisory_key = (unique.as_u128() & i64::MAX as u128) as i64;
+    install_postgres_pause_trigger(
+        &observer,
+        &function_name,
+        &paused_application,
+        "upstream_accounts",
+        "UPDATE",
+        &format!("NEW.id = '{}'", account.id),
+        advisory_key,
+    )
+    .await;
+    let mut barrier = sqlx::AnyConnection::connect(&database_url)
+        .await
+        .expect("connect catalog-first barrier");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(advisory_key)
+        .execute(&mut barrier)
+        .await
+        .expect("hold catalog-first barrier");
+    let lease = Uuid::now_v7();
+    assert!(
+        catalog_database
+            .claim_upstream_model_catalog_sync(account.id, &tenant, 1, lease)
+            .await
+            .expect("claim catalog-first lease")
+    );
+    let catalog_tenant = tenant.clone();
+    let account_id = account.id;
+    let catalog_task = tokio::spawn(async move {
+        catalog_database
+            .replace_upstream_model_catalog(
+                account_id,
+                &catalog_tenant,
+                1,
+                lease,
+                "codex_models",
+                &[DiscoveredUpstreamModel {
+                    model_id: "catalog-model".to_owned(),
+                    protocol: "openai".to_owned(),
+                    context_window: Some(272_000),
+                    reservation_token_bound: Some(272_000),
+                    reservation_bound_source: Some("mtc_context_window_bound".to_owned()),
+                }],
+            )
+            .await
+    });
+    wait_for_postgres_advisory_pause(&observer, &paused_application).await;
+
+    let route_tenant = tenant.clone();
+    let route_model = custom_model.clone();
+    let account_id = account.id;
+    let route_task = tokio::spawn(async move {
+        route_database
+            .create_routed_model_route(CreateRoutedModelRouteInput {
+                tenant_external_id: route_tenant,
+                public_model: format!("public-{route_model}"),
+                upstream_model: route_model,
+                protocol: "openai".to_owned(),
+                priority: 0,
+                enabled: true,
+                upstream_account_ids: vec![account_id],
+                included_provider_group_ids: Vec::new(),
+                excluded_provider_group_ids: Vec::new(),
+                route_group_ids: Vec::new(),
+                route_group_names: Vec::new(),
+                granted_credential_ids: Vec::new(),
+                custom_model_confirmed: true,
+            })
+            .await
+    });
+    wait_for_postgres_transaction_blocked_by(&observer, &paused_application).await;
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(advisory_key)
+        .execute(&mut barrier)
+        .await
+        .expect("release catalog-first barrier");
+    assert_eq!(
+        catalog_task
+            .await
+            .expect("join catalog-first catalog")
+            .expect("commit catalog-first catalog"),
+        ReplaceModelCatalogResult::Replaced
+    );
+    route_task
+        .await
+        .expect("join catalog-first route")
+        .expect("commit catalog-first association");
+    let config_json: String =
+        sqlx::query_scalar("SELECT config_json FROM upstream_accounts WHERE id = $1")
+            .bind(account.id.to_string())
+            .fetch_one(&observer)
+            .await
+            .expect("load catalog-first config");
+    let config: Value = serde_json::from_str(&config_json).expect("catalog-first config JSON");
+    assert_eq!(
+        config["reservation_token_bounds"][custom_model.as_str()],
+        1_000_000_000
+    );
+    assert_eq!(config["reservation_token_bounds"]["catalog-model"], 272_000);
+    assert!(
+        config["reservation_token_bounds"]
+            .get("unused-custom-model")
+            .is_none()
+    );
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(POSTGRES_CATALOG_INTERLEAVING_SERIAL_KEY)
+        .execute(&mut serial_guard)
+        .await
+        .expect("release PostgreSQL catalog interleaving guard");
 }
