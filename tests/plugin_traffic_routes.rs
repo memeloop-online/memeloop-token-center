@@ -642,14 +642,15 @@ async fn assert_cooldown_failover_keeps_one_reservation(database_url: Option<Str
     preferred.verify().await;
     standby.verify().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let persisted: (String, i64, i64, i64) = sqlx::query_as(
-        "SELECT request.upstream_account_id, reservation.reserved_tokens, window.tokens,
+    let persisted: (String, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT request.upstream_account_id, reservation.reserved_tokens, rate_window.tokens,
+                request.input_tokens, request.output_tokens,
                 (SELECT COUNT(*) FROM usage_reservations reservation
                  WHERE reservation.key_id = request.key_id)
          FROM request_records request
          JOIN usage_reservations reservation ON reservation.id = request.reservation_id
-         JOIN rate_limit_windows window ON window.key_id = reservation.key_id
-              AND window.window_start = reservation.rate_window_start
+         JOIN rate_limit_windows rate_window ON rate_window.key_id = reservation.key_id
+              AND rate_window.window_start = reservation.rate_window_start
          WHERE request.key_id = $1 ORDER BY request.created_at DESC LIMIT 1",
     )
     .bind(fixture.issued.key_id.to_string())
@@ -662,8 +663,12 @@ async fn assert_cooldown_failover_keeps_one_reservation(database_url: Option<Str
         persisted.1 > 8_000,
         "standby-specific overhead must replace the primary reservation bound"
     );
-    assert_eq!(persisted.2, persisted.1);
-    assert_eq!(persisted.3, 1);
+    assert_eq!(
+        persisted.2,
+        persisted.3 + persisted.4,
+        "terminal settlement must release unused candidate capacity"
+    );
+    assert_eq!(persisted.5, 1);
 }
 
 #[tokio::test]
