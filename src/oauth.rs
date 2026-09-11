@@ -101,6 +101,7 @@ mod tests {
                 reauthorize: Some(OAuthReauthorizationTarget {
                     account_id: stable_account_id,
                     expected_updated_at: 999,
+                    expected_credential_generation: 7,
                 }),
             },
             None,

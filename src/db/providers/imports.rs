@@ -307,6 +307,12 @@ impl Database {
         let name = input.account_name.trim().to_owned();
         let config_json = serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
         let credential_ciphertext = seal_credential(&input.credential, key_material)?;
+        let proxy_metadata =
+            if input.adapter.provider_driver() == crate::oauth::codex_device::PROVIDER_DRIVER {
+                input.credential.codex_proxy_metadata(key_material)?
+            } else {
+                input.credential.proxy_metadata(key_material)?
+            };
         let credential_expires_at = input.credential.expires_at();
         let can_refresh = input.adapter.can_refresh();
         let oauth_refresh_url = can_refresh.then(|| input.adapter.refresh_url().to_owned());
@@ -529,6 +535,13 @@ impl Database {
                 status: input.status.as_database_status().to_owned(),
                 config: input.config,
                 credential_expires_at,
+                has_proxy: proxy_metadata.has_proxy,
+                proxy_scheme: proxy_metadata.scheme,
+                proxy_remote_dns: proxy_metadata.remote_dns,
+                proxy_label: proxy_metadata.label,
+                proxy_fingerprint: proxy_metadata.fingerprint,
+                can_update_transport_proxy: input.adapter.provider_driver()
+                    == crate::oauth::codex_device::PROVIDER_DRIVER,
                 can_refresh,
                 can_rotate: true,
                 can_reauthorize: false,

@@ -92,6 +92,20 @@ pub struct UpstreamAccountView {
     pub status: String,
     pub config: Value,
     pub credential_expires_at: Option<i64>,
+    /// Sanitized transport state. The proxy URL, credentials and endpoint are
+    /// never serialized; the keyed fingerprint only supports change detection.
+    #[serde(default)]
+    pub has_proxy: bool,
+    #[serde(default)]
+    pub proxy_scheme: Option<String>,
+    #[serde(default)]
+    pub proxy_remote_dns: bool,
+    #[serde(default)]
+    pub proxy_label: Option<String>,
+    #[serde(default)]
+    pub proxy_fingerprint: Option<String>,
+    #[serde(default)]
+    pub can_update_transport_proxy: bool,
     /// Server-derived lifecycle capabilities. Clients must use these instead
     /// of inferring actions from `auth_kind` or `connection_method`.
     pub can_refresh: bool,
@@ -102,6 +116,26 @@ pub struct UpstreamAccountView {
     pub route_count: i64,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl UpstreamAccountView {
+    pub(crate) fn attach_proxy_metadata(
+        &mut self,
+        credential: &UpstreamCredential,
+        key_material: &[u8],
+    ) -> Result<(), crate::error::AppError> {
+        let metadata = if self.driver == crate::oauth::codex_device::PROVIDER_DRIVER {
+            credential.codex_proxy_metadata(key_material)?
+        } else {
+            credential.proxy_metadata(key_material)?
+        };
+        self.has_proxy = metadata.has_proxy;
+        self.proxy_scheme = metadata.scheme;
+        self.proxy_remote_dns = metadata.remote_dns;
+        self.proxy_label = metadata.label;
+        self.proxy_fingerprint = metadata.fingerprint;
+        Ok(())
+    }
 }
 
 /// Read-only deletion preflight for one stable upstream identity.

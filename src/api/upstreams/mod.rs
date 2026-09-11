@@ -9,9 +9,16 @@ mod oauth_claude;
 mod oauth_copilot;
 mod quota;
 
+fn restrict_transport_proxy_capability(
+    service: &crate::model::AuthenticatedService,
+    account: &mut crate::provider::UpstreamAccountView,
+) {
+    account.can_update_transport_proxy &= service.tenant_external_id.is_none();
+}
+
 pub(in crate::api) use accounts::{
     create_upstream, delete_upstream, get_upstream_deletion_readiness, list_upstreams,
-    rotate_upstream_credential, set_upstream_status, update_upstream,
+    rotate_codex_transport_proxy, rotate_upstream_credential, set_upstream_status, update_upstream,
 };
 pub(in crate::api) use availability::upstream_account_availability;
 pub(in crate::api) use health::probe_upstream_health;

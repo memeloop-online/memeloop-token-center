@@ -37,6 +37,36 @@ authorization or no credential. Its authentication method is metadata, not a
 separate resource type. Inactive records remain readable for audit but cannot be
 reactivated or routed without an explicit supported configuration.
 
+OpenAI Codex account configuration always identifies the fixed official
+`https://chatgpt.com/backend-api/codex` upstream; a SOCKS endpoint is transport
+state inside the encrypted OAuth credential and is never represented as
+`config.base_url`. Upstream responses expose only `has_proxy`, the SOCKS scheme,
+remote-DNS semantics, a host-free label and a pepper-keyed fingerprint. They
+never expose a proxy URL, host, port, username or password. The
+`can_update_transport_proxy` capability is additionally restricted by the
+authenticated caller and is always false for tenant-scoped services.
+
+`PUT /internal/v1/upstreams/{account_id}/transport-proxy` is the only operation
+that changes an existing Codex proxy. It requires a global `providers:write`
+operator, exact tenant authorization, `Idempotency-Key`, and the current
+`updated_at` and credential generation. It accepts only a private IP-literal
+`socks5h` URL, retains all OAuth
+material, rotates the encrypted credential generation atomically and writes a
+secret-free audit record. A new Codex authorization requires the same write-only
+`proxy_url`; reauthorization reuses the existing encrypted account proxy and
+cannot replace it. The complete device lifecycle (user-code request, device
+poll, token exchange and JWKS verification) and managed token refresh use that
+same proxy with remote target DNS. Missing or invalid proxy state fails before
+supplier DNS or network I/O, and there is no direct fallback. A Codex account
+cannot be activated without an approved proxy, and the production Codex sender
+independently fails closed before routing any unproxied request.
+
+Codex `config.transport_policy` remains runtime-adjustable through the normal
+upstream update CAS. Its bounded `connect_attempts`,
+`connect_retry_delay_millis`, and `shared_probe_attempts` fields apply to newly
+prepared inference requests without a service release; changing them never
+changes the fixed destination or encrypted per-account proxy binding.
+
 `GET /internal/v1/upstreams/{account_id}/deletion-readiness` reports the exact
 lifecycle, direct-or-multi-candidate route, immutable history, and import
 provenance blockers without mutating data. `DELETE` requires a disabled account

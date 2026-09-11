@@ -1456,6 +1456,42 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/upstreams/{account_id}/transport-proxy:
+    put:
+      tags: [Upstream providers]
+      operationId: rotateOpenAiCodexTransportProxy
+      summary: Replace only the transport proxy of an existing OpenAI Codex OAuth account
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      description: |
+        Requires a global operator authorized for the tenant, an existing Codex
+        OAuth credential, `Idempotency-Key`, and exact account/credential
+        compare-and-swap values.
+        The operation preserves all OAuth material and the fixed official Codex
+        base URL, installs a new encrypted credential generation, and records an
+        audit row containing only keyed fingerprints and schemes. Only a private
+        IP-literal `socks5h` URL is accepted so target DNS is resolved remotely.
+        The full proxy URL, credentials, and endpoint are never returned.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/RequiredIdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RotateCodexTransportProxyRequest' }
+      responses:
+        '200':
+          description: Updated sanitized upstream metadata.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamProvider' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /internal/v1/upstreams/{account_id}/models:
     get:
       tags: [Upstream providers]
@@ -1660,6 +1696,12 @@ paths:
       summary: Start native OpenAI Codex device authorization
       security: [{ serviceBearer: [] }]
       x-required-scope: oauth:write
+      description: |
+        A new account requires a global operator and a write-only private
+        IP-literal SOCKS5H proxy. Reauthorization omits `proxy_url` and reuses
+        the existing encrypted account proxy. User-code, polling, token exchange,
+        JWKS verification and later managed refresh all use that same proxy with
+        remote target DNS; missing or invalid proxy state fails before network I/O.
       requestBody:
         required: true
         content:
@@ -5452,10 +5494,25 @@ components:
         tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
         status: { type: string, enum: [active, disabled] }
         expected_updated_at: { type: integer, format: int64 }
+    RotateCodexTransportProxyRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_external_id, proxy_url, expected_updated_at, expected_credential_generation]
+      properties:
+        tenant_external_id: { type: string, minLength: 1, maxLength: 200 }
+        proxy_url:
+          type: string
+          pattern: '^socks5h://'
+          minLength: 1
+          maxLength: 2048
+          writeOnly: true
+          description: Private IPv4 or bracketed IPv6 literal SOCKS5H endpoint. May contain proxy authentication; never returned.
+        expected_updated_at: { type: integer, format: int64 }
+        expected_credential_generation: { type: integer, format: int64, minimum: 1 }
     UpstreamProvider:
       type: object
       additionalProperties: false
-      required: [id, tenant_id, tenant_external_id, name, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, can_refresh, can_rotate, can_reauthorize, route_count, created_at, updated_at]
+      required: [id, tenant_id, tenant_external_id, name, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, has_proxy, proxy_scheme, proxy_remote_dns, proxy_label, proxy_fingerprint, can_update_transport_proxy, can_refresh, can_rotate, can_reauthorize, route_count, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
@@ -5468,6 +5525,15 @@ components:
         status: { type: string, enum: [active, disabled] }
         config: { type: object, additionalProperties: true }
         credential_expires_at: { type: [integer, 'null'], format: int64 }
+        has_proxy: { type: boolean, description: True when the current encrypted credential contains a transport proxy. }
+        proxy_scheme:
+          type: [string, 'null']
+          enum: [socks5, socks5h, null]
+          description: Sanitized scheme only; socks5h means remote target DNS.
+        proxy_remote_dns: { type: boolean, description: True only for socks5h. No proxy endpoint or credential is exposed. }
+        proxy_label: { type: [string, 'null'], description: Server-generated generic label without host, port, username, or password. }
+        proxy_fingerprint: { type: [string, 'null'], pattern: '^proxy_[0-9a-f]{16}$', description: Pepper-keyed non-reversible comparison fingerprint. }
+        can_update_transport_proxy: { type: boolean, description: True only for a global operator viewing an OpenAI Codex OAuth account supported by the explicit transport operation. }
         can_refresh: { type: boolean, description: Managed OAuth refresh is available for the active generation. }
         can_rotate: { type: boolean, description: The credential may be replaced without changing the stable account identity. }
         can_reauthorize: { type: boolean, description: An interactive reauthorization endpoint is available. }
@@ -5567,6 +5633,13 @@ components:
         tenant_external_id: { type: string, default: default }
         account_name: { type: string, minLength: 1 }
         upstream_account_id: { type: string, format: uuid, description: Existing stable OpenAI Codex upstream identity to reauthorize. }
+        proxy_url:
+          type: string
+          pattern: '^socks5h://'
+          minLength: 1
+          maxLength: 2048
+          writeOnly: true
+          description: Required for a new account and must be a private IP-literal SOCKS5H endpoint. Reauthorization must omit it and reuses the existing encrypted account proxy.
     StartClaudeOAuthRequest:
       type: object
       additionalProperties: false

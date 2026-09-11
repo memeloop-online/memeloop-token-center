@@ -161,6 +161,7 @@ async fn finish_claude_login(
                     ReauthorizeUpstreamAccountInput {
                         tenant_external_id: ready.tenant_external_id,
                         expected_updated_at: target.expected_updated_at,
+                        expected_credential_generation: target.expected_credential_generation,
                         driver: claude::PROVIDER_DRIVER.to_owned(),
                         oauth_session_id: ready.session_id,
                         oauth_driver: ready.oauth_driver,

@@ -399,6 +399,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
             "../../../migrations/common/0074_upstream_quota_reset_idempotency_audit.sql"
         ),
     },
+    Migration {
+        version: 75,
+        name: "audited upstream transport proxy rotation",
+        sql: include_str!("../../../migrations/common/0075_upstream_transport_proxy_audit.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -783,6 +788,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!(
             "../../../migrations/common/0074_upstream_quota_reset_idempotency_audit.sql"
         ),
+    },
+    Migration {
+        version: 75,
+        name: "audited upstream transport proxy rotation",
+        sql: include_str!("../../../migrations/common/0075_upstream_transport_proxy_audit.sql"),
     },
 ];
 

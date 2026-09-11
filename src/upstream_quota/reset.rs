@@ -233,7 +233,7 @@ pub(crate) async fn confirm(
         .map_err(|_| temporarily_unavailable())?;
     let http = tokio::time::timeout(
         Duration::from_secs(5),
-        crate::network::client_for_config_url_without_retries(
+        crate::network::client_for_codex_url_without_retries(
             &state.http,
             CONSUME_URL,
             &json!({"network_scope":"public"}),

@@ -105,7 +105,7 @@ pub(super) async fn send_proxy_route(
         &outbound_base_url,
         &route.route.config,
         route.route.credential.proxy(),
-        state.config.allow_oauth_loopback,
+        state.config.codex_test_loopback,
     )
     .await
     .map_err(|_| ProxySendError::CandidateUnavailable)?;

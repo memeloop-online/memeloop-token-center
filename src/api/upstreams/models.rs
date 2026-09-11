@@ -341,12 +341,12 @@ async fn discover_codex_models(
         .validate(unix_millis())
         .map_err(|_| "credential_invalid")?;
     let base_url = validate_config(&account.config).map_err(|_| "destination_invalid")?;
-    let client = network::client_for_config_url(
+    let client = network::client_for_codex_url(
         &state.http,
         &base_url,
         &account.config,
         credential.proxy(),
-        state.config.allow_oauth_loopback,
+        state.config.codex_test_loopback,
     )
     .await
     .map_err(|_| "destination_invalid")?;
