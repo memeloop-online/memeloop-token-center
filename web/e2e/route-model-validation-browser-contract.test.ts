@@ -83,6 +83,57 @@ test('route model confirmation distinguishes catalog evidence from capability wi
         await page.close();
       }
     }
+    for (const change of ['Change candidates', 'Change protocol', 'Change model', 'Toggle group']) {
+      const page = await browser.newPage();
+      await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+      await page.route('**/internal/**', async (route) => {
+        assert.equal(route.request().method(), 'GET');
+        assert.equal(new URL(route.request().url()).pathname, '/internal/v1/upstream-models');
+        await route.fulfill({ json: { data: [], eligible_account_count: 2, unknown_account_count: 2, stale_account_count: 0 } });
+      });
+      await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/route-model-validation.html?editing=1`);
+      const save = page.getByRole('button', { name: 'Save route', exact: true });
+      await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('main > button')?.disabled);
+      assert.equal(await page.getByRole('checkbox').isChecked(), true, 'the original saved scope starts confirmed');
+      await page.getByRole('button', { name: change, exact: true }).click();
+      if (change === 'Toggle group') {
+        assert.equal(await save.isDisabled(), true);
+        await page.getByRole('button', { name: change, exact: true }).click();
+      }
+      assert.equal(await page.getByRole('checkbox').isChecked(), false, `${change} must not restore persisted consent`);
+      assert.equal(await save.isDisabled(), true);
+      await page.getByRole('checkbox').check();
+      await save.click();
+      assert.equal(JSON.parse(await page.locator('[data-submitted]').textContent() ?? '{}').custom_model_confirmed, true);
+      await page.close();
+    }
+    const page = await browser.newPage();
+    let reads = 0;
+    let finishMembershipRead: (() => Promise<void>) | undefined;
+    let membershipReadReady!: () => void;
+    const membershipRead = new Promise<void>((resolve) => { membershipReadReady = resolve; });
+    await page.route('**/internal/**', async (route) => {
+      assert.equal(route.request().method(), 'GET');
+      assert.equal(new URL(route.request().url()).pathname, '/internal/v1/upstream-models');
+      reads += 1;
+      const fulfill = () => route.fulfill({ json: {
+        data: [{ id: 'gpt-5.6-luna', protocol: 'openai', supported_account_count: 2, eligible_account_count: 2, complete_coverage: true }],
+        eligible_account_count: 2, unknown_account_count: reads === 1 ? 0 : 1, stale_account_count: 0,
+      } });
+      if (reads === 1) await fulfill();
+      else { finishMembershipRead = fulfill; membershipReadReady(); }
+    });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/route-model-validation.html?scenario=members`);
+    const save = page.getByRole('button', { name: 'Save route', exact: true });
+    await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('main > button')?.disabled);
+    await page.getByRole('button', { name: 'Change members', exact: true }).click();
+    assert.equal(await save.isDisabled(), true, 'membership changes invalidate old catalog evidence before refresh settles');
+    await membershipRead;
+    assert.equal(reads, 2, 'unchanged group IDs with changed membership must fetch a new catalog');
+    assert.ok(finishMembershipRead);
+    await finishMembershipRead();
+    assert.equal(await save.isDisabled(), true, 'a newly unknown member cannot inherit old full coverage');
+    await page.close();
   } finally {
     await browser.close();
     await server.close();

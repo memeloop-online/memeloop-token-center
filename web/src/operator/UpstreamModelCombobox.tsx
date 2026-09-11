@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
@@ -49,33 +49,40 @@ interface Props {
 
 export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, customModelConfirmed, onValidityChange, upstreams = [] }: Props) {
   const { locale, t } = useI18n();
-  const [catalog, setCatalog] = useState<AggregateCatalog>();
+  const sourceKey = JSON.stringify([accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol]);
+  const confirmationScope = JSON.stringify([token, tenant, sourceKey, value]);
+  const [catalogResult, setCatalogResult] = useState<{ scope: string; data: AggregateCatalog }>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [syncMessage, setSyncMessage] = useState('');
   const [open, setOpen] = useState(false);
   const [accountCatalogs, setAccountCatalogs] = useState<Map<string, AccountCatalog>>(new Map());
-  const [customConfirmed, setCustomConfirmed] = useState(customModelConfirmed);
+  // Persisted consent applies only to the scope first opened for editing.
+  // Never restore that prop after an account, group, membership or model change.
+  const [customConfirmation, setCustomConfirmation] = useState({ scope: confirmationScope, confirmed: customModelConfirmed });
+  const customConfirmed = customConfirmation.scope === confirmationScope && customConfirmation.confirmed;
+  const setCustomConfirmed = (confirmed: boolean) => setCustomConfirmation({ scope: confirmationScope, confirmed });
+  useLayoutEffect(() => {
+    if (customConfirmation.scope !== confirmationScope) setCustomConfirmed(false);
+  }, [confirmationScope, customConfirmation.scope]);
   const [partialConfirmed, setPartialConfirmed] = useState(false);
   const [refreshVersion, setRefreshVersion] = useState(0);
+  const catalogScope = JSON.stringify([confirmationScope, refreshVersion]);
+  const catalog = catalogResult?.scope === catalogScope ? catalogResult.data : undefined;
   const validityCallback = useRef(onValidityChange);
-  useEffect(() => { validityCallback.current = onValidityChange; }, [onValidityChange]);
-  const sourceKey = `${accountIds.join(',')}|${includedProviderGroupIds.join(',')}|${excludedProviderGroupIds.join(',')}|${protocol}`;
+  useLayoutEffect(() => { validityCallback.current = onValidityChange; }, [onValidityChange]);
   const hasCandidates = accountIds.length > 0 || includedProviderGroupIds.length > 0;
   const customAllowed = accountIds.length > 0 && includedProviderGroupIds.length === 0 && excludedProviderGroupIds.length === 0;
   const hasExplicitCodexOAuth = upstreams.some((account) => accountIds.includes(account.id)
     && account.driver === 'openai-codex' && account.connection_method === 'oauth');
 
   useEffect(() => {
-    setCustomConfirmed(customModelConfirmed);
     setPartialConfirmed(false);
-    // A catalog is scoped to the exact candidate set, protocol and query.
-    // Keeping the previous result visible during the debounce can make a model
-    // look selected for the newly chosen upstream and suppress the explicit
-    // custom-model confirmation until the next request settles. Clear it
-    // synchronously so neither validity nor UI can borrow stale coverage.
-    setCatalog(undefined);
-    if (!token || !tenant || !hasCandidates) { setCatalog(undefined); setError(''); setLoading(false); return; }
+    // The scope check above hides the previous result immediately, before
+    // this effect or the debounced read runs. A new candidate set must never
+    // borrow the previous catalog's coverage or suppress its own confirmation.
+    setCatalogResult(undefined);
+    if (!token || !tenant || !hasCandidates) { setError(''); setLoading(false); return; }
     const controller = new AbortController();
     const timeout = window.setTimeout(async () => {
       const query = new URLSearchParams({ tenant_external_id: tenant, limit: '100' });
@@ -84,8 +91,11 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
       if (excludedProviderGroupIds.length) query.set('exclude_provider_group_ids', excludedProviderGroupIds.join(','));
       if (value.trim()) query.set('q', value.trim());
       setLoading(true); setError('');
-      try { setCatalog(await api<AggregateCatalog>(`/internal/v1/upstream-models?${query}`, token, { signal: controller.signal })); }
-      catch (reason) { if (!controller.signal.aborted) { setCatalog(undefined); setError(reason instanceof Error ? reason.message : t('routes.catalogFailed')); } }
+      try {
+        const data = await api<AggregateCatalog>(`/internal/v1/upstream-models?${query}`, token, { signal: controller.signal });
+        if (!controller.signal.aborted) setCatalogResult({ scope: catalogScope, data });
+      }
+      catch (reason) { if (!controller.signal.aborted) { setCatalogResult(undefined); setError(reason instanceof Error ? reason.message : t('routes.catalogFailed')); } }
       finally { if (!controller.signal.aborted) setLoading(false); }
     }, 250);
     return () => { window.clearTimeout(timeout); controller.abort(); };
@@ -129,7 +139,7 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   const needsCustomConfirmation = Boolean(value.trim() && (!selected || !catalogFresh));
   const allowCustom = Boolean(needsCustomConfirmation && customAllowed && customConfirmed);
   const valid = Boolean(selectedValid || allowCustom);
-  useEffect(() => validityCallback.current(valid, allowCustom), [valid, allowCustom]);
+  useLayoutEffect(() => validityCallback.current(valid, allowCustom), [valid, allowCustom]);
 
   const choose = (model: CatalogModel) => {
     onChange(model.id); setCustomConfirmed(false); setPartialConfirmed(false);

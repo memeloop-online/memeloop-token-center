@@ -369,8 +369,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await routeForm.getByLabel('上游模型').fill('browser-workflow-v1');
   const imageCatalogResponse = await imageCatalogResponsePromise;
   assert.equal(imageCatalogResponse.status(), 200, await imageCatalogResponse.text());
-  const imageCustomModelConfirmation = routeForm.getByLabel(/未验证的自定义模型/);
-  const imagePartialCoverageConfirmation = routeForm.getByLabel(/候选支持此模型/);
+  const imageCustomModelConfirmation = routeForm.getByRole('checkbox', { name: /我确认将.*用于全部明确选择的上游，允许目录未验证的账号参与路由/ });
+  const imagePartialCoverageConfirmation = routeForm.getByRole('checkbox', { name: /个候选目录已收录此模型；我确认仅让目录已收录它的上游参与路由/ });
   const createImageRouteButton = routeForm.getByRole('button', { name: '创建路由', exact: true });
   await eventually(async () => {
     assert.ok(
@@ -380,17 +380,48 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
       'image route must be catalogued or offer the applicable model confirmation',
     );
   }, 30_000);
-  if (await imageCustomModelConfirmation.isVisible()) await imageCustomModelConfirmation.check();
+  const imageAllowsCustom = await imageCustomModelConfirmation.isVisible();
+  if (imageAllowsCustom) {
+    assert.equal(await createImageRouteButton.isEnabled(), false, 'unverified models require explicit confirmation before saving');
+    await imageCustomModelConfirmation.check();
+  }
   if (await imagePartialCoverageConfirmation.isVisible()) await imagePartialCoverageConfirmation.check();
   await eventually(async () => assert.equal(await createImageRouteButton.isEnabled(), true), 30_000,
     'the image route did not become valid after selecting its upstream model');
   const imageRouteResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
   await createImageRouteButton.click();
   const imageRouteResponse = await imageRouteResponsePromise;
+  assert.equal(imageRouteResponse.request().postDataJSON().custom_model_confirmed, imageAllowsCustom);
+  assert.deepEqual(imageRouteResponse.request().postDataJSON().upstream_account_ids, [comfyUpstream.id]);
   assert.equal(imageRouteResponse.status(), 201, await imageRouteResponse.text());
   const imageRoute = await imageRouteResponse.json() as { id: string };
   assert.match(imageRoute.id, uuidPattern);
   await assertContains(page.getByRole('status'), '路由已创建');
+
+  // Reopen a persisted custom route through the real editor. Its saved consent
+  // must not survive a candidate change, even when the original scope returns.
+  assert.equal(imageAllowsCustom, true, 'the unlisted workflow fixture must exercise persisted custom consent');
+  await page.getByRole('row').filter({ hasText: imageModel }).getByRole('button', { name: '编辑', exact: true }).click();
+  const imageEditor = page.locator('.inline-editor');
+  const editConfirmation = imageEditor.getByRole('checkbox', { name: /我确认将.*用于全部明确选择的上游，允许目录未验证的账号参与路由/ });
+  await eventually(async () => assert.equal(await editConfirmation.isChecked(), true), 10_000);
+  const editSave = imageEditor.getByRole('button', { name: '保存', exact: true });
+  const editCandidates = imageEditor.getByRole('combobox', { name: '具体提供商', exact: true });
+  await editCandidates.fill('Browser UI Seedance');
+  await editCandidates.press('Enter');
+  await eventually(async () => assert.equal(await editConfirmation.isChecked(), false), 10_000);
+  assert.equal(await editSave.isEnabled(), false, 'changing accounts must clear persisted custom consent');
+  await imageEditor.getByRole('button', { name: '移除 Browser UI Seedance', exact: true }).click();
+  assert.equal(await editConfirmation.isChecked(), false, 'returning to the saved account set must not revive consent');
+  assert.equal(await editSave.isEnabled(), false);
+  await editConfirmation.check();
+  const editedImageResponse = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/model-routes/${imageRoute.id}`) && response.request().method() === 'PUT');
+  await editSave.click();
+  const editResponse = await editedImageResponse;
+  assert.equal(editResponse.status(), 200, await editResponse.text());
+  assert.equal(editResponse.request().postDataJSON().custom_model_confirmed, true);
+  assert.deepEqual(editResponse.request().postDataJSON().upstream_account_ids, [comfyUpstream.id]);
+  await assertContains(page.getByRole('status'), '路由已更新');
 
   await routeForm.getByLabel('公开模型').fill(videoModel);
   await routeForm.getByLabel('协议').selectOption('generation');
@@ -416,8 +447,8 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   await routeForm.getByLabel('上游模型').fill('seedance-browser-v1');
   const videoCatalogResponse = await videoCatalogResponsePromise;
   assert.equal(videoCatalogResponse.status(), 200, await videoCatalogResponse.text());
-  const customModelConfirmation = routeForm.getByLabel(/未验证的自定义模型/);
-  const partialCoverageConfirmation = routeForm.getByLabel(/候选支持此模型/);
+  const customModelConfirmation = routeForm.getByRole('checkbox', { name: /我确认将.*用于全部明确选择的上游，允许目录未验证的账号参与路由/ });
+  const partialCoverageConfirmation = routeForm.getByRole('checkbox', { name: /个候选目录已收录此模型；我确认仅让目录已收录它的上游参与路由/ });
   const createVideoRouteButton = routeForm.getByRole('button', { name: '创建路由', exact: true });
   await eventually(async () => {
     assert.ok(
@@ -427,13 +458,19 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
       'the video route must be catalogued or offer the applicable model confirmation',
     );
   }, 30_000);
-  if (await customModelConfirmation.isVisible()) await customModelConfirmation.check();
+  const videoAllowsCustom = await customModelConfirmation.isVisible();
+  if (videoAllowsCustom) {
+    assert.equal(await createVideoRouteButton.isEnabled(), false, 'unverified models require explicit confirmation before saving');
+    await customModelConfirmation.check();
+  }
   if (await partialCoverageConfirmation.isVisible()) await partialCoverageConfirmation.check();
   await eventually(async () => assert.equal(await createVideoRouteButton.isEnabled(), true), 30_000,
     'the video route did not become valid after selecting its upstream model');
   const routeResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
   await createVideoRouteButton.click();
   const routeResponse = await routeResponsePromise;
+  assert.equal(routeResponse.request().postDataJSON().custom_model_confirmed, videoAllowsCustom);
+  assert.deepEqual(routeResponse.request().postDataJSON().upstream_account_ids, [seedanceUpstream.id]);
   assert.equal(routeResponse.status(), 201);
   const videoRoute = await routeResponse.json() as { id: string };
   assert.match(videoRoute.id, uuidPattern);
