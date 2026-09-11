@@ -86,6 +86,6 @@ export function UpstreamQuota({ accountId, accountName = accountId, tenant, toke
     {error && <p className="notice error" role="alert">{t(snapshot ? 'quota.refreshFailedRetained' : 'quota.readFailed')}</p>}
     {!snapshot && !busy && !error && <p>{t(tenant ? 'quota.notLoaded' : 'quota.selectTenant')}</p>}
     {snapshot && <UpstreamQuotaDetails snapshot={snapshot} />}
-    {snapshot && <UpstreamQuotaReset key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} />}
+    {snapshot && snapshot.reset_capability.provider_supported === true && snapshot.reset_capability.implementation_available && <details className="upstream-danger-zone"><summary>{t('quota.resetAction')}</summary><p>{t('quota.resetWarning')}</p><UpstreamQuotaReset key={scope} accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} /></details>}
   </section>;
 }

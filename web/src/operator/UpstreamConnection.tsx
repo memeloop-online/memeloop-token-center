@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import type { RJSFSchema } from '@rjsf/utils';
 import { api } from '../api';
 import { useI18n } from '../i18n';
@@ -19,10 +19,12 @@ export function isPrivateProxyUrl(value: string) {
 
 export function ProxyInput({ value, onChange, disabled = false }: { value: string; onChange: (value: string) => void; disabled?: boolean }) {
   const { t } = useI18n();
+  const id = useId();
+  const invalid = Boolean(value && !isPrivateProxyUrl(value.trim()));
   return <div className="upstream-proxy-editor">
-    <label>{t('connection.proxyUrl')}<input type="password" autoComplete="new-password" spellCheck={false} disabled={disabled} value={value} onChange={(event) => onChange(event.target.value)} placeholder="socks5h://10.0.0.10:1080" /></label>
-    <p>{t('connection.proxyHint')}</p>
-    {value && !isPrivateProxyUrl(value.trim()) && <p role="alert">{t('connection.proxyInvalid')}</p>}
+    <label>{t('connection.proxyUrl')} · {t('connection.required')}<input type="password" required aria-invalid={invalid} aria-describedby={`${id}-hint${invalid ? ` ${id}-error` : ''}`} autoComplete="new-password" spellCheck={false} disabled={disabled} value={value} onChange={(event) => onChange(event.target.value)} placeholder="socks5h://10.0.0.10:1080" /></label>
+    <p id={`${id}-hint`}>{t('connection.proxyHint')}</p>
+    {invalid && <p id={`${id}-error`} role="alert">{t('connection.proxyInvalid')}</p>}
   </div>;
 }
 

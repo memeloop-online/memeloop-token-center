@@ -4,6 +4,11 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'routes.identitySection': '1. 对外模型名称', 'routes.identityHint': '客户端使用此名称调用模型；它可以与上游模型名称不同。',
+  'routes.upstreamSection': '2. 上游来源与模型', 'routes.accessSection': '3. 优先级与访问授权', 'routes.accessHint': '按需选择分组和客户端凭据。保存配置不会发送模型测试请求。', 'routes.priorityHint': '请输入 -1000000 到 1000000 之间的整数。',
+  'connection.required': '必填',
+  'connection.manageAccount': '账号设置与授权操作', 'connection.dangerZone': '危险操作', 'connection.dangerHint': '停用、断开授权或删除会影响使用此账号的路由。请先确认影响范围。',
+  'quota.resetWarning': '此操作会消耗供应商重置次数，不是刷新展示数据。展开后仍需二次确认。',
   'quota.retryConfirm': '重试同一次确认', 'quota.retryConfirmSameOperation': '上次确认结果未知。此操作仅使用相同操作 ID 与幂等键重新确认，不会创建新的重置操作。继续？',
   'connection.title': '服务地址与网络出口', 'connection.fixed': '固定官方地址',
   'connection.proxy': '网络代理', 'connection.proxyUnknown': '代理状态未知', 'connection.proxyConfigured': '已配置代理',
@@ -419,6 +424,11 @@ const zh = {
 } as const;
 
 const en = {
+  'routes.identitySection': '1. Public model name', 'routes.identityHint': 'Clients use this name. It may differ from the upstream model name.',
+  'routes.upstreamSection': '2. Upstream sources and model', 'routes.accessSection': '3. Priority and access', 'routes.accessHint': 'Choose groups and client credentials as needed. Saving does not send a model test request.', 'routes.priorityHint': 'Enter an integer from -1000000 to 1000000.',
+  'connection.required': 'Required',
+  'connection.manageAccount': 'Account settings and authorization', 'connection.dangerZone': 'Danger zone', 'connection.dangerHint': 'Disabling, disconnecting or deleting this account affects routes using it. Review the impact first.',
+  'quota.resetWarning': 'This consumes a supplier reset credit; it does not merely refresh the displayed data. A separate confirmation is required.',
   'quota.retryConfirm': 'Retry the same confirmation', 'quota.retryConfirmSameOperation': 'The previous confirmation outcome is unknown. Retry with the same operation ID and idempotency key, without creating a new reset operation?',
   'connection.title': 'Service endpoint and network egress', 'connection.fixed': 'Fixed official endpoint',
   'connection.proxy': 'Network proxy', 'connection.proxyUnknown': 'Proxy status unknown', 'connection.proxyConfigured': 'Proxy configured',

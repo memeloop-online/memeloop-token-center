@@ -8,6 +8,7 @@ test('upstream connection, OAuth and quota UX in Chromium with isolated API mock
   assert.match(base, /^http:\/\/127\.0\.0\.1:\d+$/);
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1080 } });
+  page.setDefaultTimeout(120_000);
   const requests: string[] = [];
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
@@ -58,7 +59,8 @@ test('upstream connection, OAuth and quota UX in Chromium with isolated API mock
         body = account;
       } else body = [account];
     }
-    else if (path.endsWith('/monitoring-snapshot') || path.includes('/availability')) { status = 503; body = { error: { message: 'Mock monitoring unavailable' } }; }
+    else if (path.endsWith('/monitoring-snapshot')) body = { top_upstream_models: [] };
+    else if (path.endsWith('/upstream-availability')) body = { contract_version: 'upstream_account_availability_v1', tenant_external_id: 'default', generated_at: Date.now(), from_created_at: Date.now() - 86400000, to_created_at: Date.now(), accounts: [{ upstream_account_id: account.id, metrics: { requests: 0, successful_requests: 0, failed_requests: 0, avg_duration_ms: null, p95_duration_ms: null }, terminal_outcomes: [] }] };
     else if (path.endsWith('/transport-proxy')) {
       const payload = route.request().postDataJSON();
       assert.equal(payload.proxy_url, 'socks5h://10.0.0.10:1080');
@@ -89,7 +91,7 @@ test('upstream connection, OAuth and quota UX in Chromium with isolated API mock
   await page.addInitScript(() => {
     localStorage.setItem('mtc.operator.service-credential.v1', 'mock-only');
     localStorage.setItem('mtc.operator.tenant.v1', 'default');
-    localStorage.setItem('mtc.locale', 'en');
+    localStorage.setItem('mtc-locale', 'en');
   });
   try {
     await page.goto(`${base}/operator?view=providers`);
@@ -105,43 +107,36 @@ test('upstream connection, OAuth and quota UX in Chromium with isolated API mock
     await input.fill('socks5h://10.0.0.10:1080');
     await connection.getByRole('button', { name: /保存网络代理|Save network proxy/ }).click();
     await connection.getByRole('status').waitFor();
+    await card.locator('.upstream-secondary-actions > summary').click();
     await card.getByRole('button', { name: /编辑上游|Edit upstream|^编辑$|^Edit$/ }).click();
     const editor = page.locator('.inline-editor');
     assert.equal(await editor.locator('input[readonly]').count() > 0, true);
     await editor.locator('#root_name').fill('Renamed mock');
     await editor.getByRole('button', { name: /保存|Save/ }).click();
     await editor.waitFor({ state: 'hidden' });
-    await card.locator('.upstream-quota-heading button').click();
-    await card.locator('meter').waitFor();
-    await card.locator('.upstream-quota-heading button').click();
-    await card.locator('.upstream-quota > [role="alert"]').waitFor();
-    assert.equal(await card.locator('meter').count(), 1);
-    await card.locator('.upstream-quota-reset-action > button').click();
-    const dialog = page.getByRole('dialog');
-    await dialog.waitFor();
-    await dialog.getByRole('button', { name: /取消|Cancel/ }).click();
-    assert.equal(requests.some((value) => value.endsWith('/confirm')), false);
-    assert.equal(await card.locator('.upstream-quota-reset-action > button').isEnabled(), true);
-    await card.locator('.upstream-quota-reset-action > button').click();
-    await dialog.waitFor();
-    await dialog.locator('button.danger').click();
-    const retry = card.getByRole('button', { name: /重试同一次确认|Retry the same confirmation/ });
-    await retry.waitFor();
-    await retry.click();
-    await dialog.waitFor();
-    await dialog.locator('button.danger').click();
-    await retry.waitFor({ state: 'hidden' });
-    assert.equal(confirmationAttempts, 2);
-    await card.getByRole('button', { name: /主动健康检查|manual health/i }).click();
+    // Acceptance boundary: do not activate quota, reset, health or model sync controls,
+    // even with mocked transport. Quota visuals are covered by a static-only fixture.
+    assert.equal(quotaReads, 0);
+    assert.equal(confirmationAttempts, 0);
+    await card.locator('.upstream-secondary-actions > summary').click();
     const onboarding = page.locator('.provider-onboarding');
     await onboarding.locator('summary').click();
     await onboarding.locator('#root_name').fill('New mock API');
     await onboarding.locator('#root_credential_value').fill('mock-api-key');
-    await onboarding.getByRole('button', { name: /添加上游|Add upstream/ }).click();
+    await Promise.all([
+      page.waitForResponse((response) => response.url().endsWith('/internal/v1/upstreams') && response.request().method() === 'POST'),
+      onboarding.getByRole('button', { name: /添加上游|Add upstream/ }).click(),
+    ]);
     assert.ok(requests.includes('POST /internal/v1/upstreams'));
-    await onboarding.getByRole('button', { name: /账户授权|OAuth authorization|OAuth/ }).click();
+    await onboarding.getByRole('button', { name: /账户授权|Account authorization|OAuth/ }).click();
     const start = onboarding.getByRole('button', { name: /开始登录|Start login/ });
     assert.equal(await start.isDisabled(), true);
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.screenshot({ path: '/tmp/mtc-upstream-ux-oauth-before-login-desktop.png', fullPage: true, animations: 'disabled' });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.waitForFunction(() => document.querySelector('.app-sidebar')!.getBoundingClientRect().right <= 0);
+    await page.screenshot({ path: '/tmp/mtc-upstream-ux-oauth-before-login-mobile.png', fullPage: true, animations: 'disabled' });
+    await page.setViewportSize({ width: 1440, height: 1080 });
     await onboarding.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.10:1080');
     await start.click();
     await onboarding.locator('.device-authorization').waitFor();
@@ -149,9 +144,11 @@ test('upstream connection, OAuth and quota UX in Chromium with isolated API mock
     await page.evaluate(() => window.scrollTo(0, 0));
     await page.screenshot({ path: '/tmp/mtc-upstream-ux-desktop.png', fullPage: true });
     await page.setViewportSize({ width: 390, height: 844 });
+    await page.waitForFunction(() => document.querySelector('.app-sidebar')!.getBoundingClientRect().right <= 0);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
-    await page.screenshot({ path: '/tmp/mtc-upstream-ux-mobile.png', fullPage: true });
+    await page.screenshot({ path: '/tmp/mtc-upstream-ux-mobile.png', fullPage: true, animations: 'disabled' });
     assert.deepEqual(errors, []);
+    assert.equal(requests.some((value) => /\/(quota|health|models|refresh|prepare|confirm)$/.test(value)), false);
   } catch (error) {
     console.error({ errors, requests, text: (await page.locator('body').innerText()).slice(-4000) });
     throw error;

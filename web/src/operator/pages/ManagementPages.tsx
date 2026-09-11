@@ -1,7 +1,7 @@
 import { useConfirmDialog } from '../../useConfirmDialog';
 import RjsfForm, { type FormProps } from '@rjsf/core/lib/components/Form.js';
 import type { RJSFSchema } from '@rjsf/utils';
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ApiError, api, apiRead } from '../../api';
 import { formatCurrency, formatNumber } from '../../format';
 import { localizeSchema, useI18n } from '../../i18n';
@@ -221,7 +221,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <small>{value.id}</small>
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} />
             {value.credential_expires_at && <small>{t('providers.expires')}: {new Date(value.credential_expires_at).toLocaleString(locale)}</small>}
-            <UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} />
+            <details className="upstream-health-details"><summary>{t('providers.recentAvailability')} · {currentHealth ? t(currentHealth.status === 'healthy' ? 'providers.healthy' : 'providers.unhealthy') : t('providers.manualHealthCheck')}</summary><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></details>
             <UpstreamQuota key={`${token}\0${tenant}\0${value.id}`} accountId={value.id} accountName={value.name} tenant={value.tenant_external_id ?? tenant} token={token} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
@@ -229,18 +229,20 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <span className={`status ${value.status === 'active' ? 'ok' : 'pending'}`}>{enumLabel(t, 'status', value.status)}</span>
             <span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span>
             <span className="pill">{t('providers.routes', { count: formatNumber(value.route_count, locale) })}</span>
-            <div className="row-actions">
+            <details className="upstream-secondary-actions"><summary>{t('connection.manageAccount')}</summary><div className="row-actions">
               {providerAvailable && <>
                 <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setEditing(value)}>{t('providers.edit')}</button>
                 <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</button>
                 {value.can_refresh && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</button>}
                 {value.can_reauthorize && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setReauthorizing(value)}>{t('providers.reauthorize')}</button>}
-                {value.auth_kind === 'oauth' && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</button>}
                 {value.can_rotate && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => setRotating(value)}>{t('providers.rotateCredential')}</button>}
               </>}
-              {(value.status === 'active' || providerAvailable) && <button type="button" className="secondary" disabled={!manageable || Boolean(busy)} onClick={() => void setStatus(value, value.status === 'active' ? 'disabled' : 'active')}>{value.status === 'active' ? t('providers.disable') : t('providers.enable')}</button>}
+            </div></details>
+            <details className="upstream-danger-zone"><summary>{t('connection.dangerZone')}</summary><p>{t('connection.dangerHint')}</p><div className="row-actions">
+              {value.auth_kind === 'oauth' && <button type="button" className="danger" disabled={!manageable || Boolean(busy)} onClick={() => void disconnectOAuth(value)}>{t('providers.disconnect')}</button>}
+              {(value.status === 'active' || providerAvailable) && <button type="button" className="danger" disabled={!manageable || Boolean(busy)} onClick={() => void setStatus(value, value.status === 'active' ? 'disabled' : 'active')}>{value.status === 'active' ? t('providers.disable') : t('providers.enable')}</button>}
               <button type="button" className="danger" title={deletionBlockers.length > 0 ? deletionBlockers.join(' ') : undefined} disabled={!manageable || Boolean(busy)} onClick={() => void remove(value)}>{t('common.remove')}</button>
-            </div>
+            </div></details>
           </div>
         </div>;
       })}</div>
@@ -277,7 +279,7 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
   const reset = () => { setSession(undefined); setManualCode(''); setProxyUrl(''); setMessage(''); setError(''); };
   useEffect(() => { setSession(undefined); setManualCode(''); setMessage(''); setError(''); }, [tenant]);
   const start = async (providerConfig?: unknown) => {
-    if (!tenant || !selectedProvider || authorizing) return;
+    if (!tenant || !selectedProvider || !name.trim() || authorizing || session) return;
     if (!existing && selectedProvider.oauth_adapter?.flow_kind === 'openai_device' && !isPrivateProxyUrl(proxyUrl.trim())) return;
     setAuthorizing(true);
     try {
@@ -325,8 +327,8 @@ function AuthorizationConnection({ token, tenant, providers, existing, onChanged
     {error && <div className="notice error" role="alert">{error}</div>}
     {oauthProviders.length === 0 ? <div className="empty">{t('providers.noAdapter')}</div> : <>
     <label>{t('providers.provider')}<select disabled={Boolean(existing)} value={providerChoice} onChange={(event) => { const next = event.target.value; setProviderChoice(next); setName(`${next}-primary`); reset(); }}>{oauthProviders.map((value) => <option key={value.id} value={value.id}>{value.display_name}</option>)}</select></label>
-    <label>{t('providers.name')}<input readOnly={Boolean(existing)} value={name} onChange={(event) => setName(event.target.value)} /></label>
-    {selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <section className="upstream-connection"><h3>{t('connection.title')}</h3><p><b>Base URL</b> · {t('connection.fixed')}</p><p className="muted">{t('connection.endpointHint')}</p>{!existing ? <ProxyInput value={proxyUrl} onChange={setProxyUrl} disabled={authorizing} /> : <p>{t(existing.has_proxy ? 'connection.proxyConfigured' : 'connection.proxyMissing')}</p>}</section>}
+    <label>{t('providers.name')} · {t('connection.required')}<input required maxLength={200} readOnly={Boolean(existing)} disabled={authorizing || Boolean(session)} value={name} onChange={(event) => setName(event.target.value)} /></label>
+    {selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !session && <section className="upstream-connection"><h3>{t('connection.title')}</h3><p><b>Base URL</b> · {t('connection.fixed')}</p><code>https://chatgpt.com/backend-api/codex</code><p className="muted">{t('connection.endpointHint')}</p>{!existing ? <ProxyInput value={proxyUrl} onChange={setProxyUrl} disabled={authorizing} /> : <p>{t(existing.has_proxy === undefined ? 'connection.proxyUnknown' : existing.has_proxy ? 'connection.proxyConfigured' : 'connection.proxyMissing')}</p>}</section>}
     {selectedProvider && selectedProvider.source !== 'builtin' && !session ? <Form key={`${selectedProvider.id}-${locale}`} schema={localizeSchema(selectedProvider.config_schema as RJSFSchema, locale)} formData={existing?.config} readonly={Boolean(existing)} validator={validator} templates={schemaFormTemplates} onSubmit={({ formData }) => void start(formData)}><button type="submit" disabled={!tenant || authorizing}>{t('common.startLogin')}</button></Form> : <div className="button-row"><button type="button" onClick={() => void start()} disabled={!tenant || !name.trim() || authorizing || Boolean(session) || (!existing && selectedProvider?.oauth_adapter?.flow_kind === 'openai_device' && !isPrivateProxyUrl(proxyUrl.trim()))}>{t(authorizing ? 'common.loading' : 'common.startLogin')}</button>{session && <><a className="button secondary" href={session.verification_url ?? session.login_url} target="_blank" rel="noreferrer">{t('common.openAuthorization')}</a>{selectedProvider?.oauth_adapter?.flow_kind !== 'claude_manual_pkce' && <button type="button" onClick={() => void poll()}>{t('common.checkAuthorization')}</button>}</>}</div>}
     {session && selectedProvider?.oauth_adapter?.flow_kind === 'claude_manual_pkce' && <div className="manual-authorization"><label>{t('providers.manualCode')}<input value={manualCode} onChange={(event) => setManualCode(event.target.value)} placeholder={t('providers.manualCodeHint')} /></label><button type="button" disabled={!manualCode.includes('#')} onClick={() => void complete()}>{t('providers.completeAuthorization')}</button></div>}
     {session?.user_code && <div className="device-authorization" role="status"><p>{t('providers.codexSecurity')}</p><b>{t('providers.deviceCode')}</b><code>{session.user_code}</code></div>}
@@ -510,6 +512,7 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
 }) {
   const { locale, t } = useI18n();
   const knownProtocols = ['openai', 'anthropic', 'generation'];
+  const priorityHintId = useId();
   const includedAccountIds = providerGroups.filter((group) => draft.included_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids);
   const excludedAccountIds = new Set(providerGroups.filter((group) => draft.excluded_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids));
   const candidateIds = [...new Set([...draft.upstream_account_ids, ...includedAccountIds])].filter((id) => !excludedAccountIds.has(id));
@@ -529,8 +532,11 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
     ...selections(draft.route_group_ids, routeGroupOptions),
     ...draft.route_group_names.map((name) => ({ value: `new:${name}`, label: name, created: true })),
   ];
-  return <>
-    <label>{t('routes.publicModel')}<input value={draft.public_model} onChange={(event) => onChange({ ...draft, public_model: event.target.value })} /></label>
+  const priorityValid = Number.isInteger(draft.priority) && Math.abs(draft.priority) <= 1000000;
+  return <div className="route-form-sections">
+    <fieldset><legend>{t('routes.identitySection')}</legend><p className="field-hint">{t('routes.identityHint')}</p>
+    <label>{t('routes.publicModel')} · {t('connection.required')}<input required value={draft.public_model} onChange={(event) => onChange({ ...draft, public_model: event.target.value })} /></label>
+    </fieldset><fieldset><legend>{t('routes.upstreamSection')}</legend>
     <MultiCombobox label={t('routes.explicitUpstreams')} options={upstreamOptions} value={selections(draft.upstream_account_ids, upstreamOptions)} onChange={(selected) => {
       const upstream_account_ids = selected.map((item) => item.value);
       const upstream_account_id = upstream_account_ids[0] ?? '';
@@ -541,11 +547,13 @@ function RouteFields({ token, tenant, draft, upstreams, providers, providerGroup
       <MultiCombobox label={t('routes.excludeProviderGroups')} options={providerGroupOptions} value={selections(draft.excluded_provider_group_ids, providerGroupOptions)} onChange={(selected) => onChange({ ...draft, excluded_provider_group_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchProviderGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exclusionWins')} />
     </div>
     <label>{t('routes.protocol')}<select aria-invalid={!protocolCompatible} value={draft.protocol} onChange={(event) => onChange({ ...draft, protocol: event.target.value })}>{knownProtocols.map((protocol) => <option disabled={candidateIds.length > 0 && !supportedByAll.includes(protocol)} key={protocol} value={protocol}>{protocol === 'generation' ? t('routes.generation') : protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>)}</select><small className={`field-hint${protocolCompatible ? '' : ' field-error'}`}>{t(protocolCompatible ? 'routes.protocolCompatibilityHint' : 'routes.protocolIncompatible')}</small></label>
-    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={onCatalogValidity} />
-    <label>{t('routes.priority')}<input type="number" min={-1000000} max={1000000} value={draft.priority} onChange={(event) => onChange({ ...draft, priority: Number(event.target.value) })} /></label>
+    <UpstreamModelCombobox token={token} tenant={tenant} upstreams={upstreams} accountIds={draft.upstream_account_ids} includedProviderGroupIds={draft.included_provider_group_ids} excludedProviderGroupIds={draft.excluded_provider_group_ids} syncAccountIds={candidateIds} protocol={draft.protocol} value={draft.upstream_model} onChange={(upstream_model) => onChange({ ...draft, upstream_model, custom_model_confirmed: false })} customModelConfirmed={draft.custom_model_confirmed} onValidityChange={(valid, allowCustom) => onCatalogValidity(valid && protocolCompatible, allowCustom)} />
+    </fieldset><fieldset><legend>{t('routes.accessSection')}</legend><p className="field-hint">{t('routes.accessHint')}</p>
+    <label>{t('routes.priority')}<input type="number" required step={1} aria-invalid={!priorityValid} aria-describedby={priorityHintId} min={-1000000} max={1000000} value={Number.isNaN(draft.priority) ? '' : draft.priority} onChange={(event) => onChange({ ...draft, priority: event.target.valueAsNumber })} /></label><small id={priorityHintId} className={priorityValid ? 'field-hint' : 'field-error'}>{t('routes.priorityHint')}</small>
     <MultiCombobox label={t('routes.routeGroups')} options={routeGroupOptions} value={routeGroupValue} onChange={(selected) => onChange({ ...draft, route_group_ids: selected.filter((item) => !item.created).map((item) => item.value), route_group_names: selected.filter((item) => item.created).map((item) => item.label) })} placeholder={t('routes.searchOrCreateRouteGroups')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} allowCreate createLabel={(name) => t('routes.createRouteGroupNamed', { name })} hint={t('routes.routeGroupsHint')} />
     <MultiCombobox label={t('routes.exactCredentials')} options={credentialOptions} value={selections(draft.granted_credential_ids, credentialOptions)} onChange={(selected) => onChange({ ...draft, granted_credential_ids: selected.map((item) => item.value) })} placeholder={t('routes.searchCredentials')} emptyText={t('groups.noMatches')} removeLabel={(name) => t('groups.removeMember', { name })} hint={t('routes.exactCredentialsHint')} onQueryChange={onCredentialQuery} />
-  </>;
+    </fieldset>
+  </div>;
 }
 
 function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, providers }: { token: string; tenant: string; writeTenant?: string; upstreams: UpstreamAccount[]; providers: ProviderType[] }) {
@@ -636,8 +644,18 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   const statusFilter = useResourceListStatusFilter('model-routes', tenant, routes, (route) => route.enabled);
   const scopedUpstreams = upstreams.filter((value) => !value.tenant_external_id || value.tenant_external_id === writeTenant);
   const canManage = (route: ModelRouteView) => Boolean(writeTenant) && route.tenant_external_id === writeTenant;
-  const canSubmit = (draft: RouteDraft, catalogValid: boolean) => Boolean(writeTenant && catalogValid && draft.public_model.trim() && draft.upstream_model.trim()
-    && (draft.upstream_account_ids.length > 0 || draft.included_provider_group_ids.length > 0));
+  const canSubmit = (draft: RouteDraft, catalogValid: boolean) => {
+    const included = providerGroups.groups.filter((group) => draft.included_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids);
+    const excluded = new Set(providerGroups.groups.filter((group) => draft.excluded_provider_group_ids.includes(group.id)).flatMap((group) => group.member_ids));
+    const candidates = [...new Set([...draft.upstream_account_ids, ...included])].filter((id) => !excluded.has(id));
+    const compatible = candidates.every((id) => {
+      const account = scopedUpstreams.find((value) => value.id === id);
+      const provider = providers.find((value) => value.id === account?.driver);
+      return !provider || provider.protocols.includes(draft.protocol);
+    });
+    return Boolean(writeTenant && catalogValid && compatible && candidates.length > 0 && draft.public_model.trim() && draft.upstream_model.trim()
+      && Number.isInteger(draft.priority) && Math.abs(draft.priority) <= 1000000);
+  };
   const beginEdit = (route: ModelRouteView) => {
     setCredentialsRequested(true);
     setEditing(route);
