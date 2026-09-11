@@ -3,7 +3,7 @@ import { api } from '../api';
 import { costOption, latencyOption, throughputOption, type UsageChartCopy, type UsageChartFormatters } from '../charts/usageCharts';
 import { formatCurrency, formatMilliseconds, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import type { OperatorUsageAnalysis, TypedFilterAst } from '../types';
+import type { OperatorUsageAnalysisTrends, TypedFilterAst } from '../types';
 import { requestDrilldownForOverviewBucket } from './overviewDrilldown';
 import { useOperatorResource } from './hooks/useOperatorResource';
 import { statsQuery } from './usageState';
@@ -11,7 +11,7 @@ import './overview.css';
 
 const EChart = lazy(() => import('../charts/EChart').then((module) => ({ default: module.EChart })));
 
-function formatCosts(costs: OperatorUsageAnalysis['time_series'][number]['costs'], locale: 'zh-CN' | 'en') {
+function formatCosts(costs: OperatorUsageAnalysisTrends['time_series'][number]['costs'], locale: 'zh-CN' | 'en') {
   if (!costs.length) return '—';
   return [...costs]
     .sort((left, right) => left.currency.localeCompare(right.currency))
@@ -27,7 +27,7 @@ export function OverviewTrends({ token, tenant, onDrilldown }: { token: string; 
       preset: '24h', granularity: 'hour', customFrom: '', customTo: '',
       filters: { model: '', keyId: '', upstreamId: '', protocol: '', status: '', errorCode: '' },
     });
-    return api<OperatorUsageAnalysis>(`/internal/v1/usage-analysis${query}`, token);
+    return api<OperatorUsageAnalysisTrends>(`/internal/v1/usage-analysis/trends${query}`, token);
   }, t('usage.loadFailed'));
   const stats = resource.state.kind === 'ready' ? resource.state.value : undefined;
   const copy: UsageChartCopy = useMemo(() => ({

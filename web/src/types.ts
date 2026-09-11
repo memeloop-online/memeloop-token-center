@@ -270,6 +270,17 @@ export interface OperatorUsageAnalysis {
   heatmap: UsageAnalysisHeatmapBucket[];
 }
 
+export interface OperatorUsageAnalysisTrends {
+  from_created_at: number;
+  to_created_at: number;
+  granularity: 'hour' | 'day';
+  time_zone: 'UTC';
+  p95_is_approximate: true;
+  p95_method: 'fixed_histogram_upper_bound_capped_60000ms';
+  summary: UsageAnalysisMetrics;
+  time_series: UsageAnalysisTimeBucket[];
+}
+
 export interface SelfUsageAnalysis {
   from_created_at: number;
   to_created_at: number;

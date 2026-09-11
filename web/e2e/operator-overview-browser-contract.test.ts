@@ -13,6 +13,7 @@ declare global {
     overviewFixture: {
       calls: string[];
       delayedTenantResponsePending: boolean;
+      delayedTenantResponseReleased: boolean;
       drilldowns: unknown[];
       releaseDelayedTenantResponse: () => void;
     };
@@ -41,6 +42,18 @@ async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
+async function endpointCounts(page: import('playwright').Page, tenant: string) {
+  return page.evaluate((tenantScope) => {
+    const counts: Record<string, number> = {};
+    for (const call of window.overviewFixture.calls) {
+      const url = new URL(call.slice('GET '.length), location.origin);
+      if (url.searchParams.get('tenant_external_id') !== tenantScope) continue;
+      counts[url.pathname] = (counts[url.pathname] ?? 0) + 1;
+    }
+    return counts;
+  }, tenant);
+}
+
 test('Overview keeps current sections visible through independent endpoint failure, late tenant data, and responsive trend charts', { timeout: 45_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
@@ -64,10 +77,11 @@ test('Overview keeps current sections visible through independent endpoint failu
     assert.equal(await page.locator('.overview-trend-card .usage-echart').count(), 3, 'the successful statistics endpoint must render request, latency, and cost trends despite monitoring failure');
     assert.equal(await page.evaluate(() => window.overviewFixture.delayedTenantResponsePending), true, 'the alpha request response must still be pending before the scope change');
 
-    const alphaCalls = await page.evaluate(() => window.overviewFixture.calls);
-    for (const endpoint of ['/internal/v1/requests', '/internal/v1/monitoring-snapshot', '/internal/v1/usage-analysis']) {
-      assert.ok(alphaCalls.some((call) => call.includes(endpoint) && call.includes('tenant_external_id=tenant-alpha')), `missing alpha request for ${endpoint}`);
-    }
+    assert.deepEqual(await endpointCounts(page, 'tenant-alpha'), {
+      '/internal/v1/monitoring-snapshot': 1,
+      '/internal/v1/requests': 1,
+      '/internal/v1/usage-analysis/trends': 1,
+    }, 'alpha issues exactly one independent request per Overview resource and never waits on the complete analysis endpoint');
 
     await page.getByRole('button', { name: 'Switch tenant', exact: true }).click();
     await page.getByText('beta-current-model', { exact: true }).waitFor();
@@ -76,14 +90,16 @@ test('Overview keeps current sections visible through independent endpoint failu
     await page.locator('.overview-trend-card .usage-echart canvas').nth(2).waitFor();
 
     await page.evaluate(() => window.overviewFixture.releaseDelayedTenantResponse());
-    await page.waitForTimeout(50);
+    await page.waitForFunction(() => window.overviewFixture.delayedTenantResponseReleased);
+    await nextPaint(page);
     assert.equal(await page.getByText('alpha-stale-model', { exact: true }).count(), 0, 'a late response from the previous tenant must not replace beta data');
     assert.equal(await page.getByText('beta-current-model', { exact: true }).count(), 1);
 
-    const betaCalls = await page.evaluate(() => window.overviewFixture.calls);
-    for (const endpoint of ['/internal/v1/requests', '/internal/v1/monitoring-snapshot', '/internal/v1/usage-analysis']) {
-      assert.ok(betaCalls.some((call) => call.includes(endpoint) && call.includes('tenant_external_id=tenant-beta')), `missing beta request for ${endpoint}`);
-    }
+    assert.deepEqual(await endpointCounts(page, 'tenant-beta'), {
+      '/internal/v1/monitoring-snapshot': 1,
+      '/internal/v1/requests': 1,
+      '/internal/v1/usage-analysis/trends': 1,
+    }, 'beta renders its trends from one projection request and never calls the complete analysis endpoint configured to return 500');
 
     const trendData = page.locator('.overview-trend-data');
     assert.equal(await trendData.getAttribute('open'), null, 'the exact UTC table starts collapsed');

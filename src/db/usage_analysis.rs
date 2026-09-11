@@ -7,7 +7,11 @@ use generation_sql::generation_usage_dimension_sql;
 use session_accumulator::{SessionUsageAccumulator, accumulate_session_usage_row};
 use session_sql::session_usage_dimension_sql;
 
-use sqlx::{Row, any::AnyRow};
+use sqlx::{
+    Any, Row, Transaction,
+    any::{AnyArguments, AnyRow},
+    query::Query,
+};
 use uuid::Uuid;
 
 use super::{
@@ -18,7 +22,8 @@ use crate::model::{
     SelfUsageAnalysisResponse, UsageAnalysisBucket, UsageAnalysisCost,
     UsageAnalysisGenerationUnitsByBillingUnit, UsageAnalysisGenerationUnitsByModality,
     UsageAnalysisHeatmapBucket, UsageAnalysisMetrics, UsageAnalysisResponse,
-    UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, micros_to_decimal_string,
+    UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UsageAnalysisTrendsResponse,
+    micros_to_decimal_string,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -35,6 +40,58 @@ pub struct UsageAnalysisFilter {
     pub route_id: Option<Uuid>,
     pub key_alias: Option<String>,
     pub principal: Option<String>,
+}
+
+/// The only execution boundary for usage-analysis business statements.
+///
+/// Transaction setup and commit are intentionally outside the counter. The transaction itself
+/// stays private so every aggregate query must cross `fetch_all`, which records only statements
+/// that actually completed against the database.
+struct UsageAnalysisSnapshot {
+    transaction: Transaction<'static, Any>,
+    completed_business_statements: Vec<&'static str>,
+}
+
+impl UsageAnalysisSnapshot {
+    async fn begin(database: &Database) -> Result<Self, AppError> {
+        let mut transaction = database.pool.begin().await?;
+        if matches!(database.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        Ok(Self {
+            transaction,
+            completed_business_statements: Vec::new(),
+        })
+    }
+
+    async fn fetch_all<'query>(
+        &mut self,
+        statement: &'static str,
+        query: Query<'query, Any, AnyArguments>,
+    ) -> Result<Vec<AnyRow>, AppError> {
+        let rows = query.fetch_all(&mut *self.transaction).await?;
+        self.completed_business_statements.push(statement);
+        Ok(rows)
+    }
+
+    fn record_completion(&self, projection: UsageAnalysisMainProjectionSet) {
+        let business_statement_count =
+            u64::try_from(self.completed_business_statements.len()).unwrap_or(u64::MAX);
+        tracing::debug!(
+            target: "mtc_usage_analysis",
+            projection = projection.as_str(),
+            business_statement_count,
+            business_statements = ?self.completed_business_statements,
+            "usage analysis business statements completed"
+        );
+    }
+
+    async fn commit(self) -> Result<(), AppError> {
+        self.transaction.commit().await?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +137,26 @@ impl Database {
         self.aggregate_usage_analysis(None, &filter).await
     }
 
+    pub async fn operator_usage_analysis_trends(
+        &self,
+        tenant_external_id: &str,
+        filter: UsageAnalysisFilter,
+    ) -> Result<UsageAnalysisTrendsResponse, AppError> {
+        let tenant_id = self
+            .usage_analysis_tenant_id(Some(tenant_external_id))
+            .await?;
+        self.aggregate_usage_analysis_trends_for_tenant_id(tenant_id, &filter)
+            .await
+    }
+
+    pub async fn global_usage_analysis_trends(
+        &self,
+        filter: UsageAnalysisFilter,
+    ) -> Result<UsageAnalysisTrendsResponse, AppError> {
+        self.aggregate_usage_analysis_trends_for_tenant_id(None, &filter)
+            .await
+    }
+
     pub async fn self_usage_analysis(
         &self,
         tenant_id: Uuid,
@@ -99,6 +176,15 @@ impl Database {
         tenant_external_id: Option<&str>,
         filter: &UsageAnalysisFilter,
     ) -> Result<UsageAnalysisResponse, AppError> {
+        let tenant_id = self.usage_analysis_tenant_id(tenant_external_id).await?;
+        self.aggregate_usage_analysis_for_tenant_id(tenant_id, filter)
+            .await
+    }
+
+    async fn usage_analysis_tenant_id(
+        &self,
+        tenant_external_id: Option<&str>,
+    ) -> Result<Option<Uuid>, AppError> {
         let tenant_id = if let Some(external_id) = tenant_external_id {
             let stored_id = sqlx::query("SELECT id FROM tenants WHERE external_id = $1")
                 .bind(external_id)
@@ -115,8 +201,41 @@ impl Database {
         } else {
             None
         };
-        self.aggregate_usage_analysis_for_tenant_id(tenant_id, filter)
-            .await
+        Ok(tenant_id)
+    }
+
+    async fn aggregate_usage_analysis_trends_for_tenant_id(
+        &self,
+        tenant_id: Option<Uuid>,
+        filter: &UsageAnalysisFilter,
+    ) -> Result<UsageAnalysisTrendsResponse, AppError> {
+        let range = validate_usage_analysis_filter(filter)?;
+        let mut snapshot = UsageAnalysisSnapshot::begin(self).await?;
+        let mut projections = self
+            .query_usage_analysis_main(
+                &mut snapshot,
+                tenant_id,
+                filter,
+                range,
+                UsageAnalysisMainProjectionSet::Trends,
+            )
+            .await?;
+        let (summary, time_series) = take_summary_time_series(&mut projections)?;
+        if !projections.is_empty() {
+            return Err(AppError::Internal);
+        }
+        snapshot.record_completion(UsageAnalysisMainProjectionSet::Trends);
+        snapshot.commit().await?;
+        Ok(UsageAnalysisTrendsResponse {
+            from_created_at: range.from_created_at,
+            to_created_at: range.to_created_at,
+            granularity: range.granularity.as_str().to_owned(),
+            time_zone: "UTC".to_owned(),
+            p95_is_approximate: true,
+            p95_method: "fixed_histogram_upper_bound_capped_60000ms".to_owned(),
+            summary,
+            time_series,
+        })
     }
 
     async fn aggregate_usage_analysis_for_tenant_id(
@@ -126,13 +245,17 @@ impl Database {
     ) -> Result<UsageAnalysisResponse, AppError> {
         let range = validate_usage_analysis_filter(filter)?;
         let tenant_scoped = tenant_id.is_some();
+        let mut snapshot = UsageAnalysisSnapshot::begin(self).await?;
+        let mut projections = self
+            .query_usage_analysis_main(
+                &mut snapshot,
+                tenant_id,
+                filter,
+                range,
+                UsageAnalysisMainProjectionSet::Full,
+            )
+            .await?;
         let tenant_id = tenant_id.map(|id| id.to_string()).unwrap_or_default();
-        let mut snapshot = self.pool.begin().await?;
-        if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .execute(&mut *snapshot)
-                .await?;
-        }
         let key_id = filter.key_id.map(|id| id.to_string()).unwrap_or_default();
         let upstream_account_id = filter
             .upstream_account_id
@@ -148,8 +271,6 @@ impl Database {
         };
         let main_plan =
             UsageAnalysisBucketPlan::new(range.from_created_at, range.to_created_at, bucket_millis);
-        let main_sql = usage_analysis_main_sql(self.backend, range.granularity, tenant_scoped);
-
         macro_rules! bind_usage_filter {
             ($query:expr, $plan:expr) => {
                 $query
@@ -172,24 +293,16 @@ impl Database {
             };
         }
 
-        // SQL safety boundary: the generator accepts only backend/granularity enums and a scope
-        // boolean. User filters are always bound below and are never interpolated into SQL.
-        let rows = bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(main_sql)), main_plan)
-            .fetch_all(&mut *snapshot)
-            .await?;
-        let mut projections: BTreeMap<(String, String), UsageMetricsAccumulator> = BTreeMap::new();
-        for row in rows {
-            accumulate_usage_row(&mut projections, &row)?;
-        }
-
         let heatmap_sql = usage_analysis_heatmap_sql(tenant_scoped);
         let heatmap_plan =
             UsageAnalysisBucketPlan::new(range.from_created_at, range.to_created_at, 3_600_000);
         // Same closed generator boundary as the main analysis statement above.
-        let heatmap_rows =
-            bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(heatmap_sql)), heatmap_plan)
-                .fetch_all(&mut *snapshot)
-                .await?;
+        let heatmap_rows = snapshot
+            .fetch_all(
+                "heatmap",
+                bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(heatmap_sql)), heatmap_plan),
+            )
+            .await?;
         let mut heatmap_projection: BTreeMap<(String, String), UsageMetricsAccumulator> =
             BTreeMap::new();
         for row in heatmap_rows {
@@ -198,12 +311,15 @@ impl Database {
 
         let generation_dimension_sql =
             generation_usage_dimension_sql(range.granularity, tenant_scoped);
-        let generation_dimension_rows = bind_usage_filter!(
-            sqlx::query(sqlx::AssertSqlSafe(generation_dimension_sql)),
-            main_plan
-        )
-        .fetch_all(&mut *snapshot)
-        .await?;
+        let generation_dimension_rows = snapshot
+            .fetch_all(
+                "generation_dimensions",
+                bind_usage_filter!(
+                    sqlx::query(sqlx::AssertSqlSafe(generation_dimension_sql)),
+                    main_plan
+                ),
+            )
+            .await?;
         let mut generation_units_by_modality = Vec::new();
         let mut generation_units_by_billing_unit = Vec::new();
         for row in generation_dimension_rows {
@@ -241,21 +357,19 @@ impl Database {
         });
 
         let session_sql = session_usage_dimension_sql(range.granularity, tenant_scoped);
-        let session_rows =
-            bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(session_sql)), main_plan)
-                .fetch_all(&mut *snapshot)
-                .await?;
+        let session_rows = snapshot
+            .fetch_all(
+                "sessions",
+                bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(session_sql)), main_plan),
+            )
+            .await?;
         let mut session_projection: BTreeMap<(String, String), SessionUsageAccumulator> =
             BTreeMap::new();
         for row in session_rows {
             accumulate_session_usage_row(&mut session_projection, &row)?;
         }
 
-        let summary = projections
-            .remove(&("summary".to_owned(), "summary".to_owned()))
-            .unwrap_or_default()
-            .finish();
-        let mut time_series = Vec::new();
+        let (summary, time_series) = take_summary_time_series(&mut projections)?;
         let mut by_model = Vec::new();
         let mut by_key = Vec::new();
         let mut by_session = session_projection
@@ -279,10 +393,7 @@ impl Database {
             let label = accumulator.label.clone();
             let metrics = accumulator.finish();
             match kind.as_str() {
-                "time" => time_series.push(UsageAnalysisTimeBucket {
-                    bucket_start: id.parse().map_err(|_| AppError::Internal)?,
-                    metrics,
-                }),
+                "time" | "summary" => return Err(AppError::Internal),
                 "model" => by_model.push(UsageAnalysisBucket { id, label, metrics }),
                 "key" => by_key.push(UsageAnalysisBucket { id, label, metrics }),
                 "upstream" => by_upstream.push(UsageAnalysisBucket { id, label, metrics }),
@@ -299,7 +410,6 @@ impl Database {
                 _ => return Err(AppError::Internal),
             }
         }
-        time_series.sort_by_key(|bucket| bucket.bucket_start);
         for buckets in [
             &mut by_model,
             &mut by_key,
@@ -357,8 +467,71 @@ impl Database {
             errors,
             heatmap,
         };
+        snapshot.record_completion(UsageAnalysisMainProjectionSet::Full);
         snapshot.commit().await?;
         Ok(response)
+    }
+
+    async fn query_usage_analysis_main(
+        &self,
+        snapshot: &mut UsageAnalysisSnapshot,
+        tenant_id: Option<Uuid>,
+        filter: &UsageAnalysisFilter,
+        range: ValidatedUsageAnalysisRange,
+        projection: UsageAnalysisMainProjectionSet,
+    ) -> Result<BTreeMap<(String, String), UsageMetricsAccumulator>, AppError> {
+        let tenant_scoped = tenant_id.is_some();
+        let tenant_id = tenant_id.map(|id| id.to_string()).unwrap_or_default();
+        let key_id = filter.key_id.map(|id| id.to_string()).unwrap_or_default();
+        let upstream_account_id = filter
+            .upstream_account_id
+            .as_ref()
+            .map(UsageAnalysisUpstreamFilter::sql_value)
+            .unwrap_or_default();
+        let route_id = filter.route_id.map(|id| id.to_string()).unwrap_or_default();
+        let key_alias = search_prefix(filter.key_alias.as_deref());
+        let principal = search_prefix(filter.principal.as_deref());
+        let bucket_millis = match range.granularity {
+            UsageAnalysisGranularity::Hour => 3_600_000,
+            UsageAnalysisGranularity::Day => 86_400_000,
+        };
+        let plan =
+            UsageAnalysisBucketPlan::new(range.from_created_at, range.to_created_at, bucket_millis);
+        let sql = usage_analysis_projected_sql(
+            self.backend,
+            range.granularity,
+            tenant_scoped,
+            projection,
+        );
+        // SQL safety boundary: the generator accepts only closed enums and a scope boolean.
+        // User filters remain bound values and are never interpolated into the statement.
+        let rows = snapshot
+            .fetch_all(
+                "main",
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(&tenant_id)
+                    .bind(&key_id)
+                    .bind(plan.rollup_from_bucket)
+                    .bind(plan.rollup_to_bucket)
+                    .bind(filter.model.as_deref().unwrap_or_default())
+                    .bind(filter.protocol.as_deref().unwrap_or_default())
+                    .bind(filter.status.as_deref().unwrap_or_default())
+                    .bind(filter.error_code.as_deref().unwrap_or_default())
+                    .bind(&upstream_account_id)
+                    .bind(&route_id)
+                    .bind(&key_alias)
+                    .bind(&principal)
+                    .bind(plan.left_from_created_at)
+                    .bind(plan.left_to_created_at)
+                    .bind(plan.right_from_created_at)
+                    .bind(plan.right_to_created_at),
+            )
+            .await?;
+        let mut projections = BTreeMap::new();
+        for row in rows {
+            accumulate_usage_row(&mut projections, &row)?;
+        }
+        Ok(projections)
     }
 }
 
@@ -377,6 +550,7 @@ impl UsageAnalysisGranularity {
     }
 }
 
+#[derive(Clone, Copy)]
 struct ValidatedUsageAnalysisRange {
     from_created_at: i64,
     to_created_at: i64,
@@ -743,15 +917,47 @@ fn usage_analysis_generation_fact_sql(
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UsageAnalysisMainProjectionSet {
+    Full,
+    Trends,
+}
+
+impl UsageAnalysisMainProjectionSet {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Trends => "trends",
+        }
+    }
+}
+
+#[cfg(test)]
 fn usage_analysis_main_sql(
     backend: DatabaseBackend,
     granularity: UsageAnalysisGranularity,
     tenant_scoped: bool,
 ) -> String {
+    usage_analysis_projected_sql(
+        backend,
+        granularity,
+        tenant_scoped,
+        UsageAnalysisMainProjectionSet::Full,
+    )
+}
+
+fn usage_analysis_projected_sql(
+    backend: DatabaseBackend,
+    granularity: UsageAnalysisGranularity,
+    tenant_scoped: bool,
+    projection: UsageAnalysisMainProjectionSet,
+) -> String {
     let source = usage_analysis_source_sql(granularity, tenant_scoped);
     let grouped = match backend {
-        DatabaseBackend::PostgreSql => format!(
-            r#"SELECT CASE
+        DatabaseBackend::PostgreSql => {
+            let (bucket_kind, bucket_id, bucket_label, grouping_sets, having) = match projection {
+                UsageAnalysisMainProjectionSet::Full => (
+                    r#"CASE
                          WHEN GROUPING(bucket_start) = 0 THEN 'time'
                          WHEN GROUPING(model) = 0 THEN 'model'
                          WHEN GROUPING(key_id) = 0 THEN 'key'
@@ -759,8 +965,8 @@ fn usage_analysis_main_sql(
                          WHEN GROUPING(protocol) = 0 THEN 'protocol'
                          WHEN GROUPING(status_class) = 0 THEN 'status'
                          WHEN GROUPING(error_code) = 0 THEN 'error'
-                         ELSE 'summary' END AS bucket_kind,
-                     CASE
+                         ELSE 'summary' END"#,
+                    r#"CASE
                          WHEN GROUPING(bucket_start) = 0 THEN CAST(bucket_start AS TEXT)
                          WHEN GROUPING(model) = 0 THEN model
                          WHEN GROUPING(key_id) = 0 THEN key_id
@@ -768,8 +974,8 @@ fn usage_analysis_main_sql(
                          WHEN GROUPING(protocol) = 0 THEN protocol
                          WHEN GROUPING(status_class) = 0 THEN status_class
                          WHEN GROUPING(error_code) = 0 THEN error_code
-                         ELSE 'summary' END AS bucket_id,
-                     CASE
+                         ELSE 'summary' END"#,
+                    r#"CASE
                          WHEN GROUPING(bucket_start) = 0 THEN CAST(bucket_start AS TEXT)
                          WHEN GROUPING(model) = 0 THEN model
                          WHEN GROUPING(key_id) = 0 THEN key_label
@@ -777,21 +983,37 @@ fn usage_analysis_main_sql(
                          WHEN GROUPING(protocol) = 0 THEN protocol
                          WHEN GROUPING(status_class) = 0 THEN status_class
                          WHEN GROUPING(error_code) = 0 THEN error_code
-                         ELSE 'summary' END AS bucket_label,
+                         ELSE 'summary' END"#,
+                    r#"(currency), (bucket_start, currency), (model, currency),
+                   (key_id, key_label, currency),
+                   (analysis_upstream_id, upstream_label, currency),
+                   (protocol, currency), (status_class, currency), (error_code, currency)"#,
+                    "HAVING GROUPING(error_code) = 1 OR error_code <> ''",
+                ),
+                UsageAnalysisMainProjectionSet::Trends => (
+                    "CASE WHEN GROUPING(bucket_start) = 0 THEN 'time' ELSE 'summary' END",
+                    "CASE WHEN GROUPING(bucket_start) = 0 THEN CAST(bucket_start AS TEXT) ELSE 'summary' END",
+                    "CASE WHEN GROUPING(bucket_start) = 0 THEN CAST(bucket_start AS TEXT) ELSE 'summary' END",
+                    "(currency), (bucket_start, currency)",
+                    "",
+                ),
+            };
+            format!(
+                r#"SELECT {bucket_kind} AS bucket_kind,
+                     {bucket_id} AS bucket_id,
+                     {bucket_label} AS bucket_label,
                      currency,
                      {sums}
                 FROM filtered_activity
                GROUP BY GROUPING SETS (
-                   (currency), (bucket_start, currency), (model, currency),
-                   (key_id, key_label, currency),
-                   (analysis_upstream_id, upstream_label, currency),
-                   (protocol, currency), (status_class, currency), (error_code, currency)
+                   {grouping_sets}
                )
-              HAVING GROUPING(error_code) = 1 OR error_code <> ''"#,
-            sums = USAGE_ANALYSIS_METRIC_SUMS
-        ),
+               {having}"#,
+                sums = USAGE_ANALYSIS_METRIC_SUMS
+            )
+        }
         DatabaseBackend::Sqlite => {
-            let projections = [
+            let full_projections = [
                 ("summary", "'summary'", "'summary'", "currency", ""),
                 (
                     "time",
@@ -831,8 +1053,22 @@ fn usage_analysis_main_sql(
                     "WHERE error_code <> ''",
                 ),
             ];
+            let trend_projections = [
+                ("summary", "'summary'", "'summary'", "currency", ""),
+                (
+                    "time",
+                    "CAST(bucket_start AS TEXT)",
+                    "CAST(bucket_start AS TEXT)",
+                    "bucket_start, currency",
+                    "",
+                ),
+            ];
+            let projections: &[(&str, &str, &str, &str, &str)] = match projection {
+                UsageAnalysisMainProjectionSet::Full => &full_projections,
+                UsageAnalysisMainProjectionSet::Trends => &trend_projections,
+            };
             projections
-                .into_iter()
+                .iter()
                 .map(|(kind, id, label, groups, condition)| {
                     format!(
                         "SELECT '{kind}' AS bucket_kind, {id} AS bucket_id, {label} AS bucket_label, currency, {sums} FROM filtered_activity {condition} GROUP BY {groups}",
@@ -956,6 +1192,31 @@ impl UsageMetricsAccumulator {
                 .collect(),
         }
     }
+}
+
+fn take_summary_time_series(
+    projections: &mut BTreeMap<(String, String), UsageMetricsAccumulator>,
+) -> Result<(UsageAnalysisMetrics, Vec<UsageAnalysisTimeBucket>), AppError> {
+    let summary = projections
+        .remove(&("summary".to_owned(), "summary".to_owned()))
+        .unwrap_or_default()
+        .finish();
+    let time_keys = projections
+        .keys()
+        .filter(|(kind, _id)| kind == "time")
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut time_series = Vec::with_capacity(time_keys.len());
+    for key in time_keys {
+        let bucket_start = key.1.parse().map_err(|_| AppError::Internal)?;
+        let metrics = projections.remove(&key).ok_or(AppError::Internal)?.finish();
+        time_series.push(UsageAnalysisTimeBucket {
+            bucket_start,
+            metrics,
+        });
+    }
+    time_series.sort_by_key(|bucket| bucket.bucket_start);
+    Ok((summary, time_series))
 }
 
 fn accumulate_usage_row(

@@ -11,7 +11,7 @@ use crate::{
     AppState,
     db::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter},
     error::AppError,
-    model::UsageAnalysisResponse,
+    model::{UsageAnalysisResponse, UsageAnalysisTrendsResponse},
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -55,17 +55,43 @@ impl UsageAnalysisQuery {
     }
 }
 
+async fn authorized_usage_analysis_query(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: UsageAnalysisQuery,
+) -> Result<(Option<String>, UsageAnalysisFilter), AppError> {
+    let service = require_service(headers, state, "requests:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
+    Ok((tenant, query.into_filter()?))
+}
+
 pub(super) async fn internal_usage_analysis(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<UsageAnalysisQuery>,
 ) -> Result<Json<UsageAnalysisResponse>, AppError> {
-    let service = require_service(&headers, &state, "requests:read").await?;
-    let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
-    let filter = query.into_filter()?;
+    let (tenant, filter) = authorized_usage_analysis_query(&state, &headers, query).await?;
     let response = match tenant {
         Some(tenant) => state.db.operator_usage_analysis(&tenant, filter).await?,
         None => state.db.global_usage_analysis(filter).await?,
+    };
+    Ok(Json(response))
+}
+
+pub(super) async fn internal_usage_analysis_trends(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UsageAnalysisQuery>,
+) -> Result<Json<UsageAnalysisTrendsResponse>, AppError> {
+    let (tenant, filter) = authorized_usage_analysis_query(&state, &headers, query).await?;
+    let response = match tenant {
+        Some(tenant) => {
+            state
+                .db
+                .operator_usage_analysis_trends(&tenant, filter)
+                .await?
+        }
+        None => state.db.global_usage_analysis_trends(filter).await?,
     };
     Ok(Json(response))
 }

@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { Shell } from '../../src/components';
 import { I18nProvider } from '../../src/i18n';
 import { OverviewPage } from '../../src/operator/pages/OperatorPages';
-import type { OperatorMonitoringSnapshot, OperatorUsageAnalysis, RequestView, TypedFilterAst, UsageAnalysisMetrics } from '../../src/types';
+import type { OperatorMonitoringSnapshot, OperatorUsageAnalysisTrends, RequestView, TypedFilterAst, UsageAnalysisMetrics } from '../../src/types';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/styles/metrics.css';
@@ -18,6 +18,7 @@ declare global {
     overviewFixture: {
       calls: string[];
       delayedTenantResponsePending: boolean;
+      delayedTenantResponseReleased: boolean;
       drilldowns: TypedFilterAst[];
       releaseDelayedTenantResponse: () => void;
     };
@@ -40,17 +41,16 @@ function metrics(requests: number, success: number, failed: number): UsageAnalys
   };
 }
 
-function usageAnalysis(tenant: FixtureTenant): OperatorUsageAnalysis {
+function usageTrends(tenant: FixtureTenant): OperatorUsageAnalysisTrends {
   const start = now - 2 * 3_600_000;
   const points = tenant === alpha
     ? [metrics(8, 7, 1), metrics(11, 10, 1), metrics(13, 11, 2)]
     : [metrics(3, 3, 0), metrics(5, 4, 1), metrics(9, 8, 1)];
   return {
     from_created_at: now - 86_400_000, to_created_at: now, granularity: 'hour', time_zone: 'UTC',
-    p95_is_approximate: true, p95_method: 'fixture_histogram', upstream_grouping: 'stable_account',
+    p95_is_approximate: true, p95_method: 'fixed_histogram_upper_bound_capped_60000ms',
     summary: metrics(points.reduce((total, point) => total + point.requests, 0), points.reduce((total, point) => total + point.success, 0), points.reduce((total, point) => total + point.failed, 0)),
     time_series: points.map((point, index) => ({ ...point, bucket_start: start + index * 3_600_000 })),
-    by_model: [], by_key: [], by_session: [], by_upstream: [], by_protocol: [], by_status: [], errors: [], heatmap: [],
   };
 }
 
@@ -80,11 +80,13 @@ let releaseDelayedTenantResponse: (() => void) | undefined;
 window.overviewFixture = {
   calls: [],
   delayedTenantResponsePending: false,
+  delayedTenantResponseReleased: false,
   drilldowns: [],
   releaseDelayedTenantResponse: () => {
     releaseDelayedTenantResponse?.();
     releaseDelayedTenantResponse = undefined;
     window.overviewFixture.delayedTenantResponsePending = false;
+    window.overviewFixture.delayedTenantResponseReleased = true;
   },
 };
 
@@ -105,7 +107,11 @@ globalThis.fetch = async (input: RequestInfo | URL) => {
     if (tenant === alpha) return json({ error: { message: 'Monitoring fixture unavailable' } }, 503);
     return json(monitoring(beta));
   }
-  if (url.pathname === '/internal/v1/usage-analysis') return json(usageAnalysis(tenant));
+  if (url.pathname === '/internal/v1/usage-analysis/trends') return json(usageTrends(tenant));
+  if (url.pathname === '/internal/v1/usage-analysis') {
+    if (tenant === alpha) return new Promise<Response>(() => undefined);
+    return json({ error: { message: 'Complete usage analysis fixture unavailable' } }, 500);
+  }
   return json({ error: { message: 'unexpected fixture endpoint' } }, 404);
 };
 

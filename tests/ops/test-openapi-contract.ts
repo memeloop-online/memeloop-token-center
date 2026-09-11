@@ -86,6 +86,23 @@ test("usage analysis contract is currency safe and canonical", () => {
   const metrics = document.components.schemas.UsageAnalysisMetrics; for (const field of ["requests", "success", "failed", "cached_input_tokens", "cache_write_tokens", "generation_units", "costs"]) assert.ok(metrics.required.includes(field)); assert.equal(metrics.properties.costs.type, "array"); assert.equal(metrics.properties.costs.items.$ref, "#/components/schemas/UsageAnalysisCost"); const hour = document.components.schemas.UsageAnalysisHeatmapBucket.allOf[0].properties.hour_of_week; assert.deepEqual([hour.minimum, hour.maximum], [0, 167]);
 });
 
+test("overview usage trends is an exact minimal projection of the full query contract", () => {
+  const document = cloneDocument();
+  const full = document.paths["/internal/v1/usage-analysis"].get;
+  const trends = document.paths["/internal/v1/usage-analysis/trends"].get;
+  assert.deepEqual(trends.security, full.security);
+  assert.equal(trends["x-required-scope"], full["x-required-scope"]);
+  assert.deepEqual(trends.parameters, full.parameters);
+  assert.equal(trends.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UsageAnalysisTrends");
+  const schema = document.components.schemas.UsageAnalysisTrends;
+  const expected = ["from_created_at", "to_created_at", "granularity", "time_zone", "p95_is_approximate", "p95_method", "summary", "time_series"];
+  assert.deepEqual(schema.required, expected);
+  assert.deepEqual(Object.keys(schema.properties), expected);
+  assert.equal(schema.additionalProperties, false);
+  assert.equal(schema.properties.summary.$ref, "#/components/schemas/UsageAnalysisMetrics");
+  assert.equal(schema.properties.time_series.items.$ref, "#/components/schemas/UsageAnalysisTimeBucket");
+});
+
 test("operator monitoring snapshot has explicit scope/window and bounded terminal drilldowns", () => {
   const document = cloneDocument(); const operation = document.paths["/internal/v1/monitoring-snapshot"].get;
   assert.equal(operation["x-required-scope"], "requests:read"); assert.deepEqual(operation.security, [{ serviceBearer: [] }]);

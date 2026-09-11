@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 
 import { I18nProvider } from '../../src/i18n';
 import { Operator } from '../../src/operator/Operator';
-import type { OperatorMonitoringSnapshot, OperatorUsageAnalysis, RequestView, UsageAnalysisMetrics } from '../../src/types';
+import type { OperatorMonitoringSnapshot, OperatorUsageAnalysis, OperatorUsageAnalysisTrends, RequestView, UsageAnalysisMetrics } from '../../src/types';
 import type { OperatorRouteKey } from '../../src/operator/scope/operatorRoutes';
 import '../../src/styles.css';
 import '../../src/theme.css';
@@ -47,6 +47,17 @@ const usageAnalysis: OperatorUsageAnalysis = {
   by_model: [], by_key: [], by_session: [], by_upstream: [], by_protocol: [], by_status: [], errors: [], heatmap: [],
 };
 
+const usageTrends: OperatorUsageAnalysisTrends = {
+  from_created_at: usageAnalysis.from_created_at,
+  to_created_at: usageAnalysis.to_created_at,
+  granularity: usageAnalysis.granularity,
+  time_zone: usageAnalysis.time_zone,
+  p95_is_approximate: true,
+  p95_method: 'fixed_histogram_upper_bound_capped_60000ms',
+  summary: usageAnalysis.summary,
+  time_series: usageAnalysis.time_series,
+};
+
 const monitoring: OperatorMonitoringSnapshot = {
   contract_version: 'v1', generated_at: now, scope: 'tenant', tenant_external_id: tenant,
   from_created_at: bucketStart, to_created_at: now, granularity: 'hour',
@@ -71,6 +82,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   window.overviewDrilldownFixture.calls.push(`${method} ${url.pathname}${url.search}`);
   if (url.pathname === '/internal/v1/tenants') return json([{ external_id: tenant }]);
   if (url.pathname === '/internal/v1/plugins') return json([]);
+  if (url.pathname === '/internal/v1/usage-analysis/trends') return json(usageTrends);
   if (url.pathname === '/internal/v1/usage-analysis') return json(usageAnalysis);
   if (url.pathname === '/internal/v1/monitoring-snapshot') return json(monitoring);
   if (url.pathname === '/internal/v1/requests' && method === 'GET') return json([]);

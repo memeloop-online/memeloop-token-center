@@ -1,3 +1,8 @@
+use std::{
+    io::{self, Write},
+    sync::{Arc, Mutex},
+};
+
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
@@ -16,9 +21,69 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::AnyPool;
 use tower::ServiceExt;
+use tracing::instrument::WithSubscriber;
 use uuid::Uuid;
 
 const PEPPER: &[u8] = b"usage analysis integration pepper is sufficiently long";
+
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("usage analysis log capture lock")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogCapture {
+    type Writer = LogWriter;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        LogWriter(self.0.clone())
+    }
+}
+
+impl LogCapture {
+    fn dispatch(&self) -> tracing::Dispatch {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(self.clone())
+            .json()
+            .flatten_event(true)
+            .finish();
+        tracing::Dispatch::new(subscriber)
+    }
+
+    fn rendered(&self) -> String {
+        String::from_utf8(
+            self.0
+                .lock()
+                .expect("usage analysis log capture lock")
+                .clone(),
+        )
+        .expect("usage analysis log output is UTF-8")
+    }
+
+    fn analysis_events(&self) -> Vec<Value> {
+        self.rendered()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["target"] == "mtc_usage_analysis")
+            .collect()
+    }
+}
 
 async fn get_json(state: &AppState, path: &str, token: &str) -> (StatusCode, Value) {
     let response = api::router(state.clone())
@@ -42,6 +107,23 @@ async fn get_json(state: &AppState, path: &str, token: &str) -> (StatusCode, Val
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()))
     };
     (status, value)
+}
+
+fn assert_trends_match_full(full: &Value, trends: &Value) {
+    let object = trends.as_object().expect("trends response object");
+    assert_eq!(object.len(), 8, "minimal trends payload: {trends}");
+    for field in [
+        "from_created_at",
+        "to_created_at",
+        "granularity",
+        "time_zone",
+        "p95_is_approximate",
+        "p95_method",
+        "summary",
+        "time_series",
+    ] {
+        assert_eq!(trends[field], full[field], "field {field}: {trends}");
+    }
 }
 
 async fn issue(
@@ -1136,6 +1218,14 @@ async fn sqlite_usage_analysis_keeps_currency_cache_scope_and_prefix_filters_exa
     );
     let (status, body) = get_json(&state, &path, &scoped.token).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let trends_path = path.replacen(
+        "/internal/v1/usage-analysis",
+        "/internal/v1/usage-analysis/trends",
+        1,
+    );
+    let (trends_status, trends) = get_json(&state, &trends_path, &scoped.token).await;
+    assert_eq!(trends_status, StatusCode::OK, "{trends}");
+    assert_trends_match_full(&body, &trends);
     assert_eq!(body["granularity"], "hour");
     assert_eq!(body["time_zone"], "UTC");
     assert_eq!(body["p95_is_approximate"], true);
@@ -1476,16 +1566,38 @@ async fn postgres_usage_analysis_grouping_sets_match_currency_safe_contract() {
         .await
         .unwrap();
     let now = memeloop_token_center::db::unix_millis();
-    let (status, body) = get_json(
-        &state,
-        &format!(
-            "/internal/v1/usage-analysis?from_created_at={}&to_created_at={now}&granularity=hour&protocol=openai&model=pg-analysis-model",
-            now.saturating_sub(86_400_000)
-        ),
-        &service.token,
-    )
-    .await;
+    let path = format!(
+        "/internal/v1/usage-analysis?from_created_at={}&to_created_at={now}&granularity=hour&protocol=openai&model=pg-analysis-model",
+        now.saturating_sub(86_400_000)
+    );
+    let full_capture = LogCapture::default();
+    let (status, body) = get_json(&state, &path, &service.token)
+        .with_subscriber(full_capture.dispatch())
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let full_analysis_events = full_capture.analysis_events();
+    assert_eq!(full_analysis_events.len(), 1);
+    assert_eq!(full_analysis_events[0]["projection"], "full");
+    assert_eq!(full_analysis_events[0]["business_statement_count"], 4);
+    let capture = LogCapture::default();
+    let trends_path = path.replacen(
+        "/internal/v1/usage-analysis",
+        "/internal/v1/usage-analysis/trends",
+        1,
+    );
+    let (trends_status, trends) = get_json(&state, &trends_path, &service.token)
+        .with_subscriber(capture.dispatch())
+        .await;
+    assert_eq!(trends_status, StatusCode::OK, "{trends}");
+    assert_trends_match_full(&body, &trends);
+    let analysis_events = capture.analysis_events();
+    assert_eq!(
+        analysis_events.len(),
+        1,
+        "the PostgreSQL trends route executes one business aggregation statement"
+    );
+    assert_eq!(analysis_events[0]["projection"], "trends");
+    assert_eq!(analysis_events[0]["business_statement_count"], 1);
     assert_eq!(body["summary"]["requests"], 2);
     assert_eq!(body["summary"]["input_tokens"], 40);
     assert_eq!(body["summary"]["cached_input_tokens"], 14);
