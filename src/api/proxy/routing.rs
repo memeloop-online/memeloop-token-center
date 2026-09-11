@@ -21,10 +21,8 @@ pub(super) use clock::with_test_credential_application_now_once;
 pub(super) use codex::quota::classify_rate_limit;
 #[cfg(test)]
 pub(super) use codex::with_test_pre_delivery_connect_failures;
-pub(super) use codex::{
-    CodexRetryTerminal, CodexRetryTerminalGuard, runtime_transport_policy,
-};
-pub(super) use outcome::classify_attempt_failure;
+pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard, runtime_transport_policy};
+pub(super) use outcome::{classify_attempt_failure, status_failover_reason};
 pub(super) use probe::{
     SharedProbePermit, UpstreamAttemptGuard, UpstreamAttemptTerminal, join_shared_probe,
 };
