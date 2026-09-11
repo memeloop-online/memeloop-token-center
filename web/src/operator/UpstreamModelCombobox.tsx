@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import { ModelPicker, type ModelPickerOption } from '../ModelPicker';
 import type { UpstreamAccount } from '../types';
+import { confirmationForScope, modelConfirmationValidity } from './modelConfirmation';
 
 interface CatalogModel {
   id: string;
@@ -49,31 +50,41 @@ interface Props {
 
 export function UpstreamModelCombobox({ token, tenant, accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol, value, onChange, customModelConfirmed, onValidityChange, upstreams = [] }: Props) {
   const { locale, t } = useI18n();
-  const [catalog, setCatalog] = useState<AggregateCatalog>();
+  const sourceKey = JSON.stringify([accountIds, includedProviderGroupIds, excludedProviderGroupIds, syncAccountIds, protocol]);
+  const confirmationScope = JSON.stringify([token, tenant, sourceKey, value]);
+  const [catalogResult, setCatalogResult] = useState<{ scope: string; data: AggregateCatalog }>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [syncMessage, setSyncMessage] = useState('');
   const [open, setOpen] = useState(false);
   const [accountCatalogs, setAccountCatalogs] = useState<Map<string, AccountCatalog>>(new Map());
-  const [customConfirmed, setCustomConfirmed] = useState(customModelConfirmed);
+  // Persisted consent applies only to the scope first opened for editing.
+  // Never restore that prop after an account, group, membership or model change.
+  const [customConfirmation, setCustomConfirmation] = useState({ scope: confirmationScope, confirmed: customModelConfirmed });
+  const scopedConfirmation = confirmationForScope(customConfirmation, confirmationScope);
+  const customConfirmed = scopedConfirmation.confirmed;
+  const setCustomConfirmed = (confirmed: boolean) => setCustomConfirmation({ scope: confirmationScope, confirmed });
+  useLayoutEffect(() => {
+    if (customConfirmation.scope !== confirmationScope) setCustomConfirmation(scopedConfirmation);
+  }, [confirmationScope, customConfirmation.scope]);
   const [partialConfirmed, setPartialConfirmed] = useState(false);
   const [refreshVersion, setRefreshVersion] = useState(0);
+  const catalogScope = JSON.stringify([confirmationScope, refreshVersion]);
+  const catalog = catalogResult?.scope === catalogScope ? catalogResult.data : undefined;
   const validityCallback = useRef(onValidityChange);
-  useEffect(() => { validityCallback.current = onValidityChange; }, [onValidityChange]);
-  const sourceKey = `${accountIds.join(',')}|${includedProviderGroupIds.join(',')}|${excludedProviderGroupIds.join(',')}|${protocol}`;
+  useLayoutEffect(() => { validityCallback.current = onValidityChange; }, [onValidityChange]);
   const hasCandidates = accountIds.length > 0 || includedProviderGroupIds.length > 0;
   const customAllowed = accountIds.length > 0 && includedProviderGroupIds.length === 0 && excludedProviderGroupIds.length === 0;
+  const hasExplicitCodexOAuth = upstreams.some((account) => accountIds.includes(account.id)
+    && account.driver === 'openai-codex' && account.connection_method === 'oauth');
 
   useEffect(() => {
-    setCustomConfirmed(customModelConfirmed);
     setPartialConfirmed(false);
-    // A catalog is scoped to the exact candidate set, protocol and query.
-    // Keeping the previous result visible during the debounce can make a model
-    // look selected for the newly chosen upstream and suppress the explicit
-    // custom-model confirmation until the next request settles. Clear it
-    // synchronously so neither validity nor UI can borrow stale coverage.
-    setCatalog(undefined);
-    if (!token || !tenant || !hasCandidates) { setCatalog(undefined); setError(''); setLoading(false); return; }
+    // The scope check above hides the previous result immediately, before
+    // this effect or the debounced read runs. A new candidate set must never
+    // borrow the previous catalog's coverage or suppress its own confirmation.
+    setCatalogResult(undefined);
+    if (!token || !tenant || !hasCandidates) { setError(''); setLoading(false); return; }
     const controller = new AbortController();
     const timeout = window.setTimeout(async () => {
       const query = new URLSearchParams({ tenant_external_id: tenant, limit: '100' });
@@ -82,8 +93,11 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
       if (excludedProviderGroupIds.length) query.set('exclude_provider_group_ids', excludedProviderGroupIds.join(','));
       if (value.trim()) query.set('q', value.trim());
       setLoading(true); setError('');
-      try { setCatalog(await api<AggregateCatalog>(`/internal/v1/upstream-models?${query}`, token, { signal: controller.signal })); }
-      catch (reason) { if (!controller.signal.aborted) { setCatalog(undefined); setError(reason instanceof Error ? reason.message : t('routes.catalogFailed')); } }
+      try {
+        const data = await api<AggregateCatalog>(`/internal/v1/upstream-models?${query}`, token, { signal: controller.signal });
+        if (!controller.signal.aborted) setCatalogResult({ scope: catalogScope, data });
+      }
+      catch (reason) { if (!controller.signal.aborted) { setCatalogResult(undefined); setError(reason instanceof Error ? reason.message : t('routes.catalogFailed')); } }
       finally { if (!controller.signal.aborted) setLoading(false); }
     }, 250);
     return () => { window.clearTimeout(timeout); controller.abort(); };
@@ -119,15 +133,14 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     && (!value.trim() || model.id.toLowerCase().includes(value.trim().toLowerCase()))), [catalog, protocol, value]);
   const selected = catalog?.data.find((model) => model.id === value && (model.protocol === protocol || model.protocol === 'any'));
   const catalogFresh = Boolean(catalog && catalog.unknown_account_count === 0 && catalog.stale_account_count === 0);
-  const selectedValid = Boolean(selected && catalogFresh && (selected.complete_coverage || partialConfirmed));
   // A model returned by a stale or incomplete catalog is not verified. For
   // an exact account selection, keep the explicit custom-model escape hatch
   // available instead of leaving the form in a state with neither a usable
   // confirmation nor a valid submit button while synchronization settles.
-  const needsCustomConfirmation = Boolean(value.trim() && (!selected || !catalogFresh));
-  const allowCustom = Boolean(needsCustomConfirmation && customAllowed && customConfirmed);
-  const valid = Boolean(selectedValid || allowCustom);
-  useEffect(() => validityCallback.current(valid, allowCustom), [valid, allowCustom]);
+  const { needsCustomConfirmation, allowCustom, valid } = modelConfirmationValidity({
+    hasValue: Boolean(value.trim()), selected, catalogFresh, partialConfirmed, customAllowed, customConfirmed,
+  });
+  useLayoutEffect(() => validityCallback.current(valid, allowCustom), [valid, allowCustom]);
 
   const choose = (model: CatalogModel) => {
     onChange(model.id); setCustomConfirmed(false); setPartialConfirmed(false);
@@ -172,8 +185,9 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
       else { onChange(next); setCustomConfirmed(false); setPartialConfirmed(false); }
     }} />
     <div className="catalog-status"><small className="field-hint">{loading ? t('routes.catalogLoading') : error || syncMessage || (catalog ? t('routes.catalogCoverage', { eligible: formatNumber(catalog.eligible_account_count, locale), unknown: formatNumber(catalog.unknown_account_count, locale), stale: formatNumber(catalog.stale_account_count, locale) }) : t('routes.selectCandidatesFirst'))}</small>{syncAccountIds.length > 0 && <button type="button" className="secondary" disabled={loading} onClick={() => void sync()}>{t('routes.syncModels')}</button>}</div>
-    {selected && !selected.complete_coverage && <div className="custom-model-confirm"><label><input type="checkbox" checked={partialConfirmed} onChange={(event) => setPartialConfirmed(event.target.checked)} />{t('routes.confirmPartialCoverage', { supported: formatNumber(selected.supported_account_count, locale), eligible: formatNumber(selected.eligible_account_count, locale) })}</label></div>}
-    {selected && catalog && (catalog.unknown_account_count > 0 || catalog.stale_account_count > 0) && <div className="notice warning compact">{t('routes.catalogNotReady')}</div>}
+    {selected && catalogFresh && !selected.complete_coverage && <div className="custom-model-confirm"><label><input type="checkbox" checked={partialConfirmed} onChange={(event) => setPartialConfirmed(event.target.checked)} />{t('routes.confirmPartialCoverage', { supported: formatNumber(selected.supported_account_count, locale), eligible: formatNumber(selected.eligible_account_count, locale) })}</label></div>}
+    {needsCustomConfirmation && customAllowed && <div className="notice warning compact">{t('routes.catalogUnverified')}{hasExplicitCodexOAuth && <> {t('routes.codexCapabilityHint')}</>}</div>}
+    {selected && !catalogFresh && !customAllowed && <div className="notice warning compact">{t('routes.catalogNotReady')}</div>}
     {needsCustomConfirmation && <div className={`custom-model-confirm${customAllowed ? '' : ' disabled'}`}>
       {customAllowed ? <label><input type="checkbox" checked={customConfirmed} onChange={(event) => setCustomConfirmed(event.target.checked)} />{t('routes.confirmCustomModel', { model: value.trim() })}</label> : <span>{t('routes.customUnavailableForGroups')}</span>}
     </div>}
