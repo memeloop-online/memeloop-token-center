@@ -13,10 +13,11 @@ if (eventName === 'pull_request' && paths.length === 0) {
   throw new Error(`${SCOPE}: a pull request must resolve at least one changed path`);
 }
 
-// Fail closed: only presentation/documentation/deployment-only paths are known
-// not to affect the locally built service binary exercised by the memory gate.
-// Every unknown or newly introduced path runs the acceptance harness.
-const memorySafe = /^(?:docs\/|web\/|charts\/|openapi\/|README\.md$|LICENSE$|\.gitignore$|compose\.yaml$)/;
+// Fail closed: only presentation/documentation/deployment-only paths and
+// non-load test sources are known not to affect the optimized service binary
+// exercised by the memory gate. Memory/load harness inputs remain outside this
+// allowlist, so every unknown or newly introduced path runs acceptance.
+const memorySafe = /^(?:docs\/|web\/|charts\/|openapi\/|tests\/(?!load(?:\/|$))|README\.md$|LICENSE$|\.gitignore$|compose\.yaml$)/;
 const memory = eventName === 'push' || paths.some((path) => !memorySafe.test(path));
 const pluginInstaller = eventName === 'push' || paths.some((path) => /^(?:\.cargo\/|\.dockerignore$|\.github\/workflows\/ci\.yml$|Cargo\.(?:toml|lock)$|Dockerfile\.plugin-installer$|packaging\/cosign\/|src\/|migrations\/|schemas\/|wit\/|vendor\/|tests\/ops\/plugin-installer-image-contract\.test\.ts$)/.test(path));
 
