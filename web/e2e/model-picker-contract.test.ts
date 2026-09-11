@@ -6,12 +6,18 @@ import type { GroupView, ModelRouteView, UpstreamAccount } from '../src/types.js
 
 test('model hierarchy uses actual account membership, excludes removed accounts, and preserves route/public IDs', () => {
   const route = { id: 'route-1', public_model: 'not-a-provider/model', upstream_model: 'native-model', protocol: 'openai', included_provider_group_ids: ['group-1'], excluded_provider_group_ids: ['group-2'] } as ModelRouteView;
-  const accounts = [{ id: 'a', name: 'Account A', driver: 'actual-provider' }, { id: 'b', name: 'Account B', driver: 'other-provider' }] as UpstreamAccount[];
-  const groups = [{ id: 'group-1', member_ids: ['a', 'b'] }, { id: 'group-2', member_ids: ['b'] }] as GroupView[];
+  const accounts = [{ id: 'a', name: 'Account A', driver: 'actual-provider', status: 'active', credential_expires_at: null }, { id: 'b', name: 'Account B', driver: 'other-provider', status: 'disabled', credential_expires_at: null }] as UpstreamAccount[];
+  const groups = [{ id: 'group-1', name: 'Preferred', member_ids: ['a', 'b'] }, { id: 'group-2', name: 'Excluded', member_ids: ['b'] }] as GroupView[];
   const options = routeModelOptions([route], accounts, groups, 'unknown');
-  assert.deepEqual(options, [{ key: 'route-1:a', value: 'not-a-provider/model', label: 'not-a-provider/model', provider: 'actual-provider', upstream: 'Account A', description: 'native-model · openai' }]);
+  assert.deepEqual(options, [{
+    key: 'route-1:a', value: 'not-a-provider/model', label: 'not-a-provider/model', providerGroup: 'Preferred', provider: 'actual-provider', upstream: 'Account A', description: 'native-model',
+    availability: 'available', health: 'unknown', capabilities: ['openai'], disabled: false,
+  }]);
   assert.equal(routeModelOptions([route], accounts, groups, 'unknown', 'route')[0].value, 'route-1');
-  assert.equal(routeModelOptions([route], [], [], 'unknown')[0].provider, 'unknown');
+  const unknown = routeModelOptions([route], [], [], 'unknown')[0];
+  assert.equal(unknown.provider, 'unknown');
+  assert.equal(unknown.availability, 'unknown');
+  assert.equal(unknown.disabled, true);
 });
 
 test('all maintained model selectors share the same picker without replacing catalog coverage validation', async () => {
@@ -27,4 +33,16 @@ test('all maintained model selectors share the same picker without replacing cat
   assert.match(picker, /aria-activedescendant/);
   assert.match(picker, /event\.key === 'Escape'/);
   assert.doesNotMatch(picker, /setTimeout|aria-modal="true"/);
+});
+
+test('filter-assistant choice exposes configuration availability without probing an upstream', async () => {
+  const settings = await readFile(new URL('../src/operator/pages/SystemSettingsPage.tsx', import.meta.url), 'utf8');
+  const catalog = await readFile(new URL('../src/operator/modelCatalog.ts', import.meta.url), 'utf8');
+  assert.match(settings, /selectedRouteHasAvailableCandidate/);
+  assert.match(settings, /filterAssistantRouteUnavailable/);
+  assert.match(settings, /describedBy="filter-assistant-route-hint"/);
+  assert.match(catalog, /credentialExpiresAt|credential_expires_at/);
+  assert.match(catalog, /health: 'unknown'/);
+  assert.match(catalog, /disabled: !available/);
+  assert.doesNotMatch(settings, /\/health|\/models\/sync|filter-assistant\/plan/);
 });

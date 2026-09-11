@@ -60,9 +60,11 @@ test('filters are non-modal themed popovers and model selection is searchable by
     const search = catalog.getByRole('combobox');
     await search.fill('provider-b');
     await catalog.getByRole('option').first().waitFor();
+    assert.equal(await catalog.getByRole('group', { name: 'Production pool', exact: true }).count(), 1);
     assert.equal(await catalog.getByRole('group', { name: 'provider-b', exact: true }).count(), 1);
     assert.equal(await catalog.getByRole('group', { name: 'Production account', exact: true }).count(), 1);
     assert.equal(await catalog.getByRole('option').count(), 1);
+    assert.match(await catalog.getByRole('option').first().textContent() ?? '', /Health check not run/);
     await search.press('ArrowDown');
     await search.press('Enter');
     assert.equal(await filter.isVisible(), true, 'closing the nested model picker must not close the filter editor');
@@ -74,6 +76,11 @@ test('filters are non-modal themed popovers and model selection is searchable by
     await settingsCatalog.getByRole('combobox').fill('Research account');
     await settingsCatalog.getByRole('option').first().click();
     assert.match(await page.locator('.system-settings .model-picker-trigger').textContent() ?? '', /research-model/);
+    await page.locator('.system-settings .model-picker-trigger').click();
+    await settingsCatalog.getByRole('combobox').fill('Retired account');
+    const unavailable = settingsCatalog.getByRole('option', { name: /retired-model/i });
+    assert.equal(await unavailable.getAttribute('aria-disabled'), 'true');
+    assert.equal(await unavailable.isDisabled(), true);
     assert.deepEqual(pageErrors, [], 'model picker interactions must not produce page errors');
   } finally {
     await browser.close();
