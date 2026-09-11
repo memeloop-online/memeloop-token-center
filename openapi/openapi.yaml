@@ -214,7 +214,9 @@ paths:
         Creates or reuses the tenant and principal, creates a credit account and stable
         `key_id`, then returns the one-time `mtc_…` secret. When `Idempotency-Key` is
         supplied, an identical request may replay the same response for 24 hours; use
-        of the same key with a different normalized request is rejected.
+        of the same key with a different normalized request is rejected. The
+        `memeloop-cloud-principal:` namespace is reserved for the Cloud integration
+        and cannot be claimed through this generic endpoint.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters:
@@ -2581,6 +2583,8 @@ paths:
       responses:
         '200':
           description: Stable credential ensured or replayed.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ProvisionedCloudCredential' }

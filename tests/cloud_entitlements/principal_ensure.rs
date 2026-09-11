@@ -45,14 +45,16 @@ async fn service_ensure_replays_without_entitlement_or_credit() {
     let service = scoped_writer(&fixture, tenant, "cloud-ensure-writer").await;
     let url = ensure_url(&fixture);
     let request = ensure_request(tenant, principal);
-    let first: Value = fixture
+    let first_response = fixture
         .client
         .post(&url)
         .bearer_auth(&service.token)
         .json(&request)
         .send()
         .await
-        .unwrap()
+        .unwrap();
+    assert_eq!(first_response.headers()["cache-control"], "no-store");
+    let first: Value = first_response
         .error_for_status()
         .unwrap()
         .json()
@@ -115,6 +117,190 @@ async fn service_ensure_replays_without_entitlement_or_credit() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn generic_key_creation_cannot_claim_the_cloud_provisioning_namespace() {
+    let fixture = Fixture::new().await;
+    let tenant = "cloud-reserved-provisioning-namespace";
+    let principal = "cloud-reserved-provisioning-principal";
+    let service = scoped_writer(&fixture, tenant, "cloud-reserved-provisioning-writer").await;
+    let provisioning_key = format!(
+        "memeloop-cloud-principal:{}",
+        framed_digest(&[tenant.as_bytes(), principal.as_bytes()])
+    );
+    let response = fixture
+        .client
+        .post(format!("{}/internal/v1/keys", fixture.base_url))
+        .bearer_auth(&service.token)
+        .header("idempotency-key", provisioning_key)
+        .json(&json!({
+            "tenant_external_id": tenant,
+            "principal_external_id": principal,
+            "alias": "MemeLoop Cloud",
+            "currency": "USD"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        fixture
+            .state
+            .db
+            .list_managed_keys(Some(tenant), Some(principal))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn legacy_generic_namespace_squat_cannot_capture_cloud_credit_or_secret() {
+    let fixture = Fixture::new().await;
+    let tenant = "cloud-legacy-provisioning-squat";
+    let principal = "cloud-legacy-provisioning-principal";
+    let service = scoped_writer(&fixture, tenant, "cloud-legacy-provisioning-writer").await;
+    let squatter: Value = fixture
+        .client
+        .post(format!("{}/internal/v1/keys", fixture.base_url))
+        .bearer_auth(&service.token)
+        .header("idempotency-key", "legacy-generic-provisioning")
+        .json(&json!({
+            "tenant_external_id": tenant,
+            "principal_external_id": principal,
+            "alias": "MemeLoop Cloud",
+            "currency": "USD"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let squatter_key = squatter["key"].as_str().unwrap().to_owned();
+    let squatter_key_id = squatter["key_id"].as_str().unwrap();
+    let provisioning_key = format!(
+        "memeloop-cloud-principal:{}",
+        framed_digest(&[tenant.as_bytes(), principal.as_bytes()])
+    );
+    let inspection = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE key_records SET provisioning_idempotency_key = $1 WHERE id = $2")
+        .bind(provisioning_key)
+        .bind(squatter_key_id)
+        .execute(&inspection)
+        .await
+        .unwrap();
+
+    let ensure = fixture
+        .client
+        .post(ensure_url(&fixture))
+        .bearer_auth(&service.token)
+        .json(&ensure_request(tenant, principal))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ensure.status(), StatusCode::CONFLICT);
+    assert!(!ensure.text().await.unwrap().contains(&squatter_key));
+
+    let subscription = fixture
+        .send(
+            "cloud-legacy-provisioning-squat-event",
+            &active(
+                tenant,
+                principal,
+                "cloud-legacy-provisioning-squat-subscription",
+                "cycle",
+                "10",
+                1,
+                10,
+            ),
+        )
+        .await;
+    assert_eq!(subscription.status(), StatusCode::CONFLICT);
+    assert!(!subscription.text().await.unwrap().contains(&squatter_key));
+    let managed = fixture
+        .state
+        .db
+        .list_managed_keys(Some(tenant), Some(principal))
+        .await
+        .unwrap();
+    assert_eq!(managed.len(), 1);
+    assert_eq!(managed[0].available_balance, "0");
+    assert!(
+        fixture
+            .state
+            .db
+            .list_entitlements(Some(tenant), Some("memeloop-cloud"), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    inspection.close().await;
+}
+
+#[tokio::test]
+async fn cloud_ciphertext_replay_is_bound_to_its_stable_key_row() {
+    let fixture = Fixture::new().await;
+    let tenant = "cloud-ciphertext-binding";
+    let service = scoped_writer(&fixture, tenant, "cloud-ciphertext-binding-writer").await;
+    let first: Value = fixture
+        .client
+        .post(ensure_url(&fixture))
+        .bearer_auth(&service.token)
+        .json(&ensure_request(tenant, "ciphertext-owner-one"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second: Value = fixture
+        .client
+        .post(ensure_url(&fixture))
+        .bearer_auth(&service.token)
+        .json(&ensure_request(tenant, "ciphertext-owner-two"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_secret = first["key"].as_str().unwrap().to_owned();
+    let second_secret = second["key"].as_str().unwrap().to_owned();
+    let inspection = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let first_ciphertext: String =
+        sqlx::query_scalar("SELECT issued_key_ciphertext FROM key_records WHERE id = $1")
+            .bind(first["key_id"].as_str().unwrap())
+            .fetch_one(&inspection)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE key_records SET issued_key_ciphertext = $1 WHERE id = $2")
+        .bind(first_ciphertext)
+        .bind(second["key_id"].as_str().unwrap())
+        .execute(&inspection)
+        .await
+        .unwrap();
+
+    let response = fixture
+        .client
+        .post(ensure_url(&fixture))
+        .bearer_auth(&service.token)
+        .json(&ensure_request(tenant, "ciphertext-owner-two"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.text().await.unwrap();
+    assert!(!body.contains(&first_secret));
+    assert!(!body.contains(&second_secret));
+    inspection.close().await;
 }
 
 #[tokio::test]

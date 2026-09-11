@@ -10,6 +10,11 @@ key ID 和 credit account ID，但不会创建权益、修改策略或路由，�
 tenant-scoped token 访问其他租户返回 403。两个 external ID 必须是无首尾空白的有效标识，避免
 Cloud 和 Token Center 对稳定身份作出不同规范化。
 
+`memeloop-cloud-principal:` provisioning namespace 只允许上述 Cloud 合约创建。通用 key 创建
+接口不能占用该 namespace；读取既存身份时还会核对 Cloud 专用 request hash，避免历史占位记录
+接管后续订阅额度和路由。加密重放内容必须与稳定 key、account、generation 和 fingerprint 一致，
+否则服务拒绝返回任何凭据明文。
+
 租户限定服务令牌要求其租户已存在且处于 active 状态；创建令牌本身不会创建租户。
 不存在或已停用的租户仍被认证层拒绝（401），ensure 不能绕过该租户生命周期边界。
 
