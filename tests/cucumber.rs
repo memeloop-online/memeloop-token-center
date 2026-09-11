@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     fmt,
     panic::AssertUnwindSafe,
     str::FromStr,
@@ -159,23 +160,59 @@ fn spawn_test_worker(state: AppState) -> (watch::Sender<bool>, JoinHandle<()>) {
 }
 
 async fn stop_test_worker(world: &mut TokenCenterWorld) {
-    if let Some(shutdown) = world.worker_shutdown.take() {
-        let _ = shutdown.send(true);
+    let shutdown_error = world
+        .worker_shutdown
+        .take()
+        .and_then(|shutdown| shutdown.send(true).err());
+    let worker_error = match world.worker_task.take() {
+        Some(task) => task.await.err(),
+        None => None,
+    };
+
+    if let Some(error) = shutdown_error {
+        panic!("generation worker shutdown receiver dropped before shutdown: {error}");
     }
-    if let Some(task) = world.worker_task.take() {
-        task.await.expect("generation worker shuts down cleanly");
+    if let Some(error) = worker_error {
+        panic!("generation worker did not shut down cleanly: {error}");
     }
 }
 
-async fn verify_test_mocks(world: &mut TokenCenterWorld) {
-    let mock = world.mock.take();
-    let asset_mock = world.asset_mock.take();
-
-    if let Some(mock) = mock {
-        mock.verify().await;
+fn panic_message(panic: Box<dyn Any + Send>) -> String {
+    match panic.downcast::<String>() {
+        Ok(message) => *message,
+        Err(panic) => match panic.downcast::<&str>() {
+            Ok(message) => (*message).to_owned(),
+            Err(_) => "mock verification panicked without a string message".to_owned(),
+        },
     }
-    if let Some(mock) = asset_mock {
-        mock.verify().await;
+}
+
+async fn verify_test_mock(name: &str, mock: MockServer) -> Option<String> {
+    let verification = AssertUnwindSafe(mock.verify()).catch_unwind().await;
+    let failure = verification.err().map(panic_message);
+    // `MockServer::Drop` verifies again. Clearing the expectations makes the explicit result
+    // above the only diagnostic and lets every server finish cleanup without another panic.
+    mock.reset().await;
+    failure.map(|failure| format!("{name} mock verification failed:\n{failure}"))
+}
+
+async fn verify_test_mocks(world: &mut TokenCenterWorld) {
+    let mocks = [
+        ("upstream", world.mock.take()),
+        ("asset", world.asset_mock.take()),
+    ];
+    let mut failures = Vec::new();
+
+    for (name, mock) in mocks {
+        if let Some(mock) = mock
+            && let Some(failure) = verify_test_mock(name, mock).await
+        {
+            failures.push(failure);
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!("Mock verification failures:\n{}", failures.join("\n\n"));
     }
 }
 
@@ -190,6 +227,30 @@ async fn finish_scenario(world: Option<&mut TokenCenterWorld>) {
     verify_test_mocks(world).await;
 }
 
+type PanicHook = dyn for<'a> Fn(&std::panic::PanicHookInfo<'a>) + Send + Sync + 'static;
+
+struct PanicHookSilencer {
+    previous: Option<Box<PanicHook>>,
+}
+
+impl PanicHookSilencer {
+    fn new() -> Self {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        Self {
+            previous: Some(previous),
+        }
+    }
+}
+
+impl Drop for PanicHookSilencer {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::panic::set_hook(previous);
+        }
+    }
+}
+
 async fn assert_lifecycle_contract() {
     let (shutdown, mut receiver) = watch::channel(false);
     let worker = tokio::spawn(async move {
@@ -202,26 +263,50 @@ async fn assert_lifecycle_contract() {
         .expect(1)
         .mount(&mock)
         .await;
+    let asset_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&asset_mock)
+        .await;
 
     let mut world = TokenCenterWorld::default();
     world.worker_shutdown = Some(shutdown);
     world.worker_task = Some(worker);
     world.mock = Some(mock);
-    let failure = AssertUnwindSafe(finish_scenario(Some(&mut world)))
-        .catch_unwind()
-        .await
-        .expect_err("unsatisfied mock expectation must fail in the scenario after hook");
+    world.asset_mock = Some(asset_mock);
+    let verification = {
+        // This preflight runs before Cucumber starts concurrent scenarios. Its deliberately
+        // unsatisfied mocks prove the hook's diagnostic path without polluting a passing run.
+        let _panic_hook = PanicHookSilencer::new();
+        AssertUnwindSafe(finish_scenario(Some(&mut world)))
+            .catch_unwind()
+            .await
+    };
+    let failure = verification
+        .expect_err("unsatisfied mock expectations must fail in the scenario after hook");
     assert!(world.worker_shutdown.is_none());
     assert!(world.worker_task.is_none());
     assert!(world.mock.is_none());
+    assert!(world.asset_mock.is_none());
 
     let message = failure
         .downcast_ref::<String>()
         .map(String::as_str)
         .or_else(|| failure.downcast_ref::<&str>().copied())
         .expect("wiremock verification panic contains a message");
-    assert!(message.contains("Verifications failed"), "{message}");
-    assert!(message.contains("expected exactly 1"), "{message}");
+    assert!(
+        message.contains("upstream mock verification failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("asset mock verification failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Number of matched incoming requests: 0"),
+        "{message}"
+    );
 }
 
 #[given("a token center backed by SQLite and memory object storage")]
