@@ -66,7 +66,7 @@ pub(in crate::api) async fn start_codex_oauth(
                 .into(),
         ));
     }
-    let provider_config = if let Some(account_id) = body.upstream_account_id {
+    let (provider_config, session_proxy_url) = if let Some(account_id) = body.upstream_account_id {
         let account = state
             .db
             .upstream_account_for_reauthorization(account_id, &body.tenant_external_id)
@@ -76,26 +76,49 @@ pub(in crate::api) async fn start_codex_oauth(
                 "reauthorization must use the existing OpenAI Codex upstream".into(),
             ));
         }
-        account.config
+        let (_, credential, _) = state
+            .db
+            .upstream_account_with_current_credential(
+                account_id,
+                state.config.key_pepper.as_bytes(),
+            )
+            .await?;
+        let (proxy_url, proxy_scope) = credential.proxy().ok_or_else(|| {
+            AppError::BadRequest(
+                "OpenAI Codex authorization requires an approved remote-DNS proxy".into(),
+            )
+        })?;
+        if proxy_scope != OutboundScope::Private {
+            return Err(AppError::BadRequest(
+                "OpenAI Codex authorization proxy is outside the approved private network".into(),
+            ));
+        }
+        (account.config, proxy_url.to_owned())
     } else {
-        json!({
-            "base_url": crate::oauth::codex_device::BASE_URL,
-            "network_scope": "public",
-            "reservation_token_bounds": {},
-        })
+        require_global_service(&service)?;
+        let proxy_url = body.proxy_url.clone().ok_or_else(|| {
+            AppError::BadRequest(
+                "OpenAI Codex authorization requires an approved remote-DNS proxy".into(),
+            )
+        })?;
+        (
+            json!({
+                "base_url": crate::oauth::codex_device::BASE_URL,
+                "network_scope": "public",
+                "reservation_token_bounds": {},
+            }),
+            proxy_url,
+        )
     };
     validate_provider_config_schema(&state, CODEX_PROVIDER_DRIVER, &provider_config)?;
-    if let Some(proxy_url) = body.proxy_url.as_deref() {
-        require_global_service(&service)?;
-        crate::provider::validate_codex_proxy_url(proxy_url)?;
-        network::validate_codex_transport(
-            crate::oauth::codex_device::BASE_URL,
-            &provider_config,
-            Some((proxy_url, OutboundScope::Private)),
-            false,
-        )
-        .await?;
-    }
+    crate::provider::validate_codex_proxy_url(&session_proxy_url)?;
+    network::validate_codex_transport(
+        crate::oauth::codex_device::BASE_URL,
+        &provider_config,
+        Some((&session_proxy_url, OutboundScope::Private)),
+        false,
+    )
+    .await?;
     let reauthorize = reauthorization_target(
         &state,
         body.upstream_account_id,
@@ -117,12 +140,12 @@ pub(in crate::api) async fn start_codex_oauth(
                 account_name: body.account_name,
                 operator_service_id: service.service_id,
                 provider_config,
-                proxy_url: body.proxy_url,
+                proxy_url: Some(session_proxy_url),
                 reauthorize,
             },
             state.config.key_pepper.as_bytes(),
             unix_millis(),
-            state.config.allow_oauth_loopback,
+            state.config.codex_test_loopback,
         )
         .await?,
     ))
@@ -144,7 +167,7 @@ pub(in crate::api) async fn poll_codex_oauth(
             required_tenant: service.tenant_external_id.as_deref(),
             operator_service_id: service.service_id,
         },
-        state.config.allow_oauth_loopback,
+        state.config.codex_test_loopback,
     )
     .await?
     {
@@ -705,7 +728,7 @@ pub(crate) async fn refresh_managed_upstream_oauth(
                 crate::oauth::managed::codex::refresh(
                     &state.http,
                     &credential,
-                    state.config.allow_oauth_loopback,
+                    state.config.codex_test_loopback,
                 )
                 .await?
             }

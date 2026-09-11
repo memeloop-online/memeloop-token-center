@@ -1696,6 +1696,12 @@ paths:
       summary: Start native OpenAI Codex device authorization
       security: [{ serviceBearer: [] }]
       x-required-scope: oauth:write
+      description: |
+        A new account requires a global operator and a write-only private
+        IP-literal SOCKS5H proxy. Reauthorization omits `proxy_url` and reuses
+        the existing encrypted account proxy. User-code, polling, token exchange,
+        JWKS verification and later managed refresh all use that same proxy with
+        remote target DNS; missing or invalid proxy state fails before network I/O.
       requestBody:
         required: true
         content:
@@ -5633,7 +5639,7 @@ components:
           minLength: 1
           maxLength: 2048
           writeOnly: true
-          description: Optional only for compatibility. New accounts should provide a private IP-literal SOCKS5H endpoint; accounts created without one remain disabled. Reauthorization cannot change it.
+          description: Required for a new account and must be a private IP-literal SOCKS5H endpoint. Reauthorization must omit it and reuses the existing encrypted account proxy.
     StartClaudeOAuthRequest:
       type: object
       additionalProperties: false

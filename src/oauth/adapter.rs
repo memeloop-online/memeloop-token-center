@@ -76,10 +76,16 @@ pub async fn normalize_managed_oauth_document(
             return Ok(normalized);
         }
         ManagedOAuthAdapterBackend::BuiltinCodex => {
-            let normalized = managed::codex::normalize(payload)?;
-            if normalized.credential.proxy().is_some() {
-                network::client_for_config_url(
-                    http,
+            let mut normalized = managed::codex::normalize(payload)?;
+            let (credential, _) = managed::codex::restore_remote_dns_proxy(normalized.credential)
+                .map_err(|_| AppError::BadRequest("CPA Codex OAuth document is invalid".into()))?;
+            normalized.credential = credential;
+            if normalized.credential.proxy().is_none() {
+                // Compatibility imports remain inspectable but can neither
+                // refresh nor route until a global operator installs a proxy.
+                normalized.enabled = false;
+            } else {
+                network::validate_codex_transport(
                     &validate_config(&normalized.config)?,
                     &normalized.config,
                     normalized.credential.proxy(),

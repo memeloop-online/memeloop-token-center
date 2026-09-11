@@ -351,10 +351,9 @@ async fn refresh_at(
         .map_err(|_| AppError::BadRequest("OpenAI Codex OAuth credential is invalid".into()))?;
     validate_adapter_state(adapter_state.as_ref())?;
 
-    let client = network::client_for_config_url(
+    let client = network::client_for_codex_oauth_url(
         http,
         endpoint,
-        &json!({"network_scope": "public"}),
         credential.proxy(),
         allow_test_loopback,
     )
@@ -509,8 +508,6 @@ fn refresh_failed() -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, SocketAddr};
-
     use serde_json::json;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -856,7 +853,7 @@ mod tests {
     async fn refresh_uses_fixed_form_and_rotates_tokens_without_changing_state() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/token"))
+            .and(path("/oauth/token"))
             .and(header("content-type", "application/x-www-form-urlencoded"))
             .and(header("accept", "application/json"))
             .and(body_string_contains("grant_type=refresh_token"))
@@ -888,25 +885,16 @@ mod tests {
 
             let mut request = [0_u8; 4];
             client.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request[..3], &[5, 1, 0]);
-            let ip = match request[3] {
-                1 => {
-                    let mut bytes = [0_u8; 4];
-                    client.read_exact(&mut bytes).await.unwrap();
-                    IpAddr::from(bytes)
-                }
-                4 => {
-                    let mut bytes = [0_u8; 16];
-                    client.read_exact(&mut bytes).await.unwrap();
-                    IpAddr::from(bytes)
-                }
-                value => panic!("unexpected SOCKS5 address type {value}"),
-            };
+            assert_eq!(&request, &[5, 1, 0, 3]);
+            let mut hostname_length = [0_u8; 1];
+            client.read_exact(&mut hostname_length).await.unwrap();
+            let mut hostname = vec![0_u8; usize::from(hostname_length[0])];
+            client.read_exact(&mut hostname).await.unwrap();
+            assert_eq!(hostname, b"codex-refresh.test");
             let mut port = [0_u8; 2];
             client.read_exact(&mut port).await.unwrap();
-            let requested = SocketAddr::new(ip, u16::from_be_bytes(port));
-            assert_eq!(requested, target_address);
-            let mut upstream = TcpStream::connect(requested).await.unwrap();
+            assert_eq!(u16::from_be_bytes(port), target_address.port());
+            let mut upstream = TcpStream::connect(target_address).await.unwrap();
             client
                 .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
                 .await
@@ -923,7 +911,7 @@ mod tests {
             ..
         } = &mut old_credential
         {
-            *proxy_url = Some(format!("socks5://{proxy_address}"));
+            *proxy_url = Some(format!("socks5h://{proxy_address}"));
             *proxy_network_scope = Some(OutboundScope::Private);
         }
         let before = crate::db::unix_millis();
@@ -931,7 +919,10 @@ mod tests {
             &crate::build_http_client().unwrap(),
             &old_credential,
             true,
-            &format!("{}/token", server.uri()),
+            &format!(
+                "http://codex-refresh.test:{}/oauth/token",
+                server.address().port()
+            ),
         )
         .await
         .unwrap();
@@ -942,7 +933,7 @@ mod tests {
         assert_eq!(rendered["prefix"], "Bearer ");
         assert_eq!(rendered["adapter_state"]["account_id"], "account-123");
         assert_eq!(rendered["adapter_state"]["schema"], NATIVE_ADAPTER_SCHEMA);
-        assert_eq!(rendered["proxy_url"], format!("socks5://{proxy_address}"));
+        assert_eq!(rendered["proxy_url"], format!("socks5h://{proxy_address}"));
         assert_eq!(rendered["proxy_network_scope"], "private");
         assert!(rendered["expires_at"].as_i64().unwrap() >= before + 3_600_000);
 

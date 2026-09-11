@@ -52,11 +52,14 @@ operator, exact tenant authorization, `Idempotency-Key`, and the current
 `updated_at` and credential generation. It accepts only a private IP-literal
 `socks5h` URL, retains all OAuth
 material, rotates the encrypted credential generation atomically and writes a
-secret-free audit record. A new Codex authorization may include the same
-write-only `proxy_url`; compatibility clients that omit it create a disabled
-account. A Codex account cannot be activated without an approved proxy, and the
-production Codex sender independently fails closed before routing any unproxied
-request.
+secret-free audit record. A new Codex authorization requires the same write-only
+`proxy_url`; reauthorization reuses the existing encrypted account proxy and
+cannot replace it. The complete device lifecycle (user-code request, device
+poll, token exchange and JWKS verification) and managed token refresh use that
+same proxy with remote target DNS. Missing or invalid proxy state fails before
+supplier DNS or network I/O, and there is no direct fallback. A Codex account
+cannot be activated without an approved proxy, and the production Codex sender
+independently fails closed before routing any unproxied request.
 
 Codex `config.transport_policy` remains runtime-adjustable through the normal
 upstream update CAS. Its bounded `connect_attempts`,

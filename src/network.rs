@@ -365,6 +365,90 @@ pub(crate) async fn client_for_codex_url_without_retries(
     .await
 }
 
+/// Build the no-retry transport used by the native Codex OAuth lifecycle.
+///
+/// Production targets are an exact `auth.openai.com` allowlist and always
+/// require the account/session's private IP-literal `socks5h` proxy. The target
+/// hostname is deliberately never resolved here: connection-time DNS belongs
+/// to that proxy. A direct client is admitted only for a task-local loopback
+/// endpoint behind the non-serializable `Config::for_test` marker.
+pub(crate) async fn client_for_codex_oauth_url(
+    shared_test_client: &reqwest::Client,
+    value: &str,
+    proxy: Option<(&str, OutboundScope)>,
+    allow_test_loopback: bool,
+) -> Result<reqwest::Client, AppError> {
+    let target = checked_http_url(value)?;
+    let fixed_production_target = target.scheme() == "https"
+        && target.host_str() == Some("auth.openai.com")
+        && target.port().is_none()
+        && target.query().is_none()
+        && matches!(
+            target.path(),
+            "/api/accounts/deviceauth/usercode"
+                | "/api/accounts/deviceauth/token"
+                | "/oauth/token"
+                | "/.well-known/jwks.json"
+        );
+    if !fixed_production_target && !allow_test_loopback {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex OAuth target is not approved".into(),
+        ));
+    }
+
+    let Some((proxy_url, proxy_scope)) = proxy else {
+        if fixed_production_target {
+            // Reject before resolving the supplier hostname. There is no
+            // environment-proxy or direct-target fallback for production.
+            return Err(AppError::BadRequest(
+                "OpenAI Codex authorization requires an approved remote-DNS proxy".into(),
+            ));
+        }
+        let (_, target_addresses, target_test_loopback) =
+            validated_endpoint(&target, OutboundScope::Public, allow_test_loopback).await?;
+        validate_transport_security(
+            target.scheme(),
+            &target_addresses,
+            OutboundScope::Public,
+            target_test_loopback,
+        )?;
+        return target_test_loopback
+            .then(|| shared_test_client.clone())
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "OpenAI Codex authorization requires an approved remote-DNS proxy".into(),
+                )
+            });
+    };
+
+    if proxy_scope != OutboundScope::Private {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex OAuth proxy endpoint is outside the approved private network".into(),
+        ));
+    }
+    let proxy = checked_proxy_url(proxy_url)?;
+    if proxy.scheme() != "socks5h" {
+        return Err(AppError::BadRequest(
+            "OpenAI Codex authorization requires a remote-DNS SOCKS5 proxy".into(),
+        ));
+    }
+    if !has_safe_private_ip_literal_host(&proxy) {
+        if !allow_test_loopback {
+            return Err(AppError::BadRequest(
+                "OpenAI Codex authorization requires a private IP-literal socks5h proxy".into(),
+            ));
+        }
+        let (_, _, proxy_test_loopback) =
+            validated_endpoint(&proxy, OutboundScope::Private, true).await?;
+        if !proxy_test_loopback {
+            return Err(AppError::BadRequest(
+                "OpenAI Codex authorization requires a private IP-literal socks5h proxy".into(),
+            ));
+        }
+    }
+    crate::build_no_retry_http_client(Some(proxy_url), &[]).map_err(|_| AppError::Internal)
+}
+
 async fn codex_client_for_url(
     shared_test_client: &reqwest::Client,
     value: &str,
@@ -876,6 +960,48 @@ mod tests {
             .await
             .is_err(),
             "a valid proxy must not make a configurable Codex target routable"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_transport_is_fixed_remote_dns_and_fail_closed() {
+        let shared = crate::build_http_client().unwrap();
+        let endpoint = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+        for proxy in [
+            None,
+            Some(("socks5://10.20.30.40:1080", OutboundScope::Private)),
+            Some(("socks5h://10.20.30.40:1080", OutboundScope::Public)),
+            Some((
+                "socks5h://proxy.internal:1080",
+                OutboundScope::Private,
+            )),
+            Some(("socks5h://8.8.8.8:1080", OutboundScope::Private)),
+        ] {
+            assert!(
+                client_for_codex_oauth_url(&shared, endpoint, proxy, false)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            client_for_codex_oauth_url(
+                &shared,
+                endpoint,
+                Some(("socks5h://10.20.30.40:1080", OutboundScope::Private)),
+                false,
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            client_for_codex_oauth_url(
+                &shared,
+                "https://auth.openai.com/unapproved",
+                Some(("socks5h://10.20.30.40:1080", OutboundScope::Private)),
+                false,
+            )
+            .await
+            .is_err()
         );
     }
 

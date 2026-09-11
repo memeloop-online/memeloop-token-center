@@ -253,6 +253,7 @@ async fn start_codex_device_login_at(
         &DeviceUserCodeRequest {
             client_id: CLIENT_ID,
         },
+        input.proxy_url.as_deref(),
         allow_test_loopback,
     )
     .await?;
@@ -417,6 +418,7 @@ async fn poll_codex_device_login_at(
             device_auth_id: &state.device_auth_id,
             user_code: &state.user_code,
         },
+        state.proxy_url.as_deref(),
         allow_test_loopback,
     )
     .await?;
@@ -450,12 +452,20 @@ async fn poll_codex_device_login_at(
         http,
         &device_token.authorization_code,
         &device_token.code_verifier,
+        state.proxy_url.as_deref(),
         allow_test_loopback,
         endpoints,
     )
     .await?;
-    let claims =
-        verify_id_token(http, &token.id_token, now, allow_test_loopback, endpoints).await?;
+    let claims = verify_id_token(
+        http,
+        &token.id_token,
+        now,
+        state.proxy_url.as_deref(),
+        allow_test_loopback,
+        endpoints,
+    )
+    .await?;
     validate_secret_text(&token.access_token)?;
     validate_secret_text(&token.refresh_token)?;
     super::managed::account_id(&claims.openai_auth.chatgpt_account_id, "OpenAI Codex")?;
@@ -525,6 +535,7 @@ async fn exchange_authorization_code(
     http: &reqwest::Client,
     code: &str,
     verifier: &str,
+    proxy_url: Option<&str>,
     allow_test_loopback: bool,
     endpoints: &CodexDeviceEndpoints,
 ) -> Result<OAuthTokenResponse, AppError> {
@@ -535,7 +546,7 @@ async fn exchange_authorization_code(
         .append_pair("redirect_uri", DEVICE_TOKEN_REDIRECT_URI)
         .append_pair("code_verifier", verifier)
         .finish();
-    let client = oauth_client(http, &endpoints.token, allow_test_loopback).await?;
+    let client = oauth_client(http, &endpoints.token, proxy_url, allow_test_loopback).await?;
     let response = client
         .post(&endpoints.token)
         .header(ACCEPT, "application/json")
@@ -556,6 +567,7 @@ async fn verify_id_token(
     http: &reqwest::Client,
     id_token: &str,
     now: i64,
+    proxy_url: Option<&str>,
     allow_test_loopback: bool,
     endpoints: &CodexDeviceEndpoints,
 ) -> Result<VerifiedIdTokenClaims, AppError> {
@@ -565,7 +577,7 @@ async fn verify_id_token(
         return Err(device_error());
     }
     let kid = header.kid.as_deref().ok_or_else(device_error)?;
-    let client = oauth_client(http, &endpoints.jwks, allow_test_loopback).await?;
+    let client = oauth_client(http, &endpoints.jwks, proxy_url, allow_test_loopback).await?;
     let response = client
         .get(&endpoints.jwks)
         .header(ACCEPT, "application/json")
@@ -603,9 +615,10 @@ async fn post_json<T: Serialize + ?Sized>(
     http: &reqwest::Client,
     endpoint: &str,
     body: &T,
+    proxy_url: Option<&str>,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Response, AppError> {
-    let client = oauth_client(http, endpoint, allow_test_loopback).await?;
+    let client = oauth_client(http, endpoint, proxy_url, allow_test_loopback).await?;
     client
         .post(endpoint)
         .header(ACCEPT, "application/json")
@@ -619,11 +632,17 @@ async fn post_json<T: Serialize + ?Sized>(
 async fn oauth_client(
     http: &reqwest::Client,
     endpoint: &str,
+    proxy_url: Option<&str>,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
-    network::client_for_url(http, endpoint, OutboundScope::Public, allow_test_loopback)
-        .await
-        .map_err(|_| device_error())
+    network::client_for_codex_oauth_url(
+        http,
+        endpoint,
+        proxy_url.map(|proxy_url| (proxy_url, OutboundScope::Private)),
+        allow_test_loopback,
+    )
+    .await
+    .map_err(|_| device_error())
 }
 
 async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
@@ -711,6 +730,10 @@ fn device_error() -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_json, body_string_contains, method, path},
@@ -719,19 +742,72 @@ mod tests {
     const TEST_ID_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5IiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2F1dGgub3BlbmFpLmNvbSIsImF1ZCI6ImFwcF9FTW9hbUVFWjczZjBDa1hhWHA3aHJhbm4iLCJzdWIiOiJzdWJqZWN0LXRlc3QiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6NDEwMjQ0NDgwMCwiZW1haWwiOiJjb2RleEBleGFtcGxlLnRlc3QiLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjb3VudC10ZXN0In19.QcXeGlgrKbbJTGIIC3a2BHBW_ta6ab_8IGIU7DDmCgp4qhQmiogMJAZ4_nFafd1Ct4H74DNuTcTJbarZrjXZG99pqRVFfDQvkxNpBvydHl6FB2Kn2EbdG-CycoCYQ3Ggx_I9JGiDNNBGO3GhzL82YXbIo4_aJRaXAfKAOgBdcP5CPrK5W_j7UBPpN6v4TqraSWBzABp7P7sdIN6BBNf7FkdZrFyrUpjMP9dTHCJv2S-TI0nJqU_2AcEnj0RSai4yO36SmYkICfA7LRcmP9_W7zmOGCEykXNv7D6PumZ8o1scOthDRV0hUjz8HhMQcdz2il41g3HvjbGZ7Wfm8Efc7g";
     const TEST_RSA_MODULUS: &str = "wIJVXarpR5vXWoza5vjtnxy3XMLY7sYyaxMND0RkeyazN3VIdXVmc1GPMSfjSWixmP0TSLiNxry_2a-aqUqi-qWCeBDcVkYeUDzzEzKdCbGzyoXiWIkh4-3r76CMCBaeiuIucdGGhExiaiIMuFlXCej_b_pQs_rn1RDxVAJnqLIT_mp4llvJ1_gk8B60emxDuDzyGZOVxMqwzY5Z2iL4WpUYZrszwZjFfzvapbmal6QhGVhhCHE_L7MxJUNHA9m-0v6RV-SuuWWusBPkjVmjVzGzDQqGU92WLqdGvS8XHbEEKxOz-j03LrB4q1VHD1VeNOmGaDGPHp96lz9PJPVoqw";
 
+    async fn spawn_remote_dns_proxy(
+        target: std::net::SocketAddr,
+        expected_hostname: &'static [u8],
+        connections: usize,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for _ in 0..connections {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let mut greeting = [0_u8; 2];
+                client.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting[0], 5);
+                let mut methods = vec![0_u8; usize::from(greeting[1])];
+                client.read_exact(&mut methods).await.unwrap();
+                assert!(methods.contains(&0));
+                client.write_all(&[5, 0]).await.unwrap();
+
+                let mut request = [0_u8; 4];
+                client.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, &[5, 1, 0, 3]);
+                let mut hostname_length = [0_u8; 1];
+                client.read_exact(&mut hostname_length).await.unwrap();
+                let mut hostname = vec![0_u8; usize::from(hostname_length[0])];
+                client.read_exact(&mut hostname).await.unwrap();
+                assert_eq!(hostname, expected_hostname);
+                let mut port = [0_u8; 2];
+                client.read_exact(&mut port).await.unwrap();
+                assert_eq!(u16::from_be_bytes(port), target.port());
+
+                let mut upstream = TcpStream::connect(target).await.unwrap();
+                client
+                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                    .await
+                    .unwrap();
+            }
+        });
+        (format!("socks5h://{address}"), task)
+    }
+
     #[tokio::test]
     async fn mocked_device_protocol_creates_a_verified_ready_result() {
         let server = MockServer::start().await;
+        let target_origin = format!(
+            "http://codex-oauth.test:{}",
+            server.address().port()
+        );
+        let (proxy_url, proxy) =
+            spawn_remote_dns_proxy(*server.address(), b"codex-oauth.test", 4).await;
         let verifier = "verified-pkce-secret";
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         Mock::given(method("POST"))
             .and(path("/device/usercode"))
             .and(body_json(json!({"client_id": CLIENT_ID})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "device_auth_id": "device-auth-test",
-                "user_code": "CODEX-TEST",
-                "interval": 1
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("connection", "close")
+                    .set_body_json(json!({
+                        "device_auth_id": "device-auth-test",
+                        "user_code": "CODEX-TEST",
+                        "interval": 1
+                    })),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -741,11 +817,15 @@ mod tests {
                 "device_auth_id": "device-auth-test",
                 "user_code": "CODEX-TEST"
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "authorization_code": "authorization-code-test",
-                "code_verifier": verifier,
-                "code_challenge": challenge
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("connection", "close")
+                    .set_body_json(json!({
+                        "authorization_code": "authorization-code-test",
+                        "code_verifier": verifier,
+                        "code_challenge": challenge
+                    })),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -758,27 +838,35 @@ mod tests {
                 "redirect_uri=https%3A%2F%2Fauth.openai.com%2Fdeviceauth%2Fcallback",
             ))
             .and(body_string_contains("code_verifier=verified-pkce-secret"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "access_token": "access-token-test",
-                "refresh_token": "refresh-token-test",
-                "id_token": TEST_ID_TOKEN,
-                "expires_in": 3600
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("connection", "close")
+                    .set_body_json(json!({
+                        "access_token": "access-token-test",
+                        "refresh_token": "refresh-token-test",
+                        "id_token": TEST_ID_TOKEN,
+                        "expires_in": 3600
+                    })),
+            )
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "keys": [{
-                    "kty": "RSA",
-                    "kid": "test-key",
-                    "use": "sig",
-                    "alg": "RS256",
-                    "n": TEST_RSA_MODULUS,
-                    "e": "AQAB"
-                }]
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("connection", "close")
+                    .set_body_json(json!({
+                        "keys": [{
+                            "kty": "RSA",
+                            "kid": "test-key",
+                            "use": "sig",
+                            "alg": "RS256",
+                            "n": TEST_RSA_MODULUS,
+                            "e": "AQAB"
+                        }]
+                    })),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -795,7 +883,7 @@ mod tests {
             .migrate()
             .await
             .expect("migrate Codex device database");
-        let endpoints = CodexDeviceEndpoints::for_test(&server.uri());
+        let endpoints = CodexDeviceEndpoints::for_test(&target_origin);
         let now = crate::db::unix_millis();
         let key_material = b"codex-device-test-pepper-at-least-32-bytes";
         let started = start_codex_device_login_at(
@@ -810,7 +898,7 @@ mod tests {
                     "network_scope": "public",
                     "reservation_token_bounds": {}
                 }),
-                proxy_url: None,
+                proxy_url: Some(proxy_url.clone()),
                 reauthorize: None,
             },
             key_material,
@@ -855,6 +943,7 @@ mod tests {
                 access_token,
                 refresh_token,
                 adapter_state,
+                proxy_url: ready_proxy_url,
                 ..
             } => {
                 assert_eq!(access_token, "access-token-test");
@@ -866,8 +955,13 @@ mod tests {
                         .and_then(Value::as_str),
                     Some("account-test")
                 );
+                assert_eq!(ready_proxy_url.as_deref(), Some(proxy_url.as_str()));
             }
             other => panic!("unexpected credential: {other:?}"),
         }
+        tokio::time::timeout(Duration::from_secs(2), proxy)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
