@@ -783,7 +783,7 @@ pub(super) async fn proxy(
         }
     }
     let AuthorizedProxyRoutes {
-        mut primary,
+        primary,
         remaining_candidates,
         input_token_ceiling: _,
         output_token_ceiling: _,
