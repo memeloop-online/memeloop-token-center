@@ -44,6 +44,7 @@ test('memory acceptance scope skips only reviewed non-binary paths', () => {
 test('master push remains unconditionally full and plugin inputs remain covered', () => {
   assert.deepEqual(scopes('push', []), { memory: 'true', plugin_installer: 'true' });
   for (const path of [
+    '.dockerignore',
     'Dockerfile.plugin-installer',
     'Cargo.lock',
     'src/bin/install-plugin-oci.rs',

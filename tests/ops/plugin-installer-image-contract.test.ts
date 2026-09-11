@@ -3,6 +3,18 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { contains, excludes, repository, run } from './contract-helpers.ts';
 
+function cleanupOwnedImage(
+  image: string,
+  providedImage: string | undefined,
+  removeImage: (name: string) => void = (name) => {
+    spawnSync('docker', ['image', 'rm', '--force', name], { cwd: repository, encoding: 'utf8', shell: false });
+  },
+): void {
+  // A supplied image is owned by the caller (the workflow's shared BuildKit
+  // result), so this test must not remove it from the local image store.
+  if (!providedImage) removeImage(image);
+}
+
 test('plugin installer image is patched, pinned, and non-root', (context) => {
   const dockerfile = 'Dockerfile.plugin-installer';
   for (const needle of [
@@ -51,6 +63,15 @@ test('plugin installer image is patched, pinned, and non-root', (context) => {
     assert.equal(version.goVersion, 'go1.26.7');
     run('docker', ['run', '--rm', image, '--help']);
   } finally {
-    spawnSync('docker', ['image', 'rm', '--force', image], { cwd: repository, encoding: 'utf8', shell: false });
+    cleanupOwnedImage(image, providedImage);
   }
+});
+
+test('provided plugin installer images remain caller-owned', () => {
+  const removed: string[] = [];
+  cleanupOwnedImage('caller-provided-image', 'caller-provided-image', (image) => removed.push(image));
+  assert.equal(removed.length, 0);
+
+  cleanupOwnedImage('locally-built-image', undefined, (image) => removed.push(image));
+  assert.deepEqual(removed, ['locally-built-image']);
 });

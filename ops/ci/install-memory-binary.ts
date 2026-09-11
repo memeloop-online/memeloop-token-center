@@ -17,7 +17,7 @@ import {
 
 const SCOPE = 'memory binary installation';
 const [artifactValue = '', revisionValue = '', destinationValue = ''] = process.argv.slice(2);
-if (artifactValue === '' || destinationValue === '') {
+if (artifactValue === '' || revisionValue === '' || destinationValue === '') {
   fail(SCOPE, 'artifact directory, revision, and destination are required');
 }
 const artifact = requireCanonicalDirectory(resolve(artifactValue), SCOPE, 'artifact directory');

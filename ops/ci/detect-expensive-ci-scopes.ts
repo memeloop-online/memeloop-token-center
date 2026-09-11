@@ -18,7 +18,7 @@ if (eventName === 'pull_request' && paths.length === 0) {
 // Every unknown or newly introduced path runs the acceptance harness.
 const memorySafe = /^(?:docs\/|web\/|charts\/|openapi\/|README\.md$|LICENSE$|\.gitignore$|compose\.yaml$)/;
 const memory = eventName === 'push' || paths.some((path) => !memorySafe.test(path));
-const pluginInstaller = eventName === 'push' || paths.some((path) => /^(?:\.cargo\/|\.github\/workflows\/ci\.yml$|Cargo\.(?:toml|lock)$|Dockerfile\.plugin-installer$|packaging\/cosign\/|src\/|migrations\/|schemas\/|wit\/|vendor\/|tests\/ops\/plugin-installer-image-contract\.test\.ts$)/.test(path));
+const pluginInstaller = eventName === 'push' || paths.some((path) => /^(?:\.cargo\/|\.dockerignore$|\.github\/workflows\/ci\.yml$|Cargo\.(?:toml|lock)$|Dockerfile\.plugin-installer$|packaging\/cosign\/|src\/|migrations\/|schemas\/|wit\/|vendor\/|tests\/ops\/plugin-installer-image-contract\.test\.ts$)/.test(path));
 
 appendFileSync(
   outputValue,
