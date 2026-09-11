@@ -280,14 +280,14 @@ export async function addTypedFilterCondition(dialog: Locator, field: string): P
 
 /**
  * Open the model picker by its control contract rather than a localized label.
- * The visible label is product copy; `aria-haspopup=listbox` is the semantic
+ * The visible label is product copy; `aria-haspopup=dialog` is the semantic
  * contract that makes this value editor a catalog picker rather than a free
- * text field.
+ * text field. The non-modal dialog contains the listbox.
  */
 export async function openCatalogModelPicker(row: Locator): Promise<Locator> {
   const picker = row.locator('.typed-filter-model-picker');
   await assertVisible(picker);
-  const trigger = picker.locator('button[aria-haspopup="listbox"]');
+  const trigger = picker.locator('button[aria-haspopup="dialog"]');
   await trigger.click();
   const catalog = picker.getByRole('dialog', { name: '模型目录', exact: true });
   await assertVisible(catalog);
