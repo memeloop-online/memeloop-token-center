@@ -282,7 +282,7 @@ mod tests {
                     poll_url: format!("{}/poll", server.uri()),
                     refresh_url: format!("{}/refresh", server.uri()),
                 },
-                oauth_driver: "provider_adapter".to_owned(),
+                oauth_driver: "cursor".to_owned(),
                 reauthorize: None,
             },
             None,
