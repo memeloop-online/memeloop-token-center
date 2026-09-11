@@ -13,5 +13,7 @@ test('one-time credential panel provides copy, local download, failure feedback,
   assert.match(shared, /common\.secretSaved/);
   assert.match(shared, /window\.confirm\(t\('common\.confirmDismissSecret'\)\)/);
   assert.match(shared, /onDismiss\(\)/);
+  assert.doesNotMatch(shared, /<aside className="one-time" role="status"/, 'a credential must not be announced on mount');
+  assert.match(shared, /recovered \? 'common\.recoveredSecretHint' : 'common\.secretShownOnce'/);
   assert.doesNotMatch(shared, /api\(/, 'the panel must never fetch an old secret');
 });

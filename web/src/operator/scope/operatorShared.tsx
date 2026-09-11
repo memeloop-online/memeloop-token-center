@@ -26,11 +26,15 @@ export function WriteScopeNotice({ tenant }: { tenant: string }) {
   return <div className="scope-context"><span aria-hidden="true">◎</span><p>{t('operator.selectTenantToWrite')}</p></div>;
 }
 
-export function OneTimeSecret({ value, message, filename = 'token-center-credential.txt', onDismiss }: {
+export function OneTimeSecret({ value, message, filename = 'token-center-credential.txt', onDismiss, recovered = false, recoveryAvailable = false }: {
   value: string;
   message: string;
   filename?: string;
   onDismiss?: () => void;
+  /** A recovered value is fetched only after an explicit, authorized action. */
+  recovered?: boolean;
+  /** The initial value may later be recovered only through an authorized action. */
+  recoveryAvailable?: boolean;
 }) {
   const { t } = useI18n();
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
@@ -76,9 +80,11 @@ export function OneTimeSecret({ value, message, filename = 'token-center-credent
     if (onDismiss && window.confirm(t('common.confirmDismissSecret'))) onDismiss();
   }
 
-  return <aside className="one-time" role="status" aria-live="polite">
+  // Do not make this container a live region: assistive technology must not
+  // announce a credential merely because it was rendered.
+  return <aside className="one-time">
     <div className="one-time-heading">
-      <div><b>{message}</b><p>{t('common.secretShownOnce')}</p></div>
+      <div><b>{message}</b><p>{t(recovered ? 'common.recoveredSecretHint' : 'common.secretShownOnce')}</p></div>
       {onDismiss && <button type="button" className="secondary one-time-close" aria-label={t('common.close')} onClick={dismiss}>×</button>}
     </div>
     <code aria-label={t('common.secretValue')}>{value}</code>
@@ -90,6 +96,6 @@ export function OneTimeSecret({ value, message, filename = 'token-center-credent
     </div>
     {copyState === 'failed' && <small className="one-time-error" role="alert">{t('common.copySecretFailed')}</small>}
     {saved && <small className="one-time-saved" role="status">{t('common.secretSaved')}</small>}
-    <small className="one-time-hint">{t('common.secretCloseHint')}</small>
+    <small className="one-time-hint">{t(recovered ? 'common.recoveredSecretCloseHint' : recoveryAvailable ? 'common.recoverableSecretCloseHint' : 'common.secretCloseHint')}</small>
   </aside>;
 }
