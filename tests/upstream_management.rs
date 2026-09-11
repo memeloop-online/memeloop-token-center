@@ -312,7 +312,7 @@ async fn codex_transport_proxy_rotation_is_sanitized_fenced_and_audited() {
 
     let audit_pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
     let audit = sqlx::query(
-        "SELECT previous_fingerprint, previous_scheme, new_fingerprint, new_scheme, remote_dns, actor_service_id FROM upstream_transport_proxy_audit WHERE upstream_account_id = $1",
+        "SELECT previous_fingerprint, previous_scheme, new_fingerprint, new_scheme, CAST(remote_dns AS BIGINT) AS remote_dns, actor_service_id FROM upstream_transport_proxy_audit WHERE upstream_account_id = $1",
     )
     .bind(upstream.id.to_string())
     .fetch_all(&audit_pool)
