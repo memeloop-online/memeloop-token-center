@@ -6,16 +6,21 @@ const source = readFileSync(new URL('../src/operator/pages/ManagementPages.tsx',
 const pricing = source.slice(source.indexOf('function Pricing('), source.indexOf('interface RouteDraft'));
 const page = source.slice(source.indexOf('export function PricingPage('), source.indexOf('export function RoutesPage('));
 
-test('manual schemas cannot gate mounting the pricing data workspace', () => {
+test('manual schemas are fetched only when the collapsed editor is opened', () => {
   assert.doesNotMatch(page, /<ResourceBoundary/);
+  assert.match(page, /Boolean\(token\) && schemasRequested/);
+  assert.match(page, /onRequestSchemas=\{\(\) => setSchemasRequested\(true\)\}/);
   assert.match(page, /schemas=\{resource\.state\.kind === 'ready' \? resource\.state\.value : undefined\}/);
+  assert.match(pricing, /onToggle=\{\(event\) => \{ if \(event\.currentTarget\.open\) onRequestSchemas\?\.\(\); \}\}/);
 });
 
 test('pricing usage is scope-only and independent from currency price requests', () => {
   const priceLoad = pricing.slice(pricing.indexOf('const load ='), pricing.indexOf('useEffect('));
   assert.doesNotMatch(priceLoad, /usage-summary|setUsage/);
-  assert.match(pricing, /usage-summary[\s\S]*?return \(\) => controller\.abort\(\);\s*\}, \[token, tenant\]\)/);
-  assert.match(priceLoad, /\.then\(\(value\) => \{ if \(current\(\)\) \{ setPrices\(value\)/);
+  assert.match(pricing, /token && basePricingScope === scope/);
+  assert.match(pricing, /usage-summary[\s\S]*?return \(\) => controller\.abort\(\);\s*\}, \[token, tenant, basePricingScope\]\)/);
+  assert.match(priceLoad, /loadModelPricePages\(/);
+  assert.match(priceLoad, /\(value\) => \{ if \(current\(\)\) \{ setPrices\(value\)/);
   assert.match(priceLoad, /\.then\(\(value\) => \{ if \(current\(\)\) setGenerationPrices\(value\)/);
 });
 
