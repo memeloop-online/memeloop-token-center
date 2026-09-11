@@ -167,7 +167,10 @@ async fn all_codex_503_candidates_stop_at_the_global_attempt_budget() {
         add_codex_standby_route(&fixture, "codex-route-all-503-budget", "account-456").await;
     let third =
         add_codex_standby_route(&fixture, "codex-route-all-503-budget", "account-789").await;
+    let fourth =
+        add_codex_standby_route(&fixture, "codex-route-all-503-budget", "account-999").await;
     set_route_priority(&fixture, third, 20).await;
+    set_route_priority(&fixture, fourth, 30).await;
     for account in ["account-123", "account-456", "account-789"] {
         Mock::given(method("POST"))
             .and(path(codex_transport::RESPONSES_PATH))
@@ -180,6 +183,16 @@ async fn all_codex_503_candidates_stop_at_the_global_attempt_budget() {
             .mount(&upstream)
             .await;
     }
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .and(header_matcher("chatgpt-account-id", "account-999"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("must remain outside the attempt budget"),
+            "text/event-stream",
+        ))
+        .expect(0)
+        .mount(&upstream)
+        .await;
 
     let response = send_codex_route(
         &fixture,

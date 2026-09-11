@@ -9,8 +9,10 @@ pub(in crate::api::proxy) fn status_failover_reason(
     candidate_rank: usize,
     outbound_attempt: usize,
 ) -> Option<UpstreamHealthReason> {
+    let attempt_budget_available = outbound_attempt < PROXY_ROUTING_POLICY.max_attempts();
     if status == StatusCode::TOO_MANY_REQUESTS {
-        return candidate_available.then_some(UpstreamHealthReason::RateLimited);
+        return (candidate_available && attempt_budget_available)
+            .then_some(UpstreamHealthReason::RateLimited);
     }
     if status != StatusCode::SERVICE_UNAVAILABLE || !route.is_codex() {
         return None;
@@ -18,7 +20,7 @@ pub(in crate::api::proxy) fn status_failover_reason(
     let transport_policy = runtime_transport_policy(&route.route.config, 0);
     let policy_permits =
         route.codex_store_disabled && transport_policy.service_unavailable_failover;
-    let will_failover = policy_permits && candidate_available;
+    let will_failover = policy_permits && candidate_available && attempt_budget_available;
     tracing::warn!(
         %request_id,
         upstream_account_id = %route.route.account_id,
@@ -32,6 +34,7 @@ pub(in crate::api::proxy) fn status_failover_reason(
         delivery_boundary = "not_started",
         policy_permits,
         candidate_available,
+        attempt_budget_available,
         decision = if will_failover { "failover" } else { "return_503" },
         transport_policy_source = transport_policy.source,
         stage = "upstream_status_failover_decision",
