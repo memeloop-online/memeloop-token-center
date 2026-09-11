@@ -74,14 +74,6 @@ pub(in crate::api::proxy) fn runtime_transport_policy(
     }
 }
 
-pub(in crate::api::proxy) fn permits_service_unavailable_failover(
-    route: &PreparedProxyRoute,
-) -> bool {
-    route.is_codex()
-        && route.codex_store_disabled
-        && runtime_transport_policy(&route.route.config, 0).service_unavailable_failover
-}
-
 #[cfg(test)]
 mod policy_tests {
     use super::*;

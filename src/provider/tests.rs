@@ -391,11 +391,9 @@ fn builtin_codex_routes_openai_with_required_trusted_limits_only() {
         Some(&json!(0))
     );
     assert_eq!(
-        codex
-            .config_schema
-            .pointer(
-                "/properties/transport_policy/properties/service_unavailable_failover/default"
-            ),
+        codex.config_schema.pointer(
+            "/properties/transport_policy/properties/service_unavailable_failover/default"
+        ),
         Some(&json!(true))
     );
     assert!(

@@ -30,8 +30,8 @@ use routing::{
     DeferredSharedProbe, NextSendableProxyRouteInput, PROXY_ROUTING_POLICY, PreparedProxyRoute,
     PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput, ProxySendError,
     UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_compatibility,
-    materialize_proxy_route, permits_service_unavailable_failover, plan_proxy_route,
-    prepare_admitted_proxy_route, refresh_route_snapshot, send_proxy_route,
+    materialize_proxy_route, plan_proxy_route, prepare_admitted_proxy_route,
+    refresh_route_snapshot, send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -953,9 +953,10 @@ pub(super) async fn proxy(
                     &active_route.route.config,
                     state.config.upstream_health.shared_probe_attempts,
                 );
-                let policy_permits = permits_service_unavailable_failover(&active_route);
-                let candidate_available = !route_candidates.as_slice().is_empty()
-                    || !deferred_shared_probes.is_empty();
+                let policy_permits = active_route.codex_store_disabled
+                    && transport_policy.service_unavailable_failover;
+                let candidate_available =
+                    !route_candidates.as_slice().is_empty() || !deferred_shared_probes.is_empty();
                 let will_failover = policy_permits && candidate_available;
                 tracing::warn!(
                     %request_id,

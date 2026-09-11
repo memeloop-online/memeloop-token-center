@@ -68,12 +68,8 @@ async fn codex_503_fails_over_before_downstream_delivery() {
         .expect(1)
         .mount(&upstream)
         .await;
-    let standby = add_codex_standby_route(
-        &fixture,
-        "codex-route-503-failover",
-        "account-456",
-    )
-    .await;
+    let standby =
+        add_codex_standby_route(&fixture, "codex-route-503-failover", "account-456").await;
 
     let response = send_codex_route(
         &fixture,
@@ -115,12 +111,7 @@ async fn account_policy_can_disable_codex_503_failover_at_runtime() {
         .expect(0)
         .mount(&upstream)
         .await;
-    add_codex_standby_route(
-        &fixture,
-        "codex-route-503-policy-disabled",
-        "account-456",
-    )
-    .await;
+    add_codex_standby_route(&fixture, "codex-route-503-policy-disabled", "account-456").await;
     let (account, _) = fixture
         .state
         .db
@@ -172,18 +163,10 @@ async fn all_codex_503_candidates_stop_at_the_global_attempt_budget() {
     let fixture = codex_route_fixture("all-503-budget").await;
     let upstream = MockServer::start().await;
     let first = fixture.upstream_account_id;
-    let second = add_codex_standby_route(
-        &fixture,
-        "codex-route-all-503-budget",
-        "account-456",
-    )
-    .await;
-    let third = add_codex_standby_route(
-        &fixture,
-        "codex-route-all-503-budget",
-        "account-789",
-    )
-    .await;
+    let second =
+        add_codex_standby_route(&fixture, "codex-route-all-503-budget", "account-456").await;
+    let third =
+        add_codex_standby_route(&fixture, "codex-route-all-503-budget", "account-789").await;
     set_route_priority(&fixture, third, 20).await;
     for account in ["account-123", "account-456", "account-789"] {
         Mock::given(method("POST"))
@@ -313,12 +296,7 @@ async fn concurrent_503_wave_never_exposes_the_bad_account_to_callers() {
         .expect(4)
         .mount(&upstream)
         .await;
-    add_codex_standby_route(
-        &fixture,
-        "codex-route-503-concurrent-wave",
-        "account-456",
-    )
-    .await;
+    add_codex_standby_route(&fixture, "codex-route-503-concurrent-wave", "account-456").await;
 
     let responses = futures_util::future::join_all((0..4).map(|ordinal| {
         send_codex_route(
