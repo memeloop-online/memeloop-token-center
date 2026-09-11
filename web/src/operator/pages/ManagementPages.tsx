@@ -800,7 +800,6 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const [keyError, setKeyError] = useState('');
   const [routeError, setRouteError] = useState('');
   const [secret, setSecret] = useState('');
-  const [manualRecoverySecret, setManualRecoverySecret] = useState<{ keyId: string; key: string }>();
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const scopeGeneration = useRef(0);
@@ -882,7 +881,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   useEffect(() => {
     scopeGeneration.current += 1; setValues([]); setRoutes([]); setEditingPolicy(undefined); setEditingRouting(undefined); setRoutingDraft(undefined);
     setRenaming(undefined); setAliasDraft(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
-    setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(''); setManualRecoverySecret(undefined); setMessage(''); setError(''); void load();
+    setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(''); setMessage(''); setError(''); void load();
     return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); };
   }, [token, tenant, writeTenant]);
   const loadMore = async () => {
@@ -921,25 +920,14 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const canReadLimits = canReadCredentialLimits(token);
   const canWrite = canWriteCredential(writeTenant);
   const canManage = (value: KeyView) => canWrite && value.tenant_external_id === writeTenant;
-  const copyRecoveredCredential = async (value: KeyView) => {
-    if (!canManage(value) || value.status !== 'active' || !value.credential_recovery_available) return;
+  const rotateCredential = async (value: KeyView) => {
+    if (!canManage(value) || value.status === 'revoked' || !await confirm(`${t('credentials.rotate')} · ${value.alias}\n${value.key_id}`)) return;
     const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant;
-    setBusy(`copy-${value.key_id}`); setError(''); setMessage(''); setManualRecoverySecret(undefined);
+    setBusy(`rotate-${value.key_id}`); setError(''); setMessage('');
     try {
-      const result = await api<{ key_id: string; credential_generation: number; key: string }>(`/internal/v1/keys/${value.key_id}/credential-recovery/copy`, operationToken, { method: 'POST' });
+      const result = await api<{ key: string }>(`/internal/v1/keys/${value.key_id}/rotate`, operationToken, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } });
       if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
-      if (result.key_id !== value.key_id || result.credential_generation !== value.credential_generation) throw new Error(t('common.requestFailed'));
-      try {
-        if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
-        await navigator.clipboard.writeText(result.key);
-        if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
-        setMessage(t('credentials.copySuccess', { alias: value.alias }));
-      } catch {
-        if (scopeRef.current.token !== operationToken || scopeRef.current.tenant !== operationTenant || scopeRef.current.writeTenant !== operationWriteTenant) return;
-        // The recovered value remains only in this component state so the
-        // authorized operator can manually copy it. It is never persisted.
-        setManualRecoverySecret({ keyId: value.key_id, key: result.key });
-      }
+      setSecret(result.key); setMessage(t('credentials.rotated', { alias: value.alias })); await load();
     } catch (reason) {
       if (scopeRef.current.token === operationToken && scopeRef.current.tenant === operationTenant && scopeRef.current.writeTenant === operationWriteTenant) setError(messageOf(reason, t('common.requestFailed')));
     } finally {
@@ -973,8 +961,9 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       } else setError(messageOf(reason, t('common.requestFailed')));
     }
   };
-  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} />{secret && <OneTimeSecret value={secret} message={t('credentials.oneTimeSecret')} />}<section className="management-layout">
+  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} />{secret && <OneTimeSecret value={secret} filename="client-credential.txt" onDismiss={() => setSecret('')} message={t('credentials.oneTimeSecret')} />}<section className="management-layout">
     <article className="panel"><div className="panel-title"><div><h2>{t('credentials.title')}</h2><p className="muted">{t('credentials.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>
+      <div className="notice warning" role="note">{t('credentials.secretUnavailable')}</div>
       <div className="credential-list-controls"><label>{t('credentials.search')}<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('credentials.searchPlaceholder')} /></label>{writeTenant && <label>{t('credentials.groupFilter')}<select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}><option value="all">{t('common.all')}</option><option value="unassigned">{t('credentials.ungrouped')}</option>{credentialGroups.groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></label>}</div>
       <p className="credential-list-summary" role="status">{listPresentation === 'loading' ? t('credentials.loadingList') : listPresentation === 'loading-more' ? t('credentials.loadingMore', { count: formatNumber(values.length, locale) }) : listPresentation === 'failed' ? t('credentials.loadFailed', { count: formatNumber(values.length, locale) }) : listPresentation === 'filtered' ? t('credentials.filteredLoaded', { shown: formatNumber(filteredValues.length, locale), loaded: formatNumber(values.length, locale) }) : listPresentation === 'more' ? t('credentials.loadedMore', { count: formatNumber(values.length, locale) }) : t('credentials.loadedComplete', { count: formatNumber(values.length, locale) })}</p>
       {keyError && <div className="notice error" role="alert">{keyError}</div>}{routeError && <div className="notice error" role="alert">{routeError}</div>}{error && <div className="notice error" role="alert">{error}</div>}{credentialGroups.error && <div className="notice error" role="alert">{credentialGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{message && <div className="notice success" role="status">{message}</div>}
@@ -982,14 +971,8 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
         const memberships = credentialGroups.groups.filter((group) => group.member_ids.includes(value.key_id));
         return <div className="managed-resource" key={value.key_id}><div className="managed-resource-header"><div><b>{value.alias}</b><small>{value.key_id}</small><span>{!tenant && <>{t('credentials.tenant')}: {value.tenant_external_id ?? '—'} · </>}{value.principal_external_id ?? t('common.unknownPrincipal')} · {formatCurrency(value.available_balance, value.currency, locale)}</span></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div>
           <div className="credential-recovery-control">
-            {value.credential_recovery_available && value.status === 'active'
-              ? <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={() => void copyRecoveredCredential(value)}>{busy === `copy-${value.key_id}` ? t('common.loading') : t('credentials.copy')}</button>
-              : <span className="pill credential-recovery-unavailable" title={t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}>{t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}</span>}
-            {manualRecoverySecret?.keyId === value.key_id && <div className="credential-recovery-manual" role="status">
-              <b>{t('credentials.copyManual')}</b>
-              <code>{manualRecoverySecret.key}</code>
-              <button type="button" className="secondary" onClick={() => setManualRecoverySecret(undefined)}>{t('common.close')}</button>
-            </div>}
+            <span className="pill credential-recovery-unavailable" title={t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}>{t(value.status === 'revoked' ? 'credentials.copyRevoked' : value.status === 'suspended' ? 'credentials.copySuspended' : 'credentials.copyNotStored')}</span>
+            {value.status !== 'revoked' && <button type="button" className="secondary" disabled={!canManage(value) || Boolean(busy)} onClick={() => void rotateCredential(value)}>{t('credentials.rotateToCopy')}</button>}
           </div>
           {memberships.length > 0 && <div className="table-chip-list credential-group-chips" aria-label={t('groups.credential.title')}>{memberships.map((group) => <span key={group.id}>{group.name}</span>)}</div>}
           <div className="policy-chips"><span>{enumLabel(t, 'enforcementMode', value.policy.enforcement_mode)}</span><span>RPM {formatNumber(value.policy.requests_per_minute, locale)}</span><span>TPM {formatNumber(value.policy.tokens_per_minute, locale)}</span><span>{t('self.concurrency')} {formatNumber(value.policy.max_concurrency, locale)}</span><span>{t('budget.daily')}: {value.policy.daily_budget === null ? '—' : formatCurrency(value.policy.daily_budget, value.currency, locale)}</span><span>{t('budget.weekly')}: {value.policy.weekly_budget === null ? '—' : formatCurrency(value.policy.weekly_budget, value.currency, locale)}</span><span>{t('budget.lifetime')}: {value.policy.lifetime_budget === null ? '—' : formatCurrency(value.policy.lifetime_budget, value.currency, locale)}</span></div>
