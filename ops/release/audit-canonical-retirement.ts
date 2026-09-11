@@ -10,7 +10,45 @@ import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
-import { parseStrictJson } from "../lib/strict-json.ts";
+
+/** Minimal strict JSON parser: JSON.parse accepts duplicate object fields,
+ * which would let a receipt hide a failing value behind a later one. */
+class StrictJsonReader {
+  #offset = 0;
+  readonly #text: string;
+  constructor(text: string) { this.#text = text; }
+  parse(): unknown { const value = this.value(); this.space(); if (this.#offset !== this.#text.length) throw new Error("trailing JSON data"); return value; }
+  private space(): void { while (/\s/u.test(this.#text[this.#offset] ?? "")) this.#offset += 1; }
+  private value(): unknown {
+    this.space(); const current = this.#text[this.#offset];
+    if (current === "{") return this.object(); if (current === "[") return this.array(); if (current === "\"") return this.string();
+    if (this.#text.startsWith("true", this.#offset)) { this.#offset += 4; return true; }
+    if (this.#text.startsWith("false", this.#offset)) { this.#offset += 5; return false; }
+    if (this.#text.startsWith("null", this.#offset)) { this.#offset += 4; return null; }
+    const number = this.#text.slice(this.#offset).match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/u)?.[0];
+    if (!number) throw new Error("invalid JSON value"); this.#offset += number.length;
+    const result = Number(number); if (!Number.isFinite(result)) throw new Error("invalid JSON number"); return result;
+  }
+  private object(): Record<string, unknown> {
+    this.#offset += 1; this.space(); const result: Record<string, unknown> = {}; const names = new Set<string>();
+    if (this.#text[this.#offset] === "}") { this.#offset += 1; return result; }
+    while (true) {
+      this.space(); if (this.#text[this.#offset] !== "\"") throw new Error("object key expected"); const key = this.string();
+      if (names.has(key)) throw new Error("duplicate JSON key"); names.add(key); this.space(); if (this.#text[this.#offset] !== ":") throw new Error("object colon expected"); this.#offset += 1; result[key] = this.value(); this.space();
+      const separator = this.#text[this.#offset]; if (separator === "}") { this.#offset += 1; return result; } if (separator !== ",") throw new Error("object separator expected"); this.#offset += 1;
+    }
+  }
+  private array(): unknown[] {
+    this.#offset += 1; this.space(); const result: unknown[] = []; if (this.#text[this.#offset] === "]") { this.#offset += 1; return result; }
+    while (true) { result.push(this.value()); this.space(); const separator = this.#text[this.#offset]; if (separator === "]") { this.#offset += 1; return result; } if (separator !== ",") throw new Error("array separator expected"); this.#offset += 1; }
+  }
+  private string(): string {
+    const start = this.#offset; this.#offset += 1;
+    while (this.#offset < this.#text.length) { const current = this.#text[this.#offset++]!; if (current === "\"") { const encoded = this.#text.slice(start, this.#offset); const decoded: unknown = JSON.parse(encoded); if (typeof decoded !== "string") throw new Error("invalid JSON string"); return decoded; } if (current === "\\") { const escaped = this.#text[this.#offset++]; if (escaped === "u") this.#offset += 4; else if (!escaped || !'"\\/bfnrt'.includes(escaped)) throw new Error("invalid JSON escape"); } else if (current < " ") throw new Error("control character in JSON string"); }
+    throw new Error("unterminated JSON string");
+  }
+}
+function parseStrictJson(text: string): unknown { return new StrictJsonReader(text).parse(); }
 
 const MAX_RECEIPT_BYTES = 1024 * 1024;
 const SHA256 = /^[0-9a-f]{64}$/u;
