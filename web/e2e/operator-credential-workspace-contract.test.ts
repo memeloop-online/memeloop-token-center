@@ -99,7 +99,10 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     await plaintext.goto(fixture('service-plaintext'));
     await plaintext.getByText('Existing service credential', { exact: true }).waitFor();
     const create = plaintext.getByRole('button', { name: 'Create service credential', exact: true });
-    await create.evaluate((button) => { button.click(); button.click(); });
+    await create.evaluate((button) => {
+      (button as HTMLButtonElement).click();
+      (button as HTMLButtonElement).click();
+    });
     await plaintext.waitForFunction(() => window.credentialFixture.requests.filter((request) => request.method === 'POST' && request.path === '/internal/v1/service-tokens').length === 1);
     await plaintext.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_first'));
     await plaintext.getByText('mts_service_secret_first', { exact: true }).waitFor();
