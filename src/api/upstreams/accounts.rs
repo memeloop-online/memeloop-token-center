@@ -431,7 +431,7 @@ pub(in crate::api) async fn set_upstream_status(
             ));
         }
         let driver = &account_before_status.driver;
-        if !state.providers.is_public(&driver) {
+        if !state.providers.is_public(driver) {
             return Err(AppError::BadRequest(
                 "retired upstream providers cannot be enabled".into(),
             ));
