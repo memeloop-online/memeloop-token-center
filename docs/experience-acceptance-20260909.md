@@ -60,6 +60,10 @@ protocol probes are distinct evidence. An inaccessible screen remains unverified
   Restoring encrypted originals requires exact source-key identity reconciliation.
 - Overview is a windowed top-ten account/model traffic list, not a current
   provider catalog. Repeated display names need exact runtime identity evidence.
+  The 2026-09-11 replica inventory found only three active target accounts
+  (two native Codex OAuth and one HTTP JSON), with no native Kimi, Copilot, or
+  Cursor account. This is an unresolved migration gap, not a dashboard omission;
+  see `docs/operations/upstream-inventory-gap-20260911.md`.
 - Canonical Operator returned 403 from the current source. No allowlist/network
   changes are authorized as a substitute for real acceptance.
 - A successful Sol SSE request still reported incomplete archive content.
