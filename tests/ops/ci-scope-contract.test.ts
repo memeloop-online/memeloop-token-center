@@ -19,9 +19,16 @@ function scopes(event: 'pull_request' | 'push', paths: string[]): Record<string,
   }
 }
 
-test('memory acceptance scope skips only reviewed non-binary paths', () => {
+test('memory acceptance skips non-binary and ordinary test-only pull requests', () => {
   assert.deepEqual(
-    scopes('pull_request', ['docs/performance.md', 'web/src/App.tsx', 'charts/memeloop-token-center/values.yaml']),
+    scopes('pull_request', [
+      'README.md',
+      'docs/performance.md',
+      'web/src/App.tsx',
+      'charts/memeloop-token-center/values.yaml',
+      'tests/ops/readme-canonical-contract.test.ts',
+      'tests/route_management.rs',
+    ]),
     { memory: 'false', plugin_installer: 'false' },
   );
   for (const path of [
@@ -35,6 +42,12 @@ test('memory acceptance scope skips only reviewed non-binary paths', () => {
     'schemas/core-config.schema.json',
     'wit/policy.wit',
     'vendor/rust_decimal/src/lib.rs',
+    'tests/load/test-benchmark-memory.ts',
+    'ops/benchmark-memory.ts',
+    'ops/benchmark-stream-barrier.ts',
+    'ops/benchmark-soak-diagnostics.ts',
+    '.github/workflows/ci.yml',
+    '.github/workflows/memory-acceptance.yml',
     'future-runtime-input.txt',
   ]) {
     assert.equal(scopes('pull_request', [path]).memory, 'true', `${path} must run memory acceptance`);
