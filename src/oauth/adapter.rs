@@ -77,10 +77,9 @@ pub async fn normalize_managed_oauth_document(
         }
         ManagedOAuthAdapterBackend::BuiltinCodex => {
             let mut normalized = managed::codex::normalize(payload)?;
-            let (credential, _) = managed::codex::restore_remote_dns_proxy(normalized.credential)
-                .map_err(|_| {
-                    AppError::BadRequest("Codex OAuth document is invalid".into())
-                })?;
+            let (credential, _) =
+                managed::codex::restore_remote_dns_proxy(normalized.credential)
+                    .map_err(|_| AppError::BadRequest("Codex OAuth document is invalid".into()))?;
             normalized.credential = credential;
             if normalized.credential.proxy().is_none() {
                 // Compatibility imports remain inspectable but can neither
