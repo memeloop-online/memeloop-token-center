@@ -25,8 +25,7 @@ test('all maintained model selectors share the same picker without replacing cat
     assert.match(await readFile(new URL(`../src/${path}`, import.meta.url), 'utf8'), /<ModelPicker/);
   }
   const upstream = await readFile(new URL('../src/operator/UpstreamModelCombobox.tsx', import.meta.url), 'utf8');
-  assert.match(upstream, /selected\.complete_coverage \|\| partialConfirmed/);
-  assert.match(upstream, /needsCustomConfirmation && customAllowed && customConfirmed/);
+  assert.match(upstream, /modelConfirmationValidity\(/);
   assert.match(upstream, /Math\.min\(4, ids\.length\)/);
   const picker = await readFile(new URL('../src/ModelPicker.tsx', import.meta.url), 'utf8');
   assert.match(picker, /popover="auto"/);

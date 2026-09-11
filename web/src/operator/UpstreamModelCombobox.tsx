@@ -4,6 +4,7 @@ import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
 import { ModelPicker, type ModelPickerOption } from '../ModelPicker';
 import type { UpstreamAccount } from '../types';
+import { confirmationForScope, modelConfirmationValidity } from './modelConfirmation';
 
 interface CatalogModel {
   id: string;
@@ -60,10 +61,11 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
   // Persisted consent applies only to the scope first opened for editing.
   // Never restore that prop after an account, group, membership or model change.
   const [customConfirmation, setCustomConfirmation] = useState({ scope: confirmationScope, confirmed: customModelConfirmed });
-  const customConfirmed = customConfirmation.scope === confirmationScope && customConfirmation.confirmed;
+  const scopedConfirmation = confirmationForScope(customConfirmation, confirmationScope);
+  const customConfirmed = scopedConfirmation.confirmed;
   const setCustomConfirmed = (confirmed: boolean) => setCustomConfirmation({ scope: confirmationScope, confirmed });
   useLayoutEffect(() => {
-    if (customConfirmation.scope !== confirmationScope) setCustomConfirmed(false);
+    if (customConfirmation.scope !== confirmationScope) setCustomConfirmation(scopedConfirmation);
   }, [confirmationScope, customConfirmation.scope]);
   const [partialConfirmed, setPartialConfirmed] = useState(false);
   const [refreshVersion, setRefreshVersion] = useState(0);
@@ -131,14 +133,13 @@ export function UpstreamModelCombobox({ token, tenant, accountIds, includedProvi
     && (!value.trim() || model.id.toLowerCase().includes(value.trim().toLowerCase()))), [catalog, protocol, value]);
   const selected = catalog?.data.find((model) => model.id === value && (model.protocol === protocol || model.protocol === 'any'));
   const catalogFresh = Boolean(catalog && catalog.unknown_account_count === 0 && catalog.stale_account_count === 0);
-  const selectedValid = Boolean(selected && catalogFresh && (selected.complete_coverage || partialConfirmed));
   // A model returned by a stale or incomplete catalog is not verified. For
   // an exact account selection, keep the explicit custom-model escape hatch
   // available instead of leaving the form in a state with neither a usable
   // confirmation nor a valid submit button while synchronization settles.
-  const needsCustomConfirmation = Boolean(value.trim() && (!selected || !catalogFresh));
-  const allowCustom = Boolean(needsCustomConfirmation && customAllowed && customConfirmed);
-  const valid = Boolean(selectedValid || allowCustom);
+  const { needsCustomConfirmation, allowCustom, valid } = modelConfirmationValidity({
+    hasValue: Boolean(value.trim()), selected, catalogFresh, partialConfirmed, customAllowed, customConfirmed,
+  });
   useLayoutEffect(() => validityCallback.current(valid, allowCustom), [valid, allowCustom]);
 
   const choose = (model: CatalogModel) => {
