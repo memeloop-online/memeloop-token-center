@@ -370,12 +370,10 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const imageCatalogResponse = await imageCatalogResponsePromise;
   assert.equal(imageCatalogResponse.status(), 200, await imageCatalogResponse.text());
   const imageCustomModelConfirmation = routeForm.getByRole('checkbox', { name: /我确认将.*用于全部明确选择的上游，允许目录未验证的账号参与路由/ });
-  const imagePartialCoverageConfirmation = routeForm.getByRole('checkbox', { name: /个候选目录已收录此模型；我确认仅让目录已收录它的上游参与路由/ });
   const createImageRouteButton = routeForm.getByRole('button', { name: '创建路由', exact: true });
   await eventually(async () => {
     assert.ok(
       await imageCustomModelConfirmation.isVisible()
-        || await imagePartialCoverageConfirmation.isVisible()
         || await createImageRouteButton.isEnabled(),
       'image route must be catalogued or offer the applicable model confirmation',
     );
@@ -385,7 +383,6 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
     assert.equal(await createImageRouteButton.isEnabled(), false, 'unverified models require explicit confirmation before saving');
     await imageCustomModelConfirmation.check();
   }
-  if (await imagePartialCoverageConfirmation.isVisible()) await imagePartialCoverageConfirmation.check();
   await eventually(async () => assert.equal(await createImageRouteButton.isEnabled(), true), 30_000,
     'the image route did not become valid after selecting its upstream model');
   const imageRouteResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
@@ -448,12 +445,10 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
   const videoCatalogResponse = await videoCatalogResponsePromise;
   assert.equal(videoCatalogResponse.status(), 200, await videoCatalogResponse.text());
   const customModelConfirmation = routeForm.getByRole('checkbox', { name: /我确认将.*用于全部明确选择的上游，允许目录未验证的账号参与路由/ });
-  const partialCoverageConfirmation = routeForm.getByRole('checkbox', { name: /个候选目录已收录此模型；我确认仅让目录已收录它的上游参与路由/ });
   const createVideoRouteButton = routeForm.getByRole('button', { name: '创建路由', exact: true });
   await eventually(async () => {
     assert.ok(
       await customModelConfirmation.isVisible()
-        || await partialCoverageConfirmation.isVisible()
         || await createVideoRouteButton.isEnabled(),
       'the video route must be catalogued or offer the applicable model confirmation',
     );
@@ -463,7 +458,6 @@ When('管理员通过真实控件创建多模态上游、价格、路由和凭�
     assert.equal(await createVideoRouteButton.isEnabled(), false, 'unverified models require explicit confirmation before saving');
     await customModelConfirmation.check();
   }
-  if (await partialCoverageConfirmation.isVisible()) await partialCoverageConfirmation.check();
   await eventually(async () => assert.equal(await createVideoRouteButton.isEnabled(), true), 30_000,
     'the video route did not become valid after selecting its upstream model');
   const routeResponsePromise = page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST');
