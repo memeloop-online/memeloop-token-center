@@ -18,7 +18,7 @@ pub(super) use admission::{
 };
 pub(super) use candidates::{
     CandidatePreparationSummary, candidate_reservation_bounds, exhausted_candidate_error,
-    next_planned_proxy_candidate,
+    next_planned_proxy_candidate, prepared_input_reservation_bound,
 };
 pub(super) use clock::credential_application_now;
 #[cfg(test)]
@@ -78,6 +78,15 @@ impl PlannedProxyRoute {
 impl PreparedProxyRoute {
     pub(super) fn is_codex(&self) -> bool {
         codex_transport::is_driver(&self.route.driver)
+    }
+
+    pub(super) fn request_body_ceiling(&self, original_body_length: usize) -> usize {
+        original_body_length.max(self.forwarded_body.len()).max(
+            self.component_request
+                .as_ref()
+                .map(|(request, _)| request.body.len())
+                .unwrap_or_default(),
+        )
     }
 }
 

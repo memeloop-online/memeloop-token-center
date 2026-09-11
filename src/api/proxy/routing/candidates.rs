@@ -16,19 +16,36 @@ pub(in crate::api::proxy) fn candidate_reservation_bounds(
             )
         })?;
     let request_body_ceiling = planned.request_body_ceiling(original_body_length)?;
+    let candidate_ceiling = input_reservation_bound(&planned.route, request_body_ceiling)?;
+    Ok((candidate_ceiling, candidate_output_token_ceiling))
+}
+
+pub(in crate::api::proxy) fn prepared_input_reservation_bound(
+    prepared: &PreparedProxyRoute,
+    original_body_length: usize,
+) -> Result<i64, AppError> {
+    input_reservation_bound(
+        &prepared.route,
+        prepared.request_body_ceiling(original_body_length),
+    )
+}
+
+fn input_reservation_bound(
+    route: &ResolvedUpstream,
+    request_body_ceiling: usize,
+) -> Result<i64, AppError> {
     let body_ceiling = i64::try_from(request_body_ceiling).unwrap_or(i64::MAX);
-    let candidate_ceiling = body_ceiling
+    body_ceiling
         .checked_add(trusted_input_token_overhead_ceiling(
-            Some(&planned.route.driver),
-            Some(&planned.route.config),
+            Some(&route.driver),
+            Some(&route.config),
         )?)
         .filter(|ceiling| *ceiling <= MAX_REPORTED_TOKENS)
         .ok_or_else(|| {
             AppError::Upstream(
                 "upstream input token reservation is outside the supported range".into(),
             )
-        })?;
-    Ok((candidate_ceiling, candidate_output_token_ceiling))
+        })
 }
 
 #[derive(Default)]
@@ -130,4 +147,60 @@ pub(in crate::api::proxy) fn exhausted_candidate_error(
         validate_openai_chat_choice_count(request_json)?;
     }
     Ok(AppError::Overloaded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_component_body_expands_the_input_reservation_bound() {
+        const ORIGINAL_BODY_LENGTH: usize = 64;
+        const REPORTED_INPUT_TOKENS: i64 = 4_096;
+        const PREPARED_BODY_LENGTH: usize = 8_192;
+
+        let prepared = PreparedProxyRoute {
+            route: ResolvedUpstream {
+                route_id: Uuid::nil(),
+                account_id: Uuid::nil(),
+                transport_revision: 1,
+                credential_generation: 1,
+                driver: "component-test".into(),
+                base_url: "https://example.com".into(),
+                config: json!({}),
+                upstream_model: "component-model".into(),
+                credential: UpstreamCredential::None,
+            },
+            forwarded_body: b"{}".to_vec(),
+            upstream_stream: false,
+            codex_downstream_stream: false,
+            codex_store_disabled: false,
+            codex_session_id: None,
+            component_request: Some((
+                PreparedProviderRequest {
+                    method: reqwest::Method::POST,
+                    path: "/infer".into(),
+                    headers: Default::default(),
+                    body: vec![b'x'; PREPARED_BODY_LENGTH],
+                },
+                RequestContext {
+                    tenant_id: "tenant".into(),
+                    principal_id: "principal".into(),
+                    key_id: "key".into(),
+                    protocol: "openai".into(),
+                    model: "public-model".into(),
+                    config_json: "{}".into(),
+                },
+            )),
+            kimi_response: None,
+        };
+
+        let initial_bound = input_reservation_bound(&prepared.route, ORIGINAL_BODY_LENGTH).unwrap();
+        let prepared_bound =
+            prepared_input_reservation_bound(&prepared, ORIGINAL_BODY_LENGTH).unwrap();
+
+        assert!(REPORTED_INPUT_TOKENS > initial_bound);
+        assert!(REPORTED_INPUT_TOKENS <= prepared_bound);
+        assert_eq!(prepared_bound, PREPARED_BODY_LENGTH as i64);
+    }
 }

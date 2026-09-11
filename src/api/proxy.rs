@@ -33,7 +33,8 @@ use routing::{
     ProxyRequestContext, ProxyRoutePlanInput, ProxySendError, UpstreamAttemptGuard,
     UpstreamAttemptTerminal, candidate_reservation_bounds, exhausted_candidate_error,
     materialize_proxy_route, next_planned_proxy_candidate, plan_proxy_route,
-    prepare_admitted_proxy_route, refresh_route_snapshot, send_proxy_route,
+    prepare_admitted_proxy_route, prepared_input_reservation_bound, refresh_route_snapshot,
+    send_proxy_route,
 };
 use upstream_response::UpstreamResponse;
 
@@ -551,6 +552,76 @@ fn requested_service_tier(
     Ok(requested)
 }
 
+async fn execute_component_primary(
+    mut request: BufferedRequest<'_>,
+    key: &AuthenticatedKey,
+    price: &crate::model::ModelPrice,
+    mut primary: PlannedProxyRoute,
+    original_body_length: usize,
+) -> Result<Response, AppError> {
+    let readiness = match refresh_route_snapshot(request.state, &mut primary.route).await {
+        Ok(readiness) => readiness,
+        Err(error) => {
+            tracing::warn!(
+                request_id = %request.request_id,
+                upstream_account_id = %primary.route.account_id,
+                error = %error,
+                "current upstream credential is invalid"
+            );
+            return finish_proxy_failure(&request, "upstream_credential_invalid").await;
+        }
+    };
+    if readiness != PreparedRouteReadiness::Ready {
+        return finish_proxy_unavailable(&request, readiness.error_code()).await;
+    }
+    let mut active_route = match materialize_proxy_route(request.state, primary).await {
+        Ok(prepared) => prepared,
+        Err(_) => return finish_proxy_failure(&request, "provider_candidate_invalid").await,
+    };
+    let next_input_token_ceiling =
+        match prepared_input_reservation_bound(&active_route, original_body_length) {
+            Ok(ceiling) => ceiling,
+            Err(_) => return finish_proxy_failure(&request, "provider_candidate_invalid").await,
+        };
+    if next_input_token_ceiling != request.input_token_ceiling {
+        let assignment = (active_route.route.account_id, active_route.route.route_id);
+        let resized = match request
+            .state
+            .db
+            .switch_pending_proxy_candidate(SwitchProxyCandidateInput {
+                request_id: request.request_id,
+                tenant_id: request.tenant_id,
+                key,
+                price,
+                reservation: &request.reservation,
+                input_token_ceiling: next_input_token_ceiling,
+                output_token_ceiling: request.output_token_ceiling,
+                expected_assignment: assignment,
+                next_assignment: assignment,
+            })
+            .await
+        {
+            Ok(resized) => resized,
+            Err(_) => return finish_proxy_failure(&request, "provider_candidate_invalid").await,
+        };
+        request.reservation = resized;
+        request.input_token_ceiling = next_input_token_ceiling;
+    }
+    let Some((prepared, component_context)) = active_route.component_request.take() else {
+        return finish_proxy_failure(&request, "provider_candidate_invalid").await;
+    };
+    execute_component_provider(
+        request,
+        &active_route.route.driver,
+        &active_route.route.base_url,
+        &active_route.route.config,
+        &active_route.route.credential,
+        prepared,
+        component_context,
+    )
+    .await
+}
+
 pub(super) async fn proxy(
     state: AppState,
     headers: HeaderMap,
@@ -719,41 +790,8 @@ pub(super) async fn proxy(
         output_choice_count,
     } = route_plan;
     if primary.is_component() {
-        let readiness = match refresh_route_snapshot(&state, &mut primary.route).await {
-            Ok(readiness) => readiness,
-            Err(error) => {
-                tracing::warn!(
-                    %request_id,
-                    upstream_account_id = %primary.route.account_id,
-                    error = %error,
-                    "current upstream credential is invalid"
-                );
-                return finish_proxy_failure(&buffered_request, "upstream_credential_invalid")
-                    .await;
-            }
-        };
-        if readiness != PreparedRouteReadiness::Ready {
-            return finish_proxy_unavailable(&buffered_request, readiness.error_code()).await;
-        }
-        let mut active_route = match materialize_proxy_route(&state, primary).await {
-            Ok(prepared) => prepared,
-            Err(_) => {
-                return finish_proxy_failure(&buffered_request, "provider_candidate_invalid").await;
-            }
-        };
-        let Some((prepared, component_context)) = active_route.component_request.take() else {
-            return finish_proxy_failure(&buffered_request, "provider_candidate_invalid").await;
-        };
-        return execute_component_provider(
-            buffered_request,
-            &active_route.route.driver,
-            &active_route.route.base_url,
-            &active_route.route.config,
-            &active_route.route.credential,
-            prepared,
-            component_context,
-        )
-        .await;
+        return execute_component_primary(buffered_request, &key, &price, primary, body.len())
+            .await;
     }
     let mut planned_candidate = Some(primary);
     let mut route_candidates = remaining_candidates;
