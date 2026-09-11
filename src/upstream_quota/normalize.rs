@@ -218,6 +218,9 @@ mod tests {
             reset_capability: ResetCapability {
                 provider_supported: Some(true),
                 implementation_available: false,
+                prepare_available: false,
+                confirmation_required: false,
+                retryable: false,
                 available_credits: None,
                 applicable_credits: None,
                 reason: "reset_workflow_not_implemented",
@@ -289,6 +292,46 @@ mod tests {
             stale_or_error(Some(old), error, STALE_MS + 2000)
                 .observed_at
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn only_explicit_allowed_codex_window_is_recovery_evidence() {
+        let mut result = snapshot();
+        result.status = "ready";
+        usage(
+            &mut result,
+            &json!({
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {"used_percent": 42}
+                }
+            }),
+            1_000,
+        )
+        .unwrap();
+        assert!(result.conclusively_allows_codex());
+        result.windows[0].allowed = None;
+        assert!(
+            !result.conclusively_allows_codex(),
+            "unknown availability must not clear an exhausted cooldown"
+        );
+        result.windows[0].allowed = Some(true);
+        result.windows[0].limit_reached = Some(true);
+        assert!(
+            !result.conclusively_allows_codex(),
+            "explicit exhaustion wins over the allowed flag"
+        );
+        result.windows[0].limit_reached = None;
+        assert!(
+            result.conclusively_allows_codex(),
+            "explicit allowed evidence is conclusive when exhaustion is not explicitly reported"
+        );
+        result.stale = true;
+        assert!(
+            !result.conclusively_allows_codex(),
+            "cached observations cannot mutate routing health"
         );
     }
 }

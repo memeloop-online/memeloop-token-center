@@ -723,6 +723,25 @@ mod tests {
         assert_eq!(page[0].tiers.len(), 1);
         assert_eq!(page[0].tiers[0].service_tier, "default");
 
+        let first = database
+            .list_model_prices_after("USD", 1, "")
+            .await
+            .expect("first keyset model price page");
+        let second = database
+            .list_model_prices_after("USD", 1, &first[0].model)
+            .await
+            .expect("second keyset model price page");
+        assert_eq!(first[0].model, "model-a");
+        assert_eq!(second[0].model, "model-b");
+        assert_eq!(second[0].tiers[0].service_tier, "default");
+        assert!(
+            database
+                .list_model_prices_after("USD", 1, &second[0].model)
+                .await
+                .expect("exhausted keyset page")
+                .is_empty()
+        );
+
         let error = database
             .list_model_prices_page("USD", 1_001, 0)
             .await

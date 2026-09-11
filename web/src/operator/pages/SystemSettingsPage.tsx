@@ -60,6 +60,8 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
   const [loadError, setLoadError] = useState('');
   const [message, setMessage] = useState('');
   const loadSequence = useRef(0);
+  const assistantOptions = routeModelOptions(routes, upstreams, groups, t('modelPicker.unknown'), 'route');
+  const selectedRouteHasAvailableCandidate = !selectedRouteId || assistantOptions.some((option) => option.value === selectedRouteId && !option.disabled);
 
   const load = useCallback(async () => {
     const request = ++loadSequence.current;
@@ -123,9 +125,9 @@ export function SystemSettingsPage({ token, tenant }: { token: string; tenant: s
           </div>
           {settings && <span className="status ok">{t('settings.configured')}</span>}
         </div>
-        {loading ? <div className="empty" role="status">{t('common.loading')}</div> : loadError ? <div className="settings-empty"><button type="button" className="secondary" onClick={() => void load()}>{t('common.retry')}</button></div> : routes.length === 0 ? <div className="settings-empty"><b>{t('settings.noEnabledRoute')}</b><span>{t('settings.noEnabledRouteHint')}</span></div> : <form className="system-settings-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
-          <div><ModelPicker label={t('settings.filterAssistantRoute')} value={selectedRouteId} onChange={setSelectedRouteId} disabled={saving} options={routeModelOptions(routes, upstreams, groups, t('modelPicker.unknown'), 'route')} /><small>{t('settings.filterAssistantRouteHint')}</small></div>
-          <button type="submit" disabled={saving || !selectedRouteId}>{saving ? t('common.loading') : t('common.save')}</button>
+        {loading ? <div className="empty" role="status">{t('common.loading')}</div> : loadError ? <div className="settings-empty" role="alert"><b>{t('settings.filterAssistantLoadFailed')}</b><span>{loadError}</span><button type="button" className="secondary" onClick={() => void load()}>{t('common.retry')}</button></div> : routes.length === 0 ? <div className="settings-empty"><b>{t('settings.noEnabledRoute')}</b><span>{t('settings.noEnabledRouteHint')}</span></div> : <form className="system-settings-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
+          <div><ModelPicker label={t('settings.filterAssistantRoute')} popupLabel={t('settings.filterAssistantRoute')} value={selectedRouteId} onChange={setSelectedRouteId} disabled={saving} options={assistantOptions} describedBy="filter-assistant-route-hint" /><small id="filter-assistant-route-hint">{t('settings.filterAssistantRouteHint')}</small>{selectedRouteId && !selectedRouteHasAvailableCandidate && <small className="error-text" role="alert">{t('settings.filterAssistantRouteUnavailable')}</small>}</div>
+          <button type="submit" disabled={saving || !selectedRouteId || !selectedRouteHasAvailableCandidate}>{saving ? t('common.loading') : t('common.save')}</button>
         </form>}
         {settings === null && !loadError && <p className="settings-status-note">{t('settings.filterAssistantNotConfigured')}</p>}
       </article>

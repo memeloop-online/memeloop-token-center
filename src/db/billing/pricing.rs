@@ -264,6 +264,31 @@ impl Database {
         model_price_views_from_joined_rows(rows)
     }
 
+    pub async fn list_model_prices_after(
+        &self,
+        currency: &str,
+        limit: usize,
+        after_model: &str,
+    ) -> Result<Vec<ModelPriceView>, AppError> {
+        validate_currency(currency)?;
+        if limit == 0 || limit > Self::MAX_LISTED_MODEL_PRICES as usize {
+            return Err(AppError::BadRequest(format!(
+                "model price page limit must be between 1 and {}",
+                Self::MAX_LISTED_MODEL_PRICES
+            )));
+        }
+        let limit = i64::try_from(limit).map_err(|_| AppError::Internal)?;
+        let rows = sqlx::query(
+            "WITH limited_prices AS (SELECT model, currency, input_micros_per_million, output_micros_per_million, source, updated_at FROM model_prices WHERE currency = $1 AND model > $2 ORDER BY model ASC LIMIT $3) SELECT p.model, p.currency, p.input_micros_per_million, p.output_micros_per_million, p.source, p.updated_at, t.service_tier AS tier_service_tier, t.input_micros_per_million AS tier_input_micros_per_million, t.cached_input_micros_per_million AS tier_cached_input_micros_per_million, t.cache_write_micros_per_million AS tier_cache_write_micros_per_million, t.output_micros_per_million AS tier_output_micros_per_million, t.source AS tier_source, t.updated_at AS tier_updated_at, t.cache_price_estimated AS tier_cache_price_estimated FROM limited_prices p LEFT JOIN model_price_tiers t ON t.model = p.model AND t.currency = p.currency ORDER BY p.model ASC, CASE WHEN t.service_tier = 'default' THEN 0 ELSE 1 END, t.service_tier",
+        )
+        .bind(currency.to_uppercase())
+        .bind(after_model)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        model_price_views_from_joined_rows(rows)
+    }
+
     pub async fn model_price_views_for_models(
         &self,
         currency: &str,

@@ -103,11 +103,24 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         Some(ResponsesSseOutcome::Incomplete) => Some("upstream_incomplete_response"),
         Some(ResponsesSseOutcome::Completed { .. }) | None => None,
     };
-    let mut terminal_status = status_code;
-    let mut error_code = transport_error.or(protocol_error);
-    if error_code.is_some() {
-        terminal_status = 502;
-    }
+    let (mut terminal_status, mut error_code) = match transport_error {
+        // 499 is an operator receipt for a downstream that closed its body.
+        // It is never sent on the wire because the HTTP response was already
+        // admitted, but it keeps client cancellation out of upstream 5xx
+        // availability metrics and request history.
+        Some("downstream_disconnected") => (499, Some("client_cancelled")),
+        // A live but persistently unread downstream is also local evidence,
+        // not an upstream failure.
+        Some("downstream_backpressure") => (504, Some("downstream_backpressure")),
+        // Delivery state is owned by this service's database. Classify its
+        // failure as internal while retaining the stable diagnostic code.
+        Some("delivery_state") => (500, Some("delivery_state")),
+        Some(error) => (502, Some(error)),
+        None => match protocol_error {
+            Some(error) => (502, Some(error)),
+            None => (status_code, None),
+        },
+    };
     let full_contract_usage = || TokenUsage {
         input_tokens: input_token_ceiling,
         output_tokens: output_token_ceiling,

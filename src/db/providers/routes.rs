@@ -1,6 +1,7 @@
 use super::super::routing::{
     bump_credential_grant_revisions, bump_route_group_relation_timestamps,
-    ensure_route_has_eligible_candidate, lock_routing_relation_writes,
+    ensure_explicit_custom_reservation_bounds, ensure_route_has_eligible_candidate,
+    lock_routing_relation_writes,
 };
 use super::super::*;
 
@@ -151,6 +152,13 @@ impl Database {
                 "another route already uses this public model, protocol, and priority".into(),
             ));
         }
+        ensure_explicit_custom_reservation_bounds(
+            &mut tx,
+            &tenant_id,
+            input.upstream_model.trim(),
+            &[input.upstream_account_id],
+        )
+        .await?;
         sqlx::query("INSERT INTO model_route_upstream_accounts (tenant_id, model_route_id, upstream_account_id, upstream_model, scheduling_weight, created_at, catalog_policy) VALUES ($1, $2, $3, $4, 100, $5, 'explicit_custom')")
             .bind(&tenant_id).bind(route_id.to_string()).bind(input.upstream_account_id.to_string())
             .bind(input.upstream_model.trim()).bind(now).execute(&mut *tx).await?;
@@ -257,6 +265,13 @@ impl Database {
                 "reload the model route before saving it again".into(),
             ));
         }
+        ensure_explicit_custom_reservation_bounds(
+            &mut tx,
+            &tenant_id,
+            upstream_model,
+            &[input.upstream_account_id],
+        )
+        .await?;
         sqlx::query("DELETE FROM model_route_upstream_accounts WHERE tenant_id = $1 AND model_route_id = $2")
             .bind(&tenant_id).bind(route_id.to_string()).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO model_route_upstream_accounts (tenant_id, model_route_id, upstream_account_id, upstream_model, scheduling_weight, created_at, catalog_policy) VALUES ($1, $2, $3, $4, 100, $5, 'explicit_custom')")

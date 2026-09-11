@@ -144,6 +144,62 @@ async fn invariants(database: &Database, peer: &Database) {
         .bind(account.to_string()).fetch_one(&database.pool).await.unwrap();
     assert_eq!(row.get::<i64, _>("cooldown_until"), long);
     assert_eq!(row.get::<String, _>("last_failure_kind"), "quota_exhausted");
+    let recovery_fence = database
+        .upstream_quota_recovery_fence(account, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        database
+            .recover_upstream_quota_from_observation(account, 1, recovery_fence)
+            .await
+            .unwrap(),
+        "fresh supplier evidence clears the matching exhausted generation"
+    );
+    assert_eq!(
+        database
+            .claim_upstream_account_attempt(account, 1)
+            .await
+            .unwrap(),
+        UpstreamAttemptAdmission::Healthy
+    );
+    database
+        .record_upstream_account_failure(
+            account,
+            1,
+            UpstreamFailureKind::RateLimitedUntil {
+                until: long,
+                exhausted: true,
+            },
+        )
+        .await
+        .unwrap();
+    let stale_fence = recovery_fence;
+    assert!(
+        !peer
+            .recover_upstream_quota_from_observation(account, 1, stale_fence)
+            .await
+            .unwrap(),
+        "an observation that began before the current failure cannot clear it"
+    );
+    database
+        .record_upstream_account_failure(account, 1, UpstreamFailureKind::Connection)
+        .await
+        .unwrap();
+    assert!(
+        peer.upstream_quota_recovery_fence(account, 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "non-quota failures do not produce recovery fences"
+    );
+    assert!(
+        !peer
+            .recover_upstream_quota_from_observation(account, 1, stale_fence)
+            .await
+            .unwrap(),
+        "quota evidence cannot erase an unrelated transport failure"
+    );
     sqlx::query("UPDATE upstream_accounts SET credential_generation = 2 WHERE id = $1")
         .bind(account.to_string())
         .execute(&database.pool)

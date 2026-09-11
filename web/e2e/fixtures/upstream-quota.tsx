@@ -18,7 +18,7 @@ const snapshot: UpstreamQuotaSnapshot = {
     { id: 'primary', label: 'Primary window', used_percent: 75, remaining: 25, limit: 100, reset_at: now + 3600_000, period_seconds: 18000, source: 'provider_usage', reset_is_estimated: false, allowed: true, limit_reached: false },
     { id: 'secondary', label: 'Weekly window', used_percent: null, remaining: null, limit: null, reset_at: null, period_seconds: 604800, source: 'provider_usage', reset_is_estimated: false, allowed: null, limit_reached: null },
   ],
-  reset_capability: { provider_supported: mode === 'unsupported' ? false : true, implementation_available: mode === 'reset' || mode === 'unknown', available_credits: 2, applicable_credits: 1, reason: null, credit_error_code: null },
+  reset_capability: { provider_supported: mode === 'unsupported' ? false : true, implementation_available: mode === 'reset' || mode === 'unknown', prepare_available: mode === 'reset' || mode === 'unknown', confirmation_required: mode === 'reset' || mode === 'unknown', retryable: false, available_credits: 2, applicable_credits: 1, reason: null, credit_error_code: null },
   error_code: null,
 };
 declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number } }

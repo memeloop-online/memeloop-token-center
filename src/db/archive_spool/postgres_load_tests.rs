@@ -239,6 +239,138 @@ async fn postgres_gc_nowait_rolls_back_deletes_when_producer_holds_budget() {
 }
 
 #[tokio::test]
+async fn postgres_gc_skips_a_locked_oldest_spool_and_cleans_the_next_one() {
+    let Some(fixture) = PgFixture::new().await else {
+        return;
+    };
+    assert!(
+        fixture
+            .db
+            .begin_response_archive_spool(fixture.id)
+            .await
+            .unwrap()
+    );
+    let second = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..fixture.id
+    };
+    sqlx::query("INSERT INTO request_records (id, tenant_id, reservation_id) VALUES ($1, $2, $3)")
+        .bind(second.request_id.to_string())
+        .bind(second.tenant_id.to_string())
+        .bind(second.reservation_id.to_string())
+        .execute(&fixture.db.pool)
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .db
+            .begin_response_archive_spool(second)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE response_archive_spools SET expires_at = CASE request_id WHEN $1 THEN -2 ELSE -1 END")
+        .bind(fixture.id.request_id.to_string())
+        .execute(&fixture.db.pool)
+        .await
+        .unwrap();
+    let mut blocker = fixture.db.pool.begin().await.unwrap();
+    sqlx::query("SELECT request_id FROM response_archive_spools WHERE request_id = $1 FOR UPDATE")
+        .bind(fixture.id.request_id.to_string())
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let cleaned = tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture
+            .db
+            .cleanup_response_archive_spools_for(32, Duration::from_millis(100)),
+    )
+    .await
+    .expect("GC must skip a locked spool instead of requiring task cancellation")
+    .unwrap();
+    assert_eq!(cleaned, 1);
+    let cleaned_id: String = sqlx::query_scalar(
+        "SELECT request_id FROM response_archive_spools WHERE cleaned_at IS NOT NULL",
+    )
+    .fetch_one(&fixture.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(cleaned_id, second.request_id.to_string());
+    assert_eq!(budget(&fixture.db).await, SPOOL_OVERHEAD);
+
+    blocker.rollback().await.unwrap();
+    assert_eq!(
+        fixture.db.cleanup_response_archive_spools(1).await.unwrap(),
+        1
+    );
+    assert_eq!(budget(&fixture.db).await, 0);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_cancelled_cleanup_caller_leaves_batch_owned_until_commit_finishes() {
+    let Some(fixture) = PgFixture::new().await else {
+        return;
+    };
+    assert!(
+        fixture
+            .db
+            .begin_response_archive_spool(fixture.id)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE response_archive_spools SET expires_at = 0")
+        .execute(&fixture.db.pool)
+        .await
+        .unwrap();
+    fixture.install_commit_barrier().await;
+    let mut blocker = fixture.admin.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(fixture.gate)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let db = fixture.db.clone();
+    fixture
+        .cancel_at_commit(tokio::spawn(async move {
+            db.cleanup_response_archive_spools_for(1, Duration::ZERO)
+                .await
+        }))
+        .await;
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(fixture.gate)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    drop(blocker);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cleaned: Option<i64> = sqlx::query_scalar(
+                "SELECT cleaned_at FROM response_archive_spools WHERE request_id = $1",
+            )
+            .bind(fixture.id.request_id.to_string())
+            .fetch_one(&fixture.db.pool)
+            .await
+            .unwrap();
+            if cleaned.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached cleanup batch must finish its blocked commit");
+    assert_eq!(budget(&fixture.db).await, 0);
+    assert_eq!(
+        fixture.db.cleanup_response_archive_spools(1).await.unwrap(),
+        0
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn postgres_batch_reader_obeys_limits_without_waiting_for_global_budget() {
     let Some(fixture) = PgFixture::new().await else {
         return;

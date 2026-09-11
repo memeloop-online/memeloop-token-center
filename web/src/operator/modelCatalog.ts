@@ -1,7 +1,11 @@
 import type { GroupView, ModelRouteView, UpstreamAccount } from '../types.js';
 
 export interface RouteModelOption {
-  key: string; value: string; label: string; provider: string; upstream: string; description: string;
+  key: string; value: string; label: string; providerGroup?: string; provider: string; upstream: string; description: string;
+  availability: 'available' | 'unavailable' | 'unknown';
+  health: 'unknown';
+  capabilities: string[];
+  disabled: boolean;
 }
 
 /** Preserve recorded public-model/route identity; never infer providers from model names. */
@@ -12,10 +16,20 @@ export function routeModelOptions(routes: ModelRouteView[], accounts: UpstreamAc
     const ids = [...new Set([...(route.upstream_account_ids ?? []), ...(route.upstream_account_id ? [route.upstream_account_id] : []), ...included])].filter((id) => !excluded.has(id));
     return (ids.length ? ids : ['']).map((id) => {
       const account = accounts.find((candidate) => candidate.id === id);
+      const memberships = groups.filter((group) => group.member_ids.includes(id));
+      const credentialExpired = account?.credential_expires_at !== null
+        && account?.credential_expires_at !== undefined
+        && account.credential_expires_at <= Date.now();
+      const available = Boolean(account && account.status === 'active' && !credentialExpired);
+      const availability: RouteModelOption['availability'] = account ? available ? 'available' : 'unavailable' : 'unknown';
       return {
         key: `${route.id}:${id}`, value: valueKind === 'route' ? route.id : route.public_model,
-        label: route.public_model, provider: account?.driver || unknown,
-        upstream: account?.name || unknown, description: `${route.upstream_model} · ${route.protocol}`,
+        label: route.public_model, providerGroup: memberships.map((group) => group.name).join(' · ') || undefined,
+        provider: account?.driver || unknown, upstream: account?.name || unknown, description: route.upstream_model,
+        availability,
+        // The route/settings endpoints contain configuration state only. Do
+        // not imply that selecting this field performed a health probe.
+        health: 'unknown' as const, capabilities: [route.protocol], disabled: !available,
       };
     });
   }).filter((option) => option.label.trim());

@@ -9,13 +9,25 @@
 .shared-model-popover { width: min(480px, calc(100vw - 16px)); }
 .shared-model-popover::backdrop, .typed-filter-dialog[popover]::backdrop { background: transparent; pointer-events: none; }
 .shared-model-popover > input { box-sizing: border-box; width: 100%; }
+.shared-model-popover h3 { border-bottom: 1px solid var(--picker-border); color: var(--picker-text); font-size: 14px; margin: 14px 0 7px; padding-bottom: 5px; }
 .shared-model-popover h4 { color: var(--picker-text); font-size: 13px; margin: 12px 0 6px; }
 .shared-model-popover h5 { color: var(--picker-muted); font-size: 12px; margin: 8px 0 4px; padding-left: 8px; }
 .shared-model-popover [role='option'] { background: transparent; border: 0; color: var(--picker-text); display: grid; gap: 4px; margin: 0; padding: 8px 12px; text-align: left; width: 100%; }
 .shared-model-popover [role='option']:is(:hover, .active, [aria-selected='true']) { background: var(--picker-hover); }
 .shared-model-popover small { color: var(--picker-muted); overflow-wrap: anywhere; }
 .shared-model-popover b { overflow-wrap: anywhere; }
+.shared-model-popover [role='option'].unavailable { cursor: not-allowed; opacity: .66; }
+.shared-model-popover [role='option'].unavailable:hover { background: transparent; }
+.model-picker-metadata { align-items: center; display: flex; flex-wrap: wrap; gap: 5px; }
+.model-picker-metadata small { border: 1px solid var(--picker-border); border-radius: 999px; font-size: 10px; padding: 2px 6px; }
+.model-picker-metadata .model-picker-availability.available { border-color: #368765; color: #6cd8ad; }
+.model-picker-metadata .model-picker-availability.unavailable, .model-picker-metadata .model-picker-health.unhealthy { border-color: #a35757; color: #ef9292; }
+.model-picker-metadata .model-picker-health.degraded { border-color: #a98744; color: #e3bd72; }
 .shared-model-picker :focus-visible, .shared-model-popover :focus-visible { outline: 2px solid var(--picker-border); outline-offset: 2px; }
+:root[data-theme='light'] .model-picker-metadata .model-picker-availability.available { border-color: #287553; color: #176543; }
+:root[data-theme='light'] .model-picker-metadata .model-picker-availability.unavailable,
+:root[data-theme='light'] .model-picker-metadata .model-picker-health.unhealthy { border-color: #a64b4b; color: #922f2f; }
+:root[data-theme='light'] .model-picker-metadata .model-picker-health.degraded { border-color: #916b27; color: #765114; }
 :root[data-theme='light'] .typed-filter-builder .filter-chip,
 :root[data-theme='light'] .typed-filter-dialog .filter-chip { background: var(--picker-hover); border-color: var(--picker-border); color: var(--picker-text); }
 :root[data-theme='light'] .model-combobox .custom-model-confirm { background: #fff8e5; border-color: #c7ac63; color: #685014; }

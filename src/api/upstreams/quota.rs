@@ -11,6 +11,30 @@ pub(in crate::api) struct QuotaQuery {
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct ResetConfirmation {
     confirmation_token: String,
+    confirmation: String,
+}
+
+fn quota_reset_idempotency_key(headers: &HeaderMap) -> Result<&str, AppError> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let value = values.next().ok_or_else(|| {
+        AppError::BadRequest("exactly one Idempotency-Key is required for quota reset".into())
+    })?;
+    if values.next().is_some() {
+        return Err(AppError::BadRequest(
+            "exactly one Idempotency-Key is required for quota reset".into(),
+        ));
+    }
+    let value = value.to_str().map_err(|_| {
+        AppError::BadRequest(
+            "Idempotency-Key must contain 1 to 200 visible ASCII characters".into(),
+        )
+    })?;
+    if value.is_empty() || value.len() > 200 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(AppError::BadRequest(
+            "Idempotency-Key must contain 1 to 200 visible ASCII characters".into(),
+        ));
+    }
+    Ok(value)
 }
 
 async fn reset_account(
@@ -45,6 +69,7 @@ pub(in crate::api) async fn prepare_quota_reset(
     Path(account_id): Path<Uuid>,
     Query(query): Query<QuotaQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    let idempotency_key = quota_reset_idempotency_key(&headers)?;
     let (account, credential, actor) = reset_account(&state, &headers, account_id, &query).await?;
     let result = crate::upstream_quota::reset::prepare(
         &state,
@@ -52,6 +77,7 @@ pub(in crate::api) async fn prepare_quota_reset(
         &credential,
         query.tenant_external_id.trim(),
         &actor,
+        idempotency_key,
     )
     .await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
@@ -64,6 +90,12 @@ pub(in crate::api) async fn confirm_quota_reset(
     Query(query): Query<QuotaQuery>,
     Json(body): Json<ResetConfirmation>,
 ) -> Result<impl IntoResponse, AppError> {
+    let idempotency_key = quota_reset_idempotency_key(&headers)?;
+    if body.confirmation != "consume_one_supplier_reset_credit" {
+        return Err(AppError::BadRequest(
+            "confirmation must explicitly acknowledge one supplier reset credit".into(),
+        ));
+    }
     let (account, credential, actor) = reset_account(&state, &headers, account_id, &query).await?;
     let result = crate::upstream_quota::reset::confirm(
         &state,
@@ -73,6 +105,7 @@ pub(in crate::api) async fn confirm_quota_reset(
         &actor,
         &operation_id.to_string(),
         &body.confirmation_token,
+        idempotency_key,
     )
     .await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
@@ -84,12 +117,13 @@ pub(in crate::api) async fn reconcile_quota_reset(
     Path((account_id, operation_id)): Path<(Uuid, Uuid)>,
     Query(query): Query<QuotaQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let (account, credential, _) = reset_account(&state, &headers, account_id, &query).await?;
+    let (account, credential, actor) = reset_account(&state, &headers, account_id, &query).await?;
     let result = crate::upstream_quota::reset::reconcile(
         &state,
         &account,
         &credential,
         query.tenant_external_id.trim(),
+        &actor,
         &operation_id.to_string(),
     )
     .await?;

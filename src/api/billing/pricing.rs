@@ -27,6 +27,7 @@ pub(in crate::api) struct ModelPriceListQuery {
     limit: usize,
     #[serde(default)]
     offset: usize,
+    after_model: Option<String>,
 }
 
 pub(in crate::api) async fn list_model_prices(
@@ -35,12 +36,21 @@ pub(in crate::api) async fn list_model_prices(
     Query(query): Query<ModelPriceListQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     require_service(&headers, &state, "requests:read").await?;
-    Ok(Json(
-        state
-            .db
-            .list_model_prices_page(&query.currency, query.limit, query.offset)
-            .await?,
-    ))
+    let prices = match query.after_model.as_deref() {
+        Some(after_model) => {
+            state
+                .db
+                .list_model_prices_after(&query.currency, query.limit, after_model)
+                .await?
+        }
+        None => {
+            state
+                .db
+                .list_model_prices_page(&query.currency, query.limit, query.offset)
+                .await?
+        }
+    };
+    Ok(Json(prices))
 }
 
 pub(in crate::api) async fn model_price_usage_summary(

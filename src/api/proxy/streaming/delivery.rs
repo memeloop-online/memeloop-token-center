@@ -32,7 +32,7 @@ pub(super) async fn send_frame(
             .await
             .map_err(|_| "downstream_backpressure")?
             .map_err(|_| "downstream_disconnected")?;
-        prepare_proxy_delivery_with_retry(
+        if let Err(error) = prepare_proxy_delivery_with_retry(
             &input.state.db,
             input.request_id,
             input.tenant_id,
@@ -42,15 +42,21 @@ pub(super) async fn send_frame(
             input.requested_service_tier,
         )
         .await
-        .map_err(|_| "delivery_state")?;
-        confirm_proxy_delivery_with_retry(
+        {
+            log_delivery_state_failure(input.request_id, "delivery_prepare", &error);
+            return Err("delivery_state");
+        }
+        if let Err(error) = confirm_proxy_delivery_with_retry(
             &input.state.db,
             input.request_id,
             input.tenant_id,
             input.reservation,
         )
         .await
-        .map_err(|_| "delivery_state")?;
+        {
+            log_delivery_state_failure(input.request_id, "delivery_confirm", &error);
+            return Err("delivery_state");
+        }
         *input.confirmed = true;
         permit.send(Ok(bytes));
     } else {
@@ -63,6 +69,95 @@ pub(super) async fn send_frame(
         probe.delivered_validated_output().await;
     }
     Ok(billable)
+}
+
+fn log_delivery_state_failure(request_id: Uuid, stage: &'static str, error: &AppError) {
+    tracing::error!(
+        %request_id,
+        stage,
+        error_class = delivery_error_class(error),
+        "proxy delivery state transition failed"
+    );
+}
+
+fn delivery_error_class(error: &AppError) -> &'static str {
+    match error {
+        AppError::Internal => "internal",
+        AppError::Storage(_) => "storage",
+        AppError::Conflict(_) => "state_conflict",
+        AppError::NotFound => "owner_missing",
+        AppError::BadRequest(_) => "invalid_state",
+        AppError::Overloaded => "overloaded",
+        AppError::Unauthorized | AppError::Forbidden => "authorization",
+        AppError::UnpricedModel
+        | AppError::QuotaExceeded
+        | AppError::RateLimited
+        | AppError::LimitExceeded { .. }
+        | AppError::Upstream(_) => "unexpected",
+    }
+}
+
+#[cfg(test)]
+mod delivery_log_tests {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogCapture {
+        type Writer = LogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            LogWriter(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn delivery_failure_log_uses_only_fixed_safe_fields() {
+        const CANARY: &str = "DELIVERY_DATABASE_SECRET_CANARY";
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        let request_id = Uuid::now_v7();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_delivery_state_failure(
+                request_id,
+                "delivery_prepare",
+                &AppError::Conflict(CANARY.to_owned()),
+            );
+            log_delivery_state_failure(request_id, "delivery_confirm", &AppError::Internal);
+        });
+
+        let rendered = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(rendered.contains(&request_id.to_string()));
+        assert!(rendered.contains("delivery_prepare"));
+        assert!(rendered.contains("delivery_confirm"));
+        assert!(rendered.contains("state_conflict"));
+        assert!(rendered.contains("internal"));
+        assert!(!rendered.contains(CANARY));
+    }
 }
 
 /// Keep only the bounded terminal tail, never the streamed response body.

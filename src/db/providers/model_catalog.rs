@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::db::routing::lock_routing_relation_writes;
 
 pub const MODEL_CATALOG_TTL_MILLIS: i64 = 24 * 60 * 60 * 1_000;
 
@@ -168,6 +169,21 @@ impl Database {
             ));
         }
         let mut transaction = self.begin_write_transaction().await?;
+        // Route association writers take the tenant relation lock before they
+        // inspect or replace candidate edges.  Take that same lock before the
+        // account row lock so catalog pruning observes one committed
+        // association generation and cannot publish stale bound removal after
+        // a concurrent explicit-custom association commits.
+        let tenant_id: String = sqlx::query(
+            "SELECT a.tenant_id FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2",
+        )
+        .bind(account_id.to_string())
+        .bind(tenant_external_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(AppError::NotFound)?
+        .try_get("tenant_id")?;
+        lock_routing_relation_writes(&mut transaction, &tenant_id).await?;
         let account_sql = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT a.tenant_id, a.credential_generation, a.driver, a.config_json, a.updated_at FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a"
@@ -182,7 +198,10 @@ impl Database {
             .fetch_optional(&mut *transaction)
             .await?
             .ok_or(AppError::NotFound)?;
-        let tenant_id: String = account.try_get("tenant_id")?;
+        let locked_tenant_id: String = account.try_get("tenant_id")?;
+        if locked_tenant_id != tenant_id {
+            return Err(AppError::NotFound);
+        }
         let current_generation: i64 = account.try_get("credential_generation")?;
         let driver: String = account.try_get("driver")?;
         let config_json: String = account.try_get("config_json")?;
@@ -251,7 +270,7 @@ impl Database {
             let mut config: Value =
                 serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
             let object = config.as_object_mut().ok_or(AppError::Internal)?;
-            let limits = models
+            let mut limits = models
                 .iter()
                 .map(|model| {
                     model
@@ -264,6 +283,36 @@ impl Database {
                 return Err(AppError::BadRequest(
                     "Codex model catalog did not contain a trusted model".into(),
                 ));
+            }
+            let existing_bounds = object
+                .get("reservation_token_bounds")
+                .or_else(|| object.get("output_token_limits"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let explicit_custom_models = sqlx::query(
+                "SELECT DISTINCT association.upstream_model \
+                 FROM model_route_upstream_accounts association \
+                 WHERE association.tenant_id = $1 \
+                   AND association.upstream_account_id = $2 \
+                   AND association.catalog_policy = 'explicit_custom'",
+            )
+            .bind(&tenant_id)
+            .bind(account_id.to_string())
+            .fetch_all(&mut *transaction)
+            .await?;
+            for row in explicit_custom_models {
+                let model: String = row.try_get("upstream_model")?;
+                if limits.contains_key(&model) {
+                    continue;
+                }
+                if let Some(bound) = existing_bounds
+                    .get(&model)
+                    .and_then(Value::as_i64)
+                    .filter(|bound| (1..=1_000_000_000).contains(bound))
+                {
+                    limits.insert(model, Value::from(bound));
+                }
             }
             object.remove("output_token_limits");
             object.insert("reservation_token_bounds".to_owned(), Value::Object(limits));

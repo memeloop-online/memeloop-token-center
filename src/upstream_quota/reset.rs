@@ -2,8 +2,7 @@
 //! A redeem_request_id is correlation only: supplier idempotency is unproven.
 use super::*;
 use crate::{
-    crypto,
-    db::{PrepareQuotaReset, QuotaResetOperation},
+    db::{PrepareQuotaReset, QuotaResetClaim, QuotaResetOperation},
     error::AppError,
 };
 
@@ -13,12 +12,17 @@ const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset
 pub(crate) struct PreparedReset {
     operation: QuotaResetOperation,
     confirmation_token: String,
+    idempotency_replayed: bool,
 }
 
 fn blocked() -> AppError {
     AppError::Conflict(
         "fresh supplier quota and applicable reset credit evidence are required".into(),
     )
+}
+
+fn temporarily_unavailable() -> AppError {
+    AppError::Overloaded
 }
 
 async fn fresh(
@@ -34,23 +38,24 @@ async fn fresh(
         .upstream_quota
         .permits
         .try_acquire()
-        .map_err(|_| blocked())?;
+        .map_err(|_| temporarily_unavailable())?;
     let snapshot = tokio::time::timeout(
         Duration::from_secs(8),
         read_codex(
             state,
+            account,
             credential,
             QuotaSnapshot::empty(account, tenant, None),
         ),
     )
     .await
-    .map_err(|_| blocked())?
-    .map_err(|_| blocked())?;
+    .map_err(|_| temporarily_unavailable())?
+    .map_err(|_| temporarily_unavailable())?;
     if snapshot.reset_capability.credit_error_code.is_some()
         || snapshot.reset_capability.available_credits.is_none()
         || snapshot.reset_capability.applicable_credits.is_none()
     {
-        return Err(blocked());
+        return Err(temporarily_unavailable());
     }
     Ok(snapshot)
 }
@@ -61,7 +66,27 @@ pub(crate) async fn prepare(
     credential: &UpstreamCredential,
     tenant: &str,
     actor: &str,
+    idempotency_key: &str,
 ) -> Result<PreparedReset, AppError> {
+    let prepare_idempotency_hash = idempotency_hash(state, idempotency_key);
+    if let Some(operation) = state
+        .db
+        .quota_reset_prepare_replay(account, actor, &prepare_idempotency_hash)
+        .await?
+    {
+        let operation_id = Uuid::parse_str(&operation.id).map_err(|_| AppError::Internal)?;
+        return Ok(PreparedReset {
+            operation,
+            confirmation_token: confirmation_token(
+                state,
+                account,
+                actor,
+                operation_id,
+                idempotency_key,
+            ),
+            idempotency_replayed: true,
+        });
+    }
     let snapshot = fresh(state, account, credential, tenant).await?;
     let available = snapshot
         .reset_capability
@@ -74,33 +99,81 @@ pub(crate) async fn prepare(
     if available < 1 || applicable < 1 {
         return Err(blocked());
     }
-    let token =
-        crypto::issue_service_credential(account.id, state.config.key_pepper.as_bytes()).secret;
-    let hash = token_hash(state, &token);
-    let operation = state
+    let operation_id = Uuid::now_v7();
+    let token = confirmation_token(state, account, actor, operation_id, idempotency_key);
+    let result = state
         .db
         .prepare_quota_reset(PrepareQuotaReset {
+            id: operation_id,
             account: account.clone(),
             actor: actor.to_owned(),
-            confirmation_hash: hash,
+            confirmation_hash: token_hash(state, &token),
+            prepare_idempotency_hash,
             available,
             applicable,
             observed_at: snapshot.observed_at.ok_or_else(blocked)?,
         })
         .await?;
+    let token = confirmation_token(
+        state,
+        account,
+        actor,
+        Uuid::parse_str(&result.operation.id).map_err(|_| AppError::Internal)?,
+        idempotency_key,
+    );
     Ok(PreparedReset {
-        operation,
+        operation: result.operation,
         confirmation_token: token,
+        idempotency_replayed: result.replayed,
     })
 }
 
-fn token_hash(state: &AppState, token: &str) -> String {
+fn keyed_hash(state: &AppState, domain: &[u8], value: &[u8]) -> String {
     use base64::Engine;
     use hmac::{Hmac, Mac};
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(state.config.key_pepper.as_bytes())
         .expect("HMAC supports any key length");
-    mac.update(token.as_bytes());
+    mac.update(domain);
+    mac.update(&[0]);
+    mac.update(value);
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn token_hash(state: &AppState, token: &str) -> String {
+    keyed_hash(
+        state,
+        b"quota-reset-confirmation-token-v1",
+        token.as_bytes(),
+    )
+}
+
+fn idempotency_hash(state: &AppState, idempotency_key: &str) -> String {
+    keyed_hash(
+        state,
+        b"quota-reset-idempotency-key-v1",
+        idempotency_key.as_bytes(),
+    )
+}
+
+fn confirmation_token(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    actor: &str,
+    operation_id: Uuid,
+    idempotency_key: &str,
+) -> String {
+    let material = format!(
+        "{}\0{}\0{}\0{}",
+        account.id, actor, operation_id, idempotency_key
+    );
+    format!(
+        "qrct_{}",
+        keyed_hash(
+            state,
+            b"quota-reset-confirmation-token-material-v1",
+            material.as_bytes()
+        )
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -112,6 +185,7 @@ pub(crate) async fn confirm(
     actor: &str,
     operation: &str,
     token: &str,
+    idempotency_key: &str,
 ) -> Result<QuotaResetOperation, AppError> {
     if !(32..=256).contains(&token.len()) {
         return Err(blocked());
@@ -124,10 +198,23 @@ pub(crate) async fn confirm(
             operation,
         )
         .await?;
+    let confirmation_hash = token_hash(state, token);
+    let confirm_idempotency_hash = idempotency_hash(state, idempotency_key);
     if original.state != "prepared" {
-        return Err(AppError::Conflict(
-            "operation cannot be dispatched again".into(),
-        ));
+        return match state
+            .db
+            .claim_quota_reset(
+                account,
+                operation,
+                actor,
+                &confirmation_hash,
+                &confirm_idempotency_hash,
+            )
+            .await?
+        {
+            QuotaResetClaim::Replayed(operation) => Ok(*operation),
+            QuotaResetClaim::Claimed { .. } => Err(AppError::Internal),
+        };
     }
     let snapshot = fresh(state, account, credential, tenant).await?;
     if snapshot.reset_capability.available_credits != Some(original.available_credits)
@@ -143,7 +230,7 @@ pub(crate) async fn confirm(
         .upstream_quota
         .permits
         .try_acquire()
-        .map_err(|_| blocked())?;
+        .map_err(|_| temporarily_unavailable())?;
     let http = tokio::time::timeout(
         Duration::from_secs(5),
         crate::network::client_for_config_url_without_retries(
@@ -155,12 +242,22 @@ pub(crate) async fn confirm(
         ),
     )
     .await
-    .map_err(|_| blocked())?
-    .map_err(|_| blocked())?;
-    let redeem = state
+    .map_err(|_| temporarily_unavailable())?
+    .map_err(|_| temporarily_unavailable())?;
+    let claim = state
         .db
-        .claim_quota_reset(account, operation, actor, &token_hash(state, token))
+        .claim_quota_reset(
+            account,
+            operation,
+            actor,
+            &confirmation_hash,
+            &confirm_idempotency_hash,
+        )
         .await?;
+    let redeem = match claim {
+        QuotaResetClaim::Claimed { redeem_request_id } => redeem_request_id,
+        QuotaResetClaim::Replayed(operation) => return Ok(*operation),
+    };
     // No automatic retry and no new redeem ID on any ambiguous outcome.
     let result = dispatch_once(&http, credential, account_header, CONSUME_URL, &redeem).await;
     state
@@ -189,6 +286,7 @@ pub(crate) async fn reconcile(
     account: &UpstreamAccountView,
     credential: &UpstreamCredential,
     tenant: &str,
+    actor: &str,
     operation: &str,
 ) -> Result<QuotaResetOperation, AppError> {
     let tenant_id = account.tenant_id.to_string();
@@ -204,6 +302,7 @@ pub(crate) async fn reconcile(
             &tenant_id,
             &account_id,
             operation,
+            actor,
             snapshot
                 .reset_capability
                 .available_credits
