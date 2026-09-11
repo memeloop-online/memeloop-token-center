@@ -39,7 +39,7 @@ function conversationRequest(index: number, currency: 'USD' | 'CNY') {
       agent_id: index % 3 === 0 ? 'research-worker' : 'codex-root',
       parent_agent_id: index % 3 === 0 ? 'codex-root' : null,
       task_kind: index % 2 ? 'interactive' : 'background',
-      labels: { workflow: 'release', environment: 'api2-trial' },
+      labels: { workflow: 'release', environment: 'staging-fixture' },
       source: 'declared',
     },
     structure: {

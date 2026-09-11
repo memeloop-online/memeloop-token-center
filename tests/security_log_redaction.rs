@@ -99,12 +99,11 @@ async fn body_text(response: axum::response::Response) -> String {
 }
 
 #[tokio::test]
-async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canaries() {
+async fn proxy_oauth_database_and_object_store_never_log_or_return_canaries() {
     const QUERY_CANARY: &str = "MTC_CANARY_QUERY_KEY_739c1a";
     const PATH_CANARY: &str = "MTC_CANARY_PATH_SECRET_f1c2e8";
     const PROXY_CANARY: &str = "MTC_CANARY_PROXY_41c3b7";
     const OAUTH_CANARY: &str = "MTC_CANARY_OAUTH_8fca22";
-    const IMPORT_CANARY: &str = "MTC_CANARY_IMPORT_a65049";
     const DATABASE_CANARY: &str = "MTC_CANARY_DATABASE_65f33c";
     const OBJECT_CANARY: &str = "MTC_CANARY_OBJECT_STORE_d1c29a";
 
@@ -137,7 +136,9 @@ async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canari
 
         let mut config = Config::for_test(database_url);
         config.upstream_openai_url = Some(upstream.uri());
-        let state = AppState::initialize(config).await.expect("security log state");
+        let state = AppState::initialize(config)
+            .await
+            .expect("security log state");
         for uri in [
             format!("/healthz?api_key={QUERY_CANARY}"),
             format!("/ui-assets/{PATH_CANARY}"),
@@ -182,20 +183,14 @@ async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canari
         let reaper = ArchiveReaper::with_store(
             state.db.clone(),
             Arc::new(CanaryWorkerStore),
-            ArchiveStagingLeaseOwner::new("security-log-reaper")
-                .expect("worker canary reaper"),
+            ArchiveStagingLeaseOwner::new("security-log-reaper").expect("worker canary reaper"),
         );
         let pass = reaper.reap_once().await.expect("worker canary reaper pass");
         assert_eq!(pass.claimed, 1);
         assert_eq!(pass.cleaned, 0);
         state
             .db
-            .upsert_model_price(
-                "security-log-model",
-                "USD",
-                Decimal::ZERO,
-                Decimal::ZERO,
-            )
+            .upsert_model_price("security-log-model", "USD", Decimal::ZERO, Decimal::ZERO)
             .await
             .expect("security log price");
         let issued = state
@@ -337,8 +332,8 @@ async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canari
             .await
             .expect("OAuth start response");
         assert_eq!(start_response.status(), StatusCode::OK);
-        let started: Value = serde_json::from_str(&body_text(start_response).await)
-            .expect("OAuth start JSON");
+        let started: Value =
+            serde_json::from_str(&body_text(start_response).await).expect("OAuth start JSON");
         let oauth_response = api::router_for_role(state.clone(), RuntimeRole::Control)
             .oneshot(
                 Request::post("/internal/v1/oauth/cursor/poll")
@@ -356,28 +351,6 @@ async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canari
             .expect("OAuth poll response");
         assert_eq!(oauth_response.status(), StatusCode::BAD_GATEWAY);
         let oauth_body = body_text(oauth_response).await;
-
-        let import_response = api::router_for_role(state, RuntimeRole::Control)
-            .oneshot(
-                Request::post("/internal/v1/imports/cpa/managed-oauth")
-                    .header(header::AUTHORIZATION, "Bearer test-service-token")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "contract_version": 1,
-                            "tenant_external_id": "security-log-tenant",
-                            "source": {"kind": "auth_file", "relative_path": "accounts/redaction.json"},
-                            "source_type": "unsupported-redaction-source",
-                            "document": {"access_token": IMPORT_CANARY}
-                        }))
-                        .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .expect("import canary response");
-        assert_eq!(import_response.status(), StatusCode::BAD_REQUEST);
-        let import_body = body_text(import_response).await;
 
         let upstream_requests = upstream
             .received_requests()
@@ -418,7 +391,7 @@ async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canari
         )
         .await;
 
-        vec![proxy_body, oauth_body, import_body, database_body, object_body]
+        vec![proxy_body, oauth_body, database_body, object_body]
     }
     .with_subscriber(dispatch)
     .await;
@@ -445,7 +418,6 @@ async fn proxy_oauth_import_database_and_object_store_never_log_or_return_canari
         OAUTH_CANARY,
         QUERY_CANARY,
         PATH_CANARY,
-        IMPORT_CANARY,
         DATABASE_CANARY,
         OBJECT_CANARY,
         WORKER_CANARY,

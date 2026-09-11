@@ -756,6 +756,31 @@ fn successful_chat_response() -> ResponseTemplate {
 }
 
 #[tokio::test]
+async fn active_retired_provider_route_is_rejected_before_credential_or_network_access() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST")).expect(0).mount(&upstream).await;
+    let fixture = resilient_route_fixture("retired-provider", &[(upstream.uri(), 0)]).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("UPDATE upstream_accounts SET driver = 'cpa-gemini-oauth-legacy' WHERE id = $1")
+        .bind(fixture.accounts[0].to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE upstream_credentials SET credential_ciphertext = 'invalid-retired-ciphertext' WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.accounts[0].to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response = send_resilient_chat(&fixture, Some("retired-provider-session"), false).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    upstream.verify().await;
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn stable_session_keeps_the_same_candidate_when_the_set_is_unchanged() {
     let first = MockServer::start().await;
     let second = MockServer::start().await;
@@ -3753,7 +3778,7 @@ fn execution_metadata_accepts_bounded_declared_values_and_w3c_trace_context() {
     headers.insert("x-mtc-task-kind", "interactive".parse().unwrap());
     headers.insert(
         "x-mtc-session-labels",
-        r#"{"workflow":"release","environment":"api2-trial","token":"must-drop","numeric":7}"#
+        r#"{"workflow":"release","environment":"staging-fixture","token":"must-drop","numeric":7}"#
             .parse()
             .unwrap(),
     );
@@ -3776,7 +3801,7 @@ fn execution_metadata_accepts_bounded_declared_values_and_w3c_trace_context() {
     );
     assert_eq!(
         hints.labels.get("environment").map(String::as_str),
-        Some("api2-trial")
+        Some("staging-fixture")
     );
     assert!(!hints.labels.contains_key("token"));
     assert!(!hints.labels.contains_key("numeric"));

@@ -4,7 +4,6 @@ mod metered_projection;
 mod pricing_stats;
 mod queries;
 mod session_archive;
-mod session_archive_commit;
 mod session_archive_quarantine;
 mod settlement;
 mod stats;
@@ -27,23 +26,9 @@ pub(crate) use lifecycle::{
 pub use metered_projection::MeteredUsageProjectionTask;
 pub use queries::RequestListFilter;
 pub(crate) use queries::search_prefix;
-pub(crate) use session_archive::valid_archive_identifier;
-pub use session_archive::{
-    SessionArchiveCorrelation, SessionArchiveImportLock, SessionArchiveMatchInput,
-    SessionArchiveTarget, SessionArchiveUnlinkedTarget,
-};
-pub use session_archive_commit::{
-    SessionArchiveCommitInput, SessionArchiveLegacyCheckpointInput,
-    SessionArchivePresentSummaryInput, SessionArchiveSnapshotApplyInput,
-    SessionArchiveSnapshotApplyResult, SessionArchiveSnapshotChainInput,
-    SessionArchiveTombstoneInput, SessionArchiveUnlinkedCommitInput,
-    SessionArchiveUnlinkedMetadata,
-};
 pub use session_archive_quarantine::{
-    SessionArchiveImportMatch, SessionArchiveImportMatchInput, SessionArchiveQuarantineBatchInput,
-    SessionArchiveQuarantineCommitInput, SessionArchiveQuarantineFilter,
-    SessionArchiveQuarantineRecordView, SessionArchiveQuarantineResolutionInput,
-    SessionArchiveQuarantineResolutionView, SessionArchiveQuarantineTarget,
+    SessionArchiveQuarantineFilter, SessionArchiveQuarantineRecordView,
+    SessionArchiveQuarantineResolutionInput, SessionArchiveQuarantineResolutionView,
 };
 pub use settlement::normalize_proxy_usage;
 pub(crate) use settlement::{

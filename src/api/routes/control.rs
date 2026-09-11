@@ -124,15 +124,6 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(reconcile_quota_reset),
         )
         .route(
-            "/internal/v1/imports/cpa/managed-oauth/capabilities",
-            get(cpa_managed_oauth_capabilities),
-        )
-        .route(
-            "/internal/v1/imports/cpa/managed-oauth",
-            post(import_cpa_managed_oauth)
-                .layer(DefaultBodyLimit::max(MAX_MANAGED_OAUTH_IMPORT_REQUEST)),
-        )
-        .route(
             "/internal/v1/migrations/openai-codex/prepare",
             post(prepare_native_codex_upgrade),
         )

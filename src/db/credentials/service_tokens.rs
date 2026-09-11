@@ -13,7 +13,6 @@ const SUPPORTED_SERVICE_SCOPES: &[&str] = &[
     "entitlements:read",
     "entitlements:write",
     "generations:write",
-    "imports:cpa:write",
     "imports:session_archive:quarantine:read",
     "imports:session_archive:quarantine:resolve",
     "keys:read",

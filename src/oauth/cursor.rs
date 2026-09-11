@@ -12,7 +12,9 @@ use crate::{
     db::{BeginOAuthLoginSession, Database, OAuthLoginClaim, OAuthLoginSessionReference},
     error::AppError,
     network::{self, OutboundScope},
-    provider::{UpstreamCredential, open_private_json, seal_private_json, validate_config},
+    provider::{
+        ProviderCatalog, UpstreamCredential, open_private_json, seal_private_json, validate_config,
+    },
 };
 
 use super::{
@@ -303,6 +305,7 @@ pub struct CursorPollAuthority<'a> {
 
 pub async fn poll_cursor_login(
     db: &Database,
+    providers: &ProviderCatalog,
     http: &reqwest::Client,
     session_token: &str,
     key_material: &[u8],
@@ -347,13 +350,18 @@ pub async fn poll_cursor_login(
             lease_owner,
             ready_ciphertext,
         } => {
+            let login = open_private_json(&ready_ciphertext, key_material, CURSOR_READY_AAD)?;
+            if !providers.is_public(&login.provider_driver) {
+                let _ = db
+                    .release_oauth_login_poll(session.session_id, lease_owner, now)
+                    .await;
+                return Err(AppError::BadRequest(
+                    "OAuth provider driver is no longer available".into(),
+                ));
+            }
             return Ok(CursorPollResult::Ready {
                 lease_owner,
-                login: Box::new(open_private_json(
-                    &ready_ciphertext,
-                    key_material,
-                    CURSOR_READY_AAD,
-                )?),
+                login: Box::new(login),
             });
         }
         OAuthLoginClaim::Claimed {
@@ -368,6 +376,14 @@ pub async fn poll_cursor_login(
             )?,
         ),
     };
+    if !providers.is_public(&state.provider_driver) {
+        let _ = db
+            .release_oauth_login_poll(state.session_id, lease_owner, now)
+            .await;
+        return Err(AppError::BadRequest(
+            "OAuth provider driver is no longer available".into(),
+        ));
+    }
     let (mut poll_url, scope) = if state.oauth_driver == "provider_adapter" {
         oauth_adapter_endpoint_scope(
             &state.poll_url,

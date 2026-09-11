@@ -555,20 +555,6 @@ async fn every_service_scope_is_exact(world: &mut TokenCenterWorld) {
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_scope_is_not_wildcard(world, "entitlements:write", &token).await;
 
-    let token = issue_service_token(world, "scope-imports-cpa-write", &["imports:cpa:write"]).await;
-    let response = world
-        .client
-        .get(format!(
-            "{}/internal/v1/imports/cpa/managed-oauth/capabilities",
-            world.service_url
-        ))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("imports:cpa:write operation");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_scope_is_not_wildcard(world, "imports:cpa:write", &token).await;
-
     let token = issue_service_token(
         world,
         "scope-quarantine-read",

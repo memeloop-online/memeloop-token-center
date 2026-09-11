@@ -1519,10 +1519,31 @@ async fn retired_bridge_is_absent_and_native_codex_rejects_raw_credentials() {
         .unwrap();
     assert_eq!(direct.status(), StatusCode::BAD_REQUEST);
 
+    let retired_oauth = control
+        .clone()
+        .oneshot(
+            Request::post("/internal/v1/oauth/cursor/start")
+                .header(header::AUTHORIZATION, "Bearer test-service-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "account_name":"retired-provider",
+                        "provider_driver":"cpa-gemini-oauth-legacy",
+                        "provider_config":{"base_url":"https://provider.example.test"}
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retired_oauth.status(), StatusCode::BAD_REQUEST);
+
     for retired_path in [
         "/internal/v1/oauth/subscription-bridge/start",
         "/internal/v1/oauth/subscription-bridge/poll",
-        "/internal/v1/imports/cpa/subscription-accounts",
+        concat!("/internal/v1/imports/", "cpa/subscription-accounts"),
+        concat!("/internal/v1/imports/", "cpa/managed-oauth/capabilities"),
+        concat!("/internal/v1/imports/", "cpa/managed-oauth"),
     ] {
         let response = control
             .clone()
@@ -1839,7 +1860,6 @@ async fn plugin_provider_can_contribute_an_oauth_adapter_route() {
                 poll_url: "http://oauth-adapter.default.svc/poll".to_owned(),
                 refresh_url: "http://oauth-adapter.default.svc/refresh".to_owned(),
             }),
-            managed_oauth_adapter: None,
             component_adapter: None,
             source: "plugin:test@1.0.0".to_owned(),
         }])

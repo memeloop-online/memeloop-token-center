@@ -2306,30 +2306,6 @@ fn validate_provider_contribution(
             crate::oauth::validate_oauth_adapter_endpoint(endpoint, field)?;
         }
     }
-    if let Some(adapter) = &provider.managed_oauth_adapter {
-        crate::provider::validate_managed_oauth_adapter_contribution(adapter).map_err(|_| {
-            AppError::BadRequest(format!(
-                "plugin {plugin_id} provider {} contributes an invalid managed OAuth adapter",
-                provider.id
-            ))
-        })?;
-        crate::schema::validate_instance(
-            &provider.credential_schema,
-            &serde_json::json!({
-                "type": "oauth",
-                "access_token": "contract-probe",
-                "refresh_token": "contract-probe",
-                "expires_at": 4_102_444_800_000_i64,
-                "adapter_state": {"probe": true}
-            }),
-        )
-        .map_err(|_| {
-            AppError::BadRequest(format!(
-                "plugin {plugin_id} provider {} managed OAuth credential schema rejects the adapter result shape",
-                provider.id
-            ))
-        })?;
-    }
     if let Some(adapter) = &provider.component_adapter
         && (adapter.api_version != "buffered-v1"
             || adapter.max_response_bytes == 0
@@ -2822,81 +2798,6 @@ mod tests {
         let mut invalid = manifest;
         invalid.contributions.traffic_policy = true;
         assert!(validate_manifest(&invalid).is_err());
-    }
-
-    fn managed_oauth_manifest() -> PluginManifest {
-        serde_json::from_value(serde_json::json!({
-            "id": "managed-oauth",
-            "version": "1.0.0",
-            "wit_version": "0.2.0",
-            "wasm": null,
-            "contributions": {"providers": [{
-                "id": "managed-provider",
-                "display_name": "Managed provider",
-                "protocols": ["openai"],
-                "modalities": ["text"],
-                "config_schema": {"type": "object"},
-                "credential_schema": {"type": "object"},
-                "managed_oauth_adapter": {
-                    "api_version": "cpa-managed-oauth-adapter-v1",
-                    "source_types": ["codex-account", "gemini-account"],
-                    "normalize_url": "https://managed-oauth.example/normalize",
-                    "refresh_url": "https://managed-oauth.example/refresh"
-                }
-            }]}
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn managed_oauth_contribution_validates_version_sources_and_ssrf_boundaries() {
-        let valid = managed_oauth_manifest();
-        assert!(validate_manifest(&valid).is_ok());
-
-        let mut invalid_version = valid.clone();
-        invalid_version.contributions.providers[0]
-            .managed_oauth_adapter
-            .as_mut()
-            .unwrap()
-            .api_version = "cpa-managed-oauth-adapter-v2".into();
-        assert!(validate_manifest(&invalid_version).is_err());
-
-        let mut duplicate_source = valid.clone();
-        duplicate_source.contributions.providers[0]
-            .managed_oauth_adapter
-            .as_mut()
-            .unwrap()
-            .source_types = vec!["codex-account".into(), "codex-account".into()];
-        assert!(validate_manifest(&duplicate_source).is_err());
-
-        let mut illegal_source = valid.clone();
-        illegal_source.contributions.providers[0]
-            .managed_oauth_adapter
-            .as_mut()
-            .unwrap()
-            .source_types = vec!["Codex/account".into()];
-        assert!(validate_manifest(&illegal_source).is_err());
-
-        for endpoint in [
-            "ftp://adapter.example/normalize",
-            "http://example.com/normalize",
-            "https://user:password@example.com/normalize",
-            "http://127.0.0.1:3000/normalize",
-            "https://169.254.169.254/latest/meta-data",
-            "https://adapter.example/normalize?target=http://metadata.internal",
-            "https://adapter.example/normalize#fragment",
-        ] {
-            let mut invalid_endpoint = valid.clone();
-            invalid_endpoint.contributions.providers[0]
-                .managed_oauth_adapter
-                .as_mut()
-                .unwrap()
-                .normalize_url = endpoint.into();
-            assert!(
-                validate_manifest(&invalid_endpoint).is_err(),
-                "accepted {endpoint}"
-            );
-        }
     }
 
     #[test]

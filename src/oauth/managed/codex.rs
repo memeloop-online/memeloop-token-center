@@ -5,12 +5,9 @@ use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{
-    error::AppError,
-    network::{self, OutboundScope},
-    oauth::ManagedOAuthNormalizedAccount,
-    provider::UpstreamCredential,
-};
+#[cfg(test)]
+use crate::network::OutboundScope;
+use crate::{error::AppError, network, provider::UpstreamCredential};
 
 pub const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -34,78 +31,11 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CodexDocument {
-    #[serde(rename = "type")]
-    provider_type: String,
-    access_token: String,
-    refresh_token: String,
-    account_id: String,
-    #[serde(default)]
-    email: Option<String>,
-    #[serde(default)]
-    id_token: Option<String>,
-    last_refresh: String,
-    expired: String,
-    #[serde(default)]
-    disabled: bool,
-    #[serde(default)]
-    proxy_url: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
     expires_in: i64,
-}
-
-pub fn normalize(payload: &Value) -> Result<ManagedOAuthNormalizedAccount, AppError> {
-    let document: CodexDocument =
-        serde_json::from_value(payload.clone()).map_err(|_| invalid_document())?;
-    if document.provider_type != "codex" {
-        return Err(invalid_document());
-    }
-    super::bearer_token(&document.access_token, "Codex")?;
-    super::required_secret(&document.refresh_token, "Codex")?;
-    super::optional_secret(document.id_token.as_deref(), "Codex")?;
-    super::account_id(&document.account_id, "Codex")?;
-    let account_name = super::account_name(document.email.as_deref(), "Codex account", "Codex")?;
-    let _ = super::timestamp_millis(&document.last_refresh, "Codex")?;
-    let expires_at = super::timestamp_millis(&document.expired, "Codex")?;
-    let proxy_url = document
-        .proxy_url
-        .as_deref()
-        .map(normalize_private_proxy_url)
-        .transpose()?;
-    let proxy_network_scope = proxy_url.as_ref().map(|_| OutboundScope::Private);
-
-    Ok(ManagedOAuthNormalizedAccount {
-        account_name,
-        config: json!({
-            "base_url": BASE_URL,
-            "network_scope": "public",
-            // Empty is intentionally not a guessed default. An operator or a
-            // reviewed model-metadata sync must populate the exact upstream
-            // model limits before this account can carry traffic.
-            "reservation_token_bounds": {},
-        }),
-        enabled: !document.disabled,
-        credential: UpstreamCredential::OAuth {
-            access_token: document.access_token,
-            refresh_token: Some(document.refresh_token),
-            expires_at: Some(expires_at),
-            header: "authorization".to_owned(),
-            prefix: "Bearer ".to_owned(),
-            adapter_state: Some(json!({
-                "schema": NATIVE_ADAPTER_SCHEMA,
-                "account_id": document.account_id,
-            })),
-            proxy_url,
-            proxy_network_scope,
-        },
-    })
 }
 
 /// Normalize the fixed credential envelope allowed for the retired importer
@@ -519,19 +449,6 @@ mod tests {
 
     use super::*;
 
-    fn document() -> Value {
-        json!({
-            "type": "codex",
-            "access_token": "access-token-secret",
-            "refresh_token": "refresh-token-secret",
-            "account_id": "account-123",
-            "email": "codex@example.test",
-            "id_token": "id-token-secret",
-            "last_refresh": "2026-08-18T01:02:03Z",
-            "expired": "2099-01-01T00:00:00Z"
-        })
-    }
-
     fn credential(refresh_token: &str) -> UpstreamCredential {
         credential_with_schema(refresh_token, NATIVE_ADAPTER_SCHEMA)
     }
@@ -549,101 +466,6 @@ mod tests {
             })),
             proxy_url: None,
             proxy_network_scope: None,
-        }
-    }
-
-    #[test]
-    fn normalizes_valid_disabled_and_expired_documents_without_identity_leakage() {
-        let normalized = normalize(&document()).unwrap();
-        assert!(normalized.enabled);
-        assert_eq!(normalized.account_name, "codex@example.test");
-        assert_eq!(normalized.config["base_url"], BASE_URL);
-        assert_eq!(normalized.config["reservation_token_bounds"], json!({}));
-        let serialized = serde_json::to_value(&normalized.credential).unwrap();
-        assert_eq!(serialized["expires_at"], 4_070_908_800_000_i64);
-        assert_eq!(serialized["header"], "authorization");
-        assert_eq!(serialized["prefix"], "Bearer ");
-        assert_eq!(
-            serialized["adapter_state"],
-            json!({"schema": "openai-codex-oauth-v1", "account_id": "account-123"})
-        );
-        let state = serialized["adapter_state"].to_string();
-        assert!(!state.contains("codex@example.test"));
-        assert!(!state.contains("id-token-secret"));
-        let debug = format!("{normalized:?}");
-        assert!(!debug.contains("access-token-secret"));
-        assert!(!debug.contains("refresh-token-secret"));
-        assert!(!debug.contains("id-token-secret"));
-
-        let mut disabled = document();
-        disabled["disabled"] = json!(true);
-        assert!(!normalize(&disabled).unwrap().enabled);
-
-        let mut expired = document();
-        expired["expired"] = json!("2020-01-01T00:00:00Z");
-        assert!(
-            normalize(&expired)
-                .unwrap()
-                .credential
-                .expires_at()
-                .is_some_and(|value| value < crate::db::unix_millis())
-        );
-
-        let mut unnamed = document();
-        unnamed.as_object_mut().unwrap().remove("email");
-        assert_eq!(normalize(&unnamed).unwrap().account_name, "Codex account");
-    }
-
-    #[test]
-    fn normalizes_only_reviewable_private_cpa_proxy_shapes() {
-        let mut literal = document();
-        literal["proxy_url"] = json!("socks5h://proxy-user:proxy-secret@100.64.0.16:1080");
-        let normalized = normalize(&literal).unwrap();
-        assert_eq!(
-            normalized.credential.proxy(),
-            Some((
-                "socks5h://proxy-user:proxy-secret@100.64.0.16:1080",
-                OutboundScope::Private
-            ))
-        );
-        let debug = format!("{:?}", normalized.credential);
-        assert!(!debug.contains("proxy-secret"));
-        assert!(!debug.contains("100.64.0.16"));
-
-        let mut private_dns = document();
-        private_dns["proxy_url"] = json!("socks5://proxy.service.svc.cluster.local:1080");
-        assert_eq!(
-            normalize(&private_dns).unwrap().credential.proxy(),
-            Some((
-                "socks5://proxy.service.svc.cluster.local:1080",
-                OutboundScope::Private
-            ))
-        );
-
-        for value in [
-            "socks5h://proxy.service.svc.cluster.local:1080",
-            "socks5h://8.8.8.8:1080",
-            "socks5://127.0.0.1:1080",
-            "socks5://169.254.169.254:1080",
-            "socks5://100.100.100.200:1080",
-            "http://100.64.0.16:1080",
-            "socks5://100.64.0.16",
-            "socks5://100.64.0.16:1080/path",
-            "socks5://100.64.0.16:1080?token=secret",
-            "socks5://100.64.0.16:1080#secret",
-            " socks5://100.64.0.16:1080",
-            "socks5://100.64.0.16:1080\nnext",
-        ] {
-            let mut rejected = document();
-            rejected["proxy_url"] = json!(value);
-            let error = normalize(&rejected).unwrap_err();
-            let rendered = format!("{error:?} {error}");
-            assert_eq!(
-                error.to_string(),
-                "invalid request: Codex OAuth document is invalid",
-                "{value}"
-            );
-            assert!(!rendered.contains(value));
         }
     }
 
@@ -793,58 +615,6 @@ mod tests {
             ] {
                 assert!(!rendered.contains(secret));
             }
-        }
-    }
-
-    #[test]
-    fn rejects_unknown_malformed_and_unsafe_fields_with_redacted_errors() {
-        let secrets = [
-            "access-token-secret",
-            "refresh-token-secret",
-            "id-token-secret",
-            "codex@example.test",
-        ];
-        let mut rejected = Vec::new();
-
-        let mut unknown = document();
-        unknown["source_path"] = json!("/private/account.json");
-        rejected.push(unknown);
-
-        let mut wrong_type = document();
-        wrong_type["type"] = json!("claude");
-        rejected.push(wrong_type);
-
-        let mut malformed_expiry = document();
-        malformed_expiry["expired"] = json!("tomorrow");
-        rejected.push(malformed_expiry);
-
-        let mut control = document();
-        control["account_id"] = json!("account\nother");
-        rejected.push(control);
-
-        let mut oversized = document();
-        oversized["access_token"] = json!("x".repeat(super::super::MAX_TOKEN_BYTES + 1));
-        rejected.push(oversized);
-
-        let mut oversized_account = document();
-        oversized_account["account_id"] = json!("a".repeat(super::super::MAX_ACCOUNT_ID_BYTES + 1));
-        rejected.push(oversized_account);
-
-        let mut oversized_name = document();
-        oversized_name["email"] = json!("n".repeat(super::super::MAX_ACCOUNT_NAME_BYTES + 1));
-        rejected.push(oversized_name);
-
-        for payload in rejected {
-            let error = normalize(&payload).unwrap_err();
-            let rendered = format!("{error:?} {error}");
-            assert_eq!(
-                error.to_string(),
-                "invalid request: Codex OAuth document is invalid"
-            );
-            for secret in secrets {
-                assert!(!rendered.contains(secret));
-            }
-            assert!(!rendered.contains("/private/account.json"));
         }
     }
 

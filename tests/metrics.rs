@@ -301,10 +301,6 @@ async fn gateway_and_control_roles_return_404_for_every_opposite_operation_famil
         (Method::GET, format!("/internal/v1/upstreams/{id}/models")),
         (
             Method::GET,
-            "/internal/v1/imports/cpa/managed-oauth/capabilities".to_owned(),
-        ),
-        (
-            Method::GET,
             "/internal/v1/imports/session-archive/quarantine?tenant_external_id=t".to_owned(),
         ),
         (Method::GET, "/internal/v1/requests".to_owned()),

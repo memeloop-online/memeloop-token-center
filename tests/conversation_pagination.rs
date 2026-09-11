@@ -6,9 +6,7 @@ use memeloop_token_center::{
     AppState, api,
     config::Config,
     conversation::ConversationHints,
-    db::{
-        CreateKeyInput, FinishRequest, NewRequest, SessionArchiveCommitInput, SessionArchiveTarget,
-    },
+    db::{CreateKeyInput, FinishRequest, NewRequest},
     model::{AuthenticatedKey, KeyPolicy},
 };
 use rust_decimal::Decimal;
@@ -185,7 +183,7 @@ async fn declared_execution_metadata_is_bounded_persisted_and_projected() {
         agent_id: Some("codex-root".into()),
         parent_agent_id: Some("release-controller".into()),
         task_kind: Some("interactive".into()),
-        labels: [("environment".into(), "api2-trial".into())]
+        labels: [("environment".into(), "staging-fixture".into())]
             .into_iter()
             .collect(),
         ..ConversationHints::default()
@@ -255,7 +253,7 @@ async fn declared_execution_metadata_is_bounded_persisted_and_projected() {
     assert_eq!(execution.source, "declared");
     assert_eq!(
         execution.labels.get("environment").map(String::as_str),
-        Some("api2-trial")
+        Some("staging-fixture")
     );
     let structure = request.structure.as_ref().expect("protocol structure");
     assert_eq!(structure.session_id.as_deref(), Some("codex-session-7"));
@@ -740,7 +738,7 @@ async fn many_completed_facts_move_into_one_session_without_projection_drift() {
                 request_id,
                 &json!({"input": [{"role": "user", "content": format!("bulk {index}")}]}),
                 &hints,
-                Some("CPA archive importer"),
+                Some("historical archive source"),
             )
             .await
             .expect("attach bulk request");
@@ -1584,196 +1582,6 @@ async fn postgres_conversations_are_key_scoped() {
         assert_ne!(visible, request_a_candidate);
         assert!(detail.edges.is_empty());
     }
-}
-
-#[tokio::test]
-async fn archive_conversation_and_import_metadata_are_one_atomic_idempotent_commit() {
-    let fixture = Fixture::new("archive-atomic").await;
-    let parent_request = fixture.start_request("memory://parent").await;
-    fixture
-        .state
-        .db
-        .record_conversation_observation(
-            &fixture.key,
-            parent_request,
-            &json!({"input": [{"role": "user", "content": "parent"}]}),
-            &ConversationHints {
-                session_id: Some("archive-session".into()),
-                turn_id: Some("parent-turn".into()),
-                ..ConversationHints::default()
-            },
-            Some("Codex"),
-        )
-        .await
-        .expect("parent observation");
-    let child_request = fixture.start_request("gap://archive/request").await;
-    let child_created_at: i64 =
-        sqlx::query_scalar("SELECT created_at FROM request_record_locators WHERE id = $1")
-            .bind(child_request.to_string())
-            .fetch_one(&fixture.pool)
-            .await
-            .expect("child locator");
-
-    let trigger = format!(
-        "CREATE TRIGGER fail_archive_reference BEFORE UPDATE OF request_object ON request_records WHEN OLD.id = '{}' BEGIN SELECT RAISE(ABORT, 'injected archive reference failure'); END",
-        child_request
-    );
-    // Test-only SQL safety boundary: `child_request` is a typed UUID and therefore cannot inject
-    // SQL syntax. SQLite trigger definitions cannot contain bind parameters.
-    sqlx::query(sqlx::AssertSqlSafe(trigger))
-        .execute(&fixture.pool)
-        .await
-        .expect("install failure trigger");
-
-    let baseline = archive_state(&fixture).await;
-    let target = SessionArchiveTarget {
-        tenant_id: fixture.key.tenant_id,
-        target_request_id: child_request,
-        request_created_at: child_created_at,
-        key: fixture.key.clone(),
-        external_event_hash: "e".repeat(64),
-        source_created_at: child_created_at,
-        source_model: "gpt-conversation".into(),
-        replay: false,
-    };
-    let request_json = json!({
-        "input": [
-            {"role": "user", "content": "parent"},
-            {"role": "assistant", "content": "child"}
-        ]
-    });
-    let hints = ConversationHints {
-        session_id: Some("archive-session".into()),
-        turn_id: Some("child-turn".into()),
-        parent_turn_id: Some("parent-turn".into()),
-        ..ConversationHints::default()
-    };
-    let failed = fixture
-        .state
-        .db
-        .commit_session_archive_request(archive_commit_input(&target, &request_json, &hints))
-        .await;
-    assert!(
-        failed.is_err(),
-        "the injected post-observation write must fail"
-    );
-    assert_eq!(archive_state(&fixture).await, baseline);
-    let stored_ref: String = sqlx::query_scalar(
-        "SELECT request_object FROM request_records WHERE id = $1 AND created_at = $2",
-    )
-    .bind(child_request.to_string())
-    .bind(child_created_at)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("request reference");
-    assert_eq!(stored_ref, "gap://archive/request");
-
-    sqlx::query("DROP TRIGGER fail_archive_reference")
-        .execute(&fixture.pool)
-        .await
-        .expect("remove failure trigger");
-    assert!(
-        fixture
-            .state
-            .db
-            .commit_session_archive_request(archive_commit_input(&target, &request_json, &hints,))
-            .await
-            .expect("successful archive commit")
-    );
-    let applied = archive_state(&fixture).await;
-    assert_eq!(applied.observations, baseline.observations + 1);
-    assert_eq!(applied.edges, baseline.edges + 1);
-    assert_eq!(
-        applied.projection_requests,
-        baseline.projection_requests + 1
-    );
-    assert_eq!(applied.import_records, 1);
-    assert_eq!(applied.checkpoint_records, 1);
-
-    assert!(
-        !fixture
-            .state
-            .db
-            .commit_session_archive_request(archive_commit_input(&target, &request_json, &hints,))
-            .await
-            .expect("idempotent replay")
-    );
-    assert_eq!(archive_state(&fixture).await, applied);
-}
-
-fn archive_commit_input<'a>(
-    target: &'a SessionArchiveTarget,
-    request_json: &'a Value,
-    hints: &'a ConversationHints,
-) -> SessionArchiveCommitInput<'a> {
-    SessionArchiveCommitInput {
-        tenant_external_id: "conversation-archive-atomic",
-        archive_source: "atomic-fixture",
-        external_request_id: "archive-child",
-        source_session_id: "archive-session",
-        target,
-        record_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        request_digest: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-        response_digest: Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
-        request_object: Some("inline-json:{\"archived\":true}"),
-        response_object: Some("inline-json:{\"ok\":true}"),
-        request_json: Some(request_json),
-        conversation_hints: hints,
-        client_name: Some("Codex"),
-        source_started_at: target.source_created_at,
-        source_completed_at: None,
-        identity_proof_kind: "test-exact-proof-v1",
-        identity_proof_digest: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-        correlation_proof_digest: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        defer_checkpoint: false,
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ArchiveState {
-    observations: i64,
-    edges: i64,
-    semantic_atoms: i64,
-    context_nodes: i64,
-    projection_requests: i64,
-    import_records: i64,
-    checkpoint_records: i64,
-}
-
-async fn archive_state(fixture: &Fixture) -> ArchiveState {
-    ArchiveState {
-        observations: count(&fixture.pool, "conversation_observations").await,
-        edges: count(&fixture.pool, "conversation_edges").await,
-        semantic_atoms: count(&fixture.pool, "semantic_atoms").await,
-        context_nodes: count(&fixture.pool, "context_nodes").await,
-        projection_requests: sqlx::query_scalar(
-            "SELECT COALESCE(SUM(request_count), 0) FROM conversation_key_clusters WHERE key_id = $1",
-        )
-        .bind(fixture.key.key_id.to_string())
-        .fetch_one(&fixture.pool)
-        .await
-        .expect("projection count"),
-        import_records: count(&fixture.pool, "session_archive_import_records").await,
-        checkpoint_records: count(&fixture.pool, "session_archive_import_checkpoints").await,
-    }
-}
-
-async fn count(pool: &AnyPool, table: &str) -> i64 {
-    let query = match table {
-        "conversation_observations" => "SELECT COUNT(*) FROM conversation_observations",
-        "conversation_edges" => "SELECT COUNT(*) FROM conversation_edges",
-        "semantic_atoms" => "SELECT COUNT(*) FROM semantic_atoms",
-        "context_nodes" => "SELECT COUNT(*) FROM context_nodes",
-        "session_archive_import_records" => "SELECT COUNT(*) FROM session_archive_import_records",
-        "session_archive_import_checkpoints" => {
-            "SELECT COUNT(*) FROM session_archive_import_checkpoints"
-        }
-        _ => panic!("test table names are a closed internal set: {table}"),
-    };
-    sqlx::query_scalar(query)
-        .fetch_one(pool)
-        .await
-        .expect("table count")
 }
 
 #[tokio::test]

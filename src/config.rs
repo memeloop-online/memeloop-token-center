@@ -341,48 +341,6 @@ impl Config {
         })
     }
 
-    /// Minimal configuration for the one-shot session archive importer.
-    ///
-    /// It deliberately does not read control-plane credentials, upstream
-    /// credentials, plugin settings or pricing-source overrides. The importer
-    /// needs only the target database and archive object store.
-    pub fn from_session_archive_import_env() -> Result<Self, ConfigError> {
-        let archive_backend = production_archive_backend(&env_string("MTC_ARCHIVE_BACKEND", "s3"))?;
-        Ok(Self {
-            listen: "127.0.0.1:0".to_owned(),
-            database_url: required("MTC_DATABASE_URL")?,
-            database_max_connections: 2,
-            proxy_lifecycle_concurrency: 1,
-            gateway_body_read_concurrency: 1,
-            responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,
-            responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
-            upstream_health: UpstreamHealthConfig::DEFAULT,
-            run_migrations_on_start: false,
-            key_pepper: "unused-by-session-archive-importer".to_owned(),
-            service_token: "unused-by-session-archive-importer".to_owned(),
-            memeloop_cloud_webhook_secret: None,
-            archive_backend,
-            archive_path: env::var("MTC_ARCHIVE_PATH").ok(),
-            s3_bucket: env::var("MTC_S3_BUCKET").ok(),
-            s3_endpoint: env::var("MTC_S3_ENDPOINT").ok(),
-            s3_region: env_string("MTC_S3_REGION", "us-east-1"),
-            s3_access_key: env::var("MTC_S3_ACCESS_KEY").ok(),
-            s3_secret_key: env::var("MTC_S3_SECRET_KEY").ok(),
-            s3_allow_http: env_bool("MTC_S3_ALLOW_HTTP", false),
-            upstream_openai_url: None,
-            upstream_openai_key: None,
-            upstream_anthropic_url: None,
-            upstream_anthropic_key: None,
-            pricing_models_dev_url: DEFAULT_PRICING_MODELS_DEV_URL.to_owned(),
-            pricing_litellm_url: DEFAULT_PRICING_LITELLM_URL.to_owned(),
-            pricing_openrouter_url: DEFAULT_PRICING_OPENROUTER_URL.to_owned(),
-            plugin_dir: None,
-            allow_oauth_loopback: false,
-            codex_test_loopback: false,
-            runtime_profiling_enabled: false,
-        })
-    }
-
     pub fn for_test(database_url: String) -> Self {
         Self {
             listen: "127.0.0.1:0".to_owned(),

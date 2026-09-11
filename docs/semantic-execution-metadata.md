@@ -107,7 +107,7 @@ model_provider = "memeloop-token-center"
 
 [model_providers.memeloop-token-center]
 name = "MemeLoop Token Center"
-base_url = "https://token.k3s.onetwo.website/v1"
+base_url = "https://gateway.example.test/v1"
 env_key = "MTC_CLIENT_CREDENTIAL"
 wire_api = "responses"
 

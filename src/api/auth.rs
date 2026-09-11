@@ -53,14 +53,10 @@ pub(super) async fn authenticate_control_before_body(
                 ));
             }
         };
-        let maximum = match request.uri().path() {
-            "/internal/v1/imports/cpa/managed-oauth" => super::MAX_MANAGED_OAUTH_IMPORT_REQUEST,
-            _ => super::MAX_DEFAULT_REQUEST_BODY,
-        };
         request = match crate::gateway_body::admit_request_body(
             request,
             CONTROL_BODY_READ_DEADLINE,
-            maximum,
+            super::MAX_DEFAULT_REQUEST_BODY,
         )
         .await
         {

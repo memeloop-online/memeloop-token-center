@@ -25,28 +25,3 @@ fn server_migration_stderr_never_contains_database_configuration() {
         "stdout={stdout}; stderr={stderr}"
     );
 }
-
-#[test]
-fn session_importer_stderr_never_contains_database_configuration() {
-    let directory = tempfile::tempdir().unwrap();
-    let input = directory.path().join("empty.jsonl");
-    std::fs::write(&input, b"").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_import-cpa-session-archive"))
-        .arg("--input")
-        .arg(&input)
-        .arg("--plan-directory")
-        .arg(directory.path())
-        .env(
-            "MTC_DATABASE_URL",
-            format!("postgres://user:{DATABASE_CANARY}@[invalid/database"),
-        )
-        .env("MTC_ARCHIVE_BACKEND", "filesystem")
-        .env("MTC_ARCHIVE_PATH", directory.path())
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains(DATABASE_CANARY), "{stderr}");
-    assert!(stderr.contains("database_connect_failed"), "{stderr}");
-}

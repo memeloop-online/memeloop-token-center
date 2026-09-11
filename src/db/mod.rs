@@ -111,6 +111,7 @@ pub use groups::{
     CreateGroupInput, GroupKind, GroupView, ReplaceGroupMembersInput, UpdateGroupInput,
 };
 pub use migrations::{BlockedPartition, PartitionMaintenanceReport};
+#[cfg(test)]
 pub(crate) use migrations::{POSTGRES_MIGRATIONS, SQLITE_MIGRATIONS};
 #[cfg(test)]
 use migrations::{apply_migration_range, maintain_postgres_partitions};
@@ -118,8 +119,7 @@ pub use monitoring_snapshot::{MonitoringScope, MonitoringSnapshotFilter};
 pub use oauth_sessions::{BeginOAuthLoginSession, OAuthLoginClaim, OAuthLoginSessionReference};
 pub use providers::{
     AggregatedUpstreamModelCatalogView, AggregatedUpstreamModelView, CreateModelRouteInput,
-    CreateUpstreamAccountInput, DiscoveredUpstreamModel, ImportManagedOAuthAccountInput,
-    ManagedOAuthImportResult, ManagedOAuthImportStatus, NativeCodexUpgradeReport,
+    CreateUpstreamAccountInput, DiscoveredUpstreamModel, NativeCodexUpgradeReport,
     NativeCodexUpgradeTarget, ReauthorizeUpstreamAccountInput, ReplaceModelCatalogResult,
     UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
@@ -129,17 +129,9 @@ pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
     ConversationProjectionTask, FinishProxyRequest, FinishProxyRequestResult, FinishRequest,
     MeteredUsageProjectionTask, NewRequest, ProxyConversationInput, RequestListFilter,
-    SessionArchiveCommitInput, SessionArchiveCorrelation, SessionArchiveImportLock,
-    SessionArchiveImportMatch, SessionArchiveImportMatchInput, SessionArchiveLegacyCheckpointInput,
-    SessionArchiveMatchInput, SessionArchivePresentSummaryInput,
-    SessionArchiveQuarantineBatchInput, SessionArchiveQuarantineCommitInput,
     SessionArchiveQuarantineFilter, SessionArchiveQuarantineRecordView,
     SessionArchiveQuarantineResolutionInput, SessionArchiveQuarantineResolutionView,
-    SessionArchiveQuarantineTarget, SessionArchiveSnapshotApplyInput,
-    SessionArchiveSnapshotApplyResult, SessionArchiveSnapshotChainInput, SessionArchiveTarget,
-    SessionArchiveTombstoneInput, SessionArchiveUnlinkedCommitInput,
-    SessionArchiveUnlinkedMetadata, SessionArchiveUnlinkedTarget, StartProxyRequest, StatsFilter,
-    normalize_proxy_usage,
+    StartProxyRequest, StatsFilter, normalize_proxy_usage,
 };
 pub(crate) use requests::{
     ConversationObservationInput, MAX_STATS_RANGE_MILLIS, SwitchProxyCandidateInput,
@@ -147,7 +139,7 @@ pub(crate) use requests::{
     price_token_usage, proxy_contract_ceiling_micros, record_request_finished_in_transaction,
     record_request_started_in_transaction, reserve_usage_in_transaction, search_prefix,
     settle_token_usage_in_transaction, settle_token_usage_in_transaction_with_charge,
-    valid_archive_identifier, validate_numeric_range,
+    validate_numeric_range,
 };
 #[cfg(test)]
 pub(crate) use requests::{

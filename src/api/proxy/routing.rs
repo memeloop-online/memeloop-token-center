@@ -113,7 +113,7 @@ pub(super) fn plan_proxy_route(
         route,
         preparation_now,
     } = input;
-    if !state.providers.contains(&route.driver) {
+    if !state.providers.is_public(&route.driver) {
         return Err(AppError::Upstream(format!(
             "provider driver {} is not loaded",
             route.driver

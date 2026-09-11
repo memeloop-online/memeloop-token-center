@@ -1,7 +1,6 @@
 mod accounts;
 mod availability;
 mod health;
-mod managed_import;
 mod models;
 mod native_codex_upgrade;
 mod oauth;
@@ -22,9 +21,6 @@ pub(in crate::api) use accounts::{
 };
 pub(in crate::api) use availability::upstream_account_availability;
 pub(in crate::api) use health::probe_upstream_health;
-pub(in crate::api) use managed_import::{
-    MAX_MANAGED_OAUTH_IMPORT_REQUEST, cpa_managed_oauth_capabilities, import_cpa_managed_oauth,
-};
 pub(crate) use models::trigger_upstream_model_sync;
 pub(in crate::api) use models::{
     aggregate_upstream_models, list_upstream_models, sync_upstream_models,

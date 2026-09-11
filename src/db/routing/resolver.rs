@@ -199,7 +199,7 @@ impl Database {
         } = selection;
         let rows = sqlx::query(
              "SELECT r.id AS route_id, r.priority, candidates.scheduling_weight,
-                     a.id AS account_id, a.updated_at AS transport_revision,
+                     a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                      a.credential_generation
              FROM model_routes r
              JOIN model_route_eligible_upstream_accounts candidates
@@ -264,6 +264,7 @@ impl Database {
             ordered.push(AuthorizedUpstreamCandidate {
                 route_id: candidate.route_id,
                 account_id: candidate.account_id,
+                driver: candidate.driver,
                 transport_revision: candidate.transport_revision,
                 credential_generation: candidate.credential_generation,
             });
@@ -296,17 +297,19 @@ impl Database {
               AND account.status = 'active'
               AND account.updated_at = $3
               AND account.credential_generation = $4
+              AND account.driver = $5
              JOIN upstream_credentials credential
                ON credential.upstream_account_id = account.id
               AND credential.generation = account.credential_generation
               AND credential.revoked_at IS NULL
-              AND (credential.expires_at IS NULL OR credential.expires_at > $5)
+              AND (credential.expires_at IS NULL OR credential.expires_at > $6)
              WHERE route.id = $1 AND route.enabled = 1",
         )
         .bind(candidate.route_id.to_string())
         .bind(candidate.account_id.to_string())
         .bind(candidate.transport_revision)
         .bind(candidate.credential_generation)
+        .bind(&candidate.driver)
         .bind(unix_millis())
         .fetch_optional(&self.pool)
         .await?;
@@ -473,6 +476,7 @@ impl Database {
 struct RoutingCandidate {
     route_id: Uuid,
     account_id: Uuid,
+    driver: String,
     transport_revision: i64,
     credential_generation: i64,
     priority: i64,
@@ -488,6 +492,7 @@ impl RoutingCandidate {
         Ok(Self {
             route_id: parse_uuid(row.try_get("route_id")?)?,
             account_id: parse_uuid(row.try_get("account_id")?)?,
+            driver: row.try_get("driver")?,
             transport_revision: row.try_get("transport_revision")?,
             credential_generation: row.try_get("credential_generation")?,
             priority: row.try_get("priority")?,
@@ -527,6 +532,7 @@ mod tests {
         RoutingCandidate {
             route_id: Uuid::from_u128(1),
             account_id,
+            driver: "http-json".to_owned(),
             transport_revision: 1,
             credential_generation: 1,
             priority: 0,
