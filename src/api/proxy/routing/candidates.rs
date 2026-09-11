@@ -24,10 +24,15 @@ pub(in crate::api::proxy) fn prepared_input_reservation_bound(
     prepared: &PreparedProxyRoute,
     original_body_length: usize,
 ) -> Result<i64, AppError> {
-    input_reservation_bound(
-        &prepared.route,
-        prepared.request_body_ceiling(original_body_length),
-    )
+    let prepared_body_length = prepared
+        .component_request
+        .as_ref()
+        .map(|(request, _)| request.body.len())
+        .unwrap_or_default();
+    let request_body_ceiling = original_body_length
+        .max(prepared.forwarded_body.len())
+        .max(prepared_body_length);
+    input_reservation_bound(&prepared.route, request_body_ceiling)
 }
 
 fn input_reservation_bound(

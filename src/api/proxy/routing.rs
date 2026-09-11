@@ -79,15 +79,6 @@ impl PreparedProxyRoute {
     pub(super) fn is_codex(&self) -> bool {
         codex_transport::is_driver(&self.route.driver)
     }
-
-    pub(super) fn request_body_ceiling(&self, original_body_length: usize) -> usize {
-        original_body_length.max(self.forwarded_body.len()).max(
-            self.component_request
-                .as_ref()
-                .map(|(request, _)| request.body.len())
-                .unwrap_or_default(),
-        )
-    }
 }
 
 #[derive(Clone, Copy)]
