@@ -52,8 +52,10 @@ test('model create/edit forms validate and save through isolated Chromium mocks'
     assert.equal(await edit.getByRole('button', { name: 'Save', exact: true }).isDisabled(), true);
     await edit.getByLabel('Priority', { exact: true }).fill('2');
     await edit.getByLabel('Upstream model', { exact: true }).click();
-    await edit.getByRole('button', { name: 'Save', exact: true }).waitFor();
-    await page.screenshot({ path: '/tmp/mtc-model-route-edit-desktop.png', fullPage: true });
+    await edit.locator(':scope > button:enabled').waitFor();
+    await page.keyboard.press('Escape');
+    await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); window.scrollTo(0, 0); });
+    await page.screenshot({ path: '/tmp/mtc-model-route-edit-desktop.png', fullPage: true, animations: 'disabled' });
     await edit.getByRole('button', { name: 'Save', exact: true }).click();
     await edit.waitFor({ state: 'hidden' });
     assert.ok(requests.includes('PUT /internal/v1/model-routes/mock-route'));
@@ -65,7 +67,11 @@ test('model create/edit forms validate and save through isolated Chromium mocks'
     await create.getByLabel('Upstream model', { exact: true }).fill('gpt-mock');
     await create.getByLabel('Priority', { exact: true }).fill('2');
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.screenshot({ path: '/tmp/mtc-model-route-create-mobile.png', fullPage: true });
+    await page.waitForFunction(() => document.querySelector('.app-sidebar')!.getBoundingClientRect().right <= 0);
+    await create.locator('.create-resource-body > button:enabled').waitFor();
+    await page.keyboard.press('Escape');
+    await page.evaluate(() => { (document.activeElement as HTMLElement)?.blur(); window.scrollTo(0, 0); });
+    await page.screenshot({ path: '/tmp/mtc-model-route-create-mobile.png', fullPage: true, animations: 'disabled' });
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     await Promise.all([
       page.waitForResponse((response) => response.url().endsWith('/internal/v1/model-routes') && response.request().method() === 'POST'),

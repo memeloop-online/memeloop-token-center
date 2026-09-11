@@ -50,10 +50,11 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
   const [error, setError] = useState(false);
   const [saved, setSaved] = useState(false);
   const codex = account.driver === 'openai-codex' && account.auth_kind === 'oauth';
+  const canEditProxy = codex && account.can_update_transport_proxy !== false;
   const proxyState = account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? 'connection.proxyConfigured' : 'connection.proxyMissing';
   const valid = isPrivateProxyUrl(proxy.trim());
   async function save() {
-    if (!valid || busy || disabled) return;
+    if (!valid || busy || disabled || !canEditProxy) return;
     setBusy(true); setError(false); setSaved(false);
     try {
       await api(`/internal/v1/upstreams/${encodeURIComponent(account.id)}/transport-proxy`, token, {
@@ -72,7 +73,7 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
       <div><dt>{t('connection.proxy')}</dt><dd><span className={`status ${account.has_proxy ? 'ok' : 'pending'}`}>{t(codex ? proxyState : 'connection.proxyNotManaged')}</span>{account.proxy_scheme && <code>{account.proxy_scheme}</code>}{account.has_proxy && <span>{t(account.proxy_remote_dns ? 'connection.remoteDns' : 'connection.localDns')}</span>}</dd></div>
     </dl>
     <p className="muted">{t('connection.endpointHint')}</p>
-    {codex && <><button type="button" className="secondary" disabled={disabled || busy} onClick={() => { setEditing(!editing); setProxy(''); setError(false); setSaved(false); }}>{t(editing ? 'common.cancel' : 'connection.editProxy')}</button>
+    {canEditProxy && <><button type="button" className="secondary" disabled={disabled || busy} onClick={() => { setEditing(!editing); setProxy(''); setError(false); setSaved(false); }}>{t(editing ? 'common.cancel' : 'connection.editProxy')}</button>
       {editing && <form className="upstream-proxy-editor" onSubmit={(event) => { event.preventDefault(); void save(); }}>
         <ProxyInput value={proxy} onChange={setProxy} disabled={busy} />
         <button type="submit" disabled={disabled || busy || !valid}>{t(busy ? 'common.loading' : 'connection.saveProxy')}</button>
