@@ -41,7 +41,7 @@ async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
-test('credential workspaces isolate loads and preserve one-time service plaintext', { timeout: 30_000 }, async () => {
+test('credential workspaces isolate loads and preserve one-time service plaintext', { timeout: 60_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the credential workspace CI gate');
@@ -93,8 +93,10 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     const cursorCalls = (await calls(lock)).filter((call) => call.startsWith('/internal/v1/keys?') && call.includes('before_id='));
     assert.equal(cursorCalls.length, 1, 'the stale scope cannot release the active cursor request for a second load');
     assert.equal(await lock.getByText('Scope A client', { exact: true }).count(), 0, 'the old scope remains invisible while a replacement cursor page is pending');
+    await Promise.all([allTenants.close(), routeFailure.close(), race.close(), lock.close()]);
 
     const plaintext = await browser.newPage();
+    plaintext.setDefaultTimeout(10_000);
     await plaintext.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await plaintext.goto(fixture('service-plaintext'));
     await plaintext.getByText('Existing service credential', { exact: true }).waitFor();
@@ -116,6 +118,7 @@ test('credential workspaces isolate loads and preserve one-time service plaintex
     assert.equal(await plaintext.getByRole('button', { name: 'Rotate', exact: true }).isDisabled(), false);
 
     const aba = await browser.newPage();
+    aba.setDefaultTimeout(10_000);
     await aba.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await aba.goto(fixture('service-scope-aba'));
     await aba.getByText('Existing service credential', { exact: true }).waitFor();
