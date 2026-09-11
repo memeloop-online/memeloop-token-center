@@ -1,5 +1,171 @@
 use super::*;
 
+async fn gated_sse_upstream(
+    body: Vec<u8>,
+) -> (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (release_body, body_released) = tokio::sync::oneshot::channel();
+    let accepted = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request_prefix = [0_u8; 4096];
+        assert!(stream.read(&mut request_prefix).await.unwrap() > 0);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        body_released.await.unwrap();
+        stream
+            .write_all(format!("{:X}\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&body).await.unwrap();
+        stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        stream.shutdown().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "a downstream cancellation must not replay the upstream request"
+        );
+    });
+    (endpoint, release_body, accepted)
+}
+
+#[tokio::test]
+async fn dropping_downstream_body_records_client_cancelled_without_poisoning_upstream() {
+    let fixture = codex_route_fixture("downstream-client-cancelled").await;
+    let (endpoint, release_body, upstream) =
+        gated_sse_upstream(completed_codex_sse("never consumed").into_bytes()).await;
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "disconnect", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    drop(response);
+    release_body.send(()).unwrap();
+    upstream.await.unwrap();
+    wait_for_request_settlement(&fixture, 1).await;
+
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(499));
+    assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
+    assert_eq!(rows[0].cost, "0");
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let health_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert_eq!(
+        health_rows, 0,
+        "a downstream cancellation is not upstream health evidence"
+    );
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+}
+
+async fn assert_delivery_database_fault(stage: &str, target_state: &str) {
+    let fixture = codex_route_fixture(&format!("delivery-{stage}-fault")).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let trigger = match target_state {
+        "delivery_prepared" => {
+            "CREATE TRIGGER fail_delivery_prepare BEFORE UPDATE OF error_code ON request_records \
+             WHEN NEW.error_code = 'delivery_prepared' \
+             BEGIN SELECT RAISE(ABORT, 'DELIVERY_TRIGGER_PRIVATE_CANARY'); END"
+        }
+        "delivery_started" => {
+            "CREATE TRIGGER fail_delivery_confirm BEFORE UPDATE OF error_code ON request_records \
+             WHEN NEW.error_code = 'delivery_started' \
+             BEGIN SELECT RAISE(ABORT, 'DELIVERY_TRIGGER_PRIVATE_CANARY'); END"
+        }
+        _ => panic!("unsupported delivery fault target"),
+    };
+    sqlx::query(trigger).execute(&pool).await.unwrap();
+    pool.close().await;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("delivery state fault"),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "delivery fault", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .expect("delivery state failure must close with a safe SSE terminal");
+    assert!(String::from_utf8_lossy(&delivered).contains("upstream request failed"));
+
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(500));
+    assert_eq!(rows[0].error_code.as_deref(), Some("delivery_state"));
+    assert_eq!(rows[0].cost, "0");
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let health_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert_eq!(
+        health_rows, 0,
+        "a local delivery database fault is not upstream health evidence"
+    );
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn delivery_prepare_database_fault_is_local_and_unbilled() {
+    assert_delivery_database_fault("prepare", "delivery_prepared").await;
+}
+
+#[tokio::test]
+async fn delivery_confirm_database_fault_is_local_and_unbilled() {
+    assert_delivery_database_fault("confirm", "delivery_started").await;
+}
+
 async fn assert_codex_terminal_rejection(
     label: &str,
     sse: &str,
